@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { writeFileSync, readdirSync, existsSync, lstatSync, readlinkSync, mkdirSync, copyFileSync, readFileSync } from 'node:fs';
+import { writeFileSync, readdirSync, existsSync, lstatSync, readlinkSync, mkdirSync, copyFileSync, readFileSync, symlinkSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 const NODE = '/data/user/0/com.dsh.launcher/files/node';
 const HOME = '/data/user/0/com.dsh.launcher/files';
@@ -98,6 +98,57 @@ try {
   writeFileSync(PATCH, '# native stubs in place, no disables\n');
   log('patch ok (empty)');
 } catch (e) { log('WARN patch: ' + e.message); }
+// 插件装配：dsh 保持官方原版，扩展一律走插件层。
+// dsh-mobile-nav（移动端适配，third_party 旁挂）→ 设备 plugins 链接 +
+// profiles/node_modules 链接（裸名解析）+ web profile 的 cordis.patch.yml 行。
+// 全部幂等：已装配时跳过。
+try {
+  const pluginSrc = join(DSH_DIR, 'third_party/dsh-mobile-nav');
+  if (existsSync(pluginSrc)) {
+    const pluginLink = join(HOME, 'plugins/dsh-mobile-nav');
+    mkdirSync(join(HOME, 'plugins'), { recursive: true });
+    try { if (!existsSync(pluginLink)) symlinkSync(pluginSrc, pluginLink, 'dir'); } catch (e) { log('WARN plugin link: ' + e.message); }
+    // 裸名导入的实际解析路径：include 模块沿父目录上溯到 DSH_DIR/node_modules
+    // （v0.2.0 验证过的生效机制）。profiles/node_modules 链接对 profile 内包生效，也一并维护。
+    const installNm = join(DSH_DIR, 'node_modules/@dsh-external');
+    mkdirSync(installNm, { recursive: true });
+    const installLink = join(installNm, 'dsh-mobile-nav');
+    try { if (!existsSync(installLink)) symlinkSync(pluginSrc, installLink, 'dir'); } catch (e) { log('WARN install nm link: ' + e.message); }
+    const profilesNm = join(HOME, '.dsh/profiles/node_modules');
+    const nmScope = join(profilesNm, '@dsh-external');
+    mkdirSync(nmScope, { recursive: true });
+    const nmLink = join(nmScope, 'dsh-mobile-nav');
+    try { if (!existsSync(nmLink)) symlinkSync(pluginLink, nmLink, 'dir'); } catch (e) { log('WARN profiles/nm link: ' + e.message); }
+    const profilePatch = join(HOME, '.dsh/profiles/web/cordis.patch.yml');
+    if (existsSync(profilePatch)) {
+      let text = readFileSync(profilePatch, 'utf8');
+      // BOM 会让部分 YAML 加载器把首行当键名/报错；装配入口统一剥掉并重写。
+      const stripped = text.replace(/^\uFEFF/, '');
+      // 旧格式（顶层 - id: …，无 insert 包装）不会插入行（target 不存在被跳过），
+      // 检测到就剥掉重写。正确格式与 bundle 层一致：- insert: 块。
+      const OLD_ROW = /\n?- id: dsh-mobile-nav\n\s+name: '[^']*'\n?/;
+      const INSERT_ROW = "- insert:\n    - id: dsh-mobile-nav\n      name: '@dsh-external/dsh-mobile-nav'\n";
+      const hasInsert = stripped.includes('- insert:\n    - id: dsh-mobile-nav');
+      if (!hasInsert) {
+        let clean = stripped.replace(OLD_ROW, '').trimEnd();
+        // 剥掉流式数组括号（[] 或残留的坏 ]），把 insert 块追加到末尾。
+        const base = clean.endsWith(']') ? clean.slice(0, -1).trimEnd() : clean;
+        const arr = base.endsWith('[') ? base.slice(0, -1) : base;
+        writeFileSync(profilePatch, arr.trimEnd() + '\n' + INSERT_ROW);
+        log('plugin wiring ok: dsh-mobile-nav insert into web profile patch');
+      } else if (stripped !== text) {
+        writeFileSync(profilePatch, stripped);
+        log('plugin patch BOM stripped');
+      } else {
+        log('plugin already wired');
+      }
+    } else {
+      log('WARN profile patch missing, skip wiring');
+    }
+  } else {
+    log('plugin source missing, skip wiring');
+  }
+} catch (e) { log('WARN plugin wiring: ' + e.message); }
 // 启动 dsh web：优先构建产物 lib/bin.js（tsc/tsdown 构建后存在），否则用 Node 22.19+
 // 原生 TS 运行 src/bin.ts。web 是 --profile web 的别名，首次运行会自动初始化 profile。
 const cliBin = existsSync(join(DSH_DIR, 'apps/cli/lib/bin.js')) ? join(DSH_DIR, 'apps/cli/lib/bin.js') : join(DSH_DIR, 'apps/cli/src/bin.ts');
