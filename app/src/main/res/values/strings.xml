@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">DeepSeek Harness</string>
+    <string name="status_title">服务状态</string>
+    <string name="status_unknown">未知</string>
+    <string name="status_running">🟢 运行中</string>
+    <string name="status_stopped">⚪ 未运行</string>
+    <string name="btn_install">① 安装 DSH</string>
+    <string name="btn_start">② 启动服务</string>
+    <string name="btn_stop">③ 停止服务</string>
+    <string name="btn_open_web">打开 Web 界面</string>
+    <string name="btn_open_terminal">打开内置终端</string>
+    <string name="btn_terminal_run_dsh">内置终端运行 DSH</string>
+    <string name="btn_node_run_dsh">⚡ 内置 Node 运行 DSH</string>
+    <string name="btn_refresh">刷新状态</string>
+    <string name="hint_termux_not_installed">未检测到 Termux，请先从 F-Droid 安装 Termux。</string>
+</resources>

@@ -1,0 +1,15 @@
+# Build outputs
+build/
+.gradle/
+.kotlin/
+*.apk
+*.aab
+*.idsig
+
+# Local / secret
+local.properties
+*.keystore
+*.jks
+.idea/
+*.iml
+.DS_Store

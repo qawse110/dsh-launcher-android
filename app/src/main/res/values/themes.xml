@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 基础深色主题 -->
+    <style name="Theme.DshLauncher" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <item name="colorPrimary">#4D6BFE</item>
+        <item name="colorPrimaryVariant">#3451DB</item>
+        <item name="colorOnPrimary">#FFFFFF</item>
+        <item name="android:statusBarColor">#4D6BFE</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>
