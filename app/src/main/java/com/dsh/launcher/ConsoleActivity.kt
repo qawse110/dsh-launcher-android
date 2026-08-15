@@ -125,6 +125,14 @@ class ConsoleActivity : AppCompatActivity() {
             isAllCaps = false
             setOnClickListener { startUpdateCheck(true) }
         }
+        val pluginBtn = Button(this).apply {
+            text = "插件"
+            textSize = 14f
+            isAllCaps = false
+            setOnClickListener {
+                startActivity(Intent(this@ConsoleActivity, PluginManagerActivity::class.java))
+            }
+        }
         val clearBtn = Button(this).apply {
             text = "清空"
             textSize = 14f
@@ -142,6 +150,7 @@ class ConsoleActivity : AppCompatActivity() {
             orientation = LinearLayout.HORIZONTAL
             addView(nodeBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(runBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(pluginBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(updateBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(clearBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(closeBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
