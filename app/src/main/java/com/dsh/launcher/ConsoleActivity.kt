@@ -119,6 +119,12 @@ class ConsoleActivity : AppCompatActivity() {
             isAllCaps = false
             setOnClickListener { runNodeCmd() }
         }
+        val updateBtn = Button(this).apply {
+            text = "更新"
+            textSize = 14f
+            isAllCaps = false
+            setOnClickListener { startUpdateCheck(true) }
+        }
         val clearBtn = Button(this).apply {
             text = "清空"
             textSize = 14f
@@ -136,6 +142,7 @@ class ConsoleActivity : AppCompatActivity() {
             orientation = LinearLayout.HORIZONTAL
             addView(nodeBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(runBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(updateBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(clearBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(closeBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         }
@@ -202,6 +209,14 @@ class ConsoleActivity : AppCompatActivity() {
                 flowLog.parentFile?.mkdirs()
                 runCatching { flowLog.writeText("") }
                 fl("OK 1/4 node=$nodeDir")
+                fl("dsh 版本 v${DshUpdater.currentVersion(this)}" +
+                    if (DshUpdater.hasPendingUpdate(this)) "（已下载更新，本次应用）" else "")
+
+                // 自动更新检查：无待应用更新且到检查周期时，后台检查/下载；
+                // 下载完成后重启流程（新包在下次启动时优先解压）。
+                if (!DshUpdater.hasPendingUpdate(this)) {
+                    startUpdateCheck(false) { msg -> fl(msg) }
+                }
 
                 val dshHome = File(filesDir, "deepseek-harness-master")
                 if (!File(dshHome, "package.json").exists()) {
@@ -227,14 +242,21 @@ class ConsoleActivity : AppCompatActivity() {
                     return@thread
                 }
                 // 同步等待安装完成（install-dsh.mjs 内部 pnpm install + build）
-                val prebuilt = File(filesDir, "prebuilt.tgz")
-                try {
-                    assets.open("prebuilt.tgz").use { input ->
-                        prebuilt.outputStream().use { output -> input.copyTo(output) }
+                // 待应用更新包优先；否则回退 assets 内置包
+                val prebuilt = if (DshUpdater.hasPendingUpdate(this)) {
+                    fl("  使用自动更新包（${DshUpdater.pendingUpdateFile(this).length() / 1024 / 1024}MB）")
+                    DshUpdater.pendingUpdateFile(this)
+                } else {
+                    val apk = File(filesDir, "prebuilt.tgz")
+                    try {
+                        assets.open("prebuilt.tgz").use { input ->
+                            apk.outputStream().use { output -> input.copyTo(output) }
+                        }
+                        fl("  prebuilt ${apk.length() / 1024 / 1024}MB")
+                    } catch (t: Throwable) {
+                        fl("  assets 无 prebuilt.tgz：${t.message}（将退化为设备端构建）")
                     }
-                    fl("  prebuilt ${prebuilt.length() / 1024 / 1024}MB")
-                } catch (t: Throwable) {
-                    fl("  assets 无 prebuilt.tgz：${t.message}（将退化为设备端构建）")
+                    apk
                 }
                 val installEnv = mapOf("DSH_PREBUILT" to prebuilt.absolutePath)
                 val installExit = runCommandAndWait("$nodeDir/bin/node ${installScript.absolutePath}", installEnv)
@@ -245,6 +267,11 @@ class ConsoleActivity : AppCompatActivity() {
                     fl("WARN 3/4 build 产物缺失（install 成功但产物不在预期路径）")
                 } else {
                     fl("OK 3/4 install+build finished")
+                    // 更新包已成功解压应用——删除 pending，避免下次重复解压
+                    if (DshUpdater.hasPendingUpdate(this)) {
+                        DshUpdater.pendingUpdateFile(this).delete()
+                        fl("自动更新已应用，删除待应用包")
+                    }
                 }
 
                 fl(">> 3.5/4 stub fixup + 首次启动 web…")
@@ -448,6 +475,39 @@ class ConsoleActivity : AppCompatActivity() {
         AppLog.i("Console", "cmd: $raw | env LD_LIBRARY_PATH=" + File(filesDir, "node/lib").absolutePath)
         thread {
             runCommandAndWait(raw)
+        }
+    }
+
+    /**
+     * 检查并下载 dsh 更新。force=true 时忽略检查间隔（「更新」按钮）。
+     * 发现新版本并下载完成后：杀掉 node 进程并重启 flow，
+     * 下一次 runDshFlow 会优先解压新包（pending 存在时不再检查，避免循环）。
+     */
+    private fun startUpdateCheck(force: Boolean, onLog: ((String) -> Unit)? = null) {
+        val log: (String) -> Unit = onLog ?: { appendLine(it) }
+        thread {
+            val version = DshUpdater.checkRemote(this, force, log)
+            if (version != null) {
+                val file = DshUpdater.download(this, version, log)
+                if (file != null) {
+                    log("dsh v$version 更新包就绪（${file.length() / 1024 / 1024}MB），重启流程应用…")
+                    Thread.sleep(3_000)
+                    killAllNode()
+                    runOnUiThread { runDshFlow() }
+                }
+            }
+        }
+    }
+
+    /** 杀掉全部 node 进程（web 与 flow 子进程一并结束），供更新后重启。 */
+    private fun killAllNode() {
+        runCatching {
+            val pb = ProcessBuilder("/system/bin/sh", "-c", "ps -A | grep node | awk '{print \$2}' | xargs -r kill")
+            pb.redirectErrorStream(true)
+            val p = pb.start()
+            p.inputStream.bufferedReader().useLines { it.forEach { line -> appendLine(line) } }
+            p.waitFor()
+            AppLog.i("Console", "node processes killed")
         }
     }
 
