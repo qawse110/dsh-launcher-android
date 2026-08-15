@@ -4,7 +4,9 @@ plugins {
 
 android {
     namespace = "com.dsh.launcher"
-    compileSdk = 36
+    // compileSdk=35：与现有本地 SDK 环境匹配（android-36 platform 需另行下载）；
+    // 代码未使用 API 36 特性，androidx 依赖（appcompat/material/core-ktx）均支持 35。
+    compileSdk = 35
 
     defaultConfig {
         applicationId = "com.dsh.launcher"

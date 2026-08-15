@@ -98,4 +98,18 @@ object AppLog {
             }
         }
     }
+
+    /** 记录异常堆栈（含 cause 链）。 */
+    fun e(tag: String, msg: String, t: Throwable) {
+        e(tag, "$msg: ${t.javaClass.simpleName}: ${t.message}")
+        var cur: Throwable? = t
+        var depth = 0
+        while (cur != null && depth < 12) {
+            for (el in cur.stackTrace.take(6)) {
+                write("E", tag, "    at $el")
+            }
+            cur = cur.cause
+            depth++
+        }
+    }
 }

@@ -19,6 +19,7 @@ import androidx.appcompat.app.AppCompatActivity
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import kotlin.concurrent.thread
 
 /**
  * DeepSeek Harness 启动器主界面
@@ -36,10 +37,32 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         AppLog.init(this)
         AppLog.i("Main", "onCreate start, logPath=" + AppLog.logPath())
+        // 支持 `am start -n com.dsh.launcher/.MainActivity --ez dsh true` 一键触发
+        if (intent?.getBooleanExtra("dsh", false) == true) {
+            startActivity(Intent(this, ConsoleActivity::class.java)
+                .putExtra("dsh", true)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            finish()
+            return
+        }
         deployScripts()
         setContentView(buildUi())
+        requestStoragePermissions()
         refreshStatus()
         log("就绪。请选择操作。")
+    }
+
+    /** 申请存储权限（targetSdk 28 在 Android 11+ 上读写 /sdcard 需要运行时授权）。 */
+    private fun requestStoragePermissions() {
+        if (android.os.Build.VERSION.SDK_INT < 23) return
+        val needed = mutableListOf<String>()
+        if (checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED)
+            needed += android.Manifest.permission.READ_EXTERNAL_STORAGE
+        if (checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED)
+            needed += android.Manifest.permission.WRITE_EXTERNAL_STORAGE
+        if (needed.isNotEmpty()) {
+            requestPermissions(needed.toTypedArray(), 1001)
+        }
     }
 
     // ---------------- 脚本部署 ----------------
@@ -133,14 +156,13 @@ class MainActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { gravity = Gravity.CENTER_HORIZONTAL; topMargin = dp(4) })
 
-        root.addView(actionButton(getString(R.string.btn_install)) {
-            runInTermux(INSTALL_CMD, "正在 Termux 中安装 DSH，请查看终端输出")
-        })
-        root.addView(actionButton(getString(R.string.btn_start)) {
-            runInTermux(START_CMD, "已请求启动 dsh 服务")
-        })
-        root.addView(actionButton(getString(R.string.btn_stop)) {
-            runInTermux(STOP_CMD, "已请求停止 dsh 服务")
+        root.addView(actionButton(getString(R.string.btn_install_one)) {
+            // 免 Termux 一键：ConsoleActivity 驱动 4 步流程（node→源码→install+build→web）
+            runCatching {
+                startActivity(Intent(this, ConsoleActivity::class.java).putExtra("dsh", true))
+            }.onFailure {
+                log("✗ 无法打开控制台：${it.message}")
+            }
         })
         root.addView(actionButton(getString(R.string.btn_open_web)) {
             startActivity(Intent(this, WebViewActivity::class.java))
@@ -148,12 +170,11 @@ class MainActivity : AppCompatActivity() {
         root.addView(actionButton(getString(R.string.btn_open_terminal)) {
             startActivity(Intent(this, ConsoleActivity::class.java))
         })
-        root.addView(actionButton(getString(R.string.btn_terminal_run_dsh)) {
-            startActivity(Intent(this, ConsoleActivity::class.java)
-                .putExtra("cmd", "cd /sdcard/Download/DshLauncher/scripts && bash run-dsh.sh"))
-        })
-        root.addView(actionButton(getString(R.string.btn_node_run_dsh)) {
+        root.addView(actionButton(getString(R.string.btn_node_check)) {
             runNodeDsh()
+        })
+        root.addView(actionButton(getString(R.string.btn_stop_all)) {
+            stopDshAll()
         })
 
         // 反馈日志栏
@@ -174,7 +195,7 @@ class MainActivity : AppCompatActivity() {
         })
 
         root.addView(TextView(this).apply {
-            text = "操作步骤：\n① 点“⚡ 内置 Node 运行 DSH”自动解压内置 Node 并验证；\n② 如需 dsh 完整功能，在控制台执行 npm 安装 dsh；\n③ “打开 Web 界面”查看 dsh UI。\n\n提示：\n· 内置 Node 为免 Termux 方案，首次解压约需几十秒；\n· ①安装/②启动/③停止依赖 Termux 环境。"
+            text = "操作步骤：\n① 点“⚡ 一键安装并启动 DSH”自动完成：内置 Node 解压 → 获取 harness 源码（优先 /sdcard 预置 zip，可 adb push）→ pnpm 安装依赖并构建 → 启动 Web（首次约 10~30 分钟，请保持应用在前台）；\n② “打开 Web 界面”查看 dsh UI（http://127.0.0.1:3080）；\n③ “停止 dsh 服务”结束后台进程与保活服务。\n\n提示：\n· 全程免 Termux，内置 Node 为 aarch64 运行时；\n· 构建日志：/sdcard/Download/DshLauncher/install_log.txt。"
             textSize = 12f
             setTextColor(0xFF9A9A9A.toInt())
             setPadding(0, dp(18), 0, 0)
@@ -306,6 +327,28 @@ class MainActivity : AppCompatActivity() {
 
     /** 是否有内置 Node 解压完成标记。 */
     private fun hasNodeMarker(): Boolean = File(filesDir, ".node-ok").exists()
+
+    /** 停止 dsh 服务：杀 node 相关进程 + 停保活服务 + 刷新状态。 */
+    private fun stopDshAll() {
+        log("▶ 正在停止 dsh 相关进程…")
+        thread {
+            try {
+                val pb = ProcessBuilder(
+                    "/system/bin/sh", "-c",
+                    "pkill -f deepseek-harness-master; pkill -f 'bin.js web'; pkill -f 'src/bin.ts'; true"
+                )
+                pb.redirectErrorStream(true)
+                pb.start().waitFor()
+            } catch (t: Throwable) {
+                android.util.Log.w("DshMain", "kill failed: ${t.message}")
+            }
+            runOnUiThread {
+                runCatching { stopService(Intent(this@MainActivity, BuildKeepAliveService::class.java)) }
+                log("✓ 已停止 dsh 相关进程与服务")
+                refreshStatus()
+            }
+        }
+    }
 
     /** 在主界面日志栏追加一行（主线程安全），同时写入文件日志与 logcat。 */
     private fun log(msg: String) {

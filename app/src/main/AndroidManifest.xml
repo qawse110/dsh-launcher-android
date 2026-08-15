@@ -46,7 +46,7 @@
             android:windowSoftInputMode="adjustResize" />
         <activity
             android:name=".ConsoleActivity"
-            android:exported="false"
+            android:exported="true"
             android:configChanges="orientation|screenSize|keyboardHidden"
             android:windowSoftInputMode="adjustResize" />
 

@@ -178,18 +178,21 @@ class ConsoleActivity : AppCompatActivity() {
      * 通过 ConsoleActivity 的 intent `--ez dsh true` 触发，供自动化/按钮调用。
      * 各阶段用短命令经 runCommand 逐段执行：
      *   1) 确保内置 node 解压
-     *   2) 用 node 下载 install-dsh.mjs 到私有目录（GitHub raw）
-     *   3) node 执行 install-dsh.mjs（pnpm install + build），日志写共享目录
-     *   4) 启动 dsh web（后台长驻）
+     *   2) 确保 harness 源码：优先 /sdcard/Download/DshLauncher/deepseek-harness-master.zip
+     *      （adb push 预置），否则从网络下载（多源 fallback），解压到私有目录
+     *   3) node 执行 assets 内置 install-dsh.mjs（pnpm install + build:lib + build:web），
+     *      完成后执行 stub-dsh.mjs（原生模块 stub + 启动 web），日志写共享目录
+     *   4) 校验 web 进程/端口，启动 dsh web
      */
     private fun runDshFlow() {
         setState("启动 dsh 安装…")
         appendLine(">> 1/4 确保内置 Node 运行时…")
-        val flowLog = File("/sdcard/Download/DshLauncher/dsh-flow.log")
+        // 核心日志写私有目录（无需存储权限，run-as 可读）；共享目录尽力而为
+        val flowLog = File(filesDir, "dsh-flow.log")
+        val sharedFlowLog = File("/sdcard/Download/DshLauncher/dsh-flow.log")
         fun fl(msg: String) {
-            runCatching {
-                flowLog.appendText("${System.currentTimeMillis()} $msg\n")
-            }
+            runCatching { flowLog.appendText("${System.currentTimeMillis()} $msg\n") }
+            runCatching { sharedFlowLog.appendText("${System.currentTimeMillis()} $msg\n") }
             appendLine(msg)
         }
         thread {
@@ -199,37 +202,181 @@ class ConsoleActivity : AppCompatActivity() {
                 flowLog.parentFile?.mkdirs()
                 runCatching { flowLog.writeText("") }
                 fl("OK 1/4 node=$nodeDir")
-                fl(">> 2/4 从 APK assets 读取 stub 脚本…")
-                // 本地打包：直接读 assets/stub-dsh.mjs，不依赖网络下载
+
+                val dshHome = File(filesDir, "deepseek-harness-master")
+                if (!File(dshHome, "package.json").exists()) {
+                    fl(">> 2/4 获取 harness 源码…")
+                    if (!ensureHarnessSource(dshHome) { fl(it) }) {
+                        fl("FAIL 2/4 harness source not ready")
+                        setState("出错")
+                        return@thread
+                    }
+                } else {
+                    fl("OK 2/4 harness source exists: $dshHome")
+                }
+
+                fl(">> 3/4 pnpm install + build (long, 5-30 分钟)…")
                 val installScript = File(filesDir, "install-dsh.mjs")
                 try {
-                    assets.open("stub-dsh.mjs").use { input ->
+                    assets.open("install-dsh.mjs").use { input ->
                         installScript.outputStream().use { output -> input.copyTo(output) }
                     }
                 } catch (t: Throwable) {
-                    fl("FAIL 2/4 assets copy: ${t.message}")
+                    fl("FAIL 3/4 assets copy install-dsh.mjs: ${t.message}")
                     setState("出错")
                     return@thread
                 }
-                if (!installScript.exists()) {
-                    fl("FAIL 2/4 installer missing")
-                    setState("出错")
-                    return@thread
+                // 同步等待安装完成（install-dsh.mjs 内部 pnpm install + build）
+                val prebuilt = File(filesDir, "prebuilt.tgz")
+                try {
+                    assets.open("prebuilt.tgz").use { input ->
+                        prebuilt.outputStream().use { output -> input.copyTo(output) }
+                    }
+                    fl("  prebuilt ${prebuilt.length() / 1024 / 1024}MB")
+                } catch (t: Throwable) {
+                    fl("  assets 无 prebuilt.tgz：${t.message}（将退化为设备端构建）")
                 }
-                fl("OK 2/4 installer from assets")
-                fl(">> 3/4 pnpm install + build (long)…")
-                runCommand("$nodeDir/bin/node ${installScript.absolutePath}")
-                fl("OK 3/4 install script finished")
-                fl(">> 4/4 start dsh web…")
+                val installEnv = mapOf("DSH_PREBUILT" to prebuilt.absolutePath)
+                val installExit = runCommandAndWait("$nodeDir/bin/node ${installScript.absolutePath}", installEnv)
+                if (installExit != 0) {
+                    fl("FAIL 3/4 install script exit=$installExit，详见 install_log.txt")
+                } else if (!File(dshHome, "apps/cli/lib/bin.js").exists() &&
+                    !File(dshHome, "apps/web/dist").exists()) {
+                    fl("WARN 3/4 build 产物缺失（install 成功但产物不在预期路径）")
+                } else {
+                    fl("OK 3/4 install+build finished")
+                }
+
+                fl(">> 3.5/4 stub fixup + 首次启动 web…")
+                val stubScript = File(filesDir, "stub-dsh.mjs")
+                try {
+                    assets.open("stub-dsh.mjs").use { input ->
+                        stubScript.outputStream().use { output -> input.copyTo(output) }
+                    }
+                } catch (t: Throwable) {
+                    fl("FAIL 3.5/4 assets copy stub-dsh.mjs: ${t.message}")
+                }
+                runCommandAndWait("$nodeDir/bin/node ${stubScript.absolutePath}")
+
+                fl(">> 4/4 校验 dsh web…")
+                // stub 已用 nohup 启动 web，这里再补一次直启（幂等：端口占用时跳过）
                 startDshWeb(nodeDir)
-                fl("OK 4/4 dsh web started")
-                // 注意：runCommand 异步，build 可能仍在进行；keepalive 保持常驻，
-                // 由 install-dsh.mjs 完成后写入标记，外部轮询 dsh-flow.log/install_log 判定。
-                // stopKeepAlive() 不能在此调用，否则 build 期间失去保活会被系统回收。
+                fl("OK 4/4 dsh web started (http://127.0.0.1:3080)")
+                // 保持 keepalive 常驻：web 进程是其子进程，避免被系统回收；用户可在主界面停止。
+                // stopKeepAlive() 不能在此调用。
             } catch (t: Throwable) {
                 fl("FAIL: ${t.message}")
                 setState("出错")
             }
+        }
+    }
+
+    /**
+     * 确保 harness 源码就绪，优先级：
+     *  1) APK assets 内置 zip（零权限零网络，推荐）
+     *  2) /sdcard/Download/DshLauncher/deepseek-harness-master.zip（adb push 预置）
+     *  3) 网络下载（多源 fallback：GitHub 直连 → ghproxy 加速）
+     * 下载/解压后校验 package.json。
+     */
+    private fun ensureHarnessSource(dshHome: File, fl: (String) -> Unit): Boolean {
+        val zipCandidates = mutableListOf<File>()
+        // 1) assets 内置（优先，零权限零网络）
+        fl("  检查 APK assets 内置源码包…")
+        try {
+            val out = File(filesDir, "harness-source.zip")
+            assets.open("harness/deepseek-harness-master.zip").use { input ->
+                out.outputStream().use { output -> input.copyTo(output) }
+            }
+            if (out.length() > 100_000) {
+                zipCandidates.add(out)
+                fl("  内置源码包 ${out.length() / 1024 / 1024}MB")
+            } else {
+                fl("  内置源码包异常（${out.length()} 字节）")
+            }
+        } catch (t: Throwable) {
+            fl("  assets 无内置源码包：${t.message}")
+        }
+        // 2) /sdcard 预置（需要存储权限）
+        val sdcardZips = listOf(
+            File("/sdcard/Download/DshLauncher/deepseek-harness-master.zip"),
+            File("/sdcard/Download/DshLauncher/dsh-src.zip"),
+            File(getExternalFilesDir(null), "deepseek-harness-master.zip")
+        )
+        zipCandidates += sdcardZips.filter { it.exists() && it.length() > 100_000 }
+        var zipFile: File? = zipCandidates.firstOrNull()
+        if (zipFile != null) {
+            fl("  使用源码包：${zipFile.absolutePath} (${zipFile.length() / 1024 / 1024}MB)")
+        } else {
+            fl("  未找到本地源码包，尝试网络下载…")
+            val urls = arrayOf(
+                "https://github.com/deepseek-ai/deepseek-harness/archive/refs/heads/master.zip",
+                "https://ghproxy.com/https://github.com/deepseek-ai/deepseek-harness/archive/refs/heads/master.zip",
+                "https://ghfast.top/https://github.com/deepseek-ai/deepseek-harness/archive/refs/heads/master.zip"
+            )
+            var ok = false
+            for (u in urls) {
+                fl("  下载 $u")
+                try {
+                    val tmp = File(filesDir, "harness-download.zip")
+                    val conn = java.net.URL(u).openConnection() as java.net.HttpURLConnection
+                    conn.connectTimeout = 20_000
+                    conn.readTimeout = 60_000
+                    conn.instanceFollowRedirects = true
+                    conn.setRequestProperty("User-Agent", "DshLauncher/4.0")
+                    conn.connect()
+                    val code = conn.responseCode
+                    fl("  HTTP $code, size=${conn.contentLengthLong}")
+                    if (code in 200..399 && conn.contentLengthLong > 100_000) {
+                        conn.inputStream.use { input ->
+                            tmp.outputStream().use { output -> input.copyTo(output) }
+                        }
+                        zipFile = tmp
+                        ok = true
+                        break
+                    }
+                    conn.disconnect()
+                } catch (t: Throwable) {
+                    fl("  下载失败：${t.message}")
+                }
+            }
+            if (!ok) {
+                fl("  网络下载失败。可把源码包打进 APK assets（harness/ 目录）或 adb push 到 /sdcard/Download/DshLauncher/")
+                return false
+            }
+        }
+        try {
+            // 先复制到私有目录再解压：/sdcard (FUSE) 上的文件随机访问可能受限
+            val localZip = File(filesDir, "harness-source.zip")
+            if (zipFile!!.absolutePath != localZip.absolutePath) {
+                zipFile.inputStream().use { input ->
+                    localZip.outputStream().use { output -> input.copyTo(output) }
+                }
+                fl("  已复制到私有目录：${localZip.absolutePath}")
+                zipFile = localZip
+            }
+            // 解压到临时目录，避免半成品污染
+            val tmp = File(filesDir, ".harness-tmp")
+            tmp.deleteRecursively()
+            tmp.mkdirs()
+            val n = ZipUnpack.unpack(zipFile, tmp)
+            fl("  解压 $n 个文件")
+            if (!File(tmp, "package.json").exists()) {
+                fl("  解压结果缺少 package.json（zip 结构异常）")
+                return false
+            }
+            // 移动临时目录 → 目标目录
+            dshHome.deleteRecursively()
+            if (!tmp.renameTo(dshHome)) {
+                fl("  移动目录失败，改用复制")
+                tmp.copyRecursively(dshHome)
+                tmp.deleteRecursively()
+            }
+            return File(dshHome, "package.json").exists()
+        } catch (t: Throwable) {
+            fl("  解压失败：${t.message}")
+            AppLog.e("Console", "unpack failed", t)
+            android.util.Log.e("DshConsole", "unpack failed", t)
+            return false
         }
     }
 
@@ -248,12 +395,21 @@ class ConsoleActivity : AppCompatActivity() {
         runCatching { stopService(Intent(this, BuildKeepAliveService::class.java)) }
     }
 
-    /** 后台启动 dsh web（nohup 使其脱离本控制台进程）。 */
+    /** 后台启动 dsh web（nohup 使其脱离本控制台进程）。端口已监听时跳过（幂等）。 */
     private fun startDshWeb(nodeDir: File) {
         val dshHome = File(filesDir, "deepseek-harness-master")
-        if (!File(dshHome, "node_modules/.bin/dsh").exists()) {
-            appendLine("✗ 未找到 dsh 可执行文件（构建可能未完成）")
+        val cliEntry = when {
+            File(dshHome, "apps/cli/lib/bin.js").exists() -> "apps/cli/lib/bin.js"
+            else -> "apps/cli/src/bin.ts" // Node 22.19+ 原生 TS
+        }
+        if (!File(dshHome, "package.json").exists()) {
+            appendLine("✗ 未找到 dsh 源码（构建可能未完成）")
             setState("出错")
+            return
+        }
+        // 幂等：3080 已有监听则视为已启动
+        if (isPortListening(3080)) {
+            appendLine(">> dsh web 已在运行 (http://127.0.0.1:3080)")
             return
         }
         // 生成启动脚本到共享目录，用 sh 后台执行
@@ -267,12 +423,23 @@ class ConsoleActivity : AppCompatActivity() {
             "export OPENSSL_CONF=/dev/null\n" +
             "export PATH=${nodeDir.absolutePath}/bin:/system/bin:/bin\n" +
             "cd $dshHome\n" +
-            "nohup ${nodeDir.absolutePath}/bin/node ./node_modules/.bin/dsh web > /sdcard/Download/DshLauncher/dsh-web.log 2>&1 &\n" +
+            "nohup ${nodeDir.absolutePath}/bin/node --expose-internals ./$cliEntry web > ${filesDir.absolutePath}/dsh-web.log 2>&1 &\n" +
             "echo DSH_WEB_PID=$!\n"
         )
         launcher.setExecutable(true)
         runCommand("/system/bin/sh ${launcher.absolutePath}")
-        appendLine(">> dsh web 后台启动，日志：/sdcard/Download/DshLauncher/dsh-web.log")
+        appendLine(">> dsh web 后台启动，日志：${filesDir.absolutePath}/dsh-web.log")
+    }
+
+    /** 检测本机端口是否已有监听（用于幂等启动）。 */
+    private fun isPortListening(port: Int): Boolean = try {
+        java.net.ServerSocket().use { s ->
+            s.reuseAddress = false
+            s.bind(java.net.InetSocketAddress("127.0.0.1", port))
+            false
+        }
+    } catch (e: java.io.IOException) {
+        true
     }
 
     /** 通过 ProcessBuilder 执行命令，实时回显输出。 */
@@ -280,40 +447,49 @@ class ConsoleActivity : AppCompatActivity() {
         setState("运行中…")
         AppLog.i("Console", "cmd: $raw | env LD_LIBRARY_PATH=" + File(filesDir, "node/lib").absolutePath)
         thread {
-            try {
-                // 用 /system/bin/sh -c 执行，这样支持管道/重定向/环境变量
-                val pb = ProcessBuilder("/system/bin/sh", "-c", raw)
-                pb.redirectErrorStream(true)
-                val env = pb.environment()
-                env["PATH"] = listOf(
-                    "/data/data/com.dsh.launcher/files/node/bin",
-                    "/system/bin", "/bin", "/usr/bin"
-                ).joinToString(":")
-                env["HOME"] = "/data/data/com.dsh.launcher/files"
-                env["TERM"] = "xterm-256color"
-                env["LD_LIBRARY_PATH"] = File(filesDir, "node/lib").absolutePath
-                env["TMPDIR"] = File(filesDir, "node/tmp").absolutePath
-                env["OPENSSL_CONF"] = "/dev/null"
+            runCommandAndWait(raw)
+        }
+    }
 
-                val proc = pb.start()
-                // 实时逐行回显
-                proc.inputStream.bufferedReader().useLines { lines ->
-                    lines.forEach { line ->
-                        appendLine(line)
-                        AppLog.i("ConsoleOut", line)
-                    }
+    /** 同步执行命令（阻塞直到结束），返回退出码；输出实时回显。 */
+    private fun runCommandAndWait(raw: String, extraEnv: Map<String, String> = emptyMap()): Int {
+        setState("运行中…")
+        AppLog.i("Console", "cmd: $raw")
+        return try {
+            // 用 /system/bin/sh -c 执行，这样支持管道/重定向/环境变量
+            val pb = ProcessBuilder("/system/bin/sh", "-c", raw)
+            pb.redirectErrorStream(true)
+            val env = pb.environment()
+            env["PATH"] = listOf(
+                "/data/data/com.dsh.launcher/files/node/bin",
+                "/system/bin", "/bin", "/usr/bin"
+            ).joinToString(":")
+            env["HOME"] = "/data/data/com.dsh.launcher/files"
+            env["TERM"] = "xterm-256color"
+            env["LD_LIBRARY_PATH"] = File(filesDir, "node/lib").absolutePath
+            env["TMPDIR"] = File(filesDir, "node/tmp").absolutePath
+            env["OPENSSL_CONF"] = "/dev/null"
+            extraEnv.forEach { (k, v) -> env[k] = v }
+
+            val proc = pb.start()
+            // 实时逐行回显
+            proc.inputStream.bufferedReader().useLines { lines ->
+                lines.forEach { line ->
+                    appendLine(line)
+                    AppLog.i("ConsoleOut", line)
                 }
-                val exit = proc.waitFor()
-                AppLog.i("Console", "exit code: $exit")
-                setState("完成（退出码 $exit）")
-                appendLine("[退出码: $exit]")
-                appendLine("")
-                appendLine("如需继续，在下方输入命令回车；点“清空”可清理屏幕。")
-            } catch (e: Exception) {
-                AppLog.e("Console", "cmd failed: " + (e.message ?: e.toString()))
-                setState("出错")
-                appendLine("[执行失败: ${e.message}]")
             }
+            val exit = proc.waitFor()
+            AppLog.i("Console", "exit code: $exit")
+            setState("完成（退出码 $exit）")
+            appendLine("[退出码: $exit]")
+            appendLine("")
+            exit
+        } catch (e: Exception) {
+            AppLog.e("Console", "cmd failed: " + (e.message ?: e.toString()))
+            setState("出错")
+            appendLine("[执行失败: ${e.message}]")
+            -1
         }
     }
 
