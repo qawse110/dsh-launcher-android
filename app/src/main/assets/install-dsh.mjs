@@ -279,6 +279,7 @@ function copyPresets() {
   const destRoot = join(HOME, '.dsh/.agent-presets');
   mkdirSync(destRoot, { recursive: true });
   try {
+    const sourceNames = new Set();
     if (existsSync(join(srcRoot, 'agent.cordis.yml'))) {
       const dest = join(destRoot, 'router-preset');
       rmSync(dest, { recursive: true, force: true });
@@ -288,6 +289,7 @@ function copyPresets() {
       let copied = 0;
       for (const child of readdirSync(srcRoot, { withFileTypes: true })) {
         if (!child.isDirectory()) continue;
+        sourceNames.add(child.name);
         const childSrc = join(srcRoot, child.name);
         if (!existsSync(join(childSrc, 'agent.cordis.yml'))) continue;
         const dest = join(destRoot, child.name);
@@ -300,6 +302,14 @@ function copyPresets() {
         rmSync(legacy, { recursive: true, force: true });
       }
       log('preset install: router-preset (' + copied + ' subpresets)');
+    }
+    // 上游曾短暂合入 router-pro（v0.3.0）后又回退到 v0.2.0；
+    // 清理历史安装残留，避免 agent-presets 里出现上游已移除的预设。
+    for (const stale of ['router-pro']) {
+      if (!sourceNames.has(stale)) {
+        rmSync(join(destRoot, stale), { recursive: true, force: true });
+        log('removed stale preset: ' + stale + ' (upstream reverted to v0.2.0)');
+      }
     }
   } catch (e) {
     log('WARN preset copy failed: ' + e.message);

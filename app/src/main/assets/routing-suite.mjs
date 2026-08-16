@@ -203,6 +203,7 @@ async function installSuite() {
   const presetSrc = existsSync(join(presetRoot, 'preset')) ? join(presetRoot, 'preset') : presetRoot;
   const destRoot = join(HOME, '.dsh/.agent-presets');
   mkdirSync(destRoot, { recursive: true });
+  const sourceNames = new Set();
   if (existsSync(join(presetSrc, 'agent.cordis.yml'))) {
     const dest = join(destRoot, 'router-standard');
     rmSync(dest, { recursive: true, force: true });
@@ -212,6 +213,7 @@ async function installSuite() {
     let copied = 0;
     for (const child of readdirSync(presetSrc, { withFileTypes: true })) {
       if (!child.isDirectory()) continue;
+      sourceNames.add(child.name);
       const childSrc = join(presetSrc, child.name);
       if (!existsSync(join(childSrc, 'agent.cordis.yml'))) continue;
       const dest = join(destRoot, child.name);
@@ -220,6 +222,16 @@ async function installSuite() {
       copied++;
     }
     log('presets copied: ' + copied);
+  }
+  // 上游曾短暂合入 router-pro（v0.3.0）后又回退到 v0.2.0；
+  // 清理历史安装残留，避免 agent-presets 里出现上游已移除的预设。
+  if (existsSync(presetSrc)) {
+    for (const stale of ['router-pro']) {
+      if (!sourceNames.has(stale)) {
+        rmSync(join(destRoot, stale), { recursive: true, force: true });
+        log('removed stale preset: ' + stale + ' (upstream reverted to v0.2.0)');
+      }
+    }
   }
 
   log('=== routing-suite special install done ===');

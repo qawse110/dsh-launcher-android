@@ -40,7 +40,7 @@ class PluginManagerActivity : AppCompatActivity() {
             "dsh-j-space-cognition" to "J-Space Cognition Suite V3.6 Skill（j-space 推理时认知控制）",
         )
         const val PRESET_DIR = "router-preset"
-        const val PRESET_DESC = "思维模式路由预设（router-pro / router-spec / router-standard，agent-presets）"
+        const val PRESET_DESC = "思维模式路由预设（router-spec / router-standard，agent-presets）"
         const val REPO_DIR = "plugin-repo"
         const val ROUTING_REPO = "yjh051108/dsh-routing-suite"
         const val OH_WE_NEED_REPO = "scp3500/oh-we-need"
@@ -207,8 +207,9 @@ class PluginManagerActivity : AppCompatActivity() {
             listBox.addView(makeCard(d, BUNDLED_DESC[d] ?: "", ver, status, emptyList()))
         }
 
-        // 路由预设（容器展平后以 router-pro/router-spec/router-standard 三个一级预设生效）
-        val presetOk = listOf("router-pro", "router-spec", "router-standard").any { File(presetsRoot(), it).exists() }
+        // 路由预设（容器展平后以 router-spec/router-standard 两个一级预设生效；
+        // 上游曾短暂提供 router-pro 但已回退到 v0.2.0，不再内置）
+        val presetOk = listOf("router-spec", "router-standard").any { File(presetsRoot(), it).exists() }
         listBox.addView(makeCard(
             PRESET_DIR, PRESET_DESC, "preset",
             if (presetOk) "已安装（agent-presets）" else "待装配（需重新装配）", emptyList()))
