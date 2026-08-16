@@ -312,6 +312,39 @@ function installBuiltins() {
   cleanBuiltinPatch();
 }
 
+/**
+ * 内置插件以 link: 方式装配在 files/plugins 下，pnpm 不会把它们的
+ * peerDependencies 安装到该目录。这里把 dsh-prefix/node_modules 的所有包
+ * 桥接（符号链接）到 plugins/node_modules，使插件代码从 files/plugins/*
+ * 加载时也能解析 @deepseek-ai/* 等运行时依赖。
+ */
+function linkPluginDeps() {
+  const src = join(DSH_PREFIX, 'node_modules');
+  const dest = join(PLUGINS_DIR, 'node_modules');
+  if (!existsSync(src)) {
+    log('WARN dsh-prefix node_modules missing, skip plugin dep bridge');
+    return;
+  }
+  try {
+    rmSync(dest, { recursive: true, force: true });
+    mkdirSync(dest, { recursive: true });
+    let linked = 0;
+    for (const ent of readdirSync(src, { withFileTypes: true })) {
+      const target = join(src, ent.name);
+      const link = join(dest, ent.name);
+      try {
+        symlinkSync(target, link);
+        linked++;
+      } catch (e) {
+        log('WARN link plugin dep ' + ent.name + ': ' + e.message);
+      }
+    }
+    log(`plugin dep bridge: ${linked} packages -> ${dest}`);
+  } catch (e) {
+    log('WARN linkPluginDeps: ' + e.message);
+  }
+}
+
 /** 清理旧版遗留的 profile patch 内置插件 insert，避免与 dsh.profile.bundles 重复装配。 */
 function cleanBuiltinPatch() {
   const patch = join(HOME, '.dsh/profiles', DSH_PROFILE, 'cordis.patch.yml');
@@ -372,6 +405,7 @@ if (!pluginsOnly) {
 
 extractPlugins();
 installBuiltins();
+linkPluginDeps();
 
 try {
   writeFileSync(join(DSH_PREFIX, 'dsh-installed.json'), JSON.stringify({
