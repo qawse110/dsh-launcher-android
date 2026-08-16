@@ -45,7 +45,6 @@ class MainActivity : AppCompatActivity() {
             finish()
             return
         }
-        deployScripts()
         setContentView(buildUi())
         requestStoragePermissions()
         refreshStatus()
@@ -62,51 +61,6 @@ class MainActivity : AppCompatActivity() {
             needed += android.Manifest.permission.WRITE_EXTERNAL_STORAGE
         if (needed.isNotEmpty()) {
             requestPermissions(needed.toTypedArray(), 1001)
-        }
-    }
-
-    // ---------------- 脚本部署 ----------------
-    /**
-     * 把内置的 dsh 管理脚本复制到共享目录，供 Termux 执行。
-     * 目标：/storage/emulated/0/Download/DshLauncher/scripts
-     * （Termux 执行 termux-setup-storage 后可读取该目录）
-     */
-    private fun deployScripts() {
-        val names = arrayOf("install-dsh.sh", "run-dsh.sh", "dsh-manager.sh", "dsh-init.sh")
-        // 优先共享目录（Termux 可读）；若无权限则回退到 app 私有区
-        val sharedDir = File("/storage/emulated/0/Download/DshLauncher/scripts")
-        val privDir = File(filesDir, "scripts")
-        var usedDir: File? = null
-        try {
-            if (sharedDir.exists() || sharedDir.mkdirs()) {
-                // 测试共享目录是否可写
-                val probe = File(sharedDir, ".write-test")
-                try {
-                    probe.writeText("ok")
-                    probe.delete()
-                    usedDir = sharedDir
-                } catch (we: Throwable) {
-                    AppLog.w("Main", "共享目录不可写，回退私有区: ${we.message}")
-                }
-            }
-        } catch (e: Throwable) {
-            AppLog.w("Main", "共享目录创建失败: ${e.message}")
-        }
-        if (usedDir == null) {
-            usedDir = privDir
-            usedDir.mkdirs()
-        }
-        try {
-            for (name in names) {
-                val out = File(usedDir, name)
-                assets.open("scripts/$name").use { input ->
-                    out.outputStream().use { input.copyTo(it) }
-                }
-            }
-            AppLog.i("Main", "scripts deployed to " + usedDir.absolutePath)
-            android.util.Log.i("DshMain", "scripts -> ${usedDir.absolutePath}")
-        } catch (e: Exception) {
-            android.util.Log.w("Dsh", "脚本部署失败", e)
         }
     }
 
@@ -157,7 +111,7 @@ class MainActivity : AppCompatActivity() {
         ).apply { gravity = Gravity.CENTER_HORIZONTAL; topMargin = dp(4) })
 
         root.addView(actionButton(getString(R.string.btn_install_one)) {
-            // 免 Termux 一键：ConsoleActivity 驱动 4 步流程（node→源码→install+build→web）
+            // 免 Termux 一键：ConsoleActivity 驱动 4 步流程（node→官方 npm 安装 dsh→插件装配→web）
             runCatching {
                 startActivity(Intent(this, ConsoleActivity::class.java).putExtra("dsh", true))
             }.onFailure {
@@ -217,7 +171,7 @@ class MainActivity : AppCompatActivity() {
         })
 
         root.addView(TextView(this).apply {
-            text = "操作步骤：\n① 点“⚡ 一键安装并启动 DSH”自动完成：内置 Node 解压 → 获取 harness 源码（优先 /sdcard 预置 zip，可 adb push）→ pnpm 安装依赖并构建 → 启动 Web（首次约 10~30 分钟，请保持应用在前台）；\n② “打开 Web 界面”查看 dsh UI（http://127.0.0.1:3080）；\n③ “停止 dsh 服务”结束后台进程与保活服务。\n\n提示：\n· 全程免 Termux，内置 Node 为 aarch64 运行时；\n· 构建日志：/sdcard/Download/DshLauncher/install_log.txt。"
+            text = "操作步骤：\n① 点“⚡ 一键安装并启动 DSH”自动完成：内置 Node 解压 → 官方 npm 安装/更新 dsh → dsh plugin 装配内置插件 → 启动 Web（首次需联网下载，之后增量更新）；\n② “打开 Web 界面”查看 dsh UI（http://127.0.0.1:3080）；\n③ “停止 dsh 服务”结束后台进程与保活服务。\n\n提示：\n· 全程免 Termux，内置 Node 为 aarch64 运行时；\n· 安装日志：/sdcard/Download/DshLauncher/install_log.txt。"
             textSize = 12f
             setTextColor(0xFF9A9A9A.toInt())
             setPadding(0, dp(18), 0, 0)
@@ -357,7 +311,7 @@ class MainActivity : AppCompatActivity() {
             try {
                 val pb = ProcessBuilder(
                     "/system/bin/sh", "-c",
-                    "pkill -f deepseek-harness-master; pkill -f 'bin.js web'; pkill -f 'src/bin.ts'; true"
+                    "pkill -f 'dsh/lib/bin.js web'; pkill -f 'bin.js web'; pkill -f 'src/bin.ts'; true"
                 )
                 pb.redirectErrorStream(true)
                 pb.start().waitFor()
@@ -390,10 +344,6 @@ class MainActivity : AppCompatActivity() {
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
 
     companion object {
-        private const val SCRIPTS = "/storage/emulated/0/Download/DshLauncher/scripts"
         private const val WEB_URL = "http://127.0.0.1:3080"
-        private const val INSTALL_CMD = "bash $SCRIPTS/install-dsh.sh"
-        private const val START_CMD = "bash $SCRIPTS/dsh-manager.sh start"
-        private const val STOP_CMD = "bash $SCRIPTS/dsh-manager.sh stop"
     }
 }

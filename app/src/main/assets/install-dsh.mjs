@@ -1,20 +1,24 @@
 #!/usr/bin/env node
 /**
- * install-dsh.mjs — 设备端一键安装 DeepSeek Harness（dsh）。
+ * install-dsh.mjs — 设备端官方安装/更新 DeepSeek Harness (dsh)。
  *
- * 由 ConsoleActivity 复制到应用私有目录后用内置 Node 执行：
- *   1) 定位 pnpm（本地安装到 $HOME/.tools，registry 国内镜像优先）
- *   2) cd DSH_DIR && pnpm install（--ignore-scripts：原生 postinstall
- *      （lefthook / node-pty spawn-helper）在 Android 上无意义，由后续 stub 兜底）
- *   3) pnpm run build:lib（tsc 编译所有 workspace 包 → lib/ 产物）
- *   4) pnpm run build:web（vite 构建前端 dist）
- *   5) 写 .dsh-env（后续启动脚本读取）
+ * 与旧版不同：
+ *   1) dsh 本体不再克隆 deepseek-harness 源码/解压 prebuilt 源码树，
+ *      而是通过 npm 官方包 `@deepseek-ai/dsh` 安装/更新到 DSH_PREFIX。
+ *   2) 内置插件（third_party 下随 APK 分发的构建产物）通过官方
+ *      `dsh plugin --profile web add <path>` 安装。
+ *   3) 仅 yjh051108/dsh-routing-suite 需要在插件管理页走特殊适配
+ *      （见 routing-suite.mjs）；本脚本只处理随 APK 内置的插件源。
  *
- * 日志：终端 stdout + /sdcard/Download/DshLauncher/install_log.txt（追加）
- * 幂等：node_modules/.bin/dsh 或 lib 产物存在时跳过 install，仅确保 fixup。
- * 环境变量：DSH_DIR / HOME / NODE_BIN 由调用方（ConsoleActivity）设置。
+ * 用法：
+ *   node install-dsh.mjs                # 完整安装/更新 dsh + 装配内置插件
+ *   node install-dsh.mjs --plugins-only # 跳过 npm 更新，只重新装配内置插件
+ *
+ * 环境变量：
+ *   HOME / NODE_BIN / NPM_BIN / DSH_PREFIX / DSH_PROFILE / DSH_PREBUILT
+ *   DSH_PLUGINS_DIR / DSH_NODE_MEM / NPM_REGISTRY
  */
-import { existsSync, writeFileSync, mkdirSync, readFileSync, readdirSync, lstatSync, realpathSync, symlinkSync } from 'node:fs';
+import { existsSync, writeFileSync, mkdirSync, readFileSync, readdirSync, rmSync, cpSync, chmodSync, symlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { gunzipSync } from 'node:zlib';
@@ -22,11 +26,37 @@ import { gunzipSync } from 'node:zlib';
 const HOME = process.env.HOME || '/data/user/0/com.dsh.launcher/files';
 const NODE_BIN = process.env.NODE_BIN || join(HOME, 'node/bin/node');
 const NPM_BIN = process.env.NPM_BIN || join(HOME, 'node/bin/npm');
-const DSH_DIR = process.env.DSH_DIR || join(HOME, 'deepseek-harness-master');
-const PNPM_VERSION = '11.7.0'; // 与根 package.json 的 packageManager 一致
+const DSH_PREFIX = process.env.DSH_PREFIX || join(HOME, 'dsh-prefix');
+const DSH_PROFILE = process.env.DSH_PROFILE || 'web';
+const PREBUILT = process.env.DSH_PREBUILT || '';
+const PLUGINS_DIR = process.env.DSH_PLUGINS_DIR || join(HOME, 'plugins');
 const TOOLS = join(HOME, '.tools');
-const OUT = join(HOME, 'install_log.txt'); // 私有目录（无需存储权限）；共享目录尽力而为
+const REGISTRY = process.env.NPM_REGISTRY || 'https://registry.npmmirror.com';
+const PNPM_VERSION = '11.7.0';
+const OUT = join(HOME, 'install_log.txt');
 const OUT_SHARED = '/sdcard/Download/DshLauncher/install_log.txt';
+const BUILTIN_PLUGINS = [
+  'dsh-mobile-nav',
+  'dsh-super-injector',
+  'dsh-net-proxy',
+  'dsh-provider-headers',
+  'dsh-vision',
+];
+const BUILTIN_NAMES = new Set([
+  '@dsh-external/dsh-mobile-nav',
+  '@dsh-external/dsh-super-injector',
+  'dsh-net-proxy',
+  'dsh-provider-headers',
+  '@dsh-external/dsh-vision',
+]);
+const BUILTIN_IDS = new Set([
+  'dsh-mobile-nav',
+  'dsh-super-injector',
+  'net-proxy',
+  'provider-headers',
+  'dsh-vision',
+]);
+const PRESET_DIRS = ['router-preset'];
 
 function log(m) {
   const l = `${new Date().toISOString()} [install] ${m}`;
@@ -34,6 +64,7 @@ function log(m) {
   try { writeFileSync(OUT, l + '\n', { flag: 'a' }); } catch {}
   try { writeFileSync(OUT_SHARED, l + '\n', { flag: 'a' }); } catch {}
 }
+
 function run(cmd, args, opts = {}) {
   log('$ ' + cmd + ' ' + args.join(' '));
   const r = spawnSync(cmd, args, { stdio: 'inherit', ...opts });
@@ -42,179 +73,296 @@ function run(cmd, args, opts = {}) {
   log(`exit=${r.status}${sig}${err} (${cmd})`);
   return r.status === 0;
 }
-function envWithNode() {
+
+function envBase(extra = {}) {
+  const pnpmDirs = [
+    join(TOOLS, 'bin'),
+    join(TOOLS, 'lib/node_modules/.bin'),
+    join(TOOLS, 'lib/node_modules/pnpm/bin'),
+  ];
+  const pathParts = [join(HOME, 'node/bin')];
+  for (const d of pnpmDirs) if (existsSync(d)) pathParts.push(d);
+  pathParts.push('/system/bin', '/bin', '/usr/bin');
   return {
     ...process.env,
     LD_LIBRARY_PATH: join(HOME, 'node/lib'),
-    TMPDIR: join(HOME, 'tmp'), TMP: join(HOME, 'tmp'), TEMP: join(HOME, 'tmp'),
+    TMPDIR: join(HOME, 'tmp'),
+    TMP: join(HOME, 'tmp'),
+    TEMP: join(HOME, 'tmp'),
     OPENSSL_CONF: '/dev/null',
-    // 大仓库 tsc 全量编译在手机上默认 heap(~913MB) 会 OOM；设备 3.7GB RAM，
-    // 给 1536MB。可用环境变量 DSH_NODE_MEM 覆盖。
-    NODE_OPTIONS: '--max-old-space-size=' + (process.env.DSH_NODE_MEM || '1536'),
-    PATH: [join(HOME, 'node/bin'), '/system/bin', '/bin'].join(':'),
+    PATH: pathParts.join(':'),
+    ...extra,
   };
 }
 
-// 预构建产物（PC 端 build:lib + build:web 后打包的 ustar tar.gz，由 ConsoleActivity 从 assets 复制）
-const PREBUILT = process.env.DSH_PREBUILT;
+function dshCli() {
+  return join(DSH_PREFIX, 'node_modules/@deepseek-ai/dsh/lib/bin.js');
+}
 
-/**
- * 解析 ustar tar（无需外部工具）：文件(0/'0')、目录(5)、符号链接(2)。
- * 兼容 prefix 拆分长路径（>100 字符）。防御：跳过绝对路径与 .. 穿越。
- */
-function untar(buf, dest) {
+function dshInstalled() {
+  return existsSync(dshCli());
+}
+
+function ensurePnpm() {
+  mkdirSync(TOOLS, { recursive: true });
+  const pnpmRoot = join(TOOLS, 'lib/node_modules/pnpm');
+  const pnpmMjs = join(pnpmRoot, 'bin/pnpm.mjs');
+  let pnpmCjs = join(pnpmRoot, 'bin/pnpm.cjs');
+
+  // 旧版本把 shell wrapper 写到 TOOLS/bin/pnpm 时，会跟随 npm 生成的
+  // 符号链接把 pnpm.mjs 覆盖成 shell 脚本。检测到这种破损就重装 pnpm。
+  if (existsSync(pnpmMjs)) {
+    const head = readFileSync(pnpmMjs, 'utf8').slice(0, 200);
+    if (head.includes('exec "') || head.includes('#!/system/bin/sh') || head.includes('#!/bin/sh')) {
+      log('pnpm.mjs corrupted, reinstalling pnpm@' + PNPM_VERSION + ' ...');
+      rmSync(pnpmRoot, { recursive: true, force: true });
+      for (const name of ['pnpm', 'pn', 'pnpx', 'pnx']) {
+        rmSync(join(TOOLS, 'bin', name), { recursive: true, force: true });
+      }
+      pnpmCjs = join(pnpmRoot, 'bin/pnpm.cjs');
+    }
+  }
+  if (!existsSync(pnpmCjs)) pnpmCjs = join(TOOLS, 'bin/pnpm.cjs');
+  if (!existsSync(pnpmCjs)) {
+    log('installing pnpm@' + PNPM_VERSION + ' ...');
+    const r = run(NPM_BIN, [
+      'install', '-g', `pnpm@${PNPM_VERSION}`, '--prefix', TOOLS,
+      '--registry', REGISTRY, '--no-audit', '--no-fund',
+    ], { env: envBase() });
+    if (!r) {
+      log('FATAL: pnpm install failed');
+      process.exit(1);
+    }
+    pnpmCjs = join(pnpmRoot, 'bin/pnpm.cjs');
+    if (!existsSync(pnpmCjs)) pnpmCjs = join(TOOLS, 'bin/pnpm.cjs');
+  }
+  // dsh plugin 通过 PATH 里的 `pnpm` 命令转发；Android 没有 /usr/bin/env，
+  // 所以写一个 system sh wrapper 保证 pnpm 可执行。
+  // 注意：TOOLS/bin/pnpm 可能是 npm 生成的符号链接，必须先删掉再写文件，
+  // 否则 writeFileSync 会跟着符号链接覆盖真正的 pnpm.mjs。
+  const wrapper = join(TOOLS, 'bin/pnpm');
+  rmSync(wrapper, { recursive: true, force: true });
+  writeFileSync(wrapper, `#!/system/bin/sh\nexec "${NODE_BIN}" "${pnpmCjs}" "$@"\n`);
+  try { chmodSync(wrapper, 0o755); } catch {}
+  log('pnpm wrapper: ' + wrapper);
+  return pnpmCjs;
+}
+
+function ensureDsh() {
+  mkdirSync(DSH_PREFIX, { recursive: true });
+  log('install/update @deepseek-ai/dsh via npm ...');
+  const ok = run(NPM_BIN, [
+    'install', '--prefix', DSH_PREFIX, '@deepseek-ai/dsh@latest',
+    '--registry', REGISTRY, '--no-audit', '--no-fund', '--ignore-scripts',
+  ], { env: envBase() });
+  if (!ok || !dshInstalled()) {
+    log('FATAL: official dsh install/update failed');
+    process.exit(1);
+  }
+  try {
+    const pkg = JSON.parse(readFileSync(join(DSH_PREFIX, 'node_modules/@deepseek-ai/dsh/package.json'), 'utf8'));
+    log('dsh version: ' + (pkg.version || 'unknown'));
+  } catch {}
+}
+
+/** 解析 ustar tar（无需外部工具）：文件/目录/符号链接；只提取指定前缀。 */
+function untarWithPrefix(buf, dest, prefix) {
   let off = 0;
   let files = 0;
+  const strip = prefix.replace(/\/+$/, '') + '/';
   while (off + 512 <= buf.length) {
     const h = buf.subarray(off, off + 512);
     if (h.every((b) => b === 0)) break;
     const name0 = h.subarray(0, 100).toString('utf8').replace(/\0[\s\S]*$/, '');
     if (!name0) break;
-    const prefix = h.subarray(345, 500).toString('utf8').replace(/\0[\s\S]*$/, '');
-    const name = (prefix ? prefix + '/' : '') + name0;
+    const prefix0 = h.subarray(345, 500).toString('utf8').replace(/\0[\s\S]*$/, '');
+    const rawName = (prefix0 ? prefix0 + '/' : '') + name0;
+    const name = rawName.replace(/^\.\//, '');
     if (name.includes('..') || name.startsWith('/') || /^[A-Za-z]:/.test(name)) {
-      off += 512; continue; // 跳过危险条目
+      off += 512 + Math.ceil(parseInt(h.subarray(124, 136).toString('utf8').replace(/\0[\s\S]*$/, '').trim(), 8) / 512) * 512;
+      continue;
     }
-    const sizeStr = h.subarray(124, 136).toString('utf8').replace(/\0[\s\S]*$/, '').trim();
-    const size = parseInt(sizeStr, 8) || 0;
+    const size = parseInt(h.subarray(124, 136).toString('utf8').replace(/\0[\s\S]*$/, '').trim(), 8) || 0;
     const type = String.fromCharCode(h[156]);
     const data = buf.subarray(off + 512, off + 512 + size);
-    const p = join(dest, name);
-    if (type === '5') {
-      mkdirSync(p, { recursive: true });
-    } else if (type === '2') {
-      const target = h.subarray(157, 257).toString('utf8').replace(/\0[\s\S]*$/, '');
-      mkdirSync(dirname(p), { recursive: true });
-      try { symlinkSync(target, p); } catch { }
-    } else if (type === '0' || type === '\0') {
-      mkdirSync(dirname(p), { recursive: true });
-      writeFileSync(p, data);
-      files++;
+    // 只处理匹配前缀的条目；third_party 顶层目录本身也跳过
+    const matched = !prefix
+      ? (name !== '.' && name !== '')
+      : (name === strip.slice(0, -1) || name.startsWith(strip));
+    if (matched) {
+      const rel = !prefix
+        ? name
+        : (name.startsWith(strip) ? name.slice(strip.length) : '');
+      if (rel) {
+        const p = join(dest, rel);
+        if (type === '5') {
+          mkdirSync(p, { recursive: true });
+        } else if (type === '2') {
+          const target = h.subarray(157, 257).toString('utf8').replace(/\0[\s\S]*$/, '');
+          mkdirSync(dirname(p), { recursive: true });
+          try { symlinkSync(target, p); } catch {}
+        } else if (type === '0' || type === '\0') {
+          mkdirSync(dirname(p), { recursive: true });
+          writeFileSync(p, data);
+          files++;
+        }
+      }
     }
     off += 512 + Math.ceil(size / 512) * 512;
   }
-  log(`untar: ${files} files -> ${dest}`);
+  log(`untar: ${files} files (prefix=${strip}) -> ${dest}`);
 }
 
-/** 解压预构建产物（lib + web dist + vendor libs）。每次运行都解压（幂等覆盖），
- *  不能按 cli bin 存在与否早退——vendor/ 等部分可能缺失。 */
-function ensurePrebuilt() {
-  const cliBin = join(DSH_DIR, 'apps/cli/lib/bin.js');
-  const webIdx = join(DSH_DIR, 'apps/web/dist/index.html');
-  if (!PREBUILT || !existsSync(PREBUILT)) return existsSync(cliBin) && existsSync(webIdx);
+function extractPlugins() {
+  if (!PREBUILT || !existsSync(PREBUILT)) {
+    log('DSH_PREBUILT not set or missing, skip bundled plugin extraction');
+    return;
+  }
   try {
-    log('extracting prebuilt: ' + PREBUILT);
-    untar(gunzipSync(readFileSync(PREBUILT)), DSH_DIR);
+    mkdirSync(PLUGINS_DIR, { recursive: true });
+    const raw = readFileSync(PREBUILT);
+    const buf = (raw[0] === 0x1f && raw[1] === 0x8b) ? gunzipSync(raw) : raw;
+    untarWithPrefix(buf, PLUGINS_DIR, 'third_party');
+    // 兼容直接打包 plugins.tgz（顶层就是插件目录而非 third_party/）：
+    // 如果上面没解出任何东西且包内没有 third_party 前缀，再整体解到 plugins。
+    const anyBuiltin = BUILTIN_PLUGINS.some((d) => existsSync(join(PLUGINS_DIR, d, 'package.json')));
+    if (!anyBuiltin) {
+      log('no third_party prefix found, try extracting archive to plugins dir directly');
+      untarWithPrefix(buf, PLUGINS_DIR, '');
+    }
   } catch (t) {
-    log('prebuilt extract failed: ' + t.message);
+    log('WARN extract plugins failed: ' + t.message);
   }
-  return existsSync(cliBin) && existsSync(webIdx) &&
-    existsSync(join(DSH_DIR, 'vendor/cordis/lib/index.js'));
 }
 
-/**
- * Android 没有 /usr/bin/env，node_modules/.bin 下所有 `#!/usr/bin/env node`/
- * `#!/usr/bin/env sh` 脚本都无法被内核 exec。批量把 shebang 改写为绝对解释器
- * 路径（node → 内置 node；sh/bash → /system/bin/sh）。pnpm install 后执行一次。
- */
-function fixShebangs(dir, nodeBin) {
-  const binDir = join(dir, 'node_modules/.bin');
-  if (!existsSync(binDir)) return 0;
-  let fixed = 0;
-  for (const f of readdirSync(binDir)) {
-    let target;
-    try {
-      target = realpathSync(join(binDir, f));
-      if (lstatSync(target).isDirectory()) continue;
-    } catch { continue; }
-    try {
-      const bytes = readFileSync(target);
-      const nl = bytes.indexOf(0x0a);
-      if (nl < 0) continue;
-      const first = bytes.subarray(0, nl).toString('utf8');
-      if (!first.startsWith('#!')) continue;
-      if (first.startsWith('#!/usr/bin/env')) {
-        const interp = first.slice('#!/usr/bin/env'.length).trim().split(/\s+/)[0];
-        const repl = interp === 'node' ? nodeBin
-          : (interp === 'sh' || interp === 'bash') ? '/system/bin/sh' : null;
-        if (repl) {
-          writeFileSync(target, Buffer.concat([Buffer.from('#!' + repl + '\n'), bytes.subarray(nl + 1)]));
-          fixed++;
-        }
-      } else if (first.startsWith('#!/usr/bin/node')) {
-        writeFileSync(target, Buffer.concat([Buffer.from('#!' + nodeBin + '\n'), bytes.subarray(nl + 1)]));
-        fixed++;
+function dshPlugin(args) {
+  if (!dshInstalled()) {
+    log('dsh not installed at ' + dshCli());
+    return false;
+  }
+  return run(NODE_BIN, [dshCli(), 'plugin', '--profile', DSH_PROFILE, ...args], { env: envBase() });
+}
+
+function addLocalPlugin(dir) {
+  const p = join(PLUGINS_DIR, dir);
+  if (!existsSync(join(p, 'package.json'))) {
+    log(`skip builtin plugin ${dir}: not bundled`);
+    return false;
+  }
+  log(`dsh plugin add ${dir}`);
+  return dshPlugin(['add', p]);
+}
+
+/** 路由预设不是 pnpm bundle，需整体拷贝/展平到 .agent-presets（特殊适配）。 */
+function copyPresets() {
+  const srcRoot = join(PLUGINS_DIR, 'router-preset');
+  if (!existsSync(srcRoot)) {
+    log('router-preset not bundled, skip preset copy');
+    return;
+  }
+  const destRoot = join(HOME, '.dsh/.agent-presets');
+  mkdirSync(destRoot, { recursive: true });
+  try {
+    if (existsSync(join(srcRoot, 'agent.cordis.yml'))) {
+      const dest = join(destRoot, 'router-preset');
+      rmSync(dest, { recursive: true, force: true });
+      cpSync(srcRoot, dest, { recursive: true, force: true });
+      log('preset installed: router-preset');
+    } else {
+      let copied = 0;
+      for (const child of readdirSync(srcRoot, { withFileTypes: true })) {
+        if (!child.isDirectory()) continue;
+        const childSrc = join(srcRoot, child.name);
+        if (!existsSync(join(childSrc, 'agent.cordis.yml'))) continue;
+        const dest = join(destRoot, child.name);
+        rmSync(dest, { recursive: true, force: true });
+        cpSync(childSrc, dest, { recursive: true, force: true });
+        copied++;
       }
-    } catch { /* 跳过不可写/非脚本 */ }
+      const legacy = join(destRoot, 'router-preset');
+      if (existsSync(legacy) && !existsSync(join(legacy, 'agent.cordis.yml'))) {
+        rmSync(legacy, { recursive: true, force: true });
+      }
+      log('preset install: router-preset (' + copied + ' subpresets)');
+    }
+  } catch (e) {
+    log('WARN preset copy failed: ' + e.message);
   }
-  log(`shebang fix: ${fixed} scripts under ${binDir}`);
-  return fixed;
 }
 
-log('=== dsh install start ===');
-log('DSH_DIR=' + DSH_DIR + ' NODE=' + NODE_BIN + ' pnpm=' + PNPM_VERSION);
+function installBuiltins() {
+  for (const d of BUILTIN_PLUGINS) addLocalPlugin(d);
+  copyPresets();
+  cleanBuiltinPatch();
+}
 
-// TMPDIR 就绪（node 构建/安装临时文件）
+/** 清理旧版遗留的 profile patch 内置插件 insert，避免与 dsh.profile.bundles 重复装配。 */
+function cleanBuiltinPatch() {
+  const patch = join(HOME, '.dsh/profiles', DSH_PROFILE, 'cordis.patch.yml');
+  if (!existsSync(patch)) return;
+  try {
+    const lines = readFileSync(patch, 'utf8').split(/\r?\n/);
+    const out = [];
+    let block = null;
+    let keep = true;
+    const flush = () => {
+      if (block && keep) out.push(...block);
+      block = null;
+      keep = true;
+    };
+    for (const line of lines) {
+      if (/^\s*- insert:\s*$/.test(line)) {
+        flush();
+        block = [line];
+        keep = true;
+      } else if (block) {
+        const idMatch = line.match(/^\s*- id:\s*(\S+)\s*$/);
+        const nameMatch = line.match(/^\s*name:\s*['"]?([^'"]+)['"]?\s*$/);
+        if (idMatch && BUILTIN_IDS.has(idMatch[1])) keep = false;
+        if (nameMatch && BUILTIN_NAMES.has(nameMatch[1].trim())) keep = false;
+        block.push(line);
+      } else {
+        out.push(line);
+      }
+    }
+    flush();
+    const cleaned = out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+    const body = cleaned.split('\n').filter((l) => !l.trim().startsWith('#') && l.trim() !== '').join('');
+    if (!body.includes('[]') && !body.includes('- insert:')) {
+      writeFileSync(patch, (cleaned ? cleaned + '\n' : '') + '[]\n');
+    } else {
+      writeFileSync(patch, cleaned + '\n');
+    }
+    log('builtin patch entries cleaned (profile patch dedupe)');
+  } catch (e) {
+    log('WARN cleanBuiltinPatch: ' + e.message);
+  }
+}
+
+// ── main ─────────────────────────────────────────────
+log('=== official dsh install start ===');
+log('HOME=' + HOME + ' DSH_PREFIX=' + DSH_PREFIX + ' PROFILE=' + DSH_PROFILE);
 try { mkdirSync(join(HOME, 'tmp'), { recursive: true }); } catch {}
 
-if (!existsSync(DSH_DIR)) { log('FATAL: ' + DSH_DIR + ' missing'); process.exit(1); }
-const pkg = JSON.parse(readFileSync(join(DSH_DIR, 'package.json'), 'utf8'));
-log('harness version: ' + (pkg.version || 'unknown') + ' packageManager: ' + (pkg.packageManager || '-'));
+const pluginsOnly = process.argv.includes('--plugins-only');
 
-// registry：国内直连 npmmirror 最快；npmjs 作为 fallback（设备网络不通 npmmirror 时用）
-const REGISTRY = process.env.NPM_REGISTRY || 'https://registry.npmmirror.com';
-log('registry: ' + REGISTRY);
-
-// 1) 本地 pnpm（复用 .tools，避免每次重装）；bin 脚本 shebang 依赖 /usr/bin/env，
-//    Android 没有该路径，统一用内置 node 显式执行
-let pnpmBin = join(TOOLS, 'bin/pnpm.cjs');
-if (!existsSync(pnpmBin)) pnpmBin = join(TOOLS, 'lib/node_modules/pnpm/bin/pnpm.cjs');
-let needPnpm = !existsSync(pnpmBin);
-if (needPnpm) {
-  mkdirSync(TOOLS, { recursive: true });
-  log('installing pnpm@' + PNPM_VERSION + ' ...');
-  const r = spawnSync(NPM_BIN, ['install', '-g', `pnpm@${PNPM_VERSION}`, '--prefix', TOOLS, '--registry', REGISTRY, '--no-audit', '--no-fund'], { stdio: 'inherit', env: envWithNode() });
-  if (r.status !== 0) { log('FATAL: pnpm install failed'); process.exit(1); }
-}
-log('pnpm: ' + pnpmBin);
-
-// 2) pnpm install
-if (!existsSync(join(DSH_DIR, 'node_modules'))) {
-  // 注：pnpm 11 已不接受 --no-audit/--no-fund（报 Unknown options），因此不传
-  const ok = run(NODE_BIN, [pnpmBin, 'install', '--no-frozen-lockfile', '--ignore-scripts', '--registry', REGISTRY, '--reporter', 'append-only', '--config.confirmModulesPurge=false'], { cwd: DSH_DIR, env: envWithNode() });
-  if (!ok) { log('FATAL: pnpm install failed'); process.exit(1); }
-  fixShebangs(DSH_DIR, NODE_BIN);
-} else {
-  log('node_modules exists, skip install');
+ensurePnpm();
+if (!pluginsOnly) {
+  ensureDsh();
+} else if (!dshInstalled()) {
+  log('FATAL: --plugins-only but dsh not installed yet');
+  process.exit(1);
 }
 
-// 3) 预构建产物（lib + web dist + vendor），每次运行都解压（幂等覆盖）。
-//    设备端全量 tsc 会 OOM（3.7GB 内存跑 tsc 需 >1.5GB heap），所以正常路径不构建。
-const prebuiltReady = ensurePrebuilt();
-if (!existsSync(join(DSH_DIR, 'apps/cli/lib/bin.js'))) {
-  if (!prebuiltReady) {
-    const ok = run(NODE_BIN, [pnpmBin, 'run', 'build:lib'], { cwd: DSH_DIR, env: envWithNode() });
-    if (!ok) { log('FATAL: build:lib failed'); process.exit(1); }
-  }
-} else {
-  log('apps/cli/lib/bin.js exists, skip build:lib');
-}
+extractPlugins();
+installBuiltins();
 
-// 4) 前端产物（apps/web → dist，供 dsh web 服务）
-if (!existsSync(join(DSH_DIR, 'apps/web/dist/index.html'))) {
-  if (!prebuiltReady) {
-    const ok = run(NODE_BIN, [pnpmBin, '--filter', '@deepseek-ai/dsh-web-frontend', 'run', 'build'], { cwd: DSH_DIR, env: envWithNode() });
-    if (!ok) { log('FATAL: build:web failed'); process.exit(1); }
-  }
-} else {
-  log('apps/web/dist exists, skip build:web');
-}
-
-// 5) 环境文件
 try {
-  writeFileSync(join(DSH_DIR, '.dsh-env'),
-    `DSH_HOME=${DSH_DIR}\nWEB_PORT=3080\nPNPM_VERSION=${PNPM_VERSION}\nNODE_BIN=${NODE_BIN}\nINSTALL_DATE=${new Date().toISOString()}\n`);
-  log('OK .dsh-env written');
-} catch (e) { log('WARN .dsh-env: ' + e.message); }
+  writeFileSync(join(DSH_PREFIX, 'dsh-installed.json'), JSON.stringify({
+    installedAt: new Date().toISOString(),
+    profile: DSH_PROFILE,
+    plugins: BUILTIN_PLUGINS,
+  }, null, 2));
+} catch (e) { log('WARN state file: ' + e.message); }
 
-log('=== dsh install done ===');
+log('=== official dsh install done ===');

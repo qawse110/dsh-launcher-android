@@ -12,18 +12,18 @@ import android.widget.ScrollView
 import android.widget.TextView
 import org.json.JSONObject
 import java.io.File
-import java.net.HttpURLConnection
-import java.net.URL
 
 /**
- * 插件管理系统：内置插件一览（third_party，预构建随 prebuilt 分发）+ 在线安装/卸载。
- * 装配动作全部由 stub-dsh.mjs 的 CLI 模式完成（--wire-only/--add/--remove），
- * 本页只负责：下载源码包、调用 stub、展示状态与日志。
+ * 插件管理系统：内置插件一览（APK 内 plugins 源）+ 在线安装/卸载。
+ *
+ * 装配动作全部走官方 `dsh plugin --profile web add/remove`；
+ * 仅 `yjh051108/dsh-routing-suite` 走特殊适配（routing-suite.mjs：
+ * 下载聚合仓库 + 三个子仓库 → 装配 injector/mode-boost → 拷贝 agent-preset）。
  */
 class PluginManagerActivity : Activity() {
 
     companion object {
-        // 内置插件（boot 时 stub 自动装配，不可卸载）
+        // 内置插件（随 APK 分发；首次 flow 已通过 dsh plugin add 装配）
         val BUNDLED = setOf(
             "dsh-mobile-nav", "dsh-super-injector",
             "dsh-net-proxy", "dsh-provider-headers", "dsh-vision",
@@ -38,6 +38,12 @@ class PluginManagerActivity : Activity() {
         const val PRESET_DIR = "router-preset"
         const val PRESET_DESC = "思维模式路由预设（router-pro / router-spec / router-standard，agent-presets）"
         const val REPO_DIR = "plugin-repo"
+        const val ROUTING_REPO = "yjh051108/dsh-routing-suite"
+        private val BASE_BUNDLES = setOf(
+            "@deepseek-ai/dsh-base",
+            "@deepseek-ai/dsh-web-app",
+            "@deepseek-ai/dsh-headless",
+        )
     }
 
     private lateinit var listBox: LinearLayout
@@ -46,9 +52,12 @@ class PluginManagerActivity : Activity() {
     private val logSb = StringBuilder()
     private val nodeDir: File get() = NodeRuntime.ensureExtracted(this)
 
-    private fun dshHome() = File(filesDir, "deepseek-harness-master")
-    private fun thirdParty() = File(dshHome(), "third_party")
-    private fun profilePatch() = File(filesDir, ".dsh/profiles/web/cordis.patch.yml")
+    private fun dshPrefix() = File(filesDir, "dsh-prefix")
+    private fun dshCliFile() = File(dshPrefix(), "node_modules/@deepseek-ai/dsh/lib/bin.js")
+    private fun pluginsDir() = File(filesDir, "plugins")
+    private fun profileWebDir() = File(filesDir, ".dsh/profiles/web")
+    private fun profilePatch() = File(profileWebDir(), "cordis.patch.yml")
+    private fun profilePkg() = File(profileWebDir(), "package.json")
     private fun presetsRoot() = File(filesDir, ".dsh/.agent-presets")
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -65,7 +74,7 @@ class PluginManagerActivity : Activity() {
             setTextColor(0xFFFFFFFF.toInt())
         }
         val sub = TextView(this).apply {
-            text = "内置插件随 app 自动装配；在线安装从 GitHub 拉取源码包（需含 cordis.patch.yml + 构建产物 lib/）"
+            text = "内置插件随 app 自动装配；在线安装通过官方 dsh plugin --profile web add 完成"
             textSize = 11f
             setTextColor(0xFF9AA3B2.toInt())
         }
@@ -88,7 +97,7 @@ class PluginManagerActivity : Activity() {
         }
 
         val installBtn = Button(this).apply {
-            text = "下载并安装"
+            text = "安装 / 更新"
             textSize = 14f
             isAllCaps = false
             setOnClickListener { installFromRepo() }
@@ -97,7 +106,7 @@ class PluginManagerActivity : Activity() {
             text = "重新装配"
             textSize = 14f
             isAllCaps = false
-            setOnClickListener { runStub(listOf("--wire-only"), "重新装配") }
+            setOnClickListener { rewireBuiltins() }
         }
         val restartBtn = Button(this).apply {
             text = "重启 dsh"
@@ -146,7 +155,7 @@ class PluginManagerActivity : Activity() {
         root.addView(logScroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(150)))
         setContentView(root)
 
-        appendLog("插件管理就绪（tar 内置 ${BUNDLED.size} 个 + $PRESET_DIR 预设）")
+        appendLog("插件管理就绪（内置 ${BUNDLED.size} 个 + $PRESET_DIR 预设）")
     }
 
     override fun onResume() {
@@ -164,52 +173,87 @@ class PluginManagerActivity : Activity() {
 
     // ── 列表 ──────────────────────────────────────────────
     private fun refreshList() {
-        val tp = thirdParty()
+        val tp = pluginsDir()
         listBox.removeAllViews()
         if (!tp.exists()) {
-            listBox.addView(makeCard("（dsh 源树未就绪：先回控制台跑一次「执行 dsh」）", "提示", "", "—", emptyList()))
+            listBox.addView(makeCard("（内置插件源未就绪：先回控制台跑一次「执行 dsh」）", "提示", "", "—", emptyList()))
             return
         }
-        val patchText = if (profilePatch().exists()) profilePatch().readText() else ""
-        // profile patch 里已有的 entry id 集合（- id: <id>）
-        val patchIds = Regex("(?:^|\\n)\\s*-\\s*id:\\s*(\\S+)").findAll(patchText)
-            .map { it.groupValues[1] }.toSet()
         val tpDirs = tp.listFiles { f -> f.isDirectory }?.map { it.name }?.toSet() ?: emptySet()
 
         for (d in BUNDLED.sorted()) {
-            val builtin = tpDirs.contains(d)
+            val builtin = File(tp, d).isDirectory
             val wired = isWired(d)
             val status = if (!builtin) "未内置（构建产物缺失）"
             else if (wired) "内置 · 已装配"
-            else "内置 · 待装配（需重启 flow）"
+            else "内置 · 待装配（需重新装配）"
             val ver = readVersion(d)
             listBox.addView(makeCard(d, BUNDLED_DESC[d] ?: "", ver, status, emptyList()))
         }
+
         // 路由预设（容器展平后以 router-pro/router-spec/router-standard 三个一级预设生效）
         val presetOk = listOf("router-pro", "router-spec", "router-standard").any { File(presetsRoot(), it).exists() }
         listBox.addView(makeCard(
             PRESET_DIR, PRESET_DESC, "preset",
-            if (presetOk) "已安装（agent-presets）" else "待装配（需重启 flow）", emptyList()))
+            if (presetOk) "已安装（agent-presets）" else "待装配（需重新装配）", emptyList()))
 
-        // 在线安装的插件（third_party 下非内置目录）
-        val online = tpDirs - BUNDLED - PRESET_DIR
-        for (d in online.sorted()) {
-            val info = readPlugin(d) ?: continue
-            val status = if (isWired(d) || isWired(info.id)) "已装配" else "已下载 · 未装配"
-            listBox.addView(makeCard(d, info.desc, info.version, status, listOf("卸载" to { uninstall(d) })))
+        // 官方 dsh plugin add 装配的额外插件（从 profile package.json 的 bundles 读取）
+        for (name in readBundles()) {
+            if (name in BASE_BUNDLES) continue
+            if (BUNDLED.any { d -> name == d || name == "@dsh-external/$d" }) continue
+            val info = readInstalledPlugin(name) ?: continue
+            listBox.addView(makeCard(name, info.desc, info.version, "已装配", listOf("卸载" to { uninstall(name) })))
         }
     }
 
     data class PluginInfo(val id: String, val name: String, val desc: String, val version: String)
 
-    /** 装配判定：直接查 stub 建立的 node_modules 链接（真实装配事实，不依赖 patch 解析）。 */
+    private fun readBundles(): List<String> {
+        return try {
+            val j = JSONObject(profilePkg().readText())
+            val arr = j.optJSONObject("dsh")?.optJSONObject("profile")?.optJSONArray("bundles") ?: return emptyList()
+            (0 until arr.length()).mapNotNull { arr.optString(it).takeIf(String::isNotBlank) }
+        } catch (t: Throwable) {
+            emptyList()
+        }
+    }
+
+    /** 装配判定：官方 dsh plugin add 后会在 profile node_modules 出现对应包。 */
     private fun isWired(d: String): Boolean {
-        val nm = File(filesDir, "deepseek-harness-master/node_modules")
-        return File(nm, d).exists() || File(nm, "@dsh-external/$d").exists()
+        val nm = profileNm()
+        if (File(nm, d).exists()) return true
+        if (File(nm, "@dsh-external/$d").exists()) return true
+        return readBundles().any { it == d || it == "@dsh-external/$d" }
+    }
+
+    private fun profileNm() = File(profileWebDir(), "node_modules")
+
+    private fun readInstalledPlugin(name: String): PluginInfo? {
+        val dir = resolvePackageDir(name) ?: return null
+        val p = File(dir, "package.json")
+        if (!p.exists()) return null
+        return try {
+            val j = JSONObject(p.readText())
+            PluginInfo(
+                name,
+                j.optString("name", name),
+                j.optString("description", "").take(80),
+                j.optString("version", "?")
+            )
+        } catch (t: Throwable) { PluginInfo(name, name, "", "?") }
+    }
+
+    private fun resolvePackageDir(name: String): File? {
+        if (File(profileNm(), name).isDirectory) return File(profileNm(), name)
+        if (name.contains('/')) {
+            val scoped = File(profileNm(), name.substringBefore('/') + "/" + name.substringAfter('/'))
+            if (scoped.isDirectory) return scoped
+        }
+        return null
     }
 
     private fun readPlugin(dir: String): PluginInfo? {
-        val dirF = File(thirdParty(), dir)
+        val dirF = File(pluginsDir(), dir)
         val p = File(dirF, "package.json")
         if (!p.exists()) return null
         return try {
@@ -217,10 +261,8 @@ class PluginManagerActivity : Activity() {
             val name = j.optString("name", dir)
             val ver = j.optString("version", "?")
             val desc = j.optString("description", "").take(80)
-            // entry id 来自插件自带装配行（- insert: 下的 id）
             val patch = File(dirF, "cordis.patch.yml")
             val id = if (patch.exists()) {
-                // 与 stub-dsh.mjs pluginInfo 同款正则（实测通过）
                 Regex("- insert:\\s*\\n\\s*- id:\\s*(\\S+)")
                     .find(patch.readText())?.groupValues?.get(1) ?: dir
             } else dir
@@ -229,7 +271,7 @@ class PluginManagerActivity : Activity() {
     }
 
     private fun readVersion(dir: String): String {
-        val p = File(File(thirdParty(), dir), "package.json")
+        val p = File(File(pluginsDir(), dir), "package.json")
         if (!p.exists()) return "?"
         return try { JSONObject(p.readText()).optString("version", "?") } catch (t: Throwable) { "?" }
     }
@@ -287,28 +329,18 @@ class PluginManagerActivity : Activity() {
             appendLog("仓库格式无效：$raw（应形如 owner/repo 或 https://github.com/owner/repo）")
             return
         }
-        appendLog(">> 下载 $repo …")
-        Thread {
-            try {
-                val branch = fetchDefaultBranch(repo)
-                appendLog("   默认分支: $branch")
-                val dirName = repo.substringAfter('/').replace(Regex("[^A-Za-z0-9._-]"), "_")
-                val repoDir = File(filesDir, REPO_DIR).apply { mkdirs() }
-                val tgz = File(repoDir, "$dirName.tar.gz")
-                val url = "https://codeload.github.com/$repo/tar.gz/refs/heads/$branch"
-                appendLog("   GET $url")
-                download(url, tgz)
-                appendLog("   已下载 ${tgz.length() / 1024}KB → 调用 stub 解压装配…")
-                runStub(listOf("--add", tgz.absolutePath, dirName), "安装 $dirName")
-                refreshList()
-            } catch (t: Throwable) {
-                appendLog("下载/安装失败: ${t.message}")
-            }
-        }.start()
+        if (repo == ROUTING_REPO) {
+            appendLog(">> 特殊适配安装 $repo …")
+            runRoutingSuite()
+        } else {
+            appendLog(">> 官方 dsh plugin add github:$repo …")
+            runDshPlugin(listOf("add", "github:$repo"), "安装 $repo")
+        }
     }
 
     private fun parseRepo(raw: String): String? {
         var r = raw.trim().removeSuffix("/").removeSuffix(".git")
+        if (r.startsWith("github:")) r = r.removePrefix("github:")
         if (r.startsWith("https://github.com/")) r = r.removePrefix("https://github.com/")
         else if (r.startsWith("http://github.com/")) r = r.removePrefix("http://github.com/")
         if (r.startsWith("github.com/")) r = r.removePrefix("github.com/")
@@ -317,68 +349,20 @@ class PluginManagerActivity : Activity() {
         return "${seg[0]}/${seg[1]}"
     }
 
-    private fun fetchDefaultBranch(repo: String): String {
-        return try {
-            val api = URL("https://api.github.com/repos/$repo")
-            val c = api.openConnection() as HttpURLConnection
-            c.setRequestProperty("User-Agent", "DshLauncher/2.0")
-            c.connectTimeout = 15000
-            c.readTimeout = 20000
-            if (c.responseCode == 200) {
-                val body = c.inputStream.bufferedReader().readText()
-                JSONObject(body).optString("default_branch", "main")
-            } else "main"
-        } catch (t: Throwable) { "main" }
-    }
-
-    private fun download(url: String, out: File) {
-        val c = URL(url).openConnection() as HttpURLConnection
-        c.setRequestProperty("User-Agent", "DshLauncher/2.0")
-        c.instanceFollowRedirects = true
-        c.connectTimeout = 20000
-        c.readTimeout = 60000
-        if (c.responseCode !in 200..299) throw RuntimeException("HTTP ${c.responseCode}")
-        c.inputStream.use { ins -> out.outputStream().use { ous -> ins.copyTo(ous) } }
-    }
-
-    // ── stub CLI ──────────────────────────────────────────
-    private fun runStub(args: List<String>, label: String) {
-        appendLog(">> $label …")
+    // ── dsh plugin CLI ─────────────────────────────────────
+    private fun runDshPlugin(args: List<String>, label: String) {
         Thread {
             try {
-                val stub = File(filesDir, "stub-dsh.mjs")
-                try {
-                    assets.open("stub-dsh.mjs").use { ins -> stub.outputStream().use { ous -> ins.copyTo(ous) } }
-                } catch (t: Throwable) { appendLog("   WARN 无法刷新 stub: ${t.message}") }
-                // 保持 fs link 兼容层与 stub 同步（SELinux 禁硬链接，dsh 用 link 发布会话日志）
-                for (name in listOf("fs-register.mjs", "fs-loader.mjs", "fs-promises-compat.mjs")) {
-                    try {
-                        assets.open(name).use { ins ->
-                            File(filesDir, name).outputStream().use { ous -> ins.copyTo(ous) }
-                        }
-                    } catch (t: Throwable) { appendLog("   WARN 无法刷新 $name: ${t.message}") }
+                val cli = dshCliFile()
+                if (!cli.exists()) {
+                    appendLog("   ✗ dsh 未安装（请先回控制台执行「执行 dsh」）")
+                    return@Thread
                 }
                 val node = File(File(nodeDir, "bin"), "node")
-                val cmd = "${node.absolutePath} ${stub.absolutePath} ${args.joinToString(" ")}"
-                appendLog("   $ ${cmd.replace(stub.absolutePath, "stub-dsh.mjs")}")
-                val pb = ProcessBuilder("/system/bin/sh", "-c", cmd)
-                pb.redirectErrorStream(true)
-                val env = pb.environment()
-                env["PATH"] = "${File(nodeDir, "bin")}:/system/bin:/bin"
-                env["LD_LIBRARY_PATH"] = File(nodeDir, "lib").absolutePath
-                env["HOME"] = filesDir.absolutePath
-                env["TMPDIR"] = File(filesDir, "tmp").absolutePath
-                env["OPENSSL_CONF"] = "/dev/null"
-                val p = pb.start()
-                val sb = StringBuilder()
-                p.inputStream.bufferedReader().useLines { lines ->
-                    lines.forEach { line ->
-                        sb.append(line).append('\n')
-                        if (sb.length > 4000) { appendLog(sb.toString()); sb.setLength(0) }
-                    }
-                }
-                val code = p.waitFor()
-                if (sb.isNotEmpty()) appendLog(sb.toString())
+                val cmd = "${node.absolutePath} ${cli.absolutePath} plugin --profile web ${args.joinToString(" ")}"
+                appendLog(">> $label …")
+                appendLog("   $ ${cmd.replace(cli.absolutePath, "dsh")}")
+                val code = runProcess(cmd, baseEnv(), label)
                 appendLog(if (code == 0) "   ✓ $label 完成（exit=0）" else "   ✗ $label 失败（exit=$code）")
                 refreshList()
             } catch (t: Throwable) {
@@ -387,8 +371,114 @@ class PluginManagerActivity : Activity() {
         }.start()
     }
 
-    private fun uninstall(dir: String) {
-        runStub(listOf("--remove", dir), "卸载 $dir")
+    /** 重新装配内置插件：只跑 install-dsh.mjs --plugins-only，不改 dsh 本体。 */
+    private fun rewireBuiltins() {
+        Thread {
+            try {
+                appendLog(">> 重新装配内置插件…")
+                val installScript = File(filesDir, "install-dsh.mjs")
+                assets.open("install-dsh.mjs").use { input ->
+                    installScript.outputStream().use { output -> input.copyTo(output) }
+                }
+                val prebuilt = File(filesDir, "prebuilt.tgz")
+                try {
+                    assets.open("prebuilt.tgz").use { input ->
+                        prebuilt.outputStream().use { output -> input.copyTo(output) }
+                    }
+                } catch (t: Throwable) {
+                    appendLog("   WARN 无法复制 prebuilt.tgz: ${t.message}")
+                }
+                val node = File(File(nodeDir, "bin"), "node")
+                val cmd = "${node.absolutePath} ${installScript.absolutePath} --plugins-only"
+                val env = baseEnv().apply {
+                    put("DSH_PREFIX", dshPrefix().absolutePath)
+                    put("DSH_PROFILE", "web")
+                    put("DSH_PREBUILT", prebuilt.absolutePath)
+                    put("DSH_PLUGINS_DIR", pluginsDir().absolutePath)
+                }
+                val code = runProcess(cmd, env, "重新装配")
+                appendLog(if (code == 0) "   ✓ 重新装配完成" else "   ✗ 重新装配失败（exit=$code）")
+                refreshList()
+            } catch (t: Throwable) {
+                appendLog("重新装配异常: ${t.message}")
+            }
+        }.start()
+    }
+
+    /** yjh051108/dsh-routing-suite 特殊适配：走 routing-suite.mjs。 */
+    private fun runRoutingSuite() {
+        Thread {
+            try {
+                appendLog(">> 特殊适配安装/更新 dsh-routing-suite…")
+                val script = File(filesDir, "routing-suite.mjs")
+                assets.open("routing-suite.mjs").use { input ->
+                    script.outputStream().use { output -> input.copyTo(output) }
+                }
+                val node = File(File(nodeDir, "bin"), "node")
+                val cmd = "${node.absolutePath} ${script.absolutePath}"
+                val env = baseEnv().apply {
+                    put("DSH_PREFIX", dshPrefix().absolutePath)
+                    put("DSH_PROFILE", "web")
+                    put("DSH_ROUTING_REPO", ROUTING_REPO)
+                    put("DSH_ROUTING_DIR", File(filesDir, "routing-suite").absolutePath)
+                }
+                val code = runProcess(cmd, env, "routing-suite 特殊安装")
+                appendLog(if (code == 0) "   ✓ routing-suite 安装/更新完成" else "   ✗ routing-suite 安装/更新失败（exit=$code）")
+                refreshList()
+            } catch (t: Throwable) {
+                appendLog("routing-suite 异常: ${t.message}")
+            }
+        }.start()
+    }
+
+    /** 卸载：官方 dsh plugin --profile web remove <package>。 */
+    private fun uninstall(name: String) {
+        runDshPlugin(listOf("remove", name), "卸载 $name")
+    }
+
+    private fun baseEnv(): MutableMap<String, String> {
+        val node = nodeDir
+        val tools = File(filesDir, ".tools")
+        val path = listOf(
+            File(node, "bin").absolutePath,
+            File(tools, "bin").absolutePath,
+            File(tools, "lib/node_modules/.bin").absolutePath,
+            "/system/bin", "/bin", "/usr/bin"
+        ).joinToString(":")
+        return mutableMapOf(
+            "PATH" to path,
+            "HOME" to filesDir.absolutePath,
+            "LD_LIBRARY_PATH" to File(node, "lib").absolutePath,
+            "TMPDIR" to File(filesDir, "tmp").absolutePath,
+            "TMP" to File(filesDir, "tmp").absolutePath,
+            "TEMP" to File(filesDir, "tmp").absolutePath,
+            "OPENSSL_CONF" to "/dev/null"
+        )
+    }
+
+    private fun runProcess(cmd: String, env: Map<String, String>, label: String): Int {
+        appendLog("   $ $cmd")
+        return try {
+            val pb = ProcessBuilder("/system/bin/sh", "-c", cmd)
+            pb.redirectErrorStream(true)
+            val e = pb.environment()
+            env.forEach { (k, v) -> e[k] = v }
+            val p = pb.start()
+            val sb = StringBuilder()
+            p.inputStream.bufferedReader().useLines { lines ->
+                lines.forEach { line ->
+                    sb.append(line).append('\n')
+                    if (sb.length > 4000) { appendLog(sb.toString()); sb.setLength(0) }
+                }
+            }
+            val code = p.waitFor()
+            if (sb.isNotEmpty()) appendLog(sb.toString())
+            appendLog("   exit=$code ($label)")
+            code
+        } catch (t: Throwable) {
+            appendLog("   $label 执行异常: ${t.message}")
+            -1
+        }
     }
 
     private fun restartFlow() {

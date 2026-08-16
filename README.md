@@ -1,8 +1,9 @@
 # DshLauncher (Android)
 
 单 APK 的 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）Android 启动器：
-内置 Node.js aarch64 运行时，安装后在设备本机直接启动 `dsh web`（127.0.0.1:3080），
-并自带 WebView 界面——**不需要 Termux、不需要外部 Node、不需要联网构建**。
+内置 Node.js aarch64 运行时，通过官方 npm 包 `@deepseek-ai/dsh` 安装/更新 dsh，
+并在设备本机直接启动 `dsh web`（127.0.0.1:3080），
+并自带 WebView 界面——**不需要 Termux、不需要外部 Node**；联网仅用于 npm 首次安装与后续更新。
 
 **包名**：`com.dsh.launcher`（AGP 9.0 / Kotlin / Gradle 8.x）。
 
@@ -11,7 +12,7 @@
 - **内置 Node 运行时**：`assets/node/…` 打进 APK，首次启动解压到应用私有目录并
   `makeUnwritable`（解除 Android W^X 执行限制）。
 - **一键启动**：`ConsoleActivity` 内置四步引导
-  `1/4 解压 node → 2/4 解压 harness 源码 → 3/4 stub 修复 + 首次构建 → 4/4 启动 dsh web`。
+  `1/4 解压 node → 2/4 复制官方安装脚本 + 内置插件源 → 3/4 npm 官方安装/更新 dsh + dsh plugin 装配内置插件 → 4/4 启动 dsh web`。
 - **内置 WebView 界面**：主界面「打开 Web 界面」在应用内加载 `http://127.0.0.1:3080`
   （无需跳外部浏览器）；也可用任意浏览器访问同一地址。
 - **设备端免编译适配**（`assets/stub-dsh.mjs`，每次启动自动重打，幂等）：
@@ -22,6 +23,9 @@
     （`NODE_OPTIONS` 不允许该开关，必须用命令行参数）；
   - **`AbortSignal.timeout` polyfill 注入 `dist/index.html`**：系统 WebView / Chrome ≤102
     没有该 API，缺失会导致前端 client-connection 无限重连（详见下）。
+- 内置插件经官方 `dsh plugin --profile web add` 装配：`dsh-mobile-nav`、`dsh-super-injector`、
+  `dsh-net-proxy`、`dsh-provider-headers`、`dsh-vision`；`yjh051108/dsh-routing-suite`
+  走特殊适配（`routing-suite.mjs`：聚合仓库 + injector/mode-boost 装配 + agent-presets 拷贝）。
 - 自动初始化 `files/.dsh/profiles/web` 配置（含默认 LLM 提供方配置），
   界面内填入 DeepSeek API Key 即可使用。
 
@@ -77,8 +81,10 @@ adb shell am start -n com.dsh.launcher/.MainActivity   # 或直接点应用图�
   Web API，可能需要补充 polyfill（位置：`stub-dsh.mjs` 的 index shim 段）。
 - `sharp` 为 stub 实现：`attachment-local` 等依赖图片处理的能力不可用，不影响核心会话功能。
 - 设备内存有限，**不要在设备上执行 `pnpm build` / 类型检查**（tsc 全量构建会 OOM）；
-  预构建产物已打进 `assets/prebuilt.tgz`，引导阶段只做 `pnpm install` 与合并。
-- 重新安装 APK 会终止旧 web 进程，安装后需再次触发一键引导（幂等，通常 30–60 秒完成）。
+  内置插件源码打包在 `assets/prebuilt.tgz`（提取到 `files/plugins`），引导阶段使用官方
+  `dsh plugin` 装配，不进行设备端源码编译。
+- 重新安装 APK 会终止旧 web 进程，安装后需再次触发一键引导（幂等；dsh 已安装时
+  `install-dsh.mjs` 会走 npm 增量更新，通常更快）。
 - `dsh web` 只监听 loopback，仅本机（及 adb forward 的 PC）可访问。
 
 ## 发布

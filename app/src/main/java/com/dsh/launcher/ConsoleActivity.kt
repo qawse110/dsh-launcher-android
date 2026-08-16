@@ -215,13 +215,12 @@ class ConsoleActivity : AppCompatActivity() {
     /**
      * dsh 一键安装+启动流程（内嵌，避免 shell↔am 传长命令）。
      * 通过 ConsoleActivity 的 intent `--ez dsh true` 触发，供自动化/按钮调用。
-     * 各阶段用短命令经 runCommand 逐段执行：
+     * 各阶段：
      *   1) 确保内置 node 解压
-     *   2) 确保 harness 源码：优先 /sdcard/Download/DshLauncher/deepseek-harness-master.zip
-     *      （adb push 预置），否则从网络下载（多源 fallback），解压到私有目录
-     *   3) node 执行 assets 内置 install-dsh.mjs（pnpm install + build:lib + build:web），
-     *      完成后执行 stub-dsh.mjs（原生模块 stub + 启动 web），日志写共享目录
-     *   4) 校验 web 进程/端口，启动 dsh web
+     *   2) 复制 assets 内 install-dsh.mjs + prebuilt.tgz（内置插件源）
+     *   3) 官方 npm 安装/更新 @deepseek-ai/dsh 到 files/dsh-prefix，
+     *      并用 `dsh plugin --profile web add` 装配内置插件
+     *   4) 执行 stub-dsh.mjs（Android 兼容修复），启动 dsh web
      */
     private fun runDshFlow() {
         setState("启动 dsh 安装…")
@@ -241,72 +240,57 @@ class ConsoleActivity : AppCompatActivity() {
                 flowLog.parentFile?.mkdirs()
                 runCatching { flowLog.writeText("") }
                 fl("OK 1/4 node=$nodeDir")
-                fl("dsh 版本 v${DshUpdater.currentVersion(this)}" +
-                    if (DshUpdater.hasPendingUpdate(this)) "（已下载更新，本次应用）" else "")
+                fl("dsh 版本 v${DshUpdater.currentVersion(this)}")
+                // 安装/更新统一交给 install-dsh.mjs 的 `npm install @deepseek-ai/dsh@latest`；
+                // “更新”按钮通过 startUpdateCheck(force=true) 触发重启 flow 主动检查。
+                val dshPrefix = File(filesDir, "dsh-prefix")
+                val pluginsDir = File(filesDir, "plugins")
 
-                // 自动更新检查：无待应用更新且到检查周期时，后台检查/下载；
-                // 下载完成后重启流程（新包在下次启动时优先解压）。
-                if (!DshUpdater.hasPendingUpdate(this)) {
-                    startUpdateCheck(false) { msg -> fl(msg) }
-                }
-
-                val dshHome = File(filesDir, "deepseek-harness-master")
-                if (!File(dshHome, "package.json").exists()) {
-                    fl(">> 2/4 获取 harness 源码…")
-                    if (!ensureHarnessSource(dshHome) { fl(it) }) {
-                        fl("FAIL 2/4 harness source not ready")
-                        setState("出错")
-                        return@thread
-                    }
-                } else {
-                    fl("OK 2/4 harness source exists: $dshHome")
-                }
-
-                fl(">> 3/4 pnpm install + build (long, 5-30 分钟)…")
+                fl(">> 2/4 复制官方安装脚本与内置插件源…")
                 val installScript = File(filesDir, "install-dsh.mjs")
                 try {
                     assets.open("install-dsh.mjs").use { input ->
                         installScript.outputStream().use { output -> input.copyTo(output) }
                     }
                 } catch (t: Throwable) {
-                    fl("FAIL 3/4 assets copy install-dsh.mjs: ${t.message}")
+                    fl("FAIL 2/4 assets copy install-dsh.mjs: ${t.message}")
                     setState("出错")
                     return@thread
                 }
-                // 同步等待安装完成（install-dsh.mjs 内部 pnpm install + build）
-                // 待应用更新包优先；否则回退 assets 内置包
-                val prebuilt = if (DshUpdater.hasPendingUpdate(this)) {
-                    fl("  使用自动更新包（${DshUpdater.pendingUpdateFile(this).length() / 1024 / 1024}MB）")
-                    DshUpdater.pendingUpdateFile(this)
-                } else {
-                    val apk = File(filesDir, "prebuilt.tgz")
-                    try {
-                        assets.open("prebuilt.tgz").use { input ->
-                            apk.outputStream().use { output -> input.copyTo(output) }
-                        }
-                        fl("  prebuilt ${apk.length() / 1024 / 1024}MB")
-                    } catch (t: Throwable) {
-                        fl("  assets 无 prebuilt.tgz：${t.message}（将退化为设备端构建）")
+                val prebuilt = File(filesDir, "prebuilt.tgz")
+                try {
+                    assets.open("prebuilt.tgz").use { input ->
+                        prebuilt.outputStream().use { output -> input.copyTo(output) }
                     }
-                    apk
+                    fl("  内置插件源 ${prebuilt.length() / 1024 / 1024}MB")
+                } catch (t: Throwable) {
+                    fl("  assets 无 prebuilt.tgz：${t.message}")
                 }
-                val installEnv = mapOf("DSH_PREBUILT" to prebuilt.absolutePath)
+
+                fl(">> 3/4 官方 npm 安装/更新 dsh + dsh plugin 装配内置插件…")
+                val installEnv = mapOf(
+                    "HOME" to filesDir.absolutePath,
+                    "NODE_BIN" to "$nodeDir/bin/node",
+                    "NPM_BIN" to "$nodeDir/bin/npm",
+                    "DSH_PREFIX" to dshPrefix.absolutePath,
+                    "DSH_PROFILE" to "web",
+                    "DSH_PREBUILT" to prebuilt.absolutePath,
+                    "DSH_PLUGINS_DIR" to pluginsDir.absolutePath
+                )
                 val installExit = runCommandAndWait("$nodeDir/bin/node ${installScript.absolutePath}", installEnv)
                 if (installExit != 0) {
                     fl("FAIL 3/4 install script exit=$installExit，详见 install_log.txt")
-                } else if (!File(dshHome, "apps/cli/lib/bin.js").exists() &&
-                    !File(dshHome, "apps/web/dist").exists()) {
-                    fl("WARN 3/4 build 产物缺失（install 成功但产物不在预期路径）")
-                } else {
-                    fl("OK 3/4 install+build finished")
-                    // 更新包已成功解压应用——删除 pending，避免下次重复解压
-                    if (DshUpdater.hasPendingUpdate(this)) {
-                        DshUpdater.pendingUpdateFile(this).delete()
-                        fl("自动更新已应用，删除待应用包")
-                    }
+                    setState("出错")
+                    return@thread
                 }
+                if (!File(dshPrefix, "node_modules/@deepseek-ai/dsh/lib/bin.js").exists()) {
+                    fl("FAIL 3/4 官方 dsh CLI 未安装到 $dshPrefix")
+                    setState("出错")
+                    return@thread
+                }
+                fl("OK 3/4 dsh + builtin plugins installed")
 
-                fl(">> 3.5/4 stub fixup + 首次启动 web…")
+                fl(">> 3.5/4 Android 兼容修复…")
                 val stubScript = File(filesDir, "stub-dsh.mjs")
                 try {
                     assets.open("stub-dsh.mjs").use { input ->
@@ -326,11 +310,18 @@ class ConsoleActivity : AppCompatActivity() {
                         fl("WARN assets copy $name: ${t.message}")
                     }
                 }
-                runCommandAndWait("$nodeDir/bin/node ${stubScript.absolutePath}")
+                runCommandAndWait(
+                    "$nodeDir/bin/node ${stubScript.absolutePath}",
+                    mapOf(
+                        "HOME" to filesDir.absolutePath,
+                        "NODE_DIR" to nodeDir.absolutePath,
+                        "DSH_PREFIX" to dshPrefix.absolutePath,
+                        "DSH_PROFILE" to "web"
+                    )
+                )
 
                 fl(">> 4/4 校验 dsh web…")
-                // stub 已用 nohup 启动 web，这里再补一次直启（幂等：端口占用时跳过）
-                startDshWeb(nodeDir)
+                startDshWeb(nodeDir, dshPrefix)
                 fl("OK 4/4 dsh web started (http://127.0.0.1:3080)")
                 // 保持 keepalive 常驻：web 进程是其子进程，避免被系统回收；用户可在主界面停止。
                 // stopKeepAlive() 不能在此调用。
@@ -341,114 +332,6 @@ class ConsoleActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * 确保 harness 源码就绪，优先级：
-     *  1) APK assets 内置 zip（零权限零网络，推荐）
-     *  2) /sdcard/Download/DshLauncher/deepseek-harness-master.zip（adb push 预置）
-     *  3) 网络下载（多源 fallback：GitHub 直连 → ghproxy 加速）
-     * 下载/解压后校验 package.json。
-     */
-    private fun ensureHarnessSource(dshHome: File, fl: (String) -> Unit): Boolean {
-        val zipCandidates = mutableListOf<File>()
-        // 1) assets 内置（优先，零权限零网络）
-        fl("  检查 APK assets 内置源码包…")
-        try {
-            val out = File(filesDir, "harness-source.zip")
-            assets.open("harness/deepseek-harness-master.zip").use { input ->
-                out.outputStream().use { output -> input.copyTo(output) }
-            }
-            if (out.length() > 100_000) {
-                zipCandidates.add(out)
-                fl("  内置源码包 ${out.length() / 1024 / 1024}MB")
-            } else {
-                fl("  内置源码包异常（${out.length()} 字节）")
-            }
-        } catch (t: Throwable) {
-            fl("  assets 无内置源码包：${t.message}")
-        }
-        // 2) /sdcard 预置（需要存储权限）
-        val sdcardZips = listOf(
-            File("/sdcard/Download/DshLauncher/deepseek-harness-master.zip"),
-            File("/sdcard/Download/DshLauncher/dsh-src.zip"),
-            File(getExternalFilesDir(null), "deepseek-harness-master.zip")
-        )
-        zipCandidates += sdcardZips.filter { it.exists() && it.length() > 100_000 }
-        var zipFile: File? = zipCandidates.firstOrNull()
-        if (zipFile != null) {
-            fl("  使用源码包：${zipFile.absolutePath} (${zipFile.length() / 1024 / 1024}MB)")
-        } else {
-            fl("  未找到本地源码包，尝试网络下载…")
-            val urls = arrayOf(
-                "https://github.com/deepseek-ai/deepseek-harness/archive/refs/heads/master.zip",
-                "https://ghproxy.com/https://github.com/deepseek-ai/deepseek-harness/archive/refs/heads/master.zip",
-                "https://ghfast.top/https://github.com/deepseek-ai/deepseek-harness/archive/refs/heads/master.zip"
-            )
-            var ok = false
-            for (u in urls) {
-                fl("  下载 $u")
-                try {
-                    val tmp = File(filesDir, "harness-download.zip")
-                    val conn = java.net.URL(u).openConnection() as java.net.HttpURLConnection
-                    conn.connectTimeout = 20_000
-                    conn.readTimeout = 60_000
-                    conn.instanceFollowRedirects = true
-                    conn.setRequestProperty("User-Agent", "DshLauncher/4.0")
-                    conn.connect()
-                    val code = conn.responseCode
-                    fl("  HTTP $code, size=${conn.contentLengthLong}")
-                    if (code in 200..399 && conn.contentLengthLong > 100_000) {
-                        conn.inputStream.use { input ->
-                            tmp.outputStream().use { output -> input.copyTo(output) }
-                        }
-                        zipFile = tmp
-                        ok = true
-                        break
-                    }
-                    conn.disconnect()
-                } catch (t: Throwable) {
-                    fl("  下载失败：${t.message}")
-                }
-            }
-            if (!ok) {
-                fl("  网络下载失败。可把源码包打进 APK assets（harness/ 目录）或 adb push 到 /sdcard/Download/DshLauncher/")
-                return false
-            }
-        }
-        try {
-            // 先复制到私有目录再解压：/sdcard (FUSE) 上的文件随机访问可能受限
-            val localZip = File(filesDir, "harness-source.zip")
-            if (zipFile!!.absolutePath != localZip.absolutePath) {
-                zipFile.inputStream().use { input ->
-                    localZip.outputStream().use { output -> input.copyTo(output) }
-                }
-                fl("  已复制到私有目录：${localZip.absolutePath}")
-                zipFile = localZip
-            }
-            // 解压到临时目录，避免半成品污染
-            val tmp = File(filesDir, ".harness-tmp")
-            tmp.deleteRecursively()
-            tmp.mkdirs()
-            val n = ZipUnpack.unpack(zipFile, tmp)
-            fl("  解压 $n 个文件")
-            if (!File(tmp, "package.json").exists()) {
-                fl("  解压结果缺少 package.json（zip 结构异常）")
-                return false
-            }
-            // 移动临时目录 → 目标目录
-            dshHome.deleteRecursively()
-            if (!tmp.renameTo(dshHome)) {
-                fl("  移动目录失败，改用复制")
-                tmp.copyRecursively(dshHome)
-                tmp.deleteRecursively()
-            }
-            return File(dshHome, "package.json").exists()
-        } catch (t: Throwable) {
-            fl("  解压失败：${t.message}")
-            AppLog.e("Console", "unpack failed", t)
-            android.util.Log.e("DshConsole", "unpack failed", t)
-            return false
-        }
-    }
 
     /** 前台服务保活，防止长时间 build 被系统回收。 */
     private fun startKeepAlive() {
@@ -466,14 +349,10 @@ class ConsoleActivity : AppCompatActivity() {
     }
 
     /** 后台启动 dsh web（nohup 使其脱离本控制台进程）。端口已监听时跳过（幂等）。 */
-    private fun startDshWeb(nodeDir: File) {
-        val dshHome = File(filesDir, "deepseek-harness-master")
-        val cliEntry = when {
-            File(dshHome, "apps/cli/lib/bin.js").exists() -> "apps/cli/lib/bin.js"
-            else -> "apps/cli/src/bin.ts" // Node 22.19+ 原生 TS
-        }
-        if (!File(dshHome, "package.json").exists()) {
-            appendLine("✗ 未找到 dsh 源码（构建可能未完成）")
+    private fun startDshWeb(nodeDir: File, dshPrefix: File) {
+        val cli = File(dshPrefix, "node_modules/@deepseek-ai/dsh/lib/bin.js")
+        if (!cli.exists()) {
+            appendLine("✗ 未找到官方 dsh CLI（安装可能未完成）")
             setState("出错")
             return
         }
@@ -483,17 +362,17 @@ class ConsoleActivity : AppCompatActivity() {
             return
         }
         // 生成启动脚本到共享目录，用 sh 后台执行
+        File(filesDir, "tmp").mkdirs()
         val launcher = File(getExternalFilesDir(null) ?: filesDir, "dsh-web.sh")
         launcher.parentFile?.mkdirs()
         launcher.writeText(
             "#!/system/bin/sh\n" +
             "export LD_LIBRARY_PATH=${nodeDir.absolutePath}/lib\n" +
             "export HOME=${filesDir.absolutePath}\n" +
-            "export TMPDIR=${nodeDir.absolutePath}/tmp\n" +
+            "export TMPDIR=${filesDir.absolutePath}/tmp\n" +
             "export OPENSSL_CONF=/dev/null\n" +
-            "export PATH=${nodeDir.absolutePath}/bin:/system/bin:/bin\n" +
-            "cd $dshHome\n" +
-            "nohup ${nodeDir.absolutePath}/bin/node --expose-internals --import ${filesDir.absolutePath}/fs-register.mjs ./$cliEntry web > ${filesDir.absolutePath}/dsh-web.log 2>&1 &\n" +
+            "export PATH=${nodeDir.absolutePath}/bin:${File(filesDir, ".tools").absolutePath}/bin:/system/bin:/bin:/usr/bin\n" +
+            "nohup ${nodeDir.absolutePath}/bin/node --expose-internals --import ${filesDir.absolutePath}/fs-register.mjs ${cli.absolutePath} web > ${filesDir.absolutePath}/dsh-web.log 2>&1 &\n" +
             "echo DSH_WEB_PID=$!\n"
         )
         launcher.setExecutable(true)
@@ -535,22 +414,18 @@ class ConsoleActivity : AppCompatActivity() {
     }
 
     /**
-     * 检查并下载 dsh 更新。force=true 时忽略检查间隔（「更新」按钮）。
-     * 发现新版本并下载完成后：杀掉 node 进程并重启 flow，
-     * 下一次 runDshFlow 会优先解压新包（pending 存在时不再检查，避免循环）。
+     * 主动检查 dsh 更新（「更新」按钮，force=true 忽略 6h 间隔）。
+     * 发现新版本时杀掉 node 进程并重启 flow，由 install-dsh.mjs 执行 npm 官方更新。
      */
     private fun startUpdateCheck(force: Boolean, onLog: ((String) -> Unit)? = null) {
         val log: (String) -> Unit = onLog ?: { appendLine(it) }
         thread {
             val version = DshUpdater.checkRemote(this, force, log)
             if (version != null) {
-                val file = DshUpdater.download(this, version, log)
-                if (file != null) {
-                    log("dsh v$version 更新包就绪（${file.length() / 1024 / 1024}MB），重启流程应用…")
-                    Thread.sleep(3_000)
-                    killAllNode()
-                    runOnUiThread { runDshFlow() }
-                }
+                log("发现 dsh v$version，重启流程执行 npm 官方更新…")
+                Thread.sleep(3_000)
+                killAllNode()
+                runOnUiThread { runDshFlow() }
             }
         }
     }
@@ -609,7 +484,7 @@ class ConsoleActivity : AppCompatActivity() {
                 env["HOME"] = "/data/data/com.dsh.launcher/files"
                 env["TERM"] = "xterm-256color"
                 env["LD_LIBRARY_PATH"] = File(filesDir, "node/lib").absolutePath
-                env["TMPDIR"] = File(filesDir, "node/tmp").absolutePath
+                env["TMPDIR"] = File(filesDir, "tmp").absolutePath
                 env["OPENSSL_CONF"] = "/dev/null"
             }
             extraEnv.forEach { (k, v) -> env[k] = v }
