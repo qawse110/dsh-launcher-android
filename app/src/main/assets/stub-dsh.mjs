@@ -218,8 +218,33 @@ function wireAll() {
     if (!existsSync(src)) { report.push(p + ': 未内置'); continue; }
     try {
       mkdirSync(AGENT_PRESETS_ROOT, { recursive: true });
-      cpSync(src, join(AGENT_PRESETS_ROOT, p), { recursive: true, force: true });
-      report.push('preset 安装: ' + p);
+      if (existsSync(join(src, 'agent.cordis.yml'))) {
+        // 普通预设：整体拷为同名
+        const dest = join(AGENT_PRESETS_ROOT, p);
+        rmSync(dest, { recursive: true, force: true });
+        cpSync(src, dest, { recursive: true, force: true });
+        report.push('preset 安装: ' + p);
+      } else {
+        // 容器（router-preset 内含多套子预设）：展平到一级目录。
+        // dsh 只把 .agent-presets 下直接含 agent.cordis.yml 的目录当预设，
+        // 容器根如果没有 agent.cordis.yml 会占位报 broken。
+        let copied = 0;
+        for (const child of readdirSync(src, { withFileTypes: true })) {
+          if (!child.isDirectory()) continue;
+          const childSrc = join(src, child.name);
+          if (!existsSync(join(childSrc, 'agent.cordis.yml'))) continue;
+          const dest = join(AGENT_PRESETS_ROOT, child.name);
+          rmSync(dest, { recursive: true, force: true });
+          cpSync(childSrc, dest, { recursive: true, force: true });
+          copied++;
+        }
+        // 清理旧容器占位（历史上整目录拷贝产生的无 agent.cordis.yml 目录）
+        const legacy = join(AGENT_PRESETS_ROOT, p);
+        if (existsSync(legacy) && !existsSync(join(legacy, 'agent.cordis.yml'))) {
+          rmSync(legacy, { recursive: true, force: true });
+        }
+        report.push('preset 安装: ' + p + (copied > 0 ? `（${copied} 子预设）` : ''));
+      }
     } catch (e) { report.push('preset 失败: ' + e.message); }
   }
   log('wire: ' + report.join(' | '));

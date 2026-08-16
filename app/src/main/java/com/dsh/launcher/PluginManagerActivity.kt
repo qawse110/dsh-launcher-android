@@ -36,7 +36,7 @@ class PluginManagerActivity : Activity() {
             "dsh-vision" to "视觉（view_image 工具 + VLM 后端）",
         )
         const val PRESET_DIR = "router-preset"
-        const val PRESET_DESC = "思维模式路由预设（spec/react/weak + 近距离引导，agent-presets）"
+        const val PRESET_DESC = "思维模式路由预设（router-pro / router-spec / router-standard，agent-presets）"
         const val REPO_DIR = "plugin-repo"
     }
 
@@ -185,8 +185,8 @@ class PluginManagerActivity : Activity() {
             val ver = readVersion(d)
             listBox.addView(makeCard(d, BUNDLED_DESC[d] ?: "", ver, status, emptyList()))
         }
-        // 路由预设
-        val presetOk = File(presetsRoot(), PRESET_DIR).exists()
+        // 路由预设（容器展平后以 router-pro/router-spec/router-standard 三个一级预设生效）
+        val presetOk = listOf("router-pro", "router-spec", "router-standard").any { File(presetsRoot(), it).exists() }
         listBox.addView(makeCard(
             PRESET_DIR, PRESET_DESC, "preset",
             if (presetOk) "已安装（agent-presets）" else "待装配（需重启 flow）", emptyList()))
