@@ -1,7 +1,7 @@
 {
   "name": "@dsh-external/dsh-oh-we-need",
-  "version": "0.1.0",
-  "description": "自动把 oh-we-need（we need to 句式）注入 DeepSeek Harness 系统提示词，引导 V4 思维链为可执行、第一人称、任务分型风格。",
+  "version": "0.2.0",
+  "description": "自动把 oh-we-need（we need to 句式）注入 DeepSeek Harness 系统提示词，带 assemble 守卫适配 router 预设。",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
