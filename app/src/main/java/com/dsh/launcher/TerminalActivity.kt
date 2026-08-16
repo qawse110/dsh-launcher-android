@@ -35,17 +35,22 @@ class TerminalActivity : AppCompatActivity(), TerminalSessionClient, TerminalVie
 
         val shell = detectShell()
         val home = detectHome()
+        val usr = File(filesDir, "termux/usr")
+        val hasTermux = File(usr, "bin/bash").isFile
         val env = arrayOf(
             "PATH=" + listOf(
-                "/data/data/com.termux/files/usr/bin",
-                "/data/data/com.termux/files/usr/bin/applets",
-                "/data/data/com.termux/files/usr/bin/local/bin",
+                if (hasTermux) "$usr/bin" else "/data/data/com.termux/files/usr/bin",
+                if (hasTermux) "$usr/bin/applets" else "/data/data/com.termux/files/usr/bin/applets",
+                if (hasTermux) "$usr/local/bin" else "/data/data/com.termux/files/usr/bin/local/bin",
                 "/usr/bin", "/bin", "/system/bin"
             ).joinToString(":"),
             "HOME=$home",
             "TERM=xterm-256color",
-            "TMPDIR=$home"
-        )
+            "TMPDIR=$home",
+            if (hasTermux) "PREFIX=$usr" else "",
+            if (hasTermux) "LD_LIBRARY_PATH=$usr/lib" else "",
+            "LANG=C.UTF-8"
+        ).filter { it.isNotBlank() }.toTypedArray()
 
         // 会话：createSubprocess 通过原生 libtermux.so 创建 PTY 子进程
         // 注意：TerminalSession 构造不会启动子进程，需由 updateSize() 触发的
@@ -107,6 +112,7 @@ class TerminalActivity : AppCompatActivity(), TerminalSessionClient, TerminalVie
 
     private fun detectShell(): String {
         val candidates = arrayOf(
+            File(filesDir, "termux/usr/bin/bash").absolutePath,
             "/data/data/com.termux/files/usr/bin/bash",
             "/bin/bash",
             "/system/bin/sh"
@@ -116,6 +122,8 @@ class TerminalActivity : AppCompatActivity(), TerminalSessionClient, TerminalVie
     }
 
     private fun detectHome(): String {
+        val builtin = File(filesDir, "termux/home")
+        if (builtin.exists() || builtin.mkdirs()) return builtin.absolutePath
         if (File("/data/data/com.termux/files/home").exists()) return "/data/data/com.termux/files/home"
         return "/"
     }

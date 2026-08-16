@@ -168,7 +168,20 @@ class MainActivity : AppCompatActivity() {
             startActivity(Intent(this, WebViewActivity::class.java))
         })
         root.addView(actionButton(getString(R.string.btn_open_terminal)) {
-            startActivity(Intent(this, ConsoleActivity::class.java))
+            thread {
+                if (!TermuxRuntime.isReady(this@MainActivity)) {
+                    log("准备内置 Termux 环境（首次约 10~60 秒）…")
+                    try {
+                        TermuxRuntime.ensureExtracted(this@MainActivity) { msg -> log(msg) }
+                        log("Termux 环境就绪，打开终端…")
+                    } catch (t: Throwable) {
+                        log("✗ Termux 准备失败：${t.message}（回退系统 sh）")
+                    }
+                }
+                runOnUiThread {
+                    startActivity(Intent(this@MainActivity, TerminalActivity::class.java))
+                }
+            }
         })
         root.addView(actionButton(getString(R.string.btn_node_check)) {
             runNodeDsh()
@@ -192,6 +205,15 @@ class MainActivity : AppCompatActivity() {
             textSize = 12f
             setTextColor(if (hasNodeMarker()) 0xFF2DB85B.toInt() else 0xFFCC4444.toInt())
             setPadding(0, dp(8), 0, 0)
+        })
+
+        root.addView(TextView(this).apply {
+            val ready = TermuxRuntime.isReady(this@MainActivity)
+            text = if (ready) "内置 Termux：已就绪 ✓（bash + coreutils + apt，可执行 Linux 指令）"
+                   else "内置 Termux：未解压（首次执行命令/打开终端自动准备）"
+            textSize = 12f
+            setTextColor(if (ready) 0xFF2DB85B.toInt() else 0xFFCC4444.toInt())
+            setPadding(0, dp(4), 0, 0)
         })
 
         root.addView(TextView(this).apply {

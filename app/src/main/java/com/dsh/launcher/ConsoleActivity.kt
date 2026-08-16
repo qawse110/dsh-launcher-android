@@ -146,9 +146,32 @@ class ConsoleActivity : AppCompatActivity() {
             setOnClickListener { finish() }
         }
 
+        val termBtn = Button(this).apply {
+            text = "终端"
+            textSize = 14f
+            isAllCaps = false
+            setOnClickListener {
+                thread {
+                    if (!TermuxRuntime.isReady(this@ConsoleActivity)) {
+                        appendLine(">> 准备内置 Termux 环境（首次约 10~60 秒）…")
+                        try {
+                            TermuxRuntime.ensureExtracted(this@ConsoleActivity) { msg -> appendLine(msg) }
+                            appendLine(">> Termux 环境就绪，打开终端…")
+                        } catch (t: Throwable) {
+                            appendLine("✗ Termux 准备失败：${t.message}，将回退系统 sh")
+                            android.util.Log.e("Console", "termux ensure failed", t)
+                        }
+                    }
+                    runOnUiThread {
+                        startActivity(Intent(this@ConsoleActivity, TerminalActivity::class.java))
+                    }
+                }
+            }
+        }
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(nodeBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(termBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(runBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(pluginBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(updateBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
@@ -494,7 +517,20 @@ class ConsoleActivity : AppCompatActivity() {
         setState("运行中…")
         AppLog.i("Console", "cmd: $raw | env LD_LIBRARY_PATH=" + File(filesDir, "node/lib").absolutePath)
         thread {
-            runCommandAndWait(raw)
+            // 用户命令默认走内置 Termux bash；首次自动解压 bootstrap
+            if (!TermuxRuntime.isReady(this)) {
+                appendLine(">> 首次使用内置 Termux：正在解压官方 bootstrap（约 30MB，10~60 秒）…")
+                try {
+                    TermuxRuntime.ensureExtracted(this) { msg -> appendLine(msg) }
+                    appendLine(">> Termux 环境已就绪（bash + coreutils + apt 等）")
+                } catch (t: Throwable) {
+                    appendLine("✗ Termux 环境准备失败（回退系统 sh）：${t.message}")
+                    android.util.Log.e("Console", "termux ensure failed", t)
+                    setState("出错")
+                    return@thread
+                }
+            }
+            runCommandAndWait(raw, termux = true)
         }
     }
 
@@ -532,23 +568,44 @@ class ConsoleActivity : AppCompatActivity() {
     }
 
     /** 同步执行命令（阻塞直到结束），返回退出码；输出实时回显。 */
-    private fun runCommandAndWait(raw: String, extraEnv: Map<String, String> = emptyMap()): Int {
+    private fun runCommandAndWait(raw: String, extraEnv: Map<String, String> = emptyMap(), termux: Boolean = false): Int {
         setState("运行中…")
         AppLog.i("Console", "cmd: $raw")
         return try {
-            // 用 /system/bin/sh -c 执行，这样支持管道/重定向/环境变量
-            val pb = ProcessBuilder("/system/bin/sh", "-c", raw)
+            val useTermux = termux && TermuxRuntime.isBashReady(this)
+            // 用户命令用内置 Termux bash；内部 flow 命令仍用系统 sh（避免自动解压拖慢 dsh）
+            val shell = if (useTermux) TermuxRuntime.bashPath(this).absolutePath else "/system/bin/sh"
+            val pb = ProcessBuilder(shell, "-c", raw)
             pb.redirectErrorStream(true)
             val env = pb.environment()
-            env["PATH"] = listOf(
-                "/data/data/com.dsh.launcher/files/node/bin",
-                "/system/bin", "/bin", "/usr/bin"
-            ).joinToString(":")
-            env["HOME"] = "/data/data/com.dsh.launcher/files"
-            env["TERM"] = "xterm-256color"
-            env["LD_LIBRARY_PATH"] = File(filesDir, "node/lib").absolutePath
-            env["TMPDIR"] = File(filesDir, "node/tmp").absolutePath
-            env["OPENSSL_CONF"] = "/dev/null"
+            if (useTermux) {
+                val usr = TermuxRuntime.prefix(this).absolutePath
+                val home = TermuxRuntime.home(this).absolutePath
+                val tmp = TermuxRuntime.tmp(this).absolutePath
+                env["PREFIX"] = usr
+                env["PATH"] = listOf(
+                    "$usr/bin", "$usr/bin/applets", "$usr/local/bin",
+                    File(filesDir, "node/bin").absolutePath,
+                    "/system/bin", "/bin", "/usr/bin"
+                ).joinToString(":")
+                env["HOME"] = home
+                env["TERM"] = "xterm-256color"
+                env["LANG"] = "C.UTF-8"
+                env["LD_LIBRARY_PATH"] = "$usr/lib"
+                env["TMPDIR"] = tmp
+                env.remove("LD_PRELOAD")
+                env["OPENSSL_CONF"] = "/dev/null"
+            } else {
+                env["PATH"] = listOf(
+                    "/data/data/com.dsh.launcher/files/node/bin",
+                    "/system/bin", "/bin", "/usr/bin"
+                ).joinToString(":")
+                env["HOME"] = "/data/data/com.dsh.launcher/files"
+                env["TERM"] = "xterm-256color"
+                env["LD_LIBRARY_PATH"] = File(filesDir, "node/lib").absolutePath
+                env["TMPDIR"] = File(filesDir, "node/tmp").absolutePath
+                env["OPENSSL_CONF"] = "/dev/null"
+            }
             extraEnv.forEach { (k, v) -> env[k] = v }
 
             val proc = pb.start()
