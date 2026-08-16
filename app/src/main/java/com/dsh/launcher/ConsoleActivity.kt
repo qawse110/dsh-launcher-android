@@ -10,7 +10,6 @@ import android.os.IBinder
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
-import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -73,116 +72,111 @@ class ConsoleActivity : AppCompatActivity() {
     private fun buildUi(): View {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(0xFF0B0B0F.toInt())
+            setBackgroundColor(Ui.BG)
         }
+
+        val headerCard = Ui.card(this, radiusDp = 14, background = Ui.SURFACE)
+        val headerRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        headerRow.addView(TextView(this).apply {
+            text = "内置命令控制台"
+            textSize = 15f
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            setTextColor(Ui.TEXT_PRIMARY)
+        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+
+        stateView = TextView(this).apply {
+            text = "状态：空闲"
+            textSize = 12f
+            setTextColor(Ui.TEXT_SECONDARY)
+        }
+        headerRow.addView(stateView)
+        headerCard.addView(headerRow)
+
+        root.addView(headerCard, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ))
 
         output = TextView(this).apply {
             setTextColor(0xFFE0E0E0.toInt())
             textSize = 13f
             setTypeface(android.graphics.Typeface.MONOSPACE)
-            setPadding(dp(12), dp(12), dp(12), dp(12))
+            setPadding(dp(12), dp(10), dp(12), dp(10))
             setLineSpacing(dp(2).toFloat(), 1f)
         }
 
         val scroll = ScrollView(this).apply {
             addView(output, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         }
-
-        stateView = TextView(this).apply {
-            text = "状态：空闲"
-            textSize = 12f
-            setTextColor(0xFF9A9A9A.toInt())
-            setPadding(dp(12), dp(8), dp(12), dp(4))
-        }
+        val outputCard = Ui.card(this, radiusDp = 14, background = Ui.SURFACE_ALT)
+        outputCard.addView(scroll, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        root.addView(outputCard, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
+        ).apply { topMargin = dp(4) })
 
         input = EditText(this).apply {
             hint = "输入命令，回车执行"
-            setTextColor(0xFFFFFFFF.toInt())
-            setHintTextColor(0xFF888888.toInt())
-            setBackgroundColor(0xFF20242D.toInt())
-            setPadding(dp(12), dp(10), dp(12), dp(10))
+            setTextColor(Ui.TEXT_PRIMARY)
+            setHintTextColor(Ui.TEXT_MUTED)
+            background = Ui.rounded(this@ConsoleActivity, Ui.SURFACE_INPUT, 12, Ui.OUTLINE)
+            setPadding(dp(14), dp(10), dp(14), dp(10))
             setOnEditorActionListener { _, _, _ ->
                 execInput()
                 true
             }
         }
+        root.addView(input, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(6) })
 
-        val runBtn = Button(this).apply {
-            text = "执行"
-            textSize = 14f
-            isAllCaps = false
-            setOnClickListener { execInput() }
-        }
-        val nodeBtn = Button(this).apply {
-            text = "Node"
-            textSize = 14f
-            isAllCaps = false
-            setOnClickListener { runNodeCmd() }
-        }
-        val updateBtn = Button(this).apply {
-            text = "更新"
-            textSize = 14f
-            isAllCaps = false
-            setOnClickListener { startUpdateCheck(true) }
-        }
-        val pluginBtn = Button(this).apply {
-            text = "插件"
-            textSize = 14f
-            isAllCaps = false
-            setOnClickListener {
-                startActivity(Intent(this@ConsoleActivity, PluginManagerActivity::class.java))
+        fun rowOf(vararg buttons: View): LinearLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            buttons.forEachIndexed { index, button ->
+                addView(button, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    if (index < buttons.lastIndex) rightMargin = dp(6)
+                })
             }
         }
-        val clearBtn = Button(this).apply {
-            text = "清空"
-            textSize = 14f
-            isAllCaps = false
-            setOnClickListener { sb.clear(); output.text = "" }
-        }
-        val closeBtn = Button(this).apply {
-            text = "退出"
-            textSize = 14f
-            isAllCaps = false
-            setOnClickListener { finish() }
-        }
 
-        val termBtn = Button(this).apply {
-            text = "终端"
-            textSize = 14f
-            isAllCaps = false
-            setOnClickListener {
-                thread {
-                    if (!TermuxRuntime.isReady(this@ConsoleActivity)) {
-                        appendLine(">> 准备内置 Termux 环境（首次约 10~60 秒）…")
-                        try {
-                            TermuxRuntime.ensureExtracted(this@ConsoleActivity) { msg -> appendLine(msg) }
-                            appendLine(">> Termux 环境就绪，打开终端…")
-                        } catch (t: Throwable) {
-                            appendLine("✗ Termux 准备失败：${t.message}，将回退系统 sh")
-                            android.util.Log.e("Console", "termux ensure failed", t)
-                        }
-                    }
-                    runOnUiThread {
-                        startActivity(Intent(this@ConsoleActivity, TerminalActivity::class.java))
+        val nodeBtn = Ui.button(this, "Node", { runNodeCmd() }, filled = false)
+        val termBtn = Ui.button(this, "终端", {
+            thread {
+                if (!TermuxRuntime.isReady(this@ConsoleActivity)) {
+                    appendLine(">> 准备内置 Termux 环境（首次约 10~60 秒）…")
+                    try {
+                        TermuxRuntime.ensureExtracted(this@ConsoleActivity) { msg -> appendLine(msg) }
+                        appendLine(">> Termux 环境就绪，打开终端…")
+                    } catch (t: Throwable) {
+                        appendLine("✗ Termux 准备失败：${t.message}，将回退系统 sh")
+                        android.util.Log.e("Console", "termux ensure failed", t)
                     }
                 }
+                runOnUiThread {
+                    startActivity(Intent(this@ConsoleActivity, TerminalActivity::class.java))
+                }
             }
-        }
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            addView(nodeBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(termBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(runBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(pluginBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(updateBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(clearBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(closeBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        }
+        }, filled = false)
+        val runBtn = Ui.button(this, "执行", { execInput() }, filled = true)
+        val pluginBtn = Ui.button(this, "插件", {
+            startActivity(Intent(this@ConsoleActivity, PluginManagerActivity::class.java))
+        }, filled = false)
+        val updateBtn = Ui.button(this, "更新", { startUpdateCheck(true) }, filled = false)
+        val clearBtn = Ui.button(this, "清空", { sb.clear(); output.text = "" }, filled = false)
+        val closeBtn = Ui.button(this, "退出", { finish() }, filled = false, color = Ui.DANGER)
 
-        root.addView(stateView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        root.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
-        root.addView(input, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        root.addView(row, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        root.addView(rowOf(nodeBtn, termBtn, runBtn, pluginBtn), LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(6) })
+        root.addView(rowOf(updateBtn, clearBtn, closeBtn), LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(6) })
+
         return root
     }
 

@@ -45,7 +45,29 @@ function findPkg(pkgName, rel) {
   // npm 扁平布局
   const flat = join(NODE_MODULES, pkgName, rel);
   if (existsSync(flat)) return flat;
-  return null;
+  // 依赖可能被嵌套安装（如 @deepseek-ai/dsh-subprocess-local/node_modules/node-pty）
+  return findNestedPkg(pkgName, rel);
+}
+
+/** 递归查找嵌套 node_modules 中的包（pnpm 之外的 npm 嵌套布局）。 */
+function findNestedPkg(pkgName, rel) {
+  const found = [];
+  function walk(dir, depth) {
+    if (depth > 8 || found.length > 0) return;
+    let entries;
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const full = join(dir, entry.name);
+      if (entry.name === 'node_modules') {
+        const candidate = join(full, pkgName, rel);
+        if (existsSync(candidate)) { found.push(candidate); return; }
+      }
+      walk(full, depth + 1);
+    }
+  }
+  walk(NODE_MODULES, 0);
+  return found[0] || null;
 }
 
 const KSTUB = 'Y29uc3QgcD1uZXcgUHJveHkoZnVuY3Rpb24oKXt9LHtnZXQ6KHQsayk9PihrPT09U3ltYm9sLnRvUHJpbWl0aXZlKT8oKT0+MDpwLGFwcGx5OigpPT5wLGNvbnN0cnVjdDooKT0+cH0pO2NvbnN0IGtvZmZpPXtsb2FkOigpPT5wLGRlY29kZTooKT0+MCxlbmNvZGU6KCk9PjAsCnNpemVvZjooKT0+MCxhbGlnbm9mOigpPT4wLGZ1bmN0aW9uOigpPT5wLHN0cnVjdDooKT0+cCx1bmlvbjooKT0+cCxlbnVtOigpPT5wLHR5cGVkZWY6KCk9PnAscG9pbnRlcjooKT0+cCwKcmVnaXN0ZXI6KCk9PnAsS29mZmlFcnJvcjpjbGFzcyBleHRlbmRzIEVycm9ye319O2V4cG9ydCBkZWZhdWx0IGtvZmZpOw==';
@@ -112,6 +134,51 @@ try {
     log('apiproxy: not found, skip');
   }
 } catch (e) { log('WARN apiproxy: ' + e.message); }
+
+try {
+  // dsh-provider-headers: sendAttribution=false 时不再强制注入 deepseek-harness User-Agent
+  const pi = findPkg('@deepseek-ai/dsh-llm-pi-ai', 'lib/index.js');
+  if (pi) {
+    let src = readFileSync(pi, 'utf8');
+    const marker = 'sendAttribution: z.boolean().default(true)';
+    if (!src.includes(marker)) {
+      let out = src;
+      out = out.replace(
+        /sendAttribution: z\.boolean\(\)\.optional\(\),/,
+        'sendAttribution: z.boolean().default(true),'
+      );
+      out = out.replace(
+        /headers: z\.dict\(z\.string\(\)\),/,
+        'headers: z.dict(z.string()),\n\tsendAttribution: z.boolean().default(true),'
+      );
+      out = out.replace(
+        /function requestHeaders\(headers\) \{/,
+        'function requestHeaders(headers, sendAttribution = true) {'
+      );
+      out = out.replace(
+        /function requestHeaders\(headers, sendAttribution = true\) \{\n(\s*)const attribution = attributionHeaders\(\);/,
+        (m, indent) => m.replace(
+          'const attribution = attributionHeaders();',
+          `if (sendAttribution === false) return { ...(headers ?? {}) };\n${indent}const attribution = attributionHeaders();`
+        )
+      );
+      out = out.replace(
+        /headers: requestHeaders\(profile\.headers\)/,
+        'headers: requestHeaders(profile.headers, profile.sendAttribution)'
+      );
+      if (out !== src) {
+        writeFileSync(pi, out);
+        log('llm-pi-ai sendAttribution support patched: ' + pi);
+      } else {
+        log('llm-pi-ai sendAttribution pattern not found, skip');
+      }
+    } else {
+      log('llm-pi-ai sendAttribution already patched');
+    }
+  } else {
+    log('llm-pi-ai: not found, skip');
+  }
+} catch (e) { log('WARN llm-pi-ai sendAttribution: ' + e.message); }
 
 try {
   const w = findPkg('@deepseek-ai/dsh-sandbox-windows-acl', 'lib') || findPkg('@deepseek-ai/dsh-sandbox-windows-acl', 'lib/index.js');

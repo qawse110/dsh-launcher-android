@@ -41,6 +41,7 @@ const BUILTIN_PLUGINS = [
   'dsh-net-proxy',
   'dsh-provider-headers',
   'dsh-vision',
+  'dsh-oh-we-need',
 ];
 const BUILTIN_NAMES = new Set([
   '@dsh-external/dsh-mobile-nav',
@@ -48,6 +49,7 @@ const BUILTIN_NAMES = new Set([
   'dsh-net-proxy',
   'dsh-provider-headers',
   '@dsh-external/dsh-vision',
+  '@dsh-external/dsh-oh-we-need',
 ]);
 const BUILTIN_IDS = new Set([
   'dsh-mobile-nav',
@@ -55,6 +57,7 @@ const BUILTIN_IDS = new Set([
   'net-proxy',
   'provider-headers',
   'dsh-vision',
+  'dsh-oh-we-need',
 ]);
 const PRESET_DIRS = ['router-preset'];
 

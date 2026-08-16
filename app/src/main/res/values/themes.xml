@@ -1,11 +1,27 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- 基础深色主题 -->
-    <style name="Theme.DshLauncher" parent="Theme.AppCompat.DayNight.NoActionBar">
-        <item name="colorPrimary">#4D6BFE</item>
-        <item name="colorPrimaryVariant">#3451DB</item>
+    <!-- 现代深色 Material 3 主题 -->
+    <style name="Theme.DshLauncher" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="colorPrimary">#6C8CFF</item>
         <item name="colorOnPrimary">#FFFFFF</item>
-        <item name="android:statusBarColor">#4D6BFE</item>
+        <item name="colorPrimaryContainer">#23316B</item>
+        <item name="colorOnPrimaryContainer">#DDE4FF</item>
+        <item name="colorSecondary">#8FA3FF</item>
+        <item name="colorOnSecondary">#00174B</item>
+        <item name="colorSecondaryContainer">#2A3552</item>
+        <item name="colorOnSecondaryContainer">#DDE4FF</item>
+        <item name="colorSurface">#151922</item>
+        <item name="colorOnSurface">#E4E8F2</item>
+        <item name="colorSurfaceVariant">#1E2430</item>
+        <item name="colorOnSurfaceVariant">#AAB4C6</item>
+        <item name="colorOutline">#2C3547</item>
+        <item name="colorOutlineVariant">#232A38</item>
+        <item name="android:colorBackground">#0F1116</item>
+        <item name="android:windowBackground">#0F1116</item>
+        <item name="android:statusBarColor">#0F1116</item>
+        <item name="android:navigationBarColor">#0F1116</item>
         <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:windowNoTitle">true</item>
     </style>
 </resources>

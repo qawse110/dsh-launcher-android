@@ -1,8 +1,10 @@
 package com.dsh.launcher
 
 import android.annotation.SuppressLint
+import android.content.res.ColorStateList
 import android.graphics.Bitmap
 import android.os.Bundle
+import android.view.Gravity
 import android.view.View
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
@@ -10,8 +12,9 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.LinearLayout
 import android.widget.ProgressBar
-import android.widget.RelativeLayout
+import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 
 /**
@@ -25,20 +28,51 @@ class WebViewActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
 
         val webView = WebView(this)
-        val progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
-            layoutParams = RelativeLayout.LayoutParams(
-                RelativeLayout.LayoutParams.MATCH_PARENT,
-                dp(4)
-            ).apply { addRule(RelativeLayout.ALIGN_PARENT_TOP) }
-            max = 100
+        webView.setBackgroundColor(Ui.BG)
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Ui.BG)
         }
 
-        val root = RelativeLayout(this)
-        root.addView(webView, RelativeLayout.LayoutParams(
-            RelativeLayout.LayoutParams.MATCH_PARENT,
-            RelativeLayout.LayoutParams.MATCH_PARENT
+        // 顶部工具栏
+        val toolbar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(Ui.SURFACE)
+            setPadding(dp(12), dp(8), dp(8), dp(8))
+        }
+        toolbar.addView(TextView(this).apply {
+            text = "DeepSeek Harness Web"
+            textSize = 16f
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            setTextColor(Ui.TEXT_PRIMARY)
+        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+
+        toolbar.addView(Ui.button(this, "刷新", { webView.reload() }, filled = false, compact = true).apply {
+            minWidth = dp(72)
+        })
+        root.addView(toolbar, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            dp(52)
         ))
+
+        // 加载进度条
+        val progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            progressTintList = ColorStateList.valueOf(Ui.BRAND)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(3)
+            )
+        }
         root.addView(progressBar)
+
+        root.addView(webView, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            0,
+            1f
+        ))
 
         setContentView(root)
 

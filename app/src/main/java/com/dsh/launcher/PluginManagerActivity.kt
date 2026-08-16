@@ -1,15 +1,14 @@
 package com.dsh.launcher
 
-import android.app.Activity
 import android.content.Intent
-import android.graphics.Color
 import android.os.Bundle
+import android.view.View
 import android.view.ViewGroup
-import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import androidx.appcompat.app.AppCompatActivity
 import org.json.JSONObject
 import java.io.File
 
@@ -17,16 +16,19 @@ import java.io.File
  * 插件管理系统：内置插件一览（APK 内 plugins 源）+ 在线安装/卸载。
  *
  * 装配动作全部走官方 `dsh plugin --profile web add/remove`；
- * 仅 `yjh051108/dsh-routing-suite` 走特殊适配（routing-suite.mjs：
- * 下载聚合仓库 + 三个子仓库 → 装配 injector/mode-boost → 拷贝 agent-preset）。
+ * `yjh051108/dsh-routing-suite` 走特殊适配（routing-suite.mjs：
+ * 下载聚合仓库 + 三个子仓库 → 装配 injector/mode-boost → 拷贝 agent-preset）；
+ * `scp3500/oh-we-need` 是纯提示词仓库，已内置为 dsh-oh-we-need 插件，
+ * 输入该仓库时触发内置插件重新装配。
  */
-class PluginManagerActivity : Activity() {
+class PluginManagerActivity : AppCompatActivity() {
 
     companion object {
         // 内置插件（随 APK 分发；首次 flow 已通过 dsh plugin add 装配）
         val BUNDLED = setOf(
             "dsh-mobile-nav", "dsh-super-injector",
             "dsh-net-proxy", "dsh-provider-headers", "dsh-vision",
+            "dsh-oh-we-need",
         )
         val BUNDLED_DESC = mapOf(
             "dsh-mobile-nav" to "移动端 UI 适配（窄屏抽屉/全宽会话）",
@@ -34,11 +36,13 @@ class PluginManagerActivity : Activity() {
             "dsh-net-proxy" to "网络代理（web_search/web_fetch 走代理）",
             "dsh-provider-headers" to "自定义 provider 请求头（设置页配置）",
             "dsh-vision" to "视觉（view_image 工具 + VLM 后端）",
+            "dsh-oh-we-need" to "自动注入 oh-we-need 系统提示词（we need to 句式）",
         )
         const val PRESET_DIR = "router-preset"
         const val PRESET_DESC = "思维模式路由预设（router-pro / router-spec / router-standard，agent-presets）"
         const val REPO_DIR = "plugin-repo"
         const val ROUTING_REPO = "yjh051108/dsh-routing-suite"
+        const val OH_WE_NEED_REPO = "scp3500/oh-we-need"
         private val BASE_BUNDLES = setOf(
             "@deepseek-ai/dsh-base",
             "@deepseek-ai/dsh-web-app",
@@ -64,69 +68,79 @@ class PluginManagerActivity : Activity() {
         super.onCreate(savedInstanceState)
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(0xFF10131A.toInt())
-            setPadding(dp(12), dp(10), dp(12), dp(10))
+            setBackgroundColor(Ui.BG)
+            setPadding(dp(16), dp(14), dp(16), dp(12))
         }
 
         val title = TextView(this).apply {
             text = "插件管理"
-            textSize = 20f
-            setTextColor(0xFFFFFFFF.toInt())
+            textSize = 22f
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            setTextColor(Ui.TEXT_PRIMARY)
         }
         val sub = TextView(this).apply {
             text = "内置插件随 app 自动装配；在线安装通过官方 dsh plugin --profile web add 完成"
-            textSize = 11f
-            setTextColor(0xFF9AA3B2.toInt())
+            textSize = 12f
+            setTextColor(Ui.TEXT_SECONDARY)
+            setPadding(0, dp(2), 0, dp(8))
         }
 
         val tip = TextView(this).apply {
-            text = "可用：mexiaosqwq/dsh-web-mobile · yjh051108/dsh-routing-suite · mafeis/dsh-net-proxy\n本机已内置：dsh-mobile-nav · dsh-super-injector · dsh-net-proxy · dsh-provider-headers · dsh-vision · router-preset"
+            text = "可用：mexiaosqwq/dsh-web-mobile · yjh051108/dsh-routing-suite · mafeis/dsh-net-proxy · scp3500/oh-we-need（内置提示词插件）\n本机已内置：dsh-mobile-nav · dsh-super-injector · dsh-net-proxy · dsh-provider-headers · dsh-vision · dsh-oh-we-need · router-preset"
             textSize = 11f
-            setTextColor(0xFF6B7686.toInt())
+            setTextColor(Ui.TEXT_MUTED)
+            setLineSpacing(dp(2).toFloat(), 1f)
         }
+
+        root.addView(title, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ))
+        root.addView(sub, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ))
+        root.addView(tip, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(4) })
 
         input = EditText(this).apply {
             hint = "GitHub 仓库，如 mexiaosqwq/dsh-web-mobile"
             textSize = 14f
-            setTextColor(0xFFFFFFFF.toInt())
-            setHintTextColor(0xFF556070.toInt())
-            setBackgroundColor(0xFF20242D.toInt())
-            setPadding(dp(10), dp(8), dp(10), dp(8))
+            setTextColor(Ui.TEXT_PRIMARY)
+            setHintTextColor(Ui.TEXT_MUTED)
+            background = Ui.rounded(this@PluginManagerActivity, Ui.SURFACE_INPUT, 12, Ui.OUTLINE)
+            setPadding(dp(14), dp(10), dp(14), dp(10))
             maxLines = 1
             inputType = android.text.InputType.TYPE_CLASS_TEXT
         }
+        root.addView(input, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(10) })
 
-        val installBtn = Button(this).apply {
-            text = "安装 / 更新"
-            textSize = 14f
-            isAllCaps = false
-            setOnClickListener { installFromRepo() }
-        }
-        val wireBtn = Button(this).apply {
-            text = "重新装配"
-            textSize = 14f
-            isAllCaps = false
-            setOnClickListener { rewireBuiltins() }
-        }
-        val restartBtn = Button(this).apply {
-            text = "重启 dsh"
-            textSize = 14f
-            isAllCaps = false
-            setOnClickListener { restartFlow() }
-        }
-        val backBtn = Button(this).apply {
-            text = "返回"
-            textSize = 14f
-            isAllCaps = false
-            setOnClickListener { finish() }
-        }
-        val btnRow = LinearLayout(this).apply {
+        fun rowOf(vararg buttons: View): LinearLayout = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            addView(installBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(wireBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(restartBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(backBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            buttons.forEachIndexed { index, button ->
+                addView(button, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    if (index < buttons.lastIndex) rightMargin = dp(6)
+                })
+            }
         }
+
+        val installBtn = Ui.button(this, "安装 / 更新", { installFromRepo() }, filled = true)
+        val wireBtn = Ui.button(this, "重新装配", { rewireBuiltins() }, filled = false)
+        val restartBtn = Ui.button(this, "重启 dsh", { restartFlow() }, filled = false)
+        val backBtn = Ui.button(this, "返回", { finish() }, filled = false)
+        root.addView(rowOf(installBtn, wireBtn, restartBtn), LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(8) })
+        root.addView(rowOf(backBtn), LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(6) })
 
         listBox = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -134,25 +148,26 @@ class PluginManagerActivity : Activity() {
         val listScroll = ScrollView(this).apply {
             addView(listBox, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         }
+        root.addView(listScroll, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
+        ).apply { topMargin = dp(10) })
 
+        val logCard = Ui.card(this, radiusDp = 12, background = Ui.SURFACE_ALT)
         logView = TextView(this).apply {
             textSize = 11f
             typeface = android.graphics.Typeface.MONOSPACE
-            setTextColor(0xFFB8C2D0.toInt())
-            setBackgroundColor(0xFF1A1F2A.toInt())
-            setPadding(dp(8), dp(6), dp(8), dp(6))
+            setTextColor(Ui.TEXT_SECONDARY)
+            setPadding(dp(2), dp(2), dp(2), dp(2))
         }
         val logScroll = ScrollView(this).apply {
             addView(logView, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         }
+        logCard.addView(logScroll, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        root.addView(logCard, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            dp(150)
+        ).apply { topMargin = dp(8) })
 
-        root.addView(title, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        root.addView(sub, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        root.addView(tip, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        root.addView(input, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        root.addView(btnRow, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        root.addView(listScroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
-        root.addView(logScroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(150)))
         setContentView(root)
 
         appendLog("插件管理就绪（内置 ${BUNDLED.size} 个 + $PRESET_DIR 预设）")
@@ -276,47 +291,60 @@ class PluginManagerActivity : Activity() {
         return try { JSONObject(p.readText()).optString("version", "?") } catch (t: Throwable) { "?" }
     }
 
-    private fun makeCard(name: String, desc: String, ver: String, status: String, actions: List<Pair<String, () -> Unit>>): LinearLayout {
-        val card = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(0xFF1C212C.toInt())
-            setPadding(dp(10), dp(8), dp(10), dp(8))
-        }
+    private fun makeCard(name: String, desc: String, ver: String, status: String, actions: List<Pair<String, () -> Unit>>): View {
+        val card = Ui.card(this, radiusDp = 14, background = Ui.SURFACE, stroke = Ui.OUTLINE)
         val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
         lp.setMargins(0, 0, 0, dp(6))
         card.layoutParams = lp
 
-        val titleRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        card.addView(content, ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ))
+
+        val titleRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+        }
         titleRow.addView(TextView(this).apply {
             text = name
             textSize = 15f
-            setTextColor(0xFFFFFFFF.toInt())
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            setTextColor(Ui.TEXT_PRIMARY)
         }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         titleRow.addView(TextView(this).apply {
             text = "$ver · $status"
             textSize = 11f
-            setTextColor(if (status.contains("已")) 0xFF7FD086.toInt() else 0xFFE0B45A.toInt())
+            setTextColor(if (status.contains("已")) Ui.SUCCESS else Ui.WARNING)
         })
-        card.addView(titleRow)
+        content.addView(titleRow)
 
         if (desc.isNotEmpty()) {
-            card.addView(TextView(this).apply {
+            content.addView(TextView(this).apply {
                 text = desc
-                textSize = 11f
-                setTextColor(0xFF8A95A6.toInt())
+                textSize = 12f
+                setTextColor(Ui.TEXT_SECONDARY)
+                setPadding(0, dp(4), 0, 0)
+                setLineSpacing(dp(1).toFloat(), 1f)
             })
         }
         if (actions.isNotEmpty()) {
-            val actRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            val actRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(0, dp(8), 0, 0)
+            }
             for ((label, fn) in actions) {
-                actRow.addView(Button(this).apply {
-                    text = label
-                    textSize = 12f
-                    isAllCaps = false
-                    setOnClickListener { fn() }
+                actRow.addView(Ui.button(this, label, { fn() }, filled = false, compact = true).apply {
+                    layoutParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    ).apply { rightMargin = dp(6) }
                 })
             }
-            card.addView(actRow)
+            content.addView(actRow)
         }
         return card
     }
@@ -332,6 +360,9 @@ class PluginManagerActivity : Activity() {
         if (repo == ROUTING_REPO) {
             appendLog(">> 特殊适配安装 $repo …")
             runRoutingSuite()
+        } else if (repo == OH_WE_NEED_REPO) {
+            appendLog(">> $repo 是纯提示词仓库，已内置为 dsh-oh-we-need 插件；触发重新装配…")
+            rewireBuiltins()
         } else {
             appendLog(">> 官方 dsh plugin add github:$repo …")
             runDshPlugin(listOf("add", "github:$repo"), "安装 $repo")

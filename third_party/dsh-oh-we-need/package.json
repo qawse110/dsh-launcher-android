@@ -1,0 +1,24 @@
+{
+  "name": "@dsh-external/dsh-oh-we-need",
+  "version": "0.1.0",
+  "description": "自动把 oh-we-need（we need to 句式）注入 DeepSeek Harness 系统提示词，引导 V4 思维链为可执行、第一人称、任务分型风格。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "prompt.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "MIT"
+}

@@ -24,7 +24,7 @@
   - **`AbortSignal.timeout` polyfill 注入 `dist/index.html`**：系统 WebView / Chrome ≤102
     没有该 API，缺失会导致前端 client-connection 无限重连（详见下）。
 - 内置插件经官方 `dsh plugin --profile web add` 装配：`dsh-mobile-nav`、`dsh-super-injector`、
-  `dsh-net-proxy`、`dsh-provider-headers`、`dsh-vision`；`yjh051108/dsh-routing-suite`
+  `dsh-net-proxy`、`dsh-provider-headers`、`dsh-vision`、`dsh-oh-we-need`；`yjh051108/dsh-routing-suite`
   走特殊适配（`routing-suite.mjs`：聚合仓库 + injector/mode-boost 装配 + agent-presets 拷贝）。
 - 自动初始化 `files/.dsh/profiles/web` 配置（含默认 LLM 提供方配置），
   界面内填入 DeepSeek API Key 即可使用。
@@ -72,6 +72,8 @@ adb shell am start -n com.dsh.launcher/.MainActivity   # 或直接点应用图�
 | --- | --- |
 | vendor/loader 无法解析 `@deepseek-ai/…` 包 | `node --expose-internals <cli> web`（命令行参数，而非 NODE_OPTIONS） |
 | `sharp` 加载失败（无 android-arm64 运行时） | Proxy stub（已装/未装两条路径都覆盖） |
+| `node-pty` 被嵌套安装在 `@deepseek-ai/dsh-subprocess-local/node_modules` 下，Android 无 `pty.node` 预编译产物，导致 dsh plugin tree 加载失败、web 无法启动 | `stub-dsh.mjs` 递归查找嵌套 `node_modules` 并打 Proxy stub |
+| `dsh-provider-headers` 的 `sendAttribution: false` 不生效（`@deepseek-ai/dsh-llm-pi-ai` 仍强制注入 `deepseek-harness` User-Agent） | `stub-dsh.mjs` 给 `llm-pi-ai` schema/header 逻辑打补丁，关闭归因后改用自定义 User-Agent |
 | `sandbox-windows-acl` 加载期布局断言崩溃 | 正则禁用 `STARTUPINFOW` / `PROCESS_INFORMATION` 断言 |
 | **WebView 无限 `connection lost` 重连** | **`AbortSignal.timeout` polyfill**：WebView/Chrome ≤102 无此 API，`host.describe` 前置超时调用直接抛错，`loop()` 每次 attempt 立即失败 → 无限重试；在 `dist/index.html` 注入 shim 后握手全部成功 |
 

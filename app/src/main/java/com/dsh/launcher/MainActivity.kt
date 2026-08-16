@@ -5,11 +5,10 @@ import android.content.pm.PackageManager
 import android.os.Handler
 import android.os.Looper
 import android.os.Bundle
-import android.os.Environment
+import android.graphics.Typeface
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
-import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
@@ -68,60 +67,103 @@ class MainActivity : AppCompatActivity() {
     private fun buildUi(): View {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(40), dp(20), dp(24))
+            setBackgroundColor(Ui.BG)
+            setPadding(dp(20), dp(32), dp(20), dp(24))
         }
 
+        // Header
         root.addView(TextView(this).apply {
-            text = "DeepSeek Harness"
-            textSize = 26f
-            setTextColor(0xFF4D6BFE.toInt())
+            text = "⚡ DeepSeek Harness"
+            textSize = 24f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Ui.TEXT_PRIMARY)
             gravity = Gravity.CENTER
         })
-
         root.addView(TextView(this).apply {
             text = "Agent 插件化开发框架 · 本地运行"
             textSize = 13f
-            setTextColor(0xFF8A8A8A.toInt())
+            setTextColor(Ui.TEXT_MUTED)
             gravity = Gravity.CENTER
-            setPadding(0, dp(4), 0, dp(20))
+            setPadding(0, dp(6), 0, dp(20))
         })
 
-        val card = LinearLayout(this).apply {
+        // Section: 运行状态
+        root.addView(Ui.sectionLabel(this, "运行状态"))
+
+        // Status card
+        val card = Ui.card(this, radiusDp = 16, background = Ui.SURFACE)
+        val cardRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setPadding(dp(16), dp(14), dp(16), dp(14))
-            background = roundedBg(0xFFF2F4FF.toInt())
+            gravity = Gravity.CENTER_VERTICAL
         }
-        card.addView(TextView(this).apply {
+        cardRow.addView(TextView(this).apply {
             text = getString(R.string.status_title)
             textSize = 15f
-            setTextColor(0xFF333333.toInt())
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Ui.TEXT_PRIMARY)
         }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
 
         statusValue = TextView(this).apply {
             text = getString(R.string.status_unknown)
-            textSize = 15f
+            textSize = 14f
             gravity = Gravity.END
         }
-        card.addView(statusValue)
-        root.addView(card)
+        cardRow.addView(statusValue)
+        cardRow.addView(Ui.button(this, "刷新", { refreshStatus() }, filled = false, compact = true).apply {
+            minWidth = dp(64)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        })
+        card.addView(cardRow)
+        root.addView(card, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ))
 
         progress = ProgressBar(this).apply { visibility = View.GONE }
         root.addView(progress, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { gravity = Gravity.CENTER_HORIZONTAL; topMargin = dp(4) })
 
-        root.addView(actionButton(getString(R.string.btn_install_one)) {
+        // Section: 快速操作
+        root.addView(Ui.sectionLabel(this, "快速操作").apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(6) }
+        })
+
+        val actionCard = Ui.card(this, radiusDp = 16, background = Ui.SURFACE)
+        val actions = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        actionCard.addView(actions)
+        root.addView(actionCard, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(8) })
+
+        fun addButton(text: String, filled: Boolean, color: Int = Ui.BRAND_DEEP, onClick: () -> Unit) {
+            actions.addView(Ui.button(this, text, onClick, filled = filled, color = color).apply {
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = dp(8) }
+            })
+        }
+
+        addButton(getString(R.string.btn_install_one), true) {
             // 免 Termux 一键：ConsoleActivity 驱动 4 步流程（node→官方 npm 安装 dsh→插件装配→web）
             runCatching {
                 startActivity(Intent(this, ConsoleActivity::class.java).putExtra("dsh", true))
             }.onFailure {
                 log("✗ 无法打开控制台：${it.message}")
             }
-        })
-        root.addView(actionButton(getString(R.string.btn_open_web)) {
+        }
+        addButton(getString(R.string.btn_open_web), false) {
             startActivity(Intent(this, WebViewActivity::class.java))
-        })
-        root.addView(actionButton(getString(R.string.btn_open_terminal)) {
+        }
+        addButton(getString(R.string.btn_open_terminal), false) {
             thread {
                 if (!TermuxRuntime.isReady(this@MainActivity)) {
                     log("准备内置 Termux 环境（首次约 10~60 秒）…")
@@ -136,69 +178,70 @@ class MainActivity : AppCompatActivity() {
                     startActivity(Intent(this@MainActivity, TerminalActivity::class.java))
                 }
             }
-        })
-        root.addView(actionButton(getString(R.string.btn_node_check)) {
+        }
+        addButton(getString(R.string.btn_node_check), false) {
             runNodeDsh()
-        })
-        root.addView(actionButton(getString(R.string.btn_stop_all)) {
+        }
+        addButton(getString(R.string.btn_stop_all), false, Ui.DANGER) {
             stopDshAll()
+        }
+
+        // Section: 日志
+        root.addView(Ui.sectionLabel(this, "日志").apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(6) }
         })
 
         // 反馈日志栏
+        val logCard = Ui.card(this, radiusDp = 14, background = Ui.SURFACE_ALT)
         logView = TextView(this).apply {
-            setTextColor(0xFF444444.toInt())
+            setTextColor(Ui.TEXT_SECONDARY)
             textSize = 12f
-            setPadding(dp(4), dp(10), dp(4), dp(2))
+            setPadding(dp(4), dp(2), dp(4), dp(2))
+            setLineSpacing(dp(2).toFloat(), 1f)
         }
-        root.addView(logView)
+        logCard.addView(logView)
+        root.addView(logCard, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(14) })
 
-        // 内置 Node 状态
+        // Section: 运行环境
+        root.addView(Ui.sectionLabel(this, "运行环境").apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(6) }
+        })
+
+        // 内置 Node / Termux 状态
         root.addView(TextView(this).apply {
             text = if (hasNodeMarker()) "内置 Node：已就绪 ✓"
                    else "内置 Node：未解压（点上方按钮首次自动解压 ⏳）"
-            textSize = 12f
-            setTextColor(if (hasNodeMarker()) 0xFF2DB85B.toInt() else 0xFFCC4444.toInt())
-            setPadding(0, dp(8), 0, 0)
+            textSize = 13f
+            setTextColor(if (hasNodeMarker()) Ui.SUCCESS else Ui.WARNING)
+            setPadding(0, dp(12), 0, 0)
         })
-
         root.addView(TextView(this).apply {
             val ready = TermuxRuntime.isReady(this@MainActivity)
             text = if (ready) "内置 Termux：已就绪 ✓（bash + coreutils + apt，可执行 Linux 指令）"
                    else "内置 Termux：未解压（首次执行命令/打开终端自动准备）"
-            textSize = 12f
-            setTextColor(if (ready) 0xFF2DB85B.toInt() else 0xFFCC4444.toInt())
+            textSize = 13f
+            setTextColor(if (ready) Ui.SUCCESS else Ui.WARNING)
             setPadding(0, dp(4), 0, 0)
         })
 
         root.addView(TextView(this).apply {
             text = "操作步骤：\n① 点“⚡ 一键安装并启动 DSH”自动完成：内置 Node 解压 → 官方 npm 安装/更新 dsh → dsh plugin 装配内置插件 → 启动 Web（首次需联网下载，之后增量更新）；\n② “打开 Web 界面”查看 dsh UI（http://127.0.0.1:3080）；\n③ “停止 dsh 服务”结束后台进程与保活服务。\n\n提示：\n· 全程免 Termux，内置 Node 为 aarch64 运行时；\n· 安装日志：/sdcard/Download/DshLauncher/install_log.txt。"
             textSize = 12f
-            setTextColor(0xFF9A9A9A.toInt())
+            setTextColor(Ui.TEXT_MUTED)
             setPadding(0, dp(18), 0, 0)
             setLineSpacing(dp(3).toFloat(), 1f)
         })
 
         return ScrollView(this).apply { addView(root) }
-    }
-
-    private fun actionButton(text: String, onClick: () -> Unit): Button =
-        Button(this, null, android.R.attr.buttonBarButtonStyle).apply {
-            this.text = text
-            setTextSize(16f)
-            isAllCaps = false
-            setPadding(0, dp(2), 0, dp(2))
-            val lp = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            )
-            lp.topMargin = dp(10)
-            layoutParams = lp
-            setOnClickListener { onClick() }
-        }
-
-    private fun roundedBg(color: Int) = android.graphics.drawable.GradientDrawable().apply {
-        setColor(color)
-        cornerRadius = dp(12).toFloat()
     }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()

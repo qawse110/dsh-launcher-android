@@ -1,0 +1,4 @@
+# dsh-oh-we-need bundle 层：自动注入 oh-we-need 系统提示词。
+- insert:
+    - id: dsh-oh-we-need
+      name: '@dsh-external/dsh-oh-we-need'
