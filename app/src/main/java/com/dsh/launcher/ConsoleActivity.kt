@@ -292,6 +292,17 @@ class ConsoleActivity : AppCompatActivity() {
                 } catch (t: Throwable) {
                     fl("FAIL 3.5/4 assets copy stub-dsh.mjs: ${t.message}")
                 }
+                // SELinux 禁止 app 对 data 文件硬链接；dsh session 首次落盘用 link()
+                // 发布。通过 Node loader 把 node:fs/promises 的 link 重定向为 rename 兼容实现。
+                for (name in listOf("fs-register.mjs", "fs-loader.mjs", "fs-promises-compat.mjs")) {
+                    try {
+                        assets.open(name).use { input ->
+                            File(filesDir, name).outputStream().use { output -> input.copyTo(output) }
+                        }
+                    } catch (t: Throwable) {
+                        fl("WARN assets copy $name: ${t.message}")
+                    }
+                }
                 runCommandAndWait("$nodeDir/bin/node ${stubScript.absolutePath}")
 
                 fl(">> 4/4 校验 dsh web…")
@@ -459,7 +470,7 @@ class ConsoleActivity : AppCompatActivity() {
             "export OPENSSL_CONF=/dev/null\n" +
             "export PATH=${nodeDir.absolutePath}/bin:/system/bin:/bin\n" +
             "cd $dshHome\n" +
-            "nohup ${nodeDir.absolutePath}/bin/node --expose-internals ./$cliEntry web > ${filesDir.absolutePath}/dsh-web.log 2>&1 &\n" +
+            "nohup ${nodeDir.absolutePath}/bin/node --expose-internals --import ${filesDir.absolutePath}/fs-register.mjs ./$cliEntry web > ${filesDir.absolutePath}/dsh-web.log 2>&1 &\n" +
             "echo DSH_WEB_PID=$!\n"
         )
         launcher.setExecutable(true)

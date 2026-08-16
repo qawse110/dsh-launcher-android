@@ -350,6 +350,14 @@ class PluginManagerActivity : Activity() {
                 try {
                     assets.open("stub-dsh.mjs").use { ins -> stub.outputStream().use { ous -> ins.copyTo(ous) } }
                 } catch (t: Throwable) { appendLog("   WARN 无法刷新 stub: ${t.message}") }
+                // 保持 fs link 兼容层与 stub 同步（SELinux 禁硬链接，dsh 用 link 发布会话日志）
+                for (name in listOf("fs-register.mjs", "fs-loader.mjs", "fs-promises-compat.mjs")) {
+                    try {
+                        assets.open(name).use { ins ->
+                            File(filesDir, name).outputStream().use { ous -> ins.copyTo(ous) }
+                        }
+                    } catch (t: Throwable) { appendLog("   WARN 无法刷新 $name: ${t.message}") }
+                }
                 val node = File(File(nodeDir, "bin"), "node")
                 val cmd = "${node.absolutePath} ${stub.absolutePath} ${args.joinToString(" ")}"
                 appendLog("   $ ${cmd.replace(stub.absolutePath, "stub-dsh.mjs")}")

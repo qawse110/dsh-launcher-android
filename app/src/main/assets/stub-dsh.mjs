@@ -383,6 +383,6 @@ try {
 // 原生 TS 运行 src/bin.ts。web 是 --profile web 的别名，首次运行会自动初始化 profile。
 const cliBin = existsSync(join(DSH_DIR, 'apps/cli/lib/bin.js')) ? join(DSH_DIR, 'apps/cli/lib/bin.js') : join(DSH_DIR, 'apps/cli/src/bin.ts');
 log('cli entry: ' + cliBin);
-const web = spawnSync('/system/bin/sh', ['-c', 'cd ' + DSH_DIR + ' && nohup ' + NODE + '/bin/node --expose-internals ' + cliBin + ' web > ' + join(HOME, 'dsh-web.log') + ' 2>&1 & echo PID=$!'], { env, encoding: 'utf8', timeout: 30000 });
+const web = spawnSync('/system/bin/sh', ['-c', 'cd ' + DSH_DIR + ' && nohup ' + NODE + '/bin/node --expose-internals --import ' + join(HOME, 'fs-register.mjs') + ' ' + cliBin + ' web > ' + join(HOME, 'dsh-web.log') + ' 2>&1 & echo PID=$!'], { env, encoding: 'utf8', timeout: 30000 });
 log('web: ' + ((web.stdout || '').trim() || 'status=' + web.status));
 log('=== fixup done ===');
