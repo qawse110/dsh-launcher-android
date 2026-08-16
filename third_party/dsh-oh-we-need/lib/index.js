@@ -6,7 +6,7 @@
  */
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 export const name = 'dsh-oh-we-need'
@@ -76,7 +76,7 @@ function candidateFor(entry) {
     },
     source: 'bundled',
     provider: PROVIDER_NAME,
-    resourceBase: { kind: 'directory', path: SKILLS_DIR },
+    resourceBase: { kind: 'directory', path: dirname(entry.filePath) },
     rank: BUNDLED_SKILL_RANK,
     locator: locatorFor(entry),
     path: entry.filePath,
@@ -97,7 +97,7 @@ async function loadDefinition(candidate) {
     },
     source: 'bundled',
     provider: PROVIDER_NAME,
-    resourceBase: { kind: 'directory', path: SKILLS_DIR },
+    resourceBase: { kind: 'directory', path: dirname(entry.filePath) },
     content: entry.body,
     path: entry.filePath,
   }
