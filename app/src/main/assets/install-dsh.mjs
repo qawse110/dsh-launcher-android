@@ -169,7 +169,7 @@ function ensureDsh() {
   log('install/update @deepseek-ai/dsh via npm ...');
   const ok = run(NPM_BIN, [
     'install', '--prefix', DSH_PREFIX, '@deepseek-ai/dsh@latest',
-    '--registry', REGISTRY, '--no-audit', '--no-fund', '--ignore-scripts',
+    '--registry', REGISTRY, '--no-audit', '--no-fund', '--ignore-scripts', '--force',
   ], { env: envBase() });
   if (!ok || !dshInstalled()) {
     log('FATAL: official dsh install/update failed');
@@ -179,6 +179,59 @@ function ensureDsh() {
     const pkg = JSON.parse(readFileSync(join(DSH_PREFIX, 'node_modules/@deepseek-ai/dsh/package.json'), 'utf8'));
     log('dsh version: ' + (pkg.version || 'unknown'));
   } catch {}
+}
+
+/**
+ * Android 兼容：@vscode/ripgrep 没有 android-arm64 平台包，导致
+ * dsh-tool-fs-search 的 glob/grep 工具报
+ * “glob could not start its search command (ripgrep launch failed)”。
+ * 这里显式安装 @vscode/ripgrep-linux-arm64（静态二进制，可在 Android 上运行），
+ * 供 stub-dsh.mjs 把 @vscode/ripgrep 解析器指向它。
+ * --force 是必要的：npm 在 process.platform=android 时会按 EBADPLATFORM 拒绝 linux 包。
+ */
+function ensureRipgrepFallback() {
+  const rgPkg = join(DSH_PREFIX, 'node_modules/@vscode/ripgrep/package.json');
+  if (!existsSync(rgPkg)) {
+    log('@vscode/ripgrep not installed, skip ripgrep fallback');
+    return;
+  }
+  let rgVersion = '1.18.0';
+  try {
+    rgVersion = JSON.parse(readFileSync(rgPkg, 'utf8')).version || rgVersion;
+  } catch {}
+  const fallbackDir = join(DSH_PREFIX, 'node_modules/@vscode/ripgrep-linux-arm64');
+  const fallbackBin = join(fallbackDir, 'bin/rg');
+  if (existsSync(fallbackBin)) {
+    // 防止旧安装里 fallback 是 extraneous 包、下次 npm install 被 prune 掉。
+    try {
+      const pkgFile = join(DSH_PREFIX, 'package.json');
+      const pkg = JSON.parse(readFileSync(pkgFile, 'utf8'));
+      pkg.dependencies = pkg.dependencies || {};
+      pkg.dependencies['@vscode/ripgrep-linux-arm64'] = pkg.dependencies['@vscode/ripgrep-linux-arm64'] || '^' + rgVersion;
+      writeFileSync(pkgFile, JSON.stringify(pkg, null, 2) + '\n');
+    } catch (e) {
+      log('WARN declare ripgrep fallback: ' + e.message);
+    }
+    log('ripgrep linux-arm64 fallback already present: ' + fallbackBin);
+    return;
+  }
+  log('installing ripgrep linux-arm64 fallback @' + rgVersion + ' ...');
+  let ok = run(NPM_BIN, [
+    'install', '--prefix', DSH_PREFIX, `@vscode/ripgrep-linux-arm64@${rgVersion}`,
+    '--registry', REGISTRY, '--no-audit', '--no-fund', '--ignore-scripts', '--force',
+  ], { env: envBase() });
+  if (!ok || !existsSync(fallbackBin)) {
+    log('exact version fallback install failed, retrying latest ...');
+    ok = run(NPM_BIN, [
+      'install', '--prefix', DSH_PREFIX, '@vscode/ripgrep-linux-arm64',
+      '--registry', REGISTRY, '--no-audit', '--no-fund', '--ignore-scripts', '--force',
+    ], { env: envBase() });
+  }
+  if (!ok || !existsSync(fallbackBin)) {
+    log('WARN: ripgrep linux-arm64 fallback install failed (glob/grep may fail on Android)');
+  } else {
+    log('ripgrep linux-arm64 fallback ready: ' + fallbackBin);
+  }
 }
 
 /** 解析 ustar tar（无需外部工具）：文件/目录/符号链接；只提取指定前缀。 */
@@ -408,9 +461,12 @@ const pluginsOnly = process.argv.includes('--plugins-only');
 ensurePnpm();
 if (!pluginsOnly) {
   ensureDsh();
+  ensureRipgrepFallback();
 } else if (!dshInstalled()) {
   log('FATAL: --plugins-only but dsh not installed yet');
   process.exit(1);
+} else {
+  ensureRipgrepFallback();
 }
 
 extractPlugins();

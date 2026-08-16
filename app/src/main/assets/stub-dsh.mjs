@@ -222,6 +222,58 @@ try {
 } catch (e) { log('WARN index shim: ' + e.message); }
 
 try {
+  // @vscode/ripgrep：Android 没有 @vscode/ripgrep-android-arm64 平台包，
+  // 导致 dsh-tool-fs-search 的 glob/grep 报 “ripgrep launch failed”。
+  // 这里把解析器改为优先原平台包、缺失时回退到 linux-arm64 静态二进制
+  // （由 install-dsh.mjs 安装到 dsh-prefix/node_modules）。
+  const rgMain = findPkg('@vscode/ripgrep', 'lib/index.js');
+  if (!rgMain) {
+    log('@vscode/ripgrep: not found, skip android fallback');
+  } else {
+    const fallbackRg = findPkg('@vscode/ripgrep-linux-arm64', 'bin/rg')
+      || (existsSync(join(HOME, 'termux/usr/bin/rg')) ? join(HOME, 'termux/usr/bin/rg') : null);
+    if (!fallbackRg) {
+      log('@vscode/ripgrep: linux-arm64 fallback not found, skip (install-dsh should install it)');
+    } else {
+      const src = readFileSync(rgMain, 'utf8');
+      if (src.includes('dsh-launcher-android-ripgrep')) {
+        log('@vscode/ripgrep android fallback already patched');
+      } else {
+        const patched = `// dsh-launcher-android-ripgrep
+import { createRequire } from 'node:module';
+import { existsSync } from 'node:fs';
+
+const require = createRequire(import.meta.url);
+
+const arch = process.env.npm_config_arch || process.arch;
+const binaryName = process.platform === 'win32' ? 'rg.exe' : 'rg';
+const platformPkg = \`@vscode/ripgrep-\${process.platform}-\${arch}\`;
+const FALLBACK_RG = ${JSON.stringify(fallbackRg)};
+
+let resolved;
+try {
+  resolved = require.resolve(\`\${platformPkg}/bin/\${binaryName}\`);
+} catch {
+  try {
+    // Android 没有 @vscode/ripgrep-android-*；优先使用 linux-arm64 静态二进制。
+    const fallbackPkg = \`@vscode/ripgrep-linux-\${arch}\`;
+    resolved = require.resolve(\`\${fallbackPkg}/bin/\${binaryName}\`);
+  } catch {
+    if (existsSync(FALLBACK_RG)) resolved = FALLBACK_RG;
+  }
+}
+if (!resolved) throw new Error(\`No ripgrep binary for \${process.platform}-\${arch}\`);
+
+export const rgPath = resolved;
+`;
+        writeFileSync(rgMain, patched);
+        log('@vscode/ripgrep android fallback patched: ' + rgMain);
+      }
+    }
+  }
+} catch (e) { log('WARN @vscode/ripgrep: ' + e.message); }
+
+try {
   // 保持旧版占位补丁文件为空（koffi 已 stub，无需禁用行）
   const patch = join(HOME, 'patch-koffi.yml');
   writeFileSync(patch, '# native stubs in place, no disables\n');
