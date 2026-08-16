@@ -22,7 +22,14 @@ object TermuxRuntime {
 
     private const val ASSET = "termux-bootstrap.zip"
     private const val MARKER = ".termux-ok"
+    private const val MARKER_VERSION = "6"
     private const val DIR_NAME = "termux"
+
+    /** 官方二进制硬编码的 Termux 前缀（长度 31）。 */
+    private const val OFFICIAL_PREFIX = "/data/data/com.termux/files/usr"
+
+    /** 等长替换用的短前缀，通过 dataDir/t -> files/termux/usr 符号链接映射。 */
+    private const val SHORT_PREFIX = "/data/user/0/com.dsh.launcher/t"
 
     /** APK asset 是否存在（构建时内置）。 */
     fun hasAsset(context: Context): Boolean = runCatching {
@@ -30,7 +37,9 @@ object TermuxRuntime {
         true
     }.getOrDefault(false)
 
-    fun isReady(context: Context): Boolean = File(context.filesDir, MARKER).exists()
+    fun isReady(context: Context): Boolean = runCatching {
+        File(context.filesDir, MARKER).readText().trim() == MARKER_VERSION
+    }.getOrDefault(false)
 
     fun prefix(context: Context): File = File(context.filesDir, "$DIR_NAME/usr")
 
@@ -102,21 +111,31 @@ object TermuxRuntime {
             }
             progress("解压完成，创建符号链接…")
             applySymlinks(usr, symlinks.toString())
-            patchApt(usr)
+            createPrefixShortcut(context)
+            createOfficialMirror(context)
+            progress("适配 Termux 官方硬编码路径（${OFFICIAL_PREFIX} → ${SHORT_PREFIX}）…")
+            patchPrefixAll(usr)
+            patchTextOfficialDirs(usr)
+            writeAptConfig(context, usr)
+            writeShellAptHelper(usr)
+            disableSecondStageFallback(usr)
 
             // 可写业务目录：home / tmp / var（apt/dpkg 需要 var 可写）
             home(context).mkdirs()
             tmp(context).mkdirs()
             File(usr, "var").mkdirs()
             File(usr, "var/lib/dpkg").mkdirs()
+            File(usr, "var/lib/apt/lists/partial").mkdirs()
             File(usr, "var/cache/apt").mkdirs()
+            File(usr, "var/cache/apt/archives/partial").mkdirs()
+            File(usr, "var/log/apt").mkdirs()
 
             // W^X：bin/lib/share 只读可执行；var 保持可写
             makeUnwritable(File(usr, "bin"), File(usr, "bin"))
             makeUnwritable(File(usr, "lib"), File(usr, "lib"))
             makeUnwritable(File(usr, "share"), File(usr, "share"))
 
-            File(context.filesDir, MARKER).writeText("ok")
+            File(context.filesDir, MARKER).writeText(MARKER_VERSION)
             progress("Termux 环境就绪（$usr）")
             cache.delete()
             return usr
@@ -190,41 +209,216 @@ object TermuxRuntime {
     }
 
     /**
-     * 给 apt 生成 PREFIX 适配 wrapper：
-     * 官方 apt 二进制把 `/data/data/com.termux/files/usr` 编译死，直接运行会去读其他
-     * 应用的私有目录。这里把真二进制改为 apt.bin，用系统 sh 包一层，显式传入
-     * 完整的 Dir/State/Cache 覆盖参数，使 apt 至少在 update/list/download 等
-     * 不写 bin/lib 的操作上可用。安装包（写 bin/lib + 调 dpkg）留待后续补强。
+     * 在 dataDir 根创建短前缀符号链接 `t`：
+     * 官方二进制把 `/data/data/com.termux/files/usr`（31 字符）编译死，
+     * 无法原地替换成更长的真实 prefix；这里用等长的短路径
+     * `/data/user/0/com.dsh.launcher/t`（31 字符）映射到真实目录，
+     * 使所有 ELF/脚本里的硬编码路径无需改变长度即可 patch。
      */
-    private fun patchApt(usr: File) {
+    private fun createPrefixShortcut(context: Context) {
         try {
-            val apt = File(usr, "bin/apt")
-            val real = File(usr, "bin/apt.bin")
-            if (!apt.isFile || real.exists()) return
-            if (!apt.renameTo(real)) return
-            val prefix = usr.absolutePath
-            val script = "#!/system/bin/sh\n" +
-                "export PREFIX=\"$prefix\"\n" +
-                "export LD_LIBRARY_PATH=\"$prefix/lib\"\n" +
-                "export PATH=\"$prefix/bin:$prefix/bin/applets:/system/bin:/bin\"\n" +
-                "exec \"$prefix/bin/apt.bin\" \\\n" +
-                "  -o Dir=\"$prefix\" \\\n" +
-                "  -o Dir::Etc::parts=\"$prefix/etc/apt/apt.conf.d\" \\\n" +
-                "  -o Dir::Etc::sourcelist=\"$prefix/etc/apt/sources.list\" \\\n" +
-                "  -o Dir::Etc::sourceparts=\"$prefix/etc/apt/sources.list.d\" \\\n" +
-                "  -o Dir::Etc::trustedparts=\"$prefix/etc/apt/trusted.gpg.d\" \\\n" +
-                "  -o Dir::State::status=\"$prefix/var/lib/dpkg/status\" \\\n" +
-                "  -o Dir::State::lists=\"$prefix/var/lib/apt/lists\" \\\n" +
-                "  -o Dir::Cache::archives=\"$prefix/var/cache/apt/archives\" \\\n" +
-                "  -o Dir::Cache::srcpkgcache=\"$prefix/var/cache/apt/srcpkgcache.bin\" \\\n" +
-                "  -o Dir::Cache::pkgcache=\"$prefix/var/cache/apt/pkgcache.bin\" \\\n" +
-                "  \"$@\"\n"
-            apt.writeText(script)
-            apt.setExecutable(true, false)
-            android.util.Log.i("TermuxRuntime", "apt wrapper installed")
+            val target = prefix(context).absolutePath
+            val link = File(context.dataDir, "t")
+            if (java.nio.file.Files.isSymbolicLink(link.toPath())) {
+                val dest = link.canonicalFile.absolutePath
+                if (dest == target) return
+                link.delete()
+            } else if (link.exists()) {
+                if (link.isFile) {
+                    link.delete()
+                } else {
+                    android.util.Log.w("TermuxRuntime", "shortcut path exists as dir: ${link.absolutePath}")
+                    return
+                }
+            }
+            if (!link.exists()) {
+                Files.createSymbolicLink(link.toPath(), Paths.get(target))
+                android.util.Log.i("TermuxRuntime", "shortcut created: ${link.absolutePath} -> $target")
+            }
         } catch (t: Throwable) {
-            android.util.Log.w("TermuxRuntime", "patchApt failed: ${t.message}")
+            android.util.Log.w("TermuxRuntime", "createPrefixShortcut failed: ${t.message}")
         }
+    }
+
+    /**
+     * 创建官方文件系统镜像 `data/data/com.termux/files -> files/termux`。
+     * dpkg 安装包时使用 `--instdir=<dataDir>`，包内绝对路径
+     * `/data/data/com.termux/files/usr/...` 会落到 dataDir 下这个镜像，
+     * 经符号链接写入真实 Termux 目录。
+     */
+    private fun createOfficialMirror(context: Context) {
+        try {
+            val mirror = File(context.dataDir, "data/data/com.termux/files")
+            val target = File(context.filesDir, DIR_NAME).absolutePath
+            mirror.parentFile?.mkdirs()
+            if (java.nio.file.Files.isSymbolicLink(mirror.toPath())) {
+                val dest = mirror.canonicalFile.absolutePath
+                if (dest == target) return
+                mirror.delete()
+            } else if (mirror.exists()) {
+                if (mirror.isFile) {
+                    mirror.delete()
+                } else {
+                    android.util.Log.w("TermuxRuntime", "mirror exists as dir: ${mirror.absolutePath}")
+                    return
+                }
+            }
+            if (!mirror.exists()) {
+                Files.createSymbolicLink(mirror.toPath(), Paths.get(target))
+                android.util.Log.i("TermuxRuntime", "mirror created: $mirror -> $target")
+            }
+        } catch (t: Throwable) {
+            android.util.Log.w("TermuxRuntime", "createOfficialMirror failed: ${t.message}")
+        }
+    }
+
+    /**
+     * 文本脚本/配置中可能还带官方 files 根路径（如 `/data/data/com.termux/files/home`）。
+     * 二进制只能等长替换，已由 patchPrefixAll 处理；文本文件可以安全地用镜像长路径替换，
+     * 让 profile.d 等脚本通过 dataDir 下的 `data/data/com.termux/files` 符号链接落到真实目录。
+     * 只处理不含 NUL 的普通文本文件，避免破坏 ELF/其他二进制。
+     */
+    private fun patchTextOfficialDirs(usr: File) {
+        try {
+            val old = "/data/data/com.termux/files"
+            val mirror = "/data/user/0/com.dsh.launcher/data/data/com.termux/files"
+            var patched = 0
+            usr.walkTopDown().forEach { f ->
+                if (!f.isFile || java.nio.file.Files.isSymbolicLink(f.toPath())) return@forEach
+                try {
+                    val bytes = java.nio.file.Files.readAllBytes(f.toPath())
+                    if (bytes.any { it == 0.toByte() }) return@forEach
+                    val text = String(bytes, Charsets.ISO_8859_1)
+                    if (text.contains(old)) {
+                        val fixed = text.replace(old, mirror)
+                        java.nio.file.Files.write(f.toPath(), fixed.toByteArray(Charsets.ISO_8859_1))
+                        patched++
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+            android.util.Log.i("TermuxRuntime", "patched $patched text files for official files path")
+        } catch (t: Throwable) {
+            android.util.Log.w("TermuxRuntime", "patchTextOfficialDirs failed: ${t.message}")
+        }
+    }
+
+    /**
+     * 写 apt 的 PREFIX 适配配置：
+     * - Cache/State 指到真实的 var/cache/apt（避免官方 cache 路径权限问题）
+     * - dpkg 安装时用 `--instdir=<dataDir>` + 上面的官方镜像写入真实目录，
+     *   `--admindir` 指到已有的 dpkg 数据库。
+     */
+    private fun writeAptConfig(context: Context, usr: File) {
+        try {
+            val dataDir = context.dataDir.absolutePath
+            val config = File(usr, "etc/apt/apt.conf.d/00-dsh")
+            config.parentFile?.mkdirs()
+            config.writeText(
+                "Dir::Cache::archives \"$usr/var/cache/apt/archives\";\n" +
+                    "Dir::Cache::srcpkgcache \"$usr/var/cache/apt/srcpkgcache.bin\";\n" +
+                    "Dir::Cache::pkgcache \"$usr/var/cache/apt/pkgcache.bin\";\n" +
+                    "DPkg::Options:: \"--instdir=$dataDir\";\n" +
+                    "DPkg::Options:: \"--admindir=$dataDir/t/var/lib/dpkg\";\n"
+            )
+            android.util.Log.i("TermuxRuntime", "apt config written")
+        } catch (t: Throwable) {
+            android.util.Log.w("TermuxRuntime", "writeAptConfig failed: ${t.message}")
+        }
+    }
+
+    /**
+     * 给交互式 login shell（TerminalActivity）写 apt/pkg 自动 W^X 切换函数：
+     * 在终端里敲 `apt install` 时自动放开 bin/lib/share，命令结束恢复只读。
+     * ConsoleActivity 的命令行进程不走 profile，已由应用层自动切换覆盖。
+     */
+    private fun writeShellAptHelper(usr: File) {
+        try {
+            val dir = File(usr, "etc/profile.d")
+            dir.mkdirs()
+            val helper = File(dir, "00-dsh-apt.sh")
+            helper.writeText(
+                """
+                # 内置 Termux：apt/pkg 安装类命令自动放开 W^X，结束后恢复
+                __dsh_writable() { chmod -R u+w "${'$'}PREFIX/bin" "${'$'}PREFIX/lib" "${'$'}PREFIX/share" 2>/dev/null || true; }
+                __dsh_restore() { chmod -R u-w "${'$'}PREFIX/bin" "${'$'}PREFIX/lib" "${'$'}PREFIX/share" 2>/dev/null || true; }
+                apt() {
+                  case " ${'$'}* " in
+                    *" install "*|*" reinstall "*|*" upgrade "*|*" dist-upgrade "*|*" remove "*|*" purge "*)
+                      __dsh_writable; command apt "${'$'}@"; local rc=${'$'}?; __dsh_restore; return ${'$'}rc;;
+                    *) command apt "${'$'}@";;
+                  esac
+                }
+                apt-get() {
+                  case " ${'$'}* " in
+                    *" install "*|*" reinstall "*|*" upgrade "*|*" dist-upgrade "*|*" remove "*|*" purge "*)
+                      __dsh_writable; command apt-get "${'$'}@"; local rc=${'$'}?; __dsh_restore; return ${'$'}rc;;
+                    *) command apt-get "${'$'}@";;
+                  esac
+                }
+                pkg() {
+                  case " ${'$'}* " in
+                    *" install "*|*" reinstall "*|*" upgrade "*|*" dist-upgrade "*|*" remove "*|*" purge "*)
+                      __dsh_writable; command pkg "${'$'}@"; local rc=${'$'}?; __dsh_restore; return ${'$'}rc;;
+                    *) command pkg "${'$'}@";;
+                  esac
+                }
+                """.trimIndent() + "\n"
+            )
+            helper.setExecutable(true, false)
+            android.util.Log.i("TermuxRuntime", "shell apt helper written")
+        } catch (t: Throwable) {
+            android.util.Log.w("TermuxRuntime", "writeShellAptHelper failed: ${t.message}")
+        }
+    }
+
+    /**
+     * 禁用 Termux 的 second-stage fallback：
+     * 官方首次 login 会尝试执行 bootstrap second-stage，但它依赖官方绝对路径
+     * `/data/data/com.termux` 且需要可写 bin，在第三方 app 私有目录会失败刷屏。
+     * 我们的环境已经通过 apt/镜像适配准备好，直接移除该 fallback，避免每次
+     * login 重复报错。
+     */
+    private fun disableSecondStageFallback(usr: File) {
+        try {
+            val f = File(usr, "etc/profile.d/01-termux-bootstrap-second-stage-fallback.sh")
+            if (f.exists() && !java.nio.file.Files.isSymbolicLink(f.toPath())) {
+                f.delete()
+                android.util.Log.i("TermuxRuntime", "second-stage fallback disabled")
+            }
+        } catch (t: Throwable) {
+            android.util.Log.w("TermuxRuntime", "disableSecondStageFallback failed: ${t.message}")
+        }
+    }
+
+    /**
+     * 扫描整个 PREFIX，把所有普通文件中的官方硬编码路径等长替换为短前缀。
+     * 覆盖 ELF 二进制、动态库、shell 脚本、pkgconfig、dpkg 清单等，
+     * 使 apt/dpkg/bash 等全部通过 `t` 符号链接访问真实目录。
+     */
+    private fun patchPrefixAll(usr: File) {
+        val old = OFFICIAL_PREFIX
+        val new = SHORT_PREFIX
+        if (old.length != new.length) {
+            android.util.Log.e("TermuxRuntime", "prefix patch length mismatch: ${old.length} != ${new.length}")
+            return
+        }
+        var patched = 0
+        usr.walkTopDown().forEach { f ->
+            if (!f.isFile || java.nio.file.Files.isSymbolicLink(f.toPath())) return@forEach
+            try {
+                val bytes = java.nio.file.Files.readAllBytes(f.toPath())
+                // Latin-1 保证字节级无损，且 old/new 同长，替换后所有其它字节不变
+                val text = String(bytes, Charsets.ISO_8859_1)
+                if (text.contains(old)) {
+                    java.nio.file.Files.write(f.toPath(), text.replace(old, new).toByteArray(Charsets.ISO_8859_1))
+                    patched++
+                }
+            } catch (t: Throwable) {
+                // 单个文件失败不影响整体（例如权限/占用）
+            }
+        }
+        android.util.Log.i("TermuxRuntime", "prefix patched files=$patched")
     }
 
     /** 把官方 `./路径` 或其它相对/绝对引用解析为 [usr] 下的绝对路径；无法解析返回 null。 */

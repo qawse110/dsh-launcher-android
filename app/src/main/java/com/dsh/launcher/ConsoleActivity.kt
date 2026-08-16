@@ -571,10 +571,16 @@ class ConsoleActivity : AppCompatActivity() {
     private fun runCommandAndWait(raw: String, extraEnv: Map<String, String> = emptyMap(), termux: Boolean = false): Int {
         setState("运行中…")
         AppLog.i("Console", "cmd: $raw")
+        val termuxReady = termux && TermuxRuntime.isBashReady(this)
+        val wantsWrite = termuxReady && looksLikePackageInstall(raw)
         return try {
-            val useTermux = termux && TermuxRuntime.isBashReady(this)
+            val useTermux = termuxReady
             // 用户命令用内置 Termux bash；内部 flow 命令仍用系统 sh（避免自动解压拖慢 dsh）
             val shell = if (useTermux) TermuxRuntime.bashPath(this).absolutePath else "/system/bin/sh"
+            if (wantsWrite) {
+                appendLine(">> 检测到安装类命令：临时放开 bin/lib/share 写权限…")
+                TermuxRuntime.setRuntimeWritable(this, true)
+            }
             val pb = ProcessBuilder(shell, "-c", raw)
             pb.redirectErrorStream(true)
             val env = pb.environment()
@@ -627,7 +633,19 @@ class ConsoleActivity : AppCompatActivity() {
             setState("出错")
             appendLine("[执行失败: ${e.message}]")
             -1
+        } finally {
+            if (wantsWrite) {
+                runCatching { TermuxRuntime.setRuntimeWritable(this, false) }
+                appendLine(">> 安装命令结束，已恢复 bin/lib/share 只读（W^X 保护）")
+            }
         }
+    }
+
+    /** 判断命令是否可能写入 bin/lib/share（apt/pkg/dpkg 安装类），用于临时放开 W^X。 */
+    private fun looksLikePackageInstall(raw: String): Boolean {
+        val lc = raw.lowercase()
+        return Regex("""\b(apt|apt-get|pkg)\b[^\n;&]*\b(install|reinstall|upgrade|dist-upgrade)\b""").containsMatchIn(lc) ||
+            Regex("""\bdpkg\b[^\n;&]*\b(-i|--install)\b""").containsMatchIn(lc)
     }
 
     private fun setState(s: String) {
