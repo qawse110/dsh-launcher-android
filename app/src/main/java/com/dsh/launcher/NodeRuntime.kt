@@ -39,35 +39,16 @@ object NodeRuntime {
         try {
             val stream = openAsset(context)  // 已去除 gzip 头
             opened = true
-                stream.use { raw ->
-                    TarArchiveInputStream(raw).use { tar ->
-                        var e: TarArchiveEntry? = tar.nextEntry
-                        while (e != null) {
-                            val name = e.name.removePrefix("./").removePrefix("/") // 防路径穿越
-                            val out = File(dir, name)
-                            if (e.isDirectory) {
-                                out.mkdirs()
-                            } else if (e.isSymbolicLink) {
-                                // Termux 包大量使用符号链接（libcrypto.so -> libcrypto.so.3）。
-                                // 必须真实创建符号链接，否则会写成 0 字节空文件导致动态库加载失败。
-                                out.parentFile?.mkdirs()
-                                createSymlink(out, e.linkName)
-                            } else {
-                                out.parentFile?.mkdirs()
-                                val fos = java.io.FileOutputStream(out)
-                                try {
-                                    val buf = ByteArray(64 * 1024)
-                                    var n: Int
-                                    while (tar.read(buf).also { n = it } != -1) {
-                                        fos.write(buf, 0, n)
-                                    }
-                                } finally { fos.close() }
-                                out.setExecutable(true)
-                            }
-                            e = tar.nextEntry
-                        }
-                    }
+            stream.use { raw -> extractTar(dir, raw) }
+            // 兼容“外层 tar 包着真实 node tar”的资产：资产里只有一个 *.tar 时，
+            // 把它再解包一次，得到 bin/ lib/ 等真实运行时目录。
+            if (!File(dir, "bin/node").isFile) {
+                val nested = dir.listFiles()?.firstOrNull { it.isFile && it.name.endsWith(".tar") }
+                if (nested != null) {
+                    java.io.FileInputStream(nested).use { extractTar(dir, it) }
+                    nested.delete()
                 }
+            }
             // 目录视为可搜索即可（无需可写）
             dir.setReadable(true, false)
             dir.setExecutable(true, false)
@@ -88,6 +69,38 @@ object NodeRuntime {
         }
         return dir
     }
+
+    /** 把 tar 流解压到 dir；处理目录、符号链接与 W^X 可执行位。 */
+    private fun extractTar(dir: File, raw: InputStream) {
+        TarArchiveInputStream(raw).use { tar ->
+            var e: TarArchiveEntry? = tar.nextEntry
+            while (e != null) {
+                val name = e.name.removePrefix("./").removePrefix("/") // 防路径穿越
+                val out = File(dir, name)
+                if (e.isDirectory) {
+                    out.mkdirs()
+                } else if (e.isSymbolicLink) {
+                    // Termux 包大量使用符号链接（libcrypto.so -> libcrypto.so.3）。
+                    // 必须真实创建符号链接，否则会写成 0 字节空文件导致动态库加载失败。
+                    out.parentFile?.mkdirs()
+                    createSymlink(out, e.linkName)
+                } else {
+                    out.parentFile?.mkdirs()
+                    val fos = java.io.FileOutputStream(out)
+                    try {
+                        val buf = ByteArray(64 * 1024)
+                        var n: Int
+                        while (tar.read(buf).also { n = it } != -1) {
+                            fos.write(buf, 0, n)
+                        }
+                    } finally { fos.close() }
+                    out.setExecutable(true)
+                }
+                e = tar.nextEntry
+            }
+        }
+    }
+
 
     /**
      * 打开 asset 并返回可直接交给 TarArchiveInputStream 的流。
