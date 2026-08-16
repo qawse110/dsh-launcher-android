@@ -149,11 +149,15 @@ class ConsoleActivity : AppCompatActivity() {
                     appendLine(">> 准备内置 Termux 环境（首次约 10~60 秒）…")
                     try {
                         TermuxRuntime.ensureExtracted(this@ConsoleActivity) { msg -> appendLine(msg) }
-                        appendLine(">> Termux 环境就绪，打开终端…")
+                        appendLine(">> Termux 环境已就绪，检查 Harness 工具…")
+                        TermuxRuntime.ensureHarnessTools(this@ConsoleActivity) { msg -> appendLine(msg) }
+                        appendLine(">> 打开终端…")
                     } catch (t: Throwable) {
                         appendLine("✗ Termux 准备失败：${t.message}，将回退系统 sh")
                         android.util.Log.e("Console", "termux ensure failed", t)
                     }
+                } else {
+                    TermuxRuntime.ensureHarnessTools(this@ConsoleActivity) { msg -> appendLine(msg) }
                 }
                 runOnUiThread {
                     startActivity(Intent(this@ConsoleActivity, TerminalActivity::class.java))
@@ -234,6 +238,14 @@ class ConsoleActivity : AppCompatActivity() {
                 flowLog.parentFile?.mkdirs()
                 runCatching { flowLog.writeText("") }
                 fl("OK 1/4 node=$nodeDir")
+                fl(">> 1.5/4 准备内置 Termux（bash/coreutils + git/python）…")
+                try {
+                    TermuxRuntime.ensureExtracted(this) { msg -> fl(msg) }
+                    TermuxRuntime.ensureHarnessTools(this) { msg -> fl(msg) }
+                    fl("OK 1.5/4 termux ready (bash + git + python)")
+                } catch (t: Throwable) {
+                    fl("WARN 1.5/4 termux prepare failed: ${t.message}（继续 dsh 安装，dsh bash 工具可能不可用）")
+                }
                 fl("dsh 版本 v${DshUpdater.currentVersion(this)}")
                 // 安装/更新统一交给 install-dsh.mjs 的 `npm install @deepseek-ai/dsh@latest`；
                 // “更新”按钮通过 startUpdateCheck(force=true) 触发重启 flow 主动检查。
@@ -359,13 +371,19 @@ class ConsoleActivity : AppCompatActivity() {
         File(filesDir, "tmp").mkdirs()
         val launcher = File(getExternalFilesDir(null) ?: filesDir, "dsh-web.sh")
         launcher.parentFile?.mkdirs()
+        val termuxUsr = TermuxRuntime.prefix(this).absolutePath
+        val termuxReady = TermuxRuntime.isBashReady(this)
+        val termuxPath = if (termuxReady) "$termuxUsr/bin:$termuxUsr/bin/applets:$termuxUsr/local/bin:" else ""
+        val ldLibrary = if (termuxReady) "${nodeDir.absolutePath}/lib:$termuxUsr/lib" else "${nodeDir.absolutePath}/lib"
         launcher.writeText(
             "#!/system/bin/sh\n" +
-            "export LD_LIBRARY_PATH=${nodeDir.absolutePath}/lib\n" +
+            "export LD_LIBRARY_PATH=$ldLibrary\n" +
             "export HOME=${filesDir.absolutePath}\n" +
             "export TMPDIR=${filesDir.absolutePath}/tmp\n" +
             "export OPENSSL_CONF=/dev/null\n" +
-            "export PATH=${nodeDir.absolutePath}/bin:${File(filesDir, ".tools").absolutePath}/bin:/system/bin:/bin:/usr/bin\n" +
+            "export TERM=xterm-256color\n" +
+            (if (termuxReady) "export PREFIX=$termuxUsr\n" else "") +
+            "export PATH=${nodeDir.absolutePath}/bin:${termuxPath}${File(filesDir, ".tools").absolutePath}/bin:/system/bin:/bin:/usr/bin\n" +
             "nohup ${nodeDir.absolutePath}/bin/node --expose-internals --import ${filesDir.absolutePath}/fs-register.mjs ${cli.absolutePath} web > ${filesDir.absolutePath}/dsh-web.log 2>&1 &\n" +
             "echo DSH_WEB_PID=$!\n"
         )
@@ -403,6 +421,7 @@ class ConsoleActivity : AppCompatActivity() {
                     return@thread
                 }
             }
+            TermuxRuntime.ensureHarnessTools(this) { msg -> appendLine(msg) }
             runCommandAndWait(raw, termux = true)
         }
     }

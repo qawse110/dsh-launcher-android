@@ -11,6 +11,9 @@
 
 - **内置 Node 运行时**：`assets/node/…` 打进 APK，首次启动解压到应用私有目录并
   `makeUnwritable`（解除 Android W^X 执行限制）。
+- **内置 Termux 工具链**：内置 bash/coreutils/apt，并在首次使用/一键安装时自动
+  `pkg install git python`，把 Termux `bin`、内置 Node `bin` 与 pnpm 工具目录纳入
+  DSH 进程与内置终端 PATH，`TERM=xterm-256color`，满足 Harness 对 bash/git 的前置要求。
 - **一键启动**：`ConsoleActivity` 内置四步引导
   `1/4 解压 node → 2/4 复制官方安装脚本 + 内置插件源 → 3/4 npm 官方安装/更新 dsh + dsh plugin 装配内置插件 → 4/4 启动 dsh web`。
 - **内置 WebView 界面**：主界面「打开 Web 界面」在应用内加载 `http://127.0.0.1:3080`

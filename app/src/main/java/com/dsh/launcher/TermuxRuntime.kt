@@ -23,6 +23,8 @@ object TermuxRuntime {
     private const val ASSET = "termux-bootstrap.zip"
     private const val MARKER = ".termux-ok"
     private const val MARKER_VERSION = "6"
+    private const val TOOLS_MARKER = ".harness-tools-ok"
+    private const val TOOLS_MARKER_VERSION = "1"
     private const val DIR_NAME = "termux"
 
     /** 官方二进制硬编码的 Termux 前缀（长度 31）。 */
@@ -51,15 +53,103 @@ object TermuxRuntime {
 
     fun isBashReady(context: Context): Boolean = bashPath(context).isFile
 
-    /** 返回在 bash 中 export 的 Termux 环境前缀。 */
+    /** Harness 附加工具（git/python）是否已安装就绪。 */
+    fun harnessToolsReady(context: Context): Boolean = runCatching {
+        File(context.filesDir, TOOLS_MARKER).readText().trim() == TOOLS_MARKER_VERSION
+    }.getOrDefault(false)
+
+    /**
+     * 确保内置 Termux 具备 DeepSeek Harness 所需附加工具：git（必需）与 python（可选）。
+     * 通过 pkg 安装；网络不可用或安装失败时返回 false，不破坏已有 Termux 环境。
+     */
+    @Synchronized
+    fun ensureHarnessTools(context: Context, progress: (String) -> Unit = {}): Boolean {
+        try {
+            val usr = prefix(context)
+            if (harnessToolsReady(context)) return true
+            if (!isBashReady(context)) return false
+            val bash = bashPath(context).absolutePath
+            val home = home(context).absolutePath
+            val tmp = tmp(context).absolutePath
+            val marker = File(context.filesDir, TOOLS_MARKER)
+            val env = mapOf(
+                "PREFIX" to usr.absolutePath,
+                "HOME" to home,
+                "TMPDIR" to tmp,
+                "TERM" to "xterm-256color",
+                "LANG" to "C.UTF-8",
+                "PATH" to listOf(
+                    "$usr/bin", "$usr/bin/applets", "$usr/local/bin",
+                    "/system/bin", "/bin"
+                ).joinToString(":"),
+                "LD_LIBRARY_PATH" to "$usr/lib"
+            )
+            progress("检查 Harness 工具（git / python）…")
+            val check = runBash(bash, "command -v git >/dev/null 2>&1 && (command -v python >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1)", env, progress)
+            if (check == 0) {
+                marker.writeText(TOOLS_MARKER_VERSION)
+                progress("Harness 工具已就绪（git + python）")
+                return true
+            }
+            progress("安装 Harness 工具：git（必需）+ python（可选）…")
+            setRuntimeWritable(context, true)
+            try {
+                val gitRc = runBash(bash, "pkg install -y git", env, progress)
+                var gitOk = File(usr, "bin/git").isFile
+                if (!gitOk) {
+                    progress("git 安装未完成（exit=$gitRc），刷新软件源后重试一次…")
+                    runBash(bash, "pkg update -y", env, progress)
+                    runBash(bash, "pkg install -y git", env, progress)
+                    gitOk = File(usr, "bin/git").isFile
+                }
+                var pythonOk = File(usr, "bin/python").isFile || File(usr, "bin/python3").isFile
+                if (!pythonOk) {
+                    val pyRc = runBash(bash, "pkg install -y python", env, progress)
+                    pythonOk = File(usr, "bin/python").isFile || File(usr, "bin/python3").isFile
+                    if (!pythonOk) progress("WARN: python 可选安装未成功（exit=$pyRc），不影响 Harness 核心")
+                }
+                if (gitOk) {
+                    marker.writeText(TOOLS_MARKER_VERSION)
+                    progress(if (pythonOk) "Harness 工具就绪（git + python）" else "Harness 工具就绪（git；python 可选未装）")
+                } else {
+                    progress("WARN: git 仍未就绪，可稍后重试")
+                }
+                return gitOk
+            } finally {
+                setRuntimeWritable(context, false)
+            }
+        } catch (t: Throwable) {
+            progress("WARN: ensureHarnessTools 失败: ${t.message}")
+            return false
+        }
+    }
+
+    private fun runBash(bash: String, script: String, env: Map<String, String>, progress: (String) -> Unit): Int = try {
+        val pb = ProcessBuilder(bash, "-c", script)
+        pb.redirectErrorStream(true)
+        val e = pb.environment()
+        env.forEach { (k, v) -> e[k] = v }
+        e.remove("LD_PRELOAD")
+        val p = pb.start()
+        p.inputStream.bufferedReader().useLines { lines ->
+            lines.forEach { line -> progress(line) }
+        }
+        p.waitFor()
+    } catch (t: Throwable) {
+        progress("bash 执行失败: ${t.message}")
+        -1
+    }
+
+    /** 返回在 bash 中 export 的 Termux 环境前缀（含内置 node/pnpm 工具路径）。 */
     fun envPrefix(context: Context): String {
         val usr = prefix(context).absolutePath
         val home = home(context).absolutePath
         val tmp = tmp(context).absolutePath
+        val files = context.filesDir.absolutePath
         return "export PREFIX=$usr; export HOME=$home; export TMPDIR=$tmp; " +
             "export TERM=xterm-256color; export LANG=C.UTF-8; " +
-            "export PATH=$usr/bin:$usr/bin/applets:$usr/local/bin:/system/bin:/bin; " +
-            "export LD_LIBRARY_PATH=$usr/lib; unset LD_PRELOAD; "
+            "export PATH=$usr/bin:$usr/bin/applets:$usr/local/bin:$files/node/bin:$files/.tools/bin:/system/bin:/bin; " +
+            "export LD_LIBRARY_PATH=$usr/lib:$files/node/lib; unset LD_PRELOAD; "
     }
 
     /**

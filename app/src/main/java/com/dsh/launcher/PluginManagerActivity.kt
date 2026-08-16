@@ -384,6 +384,7 @@ class PluginManagerActivity : AppCompatActivity() {
     private fun runDshPlugin(args: List<String>, label: String) {
         Thread {
             try {
+                ensureHarnessTools()
                 val cli = dshCliFile()
                 if (!cli.exists()) {
                     appendLog("   ✗ dsh 未安装（请先回控制台执行「执行 dsh」）")
@@ -406,6 +407,7 @@ class PluginManagerActivity : AppCompatActivity() {
     private fun rewireBuiltins() {
         Thread {
             try {
+                ensureHarnessTools()
                 appendLog(">> 重新装配内置插件…")
                 val installScript = File(filesDir, "install-dsh.mjs")
                 assets.open("install-dsh.mjs").use { input ->
@@ -440,6 +442,7 @@ class PluginManagerActivity : AppCompatActivity() {
     private fun runRoutingSuite() {
         Thread {
             try {
+                ensureHarnessTools()
                 appendLog(">> 特殊适配安装/更新 dsh-routing-suite…")
                 val script = File(filesDir, "routing-suite.mjs")
                 assets.open("routing-suite.mjs").use { input ->
@@ -467,24 +470,53 @@ class PluginManagerActivity : AppCompatActivity() {
         runDshPlugin(listOf("remove", name), "卸载 $name")
     }
 
+    /** 确保内置 Termux 与 Harness 工具（git/python）就绪，失败仅记录不中断插件操作。 */
+    private fun ensureHarnessTools() {
+        try {
+            if (!TermuxRuntime.isReady(this)) {
+                appendLog(">> 准备内置 Termux 环境…")
+                TermuxRuntime.ensureExtracted(this) { appendLog(it) }
+            }
+            TermuxRuntime.ensureHarnessTools(this) { appendLog(it) }
+        } catch (t: Throwable) {
+            appendLog("WARN ensureHarnessTools: ${t.message}")
+        }
+    }
+
     private fun baseEnv(): MutableMap<String, String> {
         val node = nodeDir
         val tools = File(filesDir, ".tools")
-        val path = listOf(
+        val termux = File(filesDir, "termux/usr")
+        val termuxReady = File(termux, "bin/bash").isFile
+        val termuxDirs = if (termuxReady) {
+            listOf(
+                File(termux, "bin").absolutePath,
+                File(termux, "bin/applets").absolutePath,
+                File(termux, "local/bin").absolutePath
+            )
+        } else emptyList()
+        val path = (termuxDirs + listOf(
             File(node, "bin").absolutePath,
             File(tools, "bin").absolutePath,
             File(tools, "lib/node_modules/.bin").absolutePath,
             "/system/bin", "/bin", "/usr/bin"
-        ).joinToString(":")
+        )).joinToString(":")
         return mutableMapOf(
             "PATH" to path,
             "HOME" to filesDir.absolutePath,
-            "LD_LIBRARY_PATH" to File(node, "lib").absolutePath,
+            "LD_LIBRARY_PATH" to if (termuxReady) {
+                "${File(node, "lib").absolutePath}:${File(termux, "lib").absolutePath}"
+            } else {
+                File(node, "lib").absolutePath
+            },
             "TMPDIR" to File(filesDir, "tmp").absolutePath,
             "TMP" to File(filesDir, "tmp").absolutePath,
             "TEMP" to File(filesDir, "tmp").absolutePath,
+            "TERM" to "xterm-256color",
             "OPENSSL_CONF" to "/dev/null"
-        )
+        ).apply {
+            if (termuxReady) put("PREFIX", termux.absolutePath)
+        }
     }
 
     private fun runProcess(cmd: String, env: Map<String, String>, label: String): Int {

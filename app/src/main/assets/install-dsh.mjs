@@ -31,6 +31,7 @@ const DSH_PROFILE = process.env.DSH_PROFILE || 'web';
 const PREBUILT = process.env.DSH_PREBUILT || '';
 const PLUGINS_DIR = process.env.DSH_PLUGINS_DIR || join(HOME, 'plugins');
 const TOOLS = join(HOME, '.tools');
+const TERMUX = process.env.TERMUX_PREFIX || join(HOME, 'termux/usr');
 const REGISTRY = process.env.NPM_REGISTRY || 'https://registry.npmmirror.com';
 const PNPM_VERSION = '11.7.0';
 const OUT = join(HOME, 'install_log.txt');
@@ -83,19 +84,28 @@ function envBase(extra = {}) {
     join(TOOLS, 'lib/node_modules/.bin'),
     join(TOOLS, 'lib/node_modules/pnpm/bin'),
   ];
-  const pathParts = [join(HOME, 'node/bin')];
+  const termuxReady = existsSync(join(TERMUX, 'bin/bash'));
+  const termuxDirs = termuxReady
+    ? [join(TERMUX, 'bin'), join(TERMUX, 'bin/applets'), join(TERMUX, 'local/bin')]
+    : [];
+  const pathParts = [...termuxDirs, join(HOME, 'node/bin')];
   for (const d of pnpmDirs) if (existsSync(d)) pathParts.push(d);
   pathParts.push('/system/bin', '/bin', '/usr/bin');
-  return {
+  const env = {
     ...process.env,
-    LD_LIBRARY_PATH: join(HOME, 'node/lib'),
+    LD_LIBRARY_PATH: termuxReady
+      ? join(HOME, 'node/lib') + ':' + join(TERMUX, 'lib')
+      : join(HOME, 'node/lib'),
     TMPDIR: join(HOME, 'tmp'),
     TMP: join(HOME, 'tmp'),
     TEMP: join(HOME, 'tmp'),
+    TERM: 'xterm-256color',
     OPENSSL_CONF: '/dev/null',
     PATH: pathParts.join(':'),
     ...extra,
   };
+  if (termuxReady) env.PREFIX = TERMUX;
+  return env;
 }
 
 function dshCli() {

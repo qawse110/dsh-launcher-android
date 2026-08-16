@@ -35,18 +35,23 @@ class TerminalActivity : AppCompatActivity(), TerminalSessionClient, TerminalVie
         val home = detectHome()
         val usr = File(filesDir, "termux/usr")
         val hasTermux = File(usr, "bin/bash").isFile
+        val files = filesDir.absolutePath
+        val nodeLib = File(files, "node/lib").absolutePath
+        val toolsBin = File(files, ".tools/bin").absolutePath
         val env = arrayOf(
             "PATH=" + listOf(
                 if (hasTermux) "$usr/bin" else "/data/data/com.termux/files/usr/bin",
                 if (hasTermux) "$usr/bin/applets" else "/data/data/com.termux/files/usr/bin/applets",
                 if (hasTermux) "$usr/local/bin" else "/data/data/com.termux/files/usr/bin/local/bin",
+                "$files/node/bin",
+                "$toolsBin",
                 "/usr/bin", "/bin", "/system/bin"
             ).joinToString(":"),
             "HOME=$home",
             "TERM=xterm-256color",
             "TMPDIR=$home",
             if (hasTermux) "PREFIX=$usr" else "",
-            if (hasTermux) "LD_LIBRARY_PATH=$usr/lib" else "",
+            if (hasTermux) "LD_LIBRARY_PATH=${nodeLib}:$usr/lib" else "LD_LIBRARY_PATH=$nodeLib",
             "LANG=C.UTF-8"
         ).filter { it.isNotBlank() }.toTypedArray()
 

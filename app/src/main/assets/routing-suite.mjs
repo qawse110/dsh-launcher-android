@@ -24,6 +24,7 @@ const DSH_PROFILE = process.env.DSH_PROFILE || 'web';
 const ROUTING_DIR = process.env.DSH_ROUTING_DIR || join(HOME, 'routing-suite');
 const PLUGINS_DIR = process.env.DSH_PLUGINS_DIR || join(HOME, 'plugins');
 const TOOLS = join(HOME, '.tools');
+const TERMUX = process.env.TERMUX_PREFIX || join(HOME, 'termux/usr');
 const TMP = join(HOME, 'tmp');
 const OUT = join(HOME, 'install_log.txt');
 const OUT_SHARED = '/sdcard/Download/DshLauncher/install_log.txt';
@@ -44,18 +45,27 @@ function log(m) {
 
 function envBase() {
   const pnpmDirs = [join(TOOLS, 'bin'), join(TOOLS, 'lib/node_modules/.bin'), join(TOOLS, 'lib/node_modules/pnpm/bin')];
-  const pathParts = [join(HOME, 'node/bin')];
+  const termuxReady = existsSync(join(TERMUX, 'bin/bash'));
+  const termuxDirs = termuxReady
+    ? [join(TERMUX, 'bin'), join(TERMUX, 'bin/applets'), join(TERMUX, 'local/bin')]
+    : [];
+  const pathParts = [...termuxDirs, join(HOME, 'node/bin')];
   for (const d of pnpmDirs) if (existsSync(d)) pathParts.push(d);
   pathParts.push('/system/bin', '/bin', '/usr/bin');
-  return {
+  const env = {
     ...process.env,
-    LD_LIBRARY_PATH: join(HOME, 'node/lib'),
+    LD_LIBRARY_PATH: termuxReady
+      ? join(HOME, 'node/lib') + ':' + join(TERMUX, 'lib')
+      : join(HOME, 'node/lib'),
     TMPDIR: TMP,
     TMP: TMP,
     TEMP: TMP,
+    TERM: 'xterm-256color',
     OPENSSL_CONF: '/dev/null',
     PATH: pathParts.join(':'),
   };
+  if (termuxReady) env.PREFIX = TERMUX;
+  return env;
 }
 
 function dshCli() {
@@ -163,8 +173,8 @@ async function installSuite() {
   }
 
   // 1) injector：优先装配 APK 内置的已构建版本（lib/ 存在）。
-  //    只有内置版本缺失时才使用刚拉取的源码，并尝试构建；Android 无 bash，
-  //    源码仓库通常只有 src/ 没有 lib/，直接 plugin add 无法作为 bundle 加载。
+  //    只有内置版本缺失时才使用刚拉取的源码，并尝试构建；内置 Termux 提供 bash，
+  //    但源码仓库通常只有 src/ 没有 lib/，直接 plugin add 无法作为 bundle 加载。
   const bundledInjector = join(PLUGINS_DIR, 'dsh-super-injector');
   const sourceInjector = join(ROUTING_DIR, 'injector');
   const injector = existsSync(join(bundledInjector, 'lib/index.js'))
