@@ -1,7 +1,7 @@
 {
   "name": "@dsh-external/dsh-oh-we-need",
   "version": "0.2.0",
-  "description": "自动把 oh-we-need（we need to 句式）注入 DeepSeek Harness 系统提示词，带 assemble 守卫适配 router 预设。",
+  "description": "把 oh-we-need（we need to 句式）制作为 DeepSeek Harness Skill 插件，按需调用而非注入系统提示词。",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -10,6 +10,7 @@
   },
   "files": [
     "lib",
+    "skills",
     "cordis.patch.yml",
     "prompt.md",
     "README.md",

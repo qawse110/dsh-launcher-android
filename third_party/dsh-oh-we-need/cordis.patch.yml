@@ -1,4 +1,4 @@
-# dsh-oh-we-need bundle 层：自动注入 oh-we-need 系统提示词。
+# dsh-oh-we-need bundle 层：注册 oh-we-need Skill（按需调用）。
 - insert:
     - id: dsh-oh-we-need
       name: '@dsh-external/dsh-oh-we-need'

@@ -43,6 +43,7 @@ const BUILTIN_PLUGINS = [
   'dsh-provider-headers',
   'dsh-vision',
   'dsh-oh-we-need',
+  'dsh-j-space-cognition',
 ];
 const BUILTIN_NAMES = new Set([
   '@dsh-external/dsh-mobile-nav',
@@ -51,6 +52,7 @@ const BUILTIN_NAMES = new Set([
   'dsh-provider-headers',
   '@dsh-external/dsh-vision',
   '@dsh-external/dsh-oh-we-need',
+  '@dsh-external/dsh-j-space-cognition',
 ]);
 const BUILTIN_IDS = new Set([
   'dsh-mobile-nav',
@@ -59,6 +61,7 @@ const BUILTIN_IDS = new Set([
   'provider-headers',
   'dsh-vision',
   'dsh-oh-we-need',
+  'dsh-j-space-cognition',
 ]);
 const PRESET_DIRS = ['router-preset'];
 
