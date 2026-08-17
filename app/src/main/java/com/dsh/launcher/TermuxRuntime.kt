@@ -23,7 +23,7 @@ object TermuxRuntime {
     private const val MARKER = ".termux-ok"
     private const val MARKER_VERSION = "6"
     private const val TOOLS_MARKER = ".harness-tools-ok"
-    private const val TOOLS_MARKER_VERSION = "1"
+    private const val TOOLS_MARKER_VERSION = "2"
     private const val DIR_NAME = "termux"
 
     /** 官方二进制硬编码的 Termux 前缀（长度 31）。 */
@@ -46,13 +46,13 @@ object TermuxRuntime {
 
     fun isBashReady(context: Context): Boolean = bashPath(context).isFile
 
-    /** Harness 附加工具（git/python）是否已安装就绪。 */
+    /** Harness 附加工具（git/python/ripgrep）是否已安装就绪。 */
     fun harnessToolsReady(context: Context): Boolean = runCatching {
         File(context.filesDir, TOOLS_MARKER).readText().trim() == TOOLS_MARKER_VERSION
     }.getOrDefault(false)
 
     /**
-     * 确保内置 Termux 具备 DeepSeek Harness 所需附加工具：git（必需）与 python（可选）。
+     * 确保内置 Termux 具备 DeepSeek Harness 所需附加工具：git（必需）与 python、ripgrep（可选）。
      * 通过 pkg 安装；网络不可用或安装失败时返回 false，不破坏已有 Termux 环境。
      */
     @Synchronized
@@ -77,14 +77,14 @@ object TermuxRuntime {
                 ).joinToString(":"),
                 "LD_LIBRARY_PATH" to "$usr/lib"
             )
-            progress("检查 Harness 工具（git / python）…")
-            val check = runBash(bash, "command -v git >/dev/null 2>&1 && (command -v python >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1)", env, progress)
+            progress("检查 Harness 工具（git / python / ripgrep）…")
+            val check = runBash(bash, "command -v git >/dev/null 2>&1 && (command -v python >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1) && command -v rg >/dev/null 2>&1", env, progress)
             if (check == 0) {
                 marker.writeText(TOOLS_MARKER_VERSION)
-                progress("Harness 工具已就绪（git + python）")
+                progress("Harness 工具已就绪（git + python + ripgrep）")
                 return true
             }
-            progress("安装 Harness 工具：git（必需）+ python（可选）…")
+            progress("安装 Harness 工具：git（必需）+ python / ripgrep（可选）…")
             setRuntimeWritable(context, true)
             try {
                 val gitRc = runBash(bash, "pkg install -y git", env, progress)
@@ -101,9 +101,20 @@ object TermuxRuntime {
                     pythonOk = File(usr, "bin/python").isFile || File(usr, "bin/python3").isFile
                     if (!pythonOk) progress("WARN: python 可选安装未成功（exit=$pyRc），不影响 Harness 核心")
                 }
+                var rgOk = File(usr, "bin/rg").isFile
+                if (!rgOk) {
+                    val rgRc = runBash(bash, "pkg install -y ripgrep", env, progress)
+                    rgOk = File(usr, "bin/rg").isFile
+                    if (!rgOk) progress("WARN: ripgrep 可选安装未成功（exit=$rgRc），将回退 @vscode/ripgrep-linux-arm64")
+                }
                 if (gitOk) {
                     marker.writeText(TOOLS_MARKER_VERSION)
-                    progress(if (pythonOk) "Harness 工具就绪（git + python）" else "Harness 工具就绪（git；python 可选未装）")
+                    val ready = buildList {
+                        add("git")
+                        if (pythonOk) add("python")
+                        if (rgOk) add("ripgrep")
+                    }.joinToString(" + ")
+                    progress(if (ready.isNotEmpty()) "Harness 工具就绪（$ready）" else "Harness 工具就绪（git）")
                 } else {
                     progress("WARN: git 仍未就绪，可稍后重试")
                 }

@@ -183,7 +183,8 @@ function ensureDsh() {
  * Android 兼容：@vscode/ripgrep 没有 android-arm64 平台包，导致
  * dsh-tool-fs-search 的 glob/grep 工具报
  * “glob could not start its search command (ripgrep launch failed)”。
- * 这里显式安装 @vscode/ripgrep-linux-arm64（静态二进制，可在 Android 上运行），
+ * 优先使用内置 Termux 已通过 `pkg install -y ripgrep` 安装的原生 rg；
+ * 只有 Termux rg 不存在时才安装 @vscode/ripgrep-linux-arm64（静态二进制，可在 Android 上运行），
  * 供 stub-dsh.mjs 把 @vscode/ripgrep 解析器指向它。
  * --force 是必要的：npm 在 process.platform=android 时会按 EBADPLATFORM 拒绝 linux 包。
  */
@@ -191,6 +192,11 @@ function ensureRipgrepFallback() {
   const rgPkg = join(DSH_PREFIX, 'node_modules/@vscode/ripgrep/package.json');
   if (!existsSync(rgPkg)) {
     log('@vscode/ripgrep not installed, skip ripgrep fallback');
+    return;
+  }
+  const termuxRg = join(HOME, 'termux/usr/bin/rg');
+  if (existsSync(termuxRg)) {
+    log('Termux ripgrep already installed, skip npm fallback: ' + termuxRg);
     return;
   }
   let rgVersion = '1.18.0';

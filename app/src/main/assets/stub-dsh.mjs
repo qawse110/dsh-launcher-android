@@ -224,22 +224,22 @@ try {
 try {
   // @vscode/ripgrep：Android 没有 @vscode/ripgrep-android-arm64 平台包，
   // 导致 dsh-tool-fs-search 的 glob/grep 报 “ripgrep launch failed”。
-  // 这里把解析器改为优先原平台包、缺失时回退到 linux-arm64 静态二进制
-  // （由 install-dsh.mjs 安装到 dsh-prefix/node_modules）。
+  // 这里把解析器改为优先使用 Termux `pkg install -y ripgrep` 安装的原生 rg，
+  // 缺失时才回退到 linux-arm64 静态二进制（由 install-dsh.mjs 安装到 dsh-prefix/node_modules）。
   const rgMain = findPkg('@vscode/ripgrep', 'lib/index.js');
   if (!rgMain) {
     log('@vscode/ripgrep: not found, skip android fallback');
   } else {
-    const fallbackRg = findPkg('@vscode/ripgrep-linux-arm64', 'bin/rg')
-      || (existsSync(join(HOME, 'termux/usr/bin/rg')) ? join(HOME, 'termux/usr/bin/rg') : null);
+    const termuxRg = existsSync(join(HOME, 'termux/usr/bin/rg')) ? join(HOME, 'termux/usr/bin/rg') : null;
+    const fallbackRg = termuxRg || findPkg('@vscode/ripgrep-linux-arm64', 'bin/rg');
     if (!fallbackRg) {
       log('@vscode/ripgrep: linux-arm64 fallback not found, skip (install-dsh should install it)');
     } else {
       const src = readFileSync(rgMain, 'utf8');
-      if (src.includes('dsh-launcher-android-ripgrep')) {
+      if (src.includes('dsh-launcher-android-ripgrep-v2')) {
         log('@vscode/ripgrep android fallback already patched');
       } else {
-        const patched = `// dsh-launcher-android-ripgrep
+        const patched = `// dsh-launcher-android-ripgrep-v2
 import { createRequire } from 'node:module';
 import { existsSync } from 'node:fs';
 
@@ -255,11 +255,15 @@ try {
   resolved = require.resolve(\`\${platformPkg}/bin/\${binaryName}\`);
 } catch {
   try {
-    // Android 没有 @vscode/ripgrep-android-*；优先使用 linux-arm64 静态二进制。
-    const fallbackPkg = \`@vscode/ripgrep-linux-\${arch}\`;
-    resolved = require.resolve(\`\${fallbackPkg}/bin/\${binaryName}\`);
+    // Android 优先使用 Termux pkg 安装的原生 rg；缺失时再回退 linux-arm64 静态二进制。
+    if (existsSync(FALLBACK_RG)) {
+      resolved = FALLBACK_RG;
+    } else {
+      const fallbackPkg = \`@vscode/ripgrep-linux-\${arch}\`;
+      resolved = require.resolve(\`\${fallbackPkg}/bin/\${binaryName}\`);
+    }
   } catch {
-    if (existsSync(FALLBACK_RG)) resolved = FALLBACK_RG;
+    if (!resolved && existsSync(FALLBACK_RG)) resolved = FALLBACK_RG;
   }
 }
 if (!resolved) throw new Error(\`No ripgrep binary for \${process.platform}-\${arch}\`);
