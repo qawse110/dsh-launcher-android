@@ -52,11 +52,17 @@ function envBase() {
   const pathParts = [...termuxDirs, join(HOME, 'node/bin')];
   for (const d of pnpmDirs) if (existsSync(d)) pathParts.push(d);
   pathParts.push('/system/bin', '/bin', '/usr/bin');
+  const gitConfig = join(HOME, '.gitconfig');
+  try {
+    if (!existsSync(gitConfig)) writeFileSync(gitConfig, '');
+  } catch {}
   const env = {
     ...process.env,
     LD_LIBRARY_PATH: termuxReady
       ? join(HOME, 'node/lib') + ':' + join(TERMUX, 'lib')
       : join(HOME, 'node/lib'),
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_GLOBAL: gitConfig,
     TMPDIR: TMP,
     TMP: TMP,
     TEMP: TMP,
@@ -64,7 +70,10 @@ function envBase() {
     OPENSSL_CONF: '/dev/null',
     PATH: pathParts.join(':'),
   };
-  if (termuxReady) env.PREFIX = TERMUX;
+  if (termuxReady) {
+    env.PREFIX = TERMUX;
+    env.GIT_EXEC_PATH = join(TERMUX, 'libexec/git-core');
+  }
   return env;
 }
 
