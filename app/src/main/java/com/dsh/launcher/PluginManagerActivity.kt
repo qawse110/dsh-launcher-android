@@ -41,7 +41,6 @@ class PluginManagerActivity : AppCompatActivity() {
         )
         const val PRESET_DIR = "router-preset"
         const val PRESET_DESC = "思维模式路由预设（router-spec / router-standard，agent-presets）"
-        const val REPO_DIR = "plugin-repo"
         const val ROUTING_REPO = "yjh051108/dsh-routing-suite"
         const val OH_WE_NEED_REPO = "scp3500/oh-we-need"
         private val BASE_BUNDLES = setOf(
@@ -61,7 +60,6 @@ class PluginManagerActivity : AppCompatActivity() {
     private fun dshCliFile() = File(dshPrefix(), "node_modules/@deepseek-ai/dsh/lib/bin.js")
     private fun pluginsDir() = File(filesDir, "plugins")
     private fun profileWebDir() = File(filesDir, ".dsh/profiles/web")
-    private fun profilePatch() = File(profileWebDir(), "cordis.patch.yml")
     private fun profilePkg() = File(profileWebDir(), "package.json")
     private fun presetsRoot() = File(filesDir, ".dsh/.agent-presets")
 
@@ -267,24 +265,6 @@ class PluginManagerActivity : AppCompatActivity() {
             if (scoped.isDirectory) return scoped
         }
         return null
-    }
-
-    private fun readPlugin(dir: String): PluginInfo? {
-        val dirF = File(pluginsDir(), dir)
-        val p = File(dirF, "package.json")
-        if (!p.exists()) return null
-        return try {
-            val j = JSONObject(p.readText())
-            val name = j.optString("name", dir)
-            val ver = j.optString("version", "?")
-            val desc = j.optString("description", "").take(80)
-            val patch = File(dirF, "cordis.patch.yml")
-            val id = if (patch.exists()) {
-                Regex("- insert:\\s*\\n\\s*- id:\\s*(\\S+)")
-                    .find(patch.readText())?.groupValues?.get(1) ?: dir
-            } else dir
-            PluginInfo(id, name, desc, ver)
-        } catch (t: Throwable) { PluginInfo(dir, dir, "", "?") }
     }
 
     private fun readVersion(dir: String): String {

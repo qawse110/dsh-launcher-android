@@ -5,7 +5,6 @@ import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
-import android.view.Gravity
 import android.widget.LinearLayout
 import android.widget.TextView
 import com.google.android.material.button.MaterialButton
@@ -97,16 +96,6 @@ object Ui {
         setOnClickListener { onClick() }
     }
 
-    /** A compact rounded status pill. */
-    fun pill(context: Context, text: String, color: Int): TextView =
-        TextView(context).apply {
-            this.text = text
-            textSize = 12f
-            setTextColor(color)
-            setPadding(dp(context, 12), dp(context, 6), dp(context, 12), dp(context, 6))
-            background = rounded(context, withAlpha(color, 0x22), 100)
-        }
-
     /** A small uppercase-style section label used to group cards on a screen. */
     fun sectionLabel(context: Context, text: String): TextView =
         TextView(context).apply {
@@ -118,16 +107,4 @@ object Ui {
             letterSpacing = 0.06f
         }
 
-    /** A simple labelled section row used on the home screen. */
-    fun statusRow(context: Context, text: String, color: Int): TextView =
-        TextView(context).apply {
-            this.text = text
-            textSize = 13f
-            setTextColor(color)
-            setPadding(dp(context, 2), dp(context, 8), dp(context, 2), dp(context, 2))
-            setCompoundDrawablePadding(dp(context, 8))
-            compoundDrawablePadding = dp(context, 8)
-            gravity = Gravity.START
-            typeface = Typeface.MONOSPACE
-        }
-}
+    }

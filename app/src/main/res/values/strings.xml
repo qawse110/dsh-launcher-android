@@ -10,6 +10,4 @@
     <string name="btn_open_terminal">命令控制台</string>
     <string name="btn_stop_all">停止 dsh 服务</string>
     <string name="btn_node_check">内置 Node 检测</string>
-    <string name="btn_refresh">刷新状态</string>
-    <string name="hint_termux_not_installed">未检测到 Termux，请先从 F-Droid 安装 Termux。</string>
 </resources>

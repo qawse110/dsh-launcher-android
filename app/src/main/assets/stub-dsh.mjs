@@ -12,7 +12,7 @@
  * 环境变量：
  *   HOME / NODE_DIR / DSH_PREFIX / DSH_PROFILE
  */
-import { writeFileSync, existsSync, readdirSync, readFileSync, mkdirSync, lstatSync } from 'node:fs';
+import { writeFileSync, existsSync, readdirSync, readFileSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 
 const HOME = process.env.HOME || '/data/user/0/com.dsh.launcher/files';

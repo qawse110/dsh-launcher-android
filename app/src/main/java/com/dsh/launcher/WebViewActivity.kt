@@ -93,16 +93,6 @@ class WebViewActivity : AppCompatActivity() {
                 progressBar.visibility = View.GONE
             }
 
-            @Deprecated("Deprecated in Java")
-            override fun onReceivedError(
-                view: WebView?,
-                errorCode: Int,
-                description: String?,
-                failingUrl: String?
-            ) {
-                progressBar.visibility = View.GONE
-            }
-
             override fun onReceivedError(
                 view: WebView?,
                 request: WebResourceRequest?,

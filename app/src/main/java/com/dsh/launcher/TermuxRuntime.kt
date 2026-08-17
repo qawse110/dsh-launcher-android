@@ -4,7 +4,6 @@ import android.content.Context
 import org.apache.commons.compress.archivers.zip.ZipFile
 import java.io.File
 import java.nio.file.Files
-import java.nio.file.Path
 import java.nio.file.Paths
 
 /**
@@ -32,12 +31,6 @@ object TermuxRuntime {
 
     /** 等长替换用的短前缀，通过 dataDir/t -> files/termux/usr 符号链接映射。 */
     private const val SHORT_PREFIX = "/data/user/0/com.dsh.launcher/t"
-
-    /** APK asset 是否存在（构建时内置）。 */
-    fun hasAsset(context: Context): Boolean = runCatching {
-        context.assets.open(ASSET).close()
-        true
-    }.getOrDefault(false)
 
     fun isReady(context: Context): Boolean = runCatching {
         File(context.filesDir, MARKER).readText().trim() == MARKER_VERSION
@@ -140,18 +133,6 @@ object TermuxRuntime {
         -1
     }
 
-    /** 返回在 bash 中 export 的 Termux 环境前缀（含内置 node/pnpm 工具路径）。 */
-    fun envPrefix(context: Context): String {
-        val usr = prefix(context).absolutePath
-        val home = home(context).absolutePath
-        val tmp = tmp(context).absolutePath
-        val files = context.filesDir.absolutePath
-        return "export PREFIX=$usr; export HOME=$home; export TMPDIR=$tmp; " +
-            "export TERM=xterm-256color; export LANG=C.UTF-8; " +
-            "export PATH=$usr/bin:$usr/bin/applets:$usr/local/bin:$files/node/bin:$files/.tools/bin:/system/bin:/bin; " +
-            "export LD_LIBRARY_PATH=$usr/lib:$files/node/lib; unset LD_PRELOAD; "
-    }
-
     /**
      * 解压并准备 Termux 环境（同步，可能耗时 10~60 秒）。
      * [progress] 在 UI/后台线程安全时由调用方决定如何显示。
@@ -221,9 +202,9 @@ object TermuxRuntime {
             File(usr, "var/log/apt").mkdirs()
 
             // W^X：bin/lib/share 只读可执行；var 保持可写
-            makeUnwritable(File(usr, "bin"), File(usr, "bin"))
-            makeUnwritable(File(usr, "lib"), File(usr, "lib"))
-            makeUnwritable(File(usr, "share"), File(usr, "share"))
+            makeUnwritable(File(usr, "bin"))
+            makeUnwritable(File(usr, "lib"))
+            makeUnwritable(File(usr, "share"))
 
             File(context.filesDir, MARKER).writeText(MARKER_VERSION)
             progress("Termux 环境就绪（$usr）")
@@ -524,20 +505,13 @@ object TermuxRuntime {
         }
     }
 
-    private fun stripPrefix(s: String): String = when {
-        s.startsWith("/data/data/com.termux/files/usr/") -> s.removePrefix("/data/data/com.termux/files/usr/")
-        s.startsWith("/data/data/com.termux/files/usr") -> s.removePrefix("/data/data/com.termux/files/usr").trimStart('/')
-        s.startsWith("/") -> s.trimStart('/')
-        else -> s
-    }
-
-    private fun makeUnwritable(base: File, current: File) {
+    private fun makeUnwritable(current: File) {
         if (java.nio.file.Files.isSymbolicLink(current.toPath())) return
         if (current.isDirectory) {
             current.setReadable(true, false)
             current.setExecutable(true, false)
             current.setWritable(false, false)
-            current.listFiles()?.forEach { makeUnwritable(base, it) }
+            current.listFiles()?.forEach { makeUnwritable(it) }
         } else {
             current.setReadable(true, false)
             current.setExecutable(true, false)

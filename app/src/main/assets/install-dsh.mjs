@@ -63,8 +63,6 @@ const BUILTIN_IDS = new Set([
   'dsh-oh-we-need',
   'dsh-j-space-cognition',
 ]);
-const PRESET_DIRS = ['router-preset'];
-
 function log(m) {
   const l = `${new Date().toISOString()} [install] ${m}`;
   console.log(l);

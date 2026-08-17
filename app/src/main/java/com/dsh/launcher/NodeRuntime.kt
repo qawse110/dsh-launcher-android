@@ -53,7 +53,7 @@ object NodeRuntime {
             dir.setReadable(true, false)
             dir.setExecutable(true, false)
             // Android W^X：被 exec 的文件/目录必须对进程不可写
-            makeUnwritable(dir, dir)
+            makeUnwritable(dir)
             // tmp 目录需要保持可写（node 运行时 TMPDIR）
             File(dir, "tmp").apply {
                 mkdirs()
@@ -128,14 +128,14 @@ object NodeRuntime {
     }
 
     /** 递归取消写权限，满足 Android W^X：保留父目录可读可执行、文件可读可执行。 */
-    private fun makeUnwritable(base: File, current: File) {
+    private fun makeUnwritable(current: File) {
         // 跳过符号链接：只操作真实文件/目录，避免跟随链接修改到链接目标或外部文件
         if (java.nio.file.Files.isSymbolicLink(current.toPath())) return
         if (current.isDirectory) {
             current.setReadable(true, false)
             current.setExecutable(true, false)
             current.setWritable(false, false)
-            current.listFiles()?.forEach { makeUnwritable(base, it) }
+            current.listFiles()?.forEach { makeUnwritable(it) }
         } else {
             current.setReadable(true, false)
             current.setExecutable(true, false)

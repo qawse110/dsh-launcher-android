@@ -4,8 +4,6 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -135,14 +133,6 @@ class TerminalActivity : AppCompatActivity(), TerminalSessionClient, TerminalVie
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
-    override fun onResume() {
-        super.onResume()
-    }
-
-    override fun onPause() {
-        super.onPause()
-    }
-
     override fun onDestroy() {
         session?.finishIfRunning()
         super.onDestroy()
@@ -164,7 +154,6 @@ class TerminalActivity : AppCompatActivity(), TerminalSessionClient, TerminalVie
     override fun onColorsChanged(session: TerminalSession) {}
     override fun onTerminalCursorStateChange(state: Boolean) {}
     override fun getTerminalCursorStyle(): Int? = 0
-    private fun noop() {}
 
     override fun logError(tag: String, message: String) { android.util.Log.e(tag, message) }
     override fun logWarn(tag: String, message: String) { android.util.Log.w(tag, message) }

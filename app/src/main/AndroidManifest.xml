@@ -1,19 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:tools="http://schemas.android.com/tools">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <!-- 用于通过 Termux 的 RUN_COMMAND 意图在后台启动/停止 dsh 服务 -->
-    <uses-permission android:name="com.termux.permission.RUN_COMMAND" />
-    <!-- 部署脚本到共享存储 /sdcard/Download/DshLauncher/scripts 供 Termux 执行 -->
+    <!-- 共享安装/运行日志（/sdcard/Download/DshLauncher）尽力而为 -->
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
-    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
-        tools:ignore="ScopedStorage" />
 
     <application
         android:allowBackup="true"

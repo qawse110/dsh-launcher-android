@@ -247,30 +247,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
-    // ---------------- Termux 调用 ----------------
-    private fun runInTermux(command: String, successMsg: String) {
-        AppLog.i("Main", "runInTermux: $command")
-        if (!TermuxExecutor.isInstalled(this)) {
-            val msg = getString(R.string.hint_termux_not_installed)
-            AppLog.w("Main", msg)
-            toast(msg)
-            log("✗ 未检测到 Termux，无法执行：$command")
-            return
-        }
-        log("▶ 正在执行（发送到 Termux）：$command")
-        val ok = TermuxExecutor.runCommand(this, command, background = true)
-        if (ok) {
-            log("✓ " + successMsg)
-            AppLog.i("Main", "OK: $successMsg")
-            toast(successMsg)
-        } else {
-            val msg = "✗ 执行失败。请在 Termux 设置中允许外部应用运行命令（RUN_COMMAND）后重试。"
-            AppLog.e("Main", msg)
-            log(msg)
-            toast(msg)
-        }
-    }
-
     // ---------------- 状态检测 ----------------
     private fun refreshStatus() {
         progress.visibility = View.VISIBLE
@@ -299,10 +275,6 @@ class MainActivity : AppCompatActivity() {
         code in 200..399
     } catch (e: Exception) {
         false
-    }
-
-    private fun startTerminalWithCmd(cmd: String) {
-        startActivity(Intent(this, TerminalActivity::class.java).putExtra("cmd", cmd))
     }
 
     private fun runNodeDsh() {

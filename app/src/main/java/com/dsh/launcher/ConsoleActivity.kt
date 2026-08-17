@@ -330,7 +330,6 @@ class ConsoleActivity : AppCompatActivity() {
                 startDshWeb(nodeDir, dshPrefix)
                 fl("OK 4/4 dsh web started (http://127.0.0.1:3080)")
                 // 保持 keepalive 常驻：web 进程是其子进程，避免被系统回收；用户可在主界面停止。
-                // stopKeepAlive() 不能在此调用。
             } catch (t: Throwable) {
                 fl("FAIL: ${t.message}")
                 setState("出错")
@@ -348,10 +347,6 @@ class ConsoleActivity : AppCompatActivity() {
         } catch (t: Throwable) {
             AppLog.e("Console", "keepalive start failed: ${t.message}")
         }
-    }
-
-    private fun stopKeepAlive() {
-        runCatching { stopService(Intent(this, BuildKeepAliveService::class.java)) }
     }
 
     /** 后台启动 dsh web（nohup 使其脱离本控制台进程）。端口已监听时跳过（幂等）。 */

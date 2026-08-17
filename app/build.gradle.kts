@@ -39,14 +39,6 @@ android {
                 "proguard-rules.pro"
             )
         }
-        // 用于验证"非 debuggable 是否影响 seccomp/exec"：克隆 debug 但关闭 debuggable
-        create("nondbg") {
-            initWith(getByName("debug"))
-            isDebuggable = false
-            signingConfig = signingConfigs.getByName("debug")
-            // 子模块(terminal-view 等)只声明 debug/release，这里回退到 debug 变体
-            matchingFallbacks += listOf("debug", "release")
-        }
     }
 
     compileOptions {

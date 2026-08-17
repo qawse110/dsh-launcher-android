@@ -3,7 +3,6 @@ package com.dsh.launcher
 import android.content.Context
 import java.io.File
 import java.io.FileWriter
-import java.io.PrintWriter
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -57,9 +56,7 @@ object AppLog {
         }
     }
 
-    fun d(tag: String, msg: String) = write("D", tag, msg)
     fun i(tag: String, msg: String) = write("I", tag, msg)
-    fun w(tag: String, msg: String) = write("W", tag, msg)
     fun e(tag: String, msg: String) = write("E", tag, msg)
 
     private fun write(level: String, tag: String, msg: String) {
@@ -89,27 +86,4 @@ object AppLog {
     /** 获取日志文件绝对路径（用于界面提示）。 */
     fun logPath(): String = privateLog?.absolutePath ?: sharedLog?.absolutePath ?: ""
 
-    /** 追加一段较大的正文（如命令输出），自动缩进。 */
-    fun block(tag: String, title: String, body: String) {
-        i(tag, title)
-        if (body.isNotBlank()) {
-            for (line in body.split("\n")) {
-                write("I", tag, "    | " + line)
-            }
-        }
-    }
-
-    /** 记录异常堆栈（含 cause 链）。 */
-    fun e(tag: String, msg: String, t: Throwable) {
-        e(tag, "$msg: ${t.javaClass.simpleName}: ${t.message}")
-        var cur: Throwable? = t
-        var depth = 0
-        while (cur != null && depth < 12) {
-            for (el in cur.stackTrace.take(6)) {
-                write("E", tag, "    at $el")
-            }
-            cur = cur.cause
-            depth++
-        }
-    }
 }
