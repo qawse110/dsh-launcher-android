@@ -274,6 +274,31 @@ export const rgPath = resolved;
 } catch (e) { log('WARN @vscode/ripgrep: ' + e.message); }
 
 try {
+  // 工作区目录浏览器：Android 在默认 home 列表里增加一个 SD Card 快捷入口，
+  // 让 dsh 的“添加工作区”可以直接进入 /sdcard 并选择其中的目录。
+  const dp = findPkg('@deepseek-ai/dsh-host-directory-picker-browse', 'lib/index.js');
+  if (dp) {
+    let src = readFileSync(dp, 'utf8');
+    if (src.includes('dsh-launcher-android-sdcard-shortcut')) {
+      log('directory-picker-browse sdcard shortcut already patched');
+    } else {
+      const marker = 'dsh-launcher-android-sdcard-shortcut';
+      const insertion = `\n\t\tif (process.platform === "android" && target === home) {\n\t\t\ttry {\n\t\t\t\tif ((await stat("/sdcard")).isDirectory() && !entries.some((entry) => entry.path === "/sdcard")) {\n\t\t\t\t\tentries.unshift({ name: "SD Card", path: "/sdcard", hidden: false, /* ${marker} */ });\n\t\t\t\t}\n\t\t\t} catch {}\n\t\t}`;
+      const re = /(\n\t\t\tentries\.push\(row\);\n\t\t\}\n)(\t\treturn \{)/;
+      const replaced = src.replace(re, `$1${insertion}\n$2`);
+      if (replaced !== src) {
+        writeFileSync(dp, replaced);
+        log('directory-picker-browse sdcard shortcut patched: ' + dp);
+      } else {
+        log('directory-picker-browse sdcard shortcut pattern not found, skip');
+      }
+    }
+  } else {
+    log('directory-picker-browse: not found, skip');
+  }
+} catch (e) { log('WARN directory-picker-browse: ' + e.message); }
+
+try {
   // 保持旧版占位补丁文件为空（koffi 已 stub，无需禁用行）
   const patch = join(HOME, 'patch-koffi.yml');
   writeFileSync(patch, '# native stubs in place, no disables\n');
