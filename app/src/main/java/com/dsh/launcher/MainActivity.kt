@@ -224,6 +224,9 @@ class MainActivity : AppCompatActivity() {
         addButton("状态悬浮窗 / 桥接", false) {
             startActivity(Intent(this, OverlaySettingsActivity::class.java))
         }
+        addButton("插件管理", false) {
+            startActivity(Intent(this, PluginManagerActivity::class.java))
+        }
         addButton(getString(R.string.btn_stop_all), false, Ui.DANGER) {
             stopDshAll()
         }
