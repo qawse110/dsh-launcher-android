@@ -196,6 +196,12 @@ class PluginManagerActivity : AppCompatActivity() {
         }
         val tpDirs = tp.listFiles { f -> f.isDirectory }?.map { it.name }?.toSet() ?: emptySet()
 
+        listBox.addView(Ui.sectionLabel(this, "内置与预设").apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(6) }
+        })
         for (d in BUNDLED.sorted()) {
             val builtin = File(tp, d).isDirectory
             val wired = isWired(d)
@@ -214,11 +220,21 @@ class PluginManagerActivity : AppCompatActivity() {
             if (presetOk) "已安装（agent-presets）" else "待装配（需重新装配）", emptyList()))
 
         // 官方 dsh plugin add 装配的额外插件（从 profile package.json 的 bundles 读取）
-        for (name in readBundles()) {
-            if (name in BASE_BUNDLES) continue
-            if (BUNDLED.any { d -> name == d || name == "@dsh-external/$d" }) continue
-            val info = readInstalledPlugin(name) ?: continue
-            listBox.addView(makeCard(name, info.desc, info.version, "已装配", listOf("卸载" to { uninstall(name) })))
+        val extras = readBundles().filter { name ->
+            name !in BASE_BUNDLES &&
+                !BUNDLED.any { d -> name == d || name == "@dsh-external/$d" }
+        }
+        if (extras.isNotEmpty()) {
+            listBox.addView(Ui.sectionLabel(this, "在线装配扩展").apply {
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = dp(10); bottomMargin = dp(6) }
+            })
+            for (name in extras) {
+                val info = readInstalledPlugin(name) ?: continue
+                listBox.addView(makeCard(name, info.desc, info.version, "已装配", listOf("卸载" to { uninstall(name) })))
+            }
         }
     }
 
@@ -299,10 +315,16 @@ class PluginManagerActivity : AppCompatActivity() {
             setTextColor(Ui.TEXT_PRIMARY)
         }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         titleRow.addView(TextView(this).apply {
-            text = "$ver · $status"
+            text = ver
             textSize = 11f
-            setTextColor(if (status.contains("已")) Ui.SUCCESS else Ui.WARNING)
+            setTextColor(Ui.TEXT_MUTED)
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { rightMargin = dp(6) }
         })
+        titleRow.addView(Ui.pill(this, status, if (status.contains("已")) Ui.SUCCESS else Ui.WARNING))
         content.addView(titleRow)
 
         if (desc.isNotEmpty()) {

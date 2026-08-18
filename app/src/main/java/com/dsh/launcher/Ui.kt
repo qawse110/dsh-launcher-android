@@ -5,6 +5,7 @@ import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.view.View
 import android.widget.LinearLayout
 import android.widget.TextView
 import com.google.android.material.button.MaterialButton
@@ -61,6 +62,25 @@ object Ui {
         if (strokeColor != null) {
             setStroke(dp(context, strokeWidthDp), strokeColor)
         }
+    }
+
+    /** Small colored status dot used in headers/cards. */
+    fun dot(context: Context, sizeDp: Int, color: Int): View = View(context).apply {
+        background = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(color)
+        }
+        val size = dp(context, sizeDp)
+        layoutParams = LinearLayout.LayoutParams(size, size)
+    }
+
+    /** Small rounded status pill for compact labels. */
+    fun pill(context: Context, text: String, color: Int): TextView = TextView(context).apply {
+        this.text = text
+        textSize = 11f
+        setTextColor(color)
+        background = rounded(context, withAlpha(color, 0x1A), 8, color, 1)
+        setPadding(dp(context, 8), dp(context, 3), dp(context, 8), dp(context, 3))
     }
 
     /** Material 3 card with configurable elevation and surface container role. */

@@ -32,6 +32,7 @@ class MainActivity : AppCompatActivity() {
 
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var statusValue: TextView
+    private lateinit var statusDot: View
     private lateinit var progress: ProgressBar
     private lateinit var logView: TextView
     private val logSb = StringBuilder()
@@ -50,8 +51,12 @@ class MainActivity : AppCompatActivity() {
         }
         setContentView(buildUi())
         requestStoragePermissions()
-        refreshStatus()
         log("就绪。请选择操作。")
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (::statusValue.isInitialized) refreshStatus(silent = true)
     }
 
     /** 申请存储权限（Android 11+ 走“所有文件访问”，旧版走运行时授权）。 */
@@ -138,6 +143,10 @@ class MainActivity : AppCompatActivity() {
             setTextColor(Ui.TEXT_PRIMARY)
         }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
 
+        statusDot = Ui.dot(this, 8, Ui.TEXT_MUTED)
+        cardRow.addView(statusDot, LinearLayout.LayoutParams(
+            dp(8), dp(8)
+        ).apply { rightMargin = dp(6) })
         statusValue = TextView(this).apply {
             text = getString(R.string.status_unknown)
             textSize = 14f
@@ -162,24 +171,25 @@ class MainActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { gravity = Gravity.CENTER_HORIZONTAL; topMargin = dp(4) })
 
-        // Section: 快速操作
-        root.addView(Ui.sectionLabel(this, "快速操作").apply {
-            layoutParams = LinearLayout.LayoutParams(
+        // Section: 快速操作（分组展示）
+        fun addActionSection(title: String, block: LinearLayout.() -> Unit) {
+            root.addView(Ui.sectionLabel(this, title).apply {
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = dp(6) }
+            })
+            val card = Ui.card(this, radiusDp = 16, background = Ui.SURFACE_CONTAINER, elevationDp = 2f)
+            val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; block() }
+            card.addView(list)
+            root.addView(card, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(6) }
-        })
+            ).apply { topMargin = dp(8) })
+        }
 
-        val actionCard = Ui.card(this, radiusDp = 16, background = Ui.SURFACE_CONTAINER, elevationDp = 2f)
-        val actions = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        actionCard.addView(actions)
-        root.addView(actionCard, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = dp(8) })
-
-        fun addButton(text: String, filled: Boolean, color: Int = Ui.BRAND_DEEP, onClick: () -> Unit) {
-            actions.addView(Ui.button(this, text, onClick, filled = filled, color = color).apply {
+        fun LinearLayout.addButton(text: String, filled: Boolean, color: Int = Ui.BRAND_DEEP, onClick: () -> Unit) {
+            addView(Ui.button(this@MainActivity, text, onClick, filled = filled, color = color).apply {
                 layoutParams = LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT
@@ -187,48 +197,56 @@ class MainActivity : AppCompatActivity() {
             })
         }
 
-        addButton(getString(R.string.btn_install_one), true) {
-            // 免 Termux 一键：ConsoleActivity 驱动 4 步流程（node→官方 npm 安装 dsh→插件装配→web）
-            runCatching {
-                startActivity(Intent(this, ConsoleActivity::class.java).putExtra("dsh", true))
-            }.onFailure {
-                log("✗ 无法打开控制台：${it.message}")
+        addActionSection("核心操作") {
+            addButton(getString(R.string.btn_install_one), true) {
+                // 免 Termux 一键：ConsoleActivity 驱动 4 步流程（node→官方 npm 安装 dsh→插件装配→web）
+                runCatching {
+                    startActivity(Intent(this@MainActivity, ConsoleActivity::class.java).putExtra("dsh", true))
+                }.onFailure {
+                    log("✗ 无法打开控制台：${it.message}")
+                }
+            }
+            addButton(getString(R.string.btn_open_web), false) {
+                startActivity(Intent(this@MainActivity, WebViewActivity::class.java))
             }
         }
-        addButton(getString(R.string.btn_open_web), false) {
-            startActivity(Intent(this, WebViewActivity::class.java))
-        }
-        addButton(getString(R.string.btn_open_terminal), false) {
-            thread {
-                if (!TermuxRuntime.isReady(this@MainActivity)) {
-                    log("准备内置 Termux 环境（首次约 10~60 秒）…")
-                    try {
-                        TermuxRuntime.ensureExtracted(this@MainActivity) { msg -> log(msg) }
-                        TermuxRuntime.ensureHarnessTools(this@MainActivity) { msg -> log(msg) }
-                        log("Termux 环境就绪，打开终端…")
-                    } catch (t: Throwable) {
-                        log("✗ Termux 准备失败：${t.message}（回退系统 sh）")
+
+        addActionSection("工具") {
+            addButton(getString(R.string.btn_open_terminal), false) {
+                thread {
+                    if (!TermuxRuntime.isReady(this@MainActivity)) {
+                        log("准备内置 Termux 环境（首次约 10~60 秒）…")
+                        try {
+                            TermuxRuntime.ensureExtracted(this@MainActivity) { msg -> log(msg) }
+                            TermuxRuntime.ensureHarnessTools(this@MainActivity) { msg -> log(msg) }
+                            log("Termux 环境就绪，打开终端…")
+                        } catch (t: Throwable) {
+                            log("✗ Termux 准备失败：${t.message}（回退系统 sh）")
+                        }
+                    }
+                    runOnUiThread {
+                        startActivity(Intent(this@MainActivity, TerminalActivity::class.java))
                     }
                 }
-                runOnUiThread {
-                    startActivity(Intent(this@MainActivity, TerminalActivity::class.java))
-                }
+            }
+            addButton(getString(R.string.btn_node_check), false) {
+                runNodeDsh()
             }
         }
-        addButton(getString(R.string.btn_node_check), false) {
-            runNodeDsh()
-        }
-        addButton("存储权限 / 所有文件访问", false) {
-            requestStoragePermissions()
-        }
-        addButton("状态悬浮窗 / 桥接", false) {
-            startActivity(Intent(this, OverlaySettingsActivity::class.java))
-        }
-        addButton("插件管理", false) {
-            startActivity(Intent(this, PluginManagerActivity::class.java))
-        }
-        addButton(getString(R.string.btn_stop_all), false, Ui.DANGER) {
-            stopDshAll()
+
+        addActionSection("设置与状态") {
+            addButton("存储权限 / 所有文件访问", false) {
+                requestStoragePermissions()
+            }
+            addButton("状态悬浮窗 / 桥接", false) {
+                startActivity(Intent(this@MainActivity, OverlaySettingsActivity::class.java))
+            }
+            addButton("插件管理", false) {
+                startActivity(Intent(this@MainActivity, PluginManagerActivity::class.java))
+            }
+            addButton(getString(R.string.btn_stop_all), false, Ui.DANGER) {
+                stopDshAll()
+            }
         }
 
         // Section: 日志
@@ -300,9 +318,9 @@ class MainActivity : AppCompatActivity() {
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
     // ---------------- 状态检测 ----------------
-    private fun refreshStatus() {
+    private fun refreshStatus(silent: Boolean = false) {
         progress.visibility = View.VISIBLE
-        log("… 检测 dsh 服务状态…")
+        if (!silent) log("… 检测 dsh 服务状态…")
         Thread {
             val running = pingServer()
             handler.post {
@@ -312,7 +330,11 @@ class MainActivity : AppCompatActivity() {
                 val color: Int = if (running) android.graphics.Color.parseColor("#2DB85B")
                 else android.graphics.Color.parseColor("#CC4444")
                 statusValue.setTextColor(color)
-                log(if (running) "dsh 服务：运行中（3080 端口）" else "dsh 服务：未运行")
+                statusDot.background = android.graphics.drawable.GradientDrawable().apply {
+                    shape = android.graphics.drawable.GradientDrawable.OVAL
+                    setColor(color)
+                }
+                if (!silent) log(if (running) "dsh 服务：运行中（3080 端口）" else "dsh 服务：未运行")
             }
         }.start()
     }

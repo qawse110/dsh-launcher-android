@@ -14,6 +14,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import com.google.android.material.card.MaterialCardView
 import com.google.android.material.switchmaterial.SwitchMaterial
 
 /**
@@ -59,90 +60,116 @@ class OverlaySettingsActivity : AppCompatActivity() {
             setPadding(0, dp(2), 0, dp(8))
         })
 
-        val card = Ui.card(this, radiusDp = 16, background = Ui.SURFACE_CONTAINER, elevationDp = 1f)
-        val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        card.addView(list)
-        root.addView(card, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = dp(4) })
-
-        overlaySwitch = addSwitch(list, "悬浮窗显示", "在其它应用上层显示 dsh 运行状态", "overlay_enabled", true) { checked ->
-            if (checked) StatusBridgeService.resetDismissed(this)
+        fun section(text: String): TextView = Ui.sectionLabel(this, text).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(6) }
         }
-        soundSwitch = addSwitch(list, "声音提示", "AI 输出结束后播放提示音", "sound_enabled", true)
-        notifySwitch = addSwitch(list, "通知提示", "AI 输出结束后发送通知", "notify_enabled", true)
-        showStatusSwitch = addSwitch(list, "显示状态", "悬浮窗中显示 idle/running/finished", "show_status", true)
-        showLastTextSwitch = addSwitch(list, "显示最近输出", "悬浮窗中附带最近 AI 文本", "show_last_text", true)
-        displayModeSwitch = addSwitch(list, "完整模式", "显示更多最近输出（否则只显示状态）", "display_mode_full", false)
-        displayModeSwitch.isChecked = prefs().getString("display_mode", "compact") == "full"
 
-        displayModeSwitch.setOnCheckedChangeListener { _, checked ->
-            prefs().edit().putString("display_mode", if (checked) "full" else "compact").apply()
+        fun card(block: LinearLayout.() -> Unit): MaterialCardView {
+            val c = Ui.card(this, radiusDp = 16, background = Ui.SURFACE_CONTAINER, elevationDp = 1f)
+            val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; block() }
+            c.addView(list)
+            root.addView(c, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(4) })
+            return c
+        }
+
+        // 显示内容
+        root.addView(section("显示内容"))
+        card {
+            overlaySwitch = addSwitch(this, "悬浮窗显示", "在其它应用上层显示 dsh 运行状态", "overlay_enabled", true) { checked ->
+                if (checked) StatusBridgeService.resetDismissed(this@OverlaySettingsActivity)
+            }
+            showStatusSwitch = addSwitch(this, "显示状态", "显示思考中 / 输出中 / 调用工具等状态", "show_status", true)
+            showLastTextSwitch = addSwitch(this, "显示最近输出", "悬浮窗中附带最近 AI 文本", "show_last_text", true)
+            displayModeSwitch = addSwitch(this, "完整模式", "显示更多最近输出（3 行预览）", "display_mode_full", false)
+            displayModeSwitch.isChecked = prefs().getString("display_mode", "compact") == "full"
+            displayModeSwitch.setOnCheckedChangeListener { _, checked ->
+                prefs().edit().putString("display_mode", if (checked) "full" else "compact").apply()
+            }
+        }
+
+        // 提醒方式
+        root.addView(section("提醒方式"))
+        card {
+            soundSwitch = addSwitch(this, "声音提示", "AI 输出结束后播放系统通知音", "sound_enabled", true)
+            notifySwitch = addSwitch(this, "通知提示", "AI 输出结束后发送通知", "notify_enabled", true)
         }
 
         permissionHint = TextView(this).apply {
             textSize = 12f
             setTextColor(Ui.WARNING)
-            setPadding(dp(2), dp(8), dp(2), dp(4))
+            setPadding(dp(2), dp(10), dp(2), dp(4))
         }
         root.addView(permissionHint)
         refreshPermissionHint()
 
-        val startBtn = Ui.button(this, "启动桥接服务", {
-            if (Build.VERSION.SDK_INT >= 33 &&
-                checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-            ) {
-                requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 200)
-            }
-            StatusBridgeService.resetDismissed(this)
-            StatusBridgeService.start(this)
-            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-            if (Build.VERSION.SDK_INT >= 23 && !pm.isIgnoringBatteryOptimizations(packageName)) {
-                permissionHint.text = "⚠ 建议开启“忽略电池优化”，否则后台可能被系统杀死"
-                permissionHint.setTextColor(Ui.WARNING)
-            }
-        }, filled = true)
-        val stopBtn = Ui.button(this, "停止服务", {
-            StatusBridgeService.stop(this)
-        }, filled = false, color = Ui.DANGER)
-        val permBtn = Ui.button(this, "授予悬浮窗权限", {
-            openOverlaySettings()
-        }, filled = false)
-        val batteryBtn = Ui.button(this, "忽略电池优化（防后台杀）", {
-            openBatteryOptimizationSettings()
-        }, filled = false)
-        val a11yBtn = Ui.button(this, "无障碍保活（可选，强烈推荐）", {
-            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-        }, filled = false)
-        val webBtn = Ui.button(this, "打开 dsh Web", {
-            startActivity(Intent(this, WebViewActivity::class.java))
-        }, filled = false)
+        // 服务控制
+        root.addView(section("服务控制"))
+        card {
+            val startBtn = Ui.button(this@OverlaySettingsActivity, "启动桥接服务", {
+                if (Build.VERSION.SDK_INT >= 33 &&
+                    checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                ) {
+                    requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 200)
+                }
+                StatusBridgeService.resetDismissed(this@OverlaySettingsActivity)
+                StatusBridgeService.start(this@OverlaySettingsActivity)
+                val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                if (Build.VERSION.SDK_INT >= 23 && !pm.isIgnoringBatteryOptimizations(packageName)) {
+                    permissionHint.text = "⚠ 建议开启“忽略电池优化”，否则后台可能被系统杀死"
+                    permissionHint.setTextColor(Ui.WARNING)
+                }
+            }, filled = true)
+            val stopBtn = Ui.button(this@OverlaySettingsActivity, "停止服务", {
+                StatusBridgeService.stop(this@OverlaySettingsActivity)
+            }, filled = false, color = Ui.DANGER)
+            addView(startBtn, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(4) })
+            addView(stopBtn, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(8) })
+        }
 
-        root.addView(startBtn, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = dp(8) })
-        root.addView(stopBtn, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = dp(8) })
-        root.addView(permBtn, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = dp(8) })
-        root.addView(batteryBtn, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = dp(8) })
-        root.addView(a11yBtn, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = dp(8) })
-        root.addView(webBtn, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = dp(8) })
+        // 权限与保活
+        root.addView(section("权限与保活"))
+        card {
+            val permBtn = Ui.button(this@OverlaySettingsActivity, "授予悬浮窗权限", {
+                openOverlaySettings()
+            }, filled = false)
+            val batteryBtn = Ui.button(this@OverlaySettingsActivity, "忽略电池优化（防后台杀）", {
+                openBatteryOptimizationSettings()
+            }, filled = false)
+            val a11yBtn = Ui.button(this@OverlaySettingsActivity, "无障碍保活（可选，强烈推荐）", {
+                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+            }, filled = false)
+            val webBtn = Ui.button(this@OverlaySettingsActivity, "打开 dsh Web", {
+                startActivity(Intent(this@OverlaySettingsActivity, WebViewActivity::class.java))
+            }, filled = false)
+            addView(permBtn, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(4) })
+            addView(batteryBtn, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(8) })
+            addView(a11yBtn, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(8) })
+            addView(webBtn, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(8) })
+        }
 
         return ScrollView(this).apply { addView(root) }
     }
