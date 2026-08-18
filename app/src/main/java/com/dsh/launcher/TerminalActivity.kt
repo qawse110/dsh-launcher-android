@@ -66,7 +66,6 @@ class TerminalActivity : AppCompatActivity(), TerminalSessionClient, TerminalVie
 
         val list = RelativeLayout(this)
         list.setBackgroundColor(Ui.BG)
-        list.addView(terminalView, RelativeLayout.LayoutParams(RelativeLayout.LayoutParams.MATCH_PARENT, RelativeLayout.LayoutParams.MATCH_PARENT))
 
         val status = TextView(this).apply {
             text = "内置终端 · shell: $shell"
@@ -87,7 +86,18 @@ class TerminalActivity : AppCompatActivity(), TerminalSessionClient, TerminalVie
             addView(status, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
             addView(close)
         }
-        list.addView(bar, RelativeLayout.LayoutParams(RelativeLayout.LayoutParams.MATCH_PARENT, dp(48)).apply { addRule(RelativeLayout.ALIGN_PARENT_TOP) })
+        bar.id = View.generateViewId()
+        val barLp = RelativeLayout.LayoutParams(
+            RelativeLayout.LayoutParams.MATCH_PARENT,
+            dp(48)
+        ).apply { addRule(RelativeLayout.ALIGN_PARENT_TOP) }
+        list.addView(bar, barLp)
+
+        val terminalLp = RelativeLayout.LayoutParams(
+            RelativeLayout.LayoutParams.MATCH_PARENT,
+            RelativeLayout.LayoutParams.MATCH_PARENT
+        ).apply { addRule(RelativeLayout.BELOW, bar.id) }
+        list.addView(terminalView, terminalLp)
 
         setContentView(list)
 

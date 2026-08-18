@@ -23,11 +23,13 @@ import androidx.appcompat.app.AppCompatActivity
  */
 class WebViewActivity : AppCompatActivity() {
 
+    private lateinit var webView: WebView
+
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val webView = WebView(this)
+        webView = WebView(this)
         webView.setBackgroundColor(Ui.BG)
 
         val root = LinearLayout(this).apply {
@@ -49,8 +51,16 @@ class WebViewActivity : AppCompatActivity() {
             setTextColor(Ui.TEXT_PRIMARY)
         }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
 
+        toolbar.addView(Ui.button(this, "←", { if (webView.canGoBack()) webView.goBack() }, filled = false, compact = true).apply {
+            minWidth = dp(44)
+        })
+        toolbar.addView(Ui.button(this, "→", { if (webView.canGoForward()) webView.goForward() }, filled = false, compact = true).apply {
+            minWidth = dp(44)
+            leftMargin = dp(4)
+        })
         toolbar.addView(Ui.button(this, "刷新", { webView.reload() }, filled = false, compact = true).apply {
-            minWidth = dp(72)
+            minWidth = dp(60)
+            leftMargin = dp(4)
         })
         root.addView(toolbar, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
@@ -109,6 +119,10 @@ class WebViewActivity : AppCompatActivity() {
         }
 
         webView.loadUrl(TARGET_URL)
+    }
+
+    override fun onBackPressed() {
+        if (webView.canGoBack()) webView.goBack() else super.onBackPressed()
     }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()

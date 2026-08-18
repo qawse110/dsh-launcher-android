@@ -58,8 +58,16 @@ class MainActivity : AppCompatActivity() {
     private fun requestStoragePermissions() {
         if (Build.VERSION.SDK_INT >= 30) {
             if (!Environment.isExternalStorageManager()) {
-                log("需要授予“所有文件访问权限”才能完整访问 /sdcard…")
-                openAllFilesAccessSettings()
+                val prefs = getSharedPreferences("storage", MODE_PRIVATE)
+                if (!prefs.getBoolean("all_files_prompted", false)) {
+                    prefs.edit().putBoolean("all_files_prompted", true).apply()
+                    log("需要授予“所有文件访问权限”才能完整访问 /sdcard…")
+                    openAllFilesAccessSettings()
+                } else {
+                    log("尚未授予“所有文件访问权限”，可点击下方按钮前往设置")
+                }
+            } else {
+                log("已获得“所有文件访问权限”")
             }
             return
         }
@@ -261,6 +269,14 @@ class MainActivity : AppCompatActivity() {
                    else "内置 Termux：未解压（首次执行命令/打开终端自动准备）"
             textSize = 13f
             setTextColor(if (ready) Ui.SUCCESS else Ui.WARNING)
+            setPadding(0, dp(4), 0, 0)
+        })
+        root.addView(TextView(this).apply {
+            val granted = Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager()
+            text = if (granted) "共享存储：可完整访问 /sdcard ✓"
+                   else "共享存储：未授予“所有文件访问权限”（点上方按钮授权）⚠"
+            textSize = 13f
+            setTextColor(if (granted) Ui.SUCCESS else Ui.WARNING)
             setPadding(0, dp(4), 0, 0)
         })
 
