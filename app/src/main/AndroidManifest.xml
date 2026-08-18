@@ -68,6 +68,7 @@
         <service
             android:name=".StatusBridgeService"
             android:exported="false"
+            android:process=":status_bridge"
             android:foregroundServiceType="dataSync"
             android:stopWithTask="false" />
     </application>

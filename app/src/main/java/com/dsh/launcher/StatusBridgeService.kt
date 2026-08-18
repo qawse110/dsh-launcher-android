@@ -64,6 +64,7 @@ class StatusBridgeService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        writeHeartbeat("service", "started", "started")
         if (thread == null) {
             thread = Thread({ pollLoop() }, "dsh-status-bridge")
             thread?.start()
@@ -81,11 +82,12 @@ class StatusBridgeService : Service() {
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         // 即使任务被划掉也尽量保持悬浮窗服务运行
+        writeHeartbeat("service", "task-removed", "task-removed")
         try {
             val restart = Intent(this, StatusBridgeService::class.java)
             if (Build.VERSION.SDK_INT >= 26) startForegroundService(restart) else startService(restart)
-        } catch (_: Exception) {
-            // ignore: OEM/后台限制下无法自启
+        } catch (t: Exception) {
+            writeHeartbeat("service", "restart-failed", t.message ?: "exception")
         }
         super.onTaskRemoved(rootIntent)
     }
