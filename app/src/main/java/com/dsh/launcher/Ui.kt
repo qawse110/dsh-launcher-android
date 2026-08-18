@@ -5,11 +5,13 @@ import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.os.Build
 import android.view.View
 import android.widget.LinearLayout
 import android.widget.TextView
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.card.MaterialCardView
+import com.google.android.material.color.MaterialColors
 
 /**
  * Modern UI helpers used by all programmatically-built screens.
@@ -18,33 +20,82 @@ import com.google.android.material.card.MaterialCardView
 object Ui {
 
     /** Palette — Material 3 dark color roles */
-    const val BG = 0xFF0F1116.toInt()
-    const val SURFACE = 0xFF151922.toInt()
-    const val SURFACE_ALT = 0xFF141824.toInt()
-    const val SURFACE_INPUT = 0xFF1E2430.toInt()
-    const val OUTLINE = 0xFF2C3547.toInt()
-    const val BRAND = 0xFF6C8CFF.toInt()
-    const val BRAND_DEEP = 0xFF4D6BFE.toInt()
-    const val TEXT_PRIMARY = 0xFFE4E8F2.toInt()
-    const val TEXT_SECONDARY = 0xFFAAB4C6.toInt()
-    const val TEXT_MUTED = 0xFF7A8496.toInt()
-    const val SUCCESS = 0xFF7FD086.toInt()
-    const val WARNING = 0xFFE0B45A.toInt()
-    const val DANGER = 0xFFFF6B6B.toInt()
+    var BG = 0xFF0F1116.toInt()
+    var SURFACE = 0xFF151922.toInt()
+    var SURFACE_ALT = 0xFF141824.toInt()
+    var SURFACE_INPUT = 0xFF1E2430.toInt()
+    var OUTLINE = 0xFF2C3547.toInt()
+    var BRAND = 0xFF6C8CFF.toInt()
+    var BRAND_DEEP = 0xFF4D6BFE.toInt()
+    var TEXT_PRIMARY = 0xFFE4E8F2.toInt()
+    var TEXT_SECONDARY = 0xFFAAB4C6.toInt()
+    var TEXT_MUTED = 0xFF7A8496.toInt()
+    var SUCCESS = 0xFF7FD086.toInt()
+    var WARNING = 0xFFE0B45A.toInt()
+    var DANGER = 0xFFFF6B6B.toInt()
 
     // Material 3 surface container roles
-    const val SURFACE_CONTAINER_LOWEST = 0xFF0F1116.toInt()
-    const val SURFACE_CONTAINER_LOW = 0xFF171C27.toInt()
-    const val SURFACE_CONTAINER = 0xFF1A2029.toInt()
-    const val SURFACE_CONTAINER_HIGH = 0xFF202733.toInt()
-    const val SURFACE_CONTAINER_HIGHEST = 0xFF262E3C.toInt()
-    const val PRIMARY_CONTAINER = 0xFF23316B.toInt()
-    const val ON_PRIMARY_CONTAINER = 0xFFDDE4FF.toInt()
-    const val SECONDARY_CONTAINER = 0xFF2A3552.toInt()
-    const val ON_SECONDARY_CONTAINER = 0xFFDDE4FF.toInt()
+    var SURFACE_CONTAINER_LOWEST = 0xFF0F1116.toInt()
+    var SURFACE_CONTAINER_LOW = 0xFF171C27.toInt()
+    var SURFACE_CONTAINER = 0xFF1A2029.toInt()
+    var SURFACE_CONTAINER_HIGH = 0xFF202733.toInt()
+    var SURFACE_CONTAINER_HIGHEST = 0xFF262E3C.toInt()
+    var PRIMARY_CONTAINER = 0xFF23316B.toInt()
+    var ON_PRIMARY_CONTAINER = 0xFFDDE4FF.toInt()
+    var SECONDARY_CONTAINER = 0xFF2A3552.toInt()
+    var ON_SECONDARY_CONTAINER = 0xFFDDE4FF.toInt()
 
     fun dp(context: Context, value: Int): Int =
         (value * context.resources.displayMetrics.density).toInt()
+
+    /**
+     * 读取当前 Activity 主题中的 Material You 动态色（Android 12+）。
+     * 调用前应已通过 DynamicColors.applyToActivityIfAvailable(activity) 应用动态主题。
+     * 在低版本或读取失败时保持内置深色配色。
+     */
+    fun applyDynamicColors(context: Context) {
+        if (Build.VERSION.SDK_INT < 31) return
+        try {
+            val primary = MaterialColors.getColor(context, com.google.android.material.R.attr.colorPrimary, BRAND)
+            val primaryContainer = MaterialColors.getColor(context, com.google.android.material.R.attr.colorPrimaryContainer, PRIMARY_CONTAINER)
+            val onPrimaryContainer = MaterialColors.getColor(context, com.google.android.material.R.attr.colorOnPrimaryContainer, ON_PRIMARY_CONTAINER)
+            val secondary = MaterialColors.getColor(context, com.google.android.material.R.attr.colorSecondary, BRAND)
+            val secondaryContainer = MaterialColors.getColor(context, com.google.android.material.R.attr.colorSecondaryContainer, SECONDARY_CONTAINER)
+            val onSecondaryContainer = MaterialColors.getColor(context, com.google.android.material.R.attr.colorOnSecondaryContainer, ON_SECONDARY_CONTAINER)
+            val surface = MaterialColors.getColor(context, com.google.android.material.R.attr.colorSurface, SURFACE)
+            val onSurface = MaterialColors.getColor(context, com.google.android.material.R.attr.colorOnSurface, TEXT_PRIMARY)
+            val onSurfaceVariant = MaterialColors.getColor(context, com.google.android.material.R.attr.colorOnSurfaceVariant, TEXT_SECONDARY)
+            val surfaceVariant = MaterialColors.getColor(context, com.google.android.material.R.attr.colorSurfaceVariant, SURFACE_INPUT)
+            val outline = MaterialColors.getColor(context, com.google.android.material.R.attr.colorOutline, OUTLINE)
+            val surfaceContainerLowest = MaterialColors.getColor(context, com.google.android.material.R.attr.colorSurfaceContainerLowest, SURFACE_CONTAINER_LOWEST)
+            val surfaceContainerLow = MaterialColors.getColor(context, com.google.android.material.R.attr.colorSurfaceContainerLow, SURFACE_CONTAINER_LOW)
+            val surfaceContainer = MaterialColors.getColor(context, com.google.android.material.R.attr.colorSurfaceContainer, SURFACE_CONTAINER)
+            val surfaceContainerHigh = MaterialColors.getColor(context, com.google.android.material.R.attr.colorSurfaceContainerHigh, SURFACE_CONTAINER_HIGH)
+            val surfaceContainerHighest = MaterialColors.getColor(context, com.google.android.material.R.attr.colorSurfaceContainerHighest, SURFACE_CONTAINER_HIGHEST)
+
+            BG = surfaceContainerLowest
+            SURFACE = surface
+            SURFACE_ALT = surfaceVariant
+            SURFACE_INPUT = surfaceVariant
+            OUTLINE = outline
+            BRAND = primary
+            BRAND_DEEP = primary
+            TEXT_PRIMARY = onSurface
+            TEXT_SECONDARY = onSurfaceVariant
+            TEXT_MUTED = withAlpha(onSurfaceVariant, 0x99)
+            SURFACE_CONTAINER_LOWEST = surfaceContainerLowest
+            SURFACE_CONTAINER_LOW = surfaceContainerLow
+            SURFACE_CONTAINER = surfaceContainer
+            SURFACE_CONTAINER_HIGH = surfaceContainerHigh
+            SURFACE_CONTAINER_HIGHEST = surfaceContainerHighest
+            PRIMARY_CONTAINER = primaryContainer
+            ON_PRIMARY_CONTAINER = onPrimaryContainer
+            SECONDARY_CONTAINER = secondaryContainer
+            ON_SECONDARY_CONTAINER = onSecondaryContainer
+        } catch (_: Throwable) {
+            // 主题资源缺失/低版本时保留默认配色
+        }
+    }
 
     /** Alpha-combine a solid color with a given alpha (0..255). */
     fun withAlpha(color: Int, alpha: Int): Int =

@@ -16,6 +16,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import com.google.android.material.color.DynamicColors
 import java.io.File
 import kotlin.concurrent.thread
 
@@ -34,7 +35,9 @@ class ConsoleActivity : AppCompatActivity() {
     private val sb = StringBuilder()
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        DynamicColors.applyToActivityIfAvailable(this)
         super.onCreate(savedInstanceState)
+        Ui.applyDynamicColors(this)
         AppLog.init(this)
         setContentView(buildUi())
         appendLine("== 内置命令控制台（基于 ProcessBuilder）==")

@@ -12,6 +12,7 @@ import android.widget.LinearLayout
 import android.widget.RelativeLayout
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import com.google.android.material.color.DynamicColors
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
 import com.termux.view.TerminalView
@@ -28,7 +29,9 @@ class TerminalActivity : AppCompatActivity(), TerminalSessionClient, TerminalVie
     private var session: TerminalSession? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        DynamicColors.applyToActivityIfAvailable(this)
         super.onCreate(savedInstanceState)
+        Ui.applyDynamicColors(this)
 
         val shell = detectShell()
         val home = detectHome()

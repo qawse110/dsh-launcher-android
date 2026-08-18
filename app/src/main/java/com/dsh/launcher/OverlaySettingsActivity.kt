@@ -15,6 +15,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import com.google.android.material.card.MaterialCardView
+import com.google.android.material.color.DynamicColors
 import com.google.android.material.switchmaterial.SwitchMaterial
 
 /**
@@ -36,7 +37,9 @@ class OverlaySettingsActivity : AppCompatActivity() {
     private lateinit var permissionHint: TextView
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        DynamicColors.applyToActivityIfAvailable(this)
         super.onCreate(savedInstanceState)
+        Ui.applyDynamicColors(this)
         setContentView(buildUi())
     }
 

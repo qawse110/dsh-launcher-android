@@ -19,6 +19,7 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import com.google.android.material.color.DynamicColors
 
 /**
  * 内嵌 dsh Web UI 的界面。
@@ -31,7 +32,9 @@ class WebViewActivity : AppCompatActivity() {
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
+        DynamicColors.applyToActivityIfAvailable(this)
         super.onCreate(savedInstanceState)
+        Ui.applyDynamicColors(this)
 
         webView = WebView(this)
         webView.setBackgroundColor(Ui.BG)

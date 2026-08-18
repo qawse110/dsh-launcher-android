@@ -9,6 +9,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import com.google.android.material.color.DynamicColors
 import org.json.JSONObject
 import java.io.File
 
@@ -65,7 +66,9 @@ class PluginManagerActivity : AppCompatActivity() {
     private fun presetsRoot() = File(filesDir, ".dsh/.agent-presets")
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        DynamicColors.applyToActivityIfAvailable(this)
         super.onCreate(savedInstanceState)
+        Ui.applyDynamicColors(this)
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Ui.BG)

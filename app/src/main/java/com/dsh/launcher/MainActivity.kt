@@ -19,6 +19,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import com.google.android.material.color.DynamicColors
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
@@ -38,7 +39,9 @@ class MainActivity : AppCompatActivity() {
     private val logSb = StringBuilder()
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        DynamicColors.applyToActivityIfAvailable(this)
         super.onCreate(savedInstanceState)
+        Ui.applyDynamicColors(this)
         AppLog.init(this)
         AppLog.i("Main", "onCreate start, logPath=" + AppLog.logPath())
         // 支持 `am start -n com.dsh.launcher/.MainActivity --ez dsh true` 一键触发
