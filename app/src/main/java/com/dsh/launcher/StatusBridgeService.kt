@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.media.AudioManager
 import android.media.ToneGenerator
 import android.os.Build
 import android.os.Handler
@@ -232,7 +233,7 @@ class StatusBridgeService : Service() {
 
     private fun playBeep() {
         try {
-            val tone = ToneGenerator(ToneGenerator.STREAM_NOTIFICATION, 80)
+            val tone = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 80)
             tone.startTone(ToneGenerator.TONE_PROP_BEEP, 350)
         } catch (e: Exception) {
             // no sound permission / audio issue
