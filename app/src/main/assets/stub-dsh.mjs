@@ -311,6 +311,29 @@ try {
 } catch (e) { log('WARN dsh-sandbox tmp: ' + e.message); }
 
 try {
+  // Android 共享存储（/storage/emulated/0，FUSE）不支持 chmod；dsh-fs-local 原子写
+  // 会对临时 staging 目录/文件 chmod 0700/0600，导致 EACCES。这里把 chmod 改为
+  // 遇到 EACCES/EPERM 时忽略（权限位在 FUSE 上本来也无法生效）。
+  const MARKER_FS_CHMOD = 'dsh-launcher-android-fs-chmod';
+  const fsLocal = findPkg('@deepseek-ai/dsh-fs-local', 'lib/index.js');
+  if (fsLocal) {
+    let src = readFileSync(fsLocal, 'utf8');
+    if (src.includes(MARKER_FS_CHMOD)) {
+      log('dsh-fs-local chmod already patched');
+    } else {
+      const guard = (expr) => `try { ${expr}; } catch (e) { if (e && (e.code === 'EACCES' || e.code === 'EPERM')) { /* Android FUSE: chmod unsupported */ } else throw e; }`;
+      src = src.split('await chmod(stagingDir, 448);').join(guard('await chmod(stagingDir, 448)'));
+      src = src.split('await handle.chmod(384);').join(guard('await handle.chmod(384)'));
+      src = src.split('if (mode !== void 0) await handle.chmod(mode);').join(`if (mode !== void 0) { try { await handle.chmod(mode); } catch (e) { if (e && (e.code === 'EACCES' || e.code === 'EPERM')) { /* Android FUSE: chmod unsupported */ } else throw e; } }`);
+      writeFileSync(fsLocal, `// ${MARKER_FS_CHMOD}\n` + src);
+      log('dsh-fs-local chmod patched');
+    }
+  } else {
+    log('dsh-fs-local: not found, skip chmod patch');
+  }
+} catch (e) { log('WARN dsh-fs-local chmod: ' + e.message); }
+
+try {
   // 工作区目录浏览器：Android 在默认 home 列表里增加一个 SD Card 快捷入口，
   // 让 dsh 的“添加工作区”可以直接进入 /sdcard 并选择其中的目录。
   const dp = findPkg('@deepseek-ai/dsh-host-directory-picker-browse', 'lib/index.js');
