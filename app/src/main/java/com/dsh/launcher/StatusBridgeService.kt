@@ -24,6 +24,7 @@ import android.view.WindowManager
 import android.widget.LinearLayout
 import android.widget.TextView
 import org.json.JSONObject
+import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.atomic.AtomicBoolean
@@ -59,6 +60,7 @@ class StatusBridgeService : Service() {
     override fun onCreate() {
         super.onCreate()
         startForeground(NOTIFICATION_ID, buildForegroundNotification("正在连接 dsh…"))
+        writeHeartbeat("service", "created", "created")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -73,6 +75,7 @@ class StatusBridgeService : Service() {
         running.set(false)
         thread?.interrupt()
         mainHandler.post { removeOverlay() }
+        writeHeartbeat("service", "destroyed", "destroyed")
         super.onDestroy()
     }
 
@@ -102,6 +105,7 @@ class StatusBridgeService : Service() {
                     mainHandler.post {
                         updateOverlay(status, text)
                         updateForeground(status, text)
+                        writeHeartbeat(status, text)
                     }
                     if (prev == "running" && status == "finished") {
                         if (updatedAt > lastFinishedAt) {
@@ -384,6 +388,24 @@ class StatusBridgeService : Service() {
     }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+    /** 诊断心跳：把服务存活与悬浮窗挂载状态写到 App 私有目录，便于外部定位。 */
+    private fun writeHeartbeat(status: String, text: String, note: String? = null) {
+        try {
+            val f = File(filesDir, "status-bridge-heartbeat.json")
+            val obj = JSONObject()
+            obj.put("ts", System.currentTimeMillis())
+            obj.put("status", status)
+            obj.put("text", text.take(80))
+            obj.put("note", note ?: "")
+            obj.put("overlayExists", overlayView != null)
+            obj.put("overlayAttached", overlayView?.isAttachedToWindow == true)
+            obj.put("running", running.get())
+            f.writeText(obj.toString())
+        } catch (e: Exception) {
+            // 诊断文件写失败不影响主流程
+        }
+    }
 
     companion object {
         private const val NOTIFICATION_ID = 0x5A17
