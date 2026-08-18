@@ -12,9 +12,9 @@ import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.LinearLayout
 import android.widget.ScrollView
-import android.widget.Switch
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import com.google.android.material.switchmaterial.SwitchMaterial
 
 /**
  * dsh 状态桥接配置页：
@@ -24,12 +24,12 @@ import androidx.appcompat.app.AppCompatActivity
  */
 class OverlaySettingsActivity : AppCompatActivity() {
 
-    private lateinit var overlaySwitch: Switch
-    private lateinit var soundSwitch: Switch
-    private lateinit var notifySwitch: Switch
-    private lateinit var showStatusSwitch: Switch
-    private lateinit var showLastTextSwitch: Switch
-    private lateinit var displayModeSwitch: Switch
+    private lateinit var overlaySwitch: SwitchMaterial
+    private lateinit var soundSwitch: SwitchMaterial
+    private lateinit var notifySwitch: SwitchMaterial
+    private lateinit var showStatusSwitch: SwitchMaterial
+    private lateinit var showLastTextSwitch: SwitchMaterial
+    private lateinit var displayModeSwitch: SwitchMaterial
     private lateinit var permissionHint: TextView
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -59,7 +59,7 @@ class OverlaySettingsActivity : AppCompatActivity() {
             setPadding(0, dp(2), 0, dp(8))
         })
 
-        val card = Ui.card(this, radiusDp = 16, background = Ui.SURFACE)
+        val card = Ui.card(this, radiusDp = 16, background = Ui.SURFACE_CONTAINER, elevationDp = 1f)
         val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         card.addView(list)
         root.addView(card, LinearLayout.LayoutParams(
@@ -144,7 +144,7 @@ class OverlaySettingsActivity : AppCompatActivity() {
         return ScrollView(this).apply { addView(root) }
     }
 
-    private fun addSwitch(container: LinearLayout, title: String, desc: String, key: String, default: Boolean): Switch {
+    private fun addSwitch(container: LinearLayout, title: String, desc: String, key: String, default: Boolean): SwitchMaterial {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -161,7 +161,7 @@ class OverlaySettingsActivity : AppCompatActivity() {
             textSize = 11f
             setTextColor(Ui.TEXT_MUTED)
         })
-        val sw = Switch(this)
+        val sw = SwitchMaterial(this)
         sw.isChecked = prefs().getBoolean(key, default)
         sw.setOnCheckedChangeListener { _, checked ->
             prefs().edit().putBoolean(key, checked).apply()

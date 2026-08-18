@@ -152,7 +152,7 @@ class PluginManagerActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
         ).apply { topMargin = dp(10) })
 
-        val logCard = Ui.card(this, radiusDp = 12, background = Ui.SURFACE_ALT)
+        val logCard = Ui.card(this, radiusDp = 12, background = Ui.SURFACE_CONTAINER_LOW, elevationDp = 0f)
         logView = TextView(this).apply {
             textSize = 11f
             typeface = android.graphics.Typeface.MONOSPACE
@@ -275,7 +275,7 @@ class PluginManagerActivity : AppCompatActivity() {
     }
 
     private fun makeCard(name: String, desc: String, ver: String, status: String, actions: List<Pair<String, () -> Unit>>): View {
-        val card = Ui.card(this, radiusDp = 14, background = Ui.SURFACE, stroke = Ui.OUTLINE)
+        val card = Ui.card(this, radiusDp = 14, background = Ui.SURFACE_CONTAINER, elevationDp = 1f)
         val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
         lp.setMargins(0, 0, 0, dp(6))
         card.layoutParams = lp

@@ -14,6 +14,11 @@
         <item name="colorOnSurface">#E4E8F2</item>
         <item name="colorSurfaceVariant">#1E2430</item>
         <item name="colorOnSurfaceVariant">#AAB4C6</item>
+        <item name="colorSurfaceContainerLowest">#0F1116</item>
+        <item name="colorSurfaceContainerLow">#171C27</item>
+        <item name="colorSurfaceContainer">#1A2029</item>
+        <item name="colorSurfaceContainerHigh">#202733</item>
+        <item name="colorSurfaceContainerHighest">#262E3C</item>
         <item name="colorOutline">#2C3547</item>
         <item name="colorOutlineVariant">#232A38</item>
         <item name="android:colorBackground">#0F1116</item>

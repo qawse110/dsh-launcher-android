@@ -83,7 +83,7 @@ class TerminalActivity : AppCompatActivity(), TerminalSessionClient, TerminalVie
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setBackgroundColor(Ui.SURFACE)
+            setBackgroundColor(Ui.SURFACE_CONTAINER_HIGH)
             addView(status, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
             addView(close)
         }

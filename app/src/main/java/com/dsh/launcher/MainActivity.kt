@@ -126,7 +126,7 @@ class MainActivity : AppCompatActivity() {
         root.addView(Ui.sectionLabel(this, "运行状态"))
 
         // Status card
-        val card = Ui.card(this, radiusDp = 16, background = Ui.SURFACE)
+        val card = Ui.card(this, radiusDp = 16, background = Ui.SURFACE_CONTAINER_HIGH, elevationDp = 1f)
         val cardRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -170,7 +170,7 @@ class MainActivity : AppCompatActivity() {
             ).apply { topMargin = dp(6) }
         })
 
-        val actionCard = Ui.card(this, radiusDp = 16, background = Ui.SURFACE)
+        val actionCard = Ui.card(this, radiusDp = 16, background = Ui.SURFACE_CONTAINER, elevationDp = 2f)
         val actions = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         actionCard.addView(actions)
         root.addView(actionCard, LinearLayout.LayoutParams(
@@ -237,7 +237,7 @@ class MainActivity : AppCompatActivity() {
         })
 
         // 反馈日志栏
-        val logCard = Ui.card(this, radiusDp = 14, background = Ui.SURFACE_ALT)
+        val logCard = Ui.card(this, radiusDp = 14, background = Ui.SURFACE_CONTAINER_LOW, elevationDp = 0f)
         logView = TextView(this).apply {
             setTextColor(Ui.TEXT_SECONDARY)
             textSize = 12f

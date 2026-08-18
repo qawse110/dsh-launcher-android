@@ -16,20 +16,31 @@ import com.google.android.material.card.MaterialCardView
  */
 object Ui {
 
-    /** Palette */
+    /** Palette — Material 3 dark color roles */
     const val BG = 0xFF0F1116.toInt()
-    const val SURFACE = 0xFF171C27.toInt()
+    const val SURFACE = 0xFF151922.toInt()
     const val SURFACE_ALT = 0xFF141824.toInt()
     const val SURFACE_INPUT = 0xFF1E2430.toInt()
-    const val OUTLINE = 0xFF263041.toInt()
+    const val OUTLINE = 0xFF2C3547.toInt()
     const val BRAND = 0xFF6C8CFF.toInt()
     const val BRAND_DEEP = 0xFF4D6BFE.toInt()
-    const val TEXT_PRIMARY = 0xFFE8ECF8.toInt()
+    const val TEXT_PRIMARY = 0xFFE4E8F2.toInt()
     const val TEXT_SECONDARY = 0xFFAAB4C6.toInt()
     const val TEXT_MUTED = 0xFF7A8496.toInt()
     const val SUCCESS = 0xFF7FD086.toInt()
     const val WARNING = 0xFFE0B45A.toInt()
     const val DANGER = 0xFFFF6B6B.toInt()
+
+    // Material 3 surface container roles
+    const val SURFACE_CONTAINER_LOWEST = 0xFF0F1116.toInt()
+    const val SURFACE_CONTAINER_LOW = 0xFF171C27.toInt()
+    const val SURFACE_CONTAINER = 0xFF1A2029.toInt()
+    const val SURFACE_CONTAINER_HIGH = 0xFF202733.toInt()
+    const val SURFACE_CONTAINER_HIGHEST = 0xFF262E3C.toInt()
+    const val PRIMARY_CONTAINER = 0xFF23316B.toInt()
+    const val ON_PRIMARY_CONTAINER = 0xFFDDE4FF.toInt()
+    const val SECONDARY_CONTAINER = 0xFF2A3552.toInt()
+    const val ON_SECONDARY_CONTAINER = 0xFFDDE4FF.toInt()
 
     fun dp(context: Context, value: Int): Int =
         (value * context.resources.displayMetrics.density).toInt()
@@ -52,23 +63,28 @@ object Ui {
         }
     }
 
-    /** A flat, subtle outlined Material card used across the app. */
+    /** Material 3 card with configurable elevation and surface container role. */
     fun card(
         context: Context,
         radiusDp: Int = 16,
-        background: Int = SURFACE,
-        stroke: Int? = OUTLINE
+        background: Int = SURFACE_CONTAINER_LOW,
+        stroke: Int? = null,
+        elevationDp: Float = 0f
     ): MaterialCardView = MaterialCardView(context).apply {
         radius = dp(context, radiusDp).toFloat()
         setCardBackgroundColor(background)
-        cardElevation = 0f
+        cardElevation = elevationDp * context.resources.displayMetrics.density
         strokeWidth = if (stroke != null) dp(context, 1) else 0
         strokeColor = stroke ?: Color.TRANSPARENT
         useCompatPadding = false
         setContentPadding(dp(context, 16), dp(context, 14), dp(context, 16), dp(context, 14))
     }
 
-    /** A consistent Material button: filled for primary actions, tonal/outlined otherwise. */
+    /**
+     * Material 3 buttons:
+     * filled -> primary filled button;
+     * otherwise -> tonal button using primary/secondary container.
+     */
     fun button(
         context: Context,
         text: String,
@@ -88,10 +104,12 @@ object Ui {
             backgroundTintList = ColorStateList.valueOf(color)
             setTextColor(textColor)
         } else {
-            backgroundTintList = ColorStateList.valueOf(withAlpha(color, 0x1A))
-            setTextColor(if (color == BRAND_DEEP) 0xFFB7C4FF.toInt() else color)
-            strokeColor = ColorStateList.valueOf(withAlpha(color, 0x40))
-            strokeWidth = dp(context, 1)
+            // MD3 tonal button: container color + on-container text, no border
+            val container = if (color == BRAND_DEEP || color == BRAND) PRIMARY_CONTAINER else withAlpha(color, 0x1A)
+            val onContainer = if (color == BRAND_DEEP || color == BRAND) ON_PRIMARY_CONTAINER else color
+            backgroundTintList = ColorStateList.valueOf(container)
+            setTextColor(onContainer)
+            strokeWidth = 0
         }
         setOnClickListener { onClick() }
     }

@@ -75,7 +75,7 @@ class ConsoleActivity : AppCompatActivity() {
             setBackgroundColor(Ui.BG)
         }
 
-        val headerCard = Ui.card(this, radiusDp = 14, background = Ui.SURFACE)
+        val headerCard = Ui.card(this, radiusDp = 14, background = Ui.SURFACE_CONTAINER_HIGH, elevationDp = 1f)
         val headerRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -111,7 +111,7 @@ class ConsoleActivity : AppCompatActivity() {
         val scroll = ScrollView(this).apply {
             addView(output, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         }
-        val outputCard = Ui.card(this, radiusDp = 14, background = Ui.SURFACE_ALT)
+        val outputCard = Ui.card(this, radiusDp = 14, background = Ui.SURFACE_CONTAINER_LOW, elevationDp = 0f)
         outputCard.addView(scroll, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         root.addView(outputCard, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
