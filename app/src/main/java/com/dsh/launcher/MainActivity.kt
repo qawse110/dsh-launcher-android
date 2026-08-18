@@ -2,9 +2,13 @@ package com.dsh.launcher
 
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
-import android.os.Bundle
+import android.provider.Settings
 import android.graphics.Typeface
 import android.view.Gravity
 import android.view.View
@@ -50,9 +54,16 @@ class MainActivity : AppCompatActivity() {
         log("就绪。请选择操作。")
     }
 
-    /** 申请存储权限（targetSdk 28 在 Android 11+ 上读写 /sdcard 需要运行时授权）。 */
+    /** 申请存储权限（Android 11+ 走“所有文件访问”，旧版走运行时授权）。 */
     private fun requestStoragePermissions() {
-        if (android.os.Build.VERSION.SDK_INT < 23) return
+        if (Build.VERSION.SDK_INT >= 30) {
+            if (!Environment.isExternalStorageManager()) {
+                log("需要授予“所有文件访问权限”才能完整访问 /sdcard…")
+                openAllFilesAccessSettings()
+            }
+            return
+        }
+        if (Build.VERSION.SDK_INT < 23) return
         val needed = mutableListOf<String>()
         if (checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED)
             needed += android.Manifest.permission.READ_EXTERNAL_STORAGE
@@ -60,6 +71,22 @@ class MainActivity : AppCompatActivity() {
             needed += android.Manifest.permission.WRITE_EXTERNAL_STORAGE
         if (needed.isNotEmpty()) {
             requestPermissions(needed.toTypedArray(), 1001)
+        }
+    }
+
+    /** 打开 Android 11+ 的“所有文件访问”授权页。 */
+    private fun openAllFilesAccessSettings() {
+        try {
+            startActivity(Intent(
+                Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                Uri.parse("package:$packageName")
+            ))
+        } catch (e: Exception) {
+            try {
+                startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+            } catch (e2: Exception) {
+                log("无法打开存储权限设置：${e2.message}")
+            }
         }
     }
 
@@ -182,6 +209,9 @@ class MainActivity : AppCompatActivity() {
         }
         addButton(getString(R.string.btn_node_check), false) {
             runNodeDsh()
+        }
+        addButton("存储权限 / 所有文件访问", false) {
+            requestStoragePermissions()
         }
         addButton(getString(R.string.btn_stop_all), false, Ui.DANGER) {
             stopDshAll()

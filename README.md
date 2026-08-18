@@ -56,6 +56,8 @@ adb shell am start -n com.dsh.launcher/.MainActivity   # 或直接点应用图�
 ```
 
 - 主界面按钮「打开 Web 界面」进入内嵌 WebView；填写 API Key（设置 → 添加 API Key）后即可对话。
+- Android 11+ 可在主界面点击「存储权限 / 所有文件访问」并允许，以完整读写 `/sdcard`
+  （尤其当 dsh 工作区放在 `/sdcard/Download` 时）。
 - 日志：应用私有目录 `files/dsh-flow.log`（引导流程）、`files/dsh-web.log`（web 进程）。
 - 部分 ColorOS 设备从 `/sdcard` 安装 APK 会遇到 FUSE 上下文问题，先推送到
   `/data/local/tmp/` 再 `pm install -r` 即可。
