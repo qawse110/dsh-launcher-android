@@ -71,6 +71,9 @@
             android:process=":status_bridge"
             android:foregroundServiceType="dataSync"
             android:stopWithTask="false" />
+        <receiver
+            android:name=".BridgeWatchdogReceiver"
+            android:exported="false" />
     </application>
 
 </manifest>

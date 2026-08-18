@@ -1,10 +1,12 @@
 package com.dsh.launcher
 
+import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.graphics.PixelFormat
@@ -16,6 +18,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
 import android.view.Gravity
 import android.view.MotionEvent
@@ -65,6 +68,7 @@ class StatusBridgeService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         writeHeartbeat("service", "started", "started")
+        scheduleWatchdog(this)
         if (thread == null) {
             thread = Thread({ pollLoop() }, "dsh-status-bridge")
             thread?.start()
@@ -115,6 +119,9 @@ class StatusBridgeService : Service() {
                             mainHandler.post { onAiFinished(text) }
                         }
                     }
+                } else {
+                    // dsh 暂时不可达也要记录心跳，证明 Service 本身还活着
+                    mainHandler.post { writeHeartbeat(lastStatus ?: "idle", "", "poll-null") }
                 }
             } catch (t: Throwable) {
                 // ignore transient polling errors
@@ -404,6 +411,13 @@ class StatusBridgeService : Service() {
             obj.put("overlayAttached", overlayView?.isAttachedToWindow == true)
             obj.put("running", running.get())
             f.writeText(obj.toString())
+
+            val log = File(filesDir, "status-bridge-heartbeat.log")
+            log.appendText(
+                "${System.currentTimeMillis()} | $status | ${text.take(80)} | ${note ?: ""} | " +
+                    "overlayExists=${overlayView != null} attached=${overlayView?.isAttachedToWindow == true} " +
+                    "running=${running.get()}\n"
+            )
         } catch (e: Exception) {
             // 诊断文件写失败不影响主流程
         }
@@ -412,6 +426,8 @@ class StatusBridgeService : Service() {
     companion object {
         private const val NOTIFICATION_ID = 0x5A17
         private const val FINISH_NOTIFICATION_ID = 0x5A18
+        private const val WATCHDOG_REQUEST_CODE = 0x5A19
+        const val WATCHDOG_ACTION = "com.dsh.launcher.action.BRIDGE_WATCHDOG"
 
         fun start(context: Context) {
             val intent = Intent(context, StatusBridgeService::class.java)
@@ -420,10 +436,69 @@ class StatusBridgeService : Service() {
             } else {
                 context.startService(intent)
             }
+            scheduleWatchdog(context)
         }
 
         fun stop(context: Context) {
             context.stopService(Intent(context, StatusBridgeService::class.java))
+            cancelWatchdog(context)
+        }
+
+        private fun scheduleWatchdog(context: Context) {
+            try {
+                val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+                val pi = PendingIntent.getBroadcast(
+                    context,
+                    WATCHDOG_REQUEST_CODE,
+                    Intent(WATCHDOG_ACTION).setPackage(context.packageName),
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+                am.setInexactRepeating(
+                    AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                    SystemClock.elapsedRealtime() + 30_000L,
+                    30_000L,
+                    pi
+                )
+            } catch (e: Exception) {
+                // watchdog 只是兜底，失败不影响主服务
+            }
+        }
+
+        private fun cancelWatchdog(context: Context) {
+            try {
+                val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+                val pi = PendingIntent.getBroadcast(
+                    context,
+                    WATCHDOG_REQUEST_CODE,
+                    Intent(WATCHDOG_ACTION).setPackage(context.packageName),
+                    PendingIntent.FLAG_NO_CREATE or PendingIntent.FLAG_IMMUTABLE
+                )
+                if (pi != null) {
+                    am.cancel(pi)
+                    pi.cancel()
+                }
+            } catch (e: Exception) {
+                // ignore
+            }
+        }
+    }
+}
+
+/** 看门狗：桥接服务被系统销毁后，定时检查心跳文件并尝试重新拉起服务。 */
+class BridgeWatchdogReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent?) {
+        if (intent?.action != StatusBridgeService.WATCHDOG_ACTION) return
+        val alive = try {
+            val f = File(context.filesDir, "status-bridge-heartbeat.json")
+            val obj = JSONObject(f.readText())
+            val running = obj.optBoolean("running", false)
+            val ts = obj.optLong("ts", 0L)
+            running && System.currentTimeMillis() - ts < 60_000L
+        } catch (e: Exception) {
+            false
+        }
+        if (!alive) {
+            StatusBridgeService.start(context)
         }
     }
 }
