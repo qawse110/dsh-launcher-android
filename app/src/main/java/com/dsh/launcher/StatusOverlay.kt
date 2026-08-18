@@ -26,7 +26,7 @@ fun buildOverlayText(
 ): String {
     val statusText = if (showStatus) statusLabel(status, event) else ""
     val snippet = if (showLastText && text.isNotBlank()) {
-        if (fullMode) text.take(120) else text.take(24)
+        if (fullMode) text.take(160) else text.take(24)
     } else ""
     return listOf(statusText, snippet).filter { it.isNotBlank() }.joinToString(" · ")
 }

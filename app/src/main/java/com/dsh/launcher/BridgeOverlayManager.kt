@@ -40,7 +40,23 @@ class BridgeOverlayManager(
     private fun overlayEnabled() = prefs().getBoolean("overlay_enabled", true)
     private fun showStatus() = prefs().getBoolean("show_status", true)
     private fun showLastText() = prefs().getBoolean("show_last_text", true)
-    private fun displayMode() = prefs().getString("display_mode", "compact") ?: "compact"
+    private fun displayMode(): String {
+        return if (prefs().getBoolean("display_mode_auto", true)) {
+            "auto"
+        } else {
+            prefs().getString("display_mode", "compact") ?: "compact"
+        }
+    }
+
+    private fun useFullMode(text: String): Boolean {
+        val mode = displayMode()
+        return when (mode) {
+            "full" -> true
+            "compact" -> false
+            else -> text.length > 20
+        }
+    }
+
     private fun hideWhenIdle() = prefs().getBoolean("hide_when_idle", false)
 
     fun update(status: String, text: String, event: String? = null) {
@@ -87,6 +103,7 @@ class BridgeOverlayManager(
             isSingleLine = displayMode() != "full"
             maxLines = if (displayMode() == "full") 3 else 1
             ellipsize = TextUtils.TruncateAt.END
+            maxWidth = (context.resources.displayMetrics.widthPixels * 0.72).toInt()
         }
         overlayClose = TextView(context).apply {
             setText(" ×")
@@ -146,16 +163,17 @@ class BridgeOverlayManager(
             1,
             statusBorder(status)
         )
+        val full = useFullMode(text)
         tv.text = buildOverlayText(
             status,
             event,
             text,
             showStatus(),
             showLastText(),
-            displayMode() == "full"
+            full
         )
-        tv.isSingleLine = displayMode() != "full"
-        tv.maxLines = if (displayMode() == "full") 3 else 1
+        tv.isSingleLine = !full
+        tv.maxLines = if (full) 3 else 1
     }
 
     fun remove() {
