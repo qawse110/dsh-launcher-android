@@ -146,7 +146,8 @@ class StatusBridgeService : Service() {
 
     private fun prefs() = getSharedPreferences("status_bridge", Context.MODE_PRIVATE)
 
-    private fun overlayEnabled() = prefs().getBoolean("overlay_enabled", true)
+    private fun overlayEnabled() = prefs().getBoolean("overlay_enabled", true) &&
+        !prefs().getBoolean("a11y_overlay_active", false)
     private fun soundEnabled() = prefs().getBoolean("sound_enabled", true)
     private fun notifyEnabled() = prefs().getBoolean("notify_enabled", true)
     private fun showStatus() = prefs().getBoolean("show_status", true)
