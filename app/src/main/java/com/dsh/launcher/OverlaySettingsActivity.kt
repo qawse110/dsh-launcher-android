@@ -31,6 +31,7 @@ class OverlaySettingsActivity : AppCompatActivity() {
     private lateinit var showStatusSwitch: SwitchMaterial
     private lateinit var showLastTextSwitch: SwitchMaterial
     private lateinit var displayModeSwitch: SwitchMaterial
+    private lateinit var hideWhenIdleSwitch: SwitchMaterial
     private lateinit var permissionHint: TextView
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -54,7 +55,7 @@ class OverlaySettingsActivity : AppCompatActivity() {
             setTextColor(Ui.TEXT_PRIMARY)
         })
         root.addView(TextView(this).apply {
-            text = "悬浮窗显示 dsh 运行情况，AI 输出结束后可提示"
+            text = "悬浮窗显示运行情况 · 点击打开 Web · AI 结束可提示"
             textSize = 12f
             setTextColor(Ui.TEXT_SECONDARY)
             setPadding(0, dp(2), 0, dp(8))
@@ -86,6 +87,7 @@ class OverlaySettingsActivity : AppCompatActivity() {
             }
             showStatusSwitch = addSwitch(this, "显示状态", "显示思考中 / 输出中 / 调用工具等状态", "show_status", true)
             showLastTextSwitch = addSwitch(this, "显示最近输出", "悬浮窗中附带最近 AI 文本", "show_last_text", true)
+            hideWhenIdleSwitch = addSwitch(this, "空闲时隐藏", "dsh 空闲时自动隐藏悬浮窗，减少打扰", "hide_when_idle", false)
             displayModeSwitch = addSwitch(this, "完整模式", "显示更多最近输出（3 行预览）", "display_mode_full", false)
             displayModeSwitch.isChecked = prefs().getString("display_mode", "compact") == "full"
             displayModeSwitch.setOnCheckedChangeListener { _, checked ->

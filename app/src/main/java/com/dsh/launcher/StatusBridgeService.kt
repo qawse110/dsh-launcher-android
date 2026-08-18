@@ -52,6 +52,8 @@ class StatusBridgeService : Service() {
     private var dragStartY = 0
     private var dragStartTouchX = 0f
     private var dragStartTouchY = 0f
+    private var dragMoved = false
+    private val dragSlop = dp(4)
     private var lastStatus: String? = null
     private var lastFinishedAt = 0L
 
@@ -149,6 +151,7 @@ class StatusBridgeService : Service() {
     private fun showStatus() = prefs().getBoolean("show_status", true)
     private fun showLastText() = prefs().getBoolean("show_last_text", true)
     private fun displayMode() = prefs().getString("display_mode", "compact") ?: "compact"
+    private fun hideWhenIdle() = prefs().getBoolean("hide_when_idle", false)
 
     // ---------------- 悬浮窗 ----------------
 
@@ -192,6 +195,7 @@ class StatusBridgeService : Service() {
         overlayView = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            contentDescription = "点击打开 dsh Web，拖动调整位置"
             background = roundedDrawable(0xDD101722.toInt(), 14, 1, 0x33283A55.toInt())
             if (Build.VERSION.SDK_INT >= 21) elevation = dp(6).toFloat()
             setPadding(dp(12), dp(8), dp(6), dp(8))
@@ -215,8 +219,8 @@ class StatusBridgeService : Service() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = dp(8)
-            y = dp(80)
+            x = prefs().getInt("overlay_x", dp(8))
+            y = prefs().getInt("overlay_y", dp(80))
         }
         try {
             overlayView?.let { windowManager?.addView(it, overlayParams) }
@@ -234,12 +238,22 @@ class StatusBridgeService : Service() {
             removeOverlay()
             return
         }
+        if (hideWhenIdle() && status == "idle") {
+            removeOverlay()
+            return
+        }
         showOverlay(status, text, event)
     }
 
     private fun updateOverlayText(status: String, text: String, event: String?) {
         val tv = overlayText ?: return
         overlayDot?.background = circleDrawable(statusColor(status))
+        overlayView?.background = roundedDrawable(
+            statusBackground(status),
+            14,
+            1,
+            statusBorder(status)
+        )
         tv.text = buildOverlayText(
             status,
             event,
@@ -256,6 +270,18 @@ class StatusBridgeService : Service() {
         "running" -> 0xFF6C8CFF.toInt()
         "finished" -> 0xFF5FD68A.toInt()
         else -> 0xFF7A8496.toInt()
+    }
+
+    private fun statusBackground(status: String): Int = when (status) {
+        "running" -> 0xEE182238.toInt()
+        "finished" -> 0xEE1B2A24.toInt()
+        else -> 0xDD101722.toInt()
+    }
+
+    private fun statusBorder(status: String): Int = when (status) {
+        "running" -> 0x446C8CFF.toInt()
+        "finished" -> 0x445FD68A.toInt()
+        else -> 0x33283A55.toInt()
     }
 
     private fun circleDrawable(color: Int): GradientDrawable =
@@ -289,6 +315,17 @@ class StatusBridgeService : Service() {
         overlayParams = null
     }
 
+    private fun openWeb() {
+        try {
+            startActivity(
+                Intent(this, WebViewActivity::class.java)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        } catch (_: Exception) {
+            // 启动失败时静默忽略，保证悬浮窗不崩溃
+        }
+    }
+
     private val overlayTouchListener = View.OnTouchListener { _, event ->
         val p = overlayParams ?: return@OnTouchListener false
         val manager = windowManager ?: return@OnTouchListener false
@@ -299,14 +336,31 @@ class StatusBridgeService : Service() {
                 dragStartY = p.y
                 dragStartTouchX = event.rawX
                 dragStartTouchY = event.rawY
+                dragMoved = false
                 true
             }
             MotionEvent.ACTION_MOVE -> {
-                p.x = dragStartX + (event.rawX - dragStartTouchX).toInt()
-                p.y = dragStartY + (event.rawY - dragStartTouchY).toInt()
-                try { manager.updateViewLayout(view, p) } catch (e: Exception) {}
+                val dx = event.rawX - dragStartTouchX
+                val dy = event.rawY - dragStartTouchY
+                if (!dragMoved && (Math.abs(dx) > dragSlop || Math.abs(dy) > dragSlop)) {
+                    dragMoved = true
+                }
+                if (dragMoved) {
+                    p.x = dragStartX + dx.toInt()
+                    p.y = dragStartY + dy.toInt()
+                    try { manager.updateViewLayout(view, p) } catch (e: Exception) {}
+                }
                 true
             }
+            MotionEvent.ACTION_UP -> {
+                if (!dragMoved) {
+                    openWeb()
+                } else {
+                    prefs().edit().putInt("overlay_x", p.x).putInt("overlay_y", p.y).apply()
+                }
+                true
+            }
+            MotionEvent.ACTION_CANCEL -> true
             else -> false
         }
     }
