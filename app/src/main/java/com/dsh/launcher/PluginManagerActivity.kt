@@ -28,7 +28,7 @@ class PluginManagerActivity : AppCompatActivity() {
         val BUNDLED = setOf(
             "dsh-mobile-nav", "dsh-super-injector",
             "dsh-net-proxy", "dsh-provider-headers", "dsh-vision",
-            "dsh-oh-we-need", "dsh-j-space-cognition",
+            "dsh-oh-we-need", "dsh-j-space-cognition", "dsh-status-bridge",
         )
         val BUNDLED_DESC = mapOf(
             "dsh-mobile-nav" to "移动端 UI 适配（窄屏抽屉/全宽会话）",
@@ -38,6 +38,7 @@ class PluginManagerActivity : AppCompatActivity() {
             "dsh-vision" to "视觉（view_image 工具 + VLM 后端）",
             "dsh-oh-we-need" to "oh-we-need 推理风格 Skill（按需调用，不再注入系统提示词）",
             "dsh-j-space-cognition" to "J-Space Cognition Suite V3.6 Skill（j-space 推理时认知控制）",
+            "dsh-status-bridge" to "状态桥接（悬浮窗/通知显示 dsh 运行情况）",
         )
         const val PRESET_DIR = "router-preset"
         const val PRESET_DESC = "思维模式路由预设（router-spec / router-standard，agent-presets）"

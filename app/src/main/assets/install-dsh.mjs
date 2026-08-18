@@ -30,6 +30,7 @@ const DSH_PREFIX = process.env.DSH_PREFIX || join(HOME, 'dsh-prefix');
 const DSH_PROFILE = process.env.DSH_PROFILE || 'web';
 const PREBUILT = process.env.DSH_PREBUILT || '';
 const PLUGINS_DIR = process.env.DSH_PLUGINS_DIR || join(HOME, 'plugins');
+const EXTRA_PLUGINS_SRC = process.env.DSH_EXTRA_PLUGINS_SRC || join(HOME, 'extra-plugins');
 const TOOLS = join(HOME, '.tools');
 const TERMUX = process.env.TERMUX_PREFIX || join(HOME, 'termux/usr');
 const REGISTRY = process.env.NPM_REGISTRY || 'https://registry.npmmirror.com';
@@ -44,6 +45,7 @@ const BUILTIN_PLUGINS = [
   'dsh-vision',
   'dsh-oh-we-need',
   'dsh-j-space-cognition',
+  'dsh-status-bridge',
 ];
 const BUILTIN_NAMES = new Set([
   '@dsh-external/dsh-mobile-nav',
@@ -53,6 +55,7 @@ const BUILTIN_NAMES = new Set([
   '@dsh-external/dsh-vision',
   '@dsh-external/dsh-oh-we-need',
   '@dsh-external/dsh-j-space-cognition',
+  '@dsh-external/dsh-status-bridge',
 ]);
 const BUILTIN_IDS = new Set([
   'dsh-mobile-nav',
@@ -62,6 +65,7 @@ const BUILTIN_IDS = new Set([
   'dsh-vision',
   'dsh-oh-we-need',
   'dsh-j-space-cognition',
+  'dsh-status-bridge',
 ]);
 function log(m) {
   const l = `${new Date().toISOString()} [install] ${m}`;
@@ -328,8 +332,20 @@ function dshPlugin(args) {
 function addLocalPlugin(dir) {
   const p = join(PLUGINS_DIR, dir);
   if (!existsSync(join(p, 'package.json'))) {
-    log(`skip builtin plugin ${dir}: not bundled`);
-    return false;
+    // 新内置插件可能以源码形式随 APK 放在 extra-plugins/，首次安装时复制到 plugins 目录。
+    const src = join(EXTRA_PLUGINS_SRC, dir);
+    if (existsSync(join(src, 'package.json'))) {
+      log(`copy extra plugin ${dir} -> plugins`);
+      try {
+        cpSync(src, p, { recursive: true, force: true });
+      } catch (e) {
+        log(`WARN copy extra plugin ${dir}: ${e.message}`);
+        return false;
+      }
+    } else {
+      log(`skip builtin plugin ${dir}: not bundled`);
+      return false;
+    }
   }
   log(`dsh plugin add ${dir}`);
   return dshPlugin(['add', p]);

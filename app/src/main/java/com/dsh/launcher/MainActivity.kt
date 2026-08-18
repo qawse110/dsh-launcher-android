@@ -221,6 +221,9 @@ class MainActivity : AppCompatActivity() {
         addButton("存储权限 / 所有文件访问", false) {
             requestStoragePermissions()
         }
+        addButton("状态悬浮窗 / 桥接", false) {
+            startActivity(Intent(this, OverlaySettingsActivity::class.java))
+        }
         addButton(getString(R.string.btn_stop_all), false, Ui.DANGER) {
             stopDshAll()
         }

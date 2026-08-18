@@ -11,6 +11,10 @@
         android:maxSdkVersion="32" />
     <!-- Android 11+ 全文件访问（All files access），用于提升 /sdcard 等共享存储的读写权限 -->
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <!-- 状态桥接悬浮窗/通知 -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.VIBRATE" />
 
     <application
         android:allowBackup="true"
@@ -52,10 +56,19 @@
             android:exported="false"
             android:configChanges="orientation|screenSize|keyboardHidden"
             android:windowSoftInputMode="adjustResize" />
+        <activity
+            android:name=".OverlaySettingsActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:windowSoftInputMode="adjustResize" />
 
         <service
             android:name=".BuildKeepAliveService"
             android:exported="false" />
+        <service
+            android:name=".StatusBridgeService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
     </application>
 
 </manifest>

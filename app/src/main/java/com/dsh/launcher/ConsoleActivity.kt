@@ -272,6 +272,14 @@ class ConsoleActivity : AppCompatActivity() {
                 } catch (t: Throwable) {
                     fl("  assets 无 prebuilt.tgz：${t.message}")
                 }
+                val extraPluginsDir = File(filesDir, "extra-plugins")
+                try {
+                    copyAssetDir("extra-plugins", extraPluginsDir)
+                    val count = extraPluginsDir.walkTopDown().count { it.isFile }
+                    fl("  额外桥接插件源 ${count} 个文件")
+                } catch (t: Throwable) {
+                    fl("  WARN assets 无 extra-plugins：${t.message}")
+                }
 
                 fl(">> 3/4 官方 npm 安装/更新 dsh + dsh plugin 装配内置插件…")
                 val installEnv = mapOf(
@@ -281,7 +289,8 @@ class ConsoleActivity : AppCompatActivity() {
                     "DSH_PREFIX" to dshPrefix.absolutePath,
                     "DSH_PROFILE" to "web",
                     "DSH_PREBUILT" to prebuilt.absolutePath,
-                    "DSH_PLUGINS_DIR" to pluginsDir.absolutePath
+                    "DSH_PLUGINS_DIR" to pluginsDir.absolutePath,
+                    "DSH_EXTRA_PLUGINS_SRC" to extraPluginsDir.absolutePath
                 )
                 val installExit = runCommandAndWait("$nodeDir/bin/node ${installScript.absolutePath}", installEnv)
                 if (installExit != 0) {
@@ -541,6 +550,23 @@ class ConsoleActivity : AppCompatActivity() {
             output.text = sb.toString()
             // 自动滚到底部
             (output.parent as? ScrollView)?.fullScroll(View.FOCUS_DOWN)
+        }
+    }
+
+    private fun copyAssetDir(assetPath: String, dest: File) {
+        val children = assets.list(assetPath) ?: return
+        dest.mkdirs()
+        for (name in children) {
+            val childAsset = "$assetPath/$name"
+            val childDest = File(dest, name)
+            if (assets.list(childAsset)?.isNotEmpty() == true) {
+                copyAssetDir(childAsset, childDest)
+            } else {
+                childDest.parentFile?.mkdirs()
+                assets.open(childAsset).use { input ->
+                    childDest.outputStream().use { output -> input.copyTo(output) }
+                }
+            }
         }
     }
 
