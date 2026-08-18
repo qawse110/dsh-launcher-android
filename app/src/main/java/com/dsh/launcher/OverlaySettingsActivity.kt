@@ -106,8 +106,8 @@ class OverlaySettingsActivity : AppCompatActivity() {
         // 提醒方式
         root.addView(section("提醒方式"))
         card {
-            soundSwitch = addSwitch(this, "声音提示", "AI 输出结束后播放系统通知音", "sound_enabled", true)
-            notifySwitch = addSwitch(this, "通知提示", "AI 输出结束后发送通知", "notify_enabled", true)
+            soundSwitch = addSwitch(this, "声音提示", "AI 输出结束后由应用自身播放提示音", "sound_enabled", true)
+            notifySwitch = addSwitch(this, "通知提示", "发送静默通知（不附带提示音）", "notify_enabled", true)
         }
 
         permissionHint = TextView(this).apply {
