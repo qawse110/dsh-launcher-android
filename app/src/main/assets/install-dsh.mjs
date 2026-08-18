@@ -385,8 +385,8 @@ function copyPresets() {
       }
       log('preset install: router-preset (' + copied + ' subpresets)');
     }
-    // 上游曾短暂合入 router-pro（v0.3.0）后又回退到 v0.2.0；
-    // 清理历史安装残留，避免 agent-presets 里出现上游已移除的预设。
+    // 上游当前不再发布 router-pro；
+    // 清理历史安装残留，避免 agent-presets 里出现已移除的预设。
     for (const stale of ['router-pro']) {
       if (!sourceNames.has(stale)) {
         rmSync(join(destRoot, stale), { recursive: true, force: true });

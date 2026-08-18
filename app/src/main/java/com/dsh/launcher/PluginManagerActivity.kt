@@ -17,7 +17,7 @@ import java.io.File
  *
  * 装配动作全部走官方 `dsh plugin --profile web add/remove`；
  * `yjh051108/dsh-routing-suite` 走特殊适配（routing-suite.mjs：
- * 下载聚合仓库 + 三个子仓库 → 装配 injector/mode-boost → 拷贝 agent-preset）；
+ * 下载聚合仓库 + 两个子仓库 → 装配 injector → 拷贝 agent-preset）；
  * `scp3500/oh-we-need` 是纯提示词仓库，已内置为 dsh-oh-we-need 插件，
  * 输入该仓库时触发内置插件重新装配。
  */

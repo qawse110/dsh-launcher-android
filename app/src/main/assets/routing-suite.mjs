@@ -2,11 +2,11 @@
 /**
  * routing-suite.mjs — yjh051108/dsh-routing-suite 特殊适配安装/更新。
  *
- * 该仓库是聚合仓库（submodule: dsh-super-injector / dsh-router-standard /
- * dsh-mode-boost），不能像普通插件那样 `dsh plugin add github:...` 直接装配。
+ * 该仓库是聚合仓库（submodule: dsh-super-injector / dsh-router-standard），
+ * 不能像普通插件那样 `dsh plugin add github:...` 直接装配。
  * 这里特殊处理：
- *   1) 从 GitHub codeload 下载 routing-suite 及三个子仓库源码包；
- *   2) 用官方 `dsh plugin --profile web add <path>` 装配 injector 与 mode-boost；
+ *   1) 从 GitHub codeload 下载 routing-suite 及子仓库源码包；
+ *   2) 用官方 `dsh plugin --profile web add <path>` 装配 injector；
  *   3) 把 router-standard/router-spec 等 agent-preset 拷贝到 $HOME/.dsh/.agent-presets。
  *
  * 环境变量：
@@ -33,7 +33,6 @@ const SUITE_REPO = process.env.DSH_ROUTING_REPO || 'yjh051108/dsh-routing-suite'
 const SUBMODULES = [
   { name: 'injector', repo: 'yjh051108/dsh-super-injector' },
   { name: 'preset', repo: 'yjh051108/dsh-router-standard' },
-  { name: 'mode-boost', repo: 'yjh051108/dsh-mode-boost' },
 ];
 
 function log(m) {
@@ -199,15 +198,7 @@ async function installSuite() {
     log('injector package missing, skip');
   }
 
-  // 2) mode-boost：官方 dsh plugin add
-  const modeBoost = join(ROUTING_DIR, 'mode-boost');
-  if (existsSync(join(modeBoost, 'package.json'))) {
-    dshPlugin(['add', modeBoost]);
-  } else {
-    log('mode-boost package missing, skip');
-  }
-
-  // 3) router-standard/router-spec 等 agent-preset：拷贝/展平到 .agent-presets
+  // 2) router-standard/router-spec 等 agent-preset：拷贝/展平到 .agent-presets
   const presetRoot = join(ROUTING_DIR, 'preset');
   const presetSrc = existsSync(join(presetRoot, 'preset')) ? join(presetRoot, 'preset') : presetRoot;
   const destRoot = join(HOME, '.dsh/.agent-presets');
@@ -232,13 +223,12 @@ async function installSuite() {
     }
     log('presets copied: ' + copied);
   }
-  // 上游曾短暂合入 router-pro（v0.3.0）后又回退到 v0.2.0；
-  // 清理历史安装残留，避免 agent-presets 里出现上游已移除的预设。
+  // 上游当前不再发布 router-pro；清理历史安装残留，避免 agent-presets 里出现已移除的预设。
   if (existsSync(presetSrc)) {
     for (const stale of ['router-pro']) {
       if (!sourceNames.has(stale)) {
         rmSync(join(destRoot, stale), { recursive: true, force: true });
-        log('removed stale preset: ' + stale + ' (upstream reverted to v0.2.0)');
+        log('removed stale preset: ' + stale + ' (upstream no longer ships router-pro)');
       }
     }
   }
