@@ -51,17 +51,27 @@ class WebViewActivity : AppCompatActivity() {
             setTextColor(Ui.TEXT_PRIMARY)
         }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
 
-        toolbar.addView(Ui.button(this, "←", { if (webView.canGoBack()) webView.goBack() }, filled = false, compact = true).apply {
+        val backBtn = Ui.button(this, "←", { if (webView.canGoBack()) webView.goBack() }, filled = false, compact = true).apply {
             minWidth = dp(44)
-        })
-        toolbar.addView(Ui.button(this, "→", { if (webView.canGoForward()) webView.goForward() }, filled = false, compact = true).apply {
+        }
+        toolbar.addView(backBtn, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { rightMargin = dp(4) })
+        val forwardBtn = Ui.button(this, "→", { if (webView.canGoForward()) webView.goForward() }, filled = false, compact = true).apply {
             minWidth = dp(44)
-            leftMargin = dp(4)
-        })
-        toolbar.addView(Ui.button(this, "刷新", { webView.reload() }, filled = false, compact = true).apply {
+        }
+        toolbar.addView(forwardBtn, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { rightMargin = dp(4) })
+        val refreshBtn = Ui.button(this, "刷新", { webView.reload() }, filled = false, compact = true).apply {
             minWidth = dp(60)
-            leftMargin = dp(4)
-        })
+        }
+        toolbar.addView(refreshBtn, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
         root.addView(toolbar, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             dp(52)
