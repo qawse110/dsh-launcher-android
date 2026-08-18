@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.Settings
 import android.view.Gravity
 import android.view.ViewGroup
@@ -93,12 +94,23 @@ class OverlaySettingsActivity : AppCompatActivity() {
                 requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 200)
             }
             StatusBridgeService.start(this)
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            if (Build.VERSION.SDK_INT >= 23 && !pm.isIgnoringBatteryOptimizations(packageName)) {
+                permissionHint.text = "⚠ 建议开启“忽略电池优化”，否则后台可能被系统杀死"
+                permissionHint.setTextColor(Ui.WARNING)
+            }
         }, filled = true)
         val stopBtn = Ui.button(this, "停止服务", {
             StatusBridgeService.stop(this)
         }, filled = false, color = Ui.DANGER)
         val permBtn = Ui.button(this, "授予悬浮窗权限", {
             openOverlaySettings()
+        }, filled = false)
+        val batteryBtn = Ui.button(this, "忽略电池优化（防后台杀）", {
+            openBatteryOptimizationSettings()
+        }, filled = false)
+        val a11yBtn = Ui.button(this, "无障碍保活（可选，强烈推荐）", {
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         }, filled = false)
         val webBtn = Ui.button(this, "打开 dsh Web", {
             startActivity(Intent(this, WebViewActivity::class.java))
@@ -113,6 +125,14 @@ class OverlaySettingsActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = dp(8) })
         root.addView(permBtn, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(8) })
+        root.addView(batteryBtn, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(8) })
+        root.addView(a11yBtn, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = dp(8) })
@@ -175,6 +195,23 @@ class OverlaySettingsActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION))
             }
+        }
+    }
+
+    private fun openBatteryOptimizationSettings() {
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        if (Build.VERSION.SDK_INT >= 23 && !pm.isIgnoringBatteryOptimizations(packageName)) {
+            try {
+                startActivity(Intent(
+                    Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    Uri.parse("package:$packageName")
+                ))
+            } catch (e: Exception) {
+                startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            }
+        } else {
+            permissionHint.text = "✓ 已忽略电池优化"
+            permissionHint.setTextColor(Ui.SUCCESS)
         }
     }
 

@@ -10,4 +10,5 @@
     <string name="btn_open_terminal">命令控制台</string>
     <string name="btn_stop_all">停止 dsh 服务</string>
     <string name="btn_node_check">内置 Node 检测</string>
+    <string name="accessibility_service_description">用于提升 dsh 状态悬浮桥接在后台的存活率（仅保活，不读取屏幕内容）。</string>
 </resources>
