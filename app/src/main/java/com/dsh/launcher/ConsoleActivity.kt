@@ -5,6 +5,7 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.os.IBinder
 import android.view.Gravity
@@ -273,6 +274,7 @@ class ConsoleActivity : AppCompatActivity() {
                     startDshWeb(nodeDir, dshPrefix)
                     fl("OK 快速启动完成 (http://127.0.0.1:3080)")
                     setState("运行中")
+                    BuildKeepAliveService.updateRunning(this)
                     return@thread
                 }
                 fl(">> 1.5/4 准备内置 Termux（bash/coreutils + git/python）…")
@@ -374,6 +376,7 @@ class ConsoleActivity : AppCompatActivity() {
                 fl(">> 4/4 校验 dsh web…")
                 startDshWeb(nodeDir, dshPrefix)
                 fl("OK 4/4 dsh web started (http://127.0.0.1:3080)")
+                BuildKeepAliveService.updateRunning(this)
                 // 保持 keepalive 常驻：web 进程是其子进程，避免被系统回收；用户可在主界面停止。
             } catch (t: Throwable) {
                 fl("FAIL: ${t.message}")
@@ -616,6 +619,37 @@ class BuildKeepAliveService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        val running = prefs().getBoolean(KEY_RUNNING, false)
+        startForeground(
+            1,
+            buildNotification(
+                if (running) "dsh 运行中" else "dsh 安装中",
+                if (running) "dsh 正在后台运行，点击可进入管理" else "正在构建 DeepSeek Harness，请稍候…"
+            )
+        )
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_UPDATE_RUNNING) {
+            prefs().edit().putBoolean(KEY_RUNNING, true).apply()
+            startForeground(
+                1,
+                buildNotification("dsh 运行中", "dsh 正在后台运行，点击可进入管理")
+            )
+        }
+        return START_STICKY
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        runCatching {
+            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).cancel(1)
+        }
+    }
+
+    private fun prefs() = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    private fun buildNotification(title: String, text: String): Notification {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         val builder: Notification.Builder =
             if (android.os.Build.VERSION.SDK_INT >= 26) {
@@ -628,20 +662,36 @@ class BuildKeepAliveService : Service() {
                 @Suppress("DEPRECATION")
                 Notification.Builder(this)
             }
-        @Suppress("DEPRECATION")
-        val n = builder
-            .setContentTitle("dsh 安装中")
-            .setContentText("正在构建 DeepSeek Harness，请稍候…")
+        return builder
+            .setContentTitle(title)
+            .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_popup_sync)
             .setOngoing(true)
             .build()
-        startForeground(1, n)
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        runCatching {
-            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).cancel(1)
+    companion object {
+        const val ACTION_UPDATE_RUNNING = "com.dsh.launcher.action.BUILD_KEEPALIVE_RUNNING"
+        private const val PREFS_NAME = "dsh_keepalive"
+        private const val KEY_RUNNING = "running"
+
+        fun updateRunning(context: Context) {
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit().putBoolean(KEY_RUNNING, true).apply()
+            val intent = Intent(context, BuildKeepAliveService::class.java)
+                .setAction(ACTION_UPDATE_RUNNING)
+            runCatching {
+                if (android.os.Build.VERSION.SDK_INT >= 26) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+            }
+        }
+
+        fun markStopped(context: Context) {
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit().putBoolean(KEY_RUNNING, false).apply()
         }
     }
 }

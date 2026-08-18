@@ -387,6 +387,7 @@ class MainActivity : AppCompatActivity() {
                 android.util.Log.w("DshMain", "kill failed: ${t.message}")
             }
             runOnUiThread {
+                BuildKeepAliveService.markStopped(this@MainActivity)
                 runCatching { stopService(Intent(this@MainActivity, BuildKeepAliveService::class.java)) }
                 log("✓ 已停止 dsh 相关进程与服务")
                 refreshStatus()
