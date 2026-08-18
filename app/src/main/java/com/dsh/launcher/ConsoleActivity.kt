@@ -249,14 +249,12 @@ class ConsoleActivity : AppCompatActivity() {
                     fl(">> 快速启动：已安装 dsh v${DshUpdater.currentVersion(this)}，跳过 npm/插件装配…")
                     for (name in listOf("fs-register.mjs", "fs-loader.mjs", "fs-promises-compat.mjs", "stub-dsh.mjs")) {
                         val target = File(filesDir, name)
-                        if (!target.exists()) {
-                            try {
-                                assets.open(name).use { input ->
-                                    target.outputStream().use { output -> input.copyTo(output) }
-                                }
-                            } catch (t: Throwable) {
-                                fl("WARN copy $name: ${t.message}")
+                        try {
+                            assets.open(name).use { input ->
+                                target.outputStream().use { output -> input.copyTo(output) }
                             }
+                        } catch (t: Throwable) {
+                            fl("WARN copy $name: ${t.message}")
                         }
                     }
                     val stubScript = File(filesDir, "stub-dsh.mjs")
@@ -434,7 +432,7 @@ class ConsoleActivity : AppCompatActivity() {
             "echo DSH_WEB_PID=$!\n"
         )
         launcher.setExecutable(true)
-        runCommand("/system/bin/sh ${launcher.absolutePath}")
+        runCommandAndWait("/system/bin/sh ${launcher.absolutePath}")
         appendLine(">> dsh web 后台启动，日志：${filesDir.absolutePath}/dsh-web.log")
     }
 
@@ -492,7 +490,11 @@ class ConsoleActivity : AppCompatActivity() {
     /** 杀掉全部 node 进程（web 与 flow 子进程一并结束），供更新后重启。 */
     private fun killAllNode() {
         runCatching {
-            val pb = ProcessBuilder("/system/bin/sh", "-c", "ps -A | grep node | awk '{print \$2}' | xargs -r kill")
+            // 用 [n]ode 避免 grep 匹配到自身；不用 xargs -r，兼容 Android toybox
+            val pb = ProcessBuilder(
+                "/system/bin/sh", "-c",
+                "ps -A | grep '[n]ode' | awk '{print \$2}' | while read pid; do kill \"\$pid\" 2>/dev/null; done"
+            )
             pb.redirectErrorStream(true)
             val p = pb.start()
             p.inputStream.bufferedReader().useLines { it.forEach { line -> appendLine(line) } }
@@ -537,10 +539,10 @@ class ConsoleActivity : AppCompatActivity() {
                 env["OPENSSL_CONF"] = "/dev/null"
             } else {
                 env["PATH"] = listOf(
-                    "/data/data/com.dsh.launcher/files/node/bin",
+                    File(filesDir, "node/bin").absolutePath,
                     "/system/bin", "/bin", "/usr/bin"
                 ).joinToString(":")
-                env["HOME"] = "/data/data/com.dsh.launcher/files"
+                env["HOME"] = filesDir.absolutePath
                 env["TERM"] = "xterm-256color"
                 env["LD_LIBRARY_PATH"] = File(filesDir, "node/lib").absolutePath
                 env["TMPDIR"] = File(filesDir, "tmp").absolutePath
@@ -589,6 +591,10 @@ class ConsoleActivity : AppCompatActivity() {
     private fun appendLine(line: String) {
         runOnUiThread {
             sb.append(line).append("\n")
+            // 防止长时间运行输出无限增长导致 UI 卡顿/内存膨胀：只保留末尾约 120K 字符
+            if (sb.length > 240_000) {
+                sb.delete(0, sb.length - 120_000)
+            }
             output.text = sb.toString()
             // 自动滚到底部
             (output.parent as? ScrollView)?.fullScroll(View.FOCUS_DOWN)
@@ -601,7 +607,7 @@ class ConsoleActivity : AppCompatActivity() {
         for (name in children) {
             val childAsset = "$assetPath/$name"
             val childDest = File(dest, name)
-            if (assets.list(childAsset)?.isNotEmpty() == true) {
+            if (assets.list(childAsset) != null) {
                 copyAssetDir(childAsset, childDest)
             } else {
                 childDest.parentFile?.mkdirs()
