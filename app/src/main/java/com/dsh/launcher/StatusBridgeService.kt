@@ -7,8 +7,9 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
-import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.drawable.GradientDrawable
+import android.text.TextUtils
 import android.media.AudioManager
 import android.media.ToneGenerator
 import android.os.Build
@@ -42,6 +43,9 @@ class StatusBridgeService : Service() {
     private var windowManager: WindowManager? = null
     private var overlayView: LinearLayout? = null
     private var overlayText: TextView? = null
+    private var overlayDot: View? = null
+    private var overlayClose: TextView? = null
+    private var overlayDismissed = false
     private var overlayParams: WindowManager.LayoutParams? = null
     private var dragStartX = 0
     private var dragStartY = 0
@@ -128,23 +132,43 @@ class StatusBridgeService : Service() {
     // ---------------- 悬浮窗 ----------------
 
     private fun showOverlay(status: String, text: String) {
+        if (overlayDismissed) return
         if (!overlayEnabled() || !Settings.canDrawOverlays(this)) return
         if (overlayView != null) {
             updateOverlayText(status, text)
             return
         }
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+        overlayDot = View(this).apply {
+            background = circleDrawable(statusColor(status))
+        }
         overlayText = TextView(this).apply {
             textSize = 12f
-            setTextColor(Color.WHITE)
-            setPadding(dp(6), dp(3), dp(6), dp(3))
+            setTextColor(0xFFF2F5FA.toInt())
+            includeFontPadding = false
+            isSingleLine = displayMode() != "full"
+            maxLines = if (displayMode() == "full") 2 else 1
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        overlayClose = TextView(this).apply {
+            text = " ×"
+            textSize = 16f
+            setTextColor(0xAAFFFFFF)
+            setPadding(dp(6), 0, dp(2), 0)
+            setOnClickListener {
+                overlayDismissed = true
+                removeOverlay()
+            }
         }
         overlayView = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setBackgroundColor(0xDD111722.toInt())
-            setPadding(dp(10), dp(6), dp(10), dp(6))
-            addView(overlayText)
+            background = roundedDrawable(0xDD101722.toInt(), 14, 1, 0x33283A55.toInt())
+            if (Build.VERSION.SDK_INT >= 21) elevation = dp(6).toFloat()
+            setPadding(dp(12), dp(8), dp(6), dp(8))
+            addView(overlayDot, LinearLayout.LayoutParams(dp(8), dp(8)).apply { rightMargin = dp(6) })
+            addView(overlayText, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+            addView(overlayClose)
             setOnTouchListener(overlayTouchListener)
         }
         val type = if (Build.VERSION.SDK_INT >= 26)
@@ -170,6 +194,8 @@ class StatusBridgeService : Service() {
             updateOverlayText(status, text)
         } catch (e: Exception) {
             overlayView = null
+            overlayDot = null
+            overlayClose = null
             overlayParams = null
         }
     }
@@ -184,18 +210,45 @@ class StatusBridgeService : Service() {
 
     private fun updateOverlayText(status: String, text: String) {
         val tv = overlayText ?: return
+        overlayDot?.background = circleDrawable(statusColor(status))
         val showLast = showLastText() && text.isNotBlank()
         val lastSnippet = if (showLast) {
             if (displayMode() == "full") text.take(80) else text.take(20)
         } else ""
         val statusText = if (showStatus()) statusLabel(status) else ""
         tv.text = listOf(statusText, lastSnippet).filter { it.isNotBlank() }.joinToString(" · ")
+        tv.isSingleLine = displayMode() != "full"
+        tv.maxLines = if (displayMode() == "full") 2 else 1
     }
 
     private fun statusLabel(status: String): String = when (status) {
-        "running" -> "⚙ dsh 运行中"
-        "finished" -> "✓ AI 输出完成"
-        else -> "○ dsh 空闲"
+        "running" -> "dsh 运行中"
+        "finished" -> "AI 输出完成"
+        else -> "dsh 空闲"
+    }
+
+    private fun statusColor(status: String): Int = when (status) {
+        "running" -> 0xFF6C8CFF.toInt()
+        "finished" -> 0xFF5FD68A.toInt()
+        else -> 0xFF7A8496.toInt()
+    }
+
+    private fun circleDrawable(color: Int): GradientDrawable =
+        GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(color)
+        }
+
+    private fun roundedDrawable(
+        color: Int,
+        radiusDp: Int,
+        strokeWidth: Int = 0,
+        strokeColor: Int = 0
+    ): GradientDrawable = GradientDrawable().apply {
+        shape = GradientDrawable.RECTANGLE
+        setColor(color)
+        cornerRadius = dp(radiusDp).toFloat()
+        if (strokeWidth > 0) setStroke(strokeWidth, strokeColor)
     }
 
     private fun removeOverlay() {
@@ -206,6 +259,8 @@ class StatusBridgeService : Service() {
         }
         overlayView = null
         overlayText = null
+        overlayDot = null
+        overlayClose = null
         overlayParams = null
     }
 
