@@ -4,7 +4,6 @@ import android.annotation.SuppressLint
 import android.content.res.ColorStateList
 import android.graphics.Bitmap
 import android.os.Bundle
-import android.view.Gravity
 import android.view.View
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
@@ -14,7 +13,6 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.LinearLayout
 import android.widget.ProgressBar
-import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 
 /**
@@ -36,46 +34,6 @@ class WebViewActivity : AppCompatActivity() {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Ui.BG)
         }
-
-        // 顶部工具栏
-        val toolbar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setBackgroundColor(Ui.SURFACE)
-            setPadding(dp(12), dp(8), dp(8), dp(8))
-        }
-        toolbar.addView(TextView(this).apply {
-            text = "DeepSeek Harness Web"
-            textSize = 16f
-            typeface = android.graphics.Typeface.DEFAULT_BOLD
-            setTextColor(Ui.TEXT_PRIMARY)
-        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-
-        val backBtn = Ui.button(this, "←", { if (webView.canGoBack()) webView.goBack() }, filled = false, compact = true).apply {
-            minWidth = dp(44)
-        }
-        toolbar.addView(backBtn, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply { rightMargin = dp(4) })
-        val forwardBtn = Ui.button(this, "→", { if (webView.canGoForward()) webView.goForward() }, filled = false, compact = true).apply {
-            minWidth = dp(44)
-        }
-        toolbar.addView(forwardBtn, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply { rightMargin = dp(4) })
-        val refreshBtn = Ui.button(this, "刷新", { webView.reload() }, filled = false, compact = true).apply {
-            minWidth = dp(60)
-        }
-        toolbar.addView(refreshBtn, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ))
-        root.addView(toolbar, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            dp(52)
-        ))
 
         // 加载进度条
         val progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
