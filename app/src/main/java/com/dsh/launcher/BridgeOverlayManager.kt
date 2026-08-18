@@ -39,7 +39,7 @@ class BridgeOverlayManager(
     private fun showLastText() = prefs().getBoolean("show_last_text", true)
     private fun displayMode() = prefs().getString("display_mode", "compact") ?: "compact"
 
-    fun update(status: String, text: String) {
+    fun update(status: String, text: String, event: String? = null) {
         if (!overlayEnabled()) {
             remove()
             return
@@ -48,18 +48,18 @@ class BridgeOverlayManager(
             remove()
             return
         }
-        show(status, text)
+        show(status, text, event)
     }
 
     fun resetDismissed() {
         prefs().edit().putBoolean("overlay_dismissed", false).apply()
     }
 
-    private fun show(status: String, text: String) {
+    private fun show(status: String, text: String, event: String?) {
         if (prefs().getBoolean("overlay_dismissed", false)) return
         if (overlayView != null) {
             if (overlayView?.isAttachedToWindow == true) {
-                updateText(status, text)
+                updateText(status, text, event)
                 return
             }
             overlayView = null
@@ -77,7 +77,7 @@ class BridgeOverlayManager(
             setTextColor(0xFFF2F5FA.toInt())
             includeFontPadding = false
             isSingleLine = displayMode() != "full"
-            maxLines = if (displayMode() == "full") 2 else 1
+            maxLines = if (displayMode() == "full") 3 else 1
             ellipsize = TextUtils.TruncateAt.END
         }
         overlayClose = TextView(context).apply {
@@ -119,7 +119,7 @@ class BridgeOverlayManager(
         }
         try {
             overlayView?.let { windowManager?.addView(it, overlayParams) }
-            updateText(status, text)
+            updateText(status, text, event)
         } catch (e: Exception) {
             overlayView = null
             overlayDot = null
@@ -128,17 +128,19 @@ class BridgeOverlayManager(
         }
     }
 
-    private fun updateText(status: String, text: String) {
+    private fun updateText(status: String, text: String, event: String?) {
         val tv = overlayText ?: return
         overlayDot?.background = circleDrawable(statusColor(status))
-        val showLast = showLastText() && text.isNotBlank()
-        val lastSnippet = if (showLast) {
-            if (displayMode() == "full") text.take(80) else text.take(20)
-        } else ""
-        val statusText = if (showStatus()) statusLabel(status) else ""
-        tv.text = listOf(statusText, lastSnippet).filter { it.isNotBlank() }.joinToString(" · ")
+        tv.text = buildOverlayText(
+            status,
+            event,
+            text,
+            showStatus(),
+            showLastText(),
+            displayMode() == "full"
+        )
         tv.isSingleLine = displayMode() != "full"
-        tv.maxLines = if (displayMode() == "full") 2 else 1
+        tv.maxLines = if (displayMode() == "full") 3 else 1
     }
 
     fun remove() {
@@ -152,12 +154,6 @@ class BridgeOverlayManager(
         overlayDot = null
         overlayClose = null
         overlayParams = null
-    }
-
-    private fun statusLabel(status: String): String = when (status) {
-        "running" -> "dsh 运行中"
-        "finished" -> "AI 输出完成"
-        else -> "dsh 空闲"
     }
 
     private fun statusColor(status: String): Int = when (status) {

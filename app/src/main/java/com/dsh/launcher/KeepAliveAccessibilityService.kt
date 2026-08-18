@@ -25,6 +25,8 @@ class KeepAliveAccessibilityService : AccessibilityService() {
     private var polling = false
     private var pollThread: Thread? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+    private var lastStatus: String? = null
+    private var lastFinishedAt = 0L
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -69,9 +71,15 @@ class KeepAliveAccessibilityService : AccessibilityService() {
         polling = true
         pollThread = thread {
             while (polling) {
-                val status = fetchStatus()
+                val data = fetchStatus()
+                val prev = lastStatus
+                lastStatus = data.status
+                val finished = prev == "running" && data.status == "finished" &&
+                    data.updatedAt > lastFinishedAt
+                if (finished) lastFinishedAt = data.updatedAt
                 mainHandler.post {
-                    overlayManager?.update(status.first, status.second)
+                    overlayManager?.update(data.status, data.text, data.event)
+                    if (finished) StatusBridgeAlerts.onAiFinished(this, data.text)
                 }
                 try {
                     Thread.sleep(1000L)
@@ -88,7 +96,7 @@ class KeepAliveAccessibilityService : AccessibilityService() {
         pollThread = null
     }
 
-    private fun fetchStatus(): Pair<String, String> {
+    private fun fetchStatus(): StatusData {
         return try {
             val conn = URL(STATUS_URL).openConnection() as HttpURLConnection
             conn.connectTimeout = 800
@@ -96,19 +104,29 @@ class KeepAliveAccessibilityService : AccessibilityService() {
             conn.requestMethod = "GET"
             conn.useCaches = false
             try {
-                if (conn.responseCode != 200) return "idle" to ""
+                if (conn.responseCode != 200) return StatusData("idle", "", null, 0L)
                 val text = BufferedReader(InputStreamReader(conn.inputStream)).use { it.readText() }
                 val obj = JSONObject(text)
-                val status = obj.optString("status", "idle")
-                val lastText = obj.optString("text", "")
-                status to lastText
+                StatusData(
+                    status = obj.optString("status", "idle"),
+                    text = obj.optString("lastText", ""),
+                    event = if (obj.has("lastEvent")) obj.optString("lastEvent", null) else null,
+                    updatedAt = obj.optLong("updatedAt", 0L)
+                )
             } finally {
                 conn.disconnect()
             }
         } catch (e: Exception) {
-            "idle" to ""
+            StatusData("idle", "", null, 0L)
         }
     }
+
+    private data class StatusData(
+        val status: String,
+        val text: String,
+        val event: String?,
+        val updatedAt: Long
+    )
 
     companion object {
         private const val STATUS_URL = "http://127.0.0.1:3190/status"

@@ -12,8 +12,6 @@ import android.content.Intent
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.text.TextUtils
-import android.media.AudioManager
-import android.media.ToneGenerator
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -104,18 +102,19 @@ class StatusBridgeService : Service() {
                 if (json != null) {
                     val status = json.optString("status", "idle")
                     val text = json.optString("lastText", "")
+                    val event = if (json.has("lastEvent")) json.optString("lastEvent", null) else null
                     val updatedAt = json.optLong("updatedAt", 0L)
                     val prev = lastStatus
                     lastStatus = status
                     mainHandler.post {
-                        updateOverlay(status, text)
+                        updateOverlay(status, text, event)
                         updateForeground(status, text)
                         writeHeartbeat(status, text)
                     }
                     if (prev == "running" && status == "finished") {
                         if (updatedAt > lastFinishedAt) {
                             lastFinishedAt = updatedAt
-                            mainHandler.post { onAiFinished(text) }
+                            mainHandler.post { StatusBridgeAlerts.onAiFinished(this, text) }
                         }
                     }
                 } else {
@@ -147,20 +146,18 @@ class StatusBridgeService : Service() {
 
     private fun overlayEnabled() = prefs().getBoolean("overlay_enabled", true) &&
         !prefs().getBoolean("a11y_overlay_active", false)
-    private fun soundEnabled() = prefs().getBoolean("sound_enabled", true)
-    private fun notifyEnabled() = prefs().getBoolean("notify_enabled", true)
     private fun showStatus() = prefs().getBoolean("show_status", true)
     private fun showLastText() = prefs().getBoolean("show_last_text", true)
     private fun displayMode() = prefs().getString("display_mode", "compact") ?: "compact"
 
     // ---------------- 悬浮窗 ----------------
 
-    private fun showOverlay(status: String, text: String) {
+    private fun showOverlay(status: String, text: String, event: String?) {
         if (prefs().getBoolean("overlay_dismissed", false)) return
         if (!overlayEnabled() || !Settings.canDrawOverlays(this)) return
         if (overlayView != null) {
             if (overlayView?.isAttachedToWindow == true) {
-                updateOverlayText(status, text)
+                updateOverlayText(status, text, event)
                 return
             }
             // 窗口已被系统移除但引用还在：重置后重新 addView
@@ -179,7 +176,7 @@ class StatusBridgeService : Service() {
             setTextColor(0xFFF2F5FA.toInt())
             includeFontPadding = false
             isSingleLine = displayMode() != "full"
-            maxLines = if (displayMode() == "full") 2 else 1
+            maxLines = if (displayMode() == "full") 3 else 1
             ellipsize = TextUtils.TruncateAt.END
         }
         overlayClose = TextView(this).apply {
@@ -223,7 +220,7 @@ class StatusBridgeService : Service() {
         }
         try {
             overlayView?.let { windowManager?.addView(it, overlayParams) }
-            updateOverlayText(status, text)
+            updateOverlayText(status, text, event)
         } catch (e: Exception) {
             overlayView = null
             overlayDot = null
@@ -232,31 +229,27 @@ class StatusBridgeService : Service() {
         }
     }
 
-    private fun updateOverlay(status: String, text: String) {
+    private fun updateOverlay(status: String, text: String, event: String?) {
         if (!overlayEnabled() || !Settings.canDrawOverlays(this)) {
             removeOverlay()
             return
         }
-        showOverlay(status, text)
+        showOverlay(status, text, event)
     }
 
-    private fun updateOverlayText(status: String, text: String) {
+    private fun updateOverlayText(status: String, text: String, event: String?) {
         val tv = overlayText ?: return
         overlayDot?.background = circleDrawable(statusColor(status))
-        val showLast = showLastText() && text.isNotBlank()
-        val lastSnippet = if (showLast) {
-            if (displayMode() == "full") text.take(80) else text.take(20)
-        } else ""
-        val statusText = if (showStatus()) statusLabel(status) else ""
-        tv.text = listOf(statusText, lastSnippet).filter { it.isNotBlank() }.joinToString(" · ")
+        tv.text = buildOverlayText(
+            status,
+            event,
+            text,
+            showStatus(),
+            showLastText(),
+            displayMode() == "full"
+        )
         tv.isSingleLine = displayMode() != "full"
-        tv.maxLines = if (displayMode() == "full") 2 else 1
-    }
-
-    private fun statusLabel(status: String): String = when (status) {
-        "running" -> "dsh 运行中"
-        "finished" -> "AI 输出完成"
-        else -> "dsh 空闲"
+        tv.maxLines = if (displayMode() == "full") 3 else 1
     }
 
     private fun statusColor(status: String): Int = when (status) {
@@ -318,22 +311,6 @@ class StatusBridgeService : Service() {
         }
     }
 
-    // ---------------- 完成提示 ----------------
-
-    private fun onAiFinished(text: String) {
-        if (soundEnabled()) playBeep()
-        if (notifyEnabled()) postFinishNotification(text)
-    }
-
-    private fun playBeep() {
-        try {
-            val tone = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 80)
-            tone.startTone(ToneGenerator.TONE_PROP_BEEP, 350)
-        } catch (e: Exception) {
-            // no sound permission / audio issue
-        }
-    }
-
     // ---------------- 通知 ----------------
 
     private fun buildForegroundNotification(content: String): Notification {
@@ -368,34 +345,6 @@ class StatusBridgeService : Service() {
         nm.notify(NOTIFICATION_ID, buildForegroundNotification(statusLabel(status)))
     }
 
-    private fun postFinishNotification(text: String) {
-        val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-        val channelId = "dsh_status_bridge_finish"
-        if (Build.VERSION.SDK_INT >= 26) {
-            val ch = NotificationChannel(channelId, "dsh 输出完成", NotificationManager.IMPORTANCE_HIGH)
-            nm.createNotificationChannel(ch)
-        }
-        val content = if (text.isNotBlank()) "AI 输出完成：${text.take(50)}" else "AI 输出完成"
-        val builder = if (Build.VERSION.SDK_INT >= 26) {
-            Notification.Builder(this, channelId)
-        } else {
-            @Suppress("DEPRECATION")
-            Notification.Builder(this)
-        }
-        val openIntent = PendingIntent.getActivity(
-            this, 1,
-            Intent(this, WebViewActivity::class.java),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        builder
-            .setSmallIcon(android.R.drawable.ic_menu_view)
-            .setContentTitle("dsh AI 完成")
-            .setContentText(content)
-            .setContentIntent(openIntent)
-            .setAutoCancel(true)
-        nm.notify(FINISH_NOTIFICATION_ID, builder.build())
-    }
-
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
     /** 诊断心跳：把服务存活与悬浮窗挂载状态写到 App 私有目录，便于外部定位。 */
@@ -425,7 +374,6 @@ class StatusBridgeService : Service() {
 
     companion object {
         private const val NOTIFICATION_ID = 0x5A17
-        private const val FINISH_NOTIFICATION_ID = 0x5A18
         private const val WATCHDOG_REQUEST_CODE = 0x5A19
         const val WATCHDOG_ACTION = "com.dsh.launcher.action.BRIDGE_WATCHDOG"
 
