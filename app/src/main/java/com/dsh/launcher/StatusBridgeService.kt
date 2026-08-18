@@ -151,9 +151,9 @@ class StatusBridgeService : Service() {
             ellipsize = TextUtils.TruncateAt.END
         }
         overlayClose = TextView(this).apply {
-            text = " ×"
+            setText(" ×")
             textSize = 16f
-            setTextColor(0xAAFFFFFF)
+            setTextColor(0xAAFFFFFF.toInt())
             setPadding(dp(6), 0, dp(2), 0)
             setOnClickListener {
                 overlayDismissed = true
