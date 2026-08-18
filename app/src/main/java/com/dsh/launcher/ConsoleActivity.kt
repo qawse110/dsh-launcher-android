@@ -238,6 +238,43 @@ class ConsoleActivity : AppCompatActivity() {
                 flowLog.parentFile?.mkdirs()
                 runCatching { flowLog.writeText("") }
                 fl("OK 1/4 node=$nodeDir")
+                val dshPrefix = File(filesDir, "dsh-prefix")
+                val dshCli = File(dshPrefix, "node_modules/@deepseek-ai/dsh/lib/bin.js")
+                // 非首次启动：dsh 已安装时走快速启动，跳过 npm 更新/插件装配/Termux 全量准备
+                if (dshCli.exists()) {
+                    fl(">> 快速启动：已安装 dsh v${DshUpdater.currentVersion(this)}，跳过 npm/插件装配…")
+                    for (name in listOf("fs-register.mjs", "fs-loader.mjs", "fs-promises-compat.mjs", "stub-dsh.mjs")) {
+                        val target = File(filesDir, name)
+                        if (!target.exists()) {
+                            try {
+                                assets.open(name).use { input ->
+                                    target.outputStream().use { output -> input.copyTo(output) }
+                                }
+                            } catch (t: Throwable) {
+                                fl("WARN copy $name: ${t.message}")
+                            }
+                        }
+                    }
+                    val stubScript = File(filesDir, "stub-dsh.mjs")
+                    if (stubScript.exists()) {
+                        runCommandAndWait(
+                            "$nodeDir/bin/node ${stubScript.absolutePath}",
+                            mapOf(
+                                "HOME" to filesDir.absolutePath,
+                                "NODE_DIR" to nodeDir.absolutePath,
+                                "DSH_PREFIX" to dshPrefix.absolutePath,
+                                "DSH_PROFILE" to "web"
+                            )
+                        )
+                    } else {
+                        fl("WARN 未找到 stub-dsh.mjs，继续尝试启动 web")
+                    }
+                    fl(">> 快速启动 dsh web…")
+                    startDshWeb(nodeDir, dshPrefix)
+                    fl("OK 快速启动完成 (http://127.0.0.1:3080)")
+                    setState("运行中")
+                    return@thread
+                }
                 fl(">> 1.5/4 准备内置 Termux（bash/coreutils + git/python）…")
                 try {
                     TermuxRuntime.ensureExtracted(this) { msg -> fl(msg) }
@@ -249,7 +286,6 @@ class ConsoleActivity : AppCompatActivity() {
                 fl("dsh 版本 v${DshUpdater.currentVersion(this)}")
                 // 安装/更新统一交给 install-dsh.mjs 的 `npm install @deepseek-ai/dsh@latest`；
                 // “更新”按钮通过 startUpdateCheck(force=true) 触发重启 flow 主动检查。
-                val dshPrefix = File(filesDir, "dsh-prefix")
                 val pluginsDir = File(filesDir, "plugins")
 
                 fl(">> 2/4 复制官方安装脚本与内置插件源…")
