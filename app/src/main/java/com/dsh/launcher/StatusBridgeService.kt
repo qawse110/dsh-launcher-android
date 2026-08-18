@@ -135,8 +135,16 @@ class StatusBridgeService : Service() {
         if (overlayDismissed) return
         if (!overlayEnabled() || !Settings.canDrawOverlays(this)) return
         if (overlayView != null) {
-            updateOverlayText(status, text)
-            return
+            if (overlayView?.isAttachedToWindow == true) {
+                updateOverlayText(status, text)
+                return
+            }
+            // 窗口已被系统移除但引用还在：重置后重新 addView
+            overlayView = null
+            overlayText = null
+            overlayDot = null
+            overlayClose = null
+            overlayParams = null
         }
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         overlayDot = View(this).apply {
