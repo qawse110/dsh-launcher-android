@@ -43,6 +43,10 @@ class StatusBridgeService : Service() {
     private var overlayView: LinearLayout? = null
     private var overlayText: TextView? = null
     private var overlayParams: WindowManager.LayoutParams? = null
+    private var dragStartX = 0
+    private var dragStartY = 0
+    private var dragStartTouchX = 0f
+    private var dragStartTouchY = 0f
     private var lastStatus: String? = null
     private var lastFinishedAt = 0L
 
@@ -208,16 +212,19 @@ class StatusBridgeService : Service() {
     private val overlayTouchListener = View.OnTouchListener { _, event ->
         val p = overlayParams ?: return@OnTouchListener false
         val manager = windowManager ?: return@OnTouchListener false
+        val view = overlayView ?: return@OnTouchListener false
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
-                p.x = event.rawX.toInt() - p.x
-                p.y = event.rawY.toInt() - p.y
+                dragStartX = p.x
+                dragStartY = p.y
+                dragStartTouchX = event.rawX
+                dragStartTouchY = event.rawY
                 true
             }
             MotionEvent.ACTION_MOVE -> {
-                p.x = event.rawX.toInt() - p.x
-                p.y = event.rawY.toInt() - p.y
-                try { manager.updateViewLayout(overlayView, p) } catch (e: Exception) {}
+                p.x = dragStartX + (event.rawX - dragStartTouchX).toInt()
+                p.y = dragStartY + (event.rawY - dragStartTouchY).toInt()
+                try { manager.updateViewLayout(view, p) } catch (e: Exception) {}
                 true
             }
             else -> false

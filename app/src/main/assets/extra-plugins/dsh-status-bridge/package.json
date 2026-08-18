@@ -9,10 +9,13 @@
     "./package.json": "./package.json"
   },
   "files": [
-    "lib"
+    "lib",
+    "cordis.patch.yml"
   ],
   "dsh": {
-    "bundle": true
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
   },
   "license": "MIT"
 }

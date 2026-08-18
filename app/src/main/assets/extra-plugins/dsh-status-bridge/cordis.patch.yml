@@ -1,0 +1,4 @@
+# dsh-status-bridge bundle 层：监听 dsh 运行状态并桥接到 Android 悬浮窗/通知。
+- insert:
+    - id: dsh-status-bridge
+      name: '@dsh-external/dsh-status-bridge'
