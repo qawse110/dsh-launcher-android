@@ -34,6 +34,7 @@ class KeepAliveAccessibilityService : AccessibilityService() {
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
             false
         )
+        overlayManager?.resetDismissed()
         startPolling()
     }
 

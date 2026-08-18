@@ -27,7 +27,6 @@ class BridgeOverlayManager(
     private var overlayText: TextView? = null
     private var overlayDot: View? = null
     private var overlayClose: TextView? = null
-    private var overlayDismissed = false
     private var overlayParams: WindowManager.LayoutParams? = null
     private var dragStartX = 0
     private var dragStartY = 0
@@ -52,8 +51,12 @@ class BridgeOverlayManager(
         show(status, text)
     }
 
+    fun resetDismissed() {
+        prefs().edit().putBoolean("overlay_dismissed", false).apply()
+    }
+
     private fun show(status: String, text: String) {
-        if (overlayDismissed) return
+        if (prefs().getBoolean("overlay_dismissed", false)) return
         if (overlayView != null) {
             if (overlayView?.isAttachedToWindow == true) {
                 updateText(status, text)
@@ -83,7 +86,7 @@ class BridgeOverlayManager(
             setTextColor(0xAAFFFFFF.toInt())
             setPadding(dp(6), 0, dp(2), 0)
             setOnClickListener {
-                overlayDismissed = true
+                prefs().edit().putBoolean("overlay_dismissed", true).apply()
                 remove()
             }
         }

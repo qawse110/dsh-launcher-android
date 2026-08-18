@@ -67,7 +67,9 @@ class OverlaySettingsActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = dp(4) })
 
-        overlaySwitch = addSwitch(list, "悬浮窗显示", "在其它应用上层显示 dsh 运行状态", "overlay_enabled", true)
+        overlaySwitch = addSwitch(list, "悬浮窗显示", "在其它应用上层显示 dsh 运行状态", "overlay_enabled", true) { checked ->
+            if (checked) StatusBridgeService.resetDismissed(this)
+        }
         soundSwitch = addSwitch(list, "声音提示", "AI 输出结束后播放提示音", "sound_enabled", true)
         notifySwitch = addSwitch(list, "通知提示", "AI 输出结束后发送通知", "notify_enabled", true)
         showStatusSwitch = addSwitch(list, "显示状态", "悬浮窗中显示 idle/running/finished", "show_status", true)
@@ -93,6 +95,7 @@ class OverlaySettingsActivity : AppCompatActivity() {
             ) {
                 requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 200)
             }
+            StatusBridgeService.resetDismissed(this)
             StatusBridgeService.start(this)
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
             if (Build.VERSION.SDK_INT >= 23 && !pm.isIgnoringBatteryOptimizations(packageName)) {
@@ -144,7 +147,14 @@ class OverlaySettingsActivity : AppCompatActivity() {
         return ScrollView(this).apply { addView(root) }
     }
 
-    private fun addSwitch(container: LinearLayout, title: String, desc: String, key: String, default: Boolean): SwitchMaterial {
+    private fun addSwitch(
+        container: LinearLayout,
+        title: String,
+        desc: String,
+        key: String,
+        default: Boolean,
+        onChecked: ((Boolean) -> Unit)? = null
+    ): SwitchMaterial {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -165,6 +175,7 @@ class OverlaySettingsActivity : AppCompatActivity() {
         sw.isChecked = prefs().getBoolean(key, default)
         sw.setOnCheckedChangeListener { _, checked ->
             prefs().edit().putBoolean(key, checked).apply()
+            onChecked?.invoke(checked)
         }
         row.addView(textWrap, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         row.addView(sw, LinearLayout.LayoutParams(

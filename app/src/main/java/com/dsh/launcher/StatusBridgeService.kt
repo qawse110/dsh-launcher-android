@@ -49,7 +49,6 @@ class StatusBridgeService : Service() {
     private var overlayText: TextView? = null
     private var overlayDot: View? = null
     private var overlayClose: TextView? = null
-    private var overlayDismissed = false
     private var overlayParams: WindowManager.LayoutParams? = null
     private var dragStartX = 0
     private var dragStartY = 0
@@ -157,7 +156,7 @@ class StatusBridgeService : Service() {
     // ---------------- 悬浮窗 ----------------
 
     private fun showOverlay(status: String, text: String) {
-        if (overlayDismissed) return
+        if (prefs().getBoolean("overlay_dismissed", false)) return
         if (!overlayEnabled() || !Settings.canDrawOverlays(this)) return
         if (overlayView != null) {
             if (overlayView?.isAttachedToWindow == true) {
@@ -189,7 +188,7 @@ class StatusBridgeService : Service() {
             setTextColor(0xAAFFFFFF.toInt())
             setPadding(dp(6), 0, dp(2), 0)
             setOnClickListener {
-                overlayDismissed = true
+                prefs().edit().putBoolean("overlay_dismissed", true).apply()
                 removeOverlay()
             }
         }
@@ -443,6 +442,12 @@ class StatusBridgeService : Service() {
         fun stop(context: Context) {
             context.stopService(Intent(context, StatusBridgeService::class.java))
             cancelWatchdog(context)
+        }
+
+        /** 清除“点 × 已关闭”状态，下次轮询会重新显示悬浮窗。 */
+        fun resetDismissed(context: Context) {
+            context.getSharedPreferences("status_bridge", Context.MODE_PRIVATE)
+                .edit().putBoolean("overlay_dismissed", false).apply()
         }
 
         private fun scheduleWatchdog(context: Context) {
