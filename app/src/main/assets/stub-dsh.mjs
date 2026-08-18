@@ -16,6 +16,7 @@ import { writeFileSync, existsSync, readdirSync, readFileSync, mkdirSync } from 
 import { join, dirname } from 'node:path';
 
 const HOME = process.env.HOME || '/data/user/0/com.dsh.launcher/files';
+const ANDROID_TMP = process.env.TMPDIR || join(HOME, 'tmp');
 const NODE = process.env.NODE_DIR || join(HOME, 'node');
 const DSH_PREFIX = process.env.DSH_PREFIX || join(HOME, 'dsh-prefix');
 const PROFILE = process.env.DSH_PROFILE || 'web';
@@ -276,6 +277,38 @@ export const rgPath = resolved;
     }
   }
 } catch (e) { log('WARN @vscode/ripgrep: ' + e.message); }
+
+try {
+  // dsh sandbox 把宿主 /tmp 当作固定可写根；Android 上 /tmp 属于 shell 用户、app 不可写，
+  // 导致子进程写 /tmp 报 Permission denied。这里把沙箱的可写临时根改成应用私有 TMPDIR。
+  const MARKER_SANDBOX_TMP = 'dsh-launcher-android-sandbox-tmp';
+  const sandboxMain = findPkg('@deepseek-ai/dsh-sandbox', 'lib/index.js');
+  if (sandboxMain) {
+    let src = readFileSync(sandboxMain, 'utf8');
+    if (src.includes(MARKER_SANDBOX_TMP)) {
+      log('dsh-sandbox tmp path already patched');
+    } else {
+      src = src.split('"/tmp"').join(JSON.stringify(ANDROID_TMP));
+      writeFileSync(sandboxMain, `// ${MARKER_SANDBOX_TMP}\n` + src);
+      log('dsh-sandbox tmp path patched: ' + ANDROID_TMP);
+    }
+  } else {
+    log('dsh-sandbox: not found, skip tmp patch');
+  }
+  const sandboxLocal = findPkg('@deepseek-ai/dsh-sandbox-local', 'lib/index.js');
+  if (sandboxLocal) {
+    let src = readFileSync(sandboxLocal, 'utf8');
+    if (src.includes(MARKER_SANDBOX_TMP)) {
+      log('dsh-sandbox-local tmp path already patched');
+    } else {
+      src = src.split('"/tmp"').join(JSON.stringify(ANDROID_TMP));
+      writeFileSync(sandboxLocal, `// ${MARKER_SANDBOX_TMP}\n` + src);
+      log('dsh-sandbox-local tmp path patched: ' + ANDROID_TMP);
+    }
+  } else {
+    log('dsh-sandbox-local: not found, skip tmp patch');
+  }
+} catch (e) { log('WARN dsh-sandbox tmp: ' + e.message); }
 
 try {
   // 工作区目录浏览器：Android 在默认 home 列表里增加一个 SD Card 快捷入口，
