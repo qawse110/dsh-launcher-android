@@ -76,6 +76,17 @@ class StatusBridgeService : Service() {
         super.onDestroy()
     }
 
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // 即使任务被划掉也尽量保持悬浮窗服务运行
+        try {
+            val restart = Intent(this, StatusBridgeService::class.java)
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(restart) else startService(restart)
+        } catch (_: Exception) {
+            // ignore: OEM/后台限制下无法自启
+        }
+        super.onTaskRemoved(rootIntent)
+    }
+
     // ---------------- 轮询 ----------------
 
     private fun pollLoop() {
