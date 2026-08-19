@@ -37,6 +37,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var progress: ProgressBar
     private lateinit var logView: TextView
     private val logSb = StringBuilder()
+    private var contentRoot: LinearLayout? = null
+    private var updateBanner: View? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         DynamicColors.applyToActivityIfAvailable(this)
@@ -54,6 +56,7 @@ class MainActivity : AppCompatActivity() {
         }
         setContentView(buildUi())
         requestStoragePermissions()
+        syncAssetsOnApkUpdate()
         log("就绪。请选择操作。")
     }
 
@@ -113,6 +116,7 @@ class MainActivity : AppCompatActivity() {
             setBackgroundColor(Ui.BG)
             setPadding(dp(20), dp(32), dp(20), dp(24))
         }
+        contentRoot = root
 
         // Header
         root.addView(TextView(this).apply {
@@ -129,6 +133,11 @@ class MainActivity : AppCompatActivity() {
             gravity = Gravity.CENTER
             setPadding(0, dp(6), 0, dp(20))
         })
+
+        // APP 升级提示条：APK 更新后同步了内置插件源，提示重新装配
+        if (getSharedPreferences("dsh_ui", MODE_PRIVATE).getBoolean("rewire_hint", false)) {
+            root.addView(buildUpdateBanner())
+        }
 
         // Section: 运行状态
         root.addView(Ui.sectionLabel(this, "运行状态"))
@@ -319,6 +328,153 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+    // ---------------- APK 升级：同步内置插件源 ----------------
+    /**
+     * APK 升级后自动把 assets 里的内置插件源（prebuilt.tgz 等）同步到 files，
+     * 避免“更新了应用但运行时仍是旧插件”。装配本身仍需用户执行
+     * 「插件管理 → 重新装配内置插件」（或控制台一键安装）。
+     */
+    private fun syncAssetsOnApkUpdate() {
+        val current = try {
+            if (Build.VERSION.SDK_INT >= 28) {
+                packageManager.getPackageInfo(packageName, 0).longVersionCode
+            } else {
+                @Suppress("DEPRECATION")
+                packageManager.getPackageInfo(packageName, 0).versionCode.toLong()
+            }
+        } catch (t: Throwable) {
+            AppLog.e("Main", "getPackageInfo failed: " + (t.message ?: t.toString()))
+            0L
+        }
+        if (current == 0L) return
+        val prefs = getSharedPreferences("dsh_ui", MODE_PRIVATE)
+        val last = prefs.getLong("last_apk_version", 0L)
+        if (current == last) return
+        prefs.edit().putLong("last_apk_version", current).apply()
+        log("检测到应用更新（v$current），后台同步内置插件源…")
+        thread {
+            try {
+                for (name in listOf(
+                    "install-dsh.mjs", "prebuilt.tgz", "routing-suite.mjs",
+                    "fs-register.mjs", "fs-loader.mjs", "fs-promises-compat.mjs", "stub-dsh.mjs"
+                )) {
+                    copyAssetIfPresent(name)
+                }
+                copyAssetDirRecursive("extra-plugins", File(filesDir, "extra-plugins"))
+                val dshInstalled = File(filesDir, "plugins").exists() && File(filesDir, "dsh-prefix").exists()
+                if (dshInstalled) {
+                    prefs.edit().putBoolean("rewire_hint", true).apply()
+                    runOnUiThread {
+                        log("✓ 内置插件源已同步。建议在「插件管理」执行“重新装配内置插件”。")
+                        showUpdateHint()
+                    }
+                } else {
+                    runOnUiThread { log("✓ 内置插件源已同步（新装环境，装配由“一键安装”负责）。") }
+                }
+            } catch (t: Throwable) {
+                AppLog.e("Main", "apk asset sync failed: " + (t.message ?: t.toString()))
+            }
+        }
+    }
+
+    private fun copyAssetIfPresent(name: String) {
+        try {
+            val target = File(filesDir, name)
+            assets.open(name).use { input ->
+                target.outputStream().use { output -> input.copyTo(output) }
+            }
+        } catch (t: Throwable) {
+            android.util.Log.w("DshMain", "copy asset $name skipped: ${t.message}")
+        }
+    }
+
+    private fun copyAssetDirRecursive(assetPath: String, dest: File) {
+        val children = try {
+            assets.list(assetPath)
+        } catch (t: Throwable) {
+            null
+        } ?: return
+        for (name in children) {
+            val childAsset = "$assetPath/$name"
+            val childDest = File(dest, name)
+            if (assets.list(childAsset) != null) {
+                copyAssetDirRecursive(childAsset, childDest)
+            } else {
+                try {
+                    childDest.parentFile?.mkdirs()
+                    assets.open(childAsset).use { input ->
+                        childDest.outputStream().use { output -> input.copyTo(output) }
+                    }
+                } catch (t: Throwable) {
+                    android.util.Log.w("DshMain", "copy asset dir $childAsset failed: ${t.message}")
+                }
+            }
+        }
+    }
+
+    /** 「应用已更新」提示条：内置插件源已同步，引导重新装配内置插件。 */
+    private fun buildUpdateBanner(): View {
+        updateBanner?.let { return it }
+        val card = Ui.card(
+            this, radiusDp = 14,
+            background = Ui.SURFACE_CONTAINER_HIGH,
+            stroke = Ui.WARNING, elevationDp = 1f
+        )
+        val inner = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        inner.addView(TextView(this).apply {
+            text = "🔄 应用已更新"
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Ui.TEXT_PRIMARY)
+        })
+        inner.addView(TextView(this).apply {
+            text = "检测到 APK 升级，内置插件源（prebuilt.tgz）已同步到新版本。" +
+                "内置插件（如 dsh-vision）需要重新装配后才会使用新代码。"
+            textSize = 12f
+            setTextColor(Ui.TEXT_SECONDARY)
+            setLineSpacing(dp(2).toFloat(), 1f)
+            setPadding(0, dp(6), 0, 0)
+        })
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(10), 0, 0)
+        }
+        row.addView(
+            Ui.button(this, "重新装配", {
+                startActivity(Intent(this@MainActivity, PluginManagerActivity::class.java))
+            }, filled = true, compact = true),
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = dp(8) }
+        )
+        row.addView(
+            Ui.button(this, "知道了", {
+                dismissUpdateBanner()
+            }, filled = false, compact = true),
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        inner.addView(row)
+        card.addView(inner)
+        card.layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(10) }
+        updateBanner = card
+        return card
+    }
+
+    /** 同步完成后把提示条插入顶部（若 buildUi 尚未添加）。 */
+    private fun showUpdateHint() {
+        if (updateBanner != null) return
+        val root = contentRoot ?: return
+        root.addView(buildUpdateBanner(), 2)
+    }
+
+    private fun dismissUpdateBanner() {
+        getSharedPreferences("dsh_ui", MODE_PRIVATE).edit().putBoolean("rewire_hint", false).apply()
+        updateBanner?.let { contentRoot?.removeView(it) }
+        updateBanner = null
+    }
 
     // ---------------- 状态检测 ----------------
     private fun refreshStatus(silent: Boolean = false) {
