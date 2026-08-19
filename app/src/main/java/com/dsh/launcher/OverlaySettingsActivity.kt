@@ -158,6 +158,7 @@ class OverlaySettingsActivity : AppCompatActivity() {
                 addSwitch(this, "显示气泡", "桌宠上方显示状态气泡；点击气泡打开 dsh Web", "pet_show_bubble", true)
                 addSwitch(this, "桌宠发声（TTS）", "任务完成/出错/新任务/调用工具时语音播报，互动台词也会朗读（需系统 TTS 引擎）", "pet_tts", true)
                 addSwitch(this, "显示桌宠名称", "气泡中显示桌宠名字（与状态、最近输出一起）", "pet_show_name", true)
+                addSwitch(this, "闲时主动冒泡", "dsh 空闲时桌宠每隔几分钟随机说一句台词（可关闭），说时会朗读", "pet_ambient_bubble", true)
 
                 val pets = CodexPetStore.scanPets(this@OverlaySettingsActivity)
                 val selected = prefs().getString("pet_id", CodexPetStore.DEFAULT_PET_ID)
