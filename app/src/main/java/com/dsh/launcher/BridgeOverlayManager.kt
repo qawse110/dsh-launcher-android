@@ -9,7 +9,9 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
+import android.speech.tts.TextToSpeech
 import android.text.TextUtils
+import java.util.Locale
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -26,7 +28,8 @@ import kotlin.random.Random
  * - "pill"：原状态条模式（紧凑文字悬浮窗）；
  * - "pet"：安卓桌宠模式（Codex 桌宠格式精灵动画 + 状态气泡）。
  * 长按悬浮窗可在两种模式间切换；桌宠本体点击互动、气泡点击打开 dsh Web，拖动调整位置。
- * 桌宠大小（pet_size：small/medium/large）与气泡开关（pet_show_bubble）均由设置页配置。
+ * 桌宠大小（pet_size：small/medium/large）、气泡开关（pet_show_bubble）与
+ * TTS 发声（pet_tts）均由设置页配置。
  */
 class BridgeOverlayManager(
     private val context: Context,
@@ -67,6 +70,11 @@ class BridgeOverlayManager(
     private var replyRunnable: Runnable? = null
     private var downOnPet = false
 
+    // TTS 发声（桌宠模式）
+    private var tts: TextToSpeech? = null
+    private var ttsReady = false
+    private var lastSpokenKey: String? = null
+
     private var currentStyle: String? = null
     private var lastStatus: String? = null
     private var lastText: String? = null
@@ -88,6 +96,7 @@ class BridgeOverlayManager(
     private fun petId(): String =
         prefs().getString("pet_id", CodexPetStore.DEFAULT_PET_ID) ?: CodexPetStore.DEFAULT_PET_ID
     private fun showPetBubble() = prefs().getBoolean("pet_show_bubble", true)
+    private fun petTts() = prefs().getBoolean("pet_tts", true)
     private fun petHeightDp(): Int = when (prefs().getString("pet_size", "medium")) {
         "small" -> 96
         "large" -> 176
@@ -353,6 +362,7 @@ class BridgeOverlayManager(
         replyRunnable?.let { handler.removeCallbacks(it) }
         replyRunnable = null
         petView?.play(PetOverlayView.actionRowFor(status, event))
+        speakForStatus(status, event)
         petBubble?.let { bubble ->
             if (showPetBubble()) {
                 bubble.text = buildPetBubbleText(status, text, event, petName)
@@ -380,6 +390,7 @@ class BridgeOverlayManager(
         }
         bubble.text = reply
         bubble.visibility = View.VISIBLE
+        speak(reply)
         val r = Runnable {
             val s = lastStatus
             val t = lastText
@@ -387,6 +398,50 @@ class BridgeOverlayManager(
         }
         replyRunnable = r
         handler.postDelayed(r, 3000)
+    }
+
+    // ---------------- 桌宠 TTS 发声 ----------------
+
+    /** 状态转折时播报固定台词（同状态只播一次）。 */
+    private fun speakForStatus(status: String, event: String?) {
+        val key = "$status|${event ?: ""}"
+        if (key == lastSpokenKey) return
+        lastSpokenKey = key
+        val phrase = when {
+            status == "finished" -> "任务完成，太棒了！"
+            status == "failed" -> "出错了，快打开 Web 看看吧"
+            status == "running" && event == "tool/call" -> "正在调用工具，稍等一下"
+            status == "running" && event == "turn/start" -> "收到新任务，开始干活！"
+            else -> null
+        }
+        if (phrase != null) speak(phrase)
+    }
+
+    /** 朗读文本（懒初始化 TTS；无中文引擎自动回退系统默认语言；失败静默）。 */
+    private fun speak(text: String) {
+        if (!petTts() || text.isBlank()) return
+        if (tts == null) {
+            tts = TextToSpeech(context) { status ->
+                ttsReady = status == TextToSpeech.SUCCESS
+                if (ttsReady) {
+                    val ok = (tts?.isLanguageAvailable(Locale.CHINA) ?: -1) >= TextToSpeech.LANG_AVAILABLE
+                    tts?.setLanguage(if (ok) Locale.CHINA else Locale.getDefault())
+                }
+            }
+        }
+        if (!ttsReady) return
+        try {
+            tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "dsh_pet")
+        } catch (_: Exception) {
+            // TTS 不可用时静默
+        }
+    }
+
+    /** 释放 TTS 资源（服务销毁时调用）。 */
+    fun release() {
+        tts?.shutdown()
+        tts = null
+        ttsReady = false
     }
 
     // ---------------- 公共移除/切换 ----------------
@@ -401,6 +456,7 @@ class BridgeOverlayManager(
         replyRunnable?.let { handler.removeCallbacks(it) }
         replyRunnable = null
         petView?.stop()
+        lastSpokenKey = null
         try {
             overlayView?.let { windowManager?.removeView(it) }
         } catch (e: Exception) {

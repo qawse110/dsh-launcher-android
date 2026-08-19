@@ -65,6 +65,7 @@ class StatusBridgeService : Service() {
         running.set(false)
         thread?.interrupt()
         mainHandler.post { overlayManager?.remove() }
+        overlayManager?.release()
         writeHeartbeat("service", "destroyed", "destroyed")
         super.onDestroy()
     }

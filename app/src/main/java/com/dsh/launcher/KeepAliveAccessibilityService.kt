@@ -51,6 +51,7 @@ class KeepAliveAccessibilityService : AccessibilityService() {
     override fun onUnbind(intent: android.content.Intent?): Boolean {
         stopPolling()
         overlayManager?.remove()
+        overlayManager?.release()
         overlayManager = null
         prefs().edit().putBoolean("a11y_overlay_active", false).apply()
         return super.onUnbind(intent)
@@ -59,6 +60,7 @@ class KeepAliveAccessibilityService : AccessibilityService() {
     override fun onDestroy() {
         stopPolling()
         overlayManager?.remove()
+        overlayManager?.release()
         overlayManager = null
         prefs().edit().putBoolean("a11y_overlay_active", false).apply()
         super.onDestroy()
