@@ -67,8 +67,18 @@ class BridgeOverlayManager(
     private var defaultAtlasForHeightDp = 132
 
     private val handler = Handler(Looper.getMainLooper())
-    private var replyRunnable: Runnable? = null
     private var downOnPet = false
+
+    // 气泡临时内容（点击桌宠展开完整内容 / 无内容时随机台词兜底）
+    private var transientText: String? = null
+    private var transientKey: String? = null
+    private var transientRunnable: Runnable? = null
+
+    // 动画行切换稳定窗口：同一目标行连续 ≥2 次轮询（≈2s）才真正切换，
+    // 避免 tool/call ↔ assistant/message 状态抖动导致桌宠频繁换动作
+    private var pendingRow = -1
+    private var pendingRowCount = 0
+    private var lastSpokeAt = 0L
 
     // TTS 发声（桌宠模式）
     private var tts: TextToSpeech? = null
@@ -97,6 +107,7 @@ class BridgeOverlayManager(
         prefs().getString("pet_id", CodexPetStore.DEFAULT_PET_ID) ?: CodexPetStore.DEFAULT_PET_ID
     private fun showPetBubble() = prefs().getBoolean("pet_show_bubble", true)
     private fun petTts() = prefs().getBoolean("pet_tts", true)
+    private fun showPetName() = prefs().getBoolean("pet_show_name", true)
     private fun petHeightDp(): Int = when (prefs().getString("pet_size", "medium")) {
         "small" -> 96
         "large" -> 176
@@ -359,12 +370,26 @@ class BridgeOverlayManager(
     }
 
     private fun updatePet(status: String, text: String, event: String?) {
-        replyRunnable?.let { handler.removeCallbacks(it) }
-        replyRunnable = null
-        petView?.play(PetOverlayView.actionRowFor(status, event))
+        // 动作稳定窗口：同目标行连续 ≥2 次轮询才切换，避免状态抖动引发频繁变动作
+        val target = PetOverlayView.actionRowFor(status, event)
+        if (target == pendingRow) {
+            pendingRowCount++
+        } else {
+            pendingRow = target
+            pendingRowCount = 1
+        }
+        if (pendingRowCount >= 2) petView?.play(target)
         speakForStatus(status, event)
         petBubble?.let { bubble ->
+            val key = "$status|${event ?: ""}"
+            if (transientText != null) {
+                if (key == transientKey) return@let // 展开完整内容中且状态未变：保持不动
+                cancelTransient() // 状态变化：收起，恢复常规气泡
+            }
             if (showPetBubble()) {
+                bubble.maxLines = 2
+                bubble.ellipsize = TextUtils.TruncateAt.END
+                bubble.maxWidth = (context.resources.displayMetrics.widthPixels * 0.6).toInt()
                 bubble.text = buildPetBubbleText(status, text, event, petName)
                 bubble.visibility = View.VISIBLE
             } else {
@@ -374,39 +399,69 @@ class BridgeOverlayManager(
     }
 
     private fun buildPetBubbleText(status: String, text: String, event: String?, name: String): String {
-        val label = statusLabel(status, event)
+        val namePart = if (showPetName()) name else ""
+        val label = if (showStatus()) statusLabel(status, event) else ""
         val snippet = if (showLastText() && text.isNotBlank()) text.take(40) else ""
-        return listOf(name, label, snippet).filter { it.isNotBlank() }.joinToString(" · ")
+        return listOf(namePart, label, snippet).filter { it.isNotBlank() }.joinToString(" · ")
     }
 
-    /** 点击桌宠本体：随机回应一句（参考 Codex 桌宠互动），3 秒后恢复状态气泡。 */
-    private fun showRandomReply() {
+    /** 点击桌宠本体：气泡展开为最近完整内容（无内容时随机台词兜底），
+     *  12 秒或状态变化后收起。 */
+    private fun showTapFeedback() {
         val bubble = petBubble ?: return
-        replyRunnable?.let { handler.removeCallbacks(it) }
-        val reply = if (petReplies.isNotEmpty()) {
-            petReplies[Random.nextInt(petReplies.size)]
+        cancelTransient()
+        val overlay = overlayParams
+        val full = lastText?.takeIf { it.isNotBlank() }
+        if (full != null) {
+            // 展开：不限行数，宽度不超过屏幕剩余空间，避免窗口越界
+            val dm = context.resources.displayMetrics
+            val avail = if (overlay != null) dm.widthPixels - overlay.x - dp(8)
+            else dm.widthPixels - dp(8)
+            bubble.maxLines = 1000
+            bubble.ellipsize = null
+            bubble.maxWidth = minOf((dm.widthPixels * 0.85f).toInt(), avail.coerceAtLeast(dp(120)))
+            bubble.text = full
+            bubble.visibility = View.VISIBLE
+            transientText = full
         } else {
-            "主人，我在呢～"
+            val reply = if (petReplies.isNotEmpty()) {
+                petReplies[Random.nextInt(petReplies.size)]
+            } else {
+                "主人，我在呢～"
+            }
+            bubble.maxLines = 2
+            bubble.ellipsize = TextUtils.TruncateAt.END
+            bubble.text = reply
+            bubble.visibility = View.VISIBLE
+            transientText = reply
+            speak(reply)
         }
-        bubble.text = reply
-        bubble.visibility = View.VISIBLE
-        speak(reply)
+        transientKey = "$lastStatus|${lastEvent ?: ""}"
         val r = Runnable {
+            cancelTransient()
             val s = lastStatus
             val t = lastText
             if (s != null && t != null) updatePet(s, t, lastEvent)
         }
-        replyRunnable = r
-        handler.postDelayed(r, 3000)
+        transientRunnable = r
+        handler.postDelayed(r, 12_000L)
+    }
+
+    private fun cancelTransient() {
+        transientRunnable?.let { handler.removeCallbacks(it) }
+        transientRunnable = null
+        transientText = null
+        transientKey = null
     }
 
     // ---------------- 桌宠 TTS 发声 ----------------
 
-    /** 状态转折时播报固定台词（同状态只播一次）。 */
+    /** 状态转折时播报固定台词（同状态只播一次，且间隔 ≥4s 防反弹连播）。 */
     private fun speakForStatus(status: String, event: String?) {
         val key = "$status|${event ?: ""}"
         if (key == lastSpokenKey) return
         lastSpokenKey = key
+        if (SystemClock.uptimeMillis() - lastSpokeAt < 4000L) return
         val phrase = when {
             status == "finished" -> "任务完成，太棒了！"
             status == "failed" -> "出错了，快打开 Web 看看吧"
@@ -414,7 +469,10 @@ class BridgeOverlayManager(
             status == "running" && event == "turn/start" -> "收到新任务，开始干活！"
             else -> null
         }
-        if (phrase != null) speak(phrase)
+        if (phrase != null) {
+            lastSpokeAt = SystemClock.uptimeMillis()
+            speak(phrase)
+        }
     }
 
     /** 朗读文本（懒初始化 TTS；无中文引擎自动回退系统默认语言；失败静默）。 */
@@ -451,12 +509,14 @@ class BridgeOverlayManager(
         currentStyle = null
     }
 
-    /** 彻底拆除当前悬浮窗（含窗口移除、动画停止、回复定时取消），引用全部置空。 */
+    /** 彻底拆除当前悬浮窗（含窗口移除、动画停止、临时气泡取消），引用全部置空。 */
     private fun resetViews() {
-        replyRunnable?.let { handler.removeCallbacks(it) }
-        replyRunnable = null
+        cancelTransient()
         petView?.stop()
         lastSpokenKey = null
+        lastSpokeAt = 0L
+        pendingRow = -1
+        pendingRowCount = 0
         try {
             overlayView?.let { windowManager?.removeView(it) }
         } catch (e: Exception) {
@@ -565,7 +625,7 @@ class BridgeOverlayManager(
                     if (SystemClock.uptimeMillis() - downAt >= 600L) {
                         toggleStyle()
                     } else if (downOnPet) {
-                        showRandomReply()
+                        showTapFeedback()
                     } else {
                         openWeb()
                     }
