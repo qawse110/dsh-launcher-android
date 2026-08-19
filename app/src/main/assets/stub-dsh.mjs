@@ -118,6 +118,115 @@ try {
   }
   if (sharpPatched === 0) log('sharp: not found, skip');
 } catch (e) { log('WARN sharp: ' + e.message); }
+
+try {
+  // dsh-attachment-local：sharp 被 stub（Android 无原生预编译库）后，图片保存/读取的
+  // 解码校验必然失败（metadata.format 恒为 stub）。改成魔数嗅探兜底，并兼容 Android
+  // 的目录 fsync（SELinux 禁止 open /data 上级目录）与 fs-register 的 link→rename
+  // 映射（rename 成功后临时文件已不存在，unlink ENOENT 属正常）。
+  const MARKER_ATT_SNIFF = 'dsh-launcher-android-attachment-sniff';
+  const attLocal = findPkg('@deepseek-ai/dsh-attachment-local', 'lib/index.js');
+  if (!attLocal) {
+    log('attachment-local: not found, skip sniff patch');
+  } else {
+    let src = readFileSync(attLocal, 'utf8');
+    if (src.includes(MARKER_ATT_SNIFF)) {
+      log('attachment-local sniff already patched');
+    } else {
+      const helper = `
+/** ${MARKER_ATT_SNIFF}: sharp 被 stub（Android 无原生预编译库），用魔数嗅探兜底。 */
+async function sniffImageMeta(data) {
+\tconst b = data instanceof Uint8Array ? data : new Uint8Array(data);
+\tconst head = b.subarray(0, 16);
+\tif (head.length >= 4 && head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e && head[3] === 0x47) return { mediaType: "image/png", width: 0, height: 0 };
+\tif (head.length >= 3 && head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) return { mediaType: "image/jpeg", width: 0, height: 0 };
+\tif (head.length >= 6 && head[0] === 0x47 && head[1] === 0x49 && head[2] === 0x46 && head[3] === 0x38 && head[4] === 0x37 && (head[5] === 0x61 || head[5] === 0x39)) return { mediaType: "image/gif", width: 0, height: 0 };
+\tif (head.length >= 12 && head[0] === 0x52 && head[1] === 0x49 && head[2] === 0x46 && head[3] === 0x46 && head[8] === 0x57 && head[9] === 0x45 && head[10] === 0x42 && head[11] === 0x50) return { mediaType: "image/webp", width: 0, height: 0 };
+\treturn void 0;
+}
+`;
+      const probeNew = `async function probeImage(data) {
+\ttry {
+\t\t// ${MARKER_ATT_SNIFF}: sharp 被 stub 时直接退回魔数嗅探
+\t\tconst sniffed = await sniffImageMeta(data);
+\t\tif (sniffed !== void 0) return sniffed;
+\t\treturn await imageMetadata(sharp(data, {
+\t\t\tfailOn: "error",
+\t\t\tlimitInputPixels: false
+\t\t}));
+\t} catch (error) {
+\t\tif (error instanceof AttachmentError) throw error;
+\t\tthrow new AttachmentError("Unsupported or malformed image data.", "INVALID_IMAGE", { cause: error });
+\t}
+}`;
+      const detectNew = `async function detectImage(data, maxPixels) {
+\ttry {
+\t\t// ${MARKER_ATT_SNIFF}: sharp 被 stub 时直接退回魔数嗅探
+\t\tconst sniffed = await sniffImageMeta(data);
+\t\tif (sniffed !== void 0) {
+\t\t\tif (maxPixels !== void 0 && sniffed.width * sniffed.height > maxPixels) throw new AttachmentError("Image exceeds the configured decoded-pixel limit.", "IMAGE_TOO_MANY_PIXELS");
+\t\t\treturn sniffed;
+\t\t}
+\t\tconst image = sharp(data, {
+\t\t\tfailOn: "error",
+\t\t\tlimitInputPixels: false
+\t\t});
+\t\tconst detected = await imageMetadata(image);
+\t\tif (maxPixels !== void 0 && detected.width * detected.height > maxPixels) throw new AttachmentError("Image exceeds the configured decoded-pixel limit.", "IMAGE_TOO_MANY_PIXELS");
+\t\tawait image.raw().toBuffer();
+\t\treturn detected;
+\t} catch (error) {
+\t\tif (error instanceof AttachmentError) throw error;
+\t\tthrow new AttachmentError("Unsupported or malformed image data.", "INVALID_IMAGE", { cause: error });
+\t}
+}`;
+      const syncNew = `async function syncDirectory(path) {
+\t/* v8 ignore next -- Windows cannot open directory handles; NTFS metadata journaling owns entry durability there. */
+\tif (process.platform === "win32") return;
+\t/* ${MARKER_ATT_SNIFF}: Android SELinux 禁止 open 上级目录（如 /data、/data/user/0），fsync 尽力而为。 */
+\tlet handle;
+\ttry {
+\t\thandle = await open(path, constants.O_RDONLY);
+\t} catch (error) {
+\t\tif (process.platform === "android" && error && (error.code === "EACCES" || error.code === "EPERM")) return;
+\t\tthrow error;
+\t}
+\ttry {
+\t\tawait handle.sync();
+\t} catch (error) {
+\t\tif (process.platform === "android") return;
+\t\tthrow error;
+\t} finally {
+\t\tawait handle.close().catch(() => {});
+\t}
+}`;
+      const unlinkNew = `await unlink(temporary).catch((unlinkError) => {
+\t\t\t/* ${MARKER_ATT_SNIFF}: fs-register 把 link 映射为 rename，link 成功后临时文件已不存在，ENOENT 属正常。 */
+\t\t\tif (process.platform === "android" && unlinkError && unlinkError.code === "ENOENT") return;
+\t\t\tthrow unlinkError;
+\t\t});
+\t} catch (error) {`;
+      const allFound =
+        /async function probeImage\(data\) \{[\s\S]*?\n\}/.test(src) &&
+        /async function detectImage\(data, maxPixels\) \{[\s\S]*?\n\}/.test(src) &&
+        /async function syncDirectory\(path\) \{[\s\S]*?\n\}/.test(src) &&
+        src.includes('await unlink(temporary);\n\t} catch (error) {');
+      if (!allFound) {
+        log('attachment-local sniff pattern not found, skip');
+      } else {
+        let out = src;
+        out = out.replace(/async function probeImage\(data\) \{[\s\S]*?\n\}/, probeNew);
+        out = out.replace(/async function detectImage\(data, maxPixels\) \{[\s\S]*?\n\}/, detectNew);
+        out = out.replace(/async function syncDirectory\(path\) \{[\s\S]*?\n\}/, syncNew);
+        out = out.replace('await unlink(temporary);\n\t} catch (error) {', unlinkNew);
+        out = out.replace('/**\n* Parse a supported raster', helper + '/**\n* Parse a supported raster');
+        writeFileSync(attLocal, out);
+        log('attachment-local android sniff/fsync/rename patched: ' + attLocal);
+      }
+    }
+  }
+} catch (e) { log('WARN attachment-local sniff: ' + e.message); }
+
 try {
   const ap = findPkg('@deepseek-ai/dsh-host-apiproxy', 'lib/index.js');
   if (ap) {
