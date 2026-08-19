@@ -25,6 +25,9 @@ data class CodexPetInfo(
     val id: String,
     val displayName: String,
     val description: String,
+    val author: String = "",
+    val version: String = "",
+    val replies: List<String> = emptyList(),
     val source: PetSource
 )
 
@@ -48,6 +51,14 @@ object CodexPetStore {
         id = DEFAULT_PET_ID,
         displayName = "小豆丁",
         description = "DshLauncher 内置默认桌宠（Codex 桌宠格式）",
+        author = "DshLauncher",
+        version = "1.0",
+        replies = listOf(
+            "你好呀，我是小豆丁！",
+            "主人，我在呢～",
+            "要不要点气泡打开 dsh Web 看看？",
+            "今天也要加油哦！"
+        ),
         source = PetSource.BundledDefault
     )
 
@@ -81,9 +92,34 @@ object CodexPetStore {
                 id = id,
                 displayName = meta.optString("displayName").ifBlank { id },
                 description = meta.optString("description"),
+                author = meta.optString("author"),
+                version = meta.optString("version"),
+                replies = readReplies(meta),
                 source = PetSource.Folder(child)
             )
         }
+    }
+
+    /** 收集 pet.json 中的互动回复：顶层 replies，或 interactions[].replies / responses。 */
+    fun readReplies(meta: JSONObject): List<String> {
+        val out = mutableListOf<String>()
+        meta.optJSONArray("replies")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val s = arr.optString(i)
+                if (s.isNotBlank()) out.add(s)
+            }
+        }
+        meta.optJSONArray("interactions")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                val rs = obj.optJSONArray("replies") ?: obj.optJSONArray("responses") ?: continue
+                for (j in 0 until rs.length()) {
+                    val s = rs.optString(j)
+                    if (s.isNotBlank()) out.add(s)
+                }
+            }
+        }
+        return out.distinct()
     }
 
     /** 读取目录中的 pet.json，失败返回 null。 */
@@ -94,8 +130,9 @@ object CodexPetStore {
         null
     }
 
-    /** 打开精灵表（按目标显示尺寸采样解码），失败返回 null。 */
-    fun openAtlas(context: Context, pet: CodexPetInfo): CodexPetAtlas? {
+    /** 打开精灵表（按目标显示尺寸采样解码），失败返回 null。
+     *  targetHeightDp：桌宠显示高度（dp），决定解码清晰度（默认 132）。 */
+    fun openAtlas(context: Context, pet: CodexPetInfo, targetHeightDp: Int = 132): CodexPetAtlas? {
         return try {
             openSheetStream(context, pet)?.use { first ->
                 val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
@@ -111,10 +148,21 @@ object CodexPetStore {
                     baseCellH = bounds.outHeight / 9
                 }
                 if (baseCellW <= 0 || baseCellH <= 0) return null
-                // 采样使解码后的单元格像素数不低于目标显示尺寸，控制内存占用
-                val targetPx = (context.resources.displayMetrics.density * 132f).toInt()
+                // 按「单元格显示像素」采样：保证解码后每格像素不低于屏幕显示所需，
+                // 避免整表宽度比较导致的高倍降采样糊成一片
+                val density = context.resources.displayMetrics.density
+                val displayCellW = (targetHeightDp * density * baseCellW / baseCellH.toFloat()).toInt()
                 var sample = 1
-                while (sample * 2 <= 16 && bounds.outWidth / (sample * 2) >= targetPx) {
+                while (sample * 2 <= 16 &&
+                    baseCellW / (sample * 2) >= displayCellW &&
+                    bounds.outWidth / (sample * 2) >= 2048
+                ) {
+                    sample *= 2
+                }
+                // 内存兜底：解码后总像素不超过约 12M（ARGB_8888 ≈ 48MB）
+                while ((bounds.outWidth / sample.toLong()) *
+                    (bounds.outHeight / sample) > 12_000_000L
+                ) {
                     sample *= 2
                 }
                 openSheetStream(context, pet)?.use { second ->

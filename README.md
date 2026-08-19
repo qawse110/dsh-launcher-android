@@ -70,17 +70,22 @@ adb shell am start -n com.dsh.launcher/.MainActivity   # 或直接点应用图�
 
 - **切换**：主界面 →「状态悬浮窗」→「悬浮窗样式」选「状态条」或「桌宠」；
   也可以**长按悬浮窗本体**快速来回切换。切换后 1 秒内自动生效（状态轮询周期）。
-- **交互**：点击桌宠/气泡打开 dsh Web；拖动移动位置（桌宠与状态条各自记忆位置）；
-  右上角 × 隐藏（「悬浮窗显示」重新开启后恢复）。
+- **交互**：点击**桌宠本体**随机回应一句（宠物包自带互动台词，3 秒后恢复状态气泡）；
+  点击**气泡**打开 dsh Web；拖动移动位置（桌宠与状态条各自记忆位置）；
+  右上角 × 隐藏（「悬浮窗显示」重新开启后恢复）；长按切换模式。
+- **外观**：设置页可调桌宠大小（小/中/大）与气泡开关；精灵表按单元格像素全分辨率解码
+  （兼容 v1/v2 规格，内置默认包及常见社区包均清晰显示）。
 - **动作映射**：dsh 空闲 → `idle` 呼吸；思考/输出 → `review` 思考（`tool/call` 时
   `running` 跑动，`assistant/message` 时 `waiting`）；输出完成 → `jumping` 庆祝；
   出错 → `failed`。
 - **导入 Codex 桌宠包**：一个桌宠包 = 文件夹内的 `pet.json`（`id`/`displayName`/
-  `description`/`spritesheetPath`）+ `spritesheet.webp` 或 `.png`
-  （8 列 x 9 行，单元格 192x208，兼容 v2 的 8x11 表）。两种方式：
+  `description`/`author`/`version`/`replies` 可选，`spritesheetPath`）+ `spritesheet.webp`
+  或 `.png`（8 列 x 9 行，单元格 192x208，兼容 v2 的 8x11 表）。两种方式：
   1. 设置页「桌宠」→「导入桌宠包」，用系统文件选择器选中包含 `pet.json` 的文件夹；
   2. 直接把桌宠包文件夹复制到 `/sdcard/Download/DshLauncher/codex-pets/` 下
      （或应用私有目录 `files/codex-pets/`），再在设置页「刷新列表」。
+  列表会显示每只宠物的作者/版本信息；`pet.json` 中 `replies`（或 `interactions[].replies`）
+  会被用作点击互动台词。
 - 社区桌宠包来源：<https://codexpet.top>（awesome-codex-pet）、<https://petdex.dev> 等。
 - 内置默认桌宠资源由 `tools/gen_default_pet.py` 生成（Pillow），产物为
   `app/src/main/assets/codex-pets/default/`（本身就是合法 Codex 桌宠包）。

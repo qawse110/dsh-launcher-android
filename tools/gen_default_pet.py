@@ -305,7 +305,15 @@ def main():
         "id": "dsh-default",
         "displayName": "小豆丁",
         "description": "DshLauncher 内置默认桌宠（兼容 Codex 桌宠格式：8x9 精灵表）",
+        "author": "DshLauncher",
+        "version": "1.0",
         "spritesheetPath": "spritesheet.png",
+        "replies": [
+            "你好呀，我是小豆丁！",
+            "主人，我在呢～",
+            "要不要点气泡打开 dsh Web 看看？",
+            "今天也要加油哦！",
+        ],
     }
     with open(os.path.join(out_dir, "pet.json"), "w", encoding="utf-8") as f:
         json.dump(pet_json, f, ensure_ascii=False, indent=2)

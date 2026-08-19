@@ -5,6 +5,8 @@ import android.content.Intent
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
 import android.text.TextUtils
@@ -14,6 +16,7 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.LinearLayout
 import android.widget.TextView
+import kotlin.random.Random
 
 /**
  * 通用 dsh 状态悬浮窗管理器。
@@ -22,7 +25,8 @@ import android.widget.TextView
  * 支持两种模式（prefs key: overlay_style）：
  * - "pill"：原状态条模式（紧凑文字悬浮窗）；
  * - "pet"：安卓桌宠模式（Codex 桌宠格式精灵动画 + 状态气泡）。
- * 长按悬浮窗可在两种模式间切换；点击打开 dsh Web，拖动调整位置。
+ * 长按悬浮窗可在两种模式间切换；桌宠本体点击互动、气泡点击打开 dsh Web，拖动调整位置。
+ * 桌宠大小（pet_size：small/medium/large）与气泡开关（pet_show_bubble）均由设置页配置。
  */
 class BridgeOverlayManager(
     private val context: Context,
@@ -52,6 +56,16 @@ class BridgeOverlayManager(
     private var petClose: TextView? = null
     private var petAtlas: CodexPetAtlas? = null
     private var petLoadedId: String? = null
+    private var petName: String = ""
+    private var petReplies: List<String> = emptyList()
+    private var petBuiltHeightDp = 132
+    private var petAtlasForHeightDp = 132
+    private var defaultAtlas: CodexPetAtlas? = null
+    private var defaultAtlasForHeightDp = 132
+
+    private val handler = Handler(Looper.getMainLooper())
+    private var replyRunnable: Runnable? = null
+    private var downOnPet = false
 
     private var currentStyle: String? = null
     private var lastStatus: String? = null
@@ -74,6 +88,11 @@ class BridgeOverlayManager(
     private fun petId(): String =
         prefs().getString("pet_id", CodexPetStore.DEFAULT_PET_ID) ?: CodexPetStore.DEFAULT_PET_ID
     private fun showPetBubble() = prefs().getBoolean("pet_show_bubble", true)
+    private fun petHeightDp(): Int = when (prefs().getString("pet_size", "medium")) {
+        "small" -> 96
+        "large" -> 176
+        else -> 132
+    }
     private fun displayMode(): String {
         return if (prefs().getBoolean("display_mode_auto", true)) {
             "auto"
@@ -226,34 +245,45 @@ class BridgeOverlayManager(
         val wantedId = petId()
         if (overlayView != null) {
             if (overlayView?.isAttachedToWindow == true) {
-                if (petLoadedId == wantedId) {
+                if (petLoadedId == wantedId && petBuiltHeightDp == petHeightDp()) {
                     updatePet(status, text, event)
                     return
                 }
-                // 设置页更换了桌宠：重建当前桌宠窗口
+                // 设置页更换了桌宠或桌宠大小：重建当前桌宠窗口
                 resetViews()
             } else {
                 resetViews()
             }
         }
-        if (petAtlas == null || petLoadedId != wantedId) {
+        if (petAtlas == null || petLoadedId != wantedId || petAtlasForHeightDp != petHeightDp()) {
             petAtlas = null
             val pets = CodexPetStore.scanPets(context)
             val pet = pets.firstOrNull { it.id == wantedId }
                 ?: pets.firstOrNull()
                 ?: CodexPetStore.defaultPet()
-            petAtlas = CodexPetStore.openAtlas(context, pet)
+            petName = pet.displayName
+            petReplies = pet.replies
+            petAtlas = CodexPetStore.openAtlas(context, pet, petHeightDp())
             petLoadedId = if (petAtlas != null) pet.id else null
             if (petAtlas == null) {
-                // 用户包加载失败时回退内置默认（petLoadedId 保持默认，后续轮询可自愈）
-                petAtlas = CodexPetStore.openAtlas(context, CodexPetStore.defaultPet())
+                // 用户包加载失败时回退内置默认（petLoadedId 保持默认，后续轮询可自愈）；
+                // 默认图集缓存，避免每轮重新解码
+                if (defaultAtlas == null || defaultAtlasForHeightDp != petHeightDp()) {
+                    defaultAtlas = CodexPetStore.openAtlas(context, CodexPetStore.defaultPet(), petHeightDp())
+                    defaultAtlasForHeightDp = if (defaultAtlas != null) petHeightDp() else defaultAtlasForHeightDp
+                }
+                petAtlas = defaultAtlas
                 petLoadedId = if (petAtlas != null) CodexPetStore.DEFAULT_PET_ID else null
+                petName = CodexPetStore.defaultPet().displayName
+                petReplies = CodexPetStore.defaultPet().replies
             }
+            petAtlasForHeightDp = if (petAtlas != null) petHeightDp() else petAtlasForHeightDp
         }
         val atlas = petAtlas ?: return
         windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
 
-        val petH = dp(132)
+        petBuiltHeightDp = petHeightDp()
+        val petH = dp(petBuiltHeightDp)
         val petW = if (atlas.cellH > 0) (petH * atlas.cellW / atlas.cellH.toFloat()).toInt() else petH
         val pet = PetOverlayView(context, atlas)
         petView = pet
@@ -266,6 +296,7 @@ class BridgeOverlayManager(
             maxWidth = (context.resources.displayMetrics.widthPixels * 0.6).toInt()
             setPadding(dp(10), dp(5), dp(10), dp(5))
             background = roundedDrawable(0xE0101722.toInt(), 12, 1, 0x336C8CFF.toInt())
+            setOnClickListener { openWeb() }
         }
         petClose = TextView(context).apply {
             setText(" ×")
@@ -289,7 +320,7 @@ class BridgeOverlayManager(
         overlayView = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
-            contentDescription = "dsh 桌宠：点击打开 Web，拖动移动，长按切回状态条"
+            contentDescription = "dsh 桌宠：点击宠物互动，点气泡打开 Web，拖动移动，长按切回状态条"
             if (Build.VERSION.SDK_INT >= 21) elevation = dp(6).toFloat()
             addView(bubbleRow, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
@@ -319,10 +350,12 @@ class BridgeOverlayManager(
     }
 
     private fun updatePet(status: String, text: String, event: String?) {
+        replyRunnable?.let { handler.removeCallbacks(it) }
+        replyRunnable = null
         petView?.play(PetOverlayView.actionRowFor(status, event))
         petBubble?.let { bubble ->
             if (showPetBubble()) {
-                bubble.text = buildPetBubbleText(status, text, event)
+                bubble.text = buildPetBubbleText(status, text, event, petName)
                 bubble.visibility = View.VISIBLE
             } else {
                 bubble.visibility = View.GONE
@@ -330,26 +363,49 @@ class BridgeOverlayManager(
         }
     }
 
-    private fun buildPetBubbleText(status: String, text: String, event: String?): String {
+    private fun buildPetBubbleText(status: String, text: String, event: String?, name: String): String {
         val label = statusLabel(status, event)
         val snippet = if (showLastText() && text.isNotBlank()) text.take(40) else ""
-        return listOf(label, snippet).filter { it.isNotBlank() }.joinToString(" · ")
+        return listOf(name, label, snippet).filter { it.isNotBlank() }.joinToString(" · ")
+    }
+
+    /** 点击桌宠本体：随机回应一句（参考 Codex 桌宠互动），3 秒后恢复状态气泡。 */
+    private fun showRandomReply() {
+        val bubble = petBubble ?: return
+        replyRunnable?.let { handler.removeCallbacks(it) }
+        val reply = if (petReplies.isNotEmpty()) {
+            petReplies[Random.nextInt(petReplies.size)]
+        } else {
+            "主人，我在呢～"
+        }
+        bubble.text = reply
+        bubble.visibility = View.VISIBLE
+        val r = Runnable {
+            val s = lastStatus
+            val t = lastText
+            if (s != null && t != null) updatePet(s, t, lastEvent)
+        }
+        replyRunnable = r
+        handler.postDelayed(r, 3000)
     }
 
     // ---------------- 公共移除/切换 ----------------
 
     fun remove() {
+        resetViews()
+        currentStyle = null
+    }
+
+    /** 彻底拆除当前悬浮窗（含窗口移除、动画停止、回复定时取消），引用全部置空。 */
+    private fun resetViews() {
+        replyRunnable?.let { handler.removeCallbacks(it) }
+        replyRunnable = null
         petView?.stop()
         try {
             overlayView?.let { windowManager?.removeView(it) }
         } catch (e: Exception) {
             // already removed
         }
-        resetViews()
-        currentStyle = null
-    }
-
-    private fun resetViews() {
         overlayView = null
         overlayText = null
         overlayDot = null
@@ -426,6 +482,7 @@ class BridgeOverlayManager(
         val view = overlayView ?: return@OnTouchListener false
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
+                downOnPet = isTapOnPet(event.x, event.y)
                 dragStartX = p.x
                 dragStartY = p.y
                 dragStartTouchX = event.rawX
@@ -451,6 +508,8 @@ class BridgeOverlayManager(
                 if (!dragMoved) {
                     if (SystemClock.uptimeMillis() - downAt >= 600L) {
                         toggleStyle()
+                    } else if (downOnPet) {
+                        showRandomReply()
                     } else {
                         openWeb()
                     }
@@ -470,6 +529,12 @@ class BridgeOverlayManager(
             .putInt(if (isPet) "pet_x" else "overlay_x", p.x)
             .putInt(if (isPet) "pet_y" else "overlay_y", p.y)
             .apply()
+    }
+
+    /** 触点是否落在桌宠本体上（相对悬浮窗根视图坐标）。 */
+    private fun isTapOnPet(x: Float, y: Float): Boolean {
+        val pet = petView ?: return false
+        return pet.left <= x && x <= pet.right && pet.top <= y && y <= pet.bottom
     }
 
     private fun dp(v: Int): Int = (v * context.resources.displayMetrics.density).toInt()

@@ -127,6 +127,36 @@ class OverlaySettingsActivity : AppCompatActivity() {
         if (style == "pet") {
             root.addView(section("桌宠"))
             card {
+                // 桌宠大小
+                val currentSize = prefs().getString("pet_size", "medium") ?: "medium"
+                val sizeRow = LinearLayout(this@OverlaySettingsActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                }
+                val sizeOptions = listOf(
+                    "小" to "small",
+                    "中" to "medium",
+                    "大" to "large"
+                )
+                sizeOptions.forEachIndexed { idx, (label, value) ->
+                    sizeRow.addView(
+                        Ui.button(
+                            this@OverlaySettingsActivity, label,
+                            {
+                                prefs().edit().putString("pet_size", value).apply()
+                                rebuild()
+                            },
+                            filled = currentSize == value, compact = true
+                        ),
+                        LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                            .apply { if (idx > 0) leftMargin = dp(8) }
+                    )
+                }
+                addView(sizeRow, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ))
+                addSwitch(this, "显示气泡", "桌宠上方显示状态气泡；点击气泡打开 dsh Web", "pet_show_bubble", true)
+
                 val pets = CodexPetStore.scanPets(this@OverlaySettingsActivity)
                 val selected = prefs().getString("pet_id", CodexPetStore.DEFAULT_PET_ID)
                 for (pet in pets) {
@@ -304,9 +334,19 @@ class OverlaySettingsActivity : AppCompatActivity() {
             textSize = 15f
             setTextColor(Ui.TEXT_PRIMARY)
         })
-        if (pet.description.isNotBlank()) {
+        val metaLine = buildString {
+            if (pet.description.isNotBlank()) append(pet.description)
+            val by = listOf(pet.author, pet.version)
+                .filter { it.isNotBlank() }
+                .joinToString(" · ")
+            if (by.isNotBlank()) {
+                if (isNotEmpty()) append("  ·  ")
+                append(by)
+            }
+        }
+        if (metaLine.isNotBlank()) {
             textWrap.addView(TextView(this).apply {
-                text = pet.description
+                text = metaLine
                 textSize = 11f
                 setTextColor(Ui.TEXT_MUTED)
             })
