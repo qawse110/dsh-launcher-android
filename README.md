@@ -18,6 +18,10 @@
   `1/4 解压 node → 2/4 复制官方安装脚本 + 内置插件源 → 3/4 npm 官方安装/更新 dsh + dsh plugin 装配内置插件 → 4/4 启动 dsh web`。
 - **内置 WebView 界面**：主界面「打开 Web 界面」在应用内加载 `http://127.0.0.1:3080`
   （无需跳外部浏览器）；也可用任意浏览器访问同一地址。
+- **悬浮窗 + 安卓桌宠模式**：主界面的「状态悬浮窗」可显示 dsh 运行状态；支持两种样式
+  （设置页或长按悬浮窗切换）：**状态条**（紧凑文字）与**桌宠**（动画角色跟随 dsh 状态）。
+  桌宠模式**兼容 Codex 桌宠包格式**（`pet.json` + `spritesheet.webp/.png`，8x9 精灵表），
+  内置默认桌宠“小豆丁”，并可导入 awesome-codex-pet / petdex 等社区桌宠包（详见下文）。
 - **设备端免编译适配**（`assets/stub-dsh.mjs`，每次启动自动重打，幂等）：
   - `koffi` / `node-pty` / `sharp`：Android 无预编译产物（`node-addon-*`/libvips 缺失），
     以 Proxy stub 顶替，保证模块可加载；
@@ -61,6 +65,25 @@ adb shell am start -n com.dsh.launcher/.MainActivity   # 或直接点应用图�
 - 日志：应用私有目录 `files/dsh-flow.log`（引导流程）、`files/dsh-web.log`（web 进程）。
 - 部分 ColorOS 设备从 `/sdcard` 安装 APK 会遇到 FUSE 上下文问题，先推送到
   `/data/local/tmp/` 再 `pm install -r` 即可。
+
+### 桌宠模式（兼容 Codex 桌宠）
+
+- **切换**：主界面 →「状态悬浮窗」→「悬浮窗样式」选「状态条」或「桌宠」；
+  也可以**长按悬浮窗本体**快速来回切换。切换后 1 秒内自动生效（状态轮询周期）。
+- **交互**：点击桌宠/气泡打开 dsh Web；拖动移动位置（桌宠与状态条各自记忆位置）；
+  右上角 × 隐藏（「悬浮窗显示」重新开启后恢复）。
+- **动作映射**：dsh 空闲 → `idle` 呼吸；思考/输出 → `review` 思考（`tool/call` 时
+  `running` 跑动，`assistant/message` 时 `waiting`）；输出完成 → `jumping` 庆祝；
+  出错 → `failed`。
+- **导入 Codex 桌宠包**：一个桌宠包 = 文件夹内的 `pet.json`（`id`/`displayName`/
+  `description`/`spritesheetPath`）+ `spritesheet.webp` 或 `.png`
+  （8 列 x 9 行，单元格 192x208，兼容 v2 的 8x11 表）。两种方式：
+  1. 设置页「桌宠」→「导入桌宠包」，用系统文件选择器选中包含 `pet.json` 的文件夹；
+  2. 直接把桌宠包文件夹复制到 `/sdcard/Download/DshLauncher/codex-pets/` 下
+     （或应用私有目录 `files/codex-pets/`），再在设置页「刷新列表」。
+- 社区桌宠包来源：<https://codexpet.top>（awesome-codex-pet）、<https://petdex.dev> 等。
+- 内置默认桌宠资源由 `tools/gen_default_pet.py` 生成（Pillow），产物为
+  `app/src/main/assets/codex-pets/default/`（本身就是合法 Codex 桌宠包）。
 
 ## 实机验证（Sharp 803SH）
 

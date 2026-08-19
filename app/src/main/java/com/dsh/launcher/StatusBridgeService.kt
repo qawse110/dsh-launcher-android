@@ -9,21 +9,13 @@ import android.app.Service
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.graphics.PixelFormat
-import android.graphics.drawable.GradientDrawable
-import android.text.TextUtils
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
-import android.view.Gravity
-import android.view.MotionEvent
-import android.view.View
 import android.view.WindowManager
-import android.widget.LinearLayout
-import android.widget.TextView
 import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
@@ -33,7 +25,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * dsh-status-bridge 的 Android 桥接服务：
  * - 轮询本地 dsh-status-bridge 插件 HTTP 状态接口；
- * - 用悬浮窗显示运行情况；
+ * - 用悬浮窗显示运行情况（状态条 / 桌宠两种模式，见 [BridgeOverlayManager]）；
  * - AI 输出结束后可触发声音提示和通知；
  * - 全部开关/显示模式由 [OverlaySettingsActivity] 配置。
  */
@@ -42,18 +34,7 @@ class StatusBridgeService : Service() {
     private val running = AtomicBoolean(true)
     private var thread: Thread? = null
     private val mainHandler = Handler(Looper.getMainLooper())
-    private var windowManager: WindowManager? = null
-    private var overlayView: LinearLayout? = null
-    private var overlayText: TextView? = null
-    private var overlayDot: View? = null
-    private var overlayClose: TextView? = null
-    private var overlayParams: WindowManager.LayoutParams? = null
-    private var dragStartX = 0
-    private var dragStartY = 0
-    private var dragStartTouchX = 0f
-    private var dragStartTouchY = 0f
-    private var dragMoved = false
-    private val dragSlop = dp(4)
+    private var overlayManager: BridgeOverlayManager? = null
     private var lastStatus: String? = null
     private var lastFinishedAt = 0L
 
@@ -62,6 +43,11 @@ class StatusBridgeService : Service() {
     override fun onCreate() {
         super.onCreate()
         startForeground(NOTIFICATION_ID, buildForegroundNotification("正在连接 dsh…"))
+        overlayManager = BridgeOverlayManager(
+            this,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            true
+        )
         writeHeartbeat("service", "created", "created")
     }
 
@@ -78,7 +64,7 @@ class StatusBridgeService : Service() {
     override fun onDestroy() {
         running.set(false)
         thread?.interrupt()
-        mainHandler.post { removeOverlay() }
+        mainHandler.post { overlayManager?.remove() }
         writeHeartbeat("service", "destroyed", "destroyed")
         super.onDestroy()
     }
@@ -148,239 +134,15 @@ class StatusBridgeService : Service() {
 
     private fun overlayEnabled() = prefs().getBoolean("overlay_enabled", true) &&
         !prefs().getBoolean("a11y_overlay_active", false)
-    private fun showStatus() = prefs().getBoolean("show_status", true)
-    private fun showLastText() = prefs().getBoolean("show_last_text", true)
-    private fun displayMode(): String {
-        return if (prefs().getBoolean("display_mode_auto", true)) {
-            "auto"
-        } else {
-            prefs().getString("display_mode", "compact") ?: "compact"
-        }
-    }
-
-    private fun useFullMode(text: String): Boolean {
-        val mode = displayMode()
-        return when (mode) {
-            "full" -> true
-            "compact" -> false
-            else -> text.length > 20
-        }
-    }
-
-    private fun hideWhenIdle() = prefs().getBoolean("hide_when_idle", false)
 
     // ---------------- 悬浮窗 ----------------
 
-    private fun showOverlay(status: String, text: String, event: String?) {
-        if (prefs().getBoolean("overlay_dismissed", false)) return
-        if (!overlayEnabled() || !Settings.canDrawOverlays(this)) return
-        if (overlayView != null) {
-            if (overlayView?.isAttachedToWindow == true) {
-                updateOverlayText(status, text, event)
-                return
-            }
-            // 窗口已被系统移除但引用还在：重置后重新 addView
-            overlayView = null
-            overlayText = null
-            overlayDot = null
-            overlayClose = null
-            overlayParams = null
-        }
-        windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-        overlayDot = View(this).apply {
-            background = circleDrawable(statusColor(status))
-        }
-        overlayText = TextView(this).apply {
-            textSize = 12f
-            setTextColor(0xFFF2F5FA.toInt())
-            includeFontPadding = false
-            isSingleLine = displayMode() != "full"
-            maxLines = if (displayMode() == "full") 3 else 1
-            ellipsize = TextUtils.TruncateAt.END
-            maxWidth = (resources.displayMetrics.widthPixels * 0.72).toInt()
-        }
-        overlayClose = TextView(this).apply {
-            setText(" ×")
-            textSize = 16f
-            setTextColor(0xAAFFFFFF.toInt())
-            setPadding(dp(6), 0, dp(2), 0)
-            setOnClickListener {
-                prefs().edit().putBoolean("overlay_dismissed", true).apply()
-                removeOverlay()
-            }
-        }
-        overlayView = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            contentDescription = "点击打开 dsh Web，拖动调整位置"
-            background = roundedDrawable(0xDD101722.toInt(), 14, 1, 0x33283A55.toInt())
-            if (Build.VERSION.SDK_INT >= 21) elevation = dp(6).toFloat()
-            setPadding(dp(12), dp(8), dp(6), dp(8))
-            addView(overlayDot, LinearLayout.LayoutParams(dp(8), dp(8)).apply { rightMargin = dp(6) })
-            addView(overlayText, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-            addView(overlayClose)
-            setOnTouchListener(overlayTouchListener)
-        }
-        val type = if (Build.VERSION.SDK_INT >= 26)
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-        else
-            @Suppress("DEPRECATION")
-            WindowManager.LayoutParams.TYPE_PHONE
-        val flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
-        overlayParams = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            type,
-            flags,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            x = prefs().getInt("overlay_x", dp(8))
-            y = prefs().getInt("overlay_y", dp(80))
-        }
-        try {
-            overlayView?.let { windowManager?.addView(it, overlayParams) }
-            updateOverlayText(status, text, event)
-        } catch (e: Exception) {
-            overlayView = null
-            overlayDot = null
-            overlayClose = null
-            overlayParams = null
-        }
-    }
-
     private fun updateOverlay(status: String, text: String, event: String?) {
         if (!overlayEnabled() || !Settings.canDrawOverlays(this)) {
-            removeOverlay()
+            overlayManager?.remove()
             return
         }
-        if (hideWhenIdle() && status == "idle") {
-            removeOverlay()
-            return
-        }
-        showOverlay(status, text, event)
-    }
-
-    private fun updateOverlayText(status: String, text: String, event: String?) {
-        val tv = overlayText ?: return
-        overlayDot?.background = circleDrawable(statusColor(status))
-        overlayView?.background = roundedDrawable(
-            statusBackground(status),
-            14,
-            1,
-            statusBorder(status)
-        )
-        val full = useFullMode(text)
-        tv.text = buildOverlayText(
-            status,
-            event,
-            text,
-            showStatus(),
-            showLastText(),
-            full
-        )
-        tv.isSingleLine = !full
-        tv.maxLines = if (full) 3 else 1
-    }
-
-    private fun statusColor(status: String): Int = when (status) {
-        "running" -> 0xFF6C8CFF.toInt()
-        "finished" -> 0xFF5FD68A.toInt()
-        else -> 0xFF7A8496.toInt()
-    }
-
-    private fun statusBackground(status: String): Int = when (status) {
-        "running" -> 0xEE182238.toInt()
-        "finished" -> 0xEE1B2A24.toInt()
-        else -> 0xDD101722.toInt()
-    }
-
-    private fun statusBorder(status: String): Int = when (status) {
-        "running" -> 0x446C8CFF.toInt()
-        "finished" -> 0x445FD68A.toInt()
-        else -> 0x33283A55.toInt()
-    }
-
-    private fun circleDrawable(color: Int): GradientDrawable =
-        GradientDrawable().apply {
-            shape = GradientDrawable.OVAL
-            setColor(color)
-        }
-
-    private fun roundedDrawable(
-        color: Int,
-        radiusDp: Int,
-        strokeWidth: Int = 0,
-        strokeColor: Int = 0
-    ): GradientDrawable = GradientDrawable().apply {
-        shape = GradientDrawable.RECTANGLE
-        setColor(color)
-        cornerRadius = dp(radiusDp).toFloat()
-        if (strokeWidth > 0) setStroke(strokeWidth, strokeColor)
-    }
-
-    private fun removeOverlay() {
-        try {
-            overlayView?.let { windowManager?.removeView(it) }
-        } catch (e: Exception) {
-            // already removed
-        }
-        overlayView = null
-        overlayText = null
-        overlayDot = null
-        overlayClose = null
-        overlayParams = null
-    }
-
-    private fun openWeb() {
-        try {
-            startActivity(
-                Intent(this, WebViewActivity::class.java)
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            )
-        } catch (_: Exception) {
-            // 启动失败时静默忽略，保证悬浮窗不崩溃
-        }
-    }
-
-    private val overlayTouchListener = View.OnTouchListener { _, event ->
-        val p = overlayParams ?: return@OnTouchListener false
-        val manager = windowManager ?: return@OnTouchListener false
-        val view = overlayView ?: return@OnTouchListener false
-        when (event.action) {
-            MotionEvent.ACTION_DOWN -> {
-                dragStartX = p.x
-                dragStartY = p.y
-                dragStartTouchX = event.rawX
-                dragStartTouchY = event.rawY
-                dragMoved = false
-                true
-            }
-            MotionEvent.ACTION_MOVE -> {
-                val dx = event.rawX - dragStartTouchX
-                val dy = event.rawY - dragStartTouchY
-                if (!dragMoved && (Math.abs(dx) > dragSlop || Math.abs(dy) > dragSlop)) {
-                    dragMoved = true
-                }
-                if (dragMoved) {
-                    p.x = dragStartX + dx.toInt()
-                    p.y = dragStartY + dy.toInt()
-                    try { manager.updateViewLayout(view, p) } catch (e: Exception) {}
-                }
-                true
-            }
-            MotionEvent.ACTION_UP -> {
-                if (!dragMoved) {
-                    openWeb()
-                } else {
-                    prefs().edit().putInt("overlay_x", p.x).putInt("overlay_y", p.y).apply()
-                }
-                true
-            }
-            MotionEvent.ACTION_CANCEL -> true
-            else -> false
-        }
+        overlayManager?.update(status, text, event)
     }
 
     // ---------------- 通知 ----------------
@@ -417,8 +179,6 @@ class StatusBridgeService : Service() {
         nm.notify(NOTIFICATION_ID, buildForegroundNotification(statusLabel(status)))
     }
 
-    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
-
     /** 诊断心跳：把服务存活与悬浮窗挂载状态写到 App 私有目录，便于外部定位。 */
     private fun writeHeartbeat(status: String, text: String, note: String? = null) {
         try {
@@ -428,15 +188,14 @@ class StatusBridgeService : Service() {
             obj.put("status", status)
             obj.put("text", text.take(80))
             obj.put("note", note ?: "")
-            obj.put("overlayExists", overlayView != null)
-            obj.put("overlayAttached", overlayView?.isAttachedToWindow == true)
+            obj.put("overlayExists", overlayManager?.hasOverlay() == true)
             obj.put("running", running.get())
             f.writeText(obj.toString())
 
             val log = File(filesDir, "status-bridge-heartbeat.log")
             log.appendText(
                 "${System.currentTimeMillis()} | $status | ${text.take(80)} | ${note ?: ""} | " +
-                    "overlayExists=${overlayView != null} attached=${overlayView?.isAttachedToWindow == true} " +
+                    "overlayExists=${overlayManager?.hasOverlay() == true} " +
                     "running=${running.get()}\n"
             )
         } catch (e: Exception) {

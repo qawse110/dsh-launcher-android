@@ -13,13 +13,17 @@ import android.view.ViewGroup
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.documentfile.provider.DocumentFile
 import com.google.android.material.card.MaterialCardView
 import com.google.android.material.color.DynamicColors
 import com.google.android.material.switchmaterial.SwitchMaterial
+import java.io.File
 
 /**
  * dsh 状态桥接配置页：
+ * - 悬浮窗样式（状态条 / 桌宠模式）与桌宠包选择/导入；
  * - 悬浮窗 / 声音 / 通知开关；
  * - 显示内容（状态、最近 AI 输出、紧凑/完整模式）；
  * - 启动/停止桥接服务、授予悬浮窗权限。
@@ -35,6 +39,13 @@ class OverlaySettingsActivity : AppCompatActivity() {
     private lateinit var autoModeSwitch: SwitchMaterial
     private lateinit var hideWhenIdleSwitch: SwitchMaterial
     private lateinit var permissionHint: TextView
+    private var importHint: TextView? = null
+
+    private val importPet = registerForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri != null) importFromTree(uri)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         DynamicColors.applyToActivityIfAvailable(this)
@@ -81,6 +92,88 @@ class OverlaySettingsActivity : AppCompatActivity() {
                 ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply { topMargin = dp(4) })
             return c
+        }
+
+        // 悬浮窗样式：状态条 / 桌宠
+        val style = prefs().getString("overlay_style", "pill") ?: "pill"
+        root.addView(section("悬浮窗样式"))
+        card {
+            val row = LinearLayout(this@OverlaySettingsActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+            }
+            row.addView(
+                Ui.button(this@OverlaySettingsActivity, "状态条", { setStyle("pill") },
+                    filled = style != "pet", compact = true),
+                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            )
+            row.addView(
+                Ui.button(this@OverlaySettingsActivity, "桌宠", { setStyle("pet") },
+                    filled = style == "pet", compact = true),
+                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                    .apply { leftMargin = dp(8) }
+            )
+            addView(row, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ))
+            addView(TextView(this@OverlaySettingsActivity).apply {
+                text = "状态条：紧凑文字悬浮窗；桌宠：动画角色跟随 dsh 状态（兼容 Codex 桌宠包）。长按悬浮窗可快速切换。"
+                textSize = 11f
+                setTextColor(Ui.TEXT_MUTED)
+                setPadding(0, dp(6), 0, 0)
+            })
+        }
+
+        if (style == "pet") {
+            root.addView(section("桌宠"))
+            card {
+                val pets = CodexPetStore.scanPets(this@OverlaySettingsActivity)
+                val selected = prefs().getString("pet_id", CodexPetStore.DEFAULT_PET_ID)
+                for (pet in pets) {
+                    addPetRow(this, pet, pet.id == selected)
+                }
+                if (pets.size <= 1) {
+                    addView(TextView(this@OverlaySettingsActivity).apply {
+                        text = "目前只有内置默认桌宠。可导入社区桌宠包（awesome-codex-pet / petdex 的 pet.json + spritesheet 格式）。"
+                        textSize = 11f
+                        setTextColor(Ui.TEXT_MUTED)
+                        setPadding(0, 0, 0, dp(4))
+                    })
+                }
+                addView(Ui.button(
+                    this@OverlaySettingsActivity,
+                    "导入桌宠包（选择含 pet.json 的文件夹）",
+                    { importPet.launch(null) },
+                    filled = false
+                ), LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = dp(4) })
+                addView(Ui.button(
+                    this@OverlaySettingsActivity,
+                    "刷新列表",
+                    { rebuild() },
+                    filled = false
+                ), LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = dp(8) })
+                importHint = TextView(this@OverlaySettingsActivity).apply {
+                    textSize = 11f
+                    setTextColor(Ui.TEXT_MUTED)
+                    setPadding(0, dp(8), 0, 0)
+                }
+                addView(importHint, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ))
+                addView(TextView(this@OverlaySettingsActivity).apply {
+                    text = "也可直接把桌宠包文件夹复制到 /sdcard/Download/DshLauncher/codex-pets/ 下（需含 pet.json 与 spritesheet.webp/.png）。"
+                    textSize = 11f
+                    setTextColor(Ui.TEXT_MUTED)
+                    setPadding(0, dp(4), 0, 0)
+                })
+            }
         }
 
         // 显示内容
@@ -183,6 +276,105 @@ class OverlaySettingsActivity : AppCompatActivity() {
 
         return ScrollView(this).apply { addView(root) }
     }
+
+    private fun setStyle(style: String) {
+        prefs().edit().putString("overlay_style", style).apply()
+        rebuild()
+    }
+
+    private fun rebuild() {
+        runOnUiThread { setContentView(buildUi()) }
+    }
+
+    private fun addPetRow(container: LinearLayout, pet: CodexPetInfo, selected: Boolean) {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(6), 0, dp(6))
+            isClickable = true
+            isFocusable = true
+            setOnClickListener {
+                prefs().edit().putString("pet_id", pet.id).apply()
+                rebuild()
+            }
+        }
+        val textWrap = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        textWrap.addView(TextView(this).apply {
+            text = pet.displayName
+            textSize = 15f
+            setTextColor(Ui.TEXT_PRIMARY)
+        })
+        if (pet.description.isNotBlank()) {
+            textWrap.addView(TextView(this).apply {
+                text = pet.description
+                textSize = 11f
+                setTextColor(Ui.TEXT_MUTED)
+            })
+        }
+        row.addView(textWrap, LinearLayout.LayoutParams(
+            0,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            1f
+        ))
+        if (selected) {
+            row.addView(TextView(this).apply {
+                text = "✓ 使用中"
+                textSize = 12f
+                setTextColor(Ui.SUCCESS)
+            })
+        }
+        container.addView(row, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ))
+    }
+
+    /** 从 SAF 树导入桌宠包：所选文件夹本身或其一子文件夹含 pet.json 即视为一个桌宠包。 */
+    private fun importFromTree(uri: Uri) {
+        val root = DocumentFile.fromTreeUri(this, uri)
+        if (root == null) {
+            importHint?.text = "无法读取所选文件夹"
+            return
+        }
+        val candidates = mutableListOf<DocumentFile>()
+        if (root.findFile("pet.json") != null) candidates.add(root)
+        root.listFiles().forEach { child ->
+            if (child.isDirectory && child.findFile("pet.json") != null) candidates.add(child)
+        }
+        val imported = mutableListOf<String>()
+        for (dir in candidates) {
+            val name = sanitizeFileName(dir.name ?: "pet")
+            val targetDir = File(filesDir, "${CodexPetStore.DIR_NAME}/$name")
+            val petJson = dir.findFile("pet.json") ?: continue
+            if (!targetDir.exists() && !targetDir.mkdirs()) continue
+            copyDocFile(petJson, File(targetDir, "pet.json"))
+            for (ext in listOf("webp", "png")) {
+                dir.findFile("spritesheet.$ext")?.let {
+                    copyDocFile(it, File(targetDir, "spritesheet.$ext"))
+                }
+            }
+            imported.add(name)
+        }
+        rebuild()
+        importHint?.text = if (imported.isNotEmpty()) {
+            "已导入：${imported.joinToString("、")}"
+        } else {
+            "未找到含 pet.json 的桌宠包"
+        }
+    }
+
+    private fun copyDocFile(src: DocumentFile, dst: File) {
+        try {
+            contentResolver.openInputStream(src.uri)?.use { input ->
+                dst.outputStream().use { output -> input.copyTo(output) }
+            }
+        } catch (e: Exception) {
+            // 单文件拷贝失败不中断其它文件
+        }
+    }
+
+    private fun sanitizeFileName(name: String): String =
+        name.replace(Regex("[^A-Za-z0-9._-]"), "_")
 
     private fun addSwitch(
         container: LinearLayout,

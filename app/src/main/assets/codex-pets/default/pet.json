@@ -1,0 +1,6 @@
+{
+  "id": "dsh-default",
+  "displayName": "小豆丁",
+  "description": "DshLauncher 内置默认桌宠（兼容 Codex 桌宠格式：8x9 精灵表）",
+  "spritesheetPath": "spritesheet.png"
+}
