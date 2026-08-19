@@ -48,8 +48,12 @@ class ConsoleActivity : AppCompatActivity() {
     private fun handleIntentExtras() {
         val runNode = intent?.getBooleanExtra("node", false) ?: false
         val runDsh = intent?.getBooleanExtra("dsh", false) ?: false
+        val runDshInstall = intent?.getBooleanExtra("dsh_install", false) ?: false
+        val runDshStart = intent?.getBooleanExtra("dsh_start", false) ?: false
         val cmd = intent?.getStringExtra("cmd")
         when {
+            runDshInstall -> { appendLine(">> 触发 dsh 安装/更新（不启动 web）…"); AppLog.i("Console", "auto dsh install"); runDshFlow(installOnly = true) }
+            runDshStart -> { appendLine(">> 触发 dsh 启动（不安装）…"); AppLog.i("Console", "auto dsh start"); runDshFlow(startOnly = true) }
             runDsh -> { appendLine(">> 触发 dsh 安装+启动…"); AppLog.i("Console", "auto dsh run"); runDshFlow() }
             runNode -> { appendLine(">> 触发内置 Node 解压+运行…"); AppLog.i("Console", "auto node run"); runNodeCmd() }
             !cmd.isNullOrBlank() -> {
@@ -215,8 +219,11 @@ class ConsoleActivity : AppCompatActivity() {
     }
 
     /**
-     * dsh 一键安装+启动流程（内嵌，避免 shell↔am 传长命令）。
-     * 通过 ConsoleActivity 的 intent `--ez dsh true` 触发，供自动化/按钮调用。
+     * dsh 安装/启动流程（内嵌，避免 shell↔am 传长命令）。
+     * 通过 ConsoleActivity 的 intent 触发：
+     *   `--ez dsh true`          安装+启动（兼容旧入口：通知/插件管理/am 快捷方式）
+     *   `--ez dsh_install true`  仅安装/更新（npm + 插件装配，不启动 web）
+     *   `--ez dsh_start true`    仅启动（跳安装，要求已安装）
      * 各阶段：
      *   1) 确保内置 node 解压
      *   2) 复制 assets 内 install-dsh.mjs + prebuilt.tgz（内置插件源）
@@ -224,9 +231,11 @@ class ConsoleActivity : AppCompatActivity() {
      *      并用 `dsh plugin --profile web add` 装配内置插件
      *   4) 执行 stub-dsh.mjs（Android 兼容修复），启动 dsh web
      */
-    private fun runDshFlow() {
-        setState("启动 dsh 安装…")
-        appendLine(">> 1/4 确保内置 Node 运行时…")
+    private fun runDshFlow(installOnly: Boolean = false, startOnly: Boolean = false) {
+        setState(if (installOnly) "安装/更新中…" else if (startOnly) "启动 dsh…" else "启动 dsh 安装…")
+        appendLine(if (installOnly) ">> 安装/更新模式（完成后不启动 web）…"
+                   else if (startOnly) ">> 仅启动模式（跳过安装/装配）…"
+                   else ">> 安装+启动模式…")
         // 核心日志写私有目录（无需存储权限，run-as 可读）；共享目录尽力而为
         val flowLog = File(filesDir, "dsh-flow.log")
         val sharedFlowLog = File("/sdcard/Download/DshLauncher/dsh-flow.log")
@@ -244,35 +253,29 @@ class ConsoleActivity : AppCompatActivity() {
                 fl("OK 1/4 node=$nodeDir")
                 val dshPrefix = File(filesDir, "dsh-prefix")
                 val dshCli = File(dshPrefix, "node_modules/@deepseek-ai/dsh/lib/bin.js")
-                // 非首次启动：dsh 已安装时走快速启动，跳过 npm 更新/插件装配/Termux 全量准备
-                if (dshCli.exists()) {
-                    fl(">> 快速启动：已安装 dsh v${DshUpdater.currentVersion(this)}，跳过 npm/插件装配…")
-                    for (name in listOf("fs-register.mjs", "fs-loader.mjs", "fs-promises-compat.mjs", "stub-dsh.mjs")) {
-                        val target = File(filesDir, name)
-                        try {
-                            assets.open(name).use { input ->
-                                target.outputStream().use { output -> input.copyTo(output) }
-                            }
-                        } catch (t: Throwable) {
-                            fl("WARN copy $name: ${t.message}")
-                        }
+
+                // 仅启动模式：不安装，直接快速启动（要求已安装）
+                if (startOnly) {
+                    if (!dshCli.exists()) {
+                        fl("FAIL 尚未安装 dsh（$dshCli 不存在），请先点「安装 / 更新 DSH」")
+                        setState("未安装")
+                        return@thread
                     }
-                    val stubScript = File(filesDir, "stub-dsh.mjs")
-                    if (stubScript.exists()) {
-                        runCommandAndWait(
-                            "$nodeDir/bin/node ${stubScript.absolutePath}",
-                            mapOf(
-                                "HOME" to filesDir.absolutePath,
-                                "NODE_DIR" to nodeDir.absolutePath,
-                                "DSH_PREFIX" to dshPrefix.absolutePath,
-                                "DSH_PROFILE" to "web"
-                            )
-                        )
+                    if (quickStartWeb(nodeDir, dshPrefix, fl)) {
+                        fl("OK 启动完成 (http://127.0.0.1:3080)")
+                        setState("运行中")
+                        BuildKeepAliveService.updateRunning(this)
                     } else {
-                        fl("WARN 未找到 stub-dsh.mjs，继续尝试启动 web")
+                        fl("FAIL 启动：dsh web 未就绪（见上方日志尾部）")
+                        setState("启动失败")
                     }
-                    fl(">> 快速启动 dsh web…")
-                    if (startDshWeb(nodeDir, dshPrefix)) {
+                    return@thread
+                }
+
+                // 非安装模式且 dsh 已安装：快速启动，跳过 npm 更新/插件装配/Termux 全量准备
+                if (!installOnly && dshCli.exists()) {
+                    fl(">> 快速启动：已安装 dsh v${DshUpdater.currentVersion(this)}，跳过 npm/插件装配…")
+                    if (quickStartWeb(nodeDir, dshPrefix, fl)) {
                         fl("OK 快速启动完成 (http://127.0.0.1:3080)")
                         setState("运行中")
                         BuildKeepAliveService.updateRunning(this)
@@ -292,7 +295,7 @@ class ConsoleActivity : AppCompatActivity() {
                 }
                 fl("dsh 版本 v${DshUpdater.currentVersion(this)}")
                 // 安装/更新统一交给 install-dsh.mjs 的 `npm install @deepseek-ai/dsh@latest`；
-                // “更新”按钮通过 startUpdateCheck(force=true) 触发重启 flow 主动检查。
+                // 主界面「安装 / 更新 DSH」即此路径（与快速启动互斥：更新后不会自动启动 web）。
                 val pluginsDir = File(filesDir, "plugins")
 
                 fl(">> 2/4 复制官方安装脚本与内置插件源…")
@@ -378,6 +381,14 @@ class ConsoleActivity : AppCompatActivity() {
                     )
                 )
 
+                // 仅安装/更新模式：到此结束，不启动 web
+                if (installOnly) {
+                    fl("OK 安装/更新完成（未启动 web，回主界面点「启动 DSH」即可）")
+                    setState("安装完成")
+                    BuildKeepAliveService.updateRunning(this)
+                    return@thread
+                }
+
                 fl(">> 4/4 校验 dsh web…")
                 if (startDshWeb(nodeDir, dshPrefix)) {
                     fl("OK 4/4 dsh web started (http://127.0.0.1:3080)")
@@ -406,6 +417,36 @@ class ConsoleActivity : AppCompatActivity() {
         } catch (t: Throwable) {
             AppLog.e("Console", "keepalive start failed: ${t.message}")
         }
+    }
+
+    /** 快速启动：同步兼容脚本（fs-register/fs-loader/fs-promises/stub）→ 执行 stub → 启动 web。 */
+    private fun quickStartWeb(nodeDir: File, dshPrefix: File, fl: (String) -> Unit): Boolean {
+        for (name in listOf("fs-register.mjs", "fs-loader.mjs", "fs-promises-compat.mjs", "stub-dsh.mjs")) {
+            val target = File(filesDir, name)
+            try {
+                assets.open(name).use { input ->
+                    target.outputStream().use { output -> input.copyTo(output) }
+                }
+            } catch (t: Throwable) {
+                fl("WARN copy $name: ${t.message}")
+            }
+        }
+        val stubScript = File(filesDir, "stub-dsh.mjs")
+        if (stubScript.exists()) {
+            runCommandAndWait(
+                "$nodeDir/bin/node ${stubScript.absolutePath}",
+                mapOf(
+                    "HOME" to filesDir.absolutePath,
+                    "NODE_DIR" to nodeDir.absolutePath,
+                    "DSH_PREFIX" to dshPrefix.absolutePath,
+                    "DSH_PROFILE" to "web"
+                )
+            )
+        } else {
+            fl("WARN 未找到 stub-dsh.mjs，继续尝试启动 web")
+        }
+        fl(">> 启动 dsh web…")
+        return startDshWeb(nodeDir, dshPrefix)
     }
 
     /** 后台启动 dsh web 并等待 HTTP 就绪。端口已有监听但无响应时清场重启（幂等但不再盲信）。 */

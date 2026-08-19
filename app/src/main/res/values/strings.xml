@@ -6,6 +6,8 @@
     <string name="status_running">🟢 运行中</string>
     <string name="status_stopped">⚪ 未运行</string>
     <string name="btn_install_one">⚡ 一键安装并启动 DSH</string>
+    <string name="btn_install_update">⚡ 安装 / 更新 DSH</string>
+    <string name="btn_start_dsh">启动 DSH</string>
     <string name="btn_open_web">打开 Web 界面</string>
     <string name="btn_open_terminal">命令控制台</string>
     <string name="btn_stop_all">停止 dsh 服务</string>

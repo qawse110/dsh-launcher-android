@@ -247,19 +247,22 @@ class MainActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { gravity = Gravity.CENTER_HORIZONTAL; topMargin = dp(8) })
 
-        // Section: 核心操作（主 CTA 通栏加高加粗 + 次操作通栏）
+        // Section: 核心操作（安装/更新 与 启动 拆分）
         addSection("核心操作") {
-            addWide(getString(R.string.btn_install_one), true, Ui.BRAND, heightDp = 52, bold = true, textSize = 15f) {
-                // 免 Termux 一键：ConsoleActivity 驱动 4 步流程（node→官方 npm 安装 dsh→插件装配→web）
+            addWide(getString(R.string.btn_install_update), true, Ui.BRAND, heightDp = 52, bold = true, textSize = 15f) {
+                // 仅安装/更新：node→官方 npm 安装/更新 dsh→插件装配，不启动 web
                 runCatching {
-                    startActivity(Intent(this@MainActivity, ConsoleActivity::class.java).putExtra("dsh", true))
+                    startActivity(Intent(this@MainActivity, ConsoleActivity::class.java).putExtra("dsh_install", true))
                 }.onFailure {
                     log("✗ 无法打开控制台：${it.message}")
                 }
             }
-            addWide(getString(R.string.btn_open_web), false) {
+            addPair(getString(R.string.btn_start_dsh), {
+                // 仅启动：跳过安装/装配，快速启动 web（未安装时提示先安装）
+                startActivity(Intent(this@MainActivity, ConsoleActivity::class.java).putExtra("dsh_start", true))
+            }, getString(R.string.btn_open_web), {
                 startActivity(Intent(this@MainActivity, WebViewActivity::class.java))
-            }
+            })
         }
 
         // Section: 工具（两列网格）
@@ -352,7 +355,7 @@ class MainActivity : AppCompatActivity() {
         ).apply { topMargin = dp(8) })
 
         root.addView(TextView(this).apply {
-            text = "操作步骤：\n① 点“⚡ 一键安装并启动 DSH”自动完成：内置 Node 解压 → 官方 npm 安装/更新 dsh → dsh plugin 装配内置插件 → 启动 Web（首次需联网下载，之后增量更新）；\n② “打开 Web 界面”查看 dsh UI（http://127.0.0.1:3080）；\n③ “停止 dsh 服务”结束后台进程与保活服务。\n\n提示：\n· 全程免 Termux，内置 Node 为 aarch64 运行时；\n· 安装日志：/sdcard/Download/DshLauncher/install_log.txt。"
+            text = "操作步骤：\n① 点“⚡ 安装 / 更新 DSH”自动完成：内置 Node 解压 → 官方 npm 安装/更新 dsh → dsh plugin 装配内置插件（首次需联网下载，之后增量更新，不会自动启动）；\n② 点“启动 DSH”启动 Web 服务，“打开 Web 界面”进入 dsh UI（http://127.0.0.1:3080）；\n③ “停止 dsh 服务”结束后台进程与保活服务。\n\n提示：\n· 全程免 Termux，内置 Node 为 aarch64 运行时；\n· 安装日志：/sdcard/Download/DshLauncher/install_log.txt。"
             textSize = 12f
             setTextColor(Ui.TEXT_MUTED)
             setPadding(0, dp(18), 0, 0)
