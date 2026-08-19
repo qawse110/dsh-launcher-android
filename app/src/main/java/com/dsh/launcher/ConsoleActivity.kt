@@ -261,7 +261,7 @@ class ConsoleActivity : AppCompatActivity() {
                         setState("未安装")
                         return@thread
                     }
-                    if (quickStartWeb(nodeDir, dshPrefix, fl)) {
+                    if (quickStartWeb(nodeDir, dshPrefix, ::fl)) {
                         fl("OK 启动完成 (http://127.0.0.1:3080)")
                         setState("运行中")
                         BuildKeepAliveService.updateRunning(this)
@@ -275,7 +275,7 @@ class ConsoleActivity : AppCompatActivity() {
                 // 非安装模式且 dsh 已安装：快速启动，跳过 npm 更新/插件装配/Termux 全量准备
                 if (!installOnly && dshCli.exists()) {
                     fl(">> 快速启动：已安装 dsh v${DshUpdater.currentVersion(this)}，跳过 npm/插件装配…")
-                    if (quickStartWeb(nodeDir, dshPrefix, fl)) {
+                    if (quickStartWeb(nodeDir, dshPrefix, ::fl)) {
                         fl("OK 快速启动完成 (http://127.0.0.1:3080)")
                         setState("运行中")
                         BuildKeepAliveService.updateRunning(this)
