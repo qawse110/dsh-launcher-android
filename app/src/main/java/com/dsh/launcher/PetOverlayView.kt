@@ -13,6 +13,11 @@ import android.view.View
  * 行索引与 Codex Pet Contract 完全一致：
  *   0 idle / 1 running-right / 2 running-left / 3 waving / 4 jumping
  *   5 failed / 6 waiting / 7 running / 8 review
+ *
+ * 循环策略（依据官方 animation-rows.md 的行语义）：
+ * - 常驻状态行（idle / running-* / waiting / running / review / failed）在状态持续期间循环；
+ * - 一次性表演行（waving / jumping）播完一轮后**落地回 idle** 继续呼吸，
+ *   同一动作不重播，直到状态换行（例如下一轮任务完成才再次跳跃庆祝）。
  */
 class PetOverlayView(context: Context, private val atlas: CodexPetAtlas) : View(context) {
 
@@ -26,6 +31,12 @@ class PetOverlayView(context: Context, private val atlas: CodexPetAtlas) : View(
         const val ROW_WAITING = 6
         const val ROW_RUNNING = 7
         const val ROW_REVIEW = 8
+
+        /** 常驻循环行：状态持续期间一直循环（规范语义 loop / idle variant）。 */
+        private val LOOP_ROWS: Set<Int> = setOf(
+            ROW_IDLE, ROW_RUNNING_RIGHT, ROW_RUNNING_LEFT,
+            ROW_FAILED, ROW_WAITING, ROW_RUNNING, ROW_REVIEW
+        )
 
         /** 每行动画帧时长（ms），取自 Codex 规范 animation-rows.md。 */
         private val ROW_DURATIONS: Map<Int, IntArray> = mapOf(
@@ -63,22 +74,39 @@ class PetOverlayView(context: Context, private val atlas: CodexPetAtlas) : View(
     private var row = ROW_IDLE
     private var col = 0
     private var playing = false
+    /** 已表演完成的一次性动作行（waving/jumping）：落地回 idle 后不重播，直到换行。 */
+    private var settledRow = -1
 
     private val ticker = object : Runnable {
         override fun run() {
             if (!playing) return
-            col = (col + 1) % frameCount(row)
+            val count = frameCount(row)
+            col = (col + 1) % count
+            if (col == 0 && settledRow == row) {
+                // 一次性动作播完一轮：落地回 idle 继续呼吸，等待下一次换行再表演
+                row = ROW_IDLE
+                col = 0
+                invalidate()
+                handler.postDelayed(this, frameDuration(row, 0))
+                return
+            }
             invalidate()
             handler.postDelayed(this, frameDuration(row, col))
         }
     }
 
-    /** 切换动画行（动作），从头播放并循环。 */
+    /** 切换动画行（动作）：循环行持续循环；一次性动作（waving/jumping）播完一轮落地回 idle。 */
     fun play(row: Int) {
         val safeRow = row.coerceIn(0, maxRow())
-        if (playing && safeRow == this.row) return
+        if (playing && safeRow == this.row) {
+            // 已在该行：若回到常驻行则重新武装一次性动作（落地后再次换行可再表演）
+            if (safeRow in LOOP_ROWS) settledRow = -1
+            return
+        }
+        if (safeRow !in LOOP_ROWS && settledRow == safeRow) return // 同一一次性动作已表演过
         this.row = safeRow
         col = 0
+        settledRow = if (safeRow !in LOOP_ROWS) safeRow else -1
         invalidate()
         handler.removeCallbacks(ticker)
         handler.postDelayed(ticker, frameDuration(safeRow, 0))
