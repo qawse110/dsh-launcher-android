@@ -272,10 +272,14 @@ class ConsoleActivity : AppCompatActivity() {
                         fl("WARN 未找到 stub-dsh.mjs，继续尝试启动 web")
                     }
                     fl(">> 快速启动 dsh web…")
-                    startDshWeb(nodeDir, dshPrefix)
-                    fl("OK 快速启动完成 (http://127.0.0.1:3080)")
-                    setState("运行中")
-                    BuildKeepAliveService.updateRunning(this)
+                    if (startDshWeb(nodeDir, dshPrefix)) {
+                        fl("OK 快速启动完成 (http://127.0.0.1:3080)")
+                        setState("运行中")
+                        BuildKeepAliveService.updateRunning(this)
+                    } else {
+                        fl("FAIL 快速启动：dsh web 未就绪（见上方日志尾部）")
+                        setState("启动失败")
+                    }
                     return@thread
                 }
                 fl(">> 1.5/4 准备内置 Termux（bash/coreutils + git/python）…")
@@ -375,9 +379,15 @@ class ConsoleActivity : AppCompatActivity() {
                 )
 
                 fl(">> 4/4 校验 dsh web…")
-                startDshWeb(nodeDir, dshPrefix)
-                fl("OK 4/4 dsh web started (http://127.0.0.1:3080)")
-                BuildKeepAliveService.updateRunning(this)
+                if (startDshWeb(nodeDir, dshPrefix)) {
+                    fl("OK 4/4 dsh web started (http://127.0.0.1:3080)")
+                    setState("运行中")
+                    BuildKeepAliveService.updateRunning(this)
+                } else {
+                    fl("FAIL 4/4 dsh web 启动失败（见上方日志尾部）")
+                    setState("出错")
+                    return@thread
+                }
                 // 保持 keepalive 常驻：web 进程是其子进程，避免被系统回收；用户可在主界面停止。
             } catch (t: Throwable) {
                 fl("FAIL: ${t.message}")
@@ -398,18 +408,24 @@ class ConsoleActivity : AppCompatActivity() {
         }
     }
 
-    /** 后台启动 dsh web（nohup 使其脱离本控制台进程）。端口已监听时跳过（幂等）。 */
-    private fun startDshWeb(nodeDir: File, dshPrefix: File) {
+    /** 后台启动 dsh web 并等待 HTTP 就绪。端口已有监听但无响应时清场重启（幂等但不再盲信）。 */
+    private fun startDshWeb(nodeDir: File, dshPrefix: File): Boolean {
         val cli = File(dshPrefix, "node_modules/@deepseek-ai/dsh/lib/bin.js")
         if (!cli.exists()) {
             appendLine("✗ 未找到官方 dsh CLI（安装可能未完成）")
             setState("出错")
-            return
+            return false
         }
-        // 幂等：3080 已有监听则视为已启动
+        // 幂等：3080 已有监听 → 只有 HTTP 真正响应才算已启动；
+        // 残留（端口被占但 web 不响应）视为脏状态，先清理再重启。
         if (isPortListening(3080)) {
-            appendLine(">> dsh web 已在运行 (http://127.0.0.1:3080)")
-            return
+            if (waitForWebReady(5_000)) {
+                appendLine(">> dsh web 已在运行 (http://127.0.0.1:3080)")
+                return true
+            }
+            appendLine(">> 端口 3080 被残留进程占用但 web 无响应，清理后重新启动…")
+            killAllNode()
+            Thread.sleep(1500)
         }
         // 生成启动脚本到共享目录，用 sh 后台执行
         File(filesDir, "tmp").mkdirs()
@@ -419,6 +435,7 @@ class ConsoleActivity : AppCompatActivity() {
         val termuxReady = TermuxRuntime.isBashReady(this)
         val termuxPath = if (termuxReady) "$termuxUsr/bin:$termuxUsr/bin/applets:$termuxUsr/local/bin:" else ""
         val ldLibrary = if (termuxReady) "${nodeDir.absolutePath}/lib:$termuxUsr/lib" else "${nodeDir.absolutePath}/lib"
+        val nodeCmd = "${nodeDir.absolutePath}/bin/node --expose-internals --import ${filesDir.absolutePath}/fs-register.mjs ${cli.absolutePath} web"
         launcher.writeText(
             "#!/system/bin/sh\n" +
             "export LD_LIBRARY_PATH=$ldLibrary\n" +
@@ -428,12 +445,17 @@ class ConsoleActivity : AppCompatActivity() {
             "export TERM=xterm-256color\n" +
             (if (termuxReady) "export PREFIX=$termuxUsr\n" else "") +
             "export PATH=${nodeDir.absolutePath}/bin:${termuxPath}${File(filesDir, ".tools").absolutePath}/bin:/system/bin:/bin:/usr/bin\n" +
-            "nohup ${nodeDir.absolutePath}/bin/node --expose-internals --import ${filesDir.absolutePath}/fs-register.mjs ${cli.absolutePath} web > ${filesDir.absolutePath}/dsh-web.log 2>&1 &\n" +
+            "if command -v nohup >/dev/null 2>&1; then\n" +
+            "  nohup $nodeCmd > ${filesDir.absolutePath}/dsh-web.log 2>&1 &\n" +
+            "else\n" +
+            "  $nodeCmd > ${filesDir.absolutePath}/dsh-web.log 2>&1 &\n" +
+            "fi\n" +
             "echo DSH_WEB_PID=$!\n"
         )
         launcher.setExecutable(true)
         runCommandAndWait("/system/bin/sh ${launcher.absolutePath}")
-        appendLine(">> dsh web 后台启动，日志：${filesDir.absolutePath}/dsh-web.log")
+        appendLine(">> dsh web 已后台启动，等待 web 就绪（http://127.0.0.1:3080）…")
+        return waitForWebReady(90_000)
     }
 
     /** 检测本机端口是否已有监听（用于幂等启动）。 */
@@ -445,6 +467,50 @@ class ConsoleActivity : AppCompatActivity() {
         }
     } catch (e: java.io.IOException) {
         true
+    }
+
+    /** 轮询等待 dsh web 的 HTTP 真正可访问，超时后打印 dsh-web.log 尾部。 */
+    private fun waitForWebReady(timeoutMs: Long): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        var lastLog = 0L
+        while (System.currentTimeMillis() < deadline) {
+            if (httpResponds(3080)) return true
+            val now = System.currentTimeMillis()
+            if (now - lastLog >= 5000) {
+                lastLog = now
+                appendLine("   等待 dsh web 就绪…（剩余 ${(deadline - now) / 1000}s）")
+            }
+            Thread.sleep(500)
+        }
+        appendLine("✗ dsh web 未在 ${timeoutMs / 1000} 秒内就绪，日志尾部：")
+        appendLogTail(File(filesDir, "dsh-web.log"), 25)
+        return false
+    }
+
+    private fun httpResponds(port: Int): Boolean = try {
+        val conn = java.net.URL("http://127.0.0.1:$port/").openConnection() as java.net.HttpURLConnection
+        conn.connectTimeout = 800
+        conn.readTimeout = 800
+        conn.requestMethod = "GET"
+        val code = conn.responseCode
+        conn.disconnect()
+        code in 200..399
+    } catch (e: Exception) {
+        false
+    }
+
+    private fun appendLogTail(file: java.io.File, maxLines: Int) {
+        try {
+            if (!file.exists()) {
+                appendLine("   （无日志文件：${file.path}）")
+                return
+            }
+            val lines = file.readText().trim().lines()
+            val tail = if (lines.size > maxLines) lines.takeLast(maxLines) else lines
+            for (line in tail) appendLine("   | $line")
+        } catch (t: Throwable) {
+            appendLine("   （读取日志失败：${t.message}）")
+        }
     }
 
     /** 通过 ProcessBuilder 执行命令，实时回显输出。 */
