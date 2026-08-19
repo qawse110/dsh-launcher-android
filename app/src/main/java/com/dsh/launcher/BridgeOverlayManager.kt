@@ -322,7 +322,7 @@ class BridgeOverlayManager(
         petView?.play(PetOverlayView.actionRowFor(status, event))
         petBubble?.let { bubble ->
             if (showPetBubble()) {
-                bubble.text = buildPetBubbleText(status, event, text)
+                bubble.text = buildPetBubbleText(status, text, event)
                 bubble.visibility = View.VISIBLE
             } else {
                 bubble.visibility = View.GONE
