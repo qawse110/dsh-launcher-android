@@ -140,8 +140,9 @@ class BridgeOverlayManager(
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = prefs().getInt("overlay_x", dp(8))
-            y = prefs().getInt("overlay_y", dp(80))
+            x = prefs().getInt("overlay_x", dp(10))
+            // 默认放低一些，避免覆盖应用标题区（y=80 会遮住主界面标题）
+            y = prefs().getInt("overlay_y", dp(150))
         }
         try {
             overlayView?.let { windowManager?.addView(it, overlayParams) }

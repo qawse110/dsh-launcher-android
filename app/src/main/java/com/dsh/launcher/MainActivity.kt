@@ -118,20 +118,74 @@ class MainActivity : AppCompatActivity() {
         }
         contentRoot = root
 
+        // ---- 布局辅助 ----
+        /** 区块标题 + 卡片容器。 */
+        fun addSection(title: String, block: LinearLayout.() -> Unit) {
+            root.addView(Ui.sectionLabel(this, title).apply {
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = dp(20) }
+            })
+            val card = Ui.card(this, radiusDp = 16, background = Ui.SURFACE_CONTAINER, elevationDp = 1f)
+            card.addView(LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; block() })
+            root.addView(card, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(8) })
+        }
+
+        /** 通栏按钮（主操作/停止等）。 */
+        fun LinearLayout.addWide(
+            text: String, filled: Boolean, color: Int = Ui.BRAND_DEEP,
+            heightDp: Int = 48, bold: Boolean = false, textSize: Float = 14f,
+            onClick: () -> Unit
+        ) {
+            addView(Ui.button(this@MainActivity, text, onClick, filled = filled, color = color).apply {
+                this.textSize = textSize
+                if (bold) typeface = Typeface.DEFAULT_BOLD
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, dp(heightDp)
+                ).apply { topMargin = dp(8) }
+            })
+        }
+
+        /** 两列等宽按钮行（网格布局，减少滚屏）。 */
+        fun LinearLayout.addPair(
+            a: String, aOn: () -> Unit,
+            b: String, bOn: () -> Unit,
+            color: Int = Ui.BRAND_DEEP
+        ) {
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, dp(6), 0, 0)
+                addView(
+                    Ui.button(this@MainActivity, a, aOn, filled = false, color = color),
+                    LinearLayout.LayoutParams(0, dp(46), 1f).apply { rightMargin = dp(8) }
+                )
+                addView(
+                    Ui.button(this@MainActivity, b, bOn, filled = false, color = color),
+                    LinearLayout.LayoutParams(0, dp(46), 1f)
+                )
+            })
+        }
+
         // Header
         root.addView(TextView(this).apply {
             text = "⚡ DeepSeek Harness"
-            textSize = 24f
+            textSize = 26f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Ui.TEXT_PRIMARY)
             gravity = Gravity.CENTER
+            setPadding(0, dp(4), 0, 0)
         })
         root.addView(TextView(this).apply {
             text = "Agent 插件化开发框架 · 本地运行"
             textSize = 13f
             setTextColor(Ui.TEXT_MUTED)
             gravity = Gravity.CENTER
-            setPadding(0, dp(6), 0, dp(20))
+            setPadding(0, dp(8), 0, dp(24))
         })
 
         // APP 升级提示条：APK 更新后同步了内置插件源，提示重新装配
@@ -139,78 +193,63 @@ class MainActivity : AppCompatActivity() {
             root.addView(buildUpdateBanner())
         }
 
-        // Section: 运行状态
-        root.addView(Ui.sectionLabel(this, "运行状态"))
+        // Section: 运行状态（两行：标签+刷新 / 大号状态指示，不再挤一行）
+        root.addView(Ui.sectionLabel(this, "运行状态").apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(20) }
+        })
 
-        // Status card
-        val card = Ui.card(this, radiusDp = 16, background = Ui.SURFACE_CONTAINER_HIGH, elevationDp = 1f)
-        val cardRow = LinearLayout(this).apply {
+        val statusCard = Ui.card(this, radiusDp = 16, background = Ui.SURFACE_CONTAINER_HIGH, elevationDp = 1f)
+        val statusCol = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        // 第一行：弱化标签 + 刷新按钮
+        statusCol.addView(LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-        }
-        cardRow.addView(TextView(this).apply {
-            text = getString(R.string.status_title)
-            textSize = 15f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(Ui.TEXT_PRIMARY)
-        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-
-        statusDot = Ui.dot(this, 8, Ui.TEXT_MUTED)
-        cardRow.addView(statusDot, LinearLayout.LayoutParams(
-            dp(8), dp(8)
-        ).apply { rightMargin = dp(6) })
-        statusValue = TextView(this).apply {
-            text = getString(R.string.status_unknown)
-            textSize = 14f
-            gravity = Gravity.END
-        }
-        cardRow.addView(statusValue)
-        cardRow.addView(Ui.button(this, "刷新", { refreshStatus() }, filled = false, compact = true).apply {
-            minWidth = dp(64)
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            )
+            addView(TextView(this@MainActivity).apply {
+                text = "dsh 服务"
+                textSize = 13f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(Ui.TEXT_SECONDARY)
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(Ui.button(this@MainActivity, "刷新", { refreshStatus() },
+                filled = false, compact = true).apply { minWidth = dp(76); textSize = 12.5f })
         })
-        card.addView(cardRow)
-        root.addView(card, LinearLayout.LayoutParams(
+        // 第二行：大号状态点 + 状态文字 + 端口提示
+        statusCol.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(14), 0, 0)
+            statusDot = Ui.dot(this@MainActivity, 12, Ui.TEXT_MUTED)
+            addView(statusDot, LinearLayout.LayoutParams(dp(12), dp(12)).apply { rightMargin = dp(10) })
+            statusValue = TextView(this@MainActivity).apply {
+                text = getString(R.string.status_unknown)
+                textSize = 18f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(Ui.TEXT_MUTED)
+            }
+            addView(statusValue, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(TextView(this@MainActivity).apply {
+                text = "http://127.0.0.1:3080"
+                textSize = 11f
+                setTextColor(Ui.TEXT_MUTED)
+            })
+        })
+        statusCard.addView(statusCol)
+        root.addView(statusCard, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT
-        ))
+        ).apply { topMargin = dp(8) })
 
         progress = ProgressBar(this).apply { visibility = View.GONE }
         root.addView(progress, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { gravity = Gravity.CENTER_HORIZONTAL; topMargin = dp(4) })
+        ).apply { gravity = Gravity.CENTER_HORIZONTAL; topMargin = dp(8) })
 
-        // Section: 快速操作（分组展示）
-        fun addActionSection(title: String, block: LinearLayout.() -> Unit) {
-            root.addView(Ui.sectionLabel(this, title).apply {
-                layoutParams = LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                ).apply { topMargin = dp(6) }
-            })
-            val card = Ui.card(this, radiusDp = 16, background = Ui.SURFACE_CONTAINER, elevationDp = 2f)
-            val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; block() }
-            card.addView(list)
-            root.addView(card, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(8) })
-        }
-
-        fun LinearLayout.addButton(text: String, filled: Boolean, color: Int = Ui.BRAND_DEEP, onClick: () -> Unit) {
-            addView(Ui.button(this@MainActivity, text, onClick, filled = filled, color = color).apply {
-                layoutParams = LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                ).apply { topMargin = dp(8) }
-            })
-        }
-
-        addActionSection("核心操作") {
-            addButton(getString(R.string.btn_install_one), true) {
+        // Section: 核心操作（主 CTA 通栏加高加粗 + 次操作通栏）
+        addSection("核心操作") {
+            addWide(getString(R.string.btn_install_one), true, Ui.BRAND, heightDp = 52, bold = true, textSize = 15f) {
                 // 免 Termux 一键：ConsoleActivity 驱动 4 步流程（node→官方 npm 安装 dsh→插件装配→web）
                 runCatching {
                     startActivity(Intent(this@MainActivity, ConsoleActivity::class.java).putExtra("dsh", true))
@@ -218,13 +257,14 @@ class MainActivity : AppCompatActivity() {
                     log("✗ 无法打开控制台：${it.message}")
                 }
             }
-            addButton(getString(R.string.btn_open_web), false) {
+            addWide(getString(R.string.btn_open_web), false) {
                 startActivity(Intent(this@MainActivity, WebViewActivity::class.java))
             }
         }
 
-        addActionSection("工具") {
-            addButton(getString(R.string.btn_open_terminal), false) {
+        // Section: 工具（两列网格）
+        addSection("工具") {
+            addPair(getString(R.string.btn_open_terminal), {
                 thread {
                     if (!TermuxRuntime.isReady(this@MainActivity)) {
                         log("准备内置 Termux 环境（首次约 10~60 秒）…")
@@ -240,25 +280,17 @@ class MainActivity : AppCompatActivity() {
                         startActivity(Intent(this@MainActivity, TerminalActivity::class.java))
                     }
                 }
-            }
-            addButton(getString(R.string.btn_node_check), false) {
+            }, getString(R.string.btn_node_check), {
                 runNodeDsh()
-            }
+            })
         }
 
-        addActionSection("设置与状态") {
-            addButton("存储权限 / 所有文件访问", false) {
-                requestStoragePermissions()
-            }
-            addButton("状态悬浮窗 / 桥接", false) {
-                startActivity(Intent(this@MainActivity, OverlaySettingsActivity::class.java))
-            }
-            addButton("插件管理", false) {
-                startActivity(Intent(this@MainActivity, PluginManagerActivity::class.java))
-            }
-            addButton(getString(R.string.btn_stop_all), false, Ui.DANGER) {
-                stopDshAll()
-            }
+        // Section: 设置与状态（两列网格）
+        addSection("设置与状态") {
+            addPair("存储权限", { requestStoragePermissions() },
+                    "状态悬浮窗", { startActivity(Intent(this@MainActivity, OverlaySettingsActivity::class.java)) })
+            addPair("插件管理", { startActivity(Intent(this@MainActivity, PluginManagerActivity::class.java)) },
+                    getString(R.string.btn_stop_all), { stopDshAll() }, color = Ui.DANGER)
         }
 
         // Section: 日志
@@ -266,7 +298,7 @@ class MainActivity : AppCompatActivity() {
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(6) }
+            ).apply { topMargin = dp(20) }
         })
 
         // 反馈日志栏
@@ -283,38 +315,41 @@ class MainActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = dp(14) })
 
-        // Section: 运行环境
+        // Section: 运行环境（环境状态入卡，统一层级）
         root.addView(Ui.sectionLabel(this, "运行环境").apply {
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(6) }
+            ).apply { topMargin = dp(20) }
         })
-
+        val envCard = Ui.card(this, radiusDp = 14, background = Ui.SURFACE_CONTAINER_LOW, elevationDp = 0f)
+        val envList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        fun envRow(text: String, color: Int): TextView = TextView(this@MainActivity).apply {
+            this.text = text
+            textSize = 12.5f
+            setTextColor(color)
+            setPadding(0, dp(3), 0, 0)
+        }
         // 内置 Node / Termux 状态
-        root.addView(TextView(this).apply {
-            text = if (hasNodeMarker()) "内置 Node：已就绪 ✓"
-                   else "内置 Node：未解压（点上方按钮首次自动解压 ⏳）"
-            textSize = 13f
-            setTextColor(if (hasNodeMarker()) Ui.SUCCESS else Ui.WARNING)
-            setPadding(0, dp(12), 0, 0)
-        })
-        root.addView(TextView(this).apply {
-            val ready = TermuxRuntime.isReady(this@MainActivity)
-            text = if (ready) "内置 Termux：已就绪 ✓（bash + coreutils + apt，可执行 Linux 指令）"
-                   else "内置 Termux：未解压（首次执行命令/打开终端自动准备）"
-            textSize = 13f
-            setTextColor(if (ready) Ui.SUCCESS else Ui.WARNING)
-            setPadding(0, dp(4), 0, 0)
-        })
-        root.addView(TextView(this).apply {
-            val granted = Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager()
-            text = if (granted) "共享存储：可完整访问 /sdcard ✓"
-                   else "共享存储：未授予“所有文件访问权限”（点上方按钮授权）⚠"
-            textSize = 13f
-            setTextColor(if (granted) Ui.SUCCESS else Ui.WARNING)
-            setPadding(0, dp(4), 0, 0)
-        })
+        envList.addView(envRow(
+            if (hasNodeMarker()) "内置 Node：已就绪 ✓" else "内置 Node：未解压（点上方按钮首次自动解压 ⏳）",
+            if (hasNodeMarker()) Ui.SUCCESS else Ui.WARNING
+        ))
+        envList.addView(envRow(
+            if (TermuxRuntime.isReady(this@MainActivity)) "内置 Termux：已就绪 ✓（bash + coreutils + apt，可执行 Linux 指令）"
+            else "内置 Termux：未解压（首次执行命令/打开终端自动准备）",
+            if (TermuxRuntime.isReady(this@MainActivity)) Ui.SUCCESS else Ui.WARNING
+        ))
+        envList.addView(envRow(
+            if (Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager()) "共享存储：可完整访问 /sdcard ✓"
+            else "共享存储：未授予“所有文件访问权限”（点上方按钮授权）⚠",
+            if (Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager()) Ui.SUCCESS else Ui.WARNING
+        ))
+        envCard.addView(envList)
+        root.addView(envCard, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(8) })
 
         root.addView(TextView(this).apply {
             text = "操作步骤：\n① 点“⚡ 一键安装并启动 DSH”自动完成：内置 Node 解压 → 官方 npm 安装/更新 dsh → dsh plugin 装配内置插件 → 启动 Web（首次需联网下载，之后增量更新）；\n② “打开 Web 界面”查看 dsh UI（http://127.0.0.1:3080）；\n③ “停止 dsh 服务”结束后台进程与保活服务。\n\n提示：\n· 全程免 Termux，内置 Node 为 aarch64 运行时；\n· 安装日志：/sdcard/Download/DshLauncher/install_log.txt。"
