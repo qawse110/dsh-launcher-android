@@ -400,8 +400,7 @@ class BridgeOverlayManager(
                 if (key == transientKey) return@let // 展开完整内容中且状态未变：保持不动
                 cancelTransient() // 状态变化：收起，恢复常规气泡
             }
-            if (showPetBubble()) {
-                val bubbleText = buildPetBubbleText(status, text, event, petName)
+            val bubbleText = buildPetBubbleText(status, text, event, petName)
             if (showPetBubble() && bubbleText.isNotBlank()) {
                 showBubbleWindow()
                 bubble.maxLines = 2
