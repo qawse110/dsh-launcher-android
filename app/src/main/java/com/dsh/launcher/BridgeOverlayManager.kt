@@ -52,10 +52,12 @@ class BridgeOverlayManager(
     private var overlayDot: View? = null
     private var overlayParams: WindowManager.LayoutParams? = null
 
-    // 垃圾桶：拖动悬浮窗时出现在屏幕底部，拖上去松手关闭悬浮窗（替代原 × 按钮）
+    // 垃圾桶：拖动悬浮窗时出现在屏幕底部，拖上去停留片刻（防误关）再松手关闭悬浮窗
     private var trashView: TextView? = null
     private var trashParams: WindowManager.LayoutParams? = null
     private var trashShown = false
+    private var trashHovering = false
+    private var trashHoverSince = 0L
 
     // 桌宠模式
     private var petView: PetOverlayView? = null
@@ -100,6 +102,7 @@ class BridgeOverlayManager(
     private var ttsReady = false
     private var ttsReleased = false
     private var lastSpokenKey: String? = null
+    private var lastSpokenBubble: String? = null // 最近朗读过的气泡全文（去重）
 
     private var currentStyle: String? = null
     private var lastStatus: String? = null
@@ -409,12 +412,15 @@ class BridgeOverlayManager(
             if (showPetBubble()) {
                 bubble.maxLines = 2
                 bubble.ellipsize = TextUtils.TruncateAt.END
-                bubble.maxWidth = (context.resources.displayMetrics.widthPixels * 0.6).toInt()
-                bubble.text = buildPetBubbleText(status, text, event, petName)
+                bubble.maxWidth = minOf((context.resources.displayMetrics.widthPixels * 0.45).toInt(), dp(230))
+                val bubbleText = buildPetBubbleText(status, text, event, petName)
+                bubble.text = bubbleText
                 bubble.visibility = View.VISIBLE
+                speakBubbleOnChange(bubbleText, status, event)
             } else {
                 bubble.visibility = View.GONE
             }
+            applyBubbleSide() // 贴边时气泡朝屏幕内侧对齐
             if (!greeted) {
                 greeted = true
                 if (showPetBubble()) showGreeting()
@@ -429,6 +435,34 @@ class BridgeOverlayManager(
         val label = if (showStatus()) statusLabel(status, event) else ""
         val snippet = if (showLastText() && text.isNotBlank()) text.take(40) else ""
         return listOf(namePart, label, snippet).filter { it.isNotBlank() }.joinToString(" · ")
+    }
+
+    /** 气泡内容变化时朗读全文（新输出/新状态）；与固定短台词互不重复，≥5s 节流防连读。 */
+    private fun speakBubbleOnChange(bubbleText: String, status: String, event: String?) {
+        if (!petTts() || bubbleText.isBlank()) return
+        if (bubbleText == lastSpokenBubble) return
+        lastSpokenBubble = bubbleText
+        if (SystemClock.uptimeMillis() - lastSpokeAt < 5000L) return
+        // 已有固定短台词的状态（完成/出错/新任务/调工具）不重复朗读全文
+        if (status == "finished" || status == "failed") return
+        if (status == "running" && (event == "tool/call" || event == "turn/start")) return
+        lastSpokeAt = SystemClock.uptimeMillis()
+        speak(bubbleText)
+    }
+
+    /** 气泡朝向：窗口偏左 → 气泡靠左；偏右 → 气泡靠右（朝屏幕内侧，贴边时不贴屏幕边）。 */
+    private fun applyBubbleSide() {
+        if (overlayStyle() != "pet") return
+        val view = overlayView ?: return
+        val p = overlayParams ?: return
+        val child = view.getChildAt(0) ?: return
+        val params = child.layoutParams as? LinearLayout.LayoutParams ?: return
+        val dm = context.resources.displayMetrics
+        val target = if (p.x + view.width / 2 >= dm.widthPixels / 2) Gravity.END else Gravity.START
+        if (params.gravity != target) {
+            params.gravity = target
+            view.requestLayout()
+        }
     }
 
     /** 点击桌宠本体（参考 codex-pet-live patpat）：
@@ -638,6 +672,7 @@ class BridgeOverlayManager(
         petView?.stop()
         lastSpokenKey = null
         lastSpokeAt = 0L
+        lastSpokenBubble = null
         pendingRow = -1
         pendingRowCount = 0
         try {
@@ -742,6 +777,8 @@ class BridgeOverlayManager(
 
     private fun hideTrash() {
         trashShown = false
+        trashHovering = false
+        trashHoverSince = 0L
         trashView?.let { v ->
             try { windowManager?.removeView(v) } catch (_: Exception) {}
         }
@@ -749,13 +786,29 @@ class BridgeOverlayManager(
         trashParams = null
     }
 
-    /** 拖动松手时宠物窗是否与垃圾桶相交。 */
-    private fun onTrashDrop(): Boolean {
-        val r = trashParams ?: return false
-        val p = overlayParams ?: return false
-        val v = overlayView ?: return false
-        return p.x < r.x + r.width && p.x + v.width > r.x &&
+    /** 拖动中检测桌宠窗与垃圾桶是否相交：进入悬停开始计时并高亮，离开恢复。 */
+    private fun updateTrashHover(p: WindowManager.LayoutParams, v: View) {
+        val r = trashParams ?: return
+        val hit = p.x < r.x + r.width && p.x + v.width > r.x &&
             p.y < r.y + r.height && p.y + v.height > r.y
+        if (hit && !trashHovering) {
+            trashHovering = true
+            trashHoverSince = SystemClock.uptimeMillis()
+            highlightTrash(true)
+        } else if (!hit && trashHovering) {
+            trashHovering = false
+            highlightTrash(false)
+        }
+    }
+
+    private fun highlightTrash(on: Boolean) {
+        val tv = trashView ?: return
+        tv.background = if (on) {
+            roundedDrawable(0xFFD9303E.toInt(), 29, 2, 0xFFFF8A8A.toInt())
+        } else {
+            roundedDrawable(0xB3101722.toInt(), 29, 2, 0x88FF6C6C.toInt())
+        }
+        tv.textSize = if (on) 40f else 30f
     }
 
     private fun openWeb() {
@@ -807,12 +860,15 @@ class BridgeOverlayManager(
                         moveSamples.removeFirst()
                     }
                     try { manager.updateViewLayout(view, p) } catch (e: Exception) {}
+                    updateTrashHover(p, view) // 悬停垃圾桶计时（防误关）
                 }
                 true
             }
             MotionEvent.ACTION_UP -> {
                 stopFall()
-                val dropped = onTrashDrop() // 先判断（hideTrash 会清空垃圾桶引用）
+                // 需在垃圾桶上悬停 ≥350ms 才算确认关闭（快速甩过/路过不触发）
+                val dropped = trashHovering &&
+                    SystemClock.uptimeMillis() - trashHoverSince >= 350L
                 hideTrash()
                 if (!dragMoved) {
                     if (SystemClock.uptimeMillis() - downAt >= 600L) {
@@ -954,7 +1010,7 @@ class BridgeOverlayManager(
         if (falling) handler.postDelayed(fallTicker, 16L)
     }
 
-    /** 落地后自动走回停靠位（家）：未设置过家时默认停在屏幕中上部侧边（避开底部键盘/导航区）。 */
+    /** 落地后自动走回停靠位（家）：未设置过家时默认停在屏幕中上部（约 30% 屏高处，避开底部键盘/导航区，又不会太靠上）。 */
     private fun walkHome(p: WindowManager.LayoutParams) {
         val view = overlayView ?: return
         val dm = context.resources.displayMetrics
@@ -962,7 +1018,7 @@ class BridgeOverlayManager(
         val homeY = prefs().getInt("pet_home_y", -1)
         val right = dm.widthPixels - view.width
         walkTargetX = if (homeX >= 0) homeX else if (p.x + view.width / 2 < dm.widthPixels / 2) 0 else right
-        walkTargetY = if (homeY >= 0) homeY else ((dm.heightPixels - view.height) * 0.22f).toInt()
+        walkTargetY = if (homeY >= 0) homeY else ((dm.heightPixels - view.height) * 0.30f).toInt()
         if (walkTargetX == p.x && walkTargetY == p.y) {
             savePosition(p)
             return
