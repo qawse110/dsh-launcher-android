@@ -1,7 +1,11 @@
 package com.dsh.launcher
 
 import android.accessibilityservice.AccessibilityService
+import android.app.KeyguardManager
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.os.Handler
 import android.os.Looper
 import android.view.WindowManager
@@ -37,7 +41,38 @@ class KeepAliveAccessibilityService : AccessibilityService() {
             false
         )
         overlayManager?.resetDismissed()
+        registerScreenReceiver()
         startPolling()
+    }
+
+    /** 锁屏/灭屏（含息屏指纹界面）不显示悬浮窗：灭屏隐藏，解锁后恢复显示。 */
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.action) {
+                Intent.ACTION_SCREEN_OFF -> {
+                    prefs().edit().putBoolean("screen_visible", false).apply()
+                    mainHandler.post { overlayManager?.remove() }
+                }
+                Intent.ACTION_SCREEN_ON -> {
+                    val km = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+                    if (!km.isKeyguardLocked) {
+                        prefs().edit().putBoolean("screen_visible", true).apply()
+                    }
+                }
+                Intent.ACTION_USER_PRESENT -> {
+                    prefs().edit().putBoolean("screen_visible", true).apply()
+                }
+            }
+        }
+    }
+
+    private fun registerScreenReceiver() {
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_USER_PRESENT)
+        }
+        runCatching { registerReceiver(screenReceiver, filter) }
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -53,6 +88,7 @@ class KeepAliveAccessibilityService : AccessibilityService() {
         overlayManager?.remove()
         overlayManager?.release()
         overlayManager = null
+        runCatching { unregisterReceiver(screenReceiver) }
         prefs().edit().putBoolean("a11y_overlay_active", false).apply()
         return super.onUnbind(intent)
     }
@@ -62,6 +98,7 @@ class KeepAliveAccessibilityService : AccessibilityService() {
         overlayManager?.remove()
         overlayManager?.release()
         overlayManager = null
+        runCatching { unregisterReceiver(screenReceiver) }
         prefs().edit().putBoolean("a11y_overlay_active", false).apply()
         super.onDestroy()
     }

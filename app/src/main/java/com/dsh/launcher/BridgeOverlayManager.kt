@@ -196,6 +196,11 @@ class BridgeOverlayManager(
             remove()
             return
         }
+        // 锁屏/灭屏（含息屏指纹界面）不显示悬浮窗，避免遮挡系统锁屏界面
+        if (!prefs().getBoolean("screen_visible", true)) {
+            remove()
+            return
+        }
         if (hideWhenIdle() && status == "idle") {
             remove()
             return
