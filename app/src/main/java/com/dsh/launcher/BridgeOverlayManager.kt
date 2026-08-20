@@ -117,10 +117,6 @@ class BridgeOverlayManager(
         override fun run() = stepFall()
     }
 
-    // LLM 气泡（参考 codex-pet-live llm_client）：单飞请求 + 20s 冷却
-    private var llmInFlight = false
-    private var lastLlmAt = 0L
-
     private fun prefs() = context.getSharedPreferences("status_bridge", Context.MODE_PRIVATE)
     private fun overlayEnabled() = prefs().getBoolean("overlay_enabled", true)
     private fun showStatus() = prefs().getBoolean("show_status", true)
@@ -467,8 +463,6 @@ class BridgeOverlayManager(
             postTransient(reply, 2, 0.6f, 12_000L)
             speak(reply)
         }
-        // LLM 气泡开启时，点击由 AI 生成一句台词（抵达后替换展开气泡）
-        if (llmAvailable()) fireLlm("用户戳了你一下", randomPetPhrase(), pending = false)
     }
 
     /** 统一气泡临时内容：设置文本与样式，durationMs 后或状态变化时自动收起恢复常规气泡。 */
@@ -502,12 +496,11 @@ class BridgeOverlayManager(
     private fun randomPetPhrase(): String =
         if (petReplies.isNotEmpty()) petReplies[Random.nextInt(petReplies.size)] else "主人，我在呢～"
 
-    /** 登场问候一次（参考 codex-pet-live 的 greeting 气泡；LLM 开启时由 AI 打招呼）。 */
+    /** 登场问候一次（参考 codex-pet-live 的 greeting 气泡）。 */
     private fun showGreeting() {
         val name = petName.takeIf { it.isNotBlank() }
         val phrase = if (name != null) "你好呀，我是 $name！" else "你好呀～"
-        if (llmAvailable()) fireLlm("初次见面，打个招呼", phrase, pending = true, speakOut = false)
-        else postTransient(phrase, 2, 0.6f, 4000L)
+        postTransient(phrase, 2, 0.6f, 4000L)
     }
 
     /** 闲时主动冒泡（参考 codex-pet-live 的 ambient/scheduled 气泡）：dsh 空闲时
@@ -529,12 +522,8 @@ class BridgeOverlayManager(
         if (transientText != null) return
         if (petBubble == null) return
         val phrase = randomPetPhrase()
-        // LLM 开启时由 AI 生成闲时台词（先显示「思考中…」），否则本地台词
-        if (llmAvailable()) fireLlm("主人现在空闲，随便说句什么", phrase, pending = true)
-        else {
-            postTransient(phrase, 2, 0.6f, 5000L)
-            speak(phrase)
-        }
+        postTransient(phrase, 2, 0.6f, 5000L)
+        speak(phrase)
     }
 
     // ---------------- 桌宠 TTS 发声 ----------------
@@ -597,7 +586,6 @@ class BridgeOverlayManager(
     private fun resetViews() {
         cancelTransient()
         stopFall()
-        llmInFlight = false
         ambientRunnable?.let { handler.removeCallbacks(it) }
         ambientRunnable = null
         greeted = false
@@ -821,38 +809,6 @@ class BridgeOverlayManager(
         p.y = ny.toInt()
         try { manager.updateViewLayout(view, p) } catch (e: Exception) {}
         if (falling) handler.postDelayed(fallTicker, 16L)
-    }
-
-    // ---------------- LLM 气泡（参考 codex-pet-live llm_client） ----------------
-
-    /** LLM 可用：开关+配置齐全，且非请求中、距上次请求 ≥20s。 */
-    private fun llmAvailable(): Boolean {
-        val cfg = PetLlm.config(prefs())
-        if (!cfg.usable()) return false
-        if (llmInFlight) return false
-        if (SystemClock.uptimeMillis() - lastLlmAt < 20_000L) return false
-        return true
-    }
-
-    /** 发一次 LLM 气泡请求；pending 时先显示「思考中…」。失败/不可用回退本地台词。 */
-    private fun fireLlm(event: String, fallback: String, pending: Boolean, speakOut: Boolean = true) {
-        val cfg = PetLlm.config(prefs())
-        if (!cfg.usable()) {
-            postTransient(fallback, 2, 0.6f, 5000L)
-            if (speakOut) speak(fallback)
-            return
-        }
-        if (llmInFlight) return
-        if (SystemClock.uptimeMillis() - lastLlmAt < 20_000L) return
-        llmInFlight = true
-        lastLlmAt = SystemClock.uptimeMillis()
-        if (pending) postTransient("思考中…", 2, 0.6f, 6000L)
-        PetLlm.bubbleReply(cfg, event, petName) { reply ->
-            llmInFlight = false
-            val text = reply.ifBlank { fallback }
-            postTransient(text, 2, 0.6f, 5000L)
-            if (speakOut) speak(text)
-        }
     }
 
     /** 触点是否落在桌宠本体上（相对悬浮窗根视图坐标）。 */

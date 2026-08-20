@@ -78,11 +78,6 @@ adb shell am start -n com.dsh.launcher/.MainActivity   # 或直接点应用图�
 - **问候与闲时冒泡**：桌宠登场时问候一次；dsh 空闲时每隔 2.5~5 分钟随机说一句台词
   （设置页「闲时主动冒泡」可关，说时会朗读）——参考 [codex-pet-live](https://github.com/VectorPeak/codex-pet-live)
   的 patpat / ambient 气泡模型。
-- **LLM 气泡（可选）**：设置页「LLM 气泡」开启后，配置任意 **OpenAI 兼容**
-  `/chat/completions` 服务（DeepSeek、Ollama、OpenAI 等）即可让桌宠"会说话"——
-  点击桌宠、闲时冒泡、登场问候时由 **AI 生成台词**（请求期间显示「思考中…」，
-  失败自动回退本地台词，说时朗读）；请求带 ≥20 秒冷却防刷屏，密钥仅保存在本机，
-  不联网上报——移植自 codex-pet-live 的 llm_client。
 - **外观**：设置页可调桌宠大小（小/中/大）、气泡开关与**桌宠名称开关**（气泡中是否显示
   名字）；精灵表按单元格像素全分辨率解码（兼容 v1/v2 规格，内置默认包及常见社区包均
   清晰显示）。
