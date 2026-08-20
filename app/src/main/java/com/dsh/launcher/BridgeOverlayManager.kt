@@ -908,7 +908,7 @@ class BridgeOverlayManager(
             else -> nx = walkTargetX.toFloat()
         }
         val ny = if (Math.abs(dy) <= 2) walkTargetY.toFloat()
-        else (p.y + Math.signum(dy) * Math.max(2f, Math.abs(dy) * 0.08f)).toFloat()
+        else (p.y + Math.signum(dy.toFloat()) * Math.max(2f, Math.abs(dy) * 0.08f)).toFloat()
         p.x = nx.toInt()
         p.y = ny.toInt()
         try { manager.updateViewLayout(view, p) } catch (e: Exception) {}
