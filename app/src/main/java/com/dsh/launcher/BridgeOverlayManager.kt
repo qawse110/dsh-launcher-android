@@ -61,7 +61,6 @@ class BridgeOverlayManager(
 
     // 桌宠模式
     private var petView: PetOverlayView? = null
-    private var petBubble: TextView? = null
     private var petAtlas: CodexPetAtlas? = null
     private var petLoadedId: String? = null
     private var petName: String = ""
@@ -70,6 +69,11 @@ class BridgeOverlayManager(
     private var petAtlasForHeightDp = 132
     private var defaultAtlas: CodexPetAtlas? = null
     private var defaultAtlasForHeightDp = 132
+
+    // 气泡独立悬浮窗（可点击，跟随宠物窗，贴边翻转朝向；其余区域触摸自然透传）
+    private var petBubble: TextView? = null
+    private var petBubbleAdded = false
+    private var petBubbleParams: WindowManager.LayoutParams? = null
 
     private val handler = Handler(Looper.getMainLooper())
     private var downOnPet = false
@@ -343,29 +347,16 @@ class BridgeOverlayManager(
             maxWidth = minOf((context.resources.displayMetrics.widthPixels * 0.45).toInt(), dp(230))
             setPadding(dp(10), dp(5), dp(10), dp(5))
             background = roundedDrawable(0xE0101722.toInt(), 12, 1, 0x336C8CFF.toInt())
-            // 有临时气泡（点击台词/展开内容）时点击立即收起；无则打开 dsh Web
+            // 气泡独立成窗（可点）：有临时气泡（点击台词/展开内容）时点击立即收起；无则打开 dsh Web
             setOnClickListener {
                 if (transientText != null) cancelTransient() else openWeb()
             }
         }
-        val bubbleRow = LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            addView(petBubble, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ))
-        }
         overlayView = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
-            // 靠左排布：气泡宽度变化时桌宠本体不移动
-            gravity = Gravity.START
             contentDescription = "dsh 桌宠：单击互动，双击展开内容，拖动可扔进底部垃圾桶关闭，长按切回状态条"
             if (Build.VERSION.SDK_INT >= 21) elevation = dp(6).toFloat()
-            addView(bubbleRow, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(4) })
+            // 宠物窗只包精灵本体；气泡在独立窗口，空白区域触摸自然透传给下层应用
             addView(pet, LinearLayout.LayoutParams(petW, petH))
             setOnTouchListener(overlayTouchListener)
         }
@@ -410,6 +401,7 @@ class BridgeOverlayManager(
                 cancelTransient() // 状态变化：收起，恢复常规气泡
             }
             if (showPetBubble()) {
+                showBubbleWindow()
                 bubble.maxLines = 2
                 bubble.ellipsize = TextUtils.TruncateAt.END
                 bubble.maxWidth = minOf((context.resources.displayMetrics.widthPixels * 0.45).toInt(), dp(230))
@@ -418,9 +410,11 @@ class BridgeOverlayManager(
                 bubble.visibility = View.VISIBLE
                 speakBubbleOnChange(bubbleText, status, event)
             } else {
+                // 气泡窗口整体移除：该区域触摸也透传给下层应用
                 bubble.visibility = View.GONE
+                hideBubbleWindow()
             }
-            applyBubbleSide() // 贴边时气泡朝屏幕内侧对齐
+            syncBubbleWindow() // 气泡窗独立定位：跟随宠物窗，朝屏幕内侧
             if (!greeted) {
                 greeted = true
                 if (showPetBubble()) showGreeting()
@@ -450,18 +444,65 @@ class BridgeOverlayManager(
         speak(bubbleText)
     }
 
-    /** 气泡朝向：窗口偏左 → 气泡靠左；偏右 → 气泡靠右（朝屏幕内侧，贴边时不贴屏幕边）。 */
-    private fun applyBubbleSide() {
-        if (overlayStyle() != "pet") return
-        val view = overlayView ?: return
+    /** 气泡独立悬浮窗：显示在宠物窗上方/下方（视空间而定），可点击，贴边时朝屏幕内侧对齐。 */
+    private fun showBubbleWindow() {
+        if (petBubbleAdded) return
+        val b = petBubble ?: return
+        val wm = windowManager ?: return
+        petBubbleParams = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            windowType,
+            overlayFlags(),
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = 0
+            y = 0
+        }
+        try {
+            b.visibility = View.VISIBLE
+            wm.addView(b, petBubbleParams)
+            petBubbleAdded = true
+            b.post { syncBubbleWindow() } // 等首次测量完成后再定位
+        } catch (_: Exception) {
+            petBubbleAdded = false
+            petBubbleParams = null
+        }
+    }
+
+    private fun hideBubbleWindow() {
+        if (!petBubbleAdded) return
+        petBubbleAdded = false
+        petBubble?.let { b ->
+            try { windowManager?.removeView(b) } catch (_: Exception) {}
+        }
+        petBubbleParams = null
+    }
+
+    /** 同步气泡窗位置：默认在上方（留 4dp 间距），顶部放不下则翻到宠物下方；水平朝屏幕内侧对齐并夹紧在屏内。 */
+    private fun syncBubbleWindow() {
+        if (!petBubbleAdded) return
+        val b = petBubble ?: return
         val p = overlayParams ?: return
-        val child = view.getChildAt(0) ?: return
-        val params = child.layoutParams as? LinearLayout.LayoutParams ?: return
+        val v = overlayView ?: return
+        val pp = petBubbleParams ?: return
         val dm = context.resources.displayMetrics
-        val target = if (p.x + view.width / 2 >= dm.widthPixels / 2) Gravity.END else Gravity.START
-        if (params.gravity != target) {
-            params.gravity = target
-            view.requestLayout()
+        val petW = v.width
+        val petH = v.height
+        if (petW == 0 || petH == 0) return
+        val bw = b.width
+        val bh = b.height
+        if (bw == 0 || bh == 0) return
+        val towardRight = p.x + petW / 2 >= dm.widthPixels / 2
+        val x = if (towardRight) p.x + petW - bw else p.x
+        val y = if (p.y - bh - dp(4) >= 0) p.y - bh - dp(4) else p.y + petH + dp(4)
+        val nx = x.coerceIn(0, (dm.widthPixels - bw).coerceAtLeast(0))
+        val ny = y.coerceIn(0, (dm.heightPixels - bh).coerceAtLeast(0))
+        if (pp.x != nx || pp.y != ny) {
+            pp.x = nx
+            pp.y = ny
+            try { windowManager?.updateViewLayout(b, pp) } catch (_: Exception) {}
         }
     }
 
@@ -516,6 +557,7 @@ class BridgeOverlayManager(
     /** 统一气泡临时内容：设置文本与样式，durationMs 后或状态变化时自动收起恢复常规气泡。 */
     private fun postTransient(text: String, maxLines: Int, maxWidth: Float, durationMs: Long) {
         val bubble = petBubble ?: return
+        showBubbleWindow() // 即使「显示气泡」关闭，互动台词也以独立气泡窗展示
         cancelTransient()
         bubble.maxLines = maxLines
         bubble.ellipsize = if (maxLines > 2) null else TextUtils.TruncateAt.END
@@ -532,6 +574,7 @@ class BridgeOverlayManager(
         }
         transientRunnable = r
         handler.postDelayed(r, durationMs)
+        syncBubbleWindow()
     }
 
     private fun cancelTransient() {
@@ -684,6 +727,7 @@ class BridgeOverlayManager(
         overlayText = null
         overlayDot = null
         hideTrash()
+        hideBubbleWindow()
         overlayParams = null
         petView = null
         petBubble = null
@@ -861,6 +905,7 @@ class BridgeOverlayManager(
                     }
                     try { manager.updateViewLayout(view, p) } catch (e: Exception) {}
                     updateTrashHover(p, view) // 悬停垃圾桶计时（防误关）
+                    syncBubbleWindow()
                 }
                 true
             }
@@ -1007,6 +1052,7 @@ class BridgeOverlayManager(
         p.x = nx.toInt()
         p.y = ny.toInt()
         try { manager.updateViewLayout(view, p) } catch (e: Exception) {}
+        syncBubbleWindow()
         if (falling) handler.postDelayed(fallTicker, 16L)
     }
 
@@ -1053,6 +1099,7 @@ class BridgeOverlayManager(
         p.x = nx.toInt()
         p.y = ny.toInt()
         try { manager.updateViewLayout(view, p) } catch (e: Exception) {}
+        syncBubbleWindow()
         if (Math.abs(walkTargetX - p.x) <= 4 && Math.abs(walkTargetY - p.y) <= 2) {
             walking = false
             handler.removeCallbacks(walkTicker)
