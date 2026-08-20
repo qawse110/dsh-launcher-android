@@ -65,10 +65,10 @@ class BridgeOverlayManager(
     private var petLoadedId: String? = null
     private var petName: String = ""
     private var petReplies: List<String> = emptyList()
-    private var petBuiltHeightDp = 132
-    private var petAtlasForHeightDp = 132
+    private var petBuiltHeightDp = 120
+    private var petAtlasForHeightDp = 120
     private var defaultAtlas: CodexPetAtlas? = null
-    private var defaultAtlasForHeightDp = 132
+    private var defaultAtlasForHeightDp = 120
 
     // 气泡独立悬浮窗（可点击，跟随宠物窗，贴边翻转朝向；其余区域触摸自然透传）
     private var petBubble: TextView? = null
@@ -154,9 +154,9 @@ class BridgeOverlayManager(
     private fun showPetName() = prefs().getBoolean("pet_show_name", true)
     private fun showAmbientBubble() = prefs().getBoolean("pet_ambient_bubble", true)
     private fun petHeightDp(): Int = when (prefs().getString("pet_size", "medium")) {
-        "small" -> 96
-        "large" -> 176
-        else -> 132
+        "small" -> 88
+        "large" -> 160
+        else -> 120
     }
     private fun displayMode(): String {
         return if (prefs().getBoolean("display_mode_auto", true)) {
