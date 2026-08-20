@@ -1056,7 +1056,7 @@ class BridgeOverlayManager(
         if (falling) handler.postDelayed(fallTicker, 16L)
     }
 
-    /** 落地后自动走回停靠位（家）：未设置过家时默认停在屏幕中上部（约 30% 屏高处，避开底部键盘/导航区，又不会太靠上）。 */
+    /** 落地后自动走回停靠位（家）：未设置过家时默认停在屏幕最底部（贴地），左右取较近侧边。 */
     private fun walkHome(p: WindowManager.LayoutParams) {
         val view = overlayView ?: return
         val dm = context.resources.displayMetrics
@@ -1064,7 +1064,7 @@ class BridgeOverlayManager(
         val homeY = prefs().getInt("pet_home_y", -1)
         val right = dm.widthPixels - view.width
         walkTargetX = if (homeX >= 0) homeX else if (p.x + view.width / 2 < dm.widthPixels / 2) 0 else right
-        walkTargetY = if (homeY >= 0) homeY else ((dm.heightPixels - view.height) * 0.30f).toInt()
+        walkTargetY = if (homeY >= 0) homeY else (dm.heightPixels - view.height).coerceAtLeast(0)
         if (walkTargetX == p.x && walkTargetY == p.y) {
             savePosition(p)
             return
