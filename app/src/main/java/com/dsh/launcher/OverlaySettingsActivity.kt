@@ -10,11 +10,13 @@ import android.os.PowerManager
 import android.provider.Settings
 import android.view.Gravity
 import android.view.ViewGroup
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.widget.doAfterTextChanged
 import androidx.documentfile.provider.DocumentFile
 import com.google.android.material.card.MaterialCardView
 import com.google.android.material.color.DynamicColors
@@ -159,6 +161,7 @@ class OverlaySettingsActivity : AppCompatActivity() {
                 addSwitch(this, "桌宠发声（TTS）", "任务完成/出错/新任务/调用工具时语音播报，互动台词也会朗读（需系统 TTS 引擎）", "pet_tts", true)
                 addSwitch(this, "显示桌宠名称", "气泡中显示桌宠名字（与状态、最近输出一起）", "pet_show_name", true)
                 addSwitch(this, "闲时主动冒泡", "dsh 空闲时桌宠每隔几分钟随机说一句台词（可关闭），说时会朗读", "pet_ambient_bubble", true)
+                addSwitch(this, "拖拽抛落", "松手后桌宠沿抛出方向做抛物线坠落，落地带小弹跳（可关闭改为普通拖动定位）", "pet_fall", true)
 
                 val pets = CodexPetStore.scanPets(this@OverlaySettingsActivity)
                 val selected = prefs().getString("pet_id", CodexPetStore.DEFAULT_PET_ID)
@@ -207,6 +210,15 @@ class OverlaySettingsActivity : AppCompatActivity() {
                     setPadding(0, dp(4), 0, 0)
                 })
             }
+        }
+
+        // LLM 气泡（OpenAI 兼容 chat/completions，参考 codex-pet-live）
+        root.addView(section("LLM 气泡"))
+        card {
+            addSwitch(this, "LLM 气泡", "点击/闲时/问候时由 AI 生成台词（需下方配置；未配置或请求失败自动回退本地台词）", "pet_llm", false)
+            addTextField(this, "接口地址", "https://api.deepseek.com/v1 或 http://电脑局域网IP:11434/v1", "pet_llm_base_url")
+            addTextField(this, "API Key", "DeepSeek/OpenAI 密钥；Ollama 本地服务可留空", "pet_llm_api_key")
+            addTextField(this, "模型", "如 deepseek-chat、qwen2.5:3b、llama3.1", "pet_llm_model")
         }
 
         // 显示内容
@@ -459,6 +471,39 @@ class OverlaySettingsActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.WRAP_CONTENT
         ))
         return sw
+    }
+
+    private fun addTextField(
+        container: LinearLayout,
+        title: String,
+        hint: String,
+        key: String
+    ) {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(6), 0, dp(6))
+        }
+        row.addView(TextView(this).apply {
+            text = title
+            textSize = 13f
+            setTextColor(Ui.TEXT_PRIMARY)
+        })
+        val et = EditText(this).apply {
+            setText(prefs().getString(key, "") ?: "")
+            this.hint = hint
+            textSize = 13f
+            isSingleLine = true
+            setPadding(dp(8), 0, dp(8), 0)
+            doAfterTextChanged { prefs().edit().putString(key, it?.toString() ?: "").apply() }
+        }
+        row.addView(et, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(4) })
+        container.addView(row, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ))
     }
 
     private fun refreshPermissionHint() {

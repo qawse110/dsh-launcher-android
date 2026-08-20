@@ -89,6 +89,7 @@ class BridgeOverlayManager(
     // TTS 发声（桌宠模式）
     private var tts: TextToSpeech? = null
     private var ttsReady = false
+    private var ttsReleased = false
     private var lastSpokenKey: String? = null
 
     private var currentStyle: String? = null
@@ -103,6 +104,22 @@ class BridgeOverlayManager(
     private var dragMoved = false
     private var downAt = 0L
     private val dragSlop = dp(4)
+
+    // 拖拽抛落物理（参考 codex-pet-live 的 drop/gravity）：松手后抛物线坠落、
+    // 撞墙反弹、落地小弹跳后静止并保存位置
+    private val FALL_GRAVITY = 2400f // px/s²
+    private var falling = false
+    private var fallVx = 0f
+    private var fallVy = 0f
+    private var fallBounces = 0
+    private val moveSamples = ArrayDeque<FloatArray>() // [x, y, uptimeMillis]
+    private val fallTicker = object : Runnable {
+        override fun run() = stepFall()
+    }
+
+    // LLM 气泡（参考 codex-pet-live llm_client）：单飞请求 + 20s 冷却
+    private var llmInFlight = false
+    private var lastLlmAt = 0L
 
     private fun prefs() = context.getSharedPreferences("status_bridge", Context.MODE_PRIVATE)
     private fun overlayEnabled() = prefs().getBoolean("overlay_enabled", true)
@@ -450,6 +467,8 @@ class BridgeOverlayManager(
             postTransient(reply, 2, 0.6f, 12_000L)
             speak(reply)
         }
+        // LLM 气泡开启时，点击由 AI 生成一句台词（抵达后替换展开气泡）
+        if (llmAvailable()) fireLlm("用户戳了你一下", randomPetPhrase(), pending = false)
     }
 
     /** 统一气泡临时内容：设置文本与样式，durationMs 后或状态变化时自动收起恢复常规气泡。 */
@@ -483,11 +502,12 @@ class BridgeOverlayManager(
     private fun randomPetPhrase(): String =
         if (petReplies.isNotEmpty()) petReplies[Random.nextInt(petReplies.size)] else "主人，我在呢～"
 
-    /** 登场问候一次（参考 codex-pet-live 的 greeting 气泡）。 */
+    /** 登场问候一次（参考 codex-pet-live 的 greeting 气泡；LLM 开启时由 AI 打招呼）。 */
     private fun showGreeting() {
         val name = petName.takeIf { it.isNotBlank() }
         val phrase = if (name != null) "你好呀，我是 $name！" else "你好呀～"
-        postTransient(phrase, 2, 0.6f, 4000L)
+        if (llmAvailable()) fireLlm("初次见面，打个招呼", phrase, pending = true, speakOut = false)
+        else postTransient(phrase, 2, 0.6f, 4000L)
     }
 
     /** 闲时主动冒泡（参考 codex-pet-live 的 ambient/scheduled 气泡）：dsh 空闲时
@@ -509,8 +529,12 @@ class BridgeOverlayManager(
         if (transientText != null) return
         if (petBubble == null) return
         val phrase = randomPetPhrase()
-        postTransient(phrase, 2, 0.6f, 5000L)
-        speak(phrase)
+        // LLM 开启时由 AI 生成闲时台词（先显示「思考中…」），否则本地台词
+        if (llmAvailable()) fireLlm("主人现在空闲，随便说句什么", phrase, pending = true)
+        else {
+            postTransient(phrase, 2, 0.6f, 5000L)
+            speak(phrase)
+        }
     }
 
     // ---------------- 桌宠 TTS 发声 ----------------
@@ -536,7 +560,7 @@ class BridgeOverlayManager(
 
     /** 朗读文本（懒初始化 TTS；无中文引擎自动回退系统默认语言；失败静默）。 */
     private fun speak(text: String) {
-        if (!petTts() || text.isBlank()) return
+        if (ttsReleased || !petTts() || text.isBlank()) return
         if (tts == null) {
             tts = TextToSpeech(context) { status ->
                 ttsReady = status == TextToSpeech.SUCCESS
@@ -554,8 +578,9 @@ class BridgeOverlayManager(
         }
     }
 
-    /** 释放 TTS 资源（服务销毁时调用）。 */
+    /** 释放 TTS 资源（服务销毁时调用；释放后不再重建）。 */
     fun release() {
+        ttsReleased = true
         tts?.shutdown()
         tts = null
         ttsReady = false
@@ -571,6 +596,8 @@ class BridgeOverlayManager(
     /** 彻底拆除当前悬浮窗（含窗口移除、动画停止、临时气泡取消），引用全部置空。 */
     private fun resetViews() {
         cancelTransient()
+        stopFall()
+        llmInFlight = false
         ambientRunnable?.let { handler.removeCallbacks(it) }
         ambientRunnable = null
         greeted = false
@@ -661,6 +688,8 @@ class BridgeOverlayManager(
         val view = overlayView ?: return@OnTouchListener false
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
+                stopFall()
+                moveSamples.clear()
                 downOnPet = isTapOnPet(event.x, event.y)
                 dragStartX = p.x
                 dragStartY = p.y
@@ -679,11 +708,21 @@ class BridgeOverlayManager(
                 if (dragMoved) {
                     p.x = dragStartX + dx.toInt()
                     p.y = dragStartY + dy.toInt()
+                    moveSamples.addLast(
+                        floatArrayOf(p.x.toFloat(), p.y.toFloat(), SystemClock.uptimeMillis().toFloat())
+                    )
+                    val nowMs = SystemClock.uptimeMillis()
+                    while (moveSamples.size > 10 || (moveSamples.isNotEmpty() &&
+                            nowMs - moveSamples.first()[2] > 250L)
+                    ) {
+                        moveSamples.removeFirst()
+                    }
                     try { manager.updateViewLayout(view, p) } catch (e: Exception) {}
                 }
                 true
             }
             MotionEvent.ACTION_UP -> {
+                stopFall()
                 if (!dragMoved) {
                     if (SystemClock.uptimeMillis() - downAt >= 600L) {
                         toggleStyle()
@@ -694,6 +733,7 @@ class BridgeOverlayManager(
                     }
                 } else {
                     savePosition(p)
+                    if (overlayStyle() == "pet" && petFall()) startFallFromDrag(p)
                 }
                 true
             }
@@ -708,6 +748,111 @@ class BridgeOverlayManager(
             .putInt(if (isPet) "pet_x" else "overlay_x", p.x)
             .putInt(if (isPet) "pet_y" else "overlay_y", p.y)
             .apply()
+    }
+
+    // ---------------- 拖拽抛落物理（参考 codex-pet-live） ----------------
+
+    private fun petFall(): Boolean = prefs().getBoolean("pet_fall", true)
+
+    private fun stopFall() {
+        falling = false
+        handler.removeCallbacks(fallTicker)
+    }
+
+    /** 松手瞬间根据最近拖动采样估算抛出速度，开始抛物线坠落。 */
+    private fun startFallFromDrag(p: WindowManager.LayoutParams) {
+        var vx = 0f
+        var vy = 0f
+        if (moveSamples.size >= 2) {
+            val a = moveSamples.first()
+            val b = moveSamples.last()
+            val dt = (b[2] - a[2]) / 1000f
+            if (dt > 0.03f && dt < 0.35f) {
+                vx = (b[0] - a[0]) / dt
+                vy = (b[1] - a[1]) / dt
+            }
+        }
+        falling = true
+        fallVx = vx.coerceIn(-3200f, 3200f)
+        fallVy = vy.coerceIn(-3200f, 3200f)
+        fallBounces = 0
+        handler.removeCallbacks(fallTicker)
+        handler.postDelayed(fallTicker, 16L)
+    }
+
+    /** 一帧物理：重力下落、空气阻力、撞左右墙反弹、落地小弹跳（最多 2 次）后静止。 */
+    private fun stepFall() {
+        if (!falling) return
+        val p = overlayParams ?: return
+        val manager = windowManager ?: return
+        val view = overlayView ?: return
+        val dm = context.resources.displayMetrics
+        val dt = 0.016f
+        fallVy += FALL_GRAVITY * dt
+        fallVx *= 0.998f
+        var nx = p.x + fallVx * dt
+        var ny = p.y + fallVy * dt
+        val right = (dm.widthPixels - view.width).toFloat()
+        if (nx < 0f) {
+            nx = 0f
+            fallVx = -fallVx * 0.55f
+        }
+        if (nx > right) {
+            nx = right
+            fallVx = -fallVx * 0.55f
+        }
+        val floor = (dm.heightPixels - view.height).toFloat()
+        if (ny >= floor) {
+            ny = floor
+            if (fallVy > 260f && fallBounces < 2) {
+                fallVy = -fallVy * 0.38f
+                fallVx *= 0.7f
+                fallBounces++
+                petView?.play(PetOverlayView.ROW_JUMPING)
+            } else {
+                falling = false
+                handler.removeCallbacks(fallTicker)
+                petView?.play(PetOverlayView.ROW_IDLE)
+                savePosition(p)
+                return
+            }
+        }
+        p.x = nx.toInt()
+        p.y = ny.toInt()
+        try { manager.updateViewLayout(view, p) } catch (e: Exception) {}
+        if (falling) handler.postDelayed(fallTicker, 16L)
+    }
+
+    // ---------------- LLM 气泡（参考 codex-pet-live llm_client） ----------------
+
+    /** LLM 可用：开关+配置齐全，且非请求中、距上次请求 ≥20s。 */
+    private fun llmAvailable(): Boolean {
+        val cfg = PetLlm.config(prefs())
+        if (!cfg.usable()) return false
+        if (llmInFlight) return false
+        if (SystemClock.uptimeMillis() - lastLlmAt < 20_000L) return false
+        return true
+    }
+
+    /** 发一次 LLM 气泡请求；pending 时先显示「思考中…」。失败/不可用回退本地台词。 */
+    private fun fireLlm(event: String, fallback: String, pending: Boolean, speakOut: Boolean = true) {
+        val cfg = PetLlm.config(prefs())
+        if (!cfg.usable()) {
+            postTransient(fallback, 2, 0.6f, 5000L)
+            if (speakOut) speak(fallback)
+            return
+        }
+        if (llmInFlight) return
+        if (SystemClock.uptimeMillis() - lastLlmAt < 20_000L) return
+        llmInFlight = true
+        lastLlmAt = SystemClock.uptimeMillis()
+        if (pending) postTransient("思考中…", 2, 0.6f, 6000L)
+        PetLlm.bubbleReply(cfg, event, petName) { reply ->
+            llmInFlight = false
+            val text = reply.ifBlank { fallback }
+            postTransient(text, 2, 0.6f, 5000L)
+            if (speakOut) speak(text)
+        }
     }
 
     /** 触点是否落在桌宠本体上（相对悬浮窗根视图坐标）。 */
