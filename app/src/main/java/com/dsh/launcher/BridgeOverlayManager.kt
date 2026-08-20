@@ -401,16 +401,17 @@ class BridgeOverlayManager(
                 cancelTransient() // 状态变化：收起，恢复常规气泡
             }
             if (showPetBubble()) {
+                val bubbleText = buildPetBubbleText(status, text, event, petName)
+            if (showPetBubble() && bubbleText.isNotBlank()) {
                 showBubbleWindow()
                 bubble.maxLines = 2
                 bubble.ellipsize = TextUtils.TruncateAt.END
                 bubble.maxWidth = minOf((context.resources.displayMetrics.widthPixels * 0.45).toInt(), dp(230))
-                val bubbleText = buildPetBubbleText(status, text, event, petName)
                 bubble.text = bubbleText
                 bubble.visibility = View.VISIBLE
                 speakBubbleOnChange(bubbleText, status, event)
             } else {
-                // 气泡窗口整体移除：该区域触摸也透传给下层应用
+                // 无内容（或关闭气泡）时不显示空框：气泡窗口整体移除，触摸透传
                 bubble.visibility = View.GONE
                 hideBubbleWindow()
             }
