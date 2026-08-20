@@ -1100,7 +1100,8 @@ class BridgeOverlayManager(
         handler.postDelayed(walkTicker, 16L)
     }
 
-    /** 靠边行走一帧：水平固定步速走向目标边，纵向缓慢抬升，到位后停住保存位置。 */
+    /** 靠边行走一帧：水平固定步速走向目标边；纵向限速爬升（每帧 ≤6px，距离远不会瞬间
+     *  飞过去），到位后停住保存位置。 */
     private fun stepWalk() {
         if (!walking) return
         val p = overlayParams ?: return
@@ -1121,7 +1122,7 @@ class BridgeOverlayManager(
             else -> nx = walkTargetX.toFloat()
         }
         val ny = if (Math.abs(dy) <= 2) walkTargetY.toFloat()
-        else (p.y + Math.signum(dy.toFloat()) * Math.max(2f, Math.abs(dy) * 0.08f)).toFloat()
+        else (p.y + Math.signum(dy.toFloat()) * Math.max(2f, Math.min(Math.abs(dy) * 0.08f, 6f))).toFloat()
         p.x = nx.toInt()
         p.y = ny.toInt()
         try { manager.updateViewLayout(view, p) } catch (e: Exception) {}
