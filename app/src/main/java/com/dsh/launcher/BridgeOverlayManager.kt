@@ -99,6 +99,8 @@ class BridgeOverlayManager(
     // 避免 tool/call ↔ assistant/message 状态抖动导致桌宠频繁换动作
     private var pendingRow = -1
     private var pendingRowCount = 0
+    /** 互动动作（点击挥手/连点跳跃/待机挥手）开始时间：保护窗内轮询不抢占动作，避免"点击招手后突然跳起/落地"。 */
+    private var lastInteractAt = 0L
     private var lastSpokeAt = 0L
 
     // TTS 发声（桌宠模式）
@@ -119,7 +121,8 @@ class BridgeOverlayManager(
     private var dragStartTouchY = 0f
     private var dragMoved = false
     private var downAt = 0L
-    private val dragSlop = dp(4)
+    // 略大的拖动阈值：点击时手指微抖（几像素）不误判为拖动，避免误触"轻放/抛出落地"
+    private val dragSlop = dp(12)
 
     // 拖拽抛落物理（参考 codex-pet-live 的 drop/gravity）：松手后抛物线坠落、
     // 撞墙反弹、落地小弹跳后自动走回屏幕侧边待机（抬升避开底部导航）
@@ -385,7 +388,11 @@ class BridgeOverlayManager(
         // （靠边走回待机中不作状态行切换，保持行走动画）
         val target = PetOverlayView.actionRowFor(status, event)
         if (!walking) {
-            if (target == pendingRow) {
+            if (SystemClock.uptimeMillis() - lastInteractAt < 1600L) {
+                // 互动动作（挥手/跳跃）表演中：不抢占，改记目标行待播完后再接管
+                pendingRow = target
+                pendingRowCount = 0
+            } else if (target == pendingRow) {
                 pendingRowCount++
             } else {
                 pendingRow = target
@@ -512,6 +519,7 @@ class BridgeOverlayManager(
      *  双击（400ms 内第二击）→ 挥手 + 气泡展开最近完整内容。 */
     private fun showTapFeedback() {
         val now = SystemClock.uptimeMillis()
+        lastInteractAt = now // 互动动作保护窗：轮询不抢占挥手/跳跃动画
         if (now - tapWindowStart > 4000L) {
             tapCount = 1
             tapWindowStart = now
@@ -642,6 +650,7 @@ class BridgeOverlayManager(
         if (lastStatus != "idle") return
         if (petView == null) return
         // 只做挥手：一次性动作自动落地，且不干扰后续「完成」跳跃庆祝
+        lastInteractAt = SystemClock.uptimeMillis()
         petView?.play(PetOverlayView.ROW_WAVING)
     }
 
@@ -971,7 +980,8 @@ class BridgeOverlayManager(
 
     /** 根据最近拖动采样估算松手瞬时速率（px/s）。 */
     private fun estimateThrowSpeed(): Float {
-        if (moveSamples.size < 2) return 0f
+        // 至少 3 个采样才有意义：点击/轻抖只有 1~2 个 MOVE，不会算出"抛出"速度
+        if (moveSamples.size < 3) return 0f
         val a = moveSamples.first()
         val b = moveSamples.last()
         val dt = (b[2] - a[2]) / 1000f
@@ -995,7 +1005,7 @@ class BridgeOverlayManager(
     private fun startFallFromDrag(p: WindowManager.LayoutParams) {
         var vx = 0f
         var vy = 0f
-        if (moveSamples.size >= 2) {
+        if (moveSamples.size >= 3) {
             val a = moveSamples.first()
             val b = moveSamples.last()
             val dt = (b[2] - a[2]) / 1000f
