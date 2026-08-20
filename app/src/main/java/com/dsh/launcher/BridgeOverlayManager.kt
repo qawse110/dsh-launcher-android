@@ -830,7 +830,17 @@ class BridgeOverlayManager(
                         remove()
                     } else {
                         savePosition(p)
-                        if (overlayStyle() == "pet" && petFall()) startFallFromDrag(p)
+                        if (overlayStyle() == "pet" && petFall()) {
+                            if (estimateThrowSpeed() < placeSpeedThreshold()) {
+                                // 轻放 = 放置停靠位（家）：不坠落，原地待命
+                                setHome(p.x, p.y)
+                                petView?.play(PetOverlayView.ROW_IDLE)
+                                postTransient("我在这里歇会儿～", 2, 0.6f, 3000L)
+                            } else {
+                                // 用力抛出：抛物坠落，落地后自己走回停靠位
+                                startFallFromDrag(p)
+                            }
+                        }
                     }
                 }
                 true
@@ -854,6 +864,26 @@ class BridgeOverlayManager(
     // ---------------- 拖拽抛落物理（参考 codex-pet-live） ----------------
 
     private fun petFall(): Boolean = prefs().getBoolean("pet_fall", true)
+
+    /** 松开即视为轻放（放置停靠位）的速度阈值（px/s）；低于它不触发坠落。 */
+    private fun placeSpeedThreshold(): Float = 320f
+
+    /** 根据最近拖动采样估算松手瞬时速率（px/s）。 */
+    private fun estimateThrowSpeed(): Float {
+        if (moveSamples.size < 2) return 0f
+        val a = moveSamples.first()
+        val b = moveSamples.last()
+        val dt = (b[2] - a[2]) / 1000f
+        if (dt <= 0.03f || dt >= 0.35f) return 0f
+        val vx = (b[0] - a[0]) / dt
+        val vy = (b[1] - a[1]) / dt
+        return Math.sqrt((vx * vx + vy * vy).toDouble()).toFloat()
+    }
+
+    /** 把当前位置记为桌宠的停靠位（家）：轻放时即"放置在此"。 */
+    private fun setHome(x: Int, y: Int) {
+        prefs().edit().putInt("pet_home_x", x).putInt("pet_home_y", y).apply()
+    }
 
     private fun stopFall() {
         falling = false
@@ -914,7 +944,7 @@ class BridgeOverlayManager(
                 falling = false
                 handler.removeCallbacks(fallTicker)
                 petView?.play(PetOverlayView.ROW_IDLE)
-                walkToEdge(p) // 落地后自动走回侧边待机，避免一直停在底部挡操作
+                walkHome(p) // 落地后自动走回停靠位（家）
                 return
             }
         }
@@ -924,14 +954,16 @@ class BridgeOverlayManager(
         if (falling) handler.postDelayed(fallTicker, 16L)
     }
 
-    /** 落地后自动靠边待机：走回较近的屏幕侧边，并抬升到底部导航区之上。 */
-    private fun walkToEdge(p: WindowManager.LayoutParams) {
+    /** 落地后自动走回停靠位（家）：未设置过家时默认停在屏幕中上部侧边（避开底部键盘/导航区）。 */
+    private fun walkHome(p: WindowManager.LayoutParams) {
         val view = overlayView ?: return
         val dm = context.resources.displayMetrics
+        val homeX = prefs().getInt("pet_home_x", -1)
+        val homeY = prefs().getInt("pet_home_y", -1)
         val right = dm.widthPixels - view.width
-        walkTargetX = if (p.x + view.width / 2 < dm.widthPixels / 2) 0 else right
-        walkTargetY = (dm.heightPixels - view.height - dp(36)).coerceAtLeast(0)
-        if (walkTargetX == p.x && walkTargetY >= p.y) {
+        walkTargetX = if (homeX >= 0) homeX else if (p.x + view.width / 2 < dm.widthPixels / 2) 0 else right
+        walkTargetY = if (homeY >= 0) homeY else ((dm.heightPixels - view.height) * 0.22f).toInt()
+        if (walkTargetX == p.x && walkTargetY == p.y) {
             savePosition(p)
             return
         }
