@@ -1100,8 +1100,9 @@ class BridgeOverlayManager(
         handler.postDelayed(walkTicker, 16L)
     }
 
-    /** 靠边行走一帧：水平固定步速走向目标边；纵向限速爬升（每帧 ≤6px，距离远不会瞬间
-     *  飞过去），到位后停住保存位置。 */
+    /** 靠边行走一帧：水平固定步速走向目标边；纵向同速爬升（每帧 ≤4px，与横向一致，
+     *  竖向不会比横向快）；横向到位后停止跑步动画（竖向剩余行程用呼吸 idle 匀速滑行），
+     *  到位后停住保存位置。 */
     private fun stepWalk() {
         if (!walking) return
         val p = overlayParams ?: return
@@ -1119,10 +1120,14 @@ class BridgeOverlayManager(
                 petView?.play(PetOverlayView.ROW_RUNNING_LEFT)
                 nx = p.x - 4f
             }
-            else -> nx = walkTargetX.toFloat()
+            else -> {
+                nx = walkTargetX.toFloat()
+                // 横向已到位：停止跑步动画（竖向剩余行程用呼吸 idle 匀速滑行）
+                if (Math.abs(dy) > 2) petView?.play(PetOverlayView.ROW_IDLE)
+            }
         }
         val ny = if (Math.abs(dy) <= 2) walkTargetY.toFloat()
-        else (p.y + Math.signum(dy.toFloat()) * Math.max(2f, Math.min(Math.abs(dy) * 0.08f, 6f))).toFloat()
+        else (p.y + Math.signum(dy.toFloat()) * Math.max(2f, Math.min(Math.abs(dy) * 0.08f, 4f))).toFloat()
         p.x = nx.toInt()
         p.y = ny.toInt()
         try { manager.updateViewLayout(view, p) } catch (e: Exception) {}
