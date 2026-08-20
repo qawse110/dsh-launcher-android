@@ -50,13 +50,16 @@ class BridgeOverlayManager(
     private var overlayView: LinearLayout? = null
     private var overlayText: TextView? = null
     private var overlayDot: View? = null
-    private var overlayClose: TextView? = null
     private var overlayParams: WindowManager.LayoutParams? = null
+
+    // 垃圾桶：拖动悬浮窗时出现在屏幕底部，拖上去松手关闭悬浮窗（替代原 × 按钮）
+    private var trashView: TextView? = null
+    private var trashParams: WindowManager.LayoutParams? = null
+    private var trashShown = false
 
     // 桌宠模式
     private var petView: PetOverlayView? = null
     private var petBubble: TextView? = null
-    private var petClose: TextView? = null
     private var petAtlas: CodexPetAtlas? = null
     private var petLoadedId: String? = null
     private var petName: String = ""
@@ -223,20 +226,10 @@ class BridgeOverlayManager(
             ellipsize = TextUtils.TruncateAt.END
             maxWidth = (context.resources.displayMetrics.widthPixels * 0.72).toInt()
         }
-        overlayClose = TextView(context).apply {
-            setText(" ×")
-            textSize = 16f
-            setTextColor(0xAAFFFFFF.toInt())
-            setPadding(dp(6), 0, dp(2), 0)
-            setOnClickListener {
-                prefs().edit().putBoolean("overlay_dismissed", true).apply()
-                remove()
-            }
-        }
         overlayView = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            contentDescription = "dsh 状态条：点击打开 Web，拖动调整位置，长按切换桌宠"
+            contentDescription = "dsh 状态条：点击打开 Web，拖动时底部出现垃圾桶，拖上去松手关闭"
             background = roundedDrawable(0xDD101722.toInt(), 14, 1, 0x33283A55.toInt())
             if (Build.VERSION.SDK_INT >= 21) elevation = dp(6).toFloat()
             setPadding(dp(12), dp(8), dp(6), dp(8))
@@ -245,7 +238,6 @@ class BridgeOverlayManager(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ))
-            addView(overlayClose)
             setOnTouchListener(overlayTouchListener)
         }
         overlayParams = WindowManager.LayoutParams(
@@ -345,19 +337,12 @@ class BridgeOverlayManager(
             includeFontPadding = false
             maxLines = 2
             ellipsize = TextUtils.TruncateAt.END
-            maxWidth = (context.resources.displayMetrics.widthPixels * 0.6).toInt()
+            maxWidth = minOf((context.resources.displayMetrics.widthPixels * 0.45).toInt(), dp(230))
             setPadding(dp(10), dp(5), dp(10), dp(5))
             background = roundedDrawable(0xE0101722.toInt(), 12, 1, 0x336C8CFF.toInt())
-            setOnClickListener { openWeb() }
-        }
-        petClose = TextView(context).apply {
-            setText(" ×")
-            textSize = 15f
-            setTextColor(0xAAFFFFFF.toInt())
-            setPadding(dp(4), 0, dp(2), 0)
+            // 有临时气泡（点击台词/展开内容）时点击立即收起；无则打开 dsh Web
             setOnClickListener {
-                prefs().edit().putBoolean("overlay_dismissed", true).apply()
-                remove()
+                if (transientText != null) cancelTransient() else openWeb()
             }
         }
         val bubbleRow = LinearLayout(context).apply {
@@ -367,12 +352,12 @@ class BridgeOverlayManager(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ))
-            addView(petClose)
         }
         overlayView = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_HORIZONTAL
-            contentDescription = "dsh 桌宠：点击宠物互动，点气泡打开 Web，拖动移动，长按切回状态条"
+            // 靠左排布：气泡宽度变化时桌宠本体不移动
+            gravity = Gravity.START
+            contentDescription = "dsh 桌宠：单击互动，双击展开内容，拖动可扔进底部垃圾桶关闭，长按切回状态条"
             if (Build.VERSION.SDK_INT >= 21) elevation = dp(6).toFloat()
             addView(bubbleRow, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
@@ -477,7 +462,8 @@ class BridgeOverlayManager(
                 val overlay = overlayParams
                 val avail = if (overlay != null) dm.widthPixels - overlay.x - dp(8)
                 else dm.widthPixels - dp(8)
-                val width = minOf((dm.widthPixels * 0.85f).toInt(), avail.coerceAtLeast(dp(120)))
+                // 宽度上限 55% 屏幕，避免长文本把窗口撑得过宽
+                val width = minOf((dm.widthPixels * 0.55f).toInt(), avail.coerceAtLeast(dp(120)))
                 postTransient(full, 1000, width.toFloat(), 8000L)
             } else {
                 val reply = randomQuip()
@@ -662,11 +648,10 @@ class BridgeOverlayManager(
         overlayView = null
         overlayText = null
         overlayDot = null
-        overlayClose = null
+        hideTrash()
         overlayParams = null
         petView = null
         petBubble = null
-        petClose = null
     }
 
     /** 长按切换状态条/桌宠模式，下次状态轮询（≤1s）生效。 */
@@ -718,6 +703,61 @@ class BridgeOverlayManager(
         if (strokeWidth > 0) setStroke(strokeWidth, strokeColor)
     }
 
+    // ---------------- 垃圾桶（替代 × 关闭按钮） ----------------
+
+    /** 拖动开始时在屏幕底部显示垃圾桶（不可触摸，不拦截拖动事件）。 */
+    private fun showTrash() {
+        if (trashShown) return
+        val wm = windowManager ?: return
+        val ctx = context
+        val size = dp(58)
+        val tv = TextView(ctx).apply {
+            text = "🗑️"
+            textSize = 30f
+            gravity = Gravity.CENTER
+            background = roundedDrawable(0xB3101722.toInt(), 29, 2, 0x88FF6C6C.toInt())
+            elevation = dp(4).toFloat()
+        }
+        trashParams = WindowManager.LayoutParams(
+            size, size,
+            windowType,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            val dm = ctx.resources.displayMetrics
+            x = dm.widthPixels / 2 - size / 2
+            y = dm.heightPixels - size - dp(64)
+        }
+        try {
+            wm.addView(tv, trashParams)
+            trashView = tv
+        } catch (_: Exception) {
+            trashView = null
+            trashParams = null
+        }
+    }
+
+    private fun hideTrash() {
+        trashShown = false
+        trashView?.let { v ->
+            try { windowManager?.removeView(v) } catch (_: Exception) {}
+        }
+        trashView = null
+        trashParams = null
+    }
+
+    /** 拖动松手时宠物窗是否与垃圾桶相交。 */
+    private fun onTrashDrop(): Boolean {
+        val r = trashParams ?: return false
+        val p = overlayParams ?: return false
+        val v = overlayView ?: return false
+        return p.x < r.x + r.width && p.x + v.width > r.x &&
+            p.y < r.y + r.height && p.y + v.height > r.y
+    }
+
     private fun openWeb() {
         try {
             context.startActivity(
@@ -752,6 +792,7 @@ class BridgeOverlayManager(
                 val dy = event.rawY - dragStartTouchY
                 if (!dragMoved && (Math.abs(dx) > dragSlop || Math.abs(dy) > dragSlop)) {
                     dragMoved = true
+                    showTrash() // 开始拖动：屏幕底部出现垃圾桶
                 }
                 if (dragMoved) {
                     p.x = dragStartX + dx.toInt()
@@ -771,21 +812,33 @@ class BridgeOverlayManager(
             }
             MotionEvent.ACTION_UP -> {
                 stopFall()
+                val dropped = onTrashDrop() // 先判断（hideTrash 会清空垃圾桶引用）
+                hideTrash()
                 if (!dragMoved) {
                     if (SystemClock.uptimeMillis() - downAt >= 600L) {
                         toggleStyle()
                     } else if (downOnPet) {
                         showTapFeedback()
-                    } else {
-                        openWeb()
+                    } else if (overlayStyle() != "pet") {
+                        openWeb() // 状态条整条可点击打开 Web
                     }
+                    // 桌宠模式空白区域：不响应（不打开 Web）
                 } else {
-                    savePosition(p)
-                    if (overlayStyle() == "pet" && petFall()) startFallFromDrag(p)
+                    if (dropped) {
+                        // 拖进垃圾桶：关闭悬浮窗
+                        prefs().edit().putBoolean("overlay_dismissed", true).apply()
+                        remove()
+                    } else {
+                        savePosition(p)
+                        if (overlayStyle() == "pet" && petFall()) startFallFromDrag(p)
+                    }
                 }
                 true
             }
-            MotionEvent.ACTION_CANCEL -> true
+            MotionEvent.ACTION_CANCEL -> {
+                hideTrash()
+                true
+            }
             else -> false
         }
     }
