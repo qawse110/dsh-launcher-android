@@ -414,7 +414,7 @@ class BridgeOverlayManager(
                 pendingRow = target
                 pendingRowCount = 1
             }
-            if (pendingRowCount >= 2) petView?.play(target)
+            if (pendingRowCount >= 2) petView?.play(target, "$status|${event ?: ""}")
         }
         speakForStatus(status, event)
         petBubble?.let { bubble ->

@@ -77,6 +77,9 @@ class PetOverlayView(context: Context, private val atlas: CodexPetAtlas) : View(
     /** 已表演完成的一次性动作行（waving/jumping）：落地回 idle 后不重播，直到换行。 */
     private var settledRow = -1
 
+    /** 最近表演的一次性动作所对应的状态键；互动挥手（null 键）不清除它。 */
+    private var lastOneShotKey: String? = null
+
     private val ticker = object : Runnable {
         override fun run() {
             if (!playing) return
@@ -95,8 +98,14 @@ class PetOverlayView(context: Context, private val atlas: CodexPetAtlas) : View(
         }
     }
 
-    /** 切换动画行（动作）：循环行持续循环；一次性动作（waving/jumping）播完一轮落地回 idle。 */
-    fun play(row: Int) {
+    /**
+     * 切换动画行（动作）：循环行持续循环；一次性动作（waving/jumping）播完一轮落地回 idle。
+     *
+     * @param stateKey 状态键（由桥接层传入 status|event）：一次性动作在同一状态键下
+     *                 只表演一次——用户互动（挥手）打断跳跃后，轮询不会把它重播。
+     *                 传 null（互动/待机挥手等）不参与去重，总是可表演。
+     */
+    fun play(row: Int, stateKey: String? = null) {
         val safeRow = row.coerceIn(0, maxRow())
         if (playing && safeRow == this.row) {
             // 已在该行：若回到常驻行则重新武装一次性动作（落地后再次换行可再表演）
@@ -104,6 +113,8 @@ class PetOverlayView(context: Context, private val atlas: CodexPetAtlas) : View(
             return
         }
         if (safeRow !in LOOP_ROWS && settledRow == safeRow) return // 同一一次性动作已表演过
+        if (safeRow !in LOOP_ROWS && stateKey != null && lastOneShotKey == stateKey) return
+        if (safeRow !in LOOP_ROWS && stateKey != null) lastOneShotKey = stateKey
         this.row = safeRow
         col = 0
         settledRow = if (safeRow !in LOOP_ROWS) safeRow else -1
