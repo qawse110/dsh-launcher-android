@@ -107,8 +107,10 @@ class StatusBridgeService : Service() {
                         }
                     }
                 } else {
-                    // dsh 暂时不可达也要记录心跳，证明 Service 本身还活着
+                    // dsh 暂时不可达也要记录心跳，证明 Service 本身还活着；
+                    // 同时 watchdog 自动拉起 dsh web（60s 冷却，双路幂等）
                     mainHandler.post { writeHeartbeat(lastStatus ?: "idle", "", "poll-null") }
+                    DshWatchdog.maybeRevive(this)
                 }
             } catch (t: Throwable) {
                 // ignore transient polling errors

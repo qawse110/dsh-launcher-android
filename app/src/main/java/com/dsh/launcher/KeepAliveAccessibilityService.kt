@@ -111,6 +111,16 @@ class KeepAliveAccessibilityService : AccessibilityService() {
         pollThread = thread {
             while (polling) {
                 val data = fetchStatus()
+                if (data == null) {
+                    // dsh 进程不可达：watchdog 自动拉起（60s 冷却，双路幂等）
+                    DshWatchdog.maybeRevive(this)
+                    try {
+                        Thread.sleep(1000L)
+                    } catch (e: InterruptedException) {
+                        break
+                    }
+                    continue
+                }
                 val prev = lastStatus
                 lastStatus = data.status
                 val finished = prev == "running" && data.status == "finished" &&
@@ -135,7 +145,7 @@ class KeepAliveAccessibilityService : AccessibilityService() {
         pollThread = null
     }
 
-    private fun fetchStatus(): StatusData {
+    private fun fetchStatus(): StatusData? {
         return try {
             val conn = URL(STATUS_URL).openConnection() as HttpURLConnection
             conn.connectTimeout = 800
@@ -143,7 +153,7 @@ class KeepAliveAccessibilityService : AccessibilityService() {
             conn.requestMethod = "GET"
             conn.useCaches = false
             try {
-                if (conn.responseCode != 200) return StatusData("idle", "", null, 0L)
+                if (conn.responseCode != 200) return null
                 val text = BufferedReader(InputStreamReader(conn.inputStream)).use { it.readText() }
                 val obj = JSONObject(text)
                 StatusData(
@@ -156,7 +166,7 @@ class KeepAliveAccessibilityService : AccessibilityService() {
                 conn.disconnect()
             }
         } catch (e: Exception) {
-            StatusData("idle", "", null, 0L)
+            null
         }
     }
 

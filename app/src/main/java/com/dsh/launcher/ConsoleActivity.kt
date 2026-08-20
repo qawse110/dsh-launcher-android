@@ -381,11 +381,11 @@ class ConsoleActivity : AppCompatActivity() {
                     )
                 )
 
-                // 仅安装/更新模式：到此结束，不启动 web
+                // 仅安装/更新模式：到此结束，不启动 web（不置 running，watchdog 不会拉起）
                 if (installOnly) {
                     fl("OK 安装/更新完成（未启动 web，回主界面点「启动 DSH」即可）")
                     setState("安装完成")
-                    BuildKeepAliveService.updateRunning(this)
+                    startKeepAlive()
                     return@thread
                 }
 
