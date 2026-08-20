@@ -80,6 +80,12 @@ class BridgeOverlayManager(
     private var ambientRunnable: Runnable? = null
     private var greeted = false
 
+    // 双击检测：单击随机台词 / 双击展开完整内容
+    private var lastTapAt = 0L
+
+    // 待机随机小动作：idle 时每 20~45s 随机挥手一次，打破无限循环待机的机械感
+    private var idleActRunnable: Runnable? = null
+
     // 动画行切换稳定窗口：同一目标行连续 ≥2 次轮询（≈2s）才真正切换，
     // 避免 tool/call ↔ assistant/message 状态抖动导致桌宠频繁换动作
     private var pendingRow = -1
@@ -106,7 +112,7 @@ class BridgeOverlayManager(
     private val dragSlop = dp(4)
 
     // 拖拽抛落物理（参考 codex-pet-live 的 drop/gravity）：松手后抛物线坠落、
-    // 撞墙反弹、落地小弹跳后静止并保存位置
+    // 撞墙反弹、落地小弹跳后自动走回屏幕侧边待机（抬升避开底部导航）
     private val FALL_GRAVITY = 2400f // px/s²
     private var falling = false
     private var fallVx = 0f
@@ -115,6 +121,12 @@ class BridgeOverlayManager(
     private val moveSamples = ArrayDeque<FloatArray>() // [x, y, uptimeMillis]
     private val fallTicker = object : Runnable {
         override fun run() = stepFall()
+    }
+    private var walking = false
+    private var walkTargetX = 0
+    private var walkTargetY = 0
+    private val walkTicker = object : Runnable {
+        override fun run() = stepWalk()
     }
 
     private fun prefs() = context.getSharedPreferences("status_bridge", Context.MODE_PRIVATE)
@@ -391,14 +403,17 @@ class BridgeOverlayManager(
 
     private fun updatePet(status: String, text: String, event: String?) {
         // 动作稳定窗口：同目标行连续 ≥2 次轮询才切换，避免状态抖动引发频繁变动作
+        // （靠边走回待机中不作状态行切换，保持行走动画）
         val target = PetOverlayView.actionRowFor(status, event)
-        if (target == pendingRow) {
-            pendingRowCount++
-        } else {
-            pendingRow = target
-            pendingRowCount = 1
+        if (!walking) {
+            if (target == pendingRow) {
+                pendingRowCount++
+            } else {
+                pendingRow = target
+                pendingRowCount = 1
+            }
+            if (pendingRowCount >= 2) petView?.play(target)
         }
-        if (pendingRowCount >= 2) petView?.play(target)
         speakForStatus(status, event)
         petBubble?.let { bubble ->
             val key = "$status|${event ?: ""}"
@@ -420,6 +435,7 @@ class BridgeOverlayManager(
                 if (showPetBubble()) showGreeting()
             }
             if (ambientRunnable == null) scheduleAmbient()
+            if (idleActRunnable == null) scheduleIdleAct()
         }
     }
 
@@ -432,7 +448,8 @@ class BridgeOverlayManager(
 
     /** 点击桌宠本体（参考 codex-pet-live patpat）：
      *  快速连点 ≥5 次 → 被戳烦了跳一下 + 吐槽台词；
-     *  普通点击 → 挥手互动动画一次 + 气泡展开为最近完整内容（无内容时随机台词兜底）。 */
+     *  单击 → 挥手互动 + 随机台词短气泡；
+     *  双击（400ms 内第二击）→ 挥手 + 气泡展开最近完整内容。 */
     private fun showTapFeedback() {
         val now = SystemClock.uptimeMillis()
         if (now - tapWindowStart > 4000L) {
@@ -443,25 +460,36 @@ class BridgeOverlayManager(
         }
         if (tapCount >= 5) {
             tapCount = 0
+            lastTapAt = 0L
             petView?.play(PetOverlayView.ROW_JUMPING)
             postTransient("主人别戳啦～", 2, 0.6f, 3500L)
             speak("主人别戳啦～")
             return
         }
         petView?.play(PetOverlayView.ROW_WAVING)
-        val full = lastText?.takeIf { it.isNotBlank() }
-        if (full != null) {
-            // 展开：不限行数，宽度不超过屏幕剩余空间，避免窗口越界
-            val dm = context.resources.displayMetrics
-            val overlay = overlayParams
-            val avail = if (overlay != null) dm.widthPixels - overlay.x - dp(8)
-            else dm.widthPixels - dp(8)
-            val width = minOf((dm.widthPixels * 0.85f).toInt(), avail.coerceAtLeast(dp(120)))
-            postTransient(full, 1000, width.toFloat(), 12_000L)
+        if (now - lastTapAt < 400L) {
+            // 双击：展开完整内容（较长展示，8 秒或状态变化后收起）
+            tapCount = 0
+            lastTapAt = 0L
+            val full = lastText?.takeIf { it.isNotBlank() }
+            if (full != null) {
+                val dm = context.resources.displayMetrics
+                val overlay = overlayParams
+                val avail = if (overlay != null) dm.widthPixels - overlay.x - dp(8)
+                else dm.widthPixels - dp(8)
+                val width = minOf((dm.widthPixels * 0.85f).toInt(), avail.coerceAtLeast(dp(120)))
+                postTransient(full, 1000, width.toFloat(), 8000L)
+            } else {
+                val reply = randomQuip()
+                postTransient(reply, 2, 0.6f, 8000L)
+                speak(reply)
+            }
         } else {
-            val reply = randomPetPhrase()
-            postTransient(reply, 2, 0.6f, 12_000L)
-            speak(reply)
+            // 单击：随机台词短气泡（快速、不挡视线）
+            lastTapAt = now
+            val quip = randomQuip()
+            postTransient(quip, 2, 0.6f, 5000L)
+            speak(quip)
         }
     }
 
@@ -496,6 +524,14 @@ class BridgeOverlayManager(
     private fun randomPetPhrase(): String =
         if (petReplies.isNotEmpty()) petReplies[Random.nextInt(petReplies.size)] else "主人，我在呢～"
 
+    /** 点击互动随机台词：优先宠物包台词，否则内置短句池。 */
+    private val quipPool = listOf(
+        "主人，我在呢～", "怎么啦？", "嘿嘿，戳我干嘛～", "我在认真盯任务呢！", "想我了吗～"
+    )
+    private fun randomQuip(): String =
+        if (petReplies.isNotEmpty()) petReplies[Random.nextInt(petReplies.size)]
+        else quipPool[Random.nextInt(quipPool.size)]
+
     /** 登场问候一次（参考 codex-pet-live 的 greeting 气泡）。 */
     private fun showGreeting() {
         val name = petName.takeIf { it.isNotBlank() }
@@ -524,6 +560,26 @@ class BridgeOverlayManager(
         val phrase = randomPetPhrase()
         postTransient(phrase, 2, 0.6f, 5000L)
         speak(phrase)
+    }
+
+    /** 待机随机小动作（参考 codex-pet-live 的随机动作池）：idle 时随机挥手，纯动作不打扰气泡。 */
+    private fun scheduleIdleAct() {
+        idleActRunnable?.let { handler.removeCallbacks(it) }
+        val delay = Random.nextLong(20_000L, 45_000L)
+        val r = Runnable {
+            maybeIdleAct()
+            scheduleIdleAct()
+        }
+        idleActRunnable = r
+        handler.postDelayed(r, delay)
+    }
+
+    private fun maybeIdleAct() {
+        if (falling || walking) return
+        if (lastStatus != "idle") return
+        if (petView == null) return
+        // 只做挥手：一次性动作自动落地，且不干扰后续「完成」跳跃庆祝
+        petView?.play(PetOverlayView.ROW_WAVING)
     }
 
     // ---------------- 桌宠 TTS 发声 ----------------
@@ -586,6 +642,9 @@ class BridgeOverlayManager(
     private fun resetViews() {
         cancelTransient()
         stopFall()
+        stopWalk()
+        idleActRunnable?.let { handler.removeCallbacks(it) }
+        idleActRunnable = null
         ambientRunnable?.let { handler.removeCallbacks(it) }
         ambientRunnable = null
         greeted = false
@@ -677,6 +736,7 @@ class BridgeOverlayManager(
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
                 stopFall()
+                stopWalk()
                 moveSamples.clear()
                 downOnPet = isTapOnPet(event.x, event.y)
                 dragStartX = p.x
@@ -801,7 +861,7 @@ class BridgeOverlayManager(
                 falling = false
                 handler.removeCallbacks(fallTicker)
                 petView?.play(PetOverlayView.ROW_IDLE)
-                savePosition(p)
+                walkToEdge(p) // 落地后自动走回侧边待机，避免一直停在底部挡操作
                 return
             }
         }
@@ -809,6 +869,63 @@ class BridgeOverlayManager(
         p.y = ny.toInt()
         try { manager.updateViewLayout(view, p) } catch (e: Exception) {}
         if (falling) handler.postDelayed(fallTicker, 16L)
+    }
+
+    /** 落地后自动靠边待机：走回较近的屏幕侧边，并抬升到底部导航区之上。 */
+    private fun walkToEdge(p: WindowManager.LayoutParams) {
+        val view = overlayView ?: return
+        val dm = context.resources.displayMetrics
+        val right = dm.widthPixels - view.width
+        walkTargetX = if (p.x + view.width / 2 < dm.widthPixels / 2) 0 else right
+        walkTargetY = (dm.heightPixels - view.height - dp(36)).coerceAtLeast(0)
+        if (walkTargetX == p.x && walkTargetY >= p.y) {
+            savePosition(p)
+            return
+        }
+        walking = true
+        handler.removeCallbacks(walkTicker)
+        handler.postDelayed(walkTicker, 16L)
+    }
+
+    /** 靠边行走一帧：水平固定步速走向目标边，纵向缓慢抬升，到位后停住保存位置。 */
+    private fun stepWalk() {
+        if (!walking) return
+        val p = overlayParams ?: return
+        val manager = windowManager ?: return
+        val view = overlayView ?: return
+        val dx = walkTargetX - p.x
+        val dy = walkTargetY - p.y
+        var nx = p.x.toFloat()
+        when {
+            dx > 4 -> {
+                petView?.play(PetOverlayView.ROW_RUNNING_RIGHT)
+                nx = p.x + 4f
+            }
+            dx < -4 -> {
+                petView?.play(PetOverlayView.ROW_RUNNING_LEFT)
+                nx = p.x - 4f
+            }
+            else -> nx = walkTargetX.toFloat()
+        }
+        val ny = if (Math.abs(dy) <= 2) walkTargetY.toFloat()
+        else (p.y + Math.signum(dy) * Math.max(2f, Math.abs(dy) * 0.08f)).toFloat()
+        p.x = nx.toInt()
+        p.y = ny.toInt()
+        try { manager.updateViewLayout(view, p) } catch (e: Exception) {}
+        if (Math.abs(walkTargetX - p.x) <= 4 && Math.abs(walkTargetY - p.y) <= 2) {
+            walking = false
+            handler.removeCallbacks(walkTicker)
+            pendingRow = -1
+            petView?.play(PetOverlayView.ROW_IDLE)
+            savePosition(p)
+            return
+        }
+        handler.postDelayed(walkTicker, 16L)
+    }
+
+    private fun stopWalk() {
+        walking = false
+        handler.removeCallbacks(walkTicker)
     }
 
     /** 触点是否落在桌宠本体上（相对悬浮窗根视图坐标）。 */
