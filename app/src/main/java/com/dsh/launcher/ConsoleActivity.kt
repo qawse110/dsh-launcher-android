@@ -265,6 +265,7 @@ class ConsoleActivity : AppCompatActivity() {
                         fl("OK 启动完成 (http://127.0.0.1:3080)")
                         setState("运行中")
                         BuildKeepAliveService.updateRunning(this)
+                        ensureBridge()
                     } else {
                         fl("FAIL 启动：dsh web 未就绪（见上方日志尾部）")
                         setState("启动失败")
@@ -394,6 +395,7 @@ class ConsoleActivity : AppCompatActivity() {
                     fl("OK 4/4 dsh web started (http://127.0.0.1:3080)")
                     setState("运行中")
                     BuildKeepAliveService.updateRunning(this)
+                    ensureBridge()
                 } else {
                     fl("FAIL 4/4 dsh web 启动失败（见上方日志尾部）")
                     setState("出错")
@@ -417,6 +419,16 @@ class ConsoleActivity : AppCompatActivity() {
         } catch (t: Throwable) {
             AppLog.e("Console", "keepalive start failed: ${t.message}")
         }
+    }
+
+    /** dsh 启动成功后联动拉起状态桥接服务（悬浮窗自动出现；尊重「悬浮窗显示」开关）。 */
+    private fun ensureBridge() {
+        if (!getSharedPreferences("status_bridge", Context.MODE_PRIVATE)
+                .getBoolean("overlay_enabled", true)
+        ) return
+        runCatching { StatusBridgeService.start(this) }
+            .onSuccess { AppLog.i("Console", "bridge started for overlay") }
+            .onFailure { AppLog.e("Console", "bridge start failed: ${it.message}") }
     }
 
     /** 快速启动：同步兼容脚本（fs-register/fs-loader/fs-promises/stub）→ 执行 stub → 启动 web。 */

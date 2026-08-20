@@ -1,5 +1,6 @@
 package com.dsh.launcher
 
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -57,6 +58,13 @@ class MainActivity : AppCompatActivity() {
         setContentView(buildUi())
         requestStoragePermissions()
         syncAssetsOnApkUpdate()
+        // 悬浮窗自动恢复：app 关闭后再打开，只要「悬浮窗显示」开关还开着就自动拉起
+        // 状态桥接服务（服务已运行时幂等；无障碍通道由系统自动连接，无需此处处理）
+        if (getSharedPreferences("status_bridge", Context.MODE_PRIVATE)
+                .getBoolean("overlay_enabled", true)
+        ) {
+            runCatching { StatusBridgeService.start(this) }
+        }
         log("就绪。请选择操作。")
     }
 
