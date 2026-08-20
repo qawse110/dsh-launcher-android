@@ -213,7 +213,7 @@ class OverlaySettingsActivity : AppCompatActivity() {
         // 显示内容
         root.addView(section("显示内容"))
         card {
-            overlaySwitch = addSwitch(this, "悬浮窗显示", "在其它应用上层显示 dsh 运行状态", "overlay_enabled", true) { checked ->
+            overlaySwitch = addSwitch(this, "悬浮窗显示", "在其它应用上层显示 dsh 运行状态（关闭后普通与无障碍通道的悬浮窗一并隐藏）", "overlay_enabled", true) { checked ->
                 if (checked) StatusBridgeService.resetDismissed(this@OverlaySettingsActivity)
             }
             showStatusSwitch = addSwitch(this, "显示状态", "显示思考中 / 输出中 / 调用工具等状态", "show_status", true)
