@@ -177,9 +177,10 @@ function ensurePnpm() {
 
 function ensureDsh() {
   mkdirSync(DSH_PREFIX, { recursive: true });
-  log('install/update @deepseek-ai/dsh via npm ...');
+  const tag = process.env.DSH_TAG || 'latest';
+  log(`install/update @deepseek-ai/dsh@${tag} via npm ...`);
   const ok = run(NPM_BIN, [
-    'install', '--prefix', DSH_PREFIX, '@deepseek-ai/dsh@latest',
+    'install', '--prefix', DSH_PREFIX, `@deepseek-ai/dsh@${tag}`,
     '--registry', REGISTRY, '--no-audit', '--no-fund', '--ignore-scripts', '--force',
   ], { env: envBase() });
   if (!ok || !dshInstalled()) {

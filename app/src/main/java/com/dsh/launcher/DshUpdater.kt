@@ -62,11 +62,22 @@ object DshUpdater {
     }
 
     /**
-     * 检查 npm registry 是否有新版本。
+     * 检查 npm registry 是否有新版本（latest 稳定线）。
      * @param force true 忽略检查间隔强制检查。
      * @return 新版本号（有更新），或 null（已是最新/无网络/失败）。
      */
-    fun checkRemote(ctx: Context, force: Boolean, log: (String) -> Unit): String? {
+    fun checkRemote(ctx: Context, force: Boolean, log: (String) -> Unit): String? =
+        checkRemoteTag(ctx, "latest", force, log)
+
+    /**
+     * 检查 npm registry 是否有新版本（next 预发布线）。
+     * @param force true 忽略检查间隔强制检查。
+     * @return 新版本号（有更新），或 null（已是最新/无网络/失败）。
+     */
+    fun checkRemoteNext(ctx: Context, force: Boolean, log: (String) -> Unit): String? =
+        checkRemoteTag(ctx, "next", force, log)
+
+    private fun checkRemoteTag(ctx: Context, tag: String, force: Boolean, log: (String) -> Unit): String? {
         val state = readState(ctx)
         if (!force && state.checkedAt > 0 && System.currentTimeMillis() - state.checkedAt < AUTO_CHECK_INTERVAL_MS) {
             log("检查跳过（距上次 ${(System.currentTimeMillis() - state.checkedAt) / 1000}s < 6h）")
@@ -79,14 +90,14 @@ object DshUpdater {
         return try {
             val body = fetchOrNull(NPM_REGISTRY) ?: fetchOrNull(NPM_REGISTRY_FALLBACK) ?: return null
             val j = JSONObject(body)
-            val latest = j.optJSONObject("dist-tags")?.optString("latest")?.takeIf { it.isNotBlank() } ?: return null
+            val remote = j.optJSONObject("dist-tags")?.optString(tag)?.takeIf { it.isNotBlank() } ?: return null
             writeState(ctx, cur, System.currentTimeMillis())
-            if (compareVersions(latest, cur) <= 0) {
-                log("已是新版（本地 $cur，远端 $latest）")
+            if (compareVersions(remote, cur) <= 0) {
+                log("已是新版（本地 $cur，远端 $tag=$remote）")
                 null
             } else {
-                log("发现新版本 $latest（本地 $cur）")
-                latest
+                log("发现新版本 $remote（本地 $cur，dist-tag=$tag）")
+                remote
             }
         } catch (t: Throwable) {
             log("版本检查失败：${t.message}")

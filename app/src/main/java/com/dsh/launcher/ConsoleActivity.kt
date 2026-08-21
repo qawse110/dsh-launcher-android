@@ -177,6 +177,7 @@ class ConsoleActivity : AppCompatActivity() {
             startActivity(Intent(this@ConsoleActivity, PluginManagerActivity::class.java))
         }, filled = false)
         val updateBtn = Ui.button(this, "更新", { startUpdateCheck(true) }, filled = false)
+        val updateNextBtn = Ui.button(this, "更新 next", { startUpdateCheckNext(true) }, filled = false)
         val clearBtn = Ui.button(this, "清空", { sb.clear(); output.text = "" }, filled = false)
         val closeBtn = Ui.button(this, "退出", { finish() }, filled = false, color = Ui.DANGER)
 
@@ -184,7 +185,7 @@ class ConsoleActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = dp(6) })
-        root.addView(rowOf(updateBtn, clearBtn, closeBtn), LinearLayout.LayoutParams(
+        root.addView(rowOf(updateBtn, updateNextBtn, clearBtn, closeBtn), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = dp(6) })
@@ -329,6 +330,8 @@ class ConsoleActivity : AppCompatActivity() {
                 }
 
                 fl(">> 3/4 官方 npm 安装/更新 dsh + dsh plugin 装配内置插件…")
+                val tag = getSharedPreferences(CONSOLE_PREFS, Context.MODE_PRIVATE)
+                    .getString("dsh_install_tag", "latest") ?: "latest"
                 val installEnv = mapOf(
                     "HOME" to filesDir.absolutePath,
                     "NODE_BIN" to "$nodeDir/bin/node",
@@ -337,9 +340,14 @@ class ConsoleActivity : AppCompatActivity() {
                     "DSH_PROFILE" to "web",
                     "DSH_PREBUILT" to prebuilt.absolutePath,
                     "DSH_PLUGINS_DIR" to pluginsDir.absolutePath,
-                    "DSH_EXTRA_PLUGINS_SRC" to extraPluginsDir.absolutePath
+                    "DSH_EXTRA_PLUGINS_SRC" to extraPluginsDir.absolutePath,
+                    "DSH_TAG" to tag
                 )
+                if (tag != "latest") fl("  （安装 dist-tag=$tag 预发布线）")
                 val installExit = runCommandAndWait("$nodeDir/bin/node ${installScript.absolutePath}", installEnv)
+                // 一次性安装 tag 已消费（无论成败），复位避免残留 next 影响下次普通安装
+                getSharedPreferences(CONSOLE_PREFS, Context.MODE_PRIVATE)
+                    .edit().remove("dsh_install_tag").apply()
                 if (installExit != 0) {
                     fl("FAIL 3/4 install script exit=$installExit，详见 install_log.txt")
                     setState("出错")
@@ -606,6 +614,28 @@ class ConsoleActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * 更新到 next 预发布线（「更新 next」按钮）：检查 dist-tag=next，
+     * 有更新则置一次性安装 tag=next 并重启安装流程（install-dsh.mjs 按 DSH_TAG 安装）。
+     * 安装完成后 tag 自动复位为 latest。
+     */
+    private fun startUpdateCheckNext(force: Boolean, onLog: ((String) -> Unit)? = null) {
+        val log: (String) -> Unit = onLog ?: { appendLine(it) }
+        thread {
+            val version = DshUpdater.checkRemoteNext(this, force, log)
+            if (version != null) {
+                log("发现 dsh 预发布 v$version（next），重启流程安装…")
+                getSharedPreferences(CONSOLE_PREFS, Context.MODE_PRIVATE)
+                    .edit().putString("dsh_install_tag", "next").apply()
+                Thread.sleep(3_000)
+                killAllNode()
+                runOnUiThread { runDshFlow() }
+            } else {
+                log("next 线暂无更新（或已是最新预发布版）")
+            }
+        }
+    }
+
     /** 杀掉全部 node 进程（web 与 flow 子进程一并结束），供更新后重启。 */
     private fun killAllNode() {
         runCatching {
@@ -802,6 +832,7 @@ class BuildKeepAliveService : Service() {
         const val ACTION_UPDATE_RUNNING = "com.dsh.launcher.action.BUILD_KEEPALIVE_RUNNING"
         private const val PREFS_NAME = "dsh_keepalive"
         private const val KEY_RUNNING = "running"
+        private const val CONSOLE_PREFS = "dsh_console"
 
         fun updateRunning(context: Context) {
             context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
