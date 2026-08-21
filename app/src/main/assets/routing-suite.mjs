@@ -96,7 +96,16 @@ function dshPlugin(args) {
 
 async function download(url, dest) {
   log('GET ' + url);
-  const res = await fetch(url, { redirect: 'follow' });
+  // Android 网络栈可能卡死在一个无响应的 TCP 连接上，给单次请求加超时，
+  // 让 fetchRepo 的 main/master 分支重试逻辑真正生效。
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error('timeout after 30s')), 30_000);
+  let res;
+  try {
+    res = await fetch(url, { redirect: 'follow', signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
   if (!res.ok) throw new Error('HTTP ' + res.status + ' for ' + url);
   const buf = Buffer.from(await res.arrayBuffer());
   writeFileSync(dest, buf);
@@ -126,10 +135,13 @@ function untar(buf, dest) {
     if (!name0) break;
     const prefix = h.subarray(345, 500).toString('utf8').replace(/\0[\s\S]*$/, '');
     const name = (prefix ? prefix + '/' : '') + name0;
-    if (name.includes('..') || name.startsWith('/') || /^[A-Za-z]:/.test(name)) {
-      off += 512; continue;
-    }
     const size = parseInt(h.subarray(124, 136).toString('utf8').replace(/\0[\s\S]*$/, '').trim(), 8) || 0;
+    if (name.includes('..') || name.startsWith('/') || /^[A-Za-z]:/.test(name)) {
+      // 跳过整个条目（header + data），不能只跳 512 字节，否则会把
+      // 当前条目的数据体误当成下一个 tar header 解析。
+      off += 512 + Math.ceil(size / 512) * 512;
+      continue;
+    }
     const type = String.fromCharCode(h[156]);
     const data = buf.subarray(off + 512, off + 512 + size);
     const p = join(dest, name);

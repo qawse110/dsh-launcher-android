@@ -21,23 +21,22 @@ object DshUpdater {
     private const val NPM_REGISTRY_FALLBACK = "https://registry.npmjs.org/@deepseek-ai/dsh"
     private const val AUTO_CHECK_INTERVAL_MS = 6L * 60 * 60 * 1000 // 自动检查间隔 6 小时
 
-    data class State(val version: String?, val checkedAt: Long)
+    data class State(val checkedAt: Long)
 
     private fun stateFile(ctx: Context): File = File(ctx.filesDir, "dsh-update.json")
 
     private fun readState(ctx: Context): State {
         return try {
             val j = JSONObject(stateFile(ctx).readText())
-            State(j.optString("version").takeIf { it.isNotBlank() }, j.optLong("checkedAt"))
+            State(j.optLong("checkedAt"))
         } catch (_: Throwable) {
-            State(null, 0L)
+            State(0L)
         }
     }
 
-    private fun writeState(ctx: Context, version: String, checkedAt: Long) {
+    private fun writeState(ctx: Context, checkedAt: Long) {
         try {
             val j = JSONObject()
-            j.put("version", version)
             j.put("checkedAt", checkedAt)
             stateFile(ctx).writeText(j.toString())
         } catch (_: Throwable) {
@@ -91,7 +90,7 @@ object DshUpdater {
             val body = fetchOrNull(NPM_REGISTRY) ?: fetchOrNull(NPM_REGISTRY_FALLBACK) ?: return null
             val j = JSONObject(body)
             val remote = j.optJSONObject("dist-tags")?.optString(tag)?.takeIf { it.isNotBlank() } ?: return null
-            writeState(ctx, cur, System.currentTimeMillis())
+            writeState(ctx, System.currentTimeMillis())
             if (compareVersions(remote, cur) <= 0) {
                 log("已是新版（本地 $cur，远端 $tag=$remote）")
                 null
@@ -106,17 +105,20 @@ object DshUpdater {
     }
 
     private fun fetchOrNull(url: String): String? {
+        var conn: HttpURLConnection? = null
         return try {
-            val conn = URL(url).openConnection() as HttpURLConnection
+            conn = URL(url).openConnection() as HttpURLConnection
             conn.connectTimeout = 20_000
             conn.readTimeout = 30_000
             conn.instanceFollowRedirects = true
             conn.setRequestProperty("User-Agent", "DshLauncher/4.0")
             conn.connect()
             if (conn.responseCode !in 200..399) return null
-            conn.inputStream.bufferedReader().use { it.readText() }.also { conn.disconnect() }
+            conn.inputStream.bufferedReader().use { it.readText() }
         } catch (_: Throwable) {
             null
+        } finally {
+            runCatching { conn?.disconnect() }
         }
     }
 

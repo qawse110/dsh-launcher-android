@@ -417,17 +417,24 @@ class PluginManagerActivity : AppCompatActivity() {
             try {
                 ensureHarnessTools()
                 appendLog(">> 重新装配内置插件…")
+                val apkVer = AssetSync.apkVersion(this)
                 val installScript = File(filesDir, "install-dsh.mjs")
-                assets.open("install-dsh.mjs").use { input ->
-                    installScript.outputStream().use { output -> input.copyTo(output) }
+                if (!AssetSync.copyAsset(this, "install-dsh.mjs", installScript)) {
+                    appendLog("   WARN 无法复制 install-dsh.mjs，尝试使用已有脚本")
+                    if (!installScript.exists()) {
+                        appendLog("   ✗ 重新装配失败：install-dsh.mjs 缺失")
+                        return@Thread
+                    }
                 }
                 val prebuilt = File(filesDir, "prebuilt.tgz")
-                try {
-                    assets.open("prebuilt.tgz").use { input ->
-                        prebuilt.outputStream().use { output -> input.copyTo(output) }
-                    }
-                } catch (t: Throwable) {
-                    appendLog("   WARN 无法复制 prebuilt.tgz: ${t.message}")
+                val prebuiltMarker = File(filesDir, ".prebuilt-ok")
+                if (AssetSync.isSynced(prebuiltMarker, prebuilt, apkVer)) {
+                    appendLog("   内置插件源已是最新，跳过复制")
+                } else if (AssetSync.copyAsset(this, "prebuilt.tgz", prebuilt)) {
+                    AssetSync.markSynced(prebuiltMarker, apkVer)
+                    appendLog("   内置插件源 ${prebuilt.length() / 1024 / 1024}MB")
+                } else {
+                    appendLog("   WARN 无法复制 prebuilt.tgz，继续使用已有源")
                 }
                 val node = File(File(nodeDir, "bin"), "node")
                 val cmd = "${node.absolutePath} ${installScript.absolutePath} --plugins-only"
@@ -436,6 +443,7 @@ class PluginManagerActivity : AppCompatActivity() {
                     put("DSH_PROFILE", "web")
                     put("DSH_PREBUILT", prebuilt.absolutePath)
                     put("DSH_PLUGINS_DIR", pluginsDir().absolutePath)
+                    put("DSH_APK_VER", apkVer.toString())
                 }
                 val code = runProcess(cmd, env, "重新装配")
                 appendLog(if (code == 0) "   ✓ 重新装配完成" else "   ✗ 重新装配失败（exit=$code）")

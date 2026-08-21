@@ -18,7 +18,7 @@
  *   HOME / NODE_BIN / NPM_BIN / DSH_PREFIX / DSH_PROFILE / DSH_PREBUILT
  *   DSH_PLUGINS_DIR / DSH_NODE_MEM / NPM_REGISTRY
  */
-import { existsSync, writeFileSync, mkdirSync, readFileSync, readdirSync, rmSync, cpSync, chmodSync, symlinkSync } from 'node:fs';
+import { existsSync, writeFileSync, mkdirSync, readFileSync, readdirSync, rmSync, cpSync, chmodSync, symlinkSync, readlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { gunzipSync } from 'node:zlib';
@@ -29,6 +29,7 @@ const NPM_BIN = process.env.NPM_BIN || join(HOME, 'node/bin/npm');
 const DSH_PREFIX = process.env.DSH_PREFIX || join(HOME, 'dsh-prefix');
 const DSH_PROFILE = process.env.DSH_PROFILE || 'web';
 const PREBUILT = process.env.DSH_PREBUILT || '';
+const DSH_APK_VER = process.env.DSH_APK_VER || '';
 const PLUGINS_DIR = process.env.DSH_PLUGINS_DIR || join(HOME, 'plugins');
 const EXTRA_PLUGINS_SRC = process.env.DSH_EXTRA_PLUGINS_SRC || join(HOME, 'extra-plugins');
 const TOOLS = join(HOME, '.tools');
@@ -168,8 +169,15 @@ function ensurePnpm() {
   // 注意：TOOLS/bin/pnpm 可能是 npm 生成的符号链接，必须先删掉再写文件，
   // 否则 writeFileSync 会跟着符号链接覆盖真正的 pnpm.mjs。
   const wrapper = join(TOOLS, 'bin/pnpm');
+  const wrapperBody = `#!/system/bin/sh\nexec "${NODE_BIN}" "${pnpmCjs}" "$@"\n`;
+  try {
+    if (existsSync(wrapper) && readFileSync(wrapper, 'utf8') === wrapperBody) {
+      log('pnpm wrapper up-to-date: ' + wrapper);
+      return pnpmCjs;
+    }
+  } catch {}
   rmSync(wrapper, { recursive: true, force: true });
-  writeFileSync(wrapper, `#!/system/bin/sh\nexec "${NODE_BIN}" "${pnpmCjs}" "$@"\n`);
+  writeFileSync(wrapper, wrapperBody);
   try { chmodSync(wrapper, 0o755); } catch {}
   log('pnpm wrapper: ' + wrapper);
   return pnpmCjs;
@@ -298,6 +306,7 @@ function untarWithPrefix(buf, dest, prefix) {
     off += 512 + Math.ceil(size / 512) * 512;
   }
   log(`untar: ${files} files (prefix=${strip}) -> ${dest}`);
+  return files;
 }
 
 function extractPlugins() {
@@ -305,17 +314,33 @@ function extractPlugins() {
     log('DSH_PREBUILT not set or missing, skip bundled plugin extraction');
     return;
   }
+  // 提取完成标记由脚本自己维护（不能由 prebuilt 拷贝侧维护）：APK 升级后
+  // prebuilt 可能已覆盖为新包，但 plugins 目录还是旧包，必须在提取成功后
+  // 才写标记；否则会误跳过新包的提取。
+  const extractedMarker = join(HOME, '.plugins-extracted-ok');
+  let markerOk = false;
+  if (DSH_APK_VER && existsSync(extractedMarker)) {
+    try { markerOk = readFileSync(extractedMarker, 'utf8').trim() === 'apk:' + DSH_APK_VER; } catch {}
+  }
+  if (markerOk && BUILTIN_PLUGINS.every((d) => existsSync(join(PLUGINS_DIR, d, 'package.json')))) {
+    log('bundled plugins already extracted for apk:' + DSH_APK_VER + ', skip untar');
+    return;
+  }
   try {
     mkdirSync(PLUGINS_DIR, { recursive: true });
     const raw = readFileSync(PREBUILT);
     const buf = (raw[0] === 0x1f && raw[1] === 0x8b) ? gunzipSync(raw) : raw;
-    untarWithPrefix(buf, PLUGINS_DIR, 'third_party');
+    let extractedFiles = untarWithPrefix(buf, PLUGINS_DIR, 'third_party');
     // 兼容直接打包 plugins.tgz（顶层就是插件目录而非 third_party/）：
     // 如果上面没解出任何东西且包内没有 third_party 前缀，再整体解到 plugins。
     const anyBuiltin = BUILTIN_PLUGINS.some((d) => existsSync(join(PLUGINS_DIR, d, 'package.json')));
     if (!anyBuiltin) {
       log('no third_party prefix found, try extracting archive to plugins dir directly');
-      untarWithPrefix(buf, PLUGINS_DIR, '');
+      extractedFiles += untarWithPrefix(buf, PLUGINS_DIR, '');
+    }
+    const builtinReady = BUILTIN_PLUGINS.some((d) => existsSync(join(PLUGINS_DIR, d, 'package.json')));
+    if (extractedFiles > 0 && builtinReady && DSH_APK_VER) {
+      try { writeFileSync(extractedMarker, 'apk:' + DSH_APK_VER + '\n'); } catch {}
     }
   } catch (t) {
     log('WARN extract plugins failed: ' + t.message);
@@ -419,12 +444,22 @@ function linkPluginDeps() {
     return;
   }
   try {
-    rmSync(dest, { recursive: true, force: true });
     mkdirSync(dest, { recursive: true });
+    const srcNames = new Set();
+    let kept = 0;
     let linked = 0;
+    let removed = 0;
     for (const ent of readdirSync(src, { withFileTypes: true })) {
+      srcNames.add(ent.name);
       const target = join(src, ent.name);
       const link = join(dest, ent.name);
+      let matches = false;
+      try { matches = readlinkSync(link) === target; } catch {}
+      if (matches) {
+        kept++;
+        continue;
+      }
+      rmSync(link, { recursive: true, force: true });
       try {
         symlinkSync(target, link);
         linked++;
@@ -432,7 +467,14 @@ function linkPluginDeps() {
         log('WARN link plugin dep ' + ent.name + ': ' + e.message);
       }
     }
-    log(`plugin dep bridge: ${linked} packages -> ${dest}`);
+    // 清理 dsh-prefix 中已不再存在的包对应的旧链接
+    for (const ent of readdirSync(dest, { withFileTypes: true })) {
+      if (!srcNames.has(ent.name)) {
+        rmSync(join(dest, ent.name), { recursive: true, force: true });
+        removed++;
+      }
+    }
+    log(`plugin dep bridge: ${kept} kept, ${linked} linked, ${removed} stale removed -> ${dest}`);
   } catch (e) {
     log('WARN linkPluginDeps: ' + e.message);
   }

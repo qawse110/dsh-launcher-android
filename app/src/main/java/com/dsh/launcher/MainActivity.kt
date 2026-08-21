@@ -412,17 +412,7 @@ class MainActivity : AppCompatActivity() {
      * 「插件管理 → 重新装配内置插件」（或控制台一键安装）。
      */
     private fun syncAssetsOnApkUpdate() {
-        val current = try {
-            if (Build.VERSION.SDK_INT >= 28) {
-                packageManager.getPackageInfo(packageName, 0).longVersionCode
-            } else {
-                @Suppress("DEPRECATION")
-                packageManager.getPackageInfo(packageName, 0).versionCode.toLong()
-            }
-        } catch (t: Throwable) {
-            AppLog.e("Main", "getPackageInfo failed: " + (t.message ?: t.toString()))
-            0L
-        }
+        val current = AssetSync.apkVersion(this)
         if (current == 0L) return
         val prefs = getSharedPreferences("dsh_ui", MODE_PRIVATE)
         val last = prefs.getLong("last_apk_version", 0L)
@@ -432,12 +422,19 @@ class MainActivity : AppCompatActivity() {
         thread {
             try {
                 for (name in listOf(
-                    "install-dsh.mjs", "prebuilt.tgz", "routing-suite.mjs",
+                    "install-dsh.mjs", "routing-suite.mjs",
                     "fs-register.mjs", "fs-loader.mjs", "fs-promises-compat.mjs", "stub-dsh.mjs"
                 )) {
-                    copyAssetIfPresent(name)
+                    AssetSync.copyAsset(this, name, File(filesDir, name))
                 }
-                copyAssetDirRecursive("extra-plugins", File(filesDir, "extra-plugins"))
+                val prebuilt = File(filesDir, "prebuilt.tgz")
+                if (AssetSync.copyAsset(this, "prebuilt.tgz", prebuilt)) {
+                    AssetSync.markSynced(File(filesDir, ".prebuilt-ok"), current)
+                }
+                val extraPlugins = File(filesDir, "extra-plugins")
+                if (AssetSync.copyAssetDir(this, "extra-plugins", extraPlugins, clearFirst = true)) {
+                    AssetSync.markSynced(File(filesDir, ".extra-plugins-ok"), current)
+                }
                 val dshInstalled = File(filesDir, "plugins").exists() && File(filesDir, "dsh-prefix").exists()
                 if (dshInstalled) {
                     prefs.edit().putBoolean("rewire_hint", true).apply()
@@ -450,41 +447,6 @@ class MainActivity : AppCompatActivity() {
                 }
             } catch (t: Throwable) {
                 AppLog.e("Main", "apk asset sync failed: " + (t.message ?: t.toString()))
-            }
-        }
-    }
-
-    private fun copyAssetIfPresent(name: String) {
-        try {
-            val target = File(filesDir, name)
-            assets.open(name).use { input ->
-                target.outputStream().use { output -> input.copyTo(output) }
-            }
-        } catch (t: Throwable) {
-            android.util.Log.w("DshMain", "copy asset $name skipped: ${t.message}")
-        }
-    }
-
-    private fun copyAssetDirRecursive(assetPath: String, dest: File) {
-        val children = try {
-            assets.list(assetPath)
-        } catch (t: Throwable) {
-            null
-        } ?: return
-        for (name in children) {
-            val childAsset = "$assetPath/$name"
-            val childDest = File(dest, name)
-            if (assets.list(childAsset) != null) {
-                copyAssetDirRecursive(childAsset, childDest)
-            } else {
-                try {
-                    childDest.parentFile?.mkdirs()
-                    assets.open(childAsset).use { input ->
-                        childDest.outputStream().use { output -> input.copyTo(output) }
-                    }
-                } catch (t: Throwable) {
-                    android.util.Log.w("DshMain", "copy asset dir $childAsset failed: ${t.message}")
-                }
             }
         }
     }

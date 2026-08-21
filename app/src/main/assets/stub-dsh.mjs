@@ -22,6 +22,8 @@ const DSH_PREFIX = process.env.DSH_PREFIX || join(HOME, 'dsh-prefix');
 const PROFILE = process.env.DSH_PROFILE || 'web';
 const NODE_MODULES = join(DSH_PREFIX, 'node_modules');
 const PNPM_DIR = join(NODE_MODULES, '.pnpm');
+const pkgCache = new Map();
+let pnpmEntries = null;
 const OUT = join(HOME, 'install_log.txt');
 const OUT_SHARED = '/sdcard/Download/DshLauncher/install_log.txt';
 
@@ -32,12 +34,31 @@ function log(m) {
   try { writeFileSync(OUT_SHARED, l + '\n', { flag: 'a' }); } catch {}
 }
 
-/** 在 npm 扁平布局或 pnpm .pnpm 布局下定位包内相对路径。 */
+/** 缓存 .pnpm 目录列表，避免几十次 findPkg 反复 readdirSync 同一个大目录。 */
+function getPnpmEntries() {
+  if (pnpmEntries !== null) return pnpmEntries;
+  try {
+    pnpmEntries = readdirSync(PNPM_DIR);
+  } catch {
+    pnpmEntries = [];
+  }
+  return pnpmEntries;
+}
+
+/** 在 npm 扁平布局或 pnpm .pnpm 布局下定位包内相对路径（带缓存）。 */
 function findPkg(pkgName, rel) {
+  const key = pkgName + '\u0000' + rel;
+  if (pkgCache.has(key)) return pkgCache.get(key);
+  const found = findPkgUncached(pkgName, rel);
+  pkgCache.set(key, found);
+  return found;
+}
+
+function findPkgUncached(pkgName, rel) {
   // pnpm v10: node_modules/.pnpm/<name>@<hash>/node_modules/<pkg>/<rel>
   if (existsSync(PNPM_DIR)) {
     const prefix = pkgName.replace('/', '+') + '@';
-    for (const d of readdirSync(PNPM_DIR)) {
+    for (const d of getPnpmEntries()) {
       if (!d.startsWith(prefix)) continue;
       const p = join(PNPM_DIR, d, 'node_modules', pkgName, rel);
       if (existsSync(p)) return p;

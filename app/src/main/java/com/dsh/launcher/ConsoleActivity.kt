@@ -254,6 +254,7 @@ class ConsoleActivity : AppCompatActivity() {
             try {
                 startKeepAlive()
                 val nodeDir = NodeRuntime.ensureExtracted(this)
+                val apkVer = AssetSync.apkVersion(this)
                 flowLog.parentFile?.mkdirs()
                 runCatching { flowLog.writeText("") }
                 fl("OK 1/4 node=$nodeDir")
@@ -317,21 +318,31 @@ class ConsoleActivity : AppCompatActivity() {
                     return@thread
                 }
                 val prebuilt = File(filesDir, "prebuilt.tgz")
-                try {
-                    assets.open("prebuilt.tgz").use { input ->
-                        prebuilt.outputStream().use { output -> input.copyTo(output) }
-                    }
+                val prebuiltMarker = File(filesDir, ".prebuilt-ok")
+                if (AssetSync.isSynced(prebuiltMarker, prebuilt, apkVer)) {
+                    fl("  内置插件源已是最新，跳过复制")
+                } else if (AssetSync.copyAsset(this, "prebuilt.tgz", prebuilt)) {
+                    AssetSync.markSynced(prebuiltMarker, apkVer)
                     fl("  内置插件源 ${prebuilt.length() / 1024 / 1024}MB")
-                } catch (t: Throwable) {
-                    fl("  assets 无 prebuilt.tgz：${t.message}")
+                } else {
+                    fl("  WARN assets 无 prebuilt.tgz，继续使用已有插件源")
                 }
                 val extraPluginsDir = File(filesDir, "extra-plugins")
-                try {
-                    copyAssetDir("extra-plugins", extraPluginsDir)
-                    val count = extraPluginsDir.walkTopDown().count { it.isFile }
-                    fl("  额外桥接插件源 ${count} 个文件")
-                } catch (t: Throwable) {
-                    fl("  WARN assets 无 extra-plugins：${t.message}")
+                val extraMarker = File(filesDir, ".extra-plugins-ok")
+                if (AssetSync.isSynced(extraMarker, extraPluginsDir, apkVer)) {
+                    fl("  额外桥接插件源已是最新，跳过复制")
+                } else {
+                    try {
+                        if (AssetSync.copyAssetDir(this, "extra-plugins", extraPluginsDir, clearFirst = true)) {
+                            AssetSync.markSynced(extraMarker, apkVer)
+                            val count = extraPluginsDir.walkTopDown().count { it.isFile }
+                            fl("  额外桥接插件源 ${count} 个文件")
+                        } else {
+                            fl("  WARN assets 无 extra-plugins")
+                        }
+                    } catch (t: Throwable) {
+                        fl("  WARN assets 无 extra-plugins：${t.message}")
+                    }
                 }
 
                 fl(">> 3/4 官方 npm 安装/更新 dsh + dsh plugin 装配内置插件…")
@@ -346,7 +357,8 @@ class ConsoleActivity : AppCompatActivity() {
                     "DSH_PREBUILT" to prebuilt.absolutePath,
                     "DSH_PLUGINS_DIR" to pluginsDir.absolutePath,
                     "DSH_EXTRA_PLUGINS_SRC" to extraPluginsDir.absolutePath,
-                    "DSH_TAG" to tag
+                    "DSH_TAG" to tag,
+                    "DSH_APK_VER" to apkVer.toString()
                 )
                 if (tag != "latest") fl("  （安装 dist-tag=$tag 预发布线）")
                 val installExit = runCommandAndWait("$nodeDir/bin/node ${installScript.absolutePath}", installEnv)
@@ -464,12 +476,7 @@ class ConsoleActivity : AppCompatActivity() {
      * dsh 更新或 APK 更新后自动重跑；stub 执行失败不写 marker。
      */
     private fun runAndroidStubOnce(nodeDir: File, dshPrefix: File, stubScript: File, fl: (String) -> Unit) {
-        val apkVer = try {
-            if (android.os.Build.VERSION.SDK_INT >= 28) packageManager.getPackageInfo(packageName, 0).longVersionCode
-            else @Suppress("DEPRECATION") packageManager.getPackageInfo(packageName, 0).versionCode.toLong()
-        } catch (_: Throwable) {
-            0L
-        }
+        val apkVer = AssetSync.apkVersion(this)
         val expected = "apk:$apkVer|dsh:${DshUpdater.currentVersion(this)}"
         val marker = File(filesDir, ".stub-applied")
         if (marker.exists() && marker.readText().trim() == expected) {
@@ -785,23 +792,6 @@ class ConsoleActivity : AppCompatActivity() {
             output.text = sb.toString()
             // 自动滚到底部
             (output.parent as? ScrollView)?.fullScroll(View.FOCUS_DOWN)
-        }
-    }
-
-    private fun copyAssetDir(assetPath: String, dest: File) {
-        val children = assets.list(assetPath) ?: return
-        dest.mkdirs()
-        for (name in children) {
-            val childAsset = "$assetPath/$name"
-            val childDest = File(dest, name)
-            if (assets.list(childAsset) != null) {
-                copyAssetDir(childAsset, childDest)
-            } else {
-                childDest.parentFile?.mkdirs()
-                assets.open(childAsset).use { input ->
-                    childDest.outputStream().use { output -> input.copyTo(output) }
-                }
-            }
         }
     }
 
