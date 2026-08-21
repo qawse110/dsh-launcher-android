@@ -34,6 +34,11 @@ class ConsoleActivity : AppCompatActivity() {
     private lateinit var stateView: TextView
     private val sb = StringBuilder()
 
+    companion object {
+        /** 控制台自身 prefs：一次性安装 tag（dsh_install_tag=next）等。 */
+        private const val CONSOLE_PREFS = "dsh_console"
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         DynamicColors.applyToActivityIfAvailable(this)
         super.onCreate(savedInstanceState)
@@ -832,7 +837,6 @@ class BuildKeepAliveService : Service() {
         const val ACTION_UPDATE_RUNNING = "com.dsh.launcher.action.BUILD_KEEPALIVE_RUNNING"
         private const val PREFS_NAME = "dsh_keepalive"
         private const val KEY_RUNNING = "running"
-        private const val CONSOLE_PREFS = "dsh_console"
 
         fun updateRunning(context: Context) {
             context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
