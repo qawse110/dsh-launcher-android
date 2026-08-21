@@ -23,7 +23,7 @@ object TermuxRuntime {
     private const val MARKER = ".termux-ok"
     private const val MARKER_VERSION = "6"
     private const val TOOLS_MARKER = ".harness-tools-ok"
-    private const val TOOLS_MARKER_VERSION = "3"
+    private const val TOOLS_MARKER_VERSION = "4"
     private const val DIR_NAME = "termux"
 
     /** 官方二进制硬编码的 Termux 前缀（长度 31）。 */
@@ -46,15 +46,16 @@ object TermuxRuntime {
 
     fun isBashReady(context: Context): Boolean = bashPath(context).isFile
 
-    /** Harness 附加工具（git/python/ripgrep）是否已安装就绪。 */
+    /** Harness 附加工具（git/rg/file/curl/less）是否已安装就绪。 */
     fun harnessToolsReady(context: Context): Boolean = runCatching {
         File(context.filesDir, TOOLS_MARKER).readText().trim() == TOOLS_MARKER_VERSION
     }.getOrDefault(false)
 
     /**
      * 确保内置 Termux 具备 dsh 与交互式终端所需工具：
-     * git（必需）、python / ripgrep / file / curl / less（优先级次之，缺了会尽力补齐）。
-     * 通过 pkg 安装；网络不可用或安装失败时返回 false，不破坏已有 Termux 环境。
+     * git / ripgrep / file / curl / less（wget 作为可选补充）。
+     * 一次 pkg 调用补齐缺失项，安装后统一 patch 官方路径并完成 dpkg 配置；
+     * 网络不可用或安装失败时返回 false，不破坏已有 Termux 环境。
      */
     @Synchronized
     fun ensureHarnessTools(context: Context, progress: (String) -> Unit = {}): Boolean {
@@ -81,66 +82,58 @@ object TermuxRuntime {
                 ).joinToString(":"),
                 "LD_LIBRARY_PATH" to "$usr/lib"
             )
-            progress("检查 Harness 工具（git / python / ripgrep / file / curl / less）…")
-            val check = runBash(bash, "command -v git >/dev/null 2>&1 && (command -v python >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1) && command -v rg >/dev/null 2>&1 && command -v file >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 && command -v less >/dev/null 2>&1", env, progress)
-            if (check == 0) {
+            progress("检查 Harness 工具（git / ripgrep / file / curl / less）…")
+            val requiredCheck = "command -v git >/dev/null 2>&1 && git --version >/dev/null 2>&1 && command -v rg >/dev/null 2>&1 && rg --version >/dev/null 2>&1 && command -v file >/dev/null 2>&1 && file --version >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 && curl --version >/dev/null 2>&1 && command -v less >/dev/null 2>&1 && less --version >/dev/null 2>&1"
+            if (runBash(bash, requiredCheck, env, progress) == 0) {
                 marker.writeText(TOOLS_MARKER_VERSION)
-                progress("Harness 工具已就绪（git + python + ripgrep + file + curl + less）")
+                progress("Harness 工具已就绪（git / ripgrep / file / curl / less）")
                 return true
             }
-            progress("安装补全 Harness 工具（git / python / ripgrep / file / curl / less / wget）…")
+            progress("补齐 Harness 工具（git / ripgrep / file / curl / less / wget，单次 pkg 完成）…")
             setRuntimeWritable(context, true)
             try {
-                var gitOk = File(usr, "bin/git").isFile
-                if (!gitOk) {
-                    val gitRc = runBash(bash, "pkg install -y git", env, progress)
-                    gitOk = File(usr, "bin/git").isFile
-                    if (!gitOk) {
-                        progress("git 安装未完成（exit=$gitRc），刷新软件源后重试一次…")
-                        runBash(bash, "pkg update -y", env, progress)
-                        runBash(bash, "pkg install -y git", env, progress)
-                        gitOk = File(usr, "bin/git").isFile
-                    }
+                val missing = buildList {
+                    if (!File(usr, "bin/git").isFile) add("git")
+                    if (!File(usr, "bin/rg").isFile) add("ripgrep")
+                    if (!File(usr, "bin/file").isFile) add("file")
+                    if (!File(usr, "bin/curl").isFile) add("curl")
+                    if (!File(usr, "bin/less").isFile) add("less")
+                    if (!File(usr, "bin/wget").isFile) add("wget")
                 }
-                var pythonOk = File(usr, "bin/python").isFile || File(usr, "bin/python3").isFile
-                if (!pythonOk) {
-                    val pyRc = runBash(bash, "pkg install -y python", env, progress)
-                    pythonOk = File(usr, "bin/python").isFile || File(usr, "bin/python3").isFile
-                    if (!pythonOk) progress("WARN: python 可选安装未成功（exit=$pyRc），不影响 Harness 核心")
-                }
-                var rgOk = File(usr, "bin/rg").isFile
-                if (!rgOk) {
-                    val rgRc = runBash(bash, "pkg install -y ripgrep", env, progress)
-                    rgOk = File(usr, "bin/rg").isFile
-                    if (!rgOk) progress("WARN: ripgrep 可选安装未成功（exit=$rgRc），将回退 @vscode/ripgrep-linux-arm64")
-                }
-                // Linux 命令行常用工具兜底：bootstrap 通常已带 curl/less，file/wget 可能缺失。
-                progress("检查/安装 Linux 常用工具（file / curl / less / wget）…")
-                var linuxCoreOk = File(usr, "bin/file").isFile && File(usr, "bin/curl").isFile && File(usr, "bin/less").isFile
-                if (!linuxCoreOk) {
-                    runBash(bash, "pkg install -y file curl less wget", env, progress)
-                    linuxCoreOk = File(usr, "bin/file").isFile && File(usr, "bin/curl").isFile && File(usr, "bin/less").isFile
-                }
-                val wgetOk = File(usr, "bin/wget").isFile
-                if (!wgetOk) progress("WARN: wget 可选安装未成功，使用 curl 可覆盖常用下载场景")
-                if (!linuxCoreOk) progress("WARN: Linux 常用工具(file/curl/less)未完全就绪，终端体验可能略降")
-
-                if (gitOk && linuxCoreOk) {
-                    marker.writeText(TOOLS_MARKER_VERSION)
-                    val ready = buildList {
-                        add("git")
-                        if (pythonOk) add("python")
-                        if (rgOk) add("ripgrep")
-                        add("file")
-                        add("curl")
-                        add("less")
-                        if (wgetOk) add("wget")
-                    }.joinToString(" + ")
-                    progress("Harness 工具就绪（$ready）")
+                val installRc = if (missing.isNotEmpty()) {
+                    runBash(bash, "pkg install -y --no-install-recommends ${missing.joinToString(" ")}", env, progress)
                 } else {
-                    progress("WARN: Harness 工具未完全就绪（git=$gitOk, linux-core=$linuxCoreOk），保留 marker 以便下次重试")
+                    0
                 }
-                return gitOk && linuxCoreOk
+                if (installRc != 0) progress("WARN: pkg install 返回 $installRc，将尝试完成未配置的包")
+
+                // 新装的包（二进制 + maintainer 脚本）仍带官方路径；先统一 patch，
+                // 再让 dpkg 重新 configure，避免 postinst 走官方 shebang 失败。
+                progress("适配新装包路径并完成 dpkg 配置…")
+                patchPrefixAll(usr)
+                patchTextOfficialDirs(usr)
+                val cfgRc = runBash(bash, "dpkg --configure -a", env, progress)
+                if (cfgRc != 0) {
+                    progress("WARN: dpkg --configure -a 返回 $cfgRc，再试 apt-get -f install…")
+                    runBash(bash, "apt-get install -y -f --no-install-recommends", env, progress)
+                }
+
+                val ready = runBash(bash, requiredCheck, env, progress) == 0
+                val extra = buildList {
+                    add("git")
+                    add("ripgrep")
+                    add("file")
+                    add("curl")
+                    add("less")
+                    if (File(usr, "bin/wget").isFile) add("wget")
+                }.joinToString(" + ")
+                if (ready) {
+                    marker.writeText(TOOLS_MARKER_VERSION)
+                    progress("Harness 工具就绪（$extra）")
+                } else {
+                    progress("WARN: Harness 工具未完全就绪（$extra），保留 marker 下次重试")
+                }
+                return ready
             } finally {
                 setRuntimeWritable(context, false)
             }
@@ -386,24 +379,42 @@ object TermuxRuntime {
      */
     private fun patchTextOfficialDirs(usr: File) {
         try {
-            val old = "/data/data/com.termux/files"
-            val mirror = "/data/user/0/com.dsh.launcher/data/data/com.termux/files"
+            val dataDir = usr.parentFile?.parentFile?.parentFile?.absolutePath
+                ?: throw IllegalStateException("invalid usr path: $usr")
+            val oldFiles = "/data/data/com.termux/files"
+            val mirFiles = "$dataDir/data/data/com.termux/files"
+            val oldAptCache = "/data/data/com.termux/cache/apt"
+            val newAptCache = "${usr.absolutePath}/var/cache/apt"
+            // oldFiles 恰好是 mirFiles 的后缀，直接 replace 会二次替换导致路径损坏；
+            // 用一次性 token 把已 patch 好的路径保护起来，保证幂等。
+            val token = "@@DSH_MIRROR_FILES@@"
             var patched = 0
             usr.walkTopDown().forEach { f ->
                 if (!f.isFile || java.nio.file.Files.isSymbolicLink(f.toPath())) return@forEach
                 try {
                     val bytes = java.nio.file.Files.readAllBytes(f.toPath())
                     if (bytes.any { it == 0.toByte() }) return@forEach
-                    val text = String(bytes, Charsets.ISO_8859_1)
-                    if (text.contains(old)) {
-                        val fixed = text.replace(old, mirror)
-                        java.nio.file.Files.write(f.toPath(), fixed.toByteArray(Charsets.ISO_8859_1))
+                    var text = String(bytes, Charsets.ISO_8859_1)
+                    var changed = false
+                    if (text.contains(mirFiles)) {
+                        text = text.replace(mirFiles, token).replace(oldFiles, mirFiles).replace(token, mirFiles)
+                        changed = true
+                    } else if (text.contains(oldFiles)) {
+                        text = text.replace(oldFiles, mirFiles)
+                        changed = true
+                    }
+                    if (text.contains(oldAptCache)) {
+                        text = text.replace(oldAptCache, newAptCache)
+                        changed = true
+                    }
+                    if (changed) {
+                        java.nio.file.Files.write(f.toPath(), text.toByteArray(Charsets.ISO_8859_1))
                         patched++
                     }
                 } catch (_: Throwable) {
                 }
             }
-            android.util.Log.i("TermuxRuntime", "patched $patched text files for official files path")
+            android.util.Log.i("TermuxRuntime", "patched $patched text files for official paths")
         } catch (t: Throwable) {
             android.util.Log.w("TermuxRuntime", "patchTextOfficialDirs failed: ${t.message}")
         }

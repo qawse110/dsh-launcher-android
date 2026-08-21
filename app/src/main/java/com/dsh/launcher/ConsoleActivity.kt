@@ -293,11 +293,11 @@ class ConsoleActivity : AppCompatActivity() {
                     }
                     return@thread
                 }
-                fl(">> 1.5/4 准备内置 Termux（bash/coreutils + git/python）…")
+                fl(">> 1.5/4 准备内置 Termux（bash/coreutils + git/rg/file）…")
                 try {
                     TermuxRuntime.ensureExtracted(this) { msg -> fl(msg) }
                     TermuxRuntime.ensureHarnessTools(this) { msg -> fl(msg) }
-                    fl("OK 1.5/4 termux ready (bash + git + python)")
+                    fl("OK 1.5/4 termux ready (bash + git + ripgrep + file)")
                 } catch (t: Throwable) {
                     fl("WARN 1.5/4 termux prepare failed: ${t.message}（继续 dsh 安装，dsh bash 工具可能不可用）")
                 }

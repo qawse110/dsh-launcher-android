@@ -486,7 +486,7 @@ class PluginManagerActivity : AppCompatActivity() {
         runDshPlugin(listOf("remove", name), "卸载 $name")
     }
 
-    /** 确保内置 Termux 与 Harness 工具（git/python）就绪，失败仅记录不中断插件操作。 */
+    /** 确保内置 Termux 与 Harness 工具（git/rg/file 等）就绪，失败仅记录不中断插件操作。 */
     private fun ensureHarnessTools() {
         try {
             if (!TermuxRuntime.isReady(this)) {
