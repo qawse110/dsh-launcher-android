@@ -385,7 +385,7 @@ class ConsoleActivity : AppCompatActivity() {
                         fl("WARN assets copy $name: ${t.message}")
                     }
                 }
-                runAndroidStubOnce(nodeDir, dshPrefix, stubScript, fl)
+                runAndroidStubOnce(nodeDir, dshPrefix, stubScript, ::fl)
 
                 // 仅安装/更新模式：到此结束，不启动 web（不置 running，watchdog 不会拉起）
                 if (installOnly) {
