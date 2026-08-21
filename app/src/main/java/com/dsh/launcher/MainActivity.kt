@@ -224,13 +224,13 @@ class MainActivity : AppCompatActivity() {
             addView(Ui.button(this@MainActivity, "刷新", { refreshStatus() },
                 filled = false, compact = true).apply { minWidth = dp(76); textSize = 12.5f })
         })
-        // 第二行：大号状态点 + 状态文字 + 端口提示
+        // 第二行：大号状态点（带同色光晕描边）+ 状态文字 + 版本与端口提示
         statusCol.addView(LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(0, dp(14), 0, 0)
-            statusDot = Ui.dot(this@MainActivity, 12, Ui.TEXT_MUTED)
-            addView(statusDot, LinearLayout.LayoutParams(dp(12), dp(12)).apply { rightMargin = dp(10) })
+            statusDot = Ui.dot(this@MainActivity, 14, Ui.TEXT_MUTED)
+            addView(statusDot, LinearLayout.LayoutParams(dp(14), dp(14)).apply { rightMargin = dp(10) })
             statusValue = TextView(this@MainActivity).apply {
                 text = getString(R.string.status_unknown)
                 textSize = 18f
@@ -239,7 +239,7 @@ class MainActivity : AppCompatActivity() {
             }
             addView(statusValue, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(TextView(this@MainActivity).apply {
-                text = "http://127.0.0.1:3080"
+                text = "v${DshUpdater.currentVersion(this@MainActivity)} · 3080"
                 textSize = 11f
                 setTextColor(Ui.TEXT_MUTED)
             })
@@ -304,12 +304,20 @@ class MainActivity : AppCompatActivity() {
                     getString(R.string.btn_stop_all), { stopDshAll() }, color = Ui.DANGER)
         }
 
-        // Section: 日志
-        root.addView(Ui.sectionLabel(this, "日志").apply {
+        // Section: 日志（标题行右侧带「清空」小按钮）
+        root.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply { topMargin = dp(20) }
+            addView(Ui.sectionLabel(this@MainActivity, "日志"),
+                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(Ui.button(this@MainActivity, "清空", {
+                logSb.clear()
+                logView.text = ""
+            }, filled = false, compact = true).apply { minWidth = dp(64); textSize = 12f })
         })
 
         // 反馈日志栏
@@ -335,11 +343,16 @@ class MainActivity : AppCompatActivity() {
         })
         val envCard = Ui.card(this, radiusDp = 14, background = Ui.SURFACE_CONTAINER_LOW, elevationDp = 0f)
         val envList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        fun envRow(text: String, color: Int): TextView = TextView(this@MainActivity).apply {
-            this.text = text
-            textSize = 12.5f
-            setTextColor(color)
-            setPadding(0, dp(3), 0, 0)
+        fun envRow(text: String, color: Int): View = LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(4), 0, dp(2))
+            addView(Ui.dot(this@MainActivity, 7, color), LinearLayout.LayoutParams(dp(7), dp(7)).apply { rightMargin = dp(8) })
+            addView(TextView(this@MainActivity).apply {
+                this.text = text
+                textSize = 12.5f
+                setTextColor(color)
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         }
         // 内置 Node / Termux 状态
         envList.addView(envRow(
@@ -362,13 +375,30 @@ class MainActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = dp(8) })
 
-        root.addView(TextView(this).apply {
-            text = "操作步骤：\n① 点“⚡ 安装 / 更新 DSH”自动完成：内置 Node 解压 → 官方 npm 安装/更新 dsh → dsh plugin 装配内置插件（首次需联网下载，之后增量更新，不会自动启动）；\n② 点“启动 DSH”启动 Web 服务，“打开 Web 界面”进入 dsh UI（http://127.0.0.1:3080）；\n③ “停止 dsh 服务”结束后台进程与保活服务。\n\n提示：\n· 全程免 Termux，内置 Node 为 aarch64 运行时；\n· 安装日志：/sdcard/Download/DshLauncher/install_log.txt。"
+        // 操作步骤：默认收起（长帮助文本不再占据首屏），点击标题展开/收起
+        var helpExpanded = false
+        val helpTitle = TextView(this).apply {
+            text = "📖 操作步骤与提示 ▸"
+            textSize = 12.5f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Ui.TEXT_SECONDARY)
+            setPadding(0, dp(18), 0, dp(2))
+        }
+        val helpBody = TextView(this).apply {
+            text = "① 点“⚡ 安装 / 更新 DSH”自动完成：内置 Node 解压 → 官方 npm 安装/更新 dsh → dsh plugin 装配内置插件（首次需联网下载，之后增量更新，不会自动启动）；\n② 点“启动 DSH”启动 Web 服务，“打开 Web 界面”进入 dsh UI（http://127.0.0.1:3080）；\n③ “停止 dsh 服务”结束后台进程与保活服务。\n\n提示：\n· 全程免 Termux，内置 Node 为 aarch64 运行时；\n· 安装日志：/sdcard/Download/DshLauncher/install_log.txt。"
             textSize = 12f
             setTextColor(Ui.TEXT_MUTED)
-            setPadding(0, dp(18), 0, 0)
+            setPadding(0, dp(4), 0, 0)
             setLineSpacing(dp(3).toFloat(), 1f)
-        })
+            visibility = View.GONE
+        }
+        helpTitle.setOnClickListener {
+            helpExpanded = !helpExpanded
+            helpBody.visibility = if (helpExpanded) View.VISIBLE else View.GONE
+            helpTitle.text = if (helpExpanded) "📖 操作步骤与提示 ▾" else "📖 操作步骤与提示 ▸"
+        }
+        root.addView(helpTitle)
+        root.addView(helpBody)
 
         return ScrollView(this).apply { addView(root) }
     }
@@ -538,6 +568,8 @@ class MainActivity : AppCompatActivity() {
                 statusDot.background = android.graphics.drawable.GradientDrawable().apply {
                     shape = android.graphics.drawable.GradientDrawable.OVAL
                     setColor(color)
+                    // 同色半透明描边 = 轻量光晕，状态点更醒目
+                    setStroke(dp(3), Ui.withAlpha(color, 0x38))
                 }
                 if (!silent) log(if (running) "dsh 服务：运行中（3080 端口）" else "dsh 服务：未运行")
             }
