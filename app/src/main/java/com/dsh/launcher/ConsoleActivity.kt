@@ -385,15 +385,7 @@ class ConsoleActivity : AppCompatActivity() {
                         fl("WARN assets copy $name: ${t.message}")
                     }
                 }
-                runCommandAndWait(
-                    "$nodeDir/bin/node ${stubScript.absolutePath}",
-                    mapOf(
-                        "HOME" to filesDir.absolutePath,
-                        "NODE_DIR" to nodeDir.absolutePath,
-                        "DSH_PREFIX" to dshPrefix.absolutePath,
-                        "DSH_PROFILE" to "web"
-                    )
-                )
+                runAndroidStubOnce(nodeDir, dshPrefix, stubScript, fl)
 
                 // 仅安装/更新模式：到此结束，不启动 web（不置 running，watchdog 不会拉起）
                 if (installOnly) {
@@ -458,20 +450,47 @@ class ConsoleActivity : AppCompatActivity() {
         }
         val stubScript = File(filesDir, "stub-dsh.mjs")
         if (stubScript.exists()) {
-            runCommandAndWait(
-                "$nodeDir/bin/node ${stubScript.absolutePath}",
-                mapOf(
-                    "HOME" to filesDir.absolutePath,
-                    "NODE_DIR" to nodeDir.absolutePath,
-                    "DSH_PREFIX" to dshPrefix.absolutePath,
-                    "DSH_PROFILE" to "web"
-                )
-            )
+            runAndroidStubOnce(nodeDir, dshPrefix, stubScript, fl)
         } else {
             fl("WARN 未找到 stub-dsh.mjs，继续尝试启动 web")
         }
         fl(">> 启动 dsh web…")
         return startDshWeb(nodeDir, dshPrefix)
+    }
+
+    /**
+     * Android 兼容修复（stub-dsh.mjs）按版本只跑一次：
+     * marker 记录「APK 版本 + dsh 版本」，两者都没变则跳过（省 2~5 秒启动时间）。
+     * dsh 更新或 APK 更新后自动重跑；stub 执行失败不写 marker。
+     */
+    private fun runAndroidStubOnce(nodeDir: File, dshPrefix: File, stubScript: File, fl: (String) -> Unit) {
+        val apkVer = try {
+            if (android.os.Build.VERSION.SDK_INT >= 28) packageManager.getPackageInfo(packageName, 0).longVersionCode
+            else @Suppress("DEPRECATION") packageManager.getPackageInfo(packageName, 0).versionCode.toLong()
+        } catch (_: Throwable) {
+            0L
+        }
+        val expected = "apk:$apkVer|dsh:${DshUpdater.currentVersion(this)}"
+        val marker = File(filesDir, ".stub-applied")
+        if (marker.exists() && marker.readText().trim() == expected) {
+            fl(">> Android 兼容修复已应用（$expected），跳过 stub")
+            return
+        }
+        val exit = runCommandAndWait(
+            "$nodeDir/bin/node ${stubScript.absolutePath}",
+            mapOf(
+                "HOME" to filesDir.absolutePath,
+                "NODE_DIR" to nodeDir.absolutePath,
+                "DSH_PREFIX" to dshPrefix.absolutePath,
+                "DSH_PROFILE" to "web",
+                "DSH_APK_VER" to apkVer.toString()
+            )
+        )
+        if (exit == 0) {
+            runCatching { marker.writeText(expected) }
+        } else {
+            fl("WARN stub-dsh 退出码 $exit（不写 marker，下次重跑）")
+        }
     }
 
     /** 后台启动 dsh web 并等待 HTTP 就绪。端口已有监听但无响应时清场重启（幂等但不再盲信）。 */
@@ -535,7 +554,8 @@ class ConsoleActivity : AppCompatActivity() {
         true
     }
 
-    /** 轮询等待 dsh web 的 HTTP 真正可访问，超时后打印 dsh-web.log 尾部。 */
+    /** 轮询等待 dsh web 的 HTTP 真正可访问，超时后打印 dsh-web.log 尾部。
+     *  前 6 秒每 150ms 探测一次（node 冷启动通常 1~3s，尽快感知就绪），之后放宽到 500ms。 */
     private fun waitForWebReady(timeoutMs: Long): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMs
         var lastLog = 0L
@@ -546,7 +566,8 @@ class ConsoleActivity : AppCompatActivity() {
                 lastLog = now
                 appendLine("   等待 dsh web 就绪…（剩余 ${(deadline - now) / 1000}s）")
             }
-            Thread.sleep(500)
+            val elapsed = timeoutMs - (deadline - now)
+            Thread.sleep(if (elapsed < 6_000) 150 else 500)
         }
         appendLine("✗ dsh web 未在 ${timeoutMs / 1000} 秒内就绪，日志尾部：")
         appendLogTail(File(filesDir, "dsh-web.log"), 25)
@@ -739,7 +760,19 @@ class ConsoleActivity : AppCompatActivity() {
     }
 
     private fun setState(s: String) {
-        runOnUiThread { stateView.text = "状态：$s" }
+        runOnUiThread {
+            stateView.text = "状态：$s"
+            // 状态 pill：按语义着色（出错红 / 运行绿 / 进行中蓝 / 其它灰）
+            val color = when {
+                s.contains("出错") || s.contains("失败") -> Ui.DANGER
+                s.contains("运行中") || s.contains("完成") -> Ui.SUCCESS
+                s.contains("安装") || s.contains("启动") || s.contains("更新") -> Ui.BRAND
+                else -> Ui.TEXT_SECONDARY
+            }
+            stateView.setTextColor(color)
+            stateView.background = Ui.rounded(this, Ui.withAlpha(color, 0x1A), 10, color, 1)
+            stateView.setPadding(dp(8), dp(3), dp(8), dp(3))
+        }
     }
 
     private fun appendLine(line: String) {
