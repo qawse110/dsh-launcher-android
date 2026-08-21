@@ -23,7 +23,7 @@ object TermuxRuntime {
     private const val MARKER = ".termux-ok"
     private const val MARKER_VERSION = "6"
     private const val TOOLS_MARKER = ".harness-tools-ok"
-    private const val TOOLS_MARKER_VERSION = "2"
+    private const val TOOLS_MARKER_VERSION = "3"
     private const val DIR_NAME = "termux"
 
     /** 官方二进制硬编码的 Termux 前缀（长度 31）。 */
@@ -52,15 +52,19 @@ object TermuxRuntime {
     }.getOrDefault(false)
 
     /**
-     * 确保内置 Termux 具备 DeepSeek Harness 所需附加工具：git（必需）与 python、ripgrep（可选）。
+     * 确保内置 Termux 具备 dsh 与交互式终端所需工具：
+     * git（必需）、python / ripgrep / file / curl / less（优先级次之，缺了会尽力补齐）。
      * 通过 pkg 安装；网络不可用或安装失败时返回 false，不破坏已有 Termux 环境。
      */
     @Synchronized
     fun ensureHarnessTools(context: Context, progress: (String) -> Unit = {}): Boolean {
         try {
             val usr = prefix(context)
-            if (harnessToolsReady(context)) return true
             if (!isBashReady(context)) return false
+            // 每次调用都刷新 profile/inputrc（幂等），保证交互式终端体验即时生效
+            writeLinuxProfile(usr)
+            writeInputRc(usr)
+            if (harnessToolsReady(context)) return true
             val bash = bashPath(context).absolutePath
             val home = home(context).absolutePath
             val tmp = tmp(context).absolutePath
@@ -77,23 +81,26 @@ object TermuxRuntime {
                 ).joinToString(":"),
                 "LD_LIBRARY_PATH" to "$usr/lib"
             )
-            progress("检查 Harness 工具（git / python / ripgrep）…")
-            val check = runBash(bash, "command -v git >/dev/null 2>&1 && (command -v python >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1) && command -v rg >/dev/null 2>&1", env, progress)
+            progress("检查 Harness 工具（git / python / ripgrep / file / curl / less）…")
+            val check = runBash(bash, "command -v git >/dev/null 2>&1 && (command -v python >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1) && command -v rg >/dev/null 2>&1 && command -v file >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 && command -v less >/dev/null 2>&1", env, progress)
             if (check == 0) {
                 marker.writeText(TOOLS_MARKER_VERSION)
-                progress("Harness 工具已就绪（git + python + ripgrep）")
+                progress("Harness 工具已就绪（git + python + ripgrep + file + curl + less）")
                 return true
             }
-            progress("安装 Harness 工具：git（必需）+ python / ripgrep（可选）…")
+            progress("安装补全 Harness 工具（git / python / ripgrep / file / curl / less / wget）…")
             setRuntimeWritable(context, true)
             try {
-                val gitRc = runBash(bash, "pkg install -y git", env, progress)
                 var gitOk = File(usr, "bin/git").isFile
                 if (!gitOk) {
-                    progress("git 安装未完成（exit=$gitRc），刷新软件源后重试一次…")
-                    runBash(bash, "pkg update -y", env, progress)
-                    runBash(bash, "pkg install -y git", env, progress)
+                    val gitRc = runBash(bash, "pkg install -y git", env, progress)
                     gitOk = File(usr, "bin/git").isFile
+                    if (!gitOk) {
+                        progress("git 安装未完成（exit=$gitRc），刷新软件源后重试一次…")
+                        runBash(bash, "pkg update -y", env, progress)
+                        runBash(bash, "pkg install -y git", env, progress)
+                        gitOk = File(usr, "bin/git").isFile
+                    }
                 }
                 var pythonOk = File(usr, "bin/python").isFile || File(usr, "bin/python3").isFile
                 if (!pythonOk) {
@@ -107,18 +114,33 @@ object TermuxRuntime {
                     rgOk = File(usr, "bin/rg").isFile
                     if (!rgOk) progress("WARN: ripgrep 可选安装未成功（exit=$rgRc），将回退 @vscode/ripgrep-linux-arm64")
                 }
-                if (gitOk) {
+                // Linux 命令行常用工具兜底：bootstrap 通常已带 curl/less，file/wget 可能缺失。
+                progress("检查/安装 Linux 常用工具（file / curl / less / wget）…")
+                var linuxCoreOk = File(usr, "bin/file").isFile && File(usr, "bin/curl").isFile && File(usr, "bin/less").isFile
+                if (!linuxCoreOk) {
+                    runBash(bash, "pkg install -y file curl less wget", env, progress)
+                    linuxCoreOk = File(usr, "bin/file").isFile && File(usr, "bin/curl").isFile && File(usr, "bin/less").isFile
+                }
+                val wgetOk = File(usr, "bin/wget").isFile
+                if (!wgetOk) progress("WARN: wget 可选安装未成功，使用 curl 可覆盖常用下载场景")
+                if (!linuxCoreOk) progress("WARN: Linux 常用工具(file/curl/less)未完全就绪，终端体验可能略降")
+
+                if (gitOk && linuxCoreOk) {
                     marker.writeText(TOOLS_MARKER_VERSION)
                     val ready = buildList {
                         add("git")
                         if (pythonOk) add("python")
                         if (rgOk) add("ripgrep")
+                        add("file")
+                        add("curl")
+                        add("less")
+                        if (wgetOk) add("wget")
                     }.joinToString(" + ")
-                    progress(if (ready.isNotEmpty()) "Harness 工具就绪（$ready）" else "Harness 工具就绪（git）")
+                    progress("Harness 工具就绪（$ready）")
                 } else {
-                    progress("WARN: git 仍未就绪，可稍后重试")
+                    progress("WARN: Harness 工具未完全就绪（git=$gitOk, linux-core=$linuxCoreOk），保留 marker 以便下次重试")
                 }
-                return gitOk
+                return gitOk && linuxCoreOk
             } finally {
                 setRuntimeWritable(context, false)
             }
@@ -200,6 +222,8 @@ object TermuxRuntime {
             patchTextOfficialDirs(usr)
             writeAptConfig(context, usr)
             writeShellAptHelper(usr)
+            writeLinuxProfile(usr)
+            writeInputRc(usr)
             disableSecondStageFallback(usr)
 
             // 可写业务目录：home / tmp / var（apt/dpkg 需要 var 可写）
@@ -451,6 +475,73 @@ object TermuxRuntime {
             android.util.Log.i("TermuxRuntime", "shell apt helper written")
         } catch (t: Throwable) {
             android.util.Log.w("TermuxRuntime", "writeShellAptHelper failed: ${t.message}")
+        }
+    }
+
+    /**
+     * 写入 Linux 风格的交互式 shell profile：
+     * 彩色 ls / grep、ll/la 等常用别名、EDITOR/PAGER 以及 which 函数，
+     * 让内置终端和传统 Linux 终端行为更接近。
+     */
+    private fun writeLinuxProfile(usr: File) {
+        try {
+            val dir = File(usr, "etc/profile.d")
+            dir.mkdirs()
+            val profile = File(dir, "00-dsh-env.sh")
+            profile.writeText(
+                """
+                # dsh-launcher: Linux-like interactive shell profile
+                export EDITOR=nano
+                export PAGER=less
+                export MANPAGER=less
+
+                alias ls='ls --color=auto'
+                alias ll='ls -AlhF --color=auto'
+                alias la='ls -A --color=auto'
+                alias l='ls -CF --color=auto'
+                alias grep='grep --color=auto'
+                alias egrep='egrep --color=auto'
+                alias fgrep='fgrep --color=auto'
+                alias df='df -h'
+                alias du='du -h'
+
+                which() { command -v "${'$'}@" 2>/dev/null || return 1; }
+
+                case "${'$'}TERM" in
+                  xterm*|screen*|tmux*)
+                    PS1='\[\e]0;\u@\h: \w\a\]\[\e[01;32m\]\u@\h\[\e[00m\]:\[\e[01;34m\]\w\[\e[00m\]\$ '
+                    ;;
+                  *)
+                    PS1='\u@\h:\w\$ '
+                    ;;
+                esac
+                export PS1
+                """.trimIndent() + "\n"
+            )
+            profile.setExecutable(true, false)
+            android.util.Log.i("TermuxRuntime", "linux shell profile written")
+        } catch (t: Throwable) {
+            android.util.Log.w("TermuxRuntime", "writeLinuxProfile failed: ${t.message}")
+        }
+    }
+
+    /** 写 readline 配置，让 bash 在交互终端中的补全/粘贴体验更接近 Linux。 */
+    private fun writeInputRc(usr: File) {
+        try {
+            val dir = File(usr, "etc")
+            dir.mkdirs()
+            File(dir, "inputrc").writeText(
+                """
+                set enable-bracketed-paste on
+                set show-all-if-ambiguous on
+                set completion-ignore-case on
+                set bell-style visible
+                set colored-stats on
+                """.trimIndent() + "\n"
+            )
+            android.util.Log.i("TermuxRuntime", "readline inputrc written")
+        } catch (t: Throwable) {
+            android.util.Log.w("TermuxRuntime", "writeInputRc failed: ${t.message}")
         }
     }
 

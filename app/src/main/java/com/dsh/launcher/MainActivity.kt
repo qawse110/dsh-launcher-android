@@ -281,12 +281,12 @@ class MainActivity : AppCompatActivity() {
                         log("准备内置 Termux 环境（首次约 10~60 秒）…")
                         try {
                             TermuxRuntime.ensureExtracted(this@MainActivity) { msg -> log(msg) }
-                            TermuxRuntime.ensureHarnessTools(this@MainActivity) { msg -> log(msg) }
-                            log("Termux 环境就绪，打开终端…")
+                            log("Termux 环境已解压，检查/安装 Harness 工具与 Linux 常用命令…")
                         } catch (t: Throwable) {
                             log("✗ Termux 准备失败：${t.message}（回退系统 sh）")
                         }
                     }
+                    TermuxRuntime.ensureHarnessTools(this@MainActivity) { msg -> log(msg) }
                     runOnUiThread {
                         startActivity(Intent(this@MainActivity, TerminalActivity::class.java))
                     }
