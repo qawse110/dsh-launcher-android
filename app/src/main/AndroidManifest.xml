@@ -39,9 +39,17 @@
 
         <activity
             android:name=".WebViewActivity"
-            android:exported="false"
+            android:exported="true"
             android:launchMode="singleTask"
-            android:configChanges="orientation|screenSize|keyboardHidden" />
+            android:configChanges="orientation|screenSize|keyboardHidden">
+            <!-- codex://new?prompt=... 等 deep link：打开 WebUI 并自动填入指令 -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="codex" />
+            </intent-filter>
+        </activity>
 
         <activity
             android:name=".TerminalActivity"
