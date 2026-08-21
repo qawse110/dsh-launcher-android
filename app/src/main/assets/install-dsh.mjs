@@ -17,6 +17,7 @@
  * 环境变量：
  *   HOME / NODE_BIN / NPM_BIN / DSH_PREFIX / DSH_PROFILE / DSH_PREBUILT
  *   DSH_PLUGINS_DIR / DSH_NODE_MEM / NPM_REGISTRY
+ *   DSH_NPM_TIMEOUT_MS / DSH_PLUGIN_TIMEOUT_MS（子进程硬超时，防网络卡死）
  */
 import { existsSync, writeFileSync, mkdirSync, readFileSync, readdirSync, rmSync, cpSync, chmodSync, symlinkSync, readlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -36,6 +37,15 @@ const TOOLS = join(HOME, '.tools');
 const TERMUX = process.env.TERMUX_PREFIX || join(HOME, 'termux/usr');
 const REGISTRY = process.env.NPM_REGISTRY || 'https://registry.npmmirror.com';
 const PNPM_VERSION = '11.7.0';
+// 防卡死：所有子进程都有硬超时；npm 网络层自带重试/超时，避免 TCP 半开连接无限等待
+const NPM_TIMEOUT_MS = Number(process.env.DSH_NPM_TIMEOUT_MS || 15 * 60_000);
+const PLUGIN_TIMEOUT_MS = Number(process.env.DSH_PLUGIN_TIMEOUT_MS || 5 * 60_000);
+const NPM_NET_ARGS = [
+  '--fetch-timeout=120000',
+  '--fetch-retries=5',
+  '--fetch-retry-mintimeout=2000',
+  '--fetch-retry-maxtimeout=60000',
+];
 const OUT = join(HOME, 'install_log.txt');
 const OUT_SHARED = '/sdcard/Download/DshLauncher/install_log.txt';
 const BUILTIN_PLUGINS = [
@@ -76,11 +86,24 @@ function log(m) {
 }
 
 function run(cmd, args, opts = {}) {
-  log('$ ' + cmd + ' ' + args.join(' '));
-  const r = spawnSync(cmd, args, { stdio: 'inherit', ...opts });
+  const timeoutMs = opts.timeoutMs ?? 10 * 60_000;
+  const started = Date.now();
+  log('$ ' + cmd + ' ' + args.join(' ') + ` (timeout=${Math.round(timeoutMs / 1000)}s)`);
+  const { timeoutMs: _ignored, ...spawnOpts } = opts;
+  // stdin 用 ignore：子进程任何交互式提示都会立刻读到 EOF 而不是永远等待
+  const r = spawnSync(cmd, args, {
+    stdio: ['ignore', 'inherit', 'inherit'],
+    timeout: timeoutMs,
+    killSignal: 'SIGKILL',
+    ...spawnOpts,
+  });
   const sig = r.signal ? ' signal=' + r.signal : '';
   const err = r.error ? ' error=' + r.error.message : '';
-  log(`exit=${r.status}${sig}${err} (${cmd})`);
+  const secs = ((Date.now() - started) / 1000).toFixed(1);
+  log(`exit=${r.status}${sig}${err} (${cmd}, ${secs}s)`);
+  if (r.error && /timed out|timeout/i.test(String(r.error.message))) {
+    log('TIMEOUT: 子进程超时被强制结束，请检查网络后重试');
+  }
   return r.status === 0;
 }
 
@@ -112,6 +135,7 @@ function envBase(extra = {}) {
     TMP: join(HOME, 'tmp'),
     TEMP: join(HOME, 'tmp'),
     TERM: 'xterm-256color',
+    CI: '1',
     OPENSSL_CONF: '/dev/null',
     PATH: pathParts.join(':'),
     ...extra,
@@ -155,8 +179,8 @@ function ensurePnpm() {
     log('installing pnpm@' + PNPM_VERSION + ' ...');
     const r = run(NPM_BIN, [
       'install', '-g', `pnpm@${PNPM_VERSION}`, '--prefix', TOOLS,
-      '--registry', REGISTRY, '--no-audit', '--no-fund',
-    ], { env: envBase() });
+      '--registry', REGISTRY, '--no-audit', '--no-fund', ...NPM_NET_ARGS,
+    ], { env: envBase(), timeoutMs: NPM_TIMEOUT_MS });
     if (!r) {
       log('FATAL: pnpm install failed');
       process.exit(1);
@@ -187,10 +211,17 @@ function ensureDsh() {
   mkdirSync(DSH_PREFIX, { recursive: true });
   const tag = process.env.DSH_TAG || 'latest';
   log(`install/update @deepseek-ai/dsh@${tag} via npm ...`);
-  const ok = run(NPM_BIN, [
+  const npmArgs = [
     'install', '--prefix', DSH_PREFIX, `@deepseek-ai/dsh@${tag}`,
     '--registry', REGISTRY, '--no-audit', '--no-fund', '--ignore-scripts', '--force',
-  ], { env: envBase() });
+    ...NPM_NET_ARGS,
+  ];
+  let ok = run(NPM_BIN, npmArgs, { env: envBase(), timeoutMs: NPM_TIMEOUT_MS });
+  if (!ok || !dshInstalled()) {
+    // 网络抖动/镜像瞬时不可用时自动重试一次；--force 可覆盖半成品 node_modules
+    log('dsh install failed or incomplete, retrying once ...');
+    ok = run(NPM_BIN, npmArgs, { env: envBase(), timeoutMs: NPM_TIMEOUT_MS });
+  }
   if (!ok || !dshInstalled()) {
     log('FATAL: official dsh install/update failed');
     process.exit(1);
@@ -245,13 +276,15 @@ function ensureRipgrepFallback() {
   let ok = run(NPM_BIN, [
     'install', '--prefix', DSH_PREFIX, `@vscode/ripgrep-linux-arm64@${rgVersion}`,
     '--registry', REGISTRY, '--no-audit', '--no-fund', '--ignore-scripts', '--force',
-  ], { env: envBase() });
+    ...NPM_NET_ARGS,
+  ], { env: envBase(), timeoutMs: NPM_TIMEOUT_MS });
   if (!ok || !existsSync(fallbackBin)) {
     log('exact version fallback install failed, retrying latest ...');
     ok = run(NPM_BIN, [
       'install', '--prefix', DSH_PREFIX, '@vscode/ripgrep-linux-arm64',
       '--registry', REGISTRY, '--no-audit', '--no-fund', '--ignore-scripts', '--force',
-    ], { env: envBase() });
+      ...NPM_NET_ARGS,
+    ], { env: envBase(), timeoutMs: NPM_TIMEOUT_MS });
   }
   if (!ok || !existsSync(fallbackBin)) {
     log('WARN: ripgrep linux-arm64 fallback install failed (glob/grep may fail on Android)');
@@ -352,7 +385,7 @@ function dshPlugin(args) {
     log('dsh not installed at ' + dshCli());
     return false;
   }
-  return run(NODE_BIN, [dshCli(), 'plugin', '--profile', DSH_PROFILE, ...args], { env: envBase() });
+  return run(NODE_BIN, [dshCli(), 'plugin', '--profile', DSH_PROFILE, ...args], { env: envBase(), timeoutMs: PLUGIN_TIMEOUT_MS });
 }
 
 function addLocalPlugin(dir) {

@@ -66,6 +66,7 @@ function envBase() {
     TMP: TMP,
     TEMP: TMP,
     TERM: 'xterm-256color',
+    CI: '1',
     OPENSSL_CONF: '/dev/null',
     PATH: pathParts.join(':'),
   };
@@ -81,8 +82,20 @@ function dshCli() {
 }
 
 function run(cmd, args, opts = {}) {
-  log('$ ' + cmd + ' ' + args.join(' '));
-  const r = spawnSync(cmd, args, { stdio: 'inherit', ...opts });
+  const timeoutMs = opts.timeoutMs ?? 10 * 60_000;
+  const started = Date.now();
+  log('$ ' + cmd + ' ' + args.join(' ') + ` (timeout=${Math.round(timeoutMs / 1000)}s)`);
+  const { timeoutMs: _ignored, ...spawnOpts } = opts;
+  const r = spawnSync(cmd, args, {
+    stdio: ['ignore', 'inherit', 'inherit'],
+    timeout: timeoutMs,
+    killSignal: 'SIGKILL',
+    ...spawnOpts,
+  });
+  const sig = r.signal ? ' signal=' + r.signal : '';
+  const err = r.error ? ' error=' + r.error.message : '';
+  const secs = ((Date.now() - started) / 1000).toFixed(1);
+  log(`exit=${r.status}${sig}${err} (${cmd}, ${secs}s)`);
   return r.status === 0;
 }
 
@@ -91,7 +104,7 @@ function dshPlugin(args) {
     log('dsh CLI not found: ' + dshCli());
     return false;
   }
-  return run(NODE_BIN, [dshCli(), 'plugin', '--profile', DSH_PROFILE, ...args], { env: envBase() });
+  return run(NODE_BIN, [dshCli(), 'plugin', '--profile', DSH_PROFILE, ...args], { env: envBase(), timeoutMs: 5 * 60_000 });
 }
 
 async function download(url, dest) {

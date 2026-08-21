@@ -84,7 +84,7 @@ object TermuxRuntime {
             )
             progress("检查 Harness 工具（git / ripgrep / file / curl / less）…")
             val requiredCheck = "command -v git >/dev/null 2>&1 && git --version >/dev/null 2>&1 && command -v rg >/dev/null 2>&1 && rg --version >/dev/null 2>&1 && command -v file >/dev/null 2>&1 && file --version >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 && curl --version >/dev/null 2>&1 && command -v less >/dev/null 2>&1 && less --version >/dev/null 2>&1"
-            if (runBash(bash, requiredCheck, env, progress) == 0) {
+            if (runBash(bash, requiredCheck, env, progress, timeoutSec = 120) == 0) {
                 marker.writeText(TOOLS_MARKER_VERSION)
                 progress("Harness 工具已就绪（git / ripgrep / file / curl / less）")
                 return true
@@ -101,7 +101,7 @@ object TermuxRuntime {
                     if (!File(usr, "bin/wget").isFile) add("wget")
                 }
                 val installRc = if (missing.isNotEmpty()) {
-                    runBash(bash, "pkg install -y --no-install-recommends ${missing.joinToString(" ")}", env, progress)
+                    runBash(bash, "pkg install -y --no-install-recommends ${missing.joinToString(" ")}", env, progress, timeoutSec = 1200)
                 } else {
                     0
                 }
@@ -112,13 +112,13 @@ object TermuxRuntime {
                 progress("适配新装包路径并完成 dpkg 配置…")
                 patchPrefixAll(usr)
                 patchTextOfficialDirs(usr)
-                val cfgRc = runBash(bash, "dpkg --configure -a", env, progress)
+                val cfgRc = runBash(bash, "dpkg --configure -a", env, progress, timeoutSec = 600)
                 if (cfgRc != 0) {
                     progress("WARN: dpkg --configure -a 返回 $cfgRc，再试 apt-get -f install…")
-                    runBash(bash, "apt-get install -y -f --no-install-recommends", env, progress)
+                    runBash(bash, "apt-get install -y -f --no-install-recommends", env, progress, timeoutSec = 1200)
                 }
 
-                val ready = runBash(bash, requiredCheck, env, progress) == 0
+                val ready = runBash(bash, requiredCheck, env, progress, timeoutSec = 120) == 0
                 val extra = buildList {
                     add("git")
                     add("ripgrep")
@@ -143,17 +143,50 @@ object TermuxRuntime {
         }
     }
 
-    private fun runBash(bash: String, script: String, env: Map<String, String>, progress: (String) -> Unit): Int = try {
+    /**
+     * 执行 bash 命令并流式回传输出。
+     * [timeoutSec] 到期后强制结束进程并返回 -124，避免网络卡死时安装流程永远挂起。
+     */
+    private fun runBash(
+        bash: String,
+        script: String,
+        env: Map<String, String>,
+        progress: (String) -> Unit,
+        timeoutSec: Long = 900L,
+    ): Int = try {
         val pb = ProcessBuilder(bash, "-c", script)
         pb.redirectErrorStream(true)
         val e = pb.environment()
         env.forEach { (k, v) -> e[k] = v }
         e.remove("LD_PRELOAD")
         val p = pb.start()
-        p.inputStream.bufferedReader().useLines { lines ->
-            lines.forEach { line -> progress(line) }
+        // 输出在独立线程消费：waitFor(timeout) 期间管道持续排空，不会因缓冲区满而卡死子进程
+        val stopped = java.util.concurrent.atomic.AtomicBoolean(false)
+        val reader = Thread {
+            try {
+                p.inputStream.bufferedReader().useLines { lines ->
+                    for (line in lines) {
+                        if (stopped.get()) break
+                        progress(line)
+                    }
+                }
+            } catch (_: Throwable) {
+            }
         }
-        p.waitFor()
+        reader.isDaemon = true
+        reader.start()
+        val done = p.waitFor(timeoutSec, java.util.concurrent.TimeUnit.SECONDS)
+        stopped.set(true)
+        if (!done) {
+            progress("TIMEOUT: 命令超过 ${timeoutSec}s 未完成，强制结束")
+            p.destroy()
+            if (!p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) p.destroyForcibly()
+            reader.join(2000)
+            -124
+        } else {
+            reader.join(5000)
+            p.exitValue()
+        }
     } catch (t: Throwable) {
         progress("bash 执行失败: ${t.message}")
         -1
