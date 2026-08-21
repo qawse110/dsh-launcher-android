@@ -50,9 +50,20 @@ function updateState(session, event) {
       const text = textFromMessage(event.data?.message)
       if (text) state.lastText = text
       break
-    case 'turn/end':
-      state.status = 'finished'
+    case 'turn/end': {
+      // 失败识别：agent-loop 失败时 turn/end 仍会发出，但 reason.kind === "error"
+      // （正常 completed / 中断 aborted / 截断 max-tokens）。上报 failed，
+      // Android 悬浮窗据此显示失败动画并 TTS 提醒。
+      const kind = event.data?.reason?.kind
+      if (kind === 'error') {
+        state.status = 'failed'
+        const msg = event.data?.reason?.error?.message
+        if (msg) state.lastText = `出错：${msg}`
+      } else {
+        state.status = 'finished'
+      }
       break
+    }
     default:
       break
   }
