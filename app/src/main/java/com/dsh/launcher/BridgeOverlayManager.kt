@@ -1101,8 +1101,8 @@ class BridgeOverlayManager(
     }
 
     /** 靠边行走一帧：水平固定步速走向目标边；纵向同速爬升（每帧 ≤4px，与横向一致，
-     *  竖向不会比横向快）；横向到位后停止跑步动画（竖向剩余行程用呼吸 idle 匀速滑行），
-     *  到位后停住保存位置。 */
+     *  竖向不会比横向快）；横向到位后停止左右跑（竖向剩余行程改用通用跑动动画，
+     *  原地攀爬感），到位后停住保存位置。 */
     private fun stepWalk() {
         if (!walking) return
         val p = overlayParams ?: return
@@ -1122,8 +1122,9 @@ class BridgeOverlayManager(
             }
             else -> {
                 nx = walkTargetX.toFloat()
-                // 横向已到位：停止跑步动画（竖向剩余行程用呼吸 idle 匀速滑行）
-                if (Math.abs(dy) > 2) petView?.play(PetOverlayView.ROW_IDLE)
+                // 横向已到位、竖向仍有行程：用通用跑动动画（方向中性的原地跑/攀爬感），
+                // 呼吸 idle 太静态看不出在移动；完全到位后由停住分支切回 idle
+                if (Math.abs(dy) > 2) petView?.play(PetOverlayView.ROW_RUNNING)
             }
         }
         val ny = if (Math.abs(dy) <= 2) walkTargetY.toFloat()
