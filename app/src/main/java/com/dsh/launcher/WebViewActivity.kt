@@ -149,7 +149,10 @@ class WebViewActivity : AppCompatActivity() {
     }
 
     override fun onBackPressed() {
-        if (webView.canGoBack()) webView.goBack() else super.onBackPressed()
+        // dsh WebUI 是 SPA：内部路由会向 WebView history 压入大量记录，
+        // goBack 后视觉上往往没有变化，用户连按返回像"卡住无法退出"。
+        // WebUI 有自己的导航（侧栏/抽屉），浏览器级回退没有意义——直接退出。
+        super.onBackPressed()
     }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
