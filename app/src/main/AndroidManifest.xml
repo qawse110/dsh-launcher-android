@@ -78,9 +78,10 @@
         <service
             android:name=".StatusBridgeService"
             android:exported="false"
-            android:process=":status_bridge"
             android:foregroundServiceType="dataSync"
             android:stopWithTask="false" />
+        <!-- 曾用 android:process=":status_bridge" 独立进程：SharedPreferences 跨进程
+             不保证可见（设置页改开关服务进程读不到、a11y 让位标志失灵），已并回主进程。 -->
         <receiver
             android:name=".BridgeWatchdogReceiver"
             android:exported="false" />

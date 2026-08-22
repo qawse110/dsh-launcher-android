@@ -156,7 +156,11 @@ adb shell am start -n com.dsh.launcher/.MainActivity   # 或直接点应用图�
   `dsh plugin` 装配，不进行设备端源码编译。
 - 重新安装 APK 会终止旧 web 进程，安装后需再次触发一键引导（幂等；dsh 已安装时
   `install-dsh.mjs` 会走 npm 增量更新，通常更快）。
-- `dsh web` 只监听 loopback，仅本机（及 adb forward 的 PC）可访问。
+- `dsh web` 只监听 loopback，仅本机（及 adb forward 的 PC）可访问；`dsh-status-bridge`
+  的 `/status` 同样只绑 loopback，但本机任意 app 均可读取（lastText 已截断到 200 字符）。
+- 状态桥接普通通道（`StatusBridgeService`）无开机自启：重启后由无障碍通道自动恢复，
+  或打开一次 app 自动拉起。
+- 悬浮窗 watchdog 为 30s 自续式精确闹钟；系统 Doze 深度休眠下可能被合并到 ≥9 分钟一次。
 
 ## 发布
 

@@ -13,6 +13,9 @@ fun statusLabel(status: String, event: String? = null): String = when (status) {
         else -> "dsh 运行中"
     }
     "finished" -> "AI 输出完成"
+    // 插件 turn/end(reason.kind=error) 上报 failed：此前落到 else 分支显示成
+    // 「dsh 空闲」灰点，失败在悬浮窗上完全不可见（TTS 有失败台词、文案却没接上）
+    "failed" -> "出错了"
     else -> "dsh 空闲"
 }
 

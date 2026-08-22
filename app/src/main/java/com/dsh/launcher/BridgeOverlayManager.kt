@@ -1,5 +1,6 @@
 package com.dsh.launcher
 
+import android.app.KeyguardManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.PixelFormat
@@ -121,6 +122,9 @@ class BridgeOverlayManager(
     private var dragStartTouchY = 0f
     private var dragMoved = false
     private var downAt = 0L
+    // 长按切换样式阈值：原 600ms 与双击窗（400ms）之间留有死区——按住 400~600ms
+    // 松手会误触发"单击台词"；压到 350ms 后快速点按归点击、稳住即切换，语义清晰
+    private val longPressToggleMs = 350L
     // 略大的拖动阈值：点击时手指微抖（几像素）不误判为拖动，避免误触"轻放/抛出落地"
     private val dragSlop = dp(12)
 
@@ -131,7 +135,10 @@ class BridgeOverlayManager(
     private var fallVx = 0f
     private var fallVy = 0f
     private var fallBounces = 0
-    private val moveSamples = ArrayDeque<FloatArray>() // [x, y, uptimeMillis]
+    /** 拖动采样：时间戳用 Long——Float 尾数 24 位，uptime 超 ~4.6h 后毫秒精度丢失，
+     *  抛掷速度估算会失真。 */
+    private class MoveSample(val x: Float, val y: Float, val t: Long)
+    private val moveSamples = ArrayDeque<MoveSample>()
     private val fallTicker = object : Runnable {
         override fun run() = stepFall()
     }
@@ -145,11 +152,14 @@ class BridgeOverlayManager(
     private fun prefs() = context.getSharedPreferences("status_bridge", Context.MODE_PRIVATE)
     /** 悬浮窗统一开关状态：
      *  - 「悬浮窗显示」关闭 → 无论普通还是无障碍通道一律隐藏；
-     *  - 无障碍悬浮窗激活时 → 普通悬浮窗让位，避免双窗口叠加。 */
+     *  - 无障碍通道 5 秒内刷新过存活时间戳 → 普通悬浮窗让位，避免双窗口叠加。
+     *    （旧布尔 a11y_overlay_active 在宿主被杀时回调不执行、陈旧残留且跨重启持久化，
+     *     曾让普通通道永久让位 → 双通道全灭；时间戳化后自动过期自愈。） */
     private fun overlayEnabled(): Boolean {
         if (!prefs().getBoolean("overlay_enabled", true)) return false
         if (windowType != WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY &&
-            prefs().getBoolean("a11y_overlay_active", false)
+            System.currentTimeMillis() - prefs().getLong(KeepAliveAccessibilityService.A11Y_TS_KEY, 0L) <
+            KeepAliveAccessibilityService.A11Y_FRESH_MS
         ) {
             return false
         }
@@ -188,6 +198,14 @@ class BridgeOverlayManager(
 
     private fun hideWhenIdle() = prefs().getBoolean("hide_when_idle", false)
 
+    /** 屏幕当前可见（亮屏且未锁）才允许挂悬浮窗；查询失败按可见处理（宁可多画不可失联）。 */
+    private fun screenVisible(): Boolean = try {
+        val km = context.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+        km.isInteractive && !km.isKeyguardLocked
+    } catch (_: Exception) {
+        true
+    }
+
     fun update(status: String, text: String, event: String? = null) {
         lastStatus = status
         lastText = text
@@ -196,8 +214,10 @@ class BridgeOverlayManager(
             remove()
             return
         }
-        // 锁屏/灭屏（含息屏指纹界面）不显示悬浮窗，避免遮挡系统锁屏界面
-        if (!prefs().getBoolean("screen_visible", true)) {
+        // 锁屏/灭屏（含息屏指纹界面）不显示悬浮窗，避免遮挡系统锁屏界面。
+        // 实时查询 KeyguardManager：旧方案依赖无障碍接收器维护的 screen_visible 共享键，
+        // a11y 关闭时无人写入 → 门禁失效（锁屏常亮悬浮窗）或残留 false 永久隐藏。
+        if (!screenVisible()) {
             remove()
             return
         }
@@ -691,19 +711,36 @@ class BridgeOverlayManager(
         }
     }
 
-    /** 朗读文本（懒初始化 TTS；无中文引擎自动回退系统默认语言；失败静默）。 */
+    /** 朗读文本（懒初始化 TTS；初始化完成前的请求挂起补播——否则登场问候大概率无声；
+     *  无中文引擎自动回退系统默认语言；失败静默）。 */
+    private var pendingSpeak: String? = null
+
     private fun speak(text: String) {
         if (ttsReleased || !petTts() || text.isBlank()) return
         if (tts == null) {
+            pendingSpeak = text
             tts = TextToSpeech(context) { status ->
                 ttsReady = status == TextToSpeech.SUCCESS
                 if (ttsReady) {
                     val ok = (tts?.isLanguageAvailable(Locale.CHINA) ?: -1) >= TextToSpeech.LANG_AVAILABLE
                     tts?.setLanguage(if (ok) Locale.CHINA else Locale.getDefault())
                 }
+                // 初始化期间积压的最后一句话在此刻补播
+                val p = pendingSpeak
+                pendingSpeak = null
+                if (p != null && ttsReady) {
+                    try {
+                        tts?.speak(p, TextToSpeech.QUEUE_FLUSH, null, "dsh_pet")
+                    } catch (_: Exception) {
+                    }
+                }
             }
+            return
         }
-        if (!ttsReady) return
+        if (!ttsReady) {
+            pendingSpeak = text
+            return
+        }
         try {
             tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "dsh_pet")
         } catch (_: Exception) {
@@ -774,18 +811,21 @@ class BridgeOverlayManager(
     private fun statusBackground(status: String): Int = when (status) {
         "running" -> 0xEE182238.toInt()
         "finished" -> 0xEE1B2A24.toInt()
+        "failed" -> 0xEE2A1418.toInt()
         else -> 0xDD101722.toInt()
     }
 
     private fun statusBorder(status: String): Int = when (status) {
         "running" -> 0x446C8CFF.toInt()
         "finished" -> 0x445FD68A.toInt()
+        "failed" -> 0x44FF6B6B.toInt()
         else -> 0x33283A55.toInt()
     }
 
     private fun statusColor(status: String): Int = when (status) {
         "running" -> 0xFF6C8CFF.toInt()
         "finished" -> 0xFF5FD68A.toInt()
+        "failed" -> 0xFFFF6B6B.toInt()
         else -> 0xFF7A8496.toInt()
     }
 
@@ -838,6 +878,8 @@ class BridgeOverlayManager(
         try {
             wm.addView(tv, trashParams)
             trashView = tv
+            // 防重入标志此前从未置 true：若他处复用 showTrash 会重复 addView 叠出多个垃圾桶窗
+            trashShown = true
         } catch (_: Exception) {
             trashView = null
             trashParams = null
@@ -919,12 +961,10 @@ class BridgeOverlayManager(
                 if (dragMoved) {
                     p.x = dragStartX + dx.toInt()
                     p.y = dragStartY + dy.toInt()
-                    moveSamples.addLast(
-                        floatArrayOf(p.x.toFloat(), p.y.toFloat(), SystemClock.uptimeMillis().toFloat())
-                    )
+                    moveSamples.addLast(MoveSample(p.x.toFloat(), p.y.toFloat(), SystemClock.uptimeMillis()))
                     val nowMs = SystemClock.uptimeMillis()
                     while (moveSamples.size > 10 || (moveSamples.isNotEmpty() &&
-                            nowMs - moveSamples.first()[2] > 250L)
+                            nowMs - moveSamples.first().t > 250L)
                     ) {
                         moveSamples.removeFirst()
                     }
@@ -941,7 +981,7 @@ class BridgeOverlayManager(
                     SystemClock.uptimeMillis() - trashHoverSince >= 350L
                 hideTrash()
                 if (!dragMoved) {
-                    if (SystemClock.uptimeMillis() - downAt >= 600L) {
+                    if (SystemClock.uptimeMillis() - downAt >= longPressToggleMs) {
                         toggleStyle()
                     } else if (downOnPet) {
                         showTapFeedback()
@@ -1000,10 +1040,10 @@ class BridgeOverlayManager(
         if (moveSamples.size < 3) return 0f
         val a = moveSamples.first()
         val b = moveSamples.last()
-        val dt = (b[2] - a[2]) / 1000f
+        val dt = (b.t - a.t) / 1000f
         if (dt <= 0.03f || dt >= 0.35f) return 0f
-        val vx = (b[0] - a[0]) / dt
-        val vy = (b[1] - a[1]) / dt
+        val vx = (b.x - a.x) / dt
+        val vy = (b.y - a.y) / dt
         return Math.sqrt((vx * vx + vy * vy).toDouble()).toFloat()
     }
 
@@ -1024,10 +1064,10 @@ class BridgeOverlayManager(
         if (moveSamples.size >= 3) {
             val a = moveSamples.first()
             val b = moveSamples.last()
-            val dt = (b[2] - a[2]) / 1000f
+            val dt = (b.t - a.t) / 1000f
             if (dt > 0.03f && dt < 0.35f) {
-                vx = (b[0] - a[0]) / dt
-                vy = (b[1] - a[1]) / dt
+                vx = (b.x - a.x) / dt
+                vy = (b.y - a.y) / dt
             }
         }
         falling = true
@@ -1044,13 +1084,20 @@ class BridgeOverlayManager(
         val p = overlayParams ?: return
         val manager = windowManager ?: return
         val view = overlayView ?: return
+        // WRAP_CONTENT 窗口首帧测量前 width/height 为 0 → floor 会算到屏幕底之外，等下一帧
+        val vw = view.width
+        val vh = view.height
+        if (vw == 0 || vh == 0) {
+            handler.postDelayed(fallTicker, 16L)
+            return
+        }
         val dm = context.resources.displayMetrics
         val dt = 0.016f
         fallVy += FALL_GRAVITY * dt
         fallVx *= 0.998f
         var nx = p.x + fallVx * dt
         var ny = p.y + fallVy * dt
-        val right = (dm.widthPixels - view.width).toFloat()
+        val right = (dm.widthPixels - vw).toFloat()
         if (nx < 0f) {
             nx = 0f
             fallVx = -fallVx * 0.55f
@@ -1059,7 +1106,7 @@ class BridgeOverlayManager(
             nx = right
             fallVx = -fallVx * 0.55f
         }
-        val floor = (dm.heightPixels - view.height).toFloat()
+        val floor = (dm.heightPixels - vh).toFloat()
         if (ny >= floor) {
             ny = floor
             if (fallVy > 260f && fallBounces < 2) {
@@ -1085,6 +1132,7 @@ class BridgeOverlayManager(
     /** 落地后自动走回停靠位（家）：未设置过家时默认停在屏幕最底部（贴地），左右取较近侧边。 */
     private fun walkHome(p: WindowManager.LayoutParams) {
         val view = overlayView ?: return
+        if (view.width == 0 || view.height == 0) return // 测量未完成：位置未知，不导航
         val dm = context.resources.displayMetrics
         val homeX = prefs().getInt("pet_home_x", -1)
         val homeY = prefs().getInt("pet_home_y", -1)

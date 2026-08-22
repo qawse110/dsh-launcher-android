@@ -1,11 +1,7 @@
 package com.dsh.launcher
 
 import android.accessibilityservice.AccessibilityService
-import android.app.KeyguardManager
-import android.content.BroadcastReceiver
 import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
 import android.os.Handler
 import android.os.Looper
 import android.view.WindowManager
@@ -22,6 +18,13 @@ import kotlin.concurrent.thread
  * - 通过 TYPE_ACCESSIBILITY_OVERLAY 绘制 dsh 状态悬浮窗；
  * - 无障碍服务由系统保活，后台被杀的几率远低于普通前台服务；
  * - 不读取、不处理任何屏幕内容，只轮询本机 dsh status HTTP 接口。
+ *
+ * 与普通通道（StatusBridgeService）的协调：
+ * - 每次轮询刷新 prefs 的 [A11Y_TS_KEY] 时间戳，普通通道仅在时间窗口内刷新过才让位——
+ *   宿主被杀时 onUnbind/onDestroy 不回调，旧布尔标志会陈旧残留（跨重启持久化），
+ *   曾导致双通道互相谦让全灭；
+ * - 锁屏/灭屏判断统一由 BridgeOverlayManager 用 KeyguardManager 实时查询，
+ *   不再依赖本服务维护的 screen_visible 共享键（a11y 关闭时无人更新会让门禁失效）。
  */
 class KeepAliveAccessibilityService : AccessibilityService() {
 
@@ -34,45 +37,15 @@ class KeepAliveAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        prefs().edit().putBoolean("a11y_overlay_active", true).apply()
+        // 立即刷新时间戳：连接瞬间就让普通通道开始让位（不等第一次轮询）
+        prefs().edit().putLong(A11Y_TS_KEY, System.currentTimeMillis()).apply()
         overlayManager = BridgeOverlayManager(
             this,
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
             false
         )
         overlayManager?.resetDismissed()
-        registerScreenReceiver()
         startPolling()
-    }
-
-    /** 锁屏/灭屏（含息屏指纹界面）不显示悬浮窗：灭屏隐藏，解锁后恢复显示。 */
-    private val screenReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
-            when (intent.action) {
-                Intent.ACTION_SCREEN_OFF -> {
-                    prefs().edit().putBoolean("screen_visible", false).apply()
-                    mainHandler.post { overlayManager?.remove() }
-                }
-                Intent.ACTION_SCREEN_ON -> {
-                    val km = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
-                    if (!km.isKeyguardLocked) {
-                        prefs().edit().putBoolean("screen_visible", true).apply()
-                    }
-                }
-                Intent.ACTION_USER_PRESENT -> {
-                    prefs().edit().putBoolean("screen_visible", true).apply()
-                }
-            }
-        }
-    }
-
-    private fun registerScreenReceiver() {
-        val filter = IntentFilter().apply {
-            addAction(Intent.ACTION_SCREEN_OFF)
-            addAction(Intent.ACTION_SCREEN_ON)
-            addAction(Intent.ACTION_USER_PRESENT)
-        }
-        runCatching { registerReceiver(screenReceiver, filter) }
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -83,13 +56,11 @@ class KeepAliveAccessibilityService : AccessibilityService() {
         // no-op
     }
 
-    override fun onUnbind(intent: android.content.Intent?): Boolean {
+    override fun onUnbind(intent: Intent?): Boolean {
         stopPolling()
         overlayManager?.remove()
         overlayManager?.release()
         overlayManager = null
-        runCatching { unregisterReceiver(screenReceiver) }
-        prefs().edit().putBoolean("a11y_overlay_active", false).apply()
         return super.onUnbind(intent)
     }
 
@@ -98,8 +69,6 @@ class KeepAliveAccessibilityService : AccessibilityService() {
         overlayManager?.remove()
         overlayManager?.release()
         overlayManager = null
-        runCatching { unregisterReceiver(screenReceiver) }
-        prefs().edit().putBoolean("a11y_overlay_active", false).apply()
         super.onDestroy()
     }
 
@@ -110,6 +79,8 @@ class KeepAliveAccessibilityService : AccessibilityService() {
         polling = true
         pollThread = thread {
             while (polling) {
+                // 存活心跳：普通通道据此判断无障碍通道是否真的活着（5 秒窗口）
+                prefs().edit().putLong(A11Y_TS_KEY, System.currentTimeMillis()).apply()
                 val data = fetchStatus()
                 if (data == null) {
                     // dsh 进程不可达：watchdog 自动拉起（60s 冷却，双路幂等）
@@ -179,5 +150,16 @@ class KeepAliveAccessibilityService : AccessibilityService() {
 
     companion object {
         private const val STATUS_URL = "http://127.0.0.1:3190/status"
+
+        /** 无障碍通道存活时间戳的 prefs 键（值 = System.currentTimeMillis()）。 */
+        const val A11Y_TS_KEY = "a11y_overlay_ts"
+
+        /** 普通通道让位判定窗口。 */
+        const val A11Y_FRESH_MS = 5_000L
+
+        /** 无障碍通道近期活跃（供外部诊断）。 */
+        fun isA11yChannelFresh(context: Context): Boolean =
+            System.currentTimeMillis() - context.getSharedPreferences("status_bridge", Context.MODE_PRIVATE)
+                .getLong(A11Y_TS_KEY, 0L) < A11Y_FRESH_MS
     }
 }

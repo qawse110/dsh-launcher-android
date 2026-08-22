@@ -14,8 +14,8 @@ import android.os.Build
  * dsh 输出完成提醒：提示音 + 通知，两者完全独立。
  * - 提示音由应用自身 ToneGenerator 发声，不依赖通知音；
  * - 通知通道静音，只负责在通知栏展示完成信息。
- * 普通前台服务与无障碍服务都会调用，用 SharedPreferences 时间戳做跨进程去重，
- * 避免两个服务同时轮询到 finished 时重复提醒。
+ * 普通前台服务与无障碍服务都会调用；两通道同在主进程（服务曾用独立进程时
+ * SharedPreferences 去重跨进程不可见），时间戳去重现在可靠生效。
  */
 object StatusBridgeAlerts {
 
@@ -32,18 +32,21 @@ object StatusBridgeAlerts {
         prefs.edit().putLong(LAST_ALERT_AT, now).commit()
 
         if (prefs.getBoolean("sound_enabled", true)) {
-            playFinishSound(context)
+            playFinishSound()
         }
         if (prefs.getBoolean("notify_enabled", true)) {
             postFinishNotification(context, text)
         }
     }
 
-    private fun playFinishSound(context: Context) {
-        // 应用自身发声：使用 ToneGenerator 播放提示音，不再依赖系统通知音/通知渠道。
+    // ToneGenerator 打开音频设备有可感延迟（每次新建会拖慢提示音），懒加载单例复用
+    @Volatile
+    private var tone: ToneGenerator? = null
+
+    private fun playFinishSound() {
         try {
-            val tone = ToneGenerator(AudioManager.STREAM_MUSIC, 80)
-            tone.startTone(ToneGenerator.TONE_PROP_BEEP2, 500)
+            val t = tone ?: ToneGenerator(AudioManager.STREAM_MUSIC, 80).also { tone = it }
+            t.startTone(ToneGenerator.TONE_PROP_BEEP2, 500)
         } catch (_: Exception) {
             // 音频服务不可用时静默失败，不影响通知
         }

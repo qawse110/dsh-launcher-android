@@ -48,11 +48,15 @@ class StatusBridgeService : Service() {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             true
         )
-        writeHeartbeat("service", "created", "created")
+        writeHeartbeat("service", "created", "created", force = true)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        writeHeartbeat("service", "started", "started")
+        // 每次 startForegroundService 都必须配套 startForeground：服务已存活时被再次拉起
+        // （如每次打开 app 的自动恢复、watchdog 兜底），不补调会在 targetSdk≥26 下
+        // 5 秒后触发 RemoteServiceException 崩溃。重复调用幂等合法。
+        startForeground(NOTIFICATION_ID, buildForegroundNotification("正在连接 dsh…"))
+        writeHeartbeat("service", "started", "started", force = true)
         scheduleWatchdog(this)
         if (thread == null) {
             thread = Thread({ pollLoop() }, "dsh-status-bridge")
@@ -66,18 +70,18 @@ class StatusBridgeService : Service() {
         thread?.interrupt()
         mainHandler.post { overlayManager?.remove() }
         overlayManager?.release()
-        writeHeartbeat("service", "destroyed", "destroyed")
+        writeHeartbeat("service", "destroyed", "destroyed", force = true)
         super.onDestroy()
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         // 即使任务被划掉也尽量保持悬浮窗服务运行
-        writeHeartbeat("service", "task-removed", "task-removed")
+        writeHeartbeat("service", "task-removed", "task-removed", force = true)
         try {
             val restart = Intent(this, StatusBridgeService::class.java)
             if (Build.VERSION.SDK_INT >= 26) startForegroundService(restart) else startService(restart)
         } catch (t: Exception) {
-            writeHeartbeat("service", "restart-failed", t.message ?: "exception")
+            writeHeartbeat("service", "restart-failed", t.message ?: "exception", force = true)
         }
         super.onTaskRemoved(rootIntent)
     }
@@ -136,7 +140,10 @@ class StatusBridgeService : Service() {
     private fun prefs() = getSharedPreferences("status_bridge", Context.MODE_PRIVATE)
 
     private fun overlayEnabled() = prefs().getBoolean("overlay_enabled", true) &&
-        !prefs().getBoolean("a11y_overlay_active", false)
+        // 无障碍通道 5 秒内刷新过时间戳才视为激活：宿主被杀时 onUnbind/onDestroy 不回调，
+        // 布尔标志会陈旧残留（跨重启持久化），普通通道因此永久让位 → 双通道全灭
+        System.currentTimeMillis() - prefs().getLong(KeepAliveAccessibilityService.A11Y_TS_KEY, 0L) <
+            KeepAliveAccessibilityService.A11Y_FRESH_MS
 
     // ---------------- 悬浮窗 ----------------
 
@@ -182,8 +189,14 @@ class StatusBridgeService : Service() {
         nm.notify(NOTIFICATION_ID, buildForegroundNotification(statusLabel(status)))
     }
 
-    /** 诊断心跳：把服务存活与悬浮窗挂载状态写到 App 私有目录，便于外部定位。 */
-    private fun writeHeartbeat(status: String, text: String, note: String? = null) {
+    /** 诊断心跳：把服务存活与悬浮窗挂载状态写到 App 私有目录，便于外部定位。
+     *  轮询路径 5 秒节流（60 次/分钟的 flash 写盘纯属磨损，诊断价值不变）；
+     *  created/started/destroyed 等生命周期事件用 force=true 立即落盘。 */
+    private var lastHeartbeatAt = 0L
+    private fun writeHeartbeat(status: String, text: String, note: String? = null, force: Boolean = false) {
+        val now = System.currentTimeMillis()
+        if (!force && now - lastHeartbeatAt < 5_000L) return
+        lastHeartbeatAt = now
         try {
             val f = File(filesDir, "status-bridge-heartbeat.json")
             val obj = JSONObject()
@@ -232,7 +245,8 @@ class StatusBridgeService : Service() {
                 .edit().putBoolean("overlay_dismissed", false).apply()
         }
 
-        private fun scheduleWatchdog(context: Context) {
+        /** 自续式看门狗闹钟（30s 一次）：BridgeWatchdogReceiver 每次触发后重新排下一发。 */
+        internal fun scheduleWatchdog(context: Context) {
             try {
                 val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
                 val pi = PendingIntent.getBroadcast(
@@ -241,10 +255,12 @@ class StatusBridgeService : Service() {
                     Intent(WATCHDOG_ACTION).setPackage(context.packageName),
                     PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
                 )
-                am.setInexactRepeating(
+                // setInexactRepeating 的 30s 周期会被系统钳到 ~15 分钟（实机验证：服务死后
+                // 18 分钟仍未自愈）。改为一次性精确闹钟，由 BridgeWatchdogReceiver 自续链条；
+                // Doze 深度休眠下系统仍可能把 allowWhileIdle 合并到 ≥9 分钟一次，属系统约束。
+                am.setExactAndAllowWhileIdle(
                     AlarmManager.ELAPSED_REALTIME_WAKEUP,
                     SystemClock.elapsedRealtime() + 30_000L,
-                    30_000L,
                     pi
                 )
             } catch (e: Exception) {
@@ -276,6 +292,12 @@ class StatusBridgeService : Service() {
 class BridgeWatchdogReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent?) {
         if (intent?.action != StatusBridgeService.WATCHDOG_ACTION) return
+        // 用户显式停止过（「停止 dsh 服务」）就不再自续、也不拉起，
+        // 否则 watchdog 会永远唤醒；下次启动服务时 scheduleWatchdog 会重新接上链条
+        val expectRunning = context.getSharedPreferences("dsh_keepalive", Context.MODE_PRIVATE)
+            .getBoolean("running", false)
+        if (!expectRunning) return
+        StatusBridgeService.scheduleWatchdog(context)
         val alive = try {
             val f = File(context.filesDir, "status-bridge-heartbeat.json")
             val obj = JSONObject(f.readText())
