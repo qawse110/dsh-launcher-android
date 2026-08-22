@@ -6,8 +6,11 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import com.google.android.material.color.DynamicColors
 import org.json.JSONObject
@@ -16,11 +19,20 @@ import java.io.File
 /**
  * 插件管理系统：内置插件一览（APK 内 plugins 源）+ 在线安装/卸载。
  *
+ * v4.2.3 起围绕「重置」重构：
+ * - 健康检查：每个内置插件判定 目录存在/package.json 可解析/已装配 三态，
+ *   异常（空壳损坏、目录缺失、待装配）在列表顶部汇总成「一键重置」卡片；
+ * - 重置流程：先同步 extra-plugins 源 → 对异常副本从内置源恢复
+ *   （extra-plugins 直拷；third_party 来源的从 prebuilt.tgz 解包子树）→
+ *   再跑官方 `install-dsh.mjs --plugins-only` 整体装配；
+ * - 单插件级「修复/恢复/装配」按钮；
+ * - 全部操作走 busy 锁防并发，进度条反馈；后台线程不再直接触碰视图
+ *   （旧实现在 Thread 里调 refreshList，有 CalledFromWrongThreadException 隐患）；
+ * - 「重启 dsh」改为快速启动（旧实现误触发完整安装流）。
+ *
  * 装配动作全部走官方 `dsh plugin --profile web add/remove`；
- * `yjh051108/dsh-routing-suite` 走特殊适配（routing-suite.mjs：
- * 下载聚合仓库 + 两个子仓库 → 装配 injector → 拷贝 agent-preset）；
- * `scp3500/oh-we-need` 是纯提示词仓库，已内置为 dsh-oh-we-need 插件，
- * 输入该仓库时触发内置插件重新装配。
+ * `yjh051108/dsh-routing-suite` 走特殊适配（routing-suite.mjs）；
+ * `scp3500/oh-we-need` 是纯提示词仓库，已内置为 dsh-oh-we-need 插件。
  */
 class PluginManagerActivity : AppCompatActivity() {
 
@@ -54,7 +66,15 @@ class PluginManagerActivity : AppCompatActivity() {
     private lateinit var listBox: LinearLayout
     private lateinit var input: EditText
     private lateinit var logView: TextView
+    private lateinit var progress: ProgressBar
+    private lateinit var installBtn: View
+    private lateinit var wireBtn: View
+    private lateinit var restartBtn: View
     private val logSb = StringBuilder()
+
+    @Volatile
+    private var busy = false
+
     private val nodeDir: File get() = NodeRuntime.ensureExtracted(this)
 
     private fun dshPrefix() = File(filesDir, "dsh-prefix")
@@ -86,9 +106,9 @@ class PluginManagerActivity : AppCompatActivity() {
             setTextColor(Ui.TEXT_SECONDARY)
             setPadding(0, dp(2), 0, dp(8))
         }
-
         val tip = TextView(this).apply {
-            text = "可用：mexiaosqwq/dsh-web-mobile · yjh051108/dsh-routing-suite · mafeis/dsh-net-proxy · scp3500/oh-we-need（内置提示词插件）\n本机已内置：dsh-mobile-nav · dsh-super-injector · dsh-net-proxy · dsh-provider-headers · dsh-vision · dsh-oh-we-need · router-preset"
+            text = "在线仓库示例：mexiaosqwq/dsh-web-mobile · yjh051108/dsh-routing-suite · mafeis/dsh-net-proxy · scp3500/oh-we-need\n" +
+                "本机内置：" + BUNDLED.sorted().joinToString(" · ") + " · " + PRESET_DIR
             textSize = 11f
             setTextColor(Ui.TEXT_MUTED)
             setLineSpacing(dp(2).toFloat(), 1f)
@@ -122,6 +142,16 @@ class PluginManagerActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = dp(10) })
 
+        // 操作进度条：任何装配/重置/重启期间可见
+        progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            isIndeterminate = true
+            visibility = View.GONE
+            indeterminateTintList = android.content.res.ColorStateList.valueOf(Ui.BRAND)
+        }
+        root.addView(progress, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(6)
+        ).apply { topMargin = dp(8) })
+
         fun rowOf(vararg buttons: View): LinearLayout = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             buttons.forEachIndexed { index, button ->
@@ -131,14 +161,14 @@ class PluginManagerActivity : AppCompatActivity() {
             }
         }
 
-        val installBtn = Ui.button(this, "安装 / 更新", { installFromRepo() }, filled = true)
-        val wireBtn = Ui.button(this, "重新装配", { rewireBuiltins() }, filled = false)
-        val restartBtn = Ui.button(this, "重启 dsh", { restartFlow() }, filled = false)
+        installBtn = Ui.button(this, "安装 / 更新", { installFromRepo() }, filled = true)
+        wireBtn = Ui.button(this, "重新装配", { rewireBuiltins() }, filled = false)
+        restartBtn = Ui.button(this, "重启 dsh 服务", { restartFlow() }, filled = false)
         val backBtn = Ui.button(this, "返回", { finish() }, filled = false)
         root.addView(rowOf(installBtn, wireBtn, restartBtn), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = dp(8) })
+        ).apply { topMargin = dp(6) })
         root.addView(rowOf(backBtn), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT
@@ -182,10 +212,99 @@ class PluginManagerActivity : AppCompatActivity() {
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
+    private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+
     private fun appendLog(m: String) {
         logSb.append("${System.currentTimeMillis() % 100000}\t$m\n")
         if (logSb.length > 20000) logSb.delete(0, logSb.length / 2)
         runOnUiThread { logView.text = logSb.toString() }
+    }
+
+    /** 后台线程安全版刷新。 */
+    private fun refreshListSafe() {
+        runOnUiThread { refreshList() }
+    }
+
+    // ── busy 锁 ───────────────────────────────────────────
+    private fun guardBusy(): Boolean =
+        if (busy) {
+            toast("操作进行中，请稍候…")
+            false
+        } else true
+
+    private fun setBusy(b: Boolean) {
+        busy = b
+        runOnUiThread {
+            progress.visibility = if (b) View.VISIBLE else View.GONE
+            listOf(installBtn, wireBtn, restartBtn).forEach {
+                it.isEnabled = !b
+                it.alpha = if (b) 0.5f else 1f
+            }
+        }
+    }
+
+    // ── 健康检查 ──────────────────────────────────────────
+
+    private data class BundledHealth(val dirExists: Boolean, val healthy: Boolean, val wired: Boolean, val srcOk: Boolean)
+
+    private fun healthOf(id: String): BundledHealth {
+        val dir = File(pluginsDir(), id)
+        return BundledHealth(dir.isDirectory, bundleHealthy(dir), isWired(id), bundledSourceAvailable(id))
+    }
+
+    /** 目录健康：package.json 存在、可解析、name 非空。
+     *  （空壳损坏——package.json 为空/lib/index.js 变空目录——曾是 AssetSync 文件误判 bug 的产物。） */
+    private fun bundleHealthy(dir: File): Boolean {
+        val p = File(dir, "package.json")
+        if (!p.isFile) return false
+        val j = runCatching { JSONObject(p.readText()) }.getOrNull() ?: return false
+        return j.optString("name").isNotBlank()
+    }
+
+    /** APK 内是否带有该插件的可用源：extra-plugins 直拷源，或 prebuilt.tgz 内的 third_party 子树。 */
+    private fun bundledSourceAvailable(id: String): Boolean {
+        if (File(filesDir, "extra-plugins/$id/package.json").isFile) return true
+        val tgz = File(filesDir, "prebuilt.tgz")
+        if (!tgz.isFile) return false
+        return runCatching {
+            val pb = ProcessBuilder(
+                "/system/bin/sh", "-c",
+                "tar -tzf '${tgz.absolutePath}' './third_party/$id/package.json' 2>/dev/null | head -n 1"
+            )
+            pb.redirectErrorStream(true)
+            val p = pb.start()
+            val line = p.inputStream.bufferedReader().readLine()
+            p.waitFor()
+            !line.isNullOrBlank()
+        }.getOrDefault(false)
+    }
+
+    /** 从内置源恢复单个插件目录：extra-plugins 直拷；否则从 prebuilt.tgz 解包对应子树。 */
+    private fun repairFromSource(id: String): Boolean {
+        val dst = File(pluginsDir(), id)
+        dst.deleteRecursively()
+        val extraSrc = File(filesDir, "extra-plugins/$id")
+        if (File(extraSrc, "package.json").isFile) {
+            return runCatching {
+                extraSrc.copyRecursively(dst, overwrite = true)
+                bundleHealthy(dst)
+            }.getOrDefault(false)
+        }
+        val tgz = File(filesDir, "prebuilt.tgz")
+        if (!tgz.isFile) return false
+        val tmp = File(filesDir, "tmp/repair-$id")
+        tmp.deleteRecursively()
+        tmp.mkdirs()
+        val cmd = "tar -xzf '${tgz.absolutePath}' -C '${tmp.absolutePath}' './third_party/$id'"
+        if (runProcess(cmd, baseEnv(), "解包 $id") != 0) return false
+        val src = File(tmp, "third_party/$id")
+        val ok = File(src, "package.json").isFile &&
+            runCatching {
+                src.copyRecursively(dst, overwrite = true)
+                bundleHealthy(dst)
+            }.getOrDefault(false)
+        tmp.deleteRecursively()
+        return ok
     }
 
     // ── 列表 ──────────────────────────────────────────────
@@ -193,10 +312,9 @@ class PluginManagerActivity : AppCompatActivity() {
         val tp = pluginsDir()
         listBox.removeAllViews()
         if (!tp.exists()) {
-            listBox.addView(makeCard("（内置插件源未就绪：先回控制台跑一次「执行 dsh」）", "提示", "", "—", emptyList()))
+            listBox.addView(makeCard("（内置插件源未就绪：先在主界面完成一次自动安装）", "提示", "", "—", emptyList()))
             return
         }
-        val tpDirs = tp.listFiles { f -> f.isDirectory }?.map { it.name }?.toSet() ?: emptySet()
 
         listBox.addView(Ui.sectionLabel(this, "内置与预设").apply {
             layoutParams = LinearLayout.LayoutParams(
@@ -204,22 +322,49 @@ class PluginManagerActivity : AppCompatActivity() {
                 ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply { bottomMargin = dp(6) }
         })
+
+        // 先收集健康度：有异常时在区块顶部插一张汇总卡
+        val issues = mutableListOf<String>()
+        val bundledRows = mutableListOf<Triple<String, View, Unit>>()
         for (d in BUNDLED.sorted()) {
-            val builtin = File(tp, d).isDirectory
-            val wired = isWired(d)
-            val status = if (!builtin) "未内置（构建产物缺失）"
-            else if (wired) "内置 · 已装配"
-            else "内置 · 待装配（需重新装配）"
+            val h = healthOf(d)
             val ver = readVersion(d)
-            listBox.addView(makeCard(d, BUNDLED_DESC[d] ?: "", ver, status, emptyList()))
+            val status: String
+            val actions = mutableListOf<Pair<String, () -> Unit>>()
+            when {
+                !h.dirExists -> {
+                    status = if (h.srcOk) "缺失 · 可修复" else "未内置（构建产物缺失）"
+                    if (h.srcOk) actions.add("恢复" to { repairSingle(d) })
+                    issues.add("$d：目录缺失")
+                }
+                !h.healthy -> {
+                    status = if (h.srcOk) "已损坏 · 可修复" else "已损坏（无内置源）"
+                    if (h.srcOk) actions.add("修复" to { repairSingle(d) })
+                    issues.add("$d：副本损坏")
+                }
+                !h.wired -> {
+                    status = "待装配"
+                    actions.add("装配" to { wireBundled(d) })
+                    issues.add("$d：未装配")
+                }
+                else -> status = "内置 · 已装配"
+            }
+            bundledRows.add(Triple(d, makeCard(d, BUNDLED_DESC[d] ?: "", ver, status, actions), Unit))
         }
 
-        // 路由预设（容器展平后以 router-spec/router-standard 两个一级预设生效；
-        // 上游曾短暂提供 router-pro 但已回退到 v0.2.0，不再内置）
+        if (issues.isNotEmpty()) {
+            listBox.addView(buildSummaryCard(issues))
+        }
+        for ((_, view, _) in bundledRows) listBox.addView(view)
+
+        // 路由预设（容器展平后以 router-spec/router-standard 两个一级预设生效）
         val presetOk = listOf("router-spec", "router-standard").any { File(presetsRoot(), it).exists() }
+        if (!presetOk) issues.add("$PRESET_DIR：未安装")
         listBox.addView(makeCard(
             PRESET_DIR, PRESET_DESC, "preset",
-            if (presetOk) "已安装（agent-presets）" else "待装配（需重新装配）", emptyList()))
+            if (presetOk) "已安装（agent-presets）" else "待装配（需重新装配）",
+            if (presetOk) emptyList() else listOf("重新装配" to { rewireBuiltins() })
+        ))
 
         // 官方 dsh plugin add 装配的额外插件（从 profile package.json 的 bundles 读取）
         val extras = readBundles().filter { name ->
@@ -238,6 +383,35 @@ class PluginManagerActivity : AppCompatActivity() {
                 listBox.addView(makeCard(name, info.desc, info.version, "已装配", listOf("卸载" to { uninstall(name) })))
             }
         }
+    }
+
+    /** 异常汇总卡（红描边）：列出前几条原因 + 一键重置入口。 */
+    private fun buildSummaryCard(issues: List<String>): View {
+        val card = Ui.card(this, radiusDp = 14, background = Ui.SURFACE_CONTAINER_HIGH, stroke = Ui.DANGER, elevationDp = 1f)
+        val content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        card.layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { bottomMargin = dp(8) }
+        content.addView(TextView(this).apply {
+            text = "⚠ 检测到 ${issues.size} 个插件异常"
+            textSize = 14f
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            setTextColor(Ui.DANGER)
+        })
+        content.addView(TextView(this).apply {
+            text = issues.take(4).joinToString("\n") { "· $it" } + if (issues.size > 4) "\n· …" else ""
+            textSize = 11.5f
+            setTextColor(Ui.TEXT_SECONDARY)
+            setPadding(0, dp(4), 0, 0)
+            setLineSpacing(dp(2).toFloat(), 1f)
+        })
+        content.addView(Ui.button(this, "一键重置修复", { resetBuiltins() }, filled = true).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(8) }
+        })
+        card.addView(content)
+        return card
     }
 
     data class PluginInfo(val id: String, val name: String, val desc: String, val version: String)
@@ -292,6 +466,14 @@ class PluginManagerActivity : AppCompatActivity() {
         return try { JSONObject(p.readText()).optString("version", "?") } catch (t: Throwable) { "?" }
     }
 
+    /** 状态 pill 颜色：显式映射，避免「已损坏」命中 contains("已") 被画成绿色。 */
+    private fun statusColor(status: String): Int = when {
+        status.contains("已装配") || status.contains("已安装") || status.contains("已连接") -> Ui.SUCCESS
+        status.contains("损坏") || status.contains("缺失") -> Ui.DANGER
+        status.contains("待") || status.contains("需") -> Ui.WARNING
+        else -> Ui.TEXT_MUTED
+    }
+
     private fun makeCard(name: String, desc: String, ver: String, status: String, actions: List<Pair<String, () -> Unit>>): View {
         val card = Ui.card(this, radiusDp = 14, background = Ui.SURFACE_CONTAINER, elevationDp = 1f)
         val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
@@ -326,7 +508,7 @@ class PluginManagerActivity : AppCompatActivity() {
                 ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply { rightMargin = dp(6) }
         })
-        titleRow.addView(Ui.pill(this, status, if (status.contains("已")) Ui.SUCCESS else Ui.WARNING))
+        titleRow.addView(Ui.pill(this, status, statusColor(status)))
         content.addView(titleRow)
 
         if (desc.isNotEmpty()) {
@@ -358,6 +540,7 @@ class PluginManagerActivity : AppCompatActivity() {
 
     // ── 在线安装 ──────────────────────────────────────────
     private fun installFromRepo() {
+        if (!guardBusy()) return
         val raw = input.text.toString().trim()
         val repo = parseRepo(raw)
         if (repo == null) {
@@ -371,7 +554,6 @@ class PluginManagerActivity : AppCompatActivity() {
             appendLog(">> $repo 是纯提示词仓库，已内置为 dsh-oh-we-need 插件；触发重新装配…")
             rewireBuiltins()
         } else {
-            appendLog(">> 官方 dsh plugin add github:$repo …")
             runDshPlugin(listOf("add", "github:$repo"), "安装 $repo")
         }
     }
@@ -388,73 +570,190 @@ class PluginManagerActivity : AppCompatActivity() {
     }
 
     // ── dsh plugin CLI ─────────────────────────────────────
+    /** 同步执行 dsh plugin 子命令（阻塞；调用方负责线程与 busy）。 */
+    private fun dshPluginSync(args: List<String>, label: String): Int {
+        ensureHarnessTools()
+        val cli = dshCliFile()
+        if (!cli.exists()) {
+            appendLog("   ✗ dsh 未安装（请先回主界面完成一次自动安装）")
+            return -1
+        }
+        val node = File(File(nodeDir, "bin"), "node")
+        val cmd = "${node.absolutePath} ${cli.absolutePath} plugin --profile web ${args.joinToString(" ")}"
+        appendLog(">> $label …")
+        appendLog("   $ ${cmd.replace(cli.absolutePath, "dsh")}")
+        val code = runProcess(cmd, baseEnv(), label)
+        appendLog(if (code == 0) "   ✓ $label 完成（exit=0）" else "   ✗ $label 失败（exit=$code）")
+        return code
+    }
+
+    /** 异步包装（卸载/在线安装等独立操作）。 */
     private fun runDshPlugin(args: List<String>, label: String) {
+        if (!guardBusy()) return
+        setBusy(true)
+        Thread {
+            try {
+                dshPluginSync(args, label)
+                refreshListSafe()
+            } catch (t: Throwable) {
+                appendLog("$label 异常: ${t.message}")
+            } finally {
+                setBusy(false)
+            }
+        }.start()
+    }
+
+    /** 单个内置插件「装配」：目录健康但未注册进 profile 时使用。 */
+    private fun wireBundled(id: String) {
+        if (!guardBusy()) return
+        setBusy(true)
+        Thread {
+            try {
+                val path = File(pluginsDir(), id).absolutePath
+                dshPluginSync(listOf("add", path), "装配 $id")
+                refreshListSafe()
+            } catch (t: Throwable) {
+                appendLog("装配 $id 异常: ${t.message}")
+            } finally {
+                setBusy(false)
+            }
+        }.start()
+    }
+
+    /** 单个内置插件「修复/恢复」：清掉异常副本 → 从内置源恢复 → 注册进 profile。 */
+    private fun repairSingle(id: String) {
+        if (!guardBusy()) return
+        setBusy(true)
         Thread {
             try {
                 ensureHarnessTools()
-                val cli = dshCliFile()
-                if (!cli.exists()) {
-                    appendLog("   ✗ dsh 未安装（请先回控制台执行「执行 dsh」）")
+                syncExtraPluginsSource()
+                appendLog(">> 修复 $id …")
+                if (!repairFromSource(id)) {
+                    appendLog("   ✗ $id 恢复失败（无可用内置源或解包失败）")
                     return@Thread
                 }
-                val node = File(File(nodeDir, "bin"), "node")
-                val cmd = "${node.absolutePath} ${cli.absolutePath} plugin --profile web ${args.joinToString(" ")}"
-                appendLog(">> $label …")
-                appendLog("   $ ${cmd.replace(cli.absolutePath, "dsh")}")
-                val code = runProcess(cmd, baseEnv(), label)
-                appendLog(if (code == 0) "   ✓ $label 完成（exit=0）" else "   ✗ $label 失败（exit=$code）")
-                refreshList()
+                val path = File(pluginsDir(), id).absolutePath
+                dshPluginSync(listOf("add", path), "装配 $id")
+                refreshListSafe()
             } catch (t: Throwable) {
-                appendLog("$label 异常: ${t.message}")
+                appendLog("修复 $id 异常: ${t.message}")
+            } finally {
+                setBusy(false)
             }
         }.start()
     }
 
     /** 重新装配内置插件：只跑 install-dsh.mjs --plugins-only，不改 dsh 本体。 */
     private fun rewireBuiltins() {
-        Thread {
-            try {
-                ensureHarnessTools()
-                appendLog(">> 重新装配内置插件…")
-                val apkVer = AssetSync.apkVersion(this)
-                val installScript = File(filesDir, "install-dsh.mjs")
-                if (!AssetSync.copyAsset(this, "install-dsh.mjs", installScript)) {
-                    appendLog("   WARN 无法复制 install-dsh.mjs，尝试使用已有脚本")
-                    if (!installScript.exists()) {
-                        appendLog("   ✗ 重新装配失败：install-dsh.mjs 缺失")
-                        return@Thread
+        if (!guardBusy()) return
+        AlertDialog.Builder(this)
+            .setTitle("重新装配内置插件")
+            .setMessage("跳过 npm 更新，仅重新装配全部内置插件与路由预设（--plugins-only）。继续？")
+            .setPositiveButton("执行") { _, _ ->
+                setBusy(true)
+                Thread {
+                    try {
+                        ensureHarnessTools()
+                        val code = rewireCore("重新装配")
+                        if (code == 0) appendLog("   ✓ 重新装配完成")
+                        refreshListSafe()
+                    } catch (t: Throwable) {
+                        appendLog("重新装配异常: ${t.message}")
+                    } finally {
+                        setBusy(false)
                     }
-                }
-                val prebuilt = File(filesDir, "prebuilt.tgz")
-                val prebuiltMarker = File(filesDir, ".prebuilt-ok")
-                if (AssetSync.isSynced(prebuiltMarker, prebuilt, apkVer)) {
-                    appendLog("   内置插件源已是最新，跳过复制")
-                } else if (AssetSync.copyAsset(this, "prebuilt.tgz", prebuilt)) {
-                    AssetSync.markSynced(prebuiltMarker, apkVer)
-                    appendLog("   内置插件源 ${prebuilt.length() / 1024 / 1024}MB")
-                } else {
-                    appendLog("   WARN 无法复制 prebuilt.tgz，继续使用已有源")
-                }
-                val node = File(File(nodeDir, "bin"), "node")
-                val cmd = "${node.absolutePath} ${installScript.absolutePath} --plugins-only"
-                val env = baseEnv().apply {
-                    put("DSH_PREFIX", dshPrefix().absolutePath)
-                    put("DSH_PROFILE", "web")
-                    put("DSH_PREBUILT", prebuilt.absolutePath)
-                    put("DSH_PLUGINS_DIR", pluginsDir().absolutePath)
-                    put("DSH_APK_VER", apkVer.toString())
-                }
-                val code = runProcess(cmd, env, "重新装配")
-                appendLog(if (code == 0) "   ✓ 重新装配完成" else "   ✗ 重新装配失败（exit=$code）")
-                refreshList()
-            } catch (t: Throwable) {
-                appendLog("重新装配异常: ${t.message}")
+                }.start()
             }
-        }.start()
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /** 一键重置：同步源 → 修复异常副本 → 整体重新装配。 */
+    private fun resetBuiltins() {
+        if (!guardBusy()) return
+        AlertDialog.Builder(this)
+            .setTitle("一键重置内置插件")
+            .setMessage("将清理损坏/缺失的插件副本并从 APK 内置源恢复，然后整体重新装配。\n不动 dsh 本体与已安装的在线扩展。继续？")
+            .setPositiveButton("重置") { _, _ ->
+                setBusy(true)
+                Thread {
+                    try {
+                        ensureHarnessTools()
+                        syncExtraPluginsSource()
+                        for (id in BUNDLED.sorted()) {
+                            val h = healthOf(id)
+                            val needsRepair = (!h.dirExists || !h.healthy) && h.srcOk
+                            if (needsRepair) {
+                                appendLog(">> 恢复 $id …")
+                                appendLog(if (repairFromSource(id)) "   ✓ $id 已从内置源恢复" else "   ✗ $id 恢复失败")
+                            } else if (h.dirExists && !h.healthy) {
+                                appendLog("   ⚠ $id 损坏且无内置源可恢复，跳过")
+                            }
+                        }
+                        val code = rewireCore("重置装配")
+                        appendLog(if (code == 0) "✓ 一键重置完成" else "✗ 重置装配失败（exit=$code），可再试或查看日志")
+                    } catch (t: Throwable) {
+                        appendLog("重置异常: ${t.message}")
+                    } finally {
+                        setBusy(false)
+                        refreshListSafe()
+                    }
+                }.start()
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /** 同步 assets 的 extra-plugins 源到 files（AssetSync 已修复文件误判，clearFirst 自愈坏拷贝）。 */
+    private fun syncExtraPluginsSource() {
+        val apkVer = AssetSync.apkVersion(this)
+        val dest = File(filesDir, "extra-plugins")
+        val marker = File(filesDir, ".extra-plugins-ok")
+        if (AssetSync.isSynced(marker, dest, apkVer)) return
+        try {
+            if (AssetSync.copyAssetDir(this, "extra-plugins", dest, clearFirst = true)) {
+                AssetSync.markSynced(marker, apkVer)
+                appendLog("   extra-plugins 源已同步（${dest.walkTopDown().count { it.isFile }} 个文件）")
+            }
+        } catch (t: Throwable) {
+            appendLog("   WARN extra-plugins 同步失败：${t.message}")
+        }
+    }
+
+    /** --plugins-only 核心（供「重新装配」与「一键重置」复用）。 */
+    private fun rewireCore(label: String): Int {
+        val apkVer = AssetSync.apkVersion(this)
+        val installScript = File(filesDir, "install-dsh.mjs")
+        if (!AssetSync.copyAsset(this, "install-dsh.mjs", installScript) && !installScript.exists()) {
+            appendLog("   ✗ $label 失败：install-dsh.mjs 缺失")
+            return -1
+        }
+        val prebuilt = File(filesDir, "prebuilt.tgz")
+        val prebuiltMarker = File(filesDir, ".prebuilt-ok")
+        if (AssetSync.isSynced(prebuiltMarker, prebuilt, apkVer)) {
+            appendLog("   内置插件源已是最新，跳过复制")
+        } else if (AssetSync.copyAsset(this, "prebuilt.tgz", prebuilt)) {
+            AssetSync.markSynced(prebuiltMarker, apkVer)
+            appendLog("   内置插件源 ${prebuilt.length() / 1024 / 1024}MB")
+        } else {
+            appendLog("   WARN 无法复制 prebuilt.tgz，继续使用已有源")
+        }
+        val node = File(File(nodeDir, "bin"), "node")
+        val cmd = "${node.absolutePath} ${installScript.absolutePath} --plugins-only"
+        val env = baseEnv().apply {
+            put("DSH_PREFIX", dshPrefix().absolutePath)
+            put("DSH_PROFILE", "web")
+            put("DSH_PREBUILT", prebuilt.absolutePath)
+            put("DSH_PLUGINS_DIR", pluginsDir().absolutePath)
+            put("DSH_APK_VER", apkVer.toString())
+        }
+        return runProcess(cmd, env, label)
     }
 
     /** yjh051108/dsh-routing-suite 特殊适配：走 routing-suite.mjs。 */
     private fun runRoutingSuite() {
+        setBusy(true)
         Thread {
             try {
                 ensureHarnessTools()
@@ -473,9 +772,11 @@ class PluginManagerActivity : AppCompatActivity() {
                 }
                 val code = runProcess(cmd, env, "routing-suite 特殊安装")
                 appendLog(if (code == 0) "   ✓ routing-suite 安装/更新完成" else "   ✗ routing-suite 安装/更新失败（exit=$code）")
-                refreshList()
+                refreshListSafe()
             } catch (t: Throwable) {
                 appendLog("routing-suite 异常: ${t.message}")
+            } finally {
+                setBusy(false)
             }
         }.start()
     }
@@ -566,21 +867,23 @@ class PluginManagerActivity : AppCompatActivity() {
         }
     }
 
+    /** 重启 dsh：杀 node 后走快速启动引擎（秒级；旧实现误触发完整安装流）。 */
     private fun restartFlow() {
-        appendLog(">> 重启 dsh flow（杀 node → 回控制台启动）…")
+        if (!guardBusy()) return
+        setBusy(true)
+        appendLog(">> 重启 dsh 服务（快速启动，不做安装）…")
         Thread {
-            runCatching {
-                val pb = ProcessBuilder("/system/bin/sh", "-c",
-                    "ps -A | grep node | awk '{print \$2}' | xargs -r kill")
-                pb.redirectErrorStream(true)
-                val p = pb.start()
-                p.inputStream.bufferedReader().useLines { it.forEach { l -> appendLog("   $l") } }
-                p.waitFor()
-            }
+            DshFlow.killAllNode(this) { appendLog(it) }
             Thread.sleep(1500)
             runOnUiThread {
-                startActivity(Intent(this, ConsoleActivity::class.java).putExtra("dsh", true))
-                finish()
+                DshFlow.launch(
+                    this, DshFlow.Mode.START_ONLY,
+                    onLog = { appendLog(it) },
+                    onDone = { ok ->
+                        setBusy(false)
+                        appendLog(if (ok) "✓ dsh 已重启（http://127.0.0.1:${DshFlow.WEB_PORT}）" else "✗ 重启失败，详见上方日志")
+                    }
+                )
             }
         }.start()
     }
