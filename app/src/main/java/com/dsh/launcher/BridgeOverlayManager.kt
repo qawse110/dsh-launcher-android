@@ -200,8 +200,9 @@ class BridgeOverlayManager(
 
     /** 屏幕当前可见（亮屏且未锁）才允许挂悬浮窗；查询失败按可见处理（宁可多画不可失联）。 */
     private fun screenVisible(): Boolean = try {
+        val pm = context.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
         val km = context.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
-        km.isInteractive && !km.isKeyguardLocked
+        pm.isInteractive && !km.isKeyguardLocked
     } catch (_: Exception) {
         true
     }
