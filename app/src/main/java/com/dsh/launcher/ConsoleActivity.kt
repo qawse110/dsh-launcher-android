@@ -224,387 +224,40 @@ class ConsoleActivity : AppCompatActivity() {
         }
     }
 
+
+
+
+
+
     /**
-     * dsh 安装/启动流程（内嵌，避免 shell↔am 传长命令）。
-     * 通过 ConsoleActivity 的 intent 触发：
+     * dsh 安装/启动流程：具体步骤统一在 [DshFlow] 引擎中（主界面自动启动与
+     * 控制台手动触发共用同一份逻辑）。通过 intent extras 触发：
      *   `--ez dsh true`          安装+启动（兼容旧入口：通知/插件管理/am 快捷方式）
      *   `--ez dsh_install true`  仅安装/更新（npm + 插件装配，不启动 web）
      *   `--ez dsh_start true`    仅启动（跳安装，要求已安装）
-     * 各阶段：
-     *   1) 确保内置 node 解压
-     *   2) 复制 assets 内 install-dsh.mjs + prebuilt.tgz（内置插件源）
-     *   3) 官方 npm 安装/更新 @deepseek-ai/dsh 到 files/dsh-prefix，
-     *      并用 `dsh plugin --profile web add` 装配内置插件
-     *   4) 执行 stub-dsh.mjs（Android 兼容修复），启动 dsh web
      */
     private fun runDshFlow(installOnly: Boolean = false, startOnly: Boolean = false) {
-        setState(if (installOnly) "安装/更新中…" else if (startOnly) "启动 dsh…" else "启动 dsh 安装…")
-        appendLine(if (installOnly) ">> 安装/更新模式（完成后不启动 web）…"
-                   else if (startOnly) ">> 仅启动模式（跳过安装/装配）…"
-                   else ">> 安装+启动模式…")
-        // 核心日志写私有目录（无需存储权限，run-as 可读）；共享目录尽力而为
-        val flowLog = File(filesDir, "dsh-flow.log")
-        val sharedFlowLog = File("/sdcard/Download/DshLauncher/dsh-flow.log")
-        fun fl(msg: String) {
-            runCatching { flowLog.appendText("${System.currentTimeMillis()} $msg\n") }
-            runCatching { sharedFlowLog.appendText("${System.currentTimeMillis()} $msg\n") }
-            appendLine(msg)
+        val mode = when {
+            installOnly -> DshFlow.Mode.INSTALL_ONLY
+            startOnly -> DshFlow.Mode.START_ONLY
+            else -> DshFlow.Mode.INSTALL_AND_START
         }
-        thread {
-            try {
-                startKeepAlive()
-                val nodeDir = NodeRuntime.ensureExtracted(this)
-                val apkVer = AssetSync.apkVersion(this)
-                flowLog.parentFile?.mkdirs()
-                runCatching { flowLog.writeText("") }
-                fl("OK 1/4 node=$nodeDir")
-                val dshPrefix = File(filesDir, "dsh-prefix")
-                val dshCli = File(dshPrefix, "node_modules/@deepseek-ai/dsh/lib/bin.js")
-
-                // 仅启动模式：不安装，直接快速启动（要求已安装）
-                if (startOnly) {
-                    if (!dshCli.exists()) {
-                        fl("FAIL 尚未安装 dsh（$dshCli 不存在），请先点「安装 / 更新 DSH」")
-                        setState("未安装")
-                        return@thread
-                    }
-                    if (quickStartWeb(nodeDir, dshPrefix, ::fl)) {
-                        fl("OK 启动完成 (http://127.0.0.1:3080)")
-                        setState("运行中")
-                        BuildKeepAliveService.updateRunning(this)
-                        ensureBridge()
-                    } else {
-                        fl("FAIL 启动：dsh web 未就绪（见上方日志尾部）")
-                        setState("启动失败")
-                    }
-                    return@thread
-                }
-
-                // 非安装模式且 dsh 已安装：快速启动，跳过 npm 更新/插件装配/Termux 全量准备
-                if (!installOnly && dshCli.exists()) {
-                    fl(">> 快速启动：已安装 dsh v${DshUpdater.currentVersion(this)}，跳过 npm/插件装配…")
-                    if (quickStartWeb(nodeDir, dshPrefix, ::fl)) {
-                        fl("OK 快速启动完成 (http://127.0.0.1:3080)")
-                        setState("运行中")
-                        BuildKeepAliveService.updateRunning(this)
-                    } else {
-                        fl("FAIL 快速启动：dsh web 未就绪（见上方日志尾部）")
-                        setState("启动失败")
-                    }
-                    return@thread
-                }
-                fl(">> 1.5/4 准备内置 Termux（bash/coreutils + git/rg/file）…")
-                try {
-                    TermuxRuntime.ensureExtracted(this) { msg -> fl(msg) }
-                    TermuxRuntime.ensureHarnessTools(this) { msg -> fl(msg) }
-                    fl("OK 1.5/4 termux ready (bash + git + ripgrep + file)")
-                } catch (t: Throwable) {
-                    fl("WARN 1.5/4 termux prepare failed: ${t.message}（继续 dsh 安装，dsh bash 工具可能不可用）")
-                }
-                fl("dsh 版本 v${DshUpdater.currentVersion(this)}")
-                // 安装/更新统一交给 install-dsh.mjs 的 `npm install @deepseek-ai/dsh@latest`；
-                // 主界面「安装 / 更新 DSH」即此路径（与快速启动互斥：更新后不会自动启动 web）。
-                val pluginsDir = File(filesDir, "plugins")
-
-                fl(">> 2/4 复制官方安装脚本与内置插件源…")
-                val installScript = File(filesDir, "install-dsh.mjs")
-                try {
-                    assets.open("install-dsh.mjs").use { input ->
-                        installScript.outputStream().use { output -> input.copyTo(output) }
-                    }
-                } catch (t: Throwable) {
-                    fl("FAIL 2/4 assets copy install-dsh.mjs: ${t.message}")
-                    setState("出错")
-                    return@thread
-                }
-                val prebuilt = File(filesDir, "prebuilt.tgz")
-                val prebuiltMarker = File(filesDir, ".prebuilt-ok")
-                if (AssetSync.isSynced(prebuiltMarker, prebuilt, apkVer)) {
-                    fl("  内置插件源已是最新，跳过复制")
-                } else if (AssetSync.copyAsset(this, "prebuilt.tgz", prebuilt)) {
-                    AssetSync.markSynced(prebuiltMarker, apkVer)
-                    fl("  内置插件源 ${prebuilt.length() / 1024 / 1024}MB")
-                } else {
-                    fl("  WARN assets 无 prebuilt.tgz，继续使用已有插件源")
-                }
-                val extraPluginsDir = File(filesDir, "extra-plugins")
-                val extraMarker = File(filesDir, ".extra-plugins-ok")
-                if (AssetSync.isSynced(extraMarker, extraPluginsDir, apkVer)) {
-                    fl("  额外桥接插件源已是最新，跳过复制")
-                } else {
-                    try {
-                        if (AssetSync.copyAssetDir(this, "extra-plugins", extraPluginsDir, clearFirst = true)) {
-                            AssetSync.markSynced(extraMarker, apkVer)
-                            val count = extraPluginsDir.walkTopDown().count { it.isFile }
-                            fl("  额外桥接插件源 ${count} 个文件")
-                        } else {
-                            fl("  WARN assets 无 extra-plugins")
-                        }
-                    } catch (t: Throwable) {
-                        fl("  WARN assets 无 extra-plugins：${t.message}")
-                    }
-                }
-
-                fl(">> 3/4 官方 npm 安装/更新 dsh + dsh plugin 装配内置插件…")
-                val tag = getSharedPreferences(CONSOLE_PREFS, Context.MODE_PRIVATE)
-                    .getString("dsh_install_tag", "latest") ?: "latest"
-                val installEnv = mapOf(
-                    "HOME" to filesDir.absolutePath,
-                    "NODE_BIN" to "$nodeDir/bin/node",
-                    "NPM_BIN" to "$nodeDir/bin/npm",
-                    "DSH_PREFIX" to dshPrefix.absolutePath,
-                    "DSH_PROFILE" to "web",
-                    "DSH_PREBUILT" to prebuilt.absolutePath,
-                    "DSH_PLUGINS_DIR" to pluginsDir.absolutePath,
-                    "DSH_EXTRA_PLUGINS_SRC" to extraPluginsDir.absolutePath,
-                    "DSH_TAG" to tag,
-                    "DSH_APK_VER" to apkVer.toString()
-                )
-                if (tag != "latest") fl("  （安装 dist-tag=$tag 预发布线）")
-                val installExit = runCommandAndWait("$nodeDir/bin/node ${installScript.absolutePath}", installEnv)
-                // 一次性安装 tag 已消费（无论成败），复位避免残留 next 影响下次普通安装
-                getSharedPreferences(CONSOLE_PREFS, Context.MODE_PRIVATE)
-                    .edit().remove("dsh_install_tag").apply()
-                if (installExit != 0) {
-                    fl("FAIL 3/4 install script exit=$installExit，详见 install_log.txt")
-                    setState("出错")
-                    return@thread
-                }
-                if (!File(dshPrefix, "node_modules/@deepseek-ai/dsh/lib/bin.js").exists()) {
-                    fl("FAIL 3/4 官方 dsh CLI 未安装到 $dshPrefix")
-                    setState("出错")
-                    return@thread
-                }
-                fl("OK 3/4 dsh + builtin plugins installed")
-
-                fl(">> 3.5/4 Android 兼容修复…")
-                val stubScript = File(filesDir, "stub-dsh.mjs")
-                try {
-                    assets.open("stub-dsh.mjs").use { input ->
-                        stubScript.outputStream().use { output -> input.copyTo(output) }
-                    }
-                } catch (t: Throwable) {
-                    fl("FAIL 3.5/4 assets copy stub-dsh.mjs: ${t.message}")
-                }
-                // SELinux 禁止 app 对 data 文件硬链接；dsh session 首次落盘用 link()
-                // 发布。通过 Node loader 把 node:fs/promises 的 link 重定向为 rename 兼容实现。
-                for (name in listOf("fs-register.mjs", "fs-loader.mjs", "fs-promises-compat.mjs")) {
-                    try {
-                        assets.open(name).use { input ->
-                            File(filesDir, name).outputStream().use { output -> input.copyTo(output) }
-                        }
-                    } catch (t: Throwable) {
-                        fl("WARN assets copy $name: ${t.message}")
-                    }
-                }
-                runAndroidStubOnce(nodeDir, dshPrefix, stubScript, ::fl)
-
-                // 仅安装/更新模式：到此结束，不启动 web（不置 running，watchdog 不会拉起）
-                if (installOnly) {
-                    fl("OK 安装/更新完成（未启动 web，回主界面点「启动 DSH」即可）")
-                    setState("安装完成")
-                    startKeepAlive()
-                    return@thread
-                }
-
-                fl(">> 4/4 校验 dsh web…")
-                if (startDshWeb(nodeDir, dshPrefix)) {
-                    fl("OK 4/4 dsh web started (http://127.0.0.1:3080)")
-                    setState("运行中")
-                    BuildKeepAliveService.updateRunning(this)
-                    ensureBridge()
-                } else {
-                    fl("FAIL 4/4 dsh web 启动失败（见上方日志尾部）")
-                    setState("出错")
-                    return@thread
-                }
-                // 保持 keepalive 常驻：web 进程是其子进程，避免被系统回收；用户可在主界面停止。
-            } catch (t: Throwable) {
-                fl("FAIL: ${t.message}")
-                setState("出错")
-            }
-        }
-    }
-
-
-    /** 前台服务保活，防止长时间 build 被系统回收。 */
-    private fun startKeepAlive() {
-        try {
-            val i = Intent(this, BuildKeepAliveService::class.java)
-            if (android.os.Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
-            AppLog.i("Console", "keepalive started")
-        } catch (t: Throwable) {
-            AppLog.e("Console", "keepalive start failed: ${t.message}")
-        }
-    }
-
-    /** dsh 启动成功后联动拉起状态桥接服务（悬浮窗自动出现；尊重「悬浮窗显示」开关）。 */
-    private fun ensureBridge() {
-        if (!getSharedPreferences("status_bridge", Context.MODE_PRIVATE)
-                .getBoolean("overlay_enabled", true)
-        ) return
-        runCatching { StatusBridgeService.start(this) }
-            .onSuccess { AppLog.i("Console", "bridge started for overlay") }
-            .onFailure { AppLog.e("Console", "bridge start failed: ${it.message}") }
-    }
-
-    /** 快速启动：同步兼容脚本（fs-register/fs-loader/fs-promises/stub）→ 执行 stub → 启动 web。 */
-    private fun quickStartWeb(nodeDir: File, dshPrefix: File, fl: (String) -> Unit): Boolean {
-        for (name in listOf("fs-register.mjs", "fs-loader.mjs", "fs-promises-compat.mjs", "stub-dsh.mjs")) {
-            val target = File(filesDir, name)
-            try {
-                assets.open(name).use { input ->
-                    target.outputStream().use { output -> input.copyTo(output) }
-                }
-            } catch (t: Throwable) {
-                fl("WARN copy $name: ${t.message}")
-            }
-        }
-        val stubScript = File(filesDir, "stub-dsh.mjs")
-        if (stubScript.exists()) {
-            runAndroidStubOnce(nodeDir, dshPrefix, stubScript, fl)
-        } else {
-            fl("WARN 未找到 stub-dsh.mjs，继续尝试启动 web")
-        }
-        fl(">> 启动 dsh web…")
-        return startDshWeb(nodeDir, dshPrefix)
-    }
-
-    /**
-     * Android 兼容修复（stub-dsh.mjs）按版本只跑一次：
-     * marker 记录「APK 版本 + dsh 版本」，两者都没变则跳过（省 2~5 秒启动时间）。
-     * dsh 更新或 APK 更新后自动重跑；stub 执行失败不写 marker。
-     */
-    private fun runAndroidStubOnce(nodeDir: File, dshPrefix: File, stubScript: File, fl: (String) -> Unit) {
-        val apkVer = AssetSync.apkVersion(this)
-        val expected = "apk:$apkVer|dsh:${DshUpdater.currentVersion(this)}"
-        val marker = File(filesDir, ".stub-applied")
-        if (marker.exists() && marker.readText().trim() == expected) {
-            fl(">> Android 兼容修复已应用（$expected），跳过 stub")
-            return
-        }
-        val exit = runCommandAndWait(
-            "$nodeDir/bin/node ${stubScript.absolutePath}",
-            mapOf(
-                "HOME" to filesDir.absolutePath,
-                "NODE_DIR" to nodeDir.absolutePath,
-                "DSH_PREFIX" to dshPrefix.absolutePath,
-                "DSH_PROFILE" to "web",
-                "DSH_APK_VER" to apkVer.toString()
-            )
+        DshFlow.launch(
+            this, mode,
+            onLog = { line -> appendLine(line) },
+            onState = { s -> setState(s) }
         )
-        if (exit == 0) {
-            runCatching { marker.writeText(expected) }
-        } else {
-            fl("WARN stub-dsh 退出码 $exit（不写 marker，下次重跑）")
-        }
     }
 
-    /** 后台启动 dsh web 并等待 HTTP 就绪。端口已有监听但无响应时清场重启（幂等但不再盲信）。 */
-    private fun startDshWeb(nodeDir: File, dshPrefix: File): Boolean {
-        val cli = File(dshPrefix, "node_modules/@deepseek-ai/dsh/lib/bin.js")
-        if (!cli.exists()) {
-            appendLine("✗ 未找到官方 dsh CLI（安装可能未完成）")
-            setState("出错")
-            return false
-        }
-        // 幂等：3080 已有监听 → 只有 HTTP 真正响应才算已启动；
-        // 残留（端口被占但 web 不响应）视为脏状态，先清理再重启。
-        if (isPortListening(3080)) {
-            if (waitForWebReady(5_000)) {
-                appendLine(">> dsh web 已在运行 (http://127.0.0.1:3080)")
-                return true
-            }
-            appendLine(">> 端口 3080 被残留进程占用但 web 无响应，清理后重新启动…")
-            killAllNode()
-            Thread.sleep(1500)
-        }
-        // 生成启动脚本到共享目录，用 sh 后台执行
-        File(filesDir, "tmp").mkdirs()
-        val launcher = File(getExternalFilesDir(null) ?: filesDir, "dsh-web.sh")
-        launcher.parentFile?.mkdirs()
-        val termuxUsr = TermuxRuntime.prefix(this).absolutePath
-        val termuxReady = TermuxRuntime.isBashReady(this)
-        val termuxPath = if (termuxReady) "$termuxUsr/bin:$termuxUsr/bin/applets:$termuxUsr/local/bin:" else ""
-        val ldLibrary = if (termuxReady) "${nodeDir.absolutePath}/lib:$termuxUsr/lib" else "${nodeDir.absolutePath}/lib"
-        val nodeCmd = "${nodeDir.absolutePath}/bin/node --expose-internals --import ${filesDir.absolutePath}/fs-register.mjs ${cli.absolutePath} web"
-        launcher.writeText(
-            "#!/system/bin/sh\n" +
-            "export LD_LIBRARY_PATH=$ldLibrary\n" +
-            "export HOME=${filesDir.absolutePath}\n" +
-            "export TMPDIR=${filesDir.absolutePath}/tmp\n" +
-            "export OPENSSL_CONF=/dev/null\n" +
-            "export TERM=xterm-256color\n" +
-            (if (termuxReady) "export PREFIX=$termuxUsr\n" else "") +
-            "export PATH=${nodeDir.absolutePath}/bin:${termuxPath}${File(filesDir, ".tools").absolutePath}/bin:/system/bin:/bin:/usr/bin\n" +
-            "if command -v nohup >/dev/null 2>&1; then\n" +
-            "  nohup $nodeCmd > ${filesDir.absolutePath}/dsh-web.log 2>&1 &\n" +
-            "else\n" +
-            "  $nodeCmd > ${filesDir.absolutePath}/dsh-web.log 2>&1 &\n" +
-            "fi\n" +
-            "echo DSH_WEB_PID=$!\n"
-        )
-        launcher.setExecutable(true)
-        runCommandAndWait("/system/bin/sh ${launcher.absolutePath}")
-        appendLine(">> dsh web 已后台启动，等待 web 就绪（http://127.0.0.1:3080）…")
-        return waitForWebReady(90_000)
-    }
-
-    /** 检测本机端口是否已有监听（用于幂等启动）。 */
-    private fun isPortListening(port: Int): Boolean = try {
-        java.net.ServerSocket().use { s ->
-            s.reuseAddress = false
-            s.bind(java.net.InetSocketAddress("127.0.0.1", port))
-            false
-        }
-    } catch (e: java.io.IOException) {
-        true
-    }
-
-    /** 轮询等待 dsh web 的 HTTP 真正可访问，超时后打印 dsh-web.log 尾部。
-     *  前 6 秒每 150ms 探测一次（node 冷启动通常 1~3s，尽快感知就绪），之后放宽到 500ms。 */
-    private fun waitForWebReady(timeoutMs: Long): Boolean {
-        val deadline = System.currentTimeMillis() + timeoutMs
-        var lastLog = 0L
-        while (System.currentTimeMillis() < deadline) {
-            if (httpResponds(3080)) return true
-            val now = System.currentTimeMillis()
-            if (now - lastLog >= 5000) {
-                lastLog = now
-                appendLine("   等待 dsh web 就绪…（剩余 ${(deadline - now) / 1000}s）")
-            }
-            val elapsed = timeoutMs - (deadline - now)
-            Thread.sleep(if (elapsed < 6_000) 150 else 500)
-        }
-        appendLine("✗ dsh web 未在 ${timeoutMs / 1000} 秒内就绪，日志尾部：")
-        appendLogTail(File(filesDir, "dsh-web.log"), 25)
-        return false
-    }
-
-    private fun httpResponds(port: Int): Boolean = try {
-        val conn = java.net.URL("http://127.0.0.1:$port/").openConnection() as java.net.HttpURLConnection
-        conn.connectTimeout = 800
-        conn.readTimeout = 800
-        conn.requestMethod = "GET"
-        val code = conn.responseCode
-        conn.disconnect()
-        code in 200..399
-    } catch (e: Exception) {
-        false
-    }
-
-    private fun appendLogTail(file: java.io.File, maxLines: Int) {
-        try {
-            if (!file.exists()) {
-                appendLine("   （无日志文件：${file.path}）")
-                return
-            }
-            val lines = file.readText().trim().lines()
-            val tail = if (lines.size > maxLines) lines.takeLast(maxLines) else lines
-            for (line in tail) appendLine("   | $line")
-        } catch (t: Throwable) {
-            appendLine("   （读取日志失败：${t.message}）")
-        }
+    /** 同步执行命令（阻塞直到结束），返回退出码；输出实时回显（引擎见 [DshFlow.exec]）。 */
+    private fun runCommandAndWait(raw: String, extraEnv: Map<String, String> = emptyMap(), termux: Boolean = false): Int {
+        setState("运行中…")
+        val exit = DshFlow.exec(this, raw, extraEnv, termux) { line -> appendLine(line) }
+        AppLog.i("Console", "exit code: $exit")
+        setState("完成（退出码 $exit）")
+        appendLine("[退出码: $exit]")
+        appendLine("")
+        return exit
     }
 
     /** 通过 ProcessBuilder 执行命令，实时回显输出。 */
@@ -641,7 +294,7 @@ class ConsoleActivity : AppCompatActivity() {
             if (version != null) {
                 log("发现 dsh v$version，重启流程执行 npm 官方更新…")
                 Thread.sleep(3_000)
-                killAllNode()
+                DshFlow.killAllNode(this@ConsoleActivity) { appendLine(it) }
                 runOnUiThread { runDshFlow() }
             }
         }
@@ -661,7 +314,7 @@ class ConsoleActivity : AppCompatActivity() {
                 getSharedPreferences(CONSOLE_PREFS, Context.MODE_PRIVATE)
                     .edit().putString("dsh_install_tag", "next").apply()
                 Thread.sleep(3_000)
-                killAllNode()
+                DshFlow.killAllNode(this@ConsoleActivity) { appendLine(it) }
                 runOnUiThread { runDshFlow() }
             } else {
                 log("next 线暂无更新（或已是最新预发布版）")
@@ -669,102 +322,7 @@ class ConsoleActivity : AppCompatActivity() {
         }
     }
 
-    /** 杀掉全部 node 进程（web 与 flow 子进程一并结束），供更新后重启。 */
-    private fun killAllNode() {
-        runCatching {
-            // 用 [n]ode 避免 grep 匹配到自身；不用 xargs -r，兼容 Android toybox
-            val pb = ProcessBuilder(
-                "/system/bin/sh", "-c",
-                "ps -A | grep '[n]ode' | awk '{print \$2}' | while read pid; do kill \"\$pid\" 2>/dev/null; done"
-            )
-            pb.redirectErrorStream(true)
-            val p = pb.start()
-            p.inputStream.bufferedReader().useLines { it.forEach { line -> appendLine(line) } }
-            p.waitFor()
-            AppLog.i("Console", "node processes killed")
-        }
-    }
 
-    /** 同步执行命令（阻塞直到结束），返回退出码；输出实时回显。 */
-    private fun runCommandAndWait(raw: String, extraEnv: Map<String, String> = emptyMap(), termux: Boolean = false): Int {
-        setState("运行中…")
-        AppLog.i("Console", "cmd: $raw")
-        val termuxReady = termux && TermuxRuntime.isBashReady(this)
-        val wantsWrite = termuxReady && looksLikePackageInstall(raw)
-        return try {
-            val useTermux = termuxReady
-            // 用户命令用内置 Termux bash；内部 flow 命令仍用系统 sh（避免自动解压拖慢 dsh）
-            val shell = if (useTermux) TermuxRuntime.bashPath(this).absolutePath else "/system/bin/sh"
-            if (wantsWrite) {
-                appendLine(">> 检测到安装类命令：临时放开 bin/lib/share 写权限…")
-                TermuxRuntime.setRuntimeWritable(this, true)
-            }
-            val pb = ProcessBuilder(shell, "-c", raw)
-            pb.redirectErrorStream(true)
-            val env = pb.environment()
-            if (useTermux) {
-                val usr = TermuxRuntime.prefix(this).absolutePath
-                val home = TermuxRuntime.home(this).absolutePath
-                val tmp = TermuxRuntime.tmp(this).absolutePath
-                env["PREFIX"] = usr
-                env["PATH"] = listOf(
-                    "$usr/bin", "$usr/bin/applets", "$usr/local/bin",
-                    File(filesDir, "node/bin").absolutePath,
-                    "/system/bin", "/bin", "/usr/bin"
-                ).joinToString(":")
-                env["HOME"] = home
-                env["TERM"] = "xterm-256color"
-                env["LANG"] = "C.UTF-8"
-                env["LD_LIBRARY_PATH"] = "$usr/lib"
-                env["TMPDIR"] = tmp
-                env.remove("LD_PRELOAD")
-                env["OPENSSL_CONF"] = "/dev/null"
-            } else {
-                env["PATH"] = listOf(
-                    File(filesDir, "node/bin").absolutePath,
-                    "/system/bin", "/bin", "/usr/bin"
-                ).joinToString(":")
-                env["HOME"] = filesDir.absolutePath
-                env["TERM"] = "xterm-256color"
-                env["LD_LIBRARY_PATH"] = File(filesDir, "node/lib").absolutePath
-                env["TMPDIR"] = File(filesDir, "tmp").absolutePath
-                env["OPENSSL_CONF"] = "/dev/null"
-            }
-            extraEnv.forEach { (k, v) -> env[k] = v }
-
-            val proc = pb.start()
-            // 实时逐行回显
-            proc.inputStream.bufferedReader().useLines { lines ->
-                lines.forEach { line ->
-                    appendLine(line)
-                    AppLog.i("ConsoleOut", line)
-                }
-            }
-            val exit = proc.waitFor()
-            AppLog.i("Console", "exit code: $exit")
-            setState("完成（退出码 $exit）")
-            appendLine("[退出码: $exit]")
-            appendLine("")
-            exit
-        } catch (e: Exception) {
-            AppLog.e("Console", "cmd failed: " + (e.message ?: e.toString()))
-            setState("出错")
-            appendLine("[执行失败: ${e.message}]")
-            -1
-        } finally {
-            if (wantsWrite) {
-                runCatching { TermuxRuntime.setRuntimeWritable(this, false) }
-                appendLine(">> 安装命令结束，已恢复 bin/lib/share 只读（W^X 保护）")
-            }
-        }
-    }
-
-    /** 判断命令是否可能写入 bin/lib/share（apt/pkg/dpkg 安装类），用于临时放开 W^X。 */
-    private fun looksLikePackageInstall(raw: String): Boolean {
-        val lc = raw.lowercase()
-        return Regex("""\b(apt|apt-get|pkg)\b[^\n;&]*\b(install|reinstall|upgrade|dist-upgrade)\b""").containsMatchIn(lc) ||
-            Regex("""\bdpkg\b[^\n;&]*\b(-i|--install)\b""").containsMatchIn(lc)
-    }
 
     private fun setState(s: String) {
         runOnUiThread {

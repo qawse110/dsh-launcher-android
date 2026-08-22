@@ -3,6 +3,7 @@ package com.dsh.launcher
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Typeface
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -10,7 +11,6 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
-import android.graphics.Typeface
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -22,24 +22,50 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import com.google.android.material.color.DynamicColors
 import java.io.File
-import java.net.HttpURLConnection
-import java.net.URL
 import kotlin.concurrent.thread
 
 /**
- * DeepSeek Harness 启动器主界面
- * 功能：检查服务状态 / 一键安装 / 启停 dsh 服务 / 打开 Web 界面 / 打开内置终端 / 内置 Node 运行
+ * DeepSeek Harness 启动器主界面 —— 「打开即用」的自动启动流。
+ *
+ * 流程（v4.2 起）：
+ * - 首次启动（未安装）：自动 解压内置 Node → npm 安装 dsh → 装配内置插件 →
+ *   Android 兼容修复 → 启动 dsh web → 自动进入 WebUI；
+ * - 后续启动：自动快速启动 dsh web（已运行则跳过）→ 自动进入 WebUI；
+ * - 安装/更新、控制台等高级操作保留为次级入口。
+ *
+ * 启动引擎在 [DshFlow]（与命令控制台共用同一份逻辑），本类只负责状态展示与路由。
  */
 class MainActivity : AppCompatActivity() {
 
     private val handler = Handler(Looper.getMainLooper())
-    private lateinit var statusValue: TextView
-    private lateinit var statusDot: View
+
+    /** 启动阶段。 */
+    private enum class Phase { FIRST_INSTALL, STOPPED, RUNNING, FLOWING, ERROR }
+
+    private lateinit var phaseDot: View
+    private lateinit var phaseTitle: TextView
+    private lateinit var phaseSub: TextView
     private lateinit var progress: ProgressBar
-    private lateinit var logView: TextView
-    private val logSb = StringBuilder()
+    private lateinit var miniLog: TextView
+    private lateinit var primaryBtn: View
+    private lateinit var primaryText: TextView
     private var contentRoot: LinearLayout? = null
     private var updateBanner: View? = null
+
+    private val logSb = StringBuilder()
+    private var phase = Phase.FIRST_INSTALL
+    private var flowing = false
+    private var lastMode: DshFlow.Mode = DshFlow.Mode.INSTALL_AND_START
+
+    /** 冷启动自动路由只做一次；从 WebUI 返回主界面不重复弹。 */
+    private var autoRouteDone = false
+
+    private val pollRunnable = object : Runnable {
+        override fun run() {
+            if (!flowing) refreshRunState(silent = true)
+            handler.postDelayed(this, 3_000)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         DynamicColors.applyToActivityIfAvailable(this)
@@ -47,7 +73,7 @@ class MainActivity : AppCompatActivity() {
         Ui.applyDynamicColors(this)
         AppLog.init(this)
         AppLog.i("Main", "onCreate start, logPath=" + AppLog.logPath())
-        // 支持 `am start -n com.dsh.launcher/.MainActivity --ez dsh true` 一键触发
+        // 支持 `am start -n com.dsh.launcher/.MainActivity --ez dsh true` 一键触发（旧入口兼容）
         if (intent?.getBooleanExtra("dsh", false) == true) {
             startActivity(Intent(this, ConsoleActivity::class.java)
                 .putExtra("dsh", true)
@@ -65,13 +91,164 @@ class MainActivity : AppCompatActivity() {
         ) {
             runCatching { StatusBridgeService.start(this) }
         }
-        log("就绪。请选择操作。")
+        // 冷启动自动路由：首次=安装+启动；已装=启动；已在跑=直接进 WebUI
+        autoRoute(coldStart = savedInstanceState == null)
+        handler.post(pollRunnable)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        handler.removeCallbacks(pollRunnable)
+    }
+
+    /** 冷启动自动流转：已在跑→直接进 WebUI；已装→自动快速启动；未装→自动完整安装。 */
+    private fun autoRoute(coldStart: Boolean) {
+        if (!coldStart) {
+            // 旋转屏/从 WebUI 返回等重建场景：只刷新状态，不重复自动弹 WebUI
+            refreshRunState()
+            return
+        }
+        autoRouteDone = true
+        thread {
+            val installed = DshFlow.isInstalled(this)
+            val up = installed && DshFlow.isWebUp()
+            handler.post {
+                when {
+                    up -> { applyPhase(Phase.RUNNING); openWeb() }
+                    installed -> beginFlow(DshFlow.Mode.START_ONLY)
+                    else -> beginFlow(DshFlow.Mode.INSTALL_AND_START)
+                }
+            }
+        }
     }
 
     override fun onResume() {
         super.onResume()
-        if (::statusValue.isInitialized) refreshStatus(silent = true)
+        refreshEnvChips()
     }
+
+    // ---------------- 自动启动流程 ----------------
+
+    private fun beginFlow(mode: DshFlow.Mode) {
+        if (flowing) {
+            toast("启动流程进行中，请稍候…")
+            return
+        }
+        flowing = true
+        lastMode = mode
+        val firstInstall = mode == DshFlow.Mode.INSTALL_AND_START && !DshFlow.isInstalled(this)
+        applyPhase(Phase.FLOWING,
+            title = if (firstInstall) "正在安装 DeepSeek Harness…" else "正在启动 dsh…",
+            sub = if (firstInstall) "解压 Node → 下载安装 → 装配插件 → 启动，全程自动（首次需联网，约几分钟）"
+                  else "正在拉起本地服务（http://127.0.0.1:${DshFlow.WEB_PORT}），就绪后自动进入 WebUI"
+        )
+        primaryBtn.isEnabled = false
+        primaryBtn.alpha = 0.55f
+        primaryText.text = if (firstInstall) "安装中…" else "启动中…"
+
+        DshFlow.launch(
+            this, mode,
+            onLog = { line -> runOnUiThread { appendMiniLog(line) } },
+            onState = { s ->
+                runOnUiThread {
+                    if (!flowing) return@runOnUiThread
+                    phaseSub.text = s
+                }
+            },
+            onDone = { ok ->
+                runOnUiThread {
+                    flowing = false
+                    primaryBtn.isEnabled = true
+                    primaryBtn.alpha = 1f
+                    if (ok && mode != DshFlow.Mode.INSTALL_ONLY) {
+                        applyPhase(Phase.RUNNING)
+                        openWeb()
+                    } else if (ok) {
+                        // 仅安装模式（当前主界面不触发，防御性兜底）
+                        refreshRunState()
+                    } else {
+                        applyPhase(Phase.ERROR)
+                        toast("启动流程未完成，可点「重试」或查看控制台日志")
+                    }
+                }
+            }
+        )
+    }
+
+    private fun openWeb() {
+        runCatching { startActivity(Intent(this, WebViewActivity::class.java)) }
+            .onFailure { appendMiniLog("✗ 无法打开 WebUI：${it.message}") }
+    }
+
+    // ---------------- 状态渲染 ----------------
+
+    private fun refreshRunState(silent: Boolean = false) {
+        thread {
+            val running = DshFlow.isWebUp()
+            handler.post {
+                if (flowing || isFinishing || isDestroyed) return@post
+                val next = when {
+                    running -> Phase.RUNNING
+                    DshFlow.isInstalled(this) -> Phase.STOPPED
+                    else -> Phase.FIRST_INSTALL
+                }
+                applyPhase(next, silent = silent)
+            }
+        }
+    }
+
+    private fun applyPhase(next: Phase, title: String? = null, sub: String? = null, silent: Boolean = false) {
+        phase = next
+        val (t, s, color) = when (next) {
+            Phase.RUNNING -> Triple(
+                "dsh 已就绪",
+                "http://127.0.0.1:${DshFlow.WEB_PORT} · 点击下方按钮进入 WebUI",
+                Ui.SUCCESS
+            )
+            Phase.STOPPED -> Triple(
+                "一键启动",
+                "dsh v${DshUpdater.currentVersion(this)} · 点下方按钮启动并自动进入 WebUI",
+                Ui.TEXT_MUTED
+            )
+            Phase.FIRST_INSTALL -> Triple(
+                "欢迎来到 DeepSeek Harness",
+                "点下方按钮自动完成安装并启动（需联网，首次约几分钟）",
+                Ui.BRAND
+            )
+            Phase.FLOWING -> Triple(
+                title ?: "正在准备…",
+                sub ?: "",
+                Ui.BRAND_DEEP
+            )
+            Phase.ERROR -> Triple(
+                "启动未完成",
+                "可重试；详情见「控制台」日志（install_log.txt / dsh-web.log）",
+                Ui.DANGER
+            )
+        }
+        phaseDot.background = android.graphics.drawable.GradientDrawable().apply {
+            shape = android.graphics.drawable.GradientDrawable.OVAL
+            setColor(color)
+            setStroke(dp(3), Ui.withAlpha(color, 0x38))
+        }
+        phaseTitle.text = t
+        phaseTitle.setTextColor(if (next == Phase.ERROR) Ui.DANGER else Ui.TEXT_PRIMARY)
+        phaseSub.text = s
+        phaseSub.setTextColor(Ui.TEXT_SECONDARY)
+        val busy = next == Phase.FLOWING
+        progress.visibility = if (busy) View.VISIBLE else View.GONE
+        when (next) {
+            Phase.RUNNING -> { primaryText.text = getString(R.string.btn_enter_webui); primaryBtn.isEnabled = true; primaryBtn.alpha = 1f }
+            Phase.STOPPED -> { primaryText.text = getString(R.string.btn_start_auto); primaryBtn.isEnabled = true; primaryBtn.alpha = 1f }
+            Phase.FIRST_INSTALL -> { primaryText.text = getString(R.string.btn_install_start); primaryBtn.isEnabled = true; primaryBtn.alpha = 1f }
+            Phase.FLOWING -> Unit // 文案由 beginFlow 设置
+            Phase.ERROR -> { primaryText.text = getString(R.string.btn_retry); primaryBtn.isEnabled = true; primaryBtn.alpha = 1f }
+        }
+        if (!silent && !busy) AppLog.i("Main", "phase=$next")
+        refreshEnvChips()
+    }
+
+    // ---------------- 权限 ----------------
 
     /** 申请存储权限（Android 11+ 走“所有文件访问”，旧版走运行时授权）。 */
     private fun requestStoragePermissions() {
@@ -80,13 +257,8 @@ class MainActivity : AppCompatActivity() {
                 val prefs = getSharedPreferences("storage", MODE_PRIVATE)
                 if (!prefs.getBoolean("all_files_prompted", false)) {
                     prefs.edit().putBoolean("all_files_prompted", true).apply()
-                    log("需要授予“所有文件访问权限”才能完整访问 /sdcard…")
                     openAllFilesAccessSettings()
-                } else {
-                    log("尚未授予“所有文件访问权限”，可点击下方按钮前往设置")
                 }
-            } else {
-                log("已获得“所有文件访问权限”")
             }
             return
         }
@@ -111,89 +283,50 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) {
             try {
                 startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
-            } catch (e2: Exception) {
-                log("无法打开存储权限设置：${e2.message}")
+            } catch (_: Exception) {
             }
         }
     }
 
     // ---------------- UI ----------------
+
     private fun buildUi(): View {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Ui.BG)
-            setPadding(dp(20), dp(32), dp(20), dp(24))
+            setPadding(dp(20), dp(28), dp(20), dp(20))
         }
         contentRoot = root
 
-        // ---- 布局辅助 ----
-        /** 区块标题 + 卡片容器。 */
-        fun addSection(title: String, block: LinearLayout.() -> Unit) {
-            root.addView(Ui.sectionLabel(this, title).apply {
-                layoutParams = LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                ).apply { topMargin = dp(20) }
-            })
-            val card = Ui.card(this, radiusDp = 16, background = Ui.SURFACE_CONTAINER, elevationDp = 1f)
-            card.addView(LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; block() })
-            root.addView(card, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(8) })
-        }
-
-        /** 通栏按钮（主操作/停止等）。 */
-        fun LinearLayout.addWide(
-            text: String, filled: Boolean, color: Int = Ui.BRAND_DEEP,
-            heightDp: Int = 48, bold: Boolean = false, textSize: Float = 14f,
-            onClick: () -> Unit
-        ) {
-            addView(Ui.button(this@MainActivity, text, onClick, filled = filled, color = color).apply {
-                this.textSize = textSize
-                if (bold) typeface = Typeface.DEFAULT_BOLD
-                layoutParams = LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, dp(heightDp)
-                ).apply { topMargin = dp(8) }
-            })
-        }
-
-        /** 两列等宽按钮行（网格布局，减少滚屏）。 */
-        fun LinearLayout.addPair(
-            a: String, aOn: () -> Unit,
-            b: String, bOn: () -> Unit,
-            color: Int = Ui.BRAND_DEEP
-        ) {
-            addView(LinearLayout(this@MainActivity).apply {
+        /** 两列等宽小按钮行。 */
+        fun addPairRow(vararg items: Pair<String, () -> Unit>): View =
+            LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
-                setPadding(0, dp(6), 0, 0)
-                addView(
-                    Ui.button(this@MainActivity, a, aOn, filled = false, color = color),
-                    LinearLayout.LayoutParams(0, dp(46), 1f).apply { rightMargin = dp(8) }
-                )
-                addView(
-                    Ui.button(this@MainActivity, b, bOn, filled = false, color = color),
-                    LinearLayout.LayoutParams(0, dp(46), 1f)
-                )
-            })
-        }
+                items.forEachIndexed { i, (label, onClick) ->
+                    addView(
+                        Ui.button(this@MainActivity, label, onClick, filled = false),
+                        LinearLayout.LayoutParams(0, dp(44), 1f).apply {
+                            if (i < items.lastIndex) rightMargin = dp(8)
+                        }
+                    )
+                }
+            }
 
         // Header
         root.addView(TextView(this).apply {
             text = "⚡ DeepSeek Harness"
-            textSize = 26f
+            textSize = 24f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Ui.TEXT_PRIMARY)
             gravity = Gravity.CENTER
-            setPadding(0, dp(4), 0, 0)
         })
         root.addView(TextView(this).apply {
-            text = "Agent 插件化开发框架 · 本地运行"
-            textSize = 13f
+            text = "Agent 插件化开发框架 · 本地运行 · 打开即用"
+            textSize = 12.5f
             setTextColor(Ui.TEXT_MUTED)
             gravity = Gravity.CENTER
-            setPadding(0, dp(8), 0, dp(24))
+            setPadding(0, dp(6), 0, dp(16))
         })
 
         // APP 升级提示条：APK 更新后同步了内置插件源，提示重新装配
@@ -201,211 +334,189 @@ class MainActivity : AppCompatActivity() {
             root.addView(buildUpdateBanner())
         }
 
-        // Section: 运行状态（两行：标签+刷新 / 大号状态指示，不再挤一行）
-        root.addView(Ui.sectionLabel(this, "运行状态").apply {
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(20) }
-        })
+        // ---- 主状态卡 ----
+        val card = Ui.card(this, radiusDp = 18, background = Ui.SURFACE_CONTAINER_HIGH, elevationDp = 1f)
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
-        val statusCard = Ui.card(this, radiusDp = 16, background = Ui.SURFACE_CONTAINER_HIGH, elevationDp = 1f)
-        val statusCol = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        // 第一行：弱化标签 + 刷新按钮
-        statusCol.addView(LinearLayout(this).apply {
+        col.addView(LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            addView(TextView(this@MainActivity).apply {
-                text = "dsh 服务"
-                textSize = 13f
+            phaseDot = Ui.dot(this@MainActivity, 14, Ui.TEXT_MUTED)
+            addView(phaseDot, LinearLayout.LayoutParams(dp(14), dp(14)).apply { rightMargin = dp(10) })
+            phaseTitle = TextView(this@MainActivity).apply {
+                textSize = 19f
                 typeface = Typeface.DEFAULT_BOLD
-                setTextColor(Ui.TEXT_SECONDARY)
-            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(Ui.button(this@MainActivity, "刷新", { refreshStatus() },
-                filled = false, compact = true).apply { minWidth = dp(76); textSize = 12.5f })
-        })
-        // 第二行：大号状态点（带同色光晕描边）+ 状态文字 + 版本与端口提示
-        statusCol.addView(LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(14), 0, 0)
-            statusDot = Ui.dot(this@MainActivity, 14, Ui.TEXT_MUTED)
-            addView(statusDot, LinearLayout.LayoutParams(dp(14), dp(14)).apply { rightMargin = dp(10) })
-            statusValue = TextView(this@MainActivity).apply {
-                text = getString(R.string.status_unknown)
-                textSize = 18f
-                typeface = Typeface.DEFAULT_BOLD
-                setTextColor(Ui.TEXT_MUTED)
+                setTextColor(Ui.TEXT_PRIMARY)
             }
-            addView(statusValue, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(phaseTitle, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(TextView(this@MainActivity).apply {
-                text = "v${DshUpdater.currentVersion(this@MainActivity)} · 3080"
+                text = "v${DshUpdater.currentVersion(this@MainActivity)} · ${DshFlow.WEB_PORT}"
                 textSize = 11f
                 setTextColor(Ui.TEXT_MUTED)
             })
-        })
-        statusCard.addView(statusCol)
-        root.addView(statusCard, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = dp(8) })
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        progress = ProgressBar(this).apply { visibility = View.GONE }
-        root.addView(progress, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { gravity = Gravity.CENTER_HORIZONTAL; topMargin = dp(8) })
-
-        // Section: 核心操作（安装/更新 与 启动 拆分）
-        addSection("核心操作") {
-            addWide(getString(R.string.btn_install_update), true, Ui.BRAND, heightDp = 52, bold = true, textSize = 15f) {
-                // 仅安装/更新：node→官方 npm 安装/更新 dsh→插件装配，不启动 web
-                runCatching {
-                    startActivity(Intent(this@MainActivity, ConsoleActivity::class.java).putExtra("dsh_install", true))
-                }.onFailure {
-                    log("✗ 无法打开控制台：${it.message}")
-                }
-            }
-            addPair(getString(R.string.btn_start_dsh), {
-                // 仅启动：跳过安装/装配，快速启动 web（未安装时提示先安装）
-                startActivity(Intent(this@MainActivity, ConsoleActivity::class.java).putExtra("dsh_start", true))
-            }, getString(R.string.btn_open_web), {
-                startActivity(Intent(this@MainActivity, WebViewActivity::class.java))
-            })
-        }
-
-        // Section: 工具（两列网格）
-        addSection("工具") {
-            addPair(getString(R.string.btn_open_terminal), {
-                thread {
-                    if (!TermuxRuntime.isReady(this@MainActivity)) {
-                        log("准备内置 Termux 环境（首次约 10~60 秒）…")
-                        try {
-                            TermuxRuntime.ensureExtracted(this@MainActivity) { msg -> log(msg) }
-                            log("Termux 环境已解压，检查/安装 Harness 工具与 Linux 常用命令…")
-                        } catch (t: Throwable) {
-                            log("✗ Termux 准备失败：${t.message}（回退系统 sh）")
-                        }
-                    }
-                    TermuxRuntime.ensureHarnessTools(this@MainActivity) { msg -> log(msg) }
-                    runOnUiThread {
-                        startActivity(Intent(this@MainActivity, TerminalActivity::class.java))
-                    }
-                }
-            }, getString(R.string.btn_node_check), {
-                runNodeDsh()
-            })
-        }
-
-        // Section: 设置与状态（两列网格）
-        addSection("设置与状态") {
-            addPair("存储权限", { requestStoragePermissions() },
-                    "状态悬浮窗", { startActivity(Intent(this@MainActivity, OverlaySettingsActivity::class.java)) })
-            addPair("插件管理", { startActivity(Intent(this@MainActivity, PluginManagerActivity::class.java)) },
-                    getString(R.string.btn_stop_all), { stopDshAll() }, color = Ui.DANGER)
-        }
-
-        // Section: 日志（标题行右侧带「清空」小按钮）
-        root.addView(LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(20) }
-            addView(Ui.sectionLabel(this@MainActivity, "日志"),
-                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(Ui.button(this@MainActivity, "清空", {
-                logSb.clear()
-                logView.text = ""
-            }, filled = false, compact = true).apply { minWidth = dp(64); textSize = 12f })
-        })
-
-        // 反馈日志栏
-        val logCard = Ui.card(this, radiusDp = 14, background = Ui.SURFACE_CONTAINER_LOW, elevationDp = 0f)
-        logView = TextView(this).apply {
+        phaseSub = TextView(this).apply {
+            textSize = 13f
             setTextColor(Ui.TEXT_SECONDARY)
-            textSize = 12f
-            setPadding(dp(4), dp(2), dp(4), dp(2))
             setLineSpacing(dp(2).toFloat(), 1f)
+            setPadding(0, dp(8), 0, 0)
         }
-        logCard.addView(logView)
-        root.addView(logCard, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = dp(14) })
+        col.addView(phaseSub, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ))
 
-        // Section: 运行环境（环境状态入卡，统一层级）
-        root.addView(Ui.sectionLabel(this, "运行环境").apply {
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(20) }
-        })
-        val envCard = Ui.card(this, radiusDp = 14, background = Ui.SURFACE_CONTAINER_LOW, elevationDp = 0f)
-        val envList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        fun envRow(text: String, color: Int): View = LinearLayout(this@MainActivity).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(4), 0, dp(2))
-            addView(Ui.dot(this@MainActivity, 7, color), LinearLayout.LayoutParams(dp(7), dp(7)).apply { rightMargin = dp(8) })
-            addView(TextView(this@MainActivity).apply {
-                this.text = text
-                textSize = 12.5f
-                setTextColor(color)
-            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            isIndeterminate = true
+            visibility = View.GONE
+            indeterminateTintList = android.content.res.ColorStateList.valueOf(Ui.BRAND)
         }
-        // 内置 Node / Termux 状态
-        envList.addView(envRow(
-            if (hasNodeMarker()) "内置 Node：已就绪 ✓" else "内置 Node：未解压（点上方按钮首次自动解压 ⏳）",
-            if (hasNodeMarker()) Ui.SUCCESS else Ui.WARNING
-        ))
-        envList.addView(envRow(
-            if (TermuxRuntime.isReady(this@MainActivity)) "内置 Termux：已就绪 ✓（bash + coreutils + apt，可执行 Linux 指令）"
-            else "内置 Termux：未解压（首次执行命令/打开终端自动准备）",
-            if (TermuxRuntime.isReady(this@MainActivity)) Ui.SUCCESS else Ui.WARNING
-        ))
-        envList.addView(envRow(
-            if (Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager()) "共享存储：可完整访问 /sdcard ✓"
-            else "共享存储：未授予“所有文件访问权限”（点上方按钮授权）⚠",
-            if (Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager()) Ui.SUCCESS else Ui.WARNING
-        ))
-        envCard.addView(envList)
-        root.addView(envCard, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = dp(8) })
+        col.addView(progress, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(6)
+        ).apply { topMargin = dp(12) })
 
-        // 操作步骤：默认收起（长帮助文本不再占据首屏），点击标题展开/收起
-        var helpExpanded = false
-        val helpTitle = TextView(this).apply {
-            text = "📖 操作步骤与提示 ▸"
-            textSize = 12.5f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(Ui.TEXT_SECONDARY)
-            setPadding(0, dp(18), 0, dp(2))
-        }
-        val helpBody = TextView(this).apply {
-            text = "① 点“⚡ 安装 / 更新 DSH”自动完成：内置 Node 解压 → 官方 npm 安装/更新 dsh → dsh plugin 装配内置插件（首次需联网下载，之后增量更新，不会自动启动）；\n② 点“启动 DSH”启动 Web 服务，“打开 Web 界面”进入 dsh UI（http://127.0.0.1:3080）；\n③ “停止 dsh 服务”结束后台进程与保活服务。\n\n提示：\n· 全程免 Termux，内置 Node 为 aarch64 运行时；\n· 安装日志：/sdcard/Download/DshLauncher/install_log.txt。"
-            textSize = 12f
+        // 迷你日志（最近几行，弱化显示）
+        miniLog = TextView(this).apply {
             setTextColor(Ui.TEXT_MUTED)
-            setPadding(0, dp(4), 0, 0)
-            setLineSpacing(dp(3).toFloat(), 1f)
+            textSize = 10.5f
+            setTypeface(Typeface.MONOSPACE)
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            setLineSpacing(dp(2).toFloat(), 1f)
+            background = Ui.rounded(this@MainActivity, Ui.SURFACE_CONTAINER_LOW, 10)
             visibility = View.GONE
         }
-        helpTitle.setOnClickListener {
-            helpExpanded = !helpExpanded
-            helpBody.visibility = if (helpExpanded) View.VISIBLE else View.GONE
-            helpTitle.text = if (helpExpanded) "📖 操作步骤与提示 ▾" else "📖 操作步骤与提示 ▸"
+        col.addView(miniLog, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(10) })
+
+        val btn = Ui.button(this, "", { onPrimaryClicked() }, filled = true).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(52)
+            ).apply { topMargin = dp(14) }
+            textSize = 15.5f
+            typeface = Typeface.DEFAULT_BOLD
         }
-        root.addView(helpTitle)
-        root.addView(helpBody)
+        primaryBtn = btn
+        primaryText = btn
+        col.addView(btn)
+
+        card.addView(col)
+        root.addView(card, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(4) })
+
+        // ---- 次级操作网格 ----
+        root.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(12), 0, 0)
+            addView(addPairRow(
+                getString(R.string.btn_open_terminal) to { startActivity(Intent(this@MainActivity, ConsoleActivity::class.java)) },
+                "终端" to { openTerminal() }
+            ).apply {}, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(8) })
+            addView(addPairRow(
+                "状态悬浮窗" to { startActivity(Intent(this@MainActivity, OverlaySettingsActivity::class.java)) },
+                "插件管理" to { startActivity(Intent(this@MainActivity, PluginManagerActivity::class.java)) }
+            ), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(8) })
+            addView(addPairRow(
+                getString(R.string.btn_stop_all) to { stopDshAll() },
+                "📖 操作指南" to { toggleHelp() }
+            ), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        })
+
+        // 环境状态 chips
+        envChipsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(0, dp(14), 0, 0)
+        }
+        root.addView(envChipsRow)
+
+        // 操作指南（默认收起）
+        helpBody = TextView(this).apply {
+            text = """
+                ① 首次使用：点「安装并启动」即可——app 会自动完成内置 Node 解压、npm 官方安装 dsh、
+                   内置插件装配、Android 兼容修复，然后启动本地服务并自动进入 WebUI；
+                ② 之后的每次打开：自动快速启动（秒级）并直接进入 WebUI，无需任何操作；
+                ③ 「控制台」可看完整安装/运行日志，「终端」提供完整 Linux 环境；
+                ④ 「停止 dsh 服务」结束后台进程与保活。
+                
+                提示：
+                · 全程免 Termux 配置，内置 aarch64 Node 运行时；
+                · 安装日志：/sdcard/Download/DshLauncher/install_log.txt；
+                · dsh 更新：控制台右上角「更新」。
+            """.trimIndent()
+            textSize = 12f
+            setTextColor(Ui.TEXT_MUTED)
+            setLineSpacing(dp(3).toFloat(), 1f)
+            setPadding(dp(4), dp(10), dp(4), 0)
+            visibility = View.GONE
+        }
+        root.addView(helpBody, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ))
 
         return ScrollView(this).apply { addView(root) }
+    }
+
+    private lateinit var envChipsRow: LinearLayout
+    private lateinit var helpBody: TextView
+
+    private fun onPrimaryClicked() {
+        when (phase) {
+            Phase.FIRST_INSTALL -> beginFlow(DshFlow.Mode.INSTALL_AND_START)
+            Phase.STOPPED -> beginFlow(DshFlow.Mode.START_ONLY)
+            Phase.RUNNING -> openWeb()
+            Phase.ERROR -> beginFlow(lastMode)
+            Phase.FLOWING -> Unit
+        }
+    }
+
+    private fun toggleHelp() {
+        helpBody.visibility = if (helpBody.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+    }
+
+    private fun refreshEnvChips() {
+        if (!::envChipsRow.isInitialized) return
+        envChipsRow.removeAllViews()
+        fun chip(label: String, ok: Boolean) {
+            envChipsRow.addView(Ui.pill(this, "$label ${if (ok) "✓" else "…"}", if (ok) Ui.SUCCESS else Ui.TEXT_MUTED).apply {
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { rightMargin = dp(6) }
+            })
+        }
+        chip("Node", hasNodeMarker())
+        chip("Termux", TermuxRuntime.isReady(this))
+        chip("存储", Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager())
+    }
+
+    private fun appendMiniLog(line: String) {
+        if (miniLog.visibility == View.GONE && line.isNotBlank()) miniLog.visibility = View.VISIBLE
+        logSb.append(line).append("\n")
+        val lines = logSb.toString().split("\n")
+        if (lines.size > 9) logSb.clear().append(lines.takeLast(9).joinToString("\n")).append("\n")
+        miniLog.text = logSb.toString().trimEnd()
+        AppLog.i("Main", line)
+    }
+
+    private fun openTerminal() {
+        thread {
+            if (!TermuxRuntime.isReady(this)) {
+                try {
+                    TermuxRuntime.ensureExtracted(this) { msg -> appendMiniLog(msg) }
+                } catch (t: Throwable) {
+                    appendMiniLog("✗ Termux 准备失败：${t.message}（回退系统 sh）")
+                }
+            }
+            TermuxRuntime.ensureHarnessTools(this) { msg -> appendMiniLog(msg) }
+            runOnUiThread { startActivity(Intent(this, TerminalActivity::class.java)) }
+        }
     }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
     // ---------------- APK 升级：同步内置插件源 ----------------
+
     /**
      * APK 升级后自动把 assets 里的内置插件源（prebuilt.tgz 等）同步到 files，
      * 避免“更新了应用但运行时仍是旧插件”。装配本身仍需用户执行
@@ -418,7 +529,7 @@ class MainActivity : AppCompatActivity() {
         val last = prefs.getLong("last_apk_version", 0L)
         if (current == last) return
         prefs.edit().putLong("last_apk_version", current).apply()
-        log("检测到应用更新（v$current），后台同步内置插件源…")
+        appendMiniLog("检测到应用更新（v$current），后台同步内置插件源…")
         thread {
             try {
                 for (name in listOf(
@@ -439,11 +550,11 @@ class MainActivity : AppCompatActivity() {
                 if (dshInstalled) {
                     prefs.edit().putBoolean("rewire_hint", true).apply()
                     runOnUiThread {
-                        log("✓ 内置插件源已同步。建议在「插件管理」执行“重新装配内置插件”。")
+                        appendMiniLog("✓ 内置插件源已同步。建议在「插件管理」执行“重新装配内置插件”。")
                         showUpdateHint()
                     }
                 } else {
-                    runOnUiThread { log("✓ 内置插件源已同步（新装环境，装配由“一键安装”负责）。") }
+                    runOnUiThread { appendMiniLog("✓ 内置插件源已同步（新装环境，装配由首次安装负责）。") }
                 }
             } catch (t: Throwable) {
                 AppLog.e("Main", "apk asset sync failed: " + (t.message ?: t.toString()))
@@ -468,7 +579,7 @@ class MainActivity : AppCompatActivity() {
         })
         inner.addView(TextView(this).apply {
             text = "检测到 APK 升级，内置插件源（prebuilt.tgz）已同步到新版本。" +
-                "内置插件（如 dsh-vision）需要重新装配后才会使用新代码。"
+                "内置插件需要重新装配后才会使用新代码。"
             textSize = 12f
             setTextColor(Ui.TEXT_SECONDARY)
             setLineSpacing(dp(2).toFloat(), 1f)
@@ -514,88 +625,12 @@ class MainActivity : AppCompatActivity() {
         updateBanner = null
     }
 
-    // ---------------- 状态检测 ----------------
-    private fun refreshStatus(silent: Boolean = false) {
-        progress.visibility = View.VISIBLE
-        if (!silent) log("… 检测 dsh 服务状态…")
-        Thread {
-            val running = pingServer()
-            handler.post {
-                progress.visibility = View.GONE
-                statusValue.text = if (running) getString(R.string.status_running)
-                else getString(R.string.status_stopped)
-                val color: Int = if (running) android.graphics.Color.parseColor("#2DB85B")
-                else android.graphics.Color.parseColor("#CC4444")
-                statusValue.setTextColor(color)
-                statusDot.background = android.graphics.drawable.GradientDrawable().apply {
-                    shape = android.graphics.drawable.GradientDrawable.OVAL
-                    setColor(color)
-                    // 同色半透明描边 = 轻量光晕，状态点更醒目
-                    setStroke(dp(3), Ui.withAlpha(color, 0x38))
-                }
-                if (!silent) log(if (running) "dsh 服务：运行中（3080 端口）" else "dsh 服务：未运行")
-            }
-        }.start()
-    }
-
-    private fun pingServer(): Boolean = try {
-        val conn = URL(WEB_URL).openConnection() as HttpURLConnection
-        conn.connectTimeout = 1500
-        conn.readTimeout = 1500
-        conn.requestMethod = "GET"
-        val code = conn.responseCode
-        conn.disconnect()
-        code in 200..399
-    } catch (e: Exception) {
-        false
-    }
-
-    private fun runNodeDsh() {
-        if (isExtracting) {
-            toast("正在解压中，请稍候…")
-            return
-        }
-        isExtracting = true
-        progress.visibility = View.VISIBLE
-        AppLog.i("Node", "start ensureExtracted")
-        log("▶ 正在解压内置 Node 运行时（首次约需几十秒）…")
-        Thread {
-            try {
-                val nodeDir = NodeRuntime.ensureExtracted(this)
-                val marker = File(filesDir, ".node-ok").exists()
-                AppLog.i("Node", "ensureExtracted done marker=$marker dir=$nodeDir")
-                handler.post {
-                    progress.visibility = View.GONE
-                    isExtracting = false
-                    if (marker) {
-                        log("✓ 内置 Node 解压完成")
-                        toast("内置 Node 已就绪，正在打开控制台…")
-                    }
-                    log("▶ 打开控制台并验证 node 版本…")
-                    val nodeEnv = NodeRuntime.nodeEnvPrefix(this)
-                    startActivity(Intent(this, ConsoleActivity::class.java)
-                        .putExtra("cmd", "$nodeEnv $nodeDir/bin/node --version"))
-                }
-            } catch (t: Throwable) {
-                AppLog.e("Node", "extract failed: " + (t.message ?: t.toString()))
-                android.util.Log.e("DshNode", "extract failed", t)
-                handler.post {
-                    progress.visibility = View.GONE
-                    isExtracting = false
-                    val msg = "✗ Node 运行时解压失败：${t.message}"
-                    log(msg)
-                    toast(msg)
-                }
-            }
-        }.start()
-    }
-
     /** 是否有内置 Node 解压完成标记。 */
     private fun hasNodeMarker(): Boolean = File(filesDir, ".node-ok").exists()
 
     /** 停止 dsh 服务：杀 node 相关进程 + 停保活服务 + 刷新状态。 */
     private fun stopDshAll() {
-        log("▶ 正在停止 dsh 相关进程…")
+        appendMiniLog("▶ 正在停止 dsh 相关进程…")
         thread {
             try {
                 val pb = ProcessBuilder(
@@ -610,30 +645,11 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread {
                 BuildKeepAliveService.markStopped(this@MainActivity)
                 runCatching { stopService(Intent(this@MainActivity, BuildKeepAliveService::class.java)) }
-                log("✓ 已停止 dsh 相关进程与服务")
-                refreshStatus()
+                appendMiniLog("✓ 已停止 dsh 相关进程与服务")
+                refreshRunState()
             }
         }
     }
 
-    /** 在主界面日志栏追加一行（主线程安全），同时写入文件日志与 logcat。 */
-    private fun log(msg: String) {
-        AppLog.i("Main", msg)
-        android.util.Log.i("DshMain", msg)
-        handler.post {
-            logSb.append("• ").append(msg).append("\n")
-            // 保留最近 20 行
-            val lines = logSb.toString().split("\n")
-            if (lines.size > 20) logSb.clear().append(lines.takeLast(20).joinToString("\n")).append("\n")
-            logView.text = logSb.toString()
-        }
-    }
-
-    private var isExtracting = false
-
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
-
-    companion object {
-        private const val WEB_URL = "http://127.0.0.1:3080"
-    }
 }

@@ -14,9 +14,12 @@
 - **内置 Termux 工具链**：内置 bash/coreutils/apt，并在首次使用/一键安装时自动
   `pkg install git python ripgrep`，把 Termux `bin`、内置 Node `bin` 与 pnpm 工具目录纳入
   DSH 进程与内置终端 PATH，`TERM=xterm-256color`，满足 Harness 对 bash/git/ripgrep 的前置要求。
-- **一键启动**：`ConsoleActivity` 内置四步引导
-  `1/4 解压 node → 2/4 复制官方安装脚本 + 内置插件源 → 3/4 npm 官方安装/更新 dsh + dsh plugin 装配内置插件 → 4/4 启动 dsh web`。
-- **内置 WebView 界面**：主界面「打开 Web 界面」在应用内加载 `http://127.0.0.1:3080`
+- **打开即用的自动启动流**（v4.2 起）：主界面即启动器——首次启动自动完成
+  `解压 node → 复制官方安装脚本 + 内置插件源 → npm 官方安装/更新 dsh + dsh plugin 装配内置插件 →
+  Android 兼容修复 → 启动 dsh web`，就绪后**自动进入 WebUI**；后续每次打开自动快速启动
+  （秒级，已运行则跳过）并直接进入 WebUI。流程引擎统一在 `DshFlow`，
+  命令控制台（`dsh / dsh_install / dsh_start` extras）与主界面共用同一份逻辑。
+- **内置 WebView 界面**：应用内加载 `http://127.0.0.1:3080`
   （无需跳外部浏览器）；也可用任意浏览器访问同一地址。
 - **悬浮窗 + 安卓桌宠模式**：主界面的「状态悬浮窗」可显示 dsh 运行状态；支持两种样式
   （设置页或长按悬浮窗切换）：**状态条**（紧凑文字）与**桌宠**（动画角色跟随 dsh 状态）。

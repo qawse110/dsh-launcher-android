@@ -61,20 +61,42 @@ object AssetSync {
         return true
     }
 
-    private fun copyDirRecursive(context: Context, assetPath: String, dest: File) {
-        val children = context.assets.list(assetPath) ?: return
+    /**
+     * 目录判定：AssetManager.list() 对「文件」返回的是空数组（非 null）！
+     * 曾经用 `!= null` 判断导致所有文件被当成目录、只建空壳不拷内容，
+     * dsh-status-bridge 插件因此变成空壳、悬浮窗链路整体失效。
+     */
+    private fun isAssetDir(context: Context, assetPath: String): Boolean =
+        try {
+            context.assets.list(assetPath)?.isNotEmpty() == true
+        } catch (_: Throwable) {
+            false
+        }
+
+    /** 返回成功拷贝的文件数（目录本身不计）。 */
+    private fun copyDirRecursive(context: Context, assetPath: String, dest: File): Int {
+        val children = context.assets.list(assetPath) ?: return 0
         dest.mkdirs()
+        var copied = 0
         for (name in children) {
             val childAsset = "$assetPath/$name"
             val childDest = File(dest, name)
-            if (context.assets.list(childAsset) != null) {
+            copied += if (isAssetDir(context, childAsset)) {
                 copyDirRecursive(context, childAsset, childDest)
             } else {
-                childDest.parentFile?.mkdirs()
-                context.assets.open(childAsset).use { input ->
-                    childDest.outputStream().use { output -> input.copyTo(output) }
+                try {
+                    childDest.parentFile?.mkdirs()
+                    context.assets.open(childAsset).use { input ->
+                        childDest.outputStream().use { output -> input.copyTo(output) }
+                    }
+                    1
+                } catch (t: Throwable) {
+                    // assets 里的空目录会走到这里（open 失败）：静默跳过
+                    AppLog.i("AssetSync", "copy $childAsset failed: ${t.message}")
+                    0
                 }
             }
         }
+        return copied
     }
 }

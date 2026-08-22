@@ -9,6 +9,10 @@
     <string name="btn_install_update">⚡ 安装 / 更新 DSH</string>
     <string name="btn_start_dsh">启动 DSH</string>
     <string name="btn_open_web">打开 Web 界面</string>
+    <string name="btn_enter_webui">进入 DeepSeek Harness</string>
+    <string name="btn_start_auto">启动并打开 WebUI</string>
+    <string name="btn_install_start">安装并启动</string>
+    <string name="btn_retry">重试</string>
     <string name="btn_open_terminal">命令控制台</string>
     <string name="btn_stop_all">停止 dsh 服务</string>
     <string name="btn_node_check">内置 Node 检测</string>
