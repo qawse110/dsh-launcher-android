@@ -539,11 +539,30 @@ function installBuiltins() {
 }
 
 /**
- * 内置插件以 link: 方式装配在 files/plugins 下，pnpm 不会把它们的
- * peerDependencies 安装到该目录。这里把 dsh-prefix/node_modules 的所有包
- * 桥接（符号链接）到 plugins/node_modules，使插件代码从 files/plugins/*
- * 加载时也能解析 @deepseek-ai/* 等运行时依赖。
+ * 内置插件以 link: 方式装配在 files/plugins 下，包管理器不会把依赖安装到该目录。
+ * 这里把 dsh-prefix 的依赖桥接（符号链接）到 plugins/node_modules，使插件代码
+ * 从 files/plugins/* 加载时也能解析 @deepseek-ai/* 等运行时依赖。
+ * npm 扁平布局：桥接 node_modules 顶层即可。
+ * pnpm 布局：顶层只有直接依赖，传递依赖在 .pnpm 虚拟store 里——额外扫描 store，
+ * 把每个唯一包名（作用域包、多版本取最高）也桥接进去，恢复扁平解析语义。
  */
+function cmpVer(a, b) {
+  const pa = String(a).split('-');
+  const pb = String(b).split('-');
+  const na = pa[0].split('.').map((n) => parseInt(n, 10) || 0);
+  const nb = pb[0].split('.').map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < 3; i++) {
+    const d = (na[i] || 0) - (nb[i] || 0);
+    if (d) return d;
+  }
+  const ra = pa[1] || '';
+  const rb = pb[1] || '';
+  if (ra === rb) return 0;
+  if (!ra) return 1; // 无 prerelease 更高
+  if (!rb) return -1;
+  return ra > rb ? 1 : -1;
+}
+
 function linkPluginDeps() {
   const src = join(DSH_PREFIX, 'node_modules');
   const dest = join(PLUGINS_DIR, 'node_modules');
@@ -553,38 +572,78 @@ function linkPluginDeps() {
   }
   try {
     mkdirSync(dest, { recursive: true });
-    const srcNames = new Set();
     let kept = 0;
     let linked = 0;
     let removed = 0;
-    for (const ent of readdirSync(src, { withFileTypes: true })) {
-      // pnpm 布局下有 .pnpm 虚拟store / .bin 等，桥接无意义且体积巨大
-      if (ent.name.startsWith('.')) continue;
-      srcNames.add(ent.name);
-      const target = join(src, ent.name);
-      const link = join(dest, ent.name);
-      let matches = false;
-      try { matches = readlinkSync(link) === target; } catch {}
-      if (matches) {
-        kept++;
-        continue;
+    let warns = 0;
+    const keep = new Set();
+    const ensureLink = (name, target) => {
+      if (keep.has(name)) return true;
+      keep.add(name);
+      if (name.includes('/')) {
+        const scope = name.slice(0, name.indexOf('/'));
+        keep.add(scope);
+        mkdirSync(join(dest, scope), { recursive: true });
       }
+      const link = join(dest, ...name.split('/'));
+      try { if (readlinkSync(link) === target) { kept++; return true; } } catch {}
       rmSync(link, { recursive: true, force: true });
       try {
         symlinkSync(target, link);
         linked++;
+        return true;
       } catch (e) {
-        log('WARN link plugin dep ' + ent.name + ': ' + e.message);
+        warns++;
+        log('WARN bridge plugin dep ' + name + ': ' + e.message);
+        return false;
       }
+    };
+    // 1) 直接依赖（两种布局都存在）
+    for (const ent of readdirSync(src, { withFileTypes: true })) {
+      if (ent.name.startsWith('.')) continue;
+      ensureLink(ent.name, join(src, ent.name));
     }
-    // 清理 dsh-prefix 中已不再存在的包对应的旧链接
+    // 2) pnpm 传递依赖：扫描 .pnpm/<pkg>@<ver>_peerhash/node_modules/*
+    const store = join(src, '.pnpm');
+    if (existsSync(store)) {
+      const best = new Map(); // name -> {dir, ver}
+      for (const d of readdirSync(store)) {
+        if (d.startsWith('.')) continue;
+        const nm = join(store, d, 'node_modules');
+        if (!existsSync(nm)) continue;
+        const found = [];
+        try {
+          for (const c of readdirSync(nm)) {
+            if (c.startsWith('.')) continue;
+            if (c.startsWith('@')) {
+              for (const g of readdirSync(join(nm, c))) found.push([c + '/' + g, join(nm, c, g)]);
+            } else {
+              found.push([c, join(nm, c)]);
+            }
+          }
+        } catch {}
+        for (const [name, dir] of found) {
+          let ver = '0.0.0';
+          try { ver = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')).version || ver; } catch {}
+          const cur = best.get(name);
+          if (!cur || cmpVer(ver, cur.ver) > 0) best.set(name, { dir, ver });
+        }
+      }
+      let bridgedTransitive = 0;
+      for (const [name, info] of best) {
+        if (keep.has(name)) continue; // 直接依赖已从顶层桥接
+        if (ensureLink(name, info.dir)) bridgedTransitive++;
+      }
+      log(`pnpm store bridge: ${best.size} unique packages, ${bridgedTransitive} transitive bridged`);
+    }
+    // 清理本轮未覆盖的旧链接（含历史遗留的孤立作用域目录）
     for (const ent of readdirSync(dest, { withFileTypes: true })) {
-      if (!srcNames.has(ent.name)) {
+      if (!keep.has(ent.name)) {
         rmSync(join(dest, ent.name), { recursive: true, force: true });
         removed++;
       }
     }
-    log(`plugin dep bridge: ${kept} kept, ${linked} linked, ${removed} stale removed -> ${dest}`);
+    log(`plugin dep bridge: ${kept} kept, ${linked} linked, ${removed} stale removed, ${warns} warn -> ${dest}`);
   } catch (e) {
     log('WARN linkPluginDeps: ' + e.message);
   }
