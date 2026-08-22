@@ -81,6 +81,13 @@ class PluginManagerActivity : AppCompatActivity() {
     @Volatile
     private var busy = false
 
+    /** 列表代数：异步健康检查回填前校验，避免旧结果覆盖新一轮刷新。 */
+    @Volatile
+    private var listGeneration = 0
+
+    /** 内置源可用性缓存（key=apkVer:id）。tar -tzf 要解压 30MB tgz，重活只许在后台跑且须缓存。 */
+    private val srcAvailCache = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+
     private val nodeDir: File get() = NodeRuntime.ensureExtracted(this)
 
     private fun dshPrefix() = File(filesDir, "dsh-prefix")
@@ -269,39 +276,57 @@ class PluginManagerActivity : AppCompatActivity() {
     }
 
     private fun refreshList() {
+        val gen = ++listGeneration
         listBox.removeAllViews()
-        val tp = pluginsDir()
 
-        // ---- 引导卡：插件源未就绪 → 直接拉起自动安装引擎 ----
-        if (!tp.exists()) {
+        // 未就绪 → 引导卡
+        if (!pluginsDir().exists()) {
             listBox.addView(buildBootstrapCard())
             return
         }
 
-        // ---- 健康度收集 ----
-        val bundledHealth = BUNDLED.sorted().map { it to healthOf(it) }
-        val issueEntries = mutableListOf<Pair<String, String>>()
-        for ((id, h) in bundledHealth) {
-            when {
-                !h.dirExists -> issueEntries.add(id to "目录缺失")
-                !h.healthy -> issueEntries.add(id to "副本损坏")
-                !h.wired -> issueEntries.add(id to "未装配")
+        // 骨架先上屏；重活（30MB prebuilt.tgz 的 tar 探测等）全部移到后台——
+        // 此前在主线程同步扫描曾把主线程卡过 ANR 阈值，被 ColorOS 直接杀进程（表现为闪退）
+        listBox.addView(buildOverviewSkeleton())
+        listBox.addView(sectionHeader("内置插件", null))
+        listBox.addView(makeCard("健康检测中…", "目录 · package.json · 装配状态 · 内置源可用性", "", "…", emptyList()))
+        listBox.addView(sectionHeader("路由预设", null))
+        listBox.addView(sectionHeader("在线扩展", null))
+        listBox.addView(buildInstallCard())
+
+        thread(name = "plugin-health-scan") {
+            val bundled = BUNDLED.sorted().map { id -> Triple(id, healthOf(id), readVersion(id)) }
+            val presetOk = listOf("router-spec", "router-standard").any { File(presetsRoot(), it).exists() }
+            val extras = readBundles()
+                .filter { name -> name !in BASE_BUNDLES && BUNDLED.none { d -> name == d || name == "@dsh-external/$d" } }
+                .mapNotNull { name -> readInstalledPlugin(name) }
+            val issues = mutableListOf<Pair<String, String>>()
+            for ((id, h, _) in bundled) when {
+                !h.dirExists -> issues.add(id to "目录缺失")
+                !h.healthy -> issues.add(id to "副本损坏")
+                !h.wired -> issues.add(id to "未装配")
+            }
+            if (!presetOk) issues.add(PRESET_DIR to "未安装")
+
+            runOnUiThread {
+                if (isFinishing || isDestroyed || gen != listGeneration) return@runOnUiThread
+                renderList(bundled, presetOk, extras, issues)
             }
         }
-        val presetOk = listOf("router-spec", "router-standard").any { File(presetsRoot(), it).exists() }
-        if (!presetOk) issueEntries.add(PRESET_DIR to "未安装")
+    }
 
-        val extras = readBundles().filter { name ->
-            name !in BASE_BUNDLES &&
-                !BUNDLED.any { d -> name == d || name == "@dsh-external/$d" }
-        }
+    /** 数据就绪后的完整渲染（主线程，纯视图构建无 IO）。 */
+    private fun renderList(
+        bundled: List<Triple<String, BundledHealth, String>>,
+        presetOk: Boolean,
+        extras: List<PluginInfo>,
+        issues: List<Pair<String, String>>
+    ) {
+        listBox.removeAllViews()
+        listBox.addView(buildOverviewCard(bundled.size, extras.size, issues))
 
-        // ---- 概览卡 ----
-        listBox.addView(buildOverviewCard(bundledHealth.size, extras.size, issueEntries))
-
-        // ---- 内置插件区块 ----
-        listBox.addView(sectionHeader("内置插件", "${bundledHealth.size} 个"))
-        for ((id, h) in bundledHealth) {
+        listBox.addView(sectionHeader("内置插件", "${bundled.size} 个"))
+        for ((id, h, ver) in bundled) {
             val status: String
             val actions = mutableListOf<Pair<String, () -> Unit>>()
             when {
@@ -319,10 +344,9 @@ class PluginManagerActivity : AppCompatActivity() {
                 }
                 else -> status = "已装配"
             }
-            listBox.addView(makeCard(id, BUNDLED_DESC[id] ?: "", readVersion(id), status, actions))
+            listBox.addView(makeCard(id, BUNDLED_DESC[id] ?: "", ver, status, actions))
         }
 
-        // ---- 路由预设区块 ----
         listBox.addView(sectionHeader("路由预设", null))
         listBox.addView(makeCard(
             PRESET_DIR, PRESET_DESC, "preset",
@@ -330,13 +354,31 @@ class PluginManagerActivity : AppCompatActivity() {
             if (presetOk) emptyList() else listOf("重新装配" to { rewireBuiltins() })
         ))
 
-        // ---- 在线扩展区块 ----
         listBox.addView(sectionHeader("在线扩展", "${extras.size} 个"))
-        for (name in extras) {
-            val info = readInstalledPlugin(name) ?: continue
-            listBox.addView(makeCard(name, info.desc, info.version, "已装配", listOf("卸载" to { uninstall(name) })))
+        for (info in extras) {
+            listBox.addView(makeCard(info.name, info.desc, info.version, "已装配", listOf("卸载" to { uninstall(info.name) })))
         }
         listBox.addView(buildInstallCard())
+    }
+
+    /** 健康检测期间的概览占位。 */
+    private fun buildOverviewSkeleton(): View {
+        val card = Ui.card(this, radiusDp = 16, background = Ui.SURFACE_CONTAINER_HIGH, elevationDp = 1f)
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        col.addView(TextView(this).apply {
+            text = "正在扫描插件健康状态…"
+            textSize = 14f
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            setTextColor(Ui.TEXT_SECONDARY)
+        })
+        col.addView(TextView(this).apply {
+            text = "目录 · package.json · 装配状态 · 内置源可用性"
+            textSize = 11.5f
+            setTextColor(Ui.TEXT_MUTED)
+            setPadding(0, dp(4), 0, 0)
+        })
+        card.addView(col)
+        return card
     }
 
     private fun sectionHeader(title: String, count: String?): View =
@@ -609,9 +651,12 @@ class PluginManagerActivity : AppCompatActivity() {
 
     private data class BundledHealth(val dirExists: Boolean, val healthy: Boolean, val wired: Boolean, val srcOk: Boolean)
 
+    /** 只许在后台线程调用（srcOk 的 tar 探测是重活，结果按 apkVer:id 缓存）。 */
     private fun healthOf(id: String): BundledHealth {
         val dir = File(pluginsDir(), id)
-        return BundledHealth(dir.isDirectory, bundleHealthy(dir), isWired(id), bundledSourceAvailable(id))
+        val key = AssetSync.apkVersion(this).toString() + ":" + id
+        val srcOk = srcAvailCache[key] ?: bundledSourceAvailable(id).also { srcAvailCache[key] = it }
+        return BundledHealth(dir.isDirectory, bundleHealthy(dir), isWired(id), srcOk)
     }
 
     /** 目录健康：package.json 存在、可解析、name 非空（空壳损坏判定）。 */
