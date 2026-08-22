@@ -83,6 +83,7 @@ class MainActivity : AppCompatActivity() {
         }
         setContentView(buildUi())
         requestStoragePermissions()
+        maybePromptOverlayPermission()
         syncAssetsOnApkUpdate()
         // 悬浮窗自动恢复：app 关闭后再打开，只要「悬浮窗显示」开关还开着就自动拉起
         // 状态桥接服务（服务已运行时幂等；无障碍通道由系统自动连接，无需此处处理）
@@ -475,19 +476,76 @@ class MainActivity : AppCompatActivity() {
         helpBody.visibility = if (helpBody.visibility == View.VISIBLE) View.GONE else View.VISIBLE
     }
 
+    /** 环境状态 chips：Node/Termux/存储 + 悬浮窗双通道健康度。
+     *  「悬浮窗」「无障碍」两枚芯片可点：缺权限/未连接时直达对应系统页。 */
     private fun refreshEnvChips() {
         if (!::envChipsRow.isInitialized) return
         envChipsRow.removeAllViews()
-        fun chip(label: String, ok: Boolean) {
-            envChipsRow.addView(Ui.pill(this, "$label ${if (ok) "✓" else "…"}", if (ok) Ui.SUCCESS else Ui.TEXT_MUTED).apply {
+
+        fun chip(label: String, color: Int, onClick: (() -> Unit)? = null) {
+            val pill = Ui.pill(this, label, color).apply {
                 layoutParams = LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
                 ).apply { rightMargin = dp(6) }
-            })
+                if (onClick != null) {
+                    isClickable = true
+                    setOnClickListener { onClick() }
+                }
+            }
+            envChipsRow.addView(pill)
         }
-        chip("Node", hasNodeMarker())
-        chip("Termux", TermuxRuntime.isReady(this))
-        chip("存储", Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager())
+
+        chip("Node ${if (hasNodeMarker()) "✓" else "…"}", if (hasNodeMarker()) Ui.SUCCESS else Ui.TEXT_MUTED)
+        chip("Termux ${if (TermuxRuntime.isReady(this)) "✓" else "…"}", if (TermuxRuntime.isReady(this)) Ui.SUCCESS else Ui.TEXT_MUTED)
+        chip("存储 ${if (Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager()) "✓" else "…"}",
+            if (Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager()) Ui.SUCCESS else Ui.TEXT_MUTED)
+
+        // ---- 悬浮窗双通道 ----
+        val overlayGranted = Settings.canDrawOverlays(this)
+        chip(
+            if (overlayGranted) "悬浮窗 ✓" else "悬浮窗 ⚠ 授权",
+            if (overlayGranted) Ui.SUCCESS else Ui.WARNING
+        ) {
+            if (!overlayGranted) openOverlayPermissionSettings()
+        }
+
+        val a11yEnabled = KeepAliveAccessibilityService.isEnabledInSystemSettings(this)
+        val a11yFresh = a11yEnabled && KeepAliveAccessibilityService.isA11yChannelFresh(this)
+        when {
+            a11yFresh -> chip("无障碍 ✓", Ui.SUCCESS)
+            a11yEnabled -> chip("无障碍 ⚠ 未连接", Ui.WARNING) {
+                // ROM 懒绑定：开关登记着但服务没连上（悬浮窗不出现）——
+                // 去无障碍设置页关一次再开即可重绑
+                openAccessibilitySettings()
+            }
+            else -> chip("无障碍 –", Ui.TEXT_MUTED) {
+                openAccessibilitySettings()
+            }
+        }
+    }
+
+    /** 一次性引导「显示在其它应用上层」权限：普通通道拿到它即可脱离无障碍独立自启。
+     *  （部分 ROM 无障碍服务冷启时不自动重绑，需手动开关一次；双通道互为备份，
+     *   本权限是让悬浮窗稳定自启的根本解。） */
+    private fun maybePromptOverlayPermission() {
+        if (Settings.canDrawOverlays(this)) return
+        val prefs = getSharedPreferences("dsh_ui", MODE_PRIVATE)
+        if (prefs.getBoolean("overlay_perm_prompted", false)) return
+        prefs.edit().putBoolean("overlay_perm_prompted", true).apply()
+        appendMiniLog("首次引导：授予「显示在其它应用上层」后，悬浮窗不依赖无障碍也能自启")
+        openOverlayPermissionSettings()
+    }
+
+    private fun openOverlayPermissionSettings() {
+        runCatching {
+            startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+        }.onFailure {
+            runCatching { startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION)) }
+        }
+    }
+
+    private fun openAccessibilitySettings() {
+        runCatching { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
     }
 
     private fun appendMiniLog(line: String) {

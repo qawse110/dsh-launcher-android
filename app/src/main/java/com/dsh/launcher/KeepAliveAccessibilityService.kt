@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import org.json.JSONObject
@@ -162,5 +163,27 @@ class KeepAliveAccessibilityService : AccessibilityService() {
         fun isA11yChannelFresh(context: Context): Boolean =
             System.currentTimeMillis() - context.getSharedPreferences("status_bridge", Context.MODE_PRIVATE)
                 .getLong(A11Y_TS_KEY, 0L) < A11Y_FRESH_MS
+
+        /**
+         * 系统无障碍设置里是否登记了本服务（不代表当前已连接）。
+         * 「已登记但 ts 过期」= ROM 懒绑定/绑定被杀，典型表现是悬浮窗不出现、
+         * 需要用户把无障碍关一次再开——UI 层据此显示黄色警示并引导去重连。
+         */
+        fun isEnabledInSystemSettings(context: Context): Boolean = try {
+            val raw = Settings.Secure.getString(
+                context.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+            )
+            if (raw.isNullOrBlank()) false else {
+                val cls = KeepAliveAccessibilityService::class.java.name
+                val short = "." + cls.substringAfterLast('.')
+                raw.split(":").any { entry ->
+                    val c = entry.trim()
+                    c.equals(context.packageName + "/" + cls, ignoreCase = true) ||
+                        c.equals(context.packageName + short, ignoreCase = true)
+                }
+            }
+        } catch (_: Exception) {
+            false
+        }
     }
 }

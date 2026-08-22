@@ -462,11 +462,28 @@ class OverlaySettingsActivity : AppCompatActivity() {
         return sw
     }
 
+    /** 双通道健康度提示：悬浮窗权限 + 无障碍连接状态。
+     *  「已开启但未连接」= ROM 懒绑定（开关登记着、服务没连上，悬浮窗不出现），
+     *  补救方式是把无障碍关闭再打开一次。 */
     private fun refreshPermissionHint() {
         val can = Settings.canDrawOverlays(this)
-        permissionHint.text = if (can) "✓ 悬浮窗权限已授予"
-        else "⚠ 未授予悬浮窗权限，悬浮窗不会显示"
-        permissionHint.setTextColor(if (can) Ui.SUCCESS else Ui.WARNING)
+        val a11yEnabled = KeepAliveAccessibilityService.isEnabledInSystemSettings(this)
+        val a11yFresh = a11yEnabled && KeepAliveAccessibilityService.isA11yChannelFresh(this)
+        val overlayPart = if (can) "✓ 悬浮窗权限已授予" else "⚠ 未授予悬浮窗权限，悬浮窗不会显示"
+        val a11yPart = when {
+            a11yFresh -> "✓ 无障碍通道已连接"
+            a11yEnabled -> "⚠ 无障碍已开启但未连接（请关闭再打开一次以重绑）"
+            else -> "无障碍通道未开启（可选，强烈推荐）"
+        }
+        permissionHint.text = "$overlayPart\n$a11yPart"
+        permissionHint.setTextColor(
+            when {
+                !can -> Ui.WARNING
+                a11yEnabled && !a11yFresh -> Ui.WARNING
+                can || a11yFresh -> Ui.SUCCESS
+                else -> Ui.TEXT_MUTED
+            }
+        )
     }
 
     private fun openOverlaySettings() {
