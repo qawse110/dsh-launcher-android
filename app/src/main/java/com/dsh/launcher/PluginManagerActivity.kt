@@ -289,7 +289,7 @@ class PluginManagerActivity : AppCompatActivity() {
             }
         }
         val presetOk = listOf("router-spec", "router-standard").any { File(presetsRoot(), it).exists() }
-        if (!presetOk) issueEntries.add("$PRESET_DIR：未安装")
+        if (!presetOk) issueEntries.add(PRESET_DIR to "未安装")
 
         val extras = readBundles().filter { name ->
             name !in BASE_BUNDLES &&
@@ -689,6 +689,8 @@ class PluginManagerActivity : AppCompatActivity() {
     }
 
     private fun profileNm() = File(profileWebDir(), "node_modules")
+
+    data class PluginInfo(val id: String, val name: String, val desc: String, val version: String)
 
     private fun readInstalledPlugin(name: String): PluginInfo? {
         val dir = resolvePackageDir(name) ?: return null
