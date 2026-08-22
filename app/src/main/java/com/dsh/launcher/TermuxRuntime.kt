@@ -101,7 +101,7 @@ object TermuxRuntime {
                     if (!File(usr, "bin/wget").isFile) add("wget")
                 }
                 val installRc = if (missing.isNotEmpty()) {
-                    runBash(bash, "pkg install -y --no-install-recommends ${missing.joinToString(" ")}", env, progress, timeoutSec = 1200)
+                    runBash(bash, "pkg install -o Acquire::Retries=3 -y --no-install-recommends ${missing.joinToString(" ")}", env, progress, timeoutSec = 1200)
                 } else {
                     0
                 }
@@ -115,7 +115,7 @@ object TermuxRuntime {
                 val cfgRc = runBash(bash, "dpkg --configure -a", env, progress, timeoutSec = 600)
                 if (cfgRc != 0) {
                     progress("WARN: dpkg --configure -a 返回 $cfgRc，再试 apt-get -f install…")
-                    runBash(bash, "apt-get install -y -f --no-install-recommends", env, progress, timeoutSec = 1200)
+                    runBash(bash, "apt-get install -o Acquire::Retries=3 -y -f --no-install-recommends", env, progress, timeoutSec = 1200)
                 }
 
                 val ready = runBash(bash, requiredCheck, env, progress, timeoutSec = 120) == 0

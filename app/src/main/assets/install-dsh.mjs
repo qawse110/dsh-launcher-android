@@ -43,6 +43,8 @@ const NPM_TIMEOUT_MS = Number(process.env.DSH_NPM_TIMEOUT_MS || 15 * 60_000);
 const PLUGIN_TIMEOUT_MS = Number(process.env.DSH_PLUGIN_TIMEOUT_MS || 5 * 60_000);
 const NPM_NET_ARGS = [
   '--prefer-offline',
+  // 非 TTY 下让 npm 逐请求输出（等价于 _logs 里的 http fetch 行），避免长阶段静默被误判卡死
+  '--loglevel=http',
   '--fetch-timeout=120000',
   '--fetch-retries=5',
   '--fetch-retry-mintimeout=2000',
@@ -138,6 +140,9 @@ function envBase(extra = {}) {
     TEMP: join(HOME, 'tmp'),
     TERM: 'xterm-256color',
     CI: '1',
+    // pnpm 在非 TTY 下默认静默；append-only 是它专为管道日志设计的行式进度。
+    // 通过 npm_config_* 传递，可穿透 dsh CLI 内部再起的 pnpm 子进程。
+    npm_config_reporter: 'append-only',
     OPENSSL_CONF: '/dev/null',
     PATH: pathParts.join(':'),
     ...extra,
