@@ -89,7 +89,7 @@ function log(m) {
   try { writeFileSync(OUT_SHARED, l + '\n', { flag: 'a' }); } catch {}
 }
 
-function run(cmd, args, opts = {}) {
+function runEx(cmd, args, opts = {}) {
   const timeoutMs = opts.timeoutMs ?? 10 * 60_000;
   const started = Date.now();
   log('$ ' + cmd + ' ' + args.join(' ') + ` (timeout=${Math.round(timeoutMs / 1000)}s)`);
@@ -108,7 +108,15 @@ function run(cmd, args, opts = {}) {
   if (r.error && /timed out|timeout/i.test(String(r.error.message))) {
     log('TIMEOUT: 子进程超时被强制结束，请检查网络后重试');
   }
-  return r.status === 0;
+  return { ok: r.status === 0, status: r.status, signal: r.signal, error: r.error ? String(r.error.message) : '' };
+}
+
+function run(cmd, args, opts = {}) {
+  return runEx(cmd, args, opts).ok;
+}
+
+function isOom(r) {
+  return r != null && (r.status === 134 || r.signal === 'SIGABRT' || /heap out of memory/i.test(r.error || ''));
 }
 
 function envBase(extra = {}) {
@@ -235,30 +243,58 @@ function ensureDsh() {
   mkdirSync(DSH_PREFIX, { recursive: true });
   ensureHostPkg();
   const tag = process.env.DSH_TAG || 'latest';
-  log(`install/update @deepseek-ai/dsh@${tag} via npm ...`);
+  const pkgSpec = `@deepseek-ai/dsh@${tag}`;
+  const pnpmBin = join(TOOLS, 'bin', 'pnpm');
+  const pnpmStoreEnv = { npm_config_store_dir: join(TOOLS, 'pnpm-store') };
+  const pnpmCommon = ['--ignore-scripts', '--prefer-offline', '--reporter', 'append-only'];
+
+  log(`install/update ${pkgSpec} ...`);
+  // 引擎优先级：pnpm（内存占用远低于 npm；npm Arborist 在设备上解析 150+ 包
+  // 依赖树会把 2GB 堆吃爆 OOM）→ 换官方源再试 pnpm → 最后才用 npm 兜底并调大堆。
   const attempts = [
-    ['registry', REGISTRY],
-    ['registry-retry', REGISTRY],
-    ['fallback-registry', REGISTRY_FALLBACK],
+    { label: 'pnpm/' + REGISTRY, cmd: pnpmBin, engine: 'pnpm', registry: REGISTRY, env: pnpmStoreEnv },
+    { label: 'pnpm/' + REGISTRY_FALLBACK, cmd: pnpmBin, engine: 'pnpm', registry: REGISTRY_FALLBACK, env: pnpmStoreEnv },
+    {
+      label: 'npm/' + REGISTRY + '(heap-3g)',
+      cmd: NPM_BIN,
+      engine: 'npm',
+      registry: REGISTRY,
+      env: { NODE_OPTIONS: '--max-old-space-size=3072' },
+    },
   ];
-  let ok = false;
-  for (const [label, registry] of attempts) {
-    if (label !== 'registry') log(`retrying with ${label}: ${registry}`);
-    ok = run(NPM_BIN, [
-      'install', '--prefix', DSH_PREFIX, `@deepseek-ai/dsh@${tag}`,
-      '--registry', registry, '--no-audit', '--no-fund', '--ignore-scripts', '--force',
-      ...NPM_NET_ARGS,
-    ], { env: envBase(), timeoutMs: NPM_TIMEOUT_MS });
-    if (ok && dshInstalled()) break;
-    log(`attempt ${label} failed (exit ok=${ok}, dshInstalled=${dshInstalled()})`);
+  let succeeded = false;
+  for (const a of attempts) {
+    if (a.engine === 'pnpm') {
+      // 一次性迁移：npm 装出来的扁平 node_modules 没有 pnpm-lock，pnpm 无法增量接管；
+      // 清空后由 pnpm 重建（之后走 content-addressable store，更新很快）。
+      const nm = join(DSH_PREFIX, 'node_modules');
+      if (existsSync(nm) && !existsSync(join(DSH_PREFIX, 'pnpm-lock.yaml'))) {
+        log('pnpm: removing npm-layout node_modules before first pnpm install');
+        try { rmSync(nm, { recursive: true, force: true }); } catch (e) { log('WARN clean node_modules: ' + e.message); }
+      }
+    }
+    const args = a.engine === 'pnpm'
+      ? ['add', '--dir', DSH_PREFIX, pkgSpec, '--registry', a.registry, ...pnpmCommon]
+      : ['install', '--prefix', DSH_PREFIX, pkgSpec, '--registry', a.registry,
+        '--no-audit', '--no-fund', '--ignore-scripts', '--force', ...NPM_NET_ARGS];
+    if (a !== attempts[0]) log(`retrying with engine ${a.label} ...`);
+    const r = runEx(a.cmd, args, { env: { ...envBase(), ...a.env }, timeoutMs: NPM_TIMEOUT_MS });
+    if (isOom(r)) log(`OOM detected on ${a.label}, switching engine`);
+    if (r.ok && dshInstalled()) {
+      log('installed via ' + a.label);
+      succeeded = true;
+      break;
+    }
+    log(`attempt ${a.label} failed (ok=${r.ok}, dshInstalled=${dshInstalled()})`);
   }
-  if (!ok || !dshInstalled()) {
-    log('FATAL: official dsh install/update failed after all attempts');
+  if (!succeeded || !dshInstalled()) {
+    log('FATAL: official dsh install/update failed after all engines/registries');
     process.exit(1);
   }
   try {
     const pkg = JSON.parse(readFileSync(join(DSH_PREFIX, 'node_modules/@deepseek-ai/dsh/package.json'), 'utf8'));
-    log('dsh version: ' + (pkg.version || 'unknown'));
+    const lock = existsSync(join(DSH_PREFIX, 'pnpm-lock.yaml')) ? 'pnpm' : 'npm';
+    log(`dsh version: ${pkg.version || 'unknown'} (lockfile=${lock})`);
   } catch {}
 }
 
@@ -303,18 +339,27 @@ function ensureRipgrepFallback() {
     return;
   }
   log('installing ripgrep linux-arm64 fallback @' + rgVersion + ' ...');
-  let ok = run(NPM_BIN, [
-    'install', '--prefix', DSH_PREFIX, `@vscode/ripgrep-linux-arm64@${rgVersion}`,
-    '--registry', REGISTRY, '--no-audit', '--no-fund', '--ignore-scripts', '--force',
-    ...NPM_NET_ARGS,
-  ], { env: envBase(), timeoutMs: NPM_TIMEOUT_MS });
+  // 引擎跟随 dsh 主安装：pnpm 管理的目录绝不能再用 npm 写（会破坏 .pnpm 布局）
+  const pnpmManaged = existsSync(join(DSH_PREFIX, 'pnpm-lock.yaml'));
+  const pnpmBin = join(TOOLS, 'bin', 'pnpm');
+  const installFallback = (spec, registry) => {
+    if (pnpmManaged) {
+      return run(pnpmBin, ['add', '--dir', DSH_PREFIX, spec, '--registry', registry,
+        '--ignore-scripts', '--prefer-offline', '--reporter', 'append-only'], {
+        env: { ...envBase(), npm_config_store_dir: join(TOOLS, 'pnpm-store') },
+        timeoutMs: NPM_TIMEOUT_MS,
+      });
+    }
+    return run(NPM_BIN, ['install', '--prefix', DSH_PREFIX, spec, '--registry', registry,
+      '--no-audit', '--no-fund', '--ignore-scripts', '--force', ...NPM_NET_ARGS], {
+      env: { ...envBase(), NODE_OPTIONS: '--max-old-space-size=3072' },
+      timeoutMs: NPM_TIMEOUT_MS,
+    });
+  };
+  let ok = installFallback(`@vscode/ripgrep-linux-arm64@${rgVersion}`, REGISTRY);
   if (!ok || !existsSync(fallbackBin)) {
     log('exact version fallback install failed, retrying latest on fallback registry ...');
-    ok = run(NPM_BIN, [
-      'install', '--prefix', DSH_PREFIX, '@vscode/ripgrep-linux-arm64',
-      '--registry', REGISTRY_FALLBACK, '--no-audit', '--no-fund', '--ignore-scripts', '--force',
-      ...NPM_NET_ARGS,
-    ], { env: envBase(), timeoutMs: NPM_TIMEOUT_MS });
+    ok = installFallback('@vscode/ripgrep-linux-arm64', REGISTRY_FALLBACK);
   }
   if (!ok || !existsSync(fallbackBin)) {
     log('WARN: ripgrep linux-arm64 fallback install failed (glob/grep may fail on Android)');
@@ -513,6 +558,8 @@ function linkPluginDeps() {
     let linked = 0;
     let removed = 0;
     for (const ent of readdirSync(src, { withFileTypes: true })) {
+      // pnpm 布局下有 .pnpm 虚拟store / .bin 等，桥接无意义且体积巨大
+      if (ent.name.startsWith('.')) continue;
       srcNames.add(ent.name);
       const target = join(src, ent.name);
       const link = join(dest, ent.name);
