@@ -2,6 +2,8 @@ package com.dsh.launcher
 
 import android.content.Intent
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.View
 import android.view.ViewGroup
 import android.widget.EditText
@@ -15,24 +17,21 @@ import androidx.appcompat.app.AppCompatActivity
 import com.google.android.material.color.DynamicColors
 import org.json.JSONObject
 import java.io.File
+import kotlin.concurrent.thread
 
 /**
- * 插件管理系统：内置插件一览（APK 内 plugins 源）+ 在线安装/卸载。
+ * 插件管理页 —— 整页重构后的信息架构：
  *
- * v4.2.3 起围绕「重置」重构：
- * - 健康检查：每个内置插件判定 目录存在/package.json 可解析/已装配 三态，
- *   异常（空壳损坏、目录缺失、待装配）在列表顶部汇总成「一键重置」卡片；
- * - 重置流程：先同步 extra-plugins 源 → 对异常副本从内置源恢复
- *   （extra-plugins 直拷；third_party 来源的从 prebuilt.tgz 解包子树）→
- *   再跑官方 `install-dsh.mjs --plugins-only` 整体装配；
- * - 单插件级「修复/恢复/装配」按钮；
- * - 全部操作走 busy 锁防并发，进度条反馈；后台线程不再直接触碰视图
- *   （旧实现在 Thread 里调 refreshList，有 CalledFromWrongThreadException 隐患）；
- * - 「重启 dsh」改为快速启动（旧实现误触发完整安装流）。
+ * ┌ 头部：标题 + dsh 服务实时状态 pill + 手动刷新
+ * ├ 操作进度条（任何装配/重置/重启期间可见）
+ * ├ 概览卡：内置 N · 扩展 M · 异常 K；主操作（一键重置修复[异常时] / 重新装配 / 重启服务）
+ * ├ 内置插件：逐个健康卡（目录存在 / package.json 可解析 / 已装配），异常可单修
+ * ├ 路由预设：router-spec / router-standard 安装状态
+ * ├ 在线扩展：已装配扩展卡片 + 仓库安装入口（输入框内联在本区）
+ * ├ 引导卡：插件源未就绪时提供「自动安装并启动」（复用 DshFlow 全量引擎）
+ * └ 日志：可折叠控制台，操作输出实时回显
  *
- * 装配动作全部走官方 `dsh plugin --profile web add/remove`；
- * `yjh051108/dsh-routing-suite` 走特殊适配（routing-suite.mjs）；
- * `scp3500/oh-we-need` 是纯提示词仓库，已内置为 dsh-oh-we-need 插件。
+ * 全部操作走 busy 锁防并发；后台线程只经 refreshListSafe 触碰视图。
  */
 class PluginManagerActivity : AppCompatActivity() {
 
@@ -63,14 +62,21 @@ class PluginManagerActivity : AppCompatActivity() {
         )
     }
 
+    private val handler = Handler(Looper.getMainLooper())
+
     private lateinit var listBox: LinearLayout
+    private lateinit var servicePill: TextView
+    private lateinit var progress: ProgressBar
     private lateinit var input: EditText
     private lateinit var logView: TextView
-    private lateinit var progress: ProgressBar
-    private lateinit var installBtn: View
+    private lateinit var logBody: LinearLayout
+    private lateinit var logToggle: TextView
+    private val logSb = StringBuilder()
+
+    private lateinit var resetBtn: View
     private lateinit var wireBtn: View
     private lateinit var restartBtn: View
-    private val logSb = StringBuilder()
+    private lateinit var installBtn: View
 
     @Volatile
     private var busy = false
@@ -84,65 +90,78 @@ class PluginManagerActivity : AppCompatActivity() {
     private fun profilePkg() = File(profileWebDir(), "package.json")
     private fun presetsRoot() = File(filesDir, ".dsh/.agent-presets")
 
+    private val pollRunnable = object : Runnable {
+        override fun run() {
+            if (!busy) refreshServiceState()
+            handler.postDelayed(this, 3_000)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         DynamicColors.applyToActivityIfAvailable(this)
         super.onCreate(savedInstanceState)
         Ui.applyDynamicColors(this)
+        setContentView(buildUi())
+        appendLog("插件管理就绪（内置 ${BUNDLED.size} 个 + $PRESET_DIR 预设）")
+        refreshList()
+        handler.post(pollRunnable)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        refreshServiceState()
+        refreshList()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        handler.removeCallbacks(pollRunnable)
+    }
+
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+
+    // ── UI 构建 ───────────────────────────────────────────
+
+    private fun buildUi(): View {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Ui.BG)
             setPadding(dp(16), dp(14), dp(16), dp(12))
         }
 
-        val title = TextView(this).apply {
+        // ---- 头部：标题 + 服务状态 + 刷新 ----
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+        }
+        header.addView(TextView(this).apply {
             text = "插件管理"
             textSize = 22f
             typeface = android.graphics.Typeface.DEFAULT_BOLD
             setTextColor(Ui.TEXT_PRIMARY)
-        }
-        val sub = TextView(this).apply {
-            text = "内置插件随 app 自动装配；在线安装通过官方 dsh plugin --profile web add 完成"
+        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        servicePill = Ui.pill(this, "○ dsh 检测中", Ui.TEXT_MUTED)
+        header.addView(servicePill, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { rightMargin = dp(8) })
+        header.addView(Ui.button(this, "刷新", { onManualRefresh() }, filled = false, compact = true).apply {
+            minWidth = dp(64); textSize = 12.5f
+        })
+        root.addView(header, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ))
+        root.addView(TextView(this).apply {
+            text = "内置插件随 app 自动装配；在线安装走官方 dsh plugin --profile web add"
             textSize = 12f
             setTextColor(Ui.TEXT_SECONDARY)
-            setPadding(0, dp(2), 0, dp(8))
-        }
-        val tip = TextView(this).apply {
-            text = "在线仓库示例：mexiaosqwq/dsh-web-mobile · yjh051108/dsh-routing-suite · mafeis/dsh-net-proxy · scp3500/oh-we-need\n" +
-                "本机内置：" + BUNDLED.sorted().joinToString(" · ") + " · " + PRESET_DIR
-            textSize = 11f
-            setTextColor(Ui.TEXT_MUTED)
-            setLineSpacing(dp(2).toFloat(), 1f)
-        }
-
-        root.addView(title, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
+            setPadding(0, dp(2), 0, 0)
+        }, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ))
-        root.addView(sub, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        ))
-        root.addView(tip, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = dp(4) })
 
-        input = EditText(this).apply {
-            hint = "GitHub 仓库，如 mexiaosqwq/dsh-web-mobile"
-            textSize = 14f
-            setTextColor(Ui.TEXT_PRIMARY)
-            setHintTextColor(Ui.TEXT_MUTED)
-            background = Ui.rounded(this@PluginManagerActivity, Ui.SURFACE_INPUT, 12, Ui.OUTLINE)
-            setPadding(dp(14), dp(10), dp(14), dp(10))
-            maxLines = 1
-            inputType = android.text.InputType.TYPE_CLASS_TEXT
-        }
-        root.addView(input, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = dp(10) })
-
-        // 操作进度条：任何装配/重置/重启期间可见
+        // ---- 操作进度条 ----
         progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
             isIndeterminate = true
             visibility = View.GONE
@@ -152,39 +171,49 @@ class PluginManagerActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.MATCH_PARENT, dp(6)
         ).apply { topMargin = dp(8) })
 
-        fun rowOf(vararg buttons: View): LinearLayout = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            buttons.forEachIndexed { index, button ->
-                addView(button, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-                    if (index < buttons.lastIndex) rightMargin = dp(6)
-                })
-            }
-        }
-
-        installBtn = Ui.button(this, "安装 / 更新", { installFromRepo() }, filled = true)
-        wireBtn = Ui.button(this, "重新装配", { rewireBuiltins() }, filled = false)
-        restartBtn = Ui.button(this, "重启 dsh 服务", { restartFlow() }, filled = false)
-        val backBtn = Ui.button(this, "返回", { finish() }, filled = false)
-        root.addView(rowOf(installBtn, wireBtn, restartBtn), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = dp(6) })
-        root.addView(rowOf(backBtn), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = dp(6) })
-
-        listBox = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-        }
-        val listScroll = ScrollView(this).apply {
-            addView(listBox, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        }
+        // ---- 动态列表（概览/内置/预设/在线扩展/引导卡全部在此重建）----
+        listBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val listScroll = ScrollView(this).apply { addView(listBox) }
         root.addView(listScroll, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
-        ).apply { topMargin = dp(10) })
+        ).apply { topMargin = dp(8) })
 
-        val logCard = Ui.card(this, radiusDp = 12, background = Ui.SURFACE_CONTAINER_LOW, elevationDp = 0f)
+        // ---- 可折叠日志 ----
+        root.addView(buildLogCard(), LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(8) })
+
+        return root
+    }
+
+    /** 日志卡：标题行点击折叠/展开；内容固定高度滚动。 */
+    private fun buildLogCard(): View {
+        val card = Ui.card(this, radiusDp = 12, background = Ui.SURFACE_CONTAINER_LOW, elevationDp = 0f)
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+        val head = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            isClickable = true
+            setPadding(dp(4), dp(2), dp(4), dp(2))
+        }
+        head.addView(TextView(this).apply {
+            text = "日志"
+            textSize = 12f
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            setTextColor(Ui.TEXT_SECONDARY)
+            letterSpacing = 0.06f
+        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        logToggle = TextView(this).apply {
+            text = "▾ 收起"
+            textSize = 11.5f
+            setTextColor(Ui.BRAND)
+        }
+        head.addView(logToggle)
+        col.addView(head)
+
+        logBody = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         logView = TextView(this).apply {
             textSize = 11f
             typeface = android.graphics.Typeface.MONOSPACE
@@ -192,40 +221,356 @@ class PluginManagerActivity : AppCompatActivity() {
             setPadding(dp(2), dp(2), dp(2), dp(2))
         }
         val logScroll = ScrollView(this).apply {
-            addView(logView, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            addView(logView, ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ))
         }
-        logCard.addView(logScroll, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-        root.addView(logCard, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            dp(150)
-        ).apply { topMargin = dp(8) })
+        logBody.addView(logScroll, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(140)
+        ).apply { topMargin = dp(4) })
+        col.addView(logBody)
 
-        setContentView(root)
+        head.setOnClickListener {
+            val expanded = logBody.visibility == View.VISIBLE
+            logBody.visibility = if (expanded) View.GONE else View.VISIBLE
+            logToggle.text = if (expanded) "▸ 展开" else "▾ 收起"
+            if (!expanded) logScroll.post { logScroll.fullScroll(View.FOCUS_DOWN) }
+        }
 
-        appendLog("插件管理就绪（内置 ${BUNDLED.size} 个 + $PRESET_DIR 预设）")
+        card.addView(col)
+        return card
     }
 
-    override fun onResume() {
-        super.onResume()
+    // ── 状态与列表渲染 ────────────────────────────────────
+
+    private fun refreshServiceState() {
+        thread {
+            val up = runCatching { DshFlow.isWebUp() }.getOrDefault(false)
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                servicePill.text = if (up) "● dsh 运行中" else "○ dsh 已停止"
+                servicePill.setTextColor(if (up) Ui.SUCCESS else Ui.TEXT_MUTED)
+                servicePill.background = Ui.rounded(
+                    this, Ui.withAlpha(if (up) Ui.SUCCESS else Ui.TEXT_MUTED, 0x1A), 8,
+                    if (up) Ui.SUCCESS else Ui.TEXT_MUTED, 1
+                )
+            }
+        }
+    }
+
+    private fun onManualRefresh() {
+        if (busy) {
+            toast("操作进行中，请稍候…")
+            return
+        }
+        refreshServiceState()
         refreshList()
+        toast("已刷新")
     }
 
-    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+    private fun refreshList() {
+        listBox.removeAllViews()
+        val tp = pluginsDir()
 
-    private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+        // ---- 引导卡：插件源未就绪 → 直接拉起自动安装引擎 ----
+        if (!tp.exists()) {
+            listBox.addView(buildBootstrapCard())
+            return
+        }
 
-    private fun appendLog(m: String) {
-        logSb.append("${System.currentTimeMillis() % 100000}\t$m\n")
-        if (logSb.length > 20000) logSb.delete(0, logSb.length / 2)
-        runOnUiThread { logView.text = logSb.toString() }
+        // ---- 健康度收集 ----
+        val bundledHealth = BUNDLED.sorted().map { it to healthOf(it) }
+        val issueEntries = mutableListOf<Pair<String, String>>()
+        for ((id, h) in bundledHealth) {
+            when {
+                !h.dirExists -> issueEntries.add(id to "目录缺失")
+                !h.healthy -> issueEntries.add(id to "副本损坏")
+                !h.wired -> issueEntries.add(id to "未装配")
+            }
+        }
+        val presetOk = listOf("router-spec", "router-standard").any { File(presetsRoot(), it).exists() }
+        if (!presetOk) issueEntries.add("$PRESET_DIR：未安装")
+
+        val extras = readBundles().filter { name ->
+            name !in BASE_BUNDLES &&
+                !BUNDLED.any { d -> name == d || name == "@dsh-external/$d" }
+        }
+
+        // ---- 概览卡 ----
+        listBox.addView(buildOverviewCard(bundledHealth.size, extras.size, issueEntries))
+
+        // ---- 内置插件区块 ----
+        listBox.addView(sectionHeader("内置插件", "${bundledHealth.size} 个"))
+        for ((id, h) in bundledHealth) {
+            val status: String
+            val actions = mutableListOf<Pair<String, () -> Unit>>()
+            when {
+                !h.dirExists -> {
+                    status = if (h.srcOk) "缺失 · 可修复" else "未内置（构建产物缺失）"
+                    if (h.srcOk) actions.add("恢复" to { repairSingle(id) })
+                }
+                !h.healthy -> {
+                    status = if (h.srcOk) "已损坏 · 可修复" else "已损坏（无内置源）"
+                    if (h.srcOk) actions.add("修复" to { repairSingle(id) })
+                }
+                !h.wired -> {
+                    status = "待装配"
+                    actions.add("装配" to { wireBundled(id) })
+                }
+                else -> status = "已装配"
+            }
+            listBox.addView(makeCard(id, BUNDLED_DESC[id] ?: "", readVersion(id), status, actions))
+        }
+
+        // ---- 路由预设区块 ----
+        listBox.addView(sectionHeader("路由预设", null))
+        listBox.addView(makeCard(
+            PRESET_DIR, PRESET_DESC, "preset",
+            if (presetOk) "已安装（agent-presets）" else "待装配",
+            if (presetOk) emptyList() else listOf("重新装配" to { rewireBuiltins() })
+        ))
+
+        // ---- 在线扩展区块 ----
+        listBox.addView(sectionHeader("在线扩展", "${extras.size} 个"))
+        for (name in extras) {
+            val info = readInstalledPlugin(name) ?: continue
+            listBox.addView(makeCard(name, info.desc, info.version, "已装配", listOf("卸载" to { uninstall(name) })))
+        }
+        listBox.addView(buildInstallCard())
     }
 
-    /** 后台线程安全版刷新。 */
-    private fun refreshListSafe() {
-        runOnUiThread { refreshList() }
+    private fun sectionHeader(title: String, count: String?): View =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(14); bottomMargin = dp(6) }
+            addView(Ui.sectionLabel(this@PluginManagerActivity, title),
+                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            if (count != null) addView(TextView(this@PluginManagerActivity).apply {
+                text = count
+                textSize = 11f
+                setTextColor(Ui.TEXT_MUTED)
+            })
+        }
+
+    /** 概览卡：数量总览 + 异常明细 + 主操作行。 */
+    private fun buildOverviewCard(bundledCount: Int, extraCount: Int, issues: List<Pair<String, String>>): View {
+        val card = Ui.card(this, radiusDp = 16, background = Ui.SURFACE_CONTAINER_HIGH, elevationDp = 1f)
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+        val countsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+        }
+        fun countBlock(num: Int, label: String, color: Int) {
+            countsRow.addView(LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = android.view.Gravity.CENTER_HORIZONTAL
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                addView(TextView(this@PluginManagerActivity).apply {
+                    text = num.toString()
+                    textSize = 20f
+                    typeface = android.graphics.Typeface.DEFAULT_BOLD
+                    setTextColor(color)
+                    gravity = android.view.Gravity.CENTER
+                })
+                addView(TextView(this@PluginManagerActivity).apply {
+                    text = label
+                    textSize = 11f
+                    setTextColor(Ui.TEXT_MUTED)
+                    gravity = android.view.Gravity.CENTER
+                })
+            })
+        }
+        countBlock(bundledCount, "内置", Ui.TEXT_PRIMARY)
+        countBlock(extraCount, "在线扩展", Ui.TEXT_PRIMARY)
+        countBlock(issues.size, "异常", if (issues.isEmpty()) Ui.SUCCESS else Ui.DANGER)
+        col.addView(countsRow, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ))
+
+        if (issues.isNotEmpty()) {
+            col.addView(TextView(this).apply {
+                text = issues.take(3).joinToString("\n") { "· ${it.first}：${it.second}" } +
+                    if (issues.size > 3) "\n· …共 ${issues.size} 项" else ""
+                textSize = 11.5f
+                setTextColor(Ui.WARNING)
+                setPadding(0, dp(6), 0, 0)
+                setLineSpacing(dp(2).toFloat(), 1f)
+            }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ))
+        }
+
+        val btnRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(10), 0, 0)
+        }
+        if (issues.isNotEmpty()) {
+            resetBtn = Ui.button(this, "⚡ 一键重置修复", { resetBuiltins() }, filled = true)
+            wireBtn = Ui.button(this, "重新装配", { rewireBuiltins() }, filled = false)
+        } else {
+            resetBtn = Ui.button(this, "重新装配", { rewireBuiltins() }, filled = false)
+            wireBtn = Ui.button(this, "⚡ 重新装配", { rewireBuiltins() }, filled = true)
+        }
+        restartBtn = Ui.button(this, "重启服务", { restartFlow() }, filled = false)
+        btnRow.addView(resetBtn, LinearLayout.LayoutParams(0, dp(44), 1f).apply { rightMargin = dp(6) })
+        btnRow.addView(wireBtn, LinearLayout.LayoutParams(0, dp(44), 1f).apply { rightMargin = dp(6) })
+        btnRow.addView(restartBtn, LinearLayout.LayoutParams(0, dp(44), 1f))
+        col.addView(btnRow, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ))
+
+        card.addView(col)
+        return card
+    }
+
+    /** 未就绪引导卡：一键走完整自动安装引擎。 */
+    private fun buildBootstrapCard(): View {
+        val card = Ui.card(this, radiusDp = 16, background = Ui.SURFACE_CONTAINER_HIGH, stroke = Ui.WARNING, elevationDp = 1f)
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        col.addView(TextView(this).apply {
+            text = "插件源尚未就绪"
+            textSize = 15f
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            setTextColor(Ui.TEXT_PRIMARY)
+        })
+        col.addView(TextView(this).apply {
+            text = "首次使用请先完成自动安装：解压内置 Node → npm 安装 dsh → 装配内置插件 → 启动服务。\n全程需联网，约几分钟。"
+            textSize = 12f
+            setTextColor(Ui.TEXT_SECONDARY)
+            setLineSpacing(dp(2).toFloat(), 1f)
+            setPadding(0, dp(6), 0, dp(10))
+        })
+        col.addView(Ui.button(this, "自动安装并启动", { bootstrapNow() }, filled = true).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        })
+        card.addView(col)
+        return card
+    }
+
+    private fun bootstrapNow() {
+        if (!guardBusy()) return
+        setBusy(true)
+        DshFlow.launch(
+            this, DshFlow.Mode.INSTALL_AND_START,
+            onLog = { line -> runOnUiThread { appendLog(line) } },
+            onDone = { ok ->
+                runOnUiThread {
+                    setBusy(false)
+                    toast(if (ok) "安装并启动完成" else "流程未完成，见日志")
+                    refreshList()
+                }
+            }
+        )
+    }
+
+    // ── 卡片工厂 ──────────────────────────────────────────
+
+    private fun makeCard(name: String, desc: String, ver: String, status: String, actions: List<Pair<String, () -> Unit>>): View {
+        val card = Ui.card(this, radiusDp = 14, background = Ui.SURFACE_CONTAINER, elevationDp = 1f)
+        card.layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { bottomMargin = dp(6) }
+
+        val content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        card.addView(content, ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ))
+
+        val titleRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+        }
+        titleRow.addView(TextView(this).apply {
+            text = name
+            textSize = 15f
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            setTextColor(Ui.TEXT_PRIMARY)
+        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        titleRow.addView(TextView(this).apply {
+            text = ver
+            textSize = 11f
+            setTextColor(Ui.TEXT_MUTED)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { rightMargin = dp(6) }
+        })
+        titleRow.addView(Ui.pill(this, status, statusColor(status)))
+        content.addView(titleRow)
+
+        if (desc.isNotEmpty()) {
+            content.addView(TextView(this).apply {
+                text = desc
+                textSize = 12f
+                setTextColor(Ui.TEXT_SECONDARY)
+                setPadding(0, dp(4), 0, 0)
+                setLineSpacing(dp(1).toFloat(), 1f)
+            })
+        }
+        if (actions.isNotEmpty()) {
+            val actRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(0, dp(8), 0, 0)
+            }
+            for ((label, fn) in actions) {
+                actRow.addView(Ui.button(this, label, { fn() }, filled = false, compact = true).apply {
+                    layoutParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                    ).apply { rightMargin = dp(6) }
+                })
+            }
+            content.addView(actRow)
+        }
+        return card
+    }
+
+    /** 在线安装入口卡：仓库输入 + 安装按钮（内联在「在线扩展」区尾部）。 */
+    private fun buildInstallCard(): View {
+        val card = Ui.card(this, radiusDp = 14, background = Ui.SURFACE_CONTAINER_LOW, elevationDp = 0f)
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        col.addView(TextView(this).apply {
+            text = "从 GitHub 仓库安装"
+            textSize = 13f
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            setTextColor(Ui.TEXT_SECONDARY)
+        })
+        input = EditText(this).apply {
+            hint = "owner/repo 或 https://github.com/owner/repo"
+            textSize = 13f
+            setTextColor(Ui.TEXT_PRIMARY)
+            setHintTextColor(Ui.TEXT_MUTED)
+            background = Ui.rounded(this@PluginManagerActivity, Ui.SURFACE_INPUT, 10, Ui.OUTLINE)
+            setPadding(dp(12), dp(9), dp(12), dp(9))
+            maxLines = 1
+            inputType = android.text.InputType.TYPE_CLASS_TEXT
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(8) }
+        }
+        col.addView(input)
+        installBtn = Ui.button(this, "安装 / 更新", { installFromRepo() }, filled = true).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(8) }
+        }
+        col.addView(installBtn)
+        col.addView(TextView(this).apply {
+            text = "特殊适配：$ROUTING_REPO（聚合装配）· $OH_WE_NEED_REPO（内置提示词插件）"
+            textSize = 10.5f
+            setTextColor(Ui.TEXT_MUTED)
+            setPadding(0, dp(6), 0, 0)
+        })
+        card.addView(col)
+        return card
     }
 
     // ── busy 锁 ───────────────────────────────────────────
+
     private fun guardBusy(): Boolean =
         if (busy) {
             toast("操作进行中，请稍候…")
@@ -236,11 +581,28 @@ class PluginManagerActivity : AppCompatActivity() {
         busy = b
         runOnUiThread {
             progress.visibility = if (b) View.VISIBLE else View.GONE
-            listOf(installBtn, wireBtn, restartBtn).forEach {
+            // 引导卡路径（插件源未就绪）不会创建主操作按钮：逐个判 isInitialized 防崩
+            val btns = mutableListOf<View>()
+            if (::resetBtn.isInitialized) btns.add(resetBtn)
+            if (::wireBtn.isInitialized) btns.add(wireBtn)
+            if (::restartBtn.isInitialized) btns.add(restartBtn)
+            if (::installBtn.isInitialized) btns.add(installBtn)
+            btns.forEach {
                 it.isEnabled = !b
                 it.alpha = if (b) 0.5f else 1f
             }
         }
+    }
+
+    private fun appendLog(m: String) {
+        logSb.append("${System.currentTimeMillis() % 100000}\t$m\n")
+        if (logSb.length > 20000) logSb.delete(0, logSb.length / 2)
+        runOnUiThread { logView.text = logSb.toString() }
+    }
+
+    /** 后台线程安全版列表刷新。 */
+    private fun refreshListSafe() {
+        runOnUiThread { refreshList() }
     }
 
     // ── 健康检查 ──────────────────────────────────────────
@@ -252,8 +614,7 @@ class PluginManagerActivity : AppCompatActivity() {
         return BundledHealth(dir.isDirectory, bundleHealthy(dir), isWired(id), bundledSourceAvailable(id))
     }
 
-    /** 目录健康：package.json 存在、可解析、name 非空。
-     *  （空壳损坏——package.json 为空/lib/index.js 变空目录——曾是 AssetSync 文件误判 bug 的产物。） */
+    /** 目录健康：package.json 存在、可解析、name 非空（空壳损坏判定）。 */
     private fun bundleHealthy(dir: File): Boolean {
         val p = File(dir, "package.json")
         if (!p.isFile) return false
@@ -261,7 +622,7 @@ class PluginManagerActivity : AppCompatActivity() {
         return j.optString("name").isNotBlank()
     }
 
-    /** APK 内是否带有该插件的可用源：extra-plugins 直拷源，或 prebuilt.tgz 内的 third_party 子树。 */
+    /** APK 内是否带有该插件的可用源：extra-plugins 直拷源，或 prebuilt.tgz 内 third_party 子树。 */
     private fun bundledSourceAvailable(id: String): Boolean {
         if (File(filesDir, "extra-plugins/$id/package.json").isFile) return true
         val tgz = File(filesDir, "prebuilt.tgz")
@@ -279,7 +640,7 @@ class PluginManagerActivity : AppCompatActivity() {
         }.getOrDefault(false)
     }
 
-    /** 从内置源恢复单个插件目录：extra-plugins 直拷；否则从 prebuilt.tgz 解包对应子树。 */
+    /** 从内置源恢复单个插件目录：extra-plugins 直拷；否则 prebuilt.tgz 解包子树。 */
     private fun repairFromSource(id: String): Boolean {
         val dst = File(pluginsDir(), id)
         dst.deleteRecursively()
@@ -307,114 +668,7 @@ class PluginManagerActivity : AppCompatActivity() {
         return ok
     }
 
-    // ── 列表 ──────────────────────────────────────────────
-    private fun refreshList() {
-        val tp = pluginsDir()
-        listBox.removeAllViews()
-        if (!tp.exists()) {
-            listBox.addView(makeCard("（内置插件源未就绪：先在主界面完成一次自动安装）", "提示", "", "—", emptyList()))
-            return
-        }
-
-        listBox.addView(Ui.sectionLabel(this, "内置与预设").apply {
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(6) }
-        })
-
-        // 先收集健康度：有异常时在区块顶部插一张汇总卡
-        val issues = mutableListOf<String>()
-        val bundledRows = mutableListOf<Triple<String, View, Unit>>()
-        for (d in BUNDLED.sorted()) {
-            val h = healthOf(d)
-            val ver = readVersion(d)
-            val status: String
-            val actions = mutableListOf<Pair<String, () -> Unit>>()
-            when {
-                !h.dirExists -> {
-                    status = if (h.srcOk) "缺失 · 可修复" else "未内置（构建产物缺失）"
-                    if (h.srcOk) actions.add("恢复" to { repairSingle(d) })
-                    issues.add("$d：目录缺失")
-                }
-                !h.healthy -> {
-                    status = if (h.srcOk) "已损坏 · 可修复" else "已损坏（无内置源）"
-                    if (h.srcOk) actions.add("修复" to { repairSingle(d) })
-                    issues.add("$d：副本损坏")
-                }
-                !h.wired -> {
-                    status = "待装配"
-                    actions.add("装配" to { wireBundled(d) })
-                    issues.add("$d：未装配")
-                }
-                else -> status = "内置 · 已装配"
-            }
-            bundledRows.add(Triple(d, makeCard(d, BUNDLED_DESC[d] ?: "", ver, status, actions), Unit))
-        }
-
-        if (issues.isNotEmpty()) {
-            listBox.addView(buildSummaryCard(issues))
-        }
-        for ((_, view, _) in bundledRows) listBox.addView(view)
-
-        // 路由预设（容器展平后以 router-spec/router-standard 两个一级预设生效）
-        val presetOk = listOf("router-spec", "router-standard").any { File(presetsRoot(), it).exists() }
-        if (!presetOk) issues.add("$PRESET_DIR：未安装")
-        listBox.addView(makeCard(
-            PRESET_DIR, PRESET_DESC, "preset",
-            if (presetOk) "已安装（agent-presets）" else "待装配（需重新装配）",
-            if (presetOk) emptyList() else listOf("重新装配" to { rewireBuiltins() })
-        ))
-
-        // 官方 dsh plugin add 装配的额外插件（从 profile package.json 的 bundles 读取）
-        val extras = readBundles().filter { name ->
-            name !in BASE_BUNDLES &&
-                !BUNDLED.any { d -> name == d || name == "@dsh-external/$d" }
-        }
-        if (extras.isNotEmpty()) {
-            listBox.addView(Ui.sectionLabel(this, "在线装配扩展").apply {
-                layoutParams = LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                ).apply { topMargin = dp(10); bottomMargin = dp(6) }
-            })
-            for (name in extras) {
-                val info = readInstalledPlugin(name) ?: continue
-                listBox.addView(makeCard(name, info.desc, info.version, "已装配", listOf("卸载" to { uninstall(name) })))
-            }
-        }
-    }
-
-    /** 异常汇总卡（红描边）：列出前几条原因 + 一键重置入口。 */
-    private fun buildSummaryCard(issues: List<String>): View {
-        val card = Ui.card(this, radiusDp = 14, background = Ui.SURFACE_CONTAINER_HIGH, stroke = Ui.DANGER, elevationDp = 1f)
-        val content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        card.layoutParams = LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { bottomMargin = dp(8) }
-        content.addView(TextView(this).apply {
-            text = "⚠ 检测到 ${issues.size} 个插件异常"
-            textSize = 14f
-            typeface = android.graphics.Typeface.DEFAULT_BOLD
-            setTextColor(Ui.DANGER)
-        })
-        content.addView(TextView(this).apply {
-            text = issues.take(4).joinToString("\n") { "· $it" } + if (issues.size > 4) "\n· …" else ""
-            textSize = 11.5f
-            setTextColor(Ui.TEXT_SECONDARY)
-            setPadding(0, dp(4), 0, 0)
-            setLineSpacing(dp(2).toFloat(), 1f)
-        })
-        content.addView(Ui.button(this, "一键重置修复", { resetBuiltins() }, filled = true).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(8) }
-        })
-        card.addView(content)
-        return card
-    }
-
-    data class PluginInfo(val id: String, val name: String, val desc: String, val version: String)
+    // ── 数据读取 ──────────────────────────────────────────
 
     private fun readBundles(): List<String> {
         return try {
@@ -448,7 +702,9 @@ class PluginManagerActivity : AppCompatActivity() {
                 j.optString("description", "").take(80),
                 j.optString("version", "?")
             )
-        } catch (t: Throwable) { PluginInfo(name, name, "", "?") }
+        } catch (t: Throwable) {
+            PluginInfo(name, name, "", "?")
+        }
     }
 
     private fun resolvePackageDir(name: String): File? {
@@ -463,10 +719,14 @@ class PluginManagerActivity : AppCompatActivity() {
     private fun readVersion(dir: String): String {
         val p = File(File(pluginsDir(), dir), "package.json")
         if (!p.exists()) return "?"
-        return try { JSONObject(p.readText()).optString("version", "?") } catch (t: Throwable) { "?" }
+        return try {
+            JSONObject(p.readText()).optString("version", "?")
+        } catch (t: Throwable) {
+            "?"
+        }
     }
 
-    /** 状态 pill 颜色：显式映射，避免「已损坏」命中 contains("已") 被画成绿色。 */
+    /** 状态 pill 颜色显式映射（「已损坏」不得命中 contains(已) 变绿）。 */
     private fun statusColor(status: String): Int = when {
         status.contains("已装配") || status.contains("已安装") || status.contains("已连接") -> Ui.SUCCESS
         status.contains("损坏") || status.contains("缺失") -> Ui.DANGER
@@ -474,71 +734,8 @@ class PluginManagerActivity : AppCompatActivity() {
         else -> Ui.TEXT_MUTED
     }
 
-    private fun makeCard(name: String, desc: String, ver: String, status: String, actions: List<Pair<String, () -> Unit>>): View {
-        val card = Ui.card(this, radiusDp = 14, background = Ui.SURFACE_CONTAINER, elevationDp = 1f)
-        val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-        lp.setMargins(0, 0, 0, dp(6))
-        card.layoutParams = lp
+    // ── 操作：在线安装 ────────────────────────────────────
 
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-        }
-        card.addView(content, ViewGroup.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        ))
-
-        val titleRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = android.view.Gravity.CENTER_VERTICAL
-        }
-        titleRow.addView(TextView(this).apply {
-            text = name
-            textSize = 15f
-            typeface = android.graphics.Typeface.DEFAULT_BOLD
-            setTextColor(Ui.TEXT_PRIMARY)
-        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        titleRow.addView(TextView(this).apply {
-            text = ver
-            textSize = 11f
-            setTextColor(Ui.TEXT_MUTED)
-        }.apply {
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { rightMargin = dp(6) }
-        })
-        titleRow.addView(Ui.pill(this, status, statusColor(status)))
-        content.addView(titleRow)
-
-        if (desc.isNotEmpty()) {
-            content.addView(TextView(this).apply {
-                text = desc
-                textSize = 12f
-                setTextColor(Ui.TEXT_SECONDARY)
-                setPadding(0, dp(4), 0, 0)
-                setLineSpacing(dp(1).toFloat(), 1f)
-            })
-        }
-        if (actions.isNotEmpty()) {
-            val actRow = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                setPadding(0, dp(8), 0, 0)
-            }
-            for ((label, fn) in actions) {
-                actRow.addView(Ui.button(this, label, { fn() }, filled = false, compact = true).apply {
-                    layoutParams = LinearLayout.LayoutParams(
-                        ViewGroup.LayoutParams.WRAP_CONTENT,
-                        ViewGroup.LayoutParams.WRAP_CONTENT
-                    ).apply { rightMargin = dp(6) }
-                })
-            }
-            content.addView(actRow)
-        }
-        return card
-    }
-
-    // ── 在线安装 ──────────────────────────────────────────
     private fun installFromRepo() {
         if (!guardBusy()) return
         val raw = input.text.toString().trim()
@@ -547,14 +744,16 @@ class PluginManagerActivity : AppCompatActivity() {
             appendLog("仓库格式无效：$raw（应形如 owner/repo 或 https://github.com/owner/repo）")
             return
         }
-        if (repo == ROUTING_REPO) {
-            appendLog(">> 特殊适配安装 $repo …")
-            runRoutingSuite()
-        } else if (repo == OH_WE_NEED_REPO) {
-            appendLog(">> $repo 是纯提示词仓库，已内置为 dsh-oh-we-need 插件；触发重新装配…")
-            rewireBuiltins()
-        } else {
-            runDshPlugin(listOf("add", "github:$repo"), "安装 $repo")
+        when (repo) {
+            ROUTING_REPO -> {
+                appendLog(">> 特殊适配安装 $repo …")
+                runRoutingSuite()
+            }
+            OH_WE_NEED_REPO -> {
+                appendLog(">> $repo 是纯提示词仓库，已内置为 dsh-oh-we-need 插件；触发重新装配…")
+                rewireBuiltins()
+            }
+            else -> runDshPlugin(listOf("add", "github:$repo"), "安装 $repo")
         }
     }
 
@@ -570,12 +769,13 @@ class PluginManagerActivity : AppCompatActivity() {
     }
 
     // ── dsh plugin CLI ─────────────────────────────────────
+
     /** 同步执行 dsh plugin 子命令（阻塞；调用方负责线程与 busy）。 */
     private fun dshPluginSync(args: List<String>, label: String): Int {
         ensureHarnessTools()
         val cli = dshCliFile()
         if (!cli.exists()) {
-            appendLog("   ✗ dsh 未安装（请先回主界面完成一次自动安装）")
+            appendLog("   ✗ dsh 未安装（请先完成一次自动安装）")
             return -1
         }
         val node = File(File(nodeDir, "bin"), "node")
@@ -603,7 +803,7 @@ class PluginManagerActivity : AppCompatActivity() {
         }.start()
     }
 
-    /** 单个内置插件「装配」：目录健康但未注册进 profile 时使用。 */
+    /** 单个内置插件「装配」：目录健康但未注册进 profile。 */
     private fun wireBundled(id: String) {
         if (!guardBusy()) return
         setBusy(true)
@@ -620,7 +820,7 @@ class PluginManagerActivity : AppCompatActivity() {
         }.start()
     }
 
-    /** 单个内置插件「修复/恢复」：清掉异常副本 → 从内置源恢复 → 注册进 profile。 */
+    /** 单个内置插件「修复/恢复」：清异常副本 → 从内置源恢复 → 注册进 profile。 */
     private fun repairSingle(id: String) {
         if (!guardBusy()) return
         setBusy(true)
@@ -644,7 +844,7 @@ class PluginManagerActivity : AppCompatActivity() {
         }.start()
     }
 
-    /** 重新装配内置插件：只跑 install-dsh.mjs --plugins-only，不改 dsh 本体。 */
+    /** 重新装配内置插件：--plugins-only，不改 dsh 本体。 */
     private fun rewireBuiltins() {
         if (!guardBusy()) return
         AlertDialog.Builder(this)
@@ -705,7 +905,7 @@ class PluginManagerActivity : AppCompatActivity() {
             .show()
     }
 
-    /** 同步 assets 的 extra-plugins 源到 files（AssetSync 已修复文件误判，clearFirst 自愈坏拷贝）。 */
+    /** 同步 assets 的 extra-plugins 源到 files（clearFirst 自愈坏拷贝）。 */
     private fun syncExtraPluginsSource() {
         val apkVer = AssetSync.apkVersion(this)
         val dest = File(filesDir, "extra-plugins")
@@ -786,7 +986,7 @@ class PluginManagerActivity : AppCompatActivity() {
         runDshPlugin(listOf("remove", name), "卸载 $name")
     }
 
-    /** 确保内置 Termux 与 Harness 工具（git/rg/file 等）就绪，失败仅记录不中断插件操作。 */
+    /** 确保内置 Termux 与 Harness 工具就绪，失败仅记录不中断插件操作。 */
     private fun ensureHarnessTools() {
         try {
             if (!TermuxRuntime.isReady(this)) {
@@ -867,12 +1067,12 @@ class PluginManagerActivity : AppCompatActivity() {
         }
     }
 
-    /** 重启 dsh：杀 node 后走快速启动引擎（秒级；旧实现误触发完整安装流）。 */
+    /** 重启 dsh：杀 node 后快速启动（秒级）。 */
     private fun restartFlow() {
         if (!guardBusy()) return
         setBusy(true)
         appendLog(">> 重启 dsh 服务（快速启动，不做安装）…")
-        Thread {
+        thread {
             DshFlow.killAllNode(this) { appendLog(it) }
             Thread.sleep(1500)
             runOnUiThread {
@@ -881,10 +1081,11 @@ class PluginManagerActivity : AppCompatActivity() {
                     onLog = { appendLog(it) },
                     onDone = { ok ->
                         setBusy(false)
+                        refreshServiceState()
                         appendLog(if (ok) "✓ dsh 已重启（http://127.0.0.1:${DshFlow.WEB_PORT}）" else "✗ 重启失败，详见上方日志")
                     }
                 )
             }
-        }.start()
+        }
     }
 }
