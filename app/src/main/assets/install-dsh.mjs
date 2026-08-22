@@ -36,11 +36,13 @@ const EXTRA_PLUGINS_SRC = process.env.DSH_EXTRA_PLUGINS_SRC || join(HOME, 'extra
 const TOOLS = join(HOME, '.tools');
 const TERMUX = process.env.TERMUX_PREFIX || join(HOME, 'termux/usr');
 const REGISTRY = process.env.NPM_REGISTRY || 'https://registry.npmmirror.com';
+const REGISTRY_FALLBACK = process.env.NPM_REGISTRY_FALLBACK || 'https://registry.npmjs.org';
 const PNPM_VERSION = '11.7.0';
 // 防卡死：所有子进程都有硬超时；npm 网络层自带重试/超时，避免 TCP 半开连接无限等待
 const NPM_TIMEOUT_MS = Number(process.env.DSH_NPM_TIMEOUT_MS || 15 * 60_000);
 const PLUGIN_TIMEOUT_MS = Number(process.env.DSH_PLUGIN_TIMEOUT_MS || 5 * 60_000);
 const NPM_NET_ARGS = [
+  '--prefer-offline',
   '--fetch-timeout=120000',
   '--fetch-retries=5',
   '--fetch-retry-mintimeout=2000',
@@ -207,23 +209,46 @@ function ensurePnpm() {
   return pnpmCjs;
 }
 
+function ensureHostPkg() {
+  // 必须有 package.json：没有它 npm 视为临时安装，不生成 package-lock.json，
+  // 导致每次安装都重新联网解析全部依赖 manifest（弱网下极易卡住）。
+  const pkgFile = join(DSH_PREFIX, 'package.json');
+  if (existsSync(pkgFile)) return;
+  try {
+    writeFileSync(pkgFile, JSON.stringify({
+      name: 'dsh-host',
+      private: true,
+      version: '0.0.0',
+    }, null, 2) + '\n');
+    log('created ' + pkgFile + ' (enables lockfile + cache-friendly installs)');
+  } catch (e) {
+    log('WARN create host package.json: ' + e.message);
+  }
+}
+
 function ensureDsh() {
   mkdirSync(DSH_PREFIX, { recursive: true });
+  ensureHostPkg();
   const tag = process.env.DSH_TAG || 'latest';
   log(`install/update @deepseek-ai/dsh@${tag} via npm ...`);
-  const npmArgs = [
-    'install', '--prefix', DSH_PREFIX, `@deepseek-ai/dsh@${tag}`,
-    '--registry', REGISTRY, '--no-audit', '--no-fund', '--ignore-scripts', '--force',
-    ...NPM_NET_ARGS,
+  const attempts = [
+    ['registry', REGISTRY],
+    ['registry-retry', REGISTRY],
+    ['fallback-registry', REGISTRY_FALLBACK],
   ];
-  let ok = run(NPM_BIN, npmArgs, { env: envBase(), timeoutMs: NPM_TIMEOUT_MS });
-  if (!ok || !dshInstalled()) {
-    // 网络抖动/镜像瞬时不可用时自动重试一次；--force 可覆盖半成品 node_modules
-    log('dsh install failed or incomplete, retrying once ...');
-    ok = run(NPM_BIN, npmArgs, { env: envBase(), timeoutMs: NPM_TIMEOUT_MS });
+  let ok = false;
+  for (const [label, registry] of attempts) {
+    if (label !== 'registry') log(`retrying with ${label}: ${registry}`);
+    ok = run(NPM_BIN, [
+      'install', '--prefix', DSH_PREFIX, `@deepseek-ai/dsh@${tag}`,
+      '--registry', registry, '--no-audit', '--no-fund', '--ignore-scripts', '--force',
+      ...NPM_NET_ARGS,
+    ], { env: envBase(), timeoutMs: NPM_TIMEOUT_MS });
+    if (ok && dshInstalled()) break;
+    log(`attempt ${label} failed (exit ok=${ok}, dshInstalled=${dshInstalled()})`);
   }
   if (!ok || !dshInstalled()) {
-    log('FATAL: official dsh install/update failed');
+    log('FATAL: official dsh install/update failed after all attempts');
     process.exit(1);
   }
   try {
@@ -279,10 +304,10 @@ function ensureRipgrepFallback() {
     ...NPM_NET_ARGS,
   ], { env: envBase(), timeoutMs: NPM_TIMEOUT_MS });
   if (!ok || !existsSync(fallbackBin)) {
-    log('exact version fallback install failed, retrying latest ...');
+    log('exact version fallback install failed, retrying latest on fallback registry ...');
     ok = run(NPM_BIN, [
       'install', '--prefix', DSH_PREFIX, '@vscode/ripgrep-linux-arm64',
-      '--registry', REGISTRY, '--no-audit', '--no-fund', '--ignore-scripts', '--force',
+      '--registry', REGISTRY_FALLBACK, '--no-audit', '--no-fund', '--ignore-scripts', '--force',
       ...NPM_NET_ARGS,
     ], { env: envBase(), timeoutMs: NPM_TIMEOUT_MS });
   }
