@@ -32,7 +32,7 @@
     没有该 API，缺失会导致前端 client-connection 无限重连（详见下）。
 - 内置插件经官方 `dsh plugin --profile web add` 装配：`dsh-mobile-nav`、`dsh-super-injector`、
   `dsh-net-proxy`、`dsh-provider-headers`、`dsh-vision`、`dsh-oh-we-need`（Skill 化，不再注入
-  系统提示词）、`dsh-j-space-cognition`（J-Space Cognition Suite V3.6 Skill）；`yjh051108/dsh-routing-suite`
+  系统提示词）；`yjh051108/dsh-routing-suite`
   走特殊适配（`routing-suite.mjs`：聚合仓库 + injector 装配 + agent-presets 拷贝）。
 - 自动初始化 `files/.dsh/profiles/web` 配置（含默认 LLM 提供方配置），
   界面内填入 DeepSeek API Key 即可使用。

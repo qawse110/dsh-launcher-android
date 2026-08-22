@@ -1,4 +1,0 @@
-# dsh-j-space-cognition bundle 层：注册 j-space Skill（按需调用）。
-- insert:
-    - id: dsh-j-space-cognition
-      name: '@dsh-external/dsh-j-space-cognition'
