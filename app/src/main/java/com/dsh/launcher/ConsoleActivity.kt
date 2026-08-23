@@ -355,7 +355,7 @@ class ConsoleActivity : AppCompatActivity() {
      *   `--ez dsh_install true`  仅安装/更新（npm + 插件装配，不启动 web）
      *   `--ez dsh_start true`    仅启动（跳安装，要求已安装）
      */
-    private fun runDshFlow(installOnly: Boolean = false, startOnly: Boolean = false) {
+    private fun runDshFlow(installOnly: Boolean = false, startOnly: Boolean = false, forceFullInstall: Boolean = false) {
         val mode = when {
             installOnly -> DshFlow.Mode.INSTALL_ONLY
             startOnly -> DshFlow.Mode.START_ONLY
@@ -364,7 +364,8 @@ class ConsoleActivity : AppCompatActivity() {
         DshFlow.launch(
             this, mode,
             onLog = { line -> appendLine(line) },
-            onState = { s -> setState(s) }
+            onState = { s -> setState(s) },
+            forceFullInstall = forceFullInstall
         )
     }
 
@@ -414,7 +415,7 @@ class ConsoleActivity : AppCompatActivity() {
                 log("发现 dsh v$version，重启流程执行 npm 官方更新…")
                 Thread.sleep(3_000)
                 DshFlow.killAllNode(this@ConsoleActivity) { appendLine(it) }
-                runOnUiThread { runDshFlow() }
+                runOnUiThread { runDshFlow(forceFullInstall = true) }
             }
         }
     }
@@ -434,7 +435,7 @@ class ConsoleActivity : AppCompatActivity() {
                     .edit().putString("dsh_install_tag", "next").apply()
                 Thread.sleep(3_000)
                 DshFlow.killAllNode(this@ConsoleActivity) { appendLine(it) }
-                runOnUiThread { runDshFlow() }
+                runOnUiThread { runDshFlow(forceFullInstall = true) }
             } else {
                 log("next 线暂无更新（或已是最新预发布版）")
             }

@@ -50,7 +50,8 @@ object DshFlow {
         mode: Mode,
         onLog: (String) -> Unit,
         onState: ((String) -> Unit)? = null,
-        onDone: ((Boolean) -> Unit)? = null
+        onDone: ((Boolean) -> Unit)? = null,
+        forceFullInstall: Boolean = false
     ) {
         val ctx = context.applicationContext
         if (!busy.compareAndSet(false, true)) {
@@ -61,7 +62,7 @@ object DshFlow {
         thread {
             var ok = false
             try {
-                ok = runFlow(ctx, mode, onLog, onState)
+                ok = runFlow(ctx, mode, forceFullInstall, onLog, onState)
             } catch (t: Throwable) {
                 AppLog.e("DshFlow", "flow failed: " + (t.message ?: t.toString()))
                 onLog("FAIL: ${t.message}")
@@ -74,7 +75,7 @@ object DshFlow {
     }
 
     /** 流程主体（阻塞，后台线程调用）。 */
-    private fun runFlow(ctx: Context, mode: Mode, onLog: (String) -> Unit, onState: ((String) -> Unit)?): Boolean {
+    private fun runFlow(ctx: Context, mode: Mode, forceFullInstall: Boolean, onLog: (String) -> Unit, onState: ((String) -> Unit)?): Boolean {
         // 核心日志写私有目录（无需存储权限，run-as 可读）；共享目录尽力而为
         val flowLog = File(ctx.filesDir, "dsh-flow.log")
         val sharedFlowLog = File("/sdcard/Download/DshLauncher/dsh-flow.log")
@@ -128,7 +129,7 @@ object DshFlow {
         }
 
         // 安装+启动模式且 dsh 已安装：快速启动，跳过 npm 更新/插件装配/Termux 全量准备
-        if (mode == Mode.INSTALL_AND_START && isInstalled(ctx)) {
+        if (mode == Mode.INSTALL_AND_START && !forceFullInstall && isInstalled(ctx)) {
             fl(">> 快速启动：已安装 dsh v${DshUpdater.currentVersion(ctx)}，跳过 npm/插件装配…")
             return if (quickStartWeb(ctx, nodeDir, dshPrefix, ::fl)) {
                 fl("OK 快速启动完成 (http://127.0.0.1:$WEB_PORT)")
