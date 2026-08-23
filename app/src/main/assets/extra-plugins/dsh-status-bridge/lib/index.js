@@ -83,15 +83,12 @@ function sendJson(res, payload, statusCode = 200) {
   res.end(body)
 }
 
-function ensureServer() {
-  // server 挂到 globalThis 跨热重载复用：ESM 重新加载会得到新的模块级变量（server=null），
-  // 直接再 listen 会 EADDRINUSE，旧实例继续用被拆除的事件订阅 serve 旧数据 → 状态僵死
+// 单飞合成服务：监听失败（如重启瞬间的端口竞争）按 3s 退避重试至多 60s，
+// 并由守卫定时器周期性自愈；成功后经 globalThis 跨热重载复用。
+function ensureServer(attempt = 0) {
   const g = globalThis
-  if (g.__dshStatusBridgeServer?.listening) {
-    server = g.__dshStatusBridgeServer
-    return
-  }
-  server = createServer((req, res) => {
+  if (g.__dshStatusBridgeServer?.listening) { server = g.__dshStatusBridgeServer; return }
+  const s = createServer((req, res) => {
     const url = (req.url || '/').split('?')[0]
     if (url === '/' || url === '/status') {
       sendJson(res, state)
@@ -101,13 +98,26 @@ function ensureServer() {
       sendJson(res, { error: 'not found' }, 404)
     }
   })
-  server.on('error', (err) => {
-    console.error('[dsh-status-bridge] server error', err?.message || err)
+  s.on('error', (err) => {
+    console.error('[dsh-status-bridge] server error', err?.code || err?.message || err)
+    if (g.__dshStatusBridgeServer === s) g.__dshStatusBridgeServer = null
+    if (attempt < 20) setTimeout(() => ensureServer(attempt + 1), 3000)
   })
-  server.listen(PORT, '127.0.0.1')
-  g.__dshStatusBridgeServer = server
-  console.log(`[dsh-status-bridge] listening on http://127.0.0.1:${PORT}`)
+  s.listen(PORT, '127.0.0.1', () => {
+    g.__dshStatusBridgeServer = s
+    console.log('[dsh-status-bridge] listening on http://127.0.0.1:' + PORT)
+  })
+  server = s
 }
+
+// 守卫：任何原因导致的掉线都会在 ≤15s 内被重新拉起
+setInterval(() => {
+  const g = globalThis
+  if (!g.__dshStatusBridgeServer?.listening) {
+    console.warn('[dsh-status-bridge] guard: server down, restarting')
+    ensureServer(0)
+  }
+}, 15000).unref?.()
 
 export function apply(ctx) {
   const onEvent = (session, event) => {
