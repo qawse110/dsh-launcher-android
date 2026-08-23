@@ -512,7 +512,7 @@ class BridgeOverlayManager(
                 break // 句子尚未写完，等下一轮轮询
             }
             val trimmed = utterance.trim()
-            if (trimmed.isNotEmpty()) speak(trimmed, TextToSpeech.QUEUE_ADD)
+            if (trimmed.isNotEmpty()) speak(trimmed, append = true)
             start += utterance.length
             advanced = true
         }
@@ -747,8 +747,31 @@ class BridgeOverlayManager(
      *  无中文引擎自动回退系统默认语言；失败静默）。 */
     private var pendingSpeak: String? = null
 
-    private fun speak(text: String, queueMode: Int = TextToSpeech.QUEUE_FLUSH) {
-        if (ttsReleased || !petTts() || text.isBlank()) return
+    /**
+     * 播报总入口：按设置分流 Edge 在线语音 / 系统引擎。
+     * @param append false=FLUSH 语义（打断当前播报，如状态转折/互动台词）；
+     *               true =ADD 语义（正文整句接续排队）。
+     */
+    private fun speak(text: String, append: Boolean = false) {
+        if (!petTts() || text.isBlank()) return
+        val engine = prefs().getString("tts_engine", "system") ?: "system"
+        if (engine == "edge") {
+            if (!edgeTtsInited) {
+                edgeTtsInited = true
+                EdgeTts.init(context.applicationContext) { t, fl -> speakSystem(t, fl) }
+            }
+            val voice = prefs().getString("tts_edge_voice", "zh-CN-XiaoxiaoNeural") ?: "zh-CN-XiaoxiaoNeural"
+            EdgeTts.enqueue(text, voice, !append)
+            return
+        }
+        speakSystem(text, append)
+    }
+
+    /** 系统 TextToSpeech 播报（含懒初始化与初始化期补播）。 */
+    private var edgeTtsInited = false
+
+    private fun speakSystem(text: String, append: Boolean) {
+        if (ttsReleased || text.isBlank()) return
         if (tts == null) {
             pendingSpeak = text
             tts = TextToSpeech(context) { status ->
@@ -774,7 +797,7 @@ class BridgeOverlayManager(
             return
         }
         try {
-            tts?.speak(text, queueMode, null, "dsh_pet")
+            tts?.speak(text, if (append) TextToSpeech.QUEUE_ADD else TextToSpeech.QUEUE_FLUSH, null, "dsh_pet")
         } catch (_: Exception) {
             // TTS 不可用时静默
         }
@@ -783,6 +806,7 @@ class BridgeOverlayManager(
     /** 释放 TTS 资源（服务销毁时调用；释放后不再重建）。 */
     fun release() {
         ttsReleased = true
+        EdgeTts.shutdown()
         tts?.shutdown()
         tts = null
         ttsReady = false

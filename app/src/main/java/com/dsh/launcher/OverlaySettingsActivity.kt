@@ -237,6 +237,55 @@ class OverlaySettingsActivity : AppCompatActivity() {
             notifySwitch = addSwitch(this, "通知提示", "发送静默通知（不附带提示音）", "notify_enabled", true)
         }
 
+        // TTS 播报引擎
+        root.addView(section("TTS 播报"))
+        card {
+            val engines = linkedMapOf(
+                "system" to "系统引擎（离线）",
+                "edge" to "Edge 在线语音（音质佳，需联网）"
+            )
+            val voices = linkedMapOf(
+                "zh-CN-XiaoxiaoNeural" to "晓晓 · 女声自然",
+                "zh-CN-XiaoyiNeural" to "晓伊 · 女声活泼",
+                "zh-CN-YunxiNeural" to "云希 · 男声年轻",
+                "zh-CN-YunyangNeural" to "云扬 · 男声新闻",
+                "zh-CN-liaoning-XiaobeiNeural" to "晓北 · 女声东北"
+            )
+            val engineBtn = Ui.button(this@OverlaySettingsActivity, "", { }, filled = false)
+            val voiceBtn = Ui.button(this@OverlaySettingsActivity, "", { }, filled = false)
+            fun refresh() {
+                val cur = prefs().getString("tts_engine", "system") ?: "system"
+                engineBtn.text = "引擎：" + (engines[cur] ?: engines["system"]!!)
+                voiceBtn.text = "语音：" + (voices[prefs().getString("tts_edge_voice", "zh-CN-XiaoxiaoNeural")] ?: "晓晓")
+                voiceBtn.visibility = if (cur == "edge") View.VISIBLE else View.GONE
+            }
+            engineBtn.setOnClickListener {
+                val next = if ((prefs().getString("tts_engine", "system") ?: "system") == "edge") "system" else "edge"
+                prefs().edit().putString("tts_engine", next).apply()
+                refresh()
+            }
+            voiceBtn.setOnClickListener {
+                val cur = prefs().getString("tts_edge_voice", "zh-CN-XiaoxiaoNeural") ?: "zh-CN-XiaoxiaoNeural"
+                val keys = voices.keys.toList()
+                val next = keys[(keys.indexOf(cur).coerceAtLeast(0) + 1) % keys.size]
+                prefs().edit().putString("tts_edge_voice", next).apply()
+                refresh()
+            }
+            refresh()
+            addView(engineBtn, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(4) })
+            addView(voiceBtn, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(8) })
+            addView(TextView(this@OverlaySettingsActivity).apply {
+                text = "Edge 语音为微软在线服务，播报需联网；失败自动回退系统引擎。"
+                textSize = 11f
+                setTextColor(Ui.TEXT_MUTED)
+                setPadding(0, dp(8), 0, 0)
+            })
+        }
+
         permissionHint = TextView(this).apply {
             textSize = 12f
             setTextColor(Ui.WARNING)
