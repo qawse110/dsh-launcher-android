@@ -12,8 +12,8 @@ android {
         applicationId = "com.dsh.launcher"
         minSdk = 24
         targetSdk = 28
-        versionCode = 17
-        versionName = "4.3.2"
+        versionCode = 18
+        versionName = "4.3.3"
     }
 
     buildTypes {
@@ -65,4 +65,5 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("androidx.documentfile:documentfile:1.0.1")
     implementation("com.google.android.material:material:1.12.0")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }

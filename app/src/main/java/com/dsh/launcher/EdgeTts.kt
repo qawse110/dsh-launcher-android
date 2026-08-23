@@ -4,28 +4,32 @@ import android.content.Context
 import android.media.MediaPlayer
 import android.os.Handler
 import android.os.Looper
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import okio.ByteString
 import java.io.ByteArrayOutputStream
 import java.io.File
-import java.net.URI
-import java.net.http.HttpClient
-import java.net.http.WebSocket
-import java.nio.ByteBuffer
 import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.ArrayDeque
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
-import java.util.concurrent.CompletionStage
-import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Edge TTS —— 参考 rany2/edge-tts 的微软 Edge「大声朗读」接口实现：
  * wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1
  * 经 WebSocket 提交 SSML，回收 audio-24khz-48kbitrate-mono-mp3 音频帧。
  *
- * - 零第三方依赖：WebSocket 用 API 24+ 的 java.net.http（minSdk 24 恰好覆盖）；
+ * - WebSocket 用 OkHttp：Android 平台从未移植 OpenJDK 的 java.net.http
+ *   （android.jar 编译桩有、真机运行时没有，曾导致 NoClassDefFoundError 闪退），
+ *   OkHttp 全 API 版本可用；
  * - 防滥用令牌 Sec-MS-GEC：Windows 文件时间按 5 分钟取整后拼接 TrustedClientToken
  *   再 SHA-256 大写（与 rany2 v6.x 的 DRM 校验一致，缺了会被 403）；
  * - 单飞流水线：合成 → MediaPlayer 播放 → 完成后才取下一条；flush 清队并打断当前；
@@ -48,8 +52,14 @@ object EdgeTts {
     private val busy = AtomicBoolean(false)
     private var ws: WebSocket? = null
     private var player: MediaPlayer? = null
-    private var playing = false
     private var timeoutRunnable: Runnable? = null
+
+    private val client: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(15, TimeUnit.SECONDS)   // 帧间最大静默；总时长由外层超时兜底
+            .build()
+    }
 
     /** 注册上下文与系统 TTS 回退通道。 */
     fun init(context: Context, onFallback: (text: String, flush: Boolean) -> Unit) {
@@ -122,6 +132,11 @@ object EdgeTts {
             "<voice name='$voice'><prosody pitch='+0Hz' rate='+0%' volume='+0%'>$escaped</prosody></voice></speak>"
     }
 
+    private fun wssUrl(): String =
+        "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1" +
+            "?TrustedClientToken=$TRUSTED_TOKEN&Sec-MS-GEC=" + gecToken() +
+            "&Sec-MS-GEC-Version=$GEC_VERSION"
+
     private fun startSynth(item: Item) {
         val ctx = appCtx ?: run { failToSystem(item); return }
         val myGen = gen.incrementAndGet()
@@ -130,68 +145,52 @@ object EdgeTts {
         val config = "{\"context\":{\"synthesis\":{\"audio\":{\"metadataoptions\":" +
             "{\"sentenceBoundaryEnabled\":\"false\",\"wordBoundaryEnabled\":\"false\"}," +
             "\"outputFormat\":\"audio-24khz-48kbitrate-mono-mp3\"}}}}"
+        val configMsg = "X-Timestamp:" + httpDate() +
+            "\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n" + config
         val requestMsg = "X-RequestId:" + UUID.randomUUID().toString().replace("-", "") +
             "\r\nContent-Type:application/ssml+xml\r\nX-Timestamp:" + httpDate() + "Z" +
             "\r\nPath:ssml\r\n\r\n" + ssml(item.text, item.voice)
 
-        val listener = object : WebSocket.Listener {
-            // android-35 桩里 Listener.onOpen 返回 void（与 OpenJDK 的 CompletionStage 不同），按平台签名覆写
-            override fun onOpen(webSocket: WebSocket) {
-                if (stale(myGen)) { webSocket.abort(); return }
-                webSocket.sendText("X-Timestamp:" + httpDate() + "\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n$config", true)
-                webSocket.sendText(requestMsg, true)
+        val listener = object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                if (stale(myGen)) { webSocket.cancel(); return }
+                webSocket.send(configMsg)
+                webSocket.send(requestMsg)
                 armTimeout(myGen, item)
-                webSocket.request(1)
             }
 
-            override fun onText(webSocket: WebSocket, data: CharSequence, last: Boolean): CompletionStage<Void>? {
-                if (stale(myGen)) { webSocket.abort(); return null }
-                if (data.contains("Path:turn.end")) {
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                if (stale(myGen)) { webSocket.cancel(); return }
+                if (text.contains("Path:turn.end")) {
+                    disarmTimeout()
+                    webSocket.close(1000, null)
                     finishSynth(myGen, item, ctx, audio.toByteArray())
-                    webSocket.sendClose(WebSocket.NORMAL_CLOSURE, "done")
-                    return null
                 }
-                webSocket.request(1)
-                return null
             }
 
-            override fun onBinary(webSocket: WebSocket, data: ByteBuffer, last: Boolean): CompletionStage<Void>? {
-                if (stale(myGen)) { webSocket.abort(); return null }
-                val arr = ByteArray(data.remaining())
-                data.get(arr)
+            override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                if (stale(myGen)) { webSocket.cancel(); return }
+                val arr = bytes.toByteArray()
                 if (arr.size > 2) {
                     val headerLen = ((arr[0].toInt() and 0xFF) shl 8) or (arr[1].toInt() and 0xFF)
                     if (arr.size > headerLen + 2) audio.write(arr, headerLen + 2, arr.size - headerLen - 2)
                 }
-                webSocket.request(1)
-                return null
             }
 
-            override fun onError(webSocket: WebSocket, error: Throwable) {
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 if (!stale(myGen)) failToSystem(item)
             }
         }
 
         try {
-            HttpClient.newHttpClient().newWebSocketBuilder()
+            val request = Request.Builder()
+                .url(wssUrl())
                 .header("Origin", "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold")
                 .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.2849.68")
                 .header("Pragma", "no-cache")
                 .header("Cache-Control", "no-cache")
-                .header("Sec-MS-GEC", gecToken())
-                .header("Sec-MS-GEC-Version", GEC_VERSION)
-                .buildAsync(
-                    URI("wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=$TRUSTED_TOKEN"),
-                    listener
-                )
-                .whenComplete { w, err ->
-                    if (err != null || stale(myGen)) {
-                        runCatching { w?.abort() }
-                        if (!stale(myGen)) failToSystem(item)
-                    } else {
-                        ws = w
-                    }
-                }
+                .build()
+            ws = client.newWebSocket(request, listener)
         } catch (t: Throwable) {
             failToSystem(item)
         }
@@ -235,7 +234,6 @@ object EdgeTts {
         runCatching { player?.stop() }
         runCatching { player?.release() }
         player = null
-        playing = false
     }
 
     // ── 超时/代数 ────────────────────────────────────────
@@ -244,7 +242,7 @@ object EdgeTts {
 
     private fun abortCurrent() {
         gen.incrementAndGet()          // 使所有在途回调失效
-        runCatching { ws?.abort() }
+        runCatching { ws?.cancel() }   // OkHttp 取消语义
         ws = null
         disarmTimeout()
         stopPlayer()
@@ -254,7 +252,7 @@ object EdgeTts {
         disarmTimeout()
         val r = Runnable {
             if (!stale(myGen)) {
-                runCatching { ws?.abort() }
+                runCatching { ws?.cancel() }
                 failToSystem(item)
             }
         }
