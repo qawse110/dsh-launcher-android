@@ -12,8 +12,8 @@ android {
         applicationId = "com.dsh.launcher"
         minSdk = 24
         targetSdk = 28
-        versionCode = 13
-        versionName = "4.2.6"
+        versionCode = 14
+        versionName = "4.2.7"
     }
 
     buildTypes {

@@ -109,7 +109,10 @@ class BridgeOverlayManager(
     private var ttsReady = false
     private var ttsReleased = false
     private var lastSpokenKey: String? = null
-    private var lastSpokenBubble: String? = null // 最近朗读过的气泡全文（去重）
+    // 正文增量朗读游标：记录 lastText 已读到哪，流式输出每凑齐一个完整句才播报
+    @Volatile private var spokenLen = 0
+    private val sentenceEndRe = Regex("[。！？!?…；;]|\\n")
+    private val softPuncts = charArrayOf('，', ',', '、', '：', ':', ' ')
 
     private var currentStyle: String? = null
     private var lastStatus: String? = null
@@ -452,7 +455,7 @@ class BridgeOverlayManager(
                 bubble.maxWidth = minOf((context.resources.displayMetrics.widthPixels * 0.45).toInt(), dp(230))
                 bubble.text = bubbleText
                 bubble.visibility = View.VISIBLE
-                speakBubbleOnChange(bubbleText, status, event)
+                speakContentIncremental(status, event)
             } else {
                 // 无内容（或关闭气泡）时不显示空框：气泡窗口整体移除，触摸透传
                 bubble.visibility = View.GONE
@@ -475,17 +478,45 @@ class BridgeOverlayManager(
         return listOf(namePart, label, snippet).filter { it.isNotBlank() }.joinToString(" · ")
     }
 
-    /** 气泡内容变化时朗读全文（新输出/新状态）；与固定短台词互不重复，≥5s 节流防连读。 */
-    private fun speakBubbleOnChange(bubbleText: String, status: String, event: String?) {
-        if (!petTts() || bubbleText.isBlank()) return
-        if (bubbleText == lastSpokenBubble) return
-        lastSpokenBubble = bubbleText
-        if (SystemClock.uptimeMillis() - lastSpokeAt < 5000L) return
-        // 已有固定短台词的状态（完成/出错/新任务/调工具）不重复朗读全文
-        if (status == "finished" || status == "failed") return
-        if (status == "running" && (event == "tool/call" || event == "turn/start")) return
-        lastSpokeAt = SystemClock.uptimeMillis()
-        speak(bubbleText)
+    /**
+     * 正文增量朗读：只读「上次读到之后」的新增完整句——旧实现读 40 字预览，
+     * 总在半句处截断，且流式增长时反复重读近似前缀。
+     * - 句界：。！？!?…；; 换行；凑齐一句即入队（QUEUE_ADD，接续不打断前句）；
+     * - 160 字内无句界时按逗号/顿号兜底断句，硬切上限 160；
+     * - 新消息（文本变短）或 turn/start 重置游标；
+     * - 完成/失败/空闲不追加正文：状态转折有固定台词，且 FLUSH 会打断正文。
+     */
+    private fun speakContentIncremental(status: String, event: String?) {
+        if (!petTts() || ttsReleased) return
+        val text = lastText ?: return
+        if (event == "turn/start" || event == "user/message") spokenLen = 0
+        if (text.length < spokenLen) spokenLen = 0
+        if (status != "running" || event != "assistant/message") return
+        if (spokenLen >= text.length) return
+
+        var start = spokenLen
+        var advanced = false
+        while (start < text.length) {
+            val remain = text.substring(start)
+            val window = remain.substring(0, minOf(remain.length, 160))
+            val ends = sentenceEndRe.findAll(window).toList()
+            val utterance: String
+            if (ends.isNotEmpty()) {
+                val m = ends.last()
+                utterance = window.substring(0, m.range.last + 1)
+            } else if (remain.length > 160) {
+                // 积压超限仍无句界：软标点兜底断句，再不行硬切
+                val softIdx = window.lastIndexOfAny(softPuncts)
+                utterance = if (softIdx > 40) window.substring(0, softIdx + 1) else window
+            } else {
+                break // 句子尚未写完，等下一轮轮询
+            }
+            val trimmed = utterance.trim()
+            if (trimmed.isNotEmpty()) speak(trimmed, TextToSpeech.QUEUE_ADD)
+            start += utterance.length
+            advanced = true
+        }
+        if (advanced) spokenLen = start
     }
 
     /** 气泡独立悬浮窗：显示在宠物窗上方/下方（视空间而定），可点击，贴边时朝屏幕内侧对齐。 */
@@ -716,7 +747,7 @@ class BridgeOverlayManager(
      *  无中文引擎自动回退系统默认语言；失败静默）。 */
     private var pendingSpeak: String? = null
 
-    private fun speak(text: String) {
+    private fun speak(text: String, queueMode: Int = TextToSpeech.QUEUE_FLUSH) {
         if (ttsReleased || !petTts() || text.isBlank()) return
         if (tts == null) {
             pendingSpeak = text
@@ -743,7 +774,7 @@ class BridgeOverlayManager(
             return
         }
         try {
-            tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "dsh_pet")
+            tts?.speak(text, queueMode, null, "dsh_pet")
         } catch (_: Exception) {
             // TTS 不可用时静默
         }
@@ -778,7 +809,6 @@ class BridgeOverlayManager(
         petView?.stop()
         lastSpokenKey = null
         lastSpokeAt = 0L
-        lastSpokenBubble = null
         pendingRow = -1
         pendingRowCount = 0
         try {

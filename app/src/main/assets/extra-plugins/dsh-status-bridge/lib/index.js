@@ -13,7 +13,7 @@ export const name = 'dsh-status-bridge'
 const PORT = Number(process.env.DSH_STATUS_BRIDGE_PORT || 3190)
 // /status 对本机任意有 INTERNET 权限的 app 可读（loopback 无 per-app 访问控制），
 // lastText 只保留悬浮窗实际用到的长度（气泡 ≤40 字、full 模式 ≤160 字），不暴露全文
-const LAST_TEXT_CAP = 200
+const LAST_TEXT_CAP = 400 // TTS 增量整句播报需要更长上下文；仍为有界防泄露
 const cap = (s) => String(s ?? '').slice(0, LAST_TEXT_CAP)
 
 let server = null
