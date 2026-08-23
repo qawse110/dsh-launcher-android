@@ -1,6 +1,8 @@
 package com.dsh.launcher
 
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -12,9 +14,11 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.EditText
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import com.google.android.material.color.DynamicColors
 import java.io.File
@@ -32,6 +36,16 @@ class ConsoleActivity : AppCompatActivity() {
     private lateinit var output: TextView
     private lateinit var input: EditText
     private lateinit var stateView: TextView
+    private lateinit var servicePill: TextView
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val cmdHistory = ArrayDeque<String>()
+    private var histCursor = -1
+    private val servicePoll = object : Runnable {
+        override fun run() {
+            refreshServicePill()
+            mainHandler.postDelayed(this, 3_000)
+        }
+    }
     private val sb = StringBuilder()
 
     companion object {
@@ -47,6 +61,7 @@ class ConsoleActivity : AppCompatActivity() {
         setContentView(buildUi())
         appendLine("== 内置命令控制台（基于 ProcessBuilder）==")
         handleIntentExtras()
+        mainHandler.post(servicePoll)
     }
 
     /** 处理 intent extras（onCreate 与 onNewIntent 共用，支持复用 Activity 时执行新命令）。 */
@@ -82,37 +97,98 @@ class ConsoleActivity : AppCompatActivity() {
         handleIntentExtras()
     }
 
+    override fun onDestroy() {
+        super.onDestroy()
+        mainHandler.removeCallbacks(servicePoll)
+    }
+
     private fun buildUi(): View {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Ui.BG)
+            setPadding(dp(12), dp(10), dp(12), dp(8))
         }
 
+        // ---- 头部：标题 + 执行状态 pill + dsh 服务 pill（3s 轮询）----
         val headerCard = Ui.card(this, radiusDp = 14, background = Ui.SURFACE_CONTAINER_HIGH, elevationDp = 1f)
         val headerRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
         headerRow.addView(TextView(this).apply {
-            text = "内置命令控制台"
+            text = "命令控制台"
             textSize = 15f
             typeface = android.graphics.Typeface.DEFAULT_BOLD
             setTextColor(Ui.TEXT_PRIMARY)
         }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
 
         stateView = TextView(this).apply {
-            text = "状态：空闲"
-            textSize = 12f
+            text = "空闲"
+            textSize = 11.5f
             setTextColor(Ui.TEXT_SECONDARY)
         }
-        headerRow.addView(stateView)
-        headerCard.addView(headerRow)
+        headerRow.addView(stateView, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { rightMargin = dp(8) })
 
+        servicePill = Ui.pill(this, "○ 检测中", Ui.TEXT_MUTED)
+        headerRow.addView(servicePill)
+
+        headerCard.addView(headerRow)
         root.addView(headerCard, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT
         ))
 
+        // ---- 快捷指令：一键直发，输出进下方控制台 ----
+        val chips = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+        }
+        val chipRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(2), dp(6), dp(2), dp(2))
+        }
+        fun chip(label: String, onClick: () -> Unit) {
+            chipRow.addView(Ui.button(this, label, onClick, filled = false, compact = true).apply {
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { rightMargin = dp(6); minWidth = dp(0) }
+            })
+        }
+        fun stopDsh() {
+            appendLine(">> 停止 dsh 相关进程…")
+            thread {
+                DshFlow.killAllNode(this) { l -> runOnUiThread { appendLine(l) } }
+                BuildKeepAliveService.markStopped(this)
+                runOnUiThread { appendLine("✓ 已停止。可用「启动 dsh」重新拉起") }
+            }
+        }
+        chip("▶ 启动 dsh") { runDshFlow(startOnly = true) }
+        chip("↻ 重启服务") {
+            appendLine(">> 重启 dsh 服务…")
+            thread {
+                DshFlow.killAllNode(this) { l -> runOnUiThread { appendLine(l) } }
+                Thread.sleep(1200)
+                runOnUiThread { runDshFlow(startOnly = true) }
+            }
+        }
+        chip("■ 停止 dsh") { stopDsh() }
+        chip("● 服务状态") {
+            thread {
+                val up = runCatching { DshFlow.isWebUp() }.getOrDefault(false)
+                runOnUiThread {
+                    appendLine("dsh web：" + if (up) "运行中（http://127.0.0.1:3080）" else "未运行")
+                    setState(if (up) "运行中" else "已停止")
+                }
+            }
+        }
+        chip("node -v") { runNodeCmd() }
+        chips.addView(chipRow)
+        root.addView(chips, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ))
+
+        // ---- 输出区 ----
         output = TextView(this).apply {
             setTextColor(0xFFE0E0E0.toInt())
             textSize = 13f
@@ -130,22 +206,31 @@ class ConsoleActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
         ).apply { topMargin = dp(4) })
 
+        // ---- 输入行：输入框(weight) + ↑历史 + 执行 ----
+        val inputRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
         input = EditText(this).apply {
             hint = "输入命令，回车执行"
+            textSize = 14f
             setTextColor(Ui.TEXT_PRIMARY)
             setHintTextColor(Ui.TEXT_MUTED)
             background = Ui.rounded(this@ConsoleActivity, Ui.SURFACE_INPUT, 12, Ui.OUTLINE)
             setPadding(dp(14), dp(10), dp(14), dp(10))
-            setOnEditorActionListener { _, _, _ ->
-                execInput()
-                true
-            }
+            maxLines = 1
+            inputType = android.text.InputType.TYPE_CLASS_TEXT
         }
-        root.addView(input, LinearLayout.LayoutParams(
+        inputRow.addView(input, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = dp(6) })
+        inputRow.addView(Ui.button(this, "↑", { historyPrev() }, filled = false, compact = true), LinearLayout.LayoutParams(dp(44), ViewGroup.LayoutParams.WRAP_CONTENT).apply { rightMargin = dp(6) })
+        inputRow.addView(Ui.button(this, "↓", { historyNext() }, filled = false, compact = true), LinearLayout.LayoutParams(dp(44), ViewGroup.LayoutParams.WRAP_CONTENT).apply { rightMargin = dp(6) })
+        inputRow.addView(Ui.button(this, "执行", { execInput() }, filled = true, compact = true), LinearLayout.LayoutParams(dp(72), ViewGroup.LayoutParams.WRAP_CONTENT))
+        root.addView(inputRow, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = dp(6) })
 
+        // ---- 工具行 ----
         fun rowOf(vararg buttons: View): LinearLayout = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             buttons.forEachIndexed { index, button ->
@@ -162,7 +247,6 @@ class ConsoleActivity : AppCompatActivity() {
                     appendLine(">> 准备内置 Termux 环境（首次约 10~60 秒）…")
                     try {
                         TermuxRuntime.ensureExtracted(this@ConsoleActivity) { msg -> appendLine(msg) }
-                        appendLine(">> Termux 环境已就绪，检查 Harness 工具…")
                         TermuxRuntime.ensureHarnessTools(this@ConsoleActivity) { msg -> appendLine(msg) }
                         appendLine(">> 打开终端…")
                     } catch (t: Throwable) {
@@ -177,20 +261,19 @@ class ConsoleActivity : AppCompatActivity() {
                 }
             }
         }, filled = false)
-        val runBtn = Ui.button(this, "执行", { execInput() }, filled = true)
-        val pluginBtn = Ui.button(this, "插件", {
+        val pluginBtn = Ui.button(this, "插件管理", {
             startActivity(Intent(this@ConsoleActivity, PluginManagerActivity::class.java))
         }, filled = false)
-        val updateBtn = Ui.button(this, "更新", { startUpdateCheck(true) }, filled = false)
+        val updateBtn = Ui.button(this, "检查更新", { startUpdateCheck(true) }, filled = false)
         val updateNextBtn = Ui.button(this, "更新 next", { startUpdateCheckNext(true) }, filled = false)
         val clearBtn = Ui.button(this, "清空", { sb.clear(); output.text = "" }, filled = false)
         val closeBtn = Ui.button(this, "退出", { finish() }, filled = false, color = Ui.DANGER)
 
-        root.addView(rowOf(nodeBtn, termBtn, runBtn, pluginBtn), LinearLayout.LayoutParams(
+        root.addView(rowOf(nodeBtn, termBtn, pluginBtn, updateBtn), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = dp(6) })
-        root.addView(rowOf(updateBtn, updateNextBtn, clearBtn, closeBtn), LinearLayout.LayoutParams(
+        root.addView(rowOf(updateNextBtn, clearBtn, closeBtn), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = dp(6) })
@@ -198,10 +281,46 @@ class ConsoleActivity : AppCompatActivity() {
         return root
     }
 
+    private fun refreshServicePill() {
+        thread {
+            val up = runCatching { DshFlow.isWebUp() }.getOrDefault(false)
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                servicePill.text = if (up) "● dsh 运行中" else "○ dsh 已停止"
+                servicePill.setTextColor(if (up) Ui.SUCCESS else Ui.TEXT_MUTED)
+                servicePill.background = Ui.rounded(this, Ui.withAlpha(if (up) Ui.SUCCESS else Ui.TEXT_MUTED, 0x1A), 8, if (up) Ui.SUCCESS else Ui.TEXT_MUTED, 1)
+            }
+        }
+    }
+
+    private fun historyPrev() {
+        if (cmdHistory.isEmpty()) return
+        histCursor = if (histCursor == -1) cmdHistory.lastIndex else (histCursor - 1).coerceAtLeast(0)
+        input.setText(cmdHistory[histCursor])
+        input.setSelection(input.text.length)
+    }
+
+    private fun historyNext() {
+        if (histCursor == -1) return
+        histCursor++
+        if (histCursor >= cmdHistory.size) {
+            histCursor = -1
+            input.setText("")
+            return
+        }
+        input.setText(cmdHistory[histCursor])
+        input.setSelection(input.text.length)
+    }
+
     private fun execInput() {
         val cmd = input.text.toString().trim()
         if (cmd.isNotEmpty()) {
             appendLine("$ $cmd")
+            if (cmdHistory.lastOrNull() != cmd) {
+                cmdHistory.addLast(cmd)
+                if (cmdHistory.size > 50) cmdHistory.removeFirst()
+            }
+            histCursor = -1
             input.setText("")
             runCommand(cmd)
         }
