@@ -18,6 +18,7 @@ import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.CompletionStage
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Edge TTS —— 参考 rany2/edge-tts 的微软 Edge「大声朗读」接口实现：
@@ -44,6 +45,7 @@ object EdgeTts {
     private var fallback: ((text: String, flush: Boolean) -> Unit)? = null
     private val main = Handler(Looper.getMainLooper())
     private val gen = AtomicInteger(0)
+    private val busy = AtomicBoolean(false)
     private var ws: WebSocket? = null
     private var player: MediaPlayer? = null
     private var playing = false
@@ -133,7 +135,7 @@ object EdgeTts {
             "\r\nPath:ssml\r\n\r\n" + ssml(item.text, item.voice)
 
         val listener = object : WebSocket.Listener {
-            override fun onOpen(webSocket: WebSocket): CompletionStage<*>? {
+            override fun onOpen(webSocket: WebSocket): CompletionStage<Void>? {
                 if (stale(myGen)) { webSocket.abort(); return null }
                 webSocket.sendText("X-Timestamp:" + httpDate() + "\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n$config", true)
                 webSocket.sendText(requestMsg, true)
@@ -142,7 +144,7 @@ object EdgeTts {
                 return null
             }
 
-            override fun onText(webSocket: WebSocket, data: CharSequence, last: Boolean): CompletionStage<*>? {
+            override fun onText(webSocket: WebSocket, data: CharSequence, last: Boolean): CompletionStage<Void>? {
                 if (stale(myGen)) { webSocket.abort(); return null }
                 if (data.contains("Path:turn.end")) {
                     finishSynth(myGen, item, ctx, audio.toByteArray())
@@ -153,7 +155,7 @@ object EdgeTts {
                 return null
             }
 
-            override fun onBinary(webSocket: WebSocket, data: ByteBuffer, last: Boolean): CompletionStage<*>? {
+            override fun onBinary(webSocket: WebSocket, data: ByteBuffer, last: Boolean): CompletionStage<Void>? {
                 if (stale(myGen)) { webSocket.abort(); return null }
                 val arr = ByteArray(data.remaining())
                 data.get(arr)
@@ -171,7 +173,7 @@ object EdgeTts {
         }
 
         try {
-            ws = HttpClient.newHttpClient().newWebSocketBuilder()
+            HttpClient.newHttpClient().newWebSocketBuilder()
                 .header("Origin", "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold")
                 .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.2849.68")
                 .header("Pragma", "no-cache")
@@ -182,6 +184,14 @@ object EdgeTts {
                     URI("wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=$TRUSTED_TOKEN"),
                     listener
                 )
+                .whenComplete { w, err ->
+                    if (err != null || stale(myGen)) {
+                        runCatching { w?.abort() }
+                        if (!stale(myGen)) failToSystem(item)
+                    } else {
+                        ws = w
+                    }
+                }
         } catch (t: Throwable) {
             failToSystem(item)
         }
