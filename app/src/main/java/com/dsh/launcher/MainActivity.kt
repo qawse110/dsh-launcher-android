@@ -441,13 +441,13 @@ class MainActivity : AppCompatActivity() {
         ucCol.addView(LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            addView(TextView(this).apply {
+            addView(TextView(this@MainActivity).apply {
                 text = "📦 DSH 核心"
                 textSize = 13f
                 typeface = android.graphics.Typeface.DEFAULT_BOLD
                 setTextColor(Ui.TEXT_SECONDARY)
             }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(TextView(this).apply {
+            addView(TextView(this@MainActivity).apply {
                 text = "v" + DshUpdater.currentVersion(this@MainActivity)
                 textSize = 11f
                 setTextColor(Ui.TEXT_MUTED)
