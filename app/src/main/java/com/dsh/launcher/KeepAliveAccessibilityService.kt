@@ -34,7 +34,7 @@ class KeepAliveAccessibilityService : AccessibilityService() {
     private var polling = false
     private var pollThread: Thread? = null
     private val mainHandler = Handler(Looper.getMainLooper())
-    private var lastStatus: String? = null
+    @Volatile private var lastStatus: String? = null
     private var lastFinishedAt = 0L
 
     override fun onServiceConnected() {
@@ -88,7 +88,8 @@ class KeepAliveAccessibilityService : AccessibilityService() {
                     // dsh 进程不可达：watchdog 自动拉起（60s 冷却，双路幂等）
                     DshWatchdog.maybeRevive(this)
                     try {
-                        Thread.sleep(1000L)
+                        // 功耗档位同 PollPolicy（亮屏 1s / 灭屏+任务 5s / 灭屏+空闲 20s）
+                        Thread.sleep(PollPolicy.intervalMs(this, lastStatus))
                     } catch (e: InterruptedException) {
                         break
                     }
@@ -104,7 +105,7 @@ class KeepAliveAccessibilityService : AccessibilityService() {
                     if (finished) StatusBridgeAlerts.onAiFinished(this, data.text)
                 }
                 try {
-                    Thread.sleep(1000L)
+                    Thread.sleep(PollPolicy.intervalMs(this, lastStatus))
                 } catch (e: InterruptedException) {
                     break
                 }

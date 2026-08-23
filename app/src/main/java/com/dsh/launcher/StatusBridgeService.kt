@@ -33,6 +33,7 @@ class StatusBridgeService : Service() {
 
     private val running = AtomicBoolean(true)
     private var thread: Thread? = null
+    @Volatile private var lastStatus: String? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private var overlayManager: BridgeOverlayManager? = null
     private var lastStatus: String? = null
@@ -119,7 +120,8 @@ class StatusBridgeService : Service() {
             } catch (t: Throwable) {
                 // ignore transient polling errors
             }
-            try { Thread.sleep(1000L) } catch (e: InterruptedException) { break }
+            // 功耗档位：亮屏 1s / 灭屏+任务 5s / 灭屏+空闲 20s（见 PollPolicy）
+            try { Thread.sleep(PollPolicy.intervalMs(this, lastStatus)) } catch (e: InterruptedException) { break }
         }
     }
 
@@ -184,7 +186,13 @@ class StatusBridgeService : Service() {
             .build()
     }
 
+    private var lastNotifiedKey: String? = null
+
     private fun updateForeground(status: String, text: String) {
+        // 内容没变就不 notify()：旧实现每秒刷一次前台通知，白白消耗系统调度与电量
+        val key = status + "|" + text.take(40)
+        if (key == lastNotifiedKey) return
+        lastNotifiedKey = key
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         nm.notify(NOTIFICATION_ID, buildForegroundNotification(statusLabel(status)))
     }
@@ -256,10 +264,12 @@ class StatusBridgeService : Service() {
                     PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
                 )
                 // setInexactRepeating 的 30s 周期会被系统钳到 ~15 分钟（实机验证：服务死后
-                // 18 分钟仍未自愈）。改为一次性精确闹钟，由 BridgeWatchdogReceiver 自续链条；
-                // Doze 深度休眠下系统仍可能把 allowWhileIdle 合并到 ≥9 分钟一次，属系统约束。
+                // 18 分钟仍未自愈）。改为一次性精确闹钟，由 BridgeWatchdogReceiver 自续链条。
+                // 功耗关键：用非唤醒型 ELAPSED_REALTIME——灭屏待机不再每 30s 把设备从深睡
+                // 揍醒（旧 WAKEUP 版是待机掉电大头）；灭屏期间悬浮窗本就不显示，
+                // 待用户亮屏的瞬间积压闹钟立即触发补拉，体验无损。
                 am.setExactAndAllowWhileIdle(
-                    AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                    AlarmManager.ELAPSED_REALTIME,
                     SystemClock.elapsedRealtime() + 30_000L,
                     pi
                 )
