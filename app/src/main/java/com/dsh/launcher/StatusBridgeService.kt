@@ -33,10 +33,9 @@ class StatusBridgeService : Service() {
 
     private val running = AtomicBoolean(true)
     private var thread: Thread? = null
-    @Volatile private var lastStatus: String? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private var overlayManager: BridgeOverlayManager? = null
-    private var lastStatus: String? = null
+    @Volatile private var lastStatus: String? = null
     private var lastFinishedAt = 0L
 
     override fun onBind(intent: Intent?): IBinder? = null
