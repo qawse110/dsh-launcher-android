@@ -38,6 +38,9 @@ class StatusBridgeService : Service() {
     @Volatile private var lastStatus: String? = null
     private var lastFinishedAt = 0L
 
+    private var wakeLock: android.os.PowerManager.WakeLock? = null
+    private var wakeHeld = false
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
@@ -67,6 +70,7 @@ class StatusBridgeService : Service() {
 
     override fun onDestroy() {
         running.set(false)
+        syncWakeLock(false)
         thread?.interrupt()
         mainHandler.post { overlayManager?.remove() }
         overlayManager?.release()
@@ -90,6 +94,10 @@ class StatusBridgeService : Service() {
 
     private fun pollLoop() {
         while (running.get()) {
+            // 自适应策略：屏幕/任务态喂给治理器，按档位取间隔；任务后台运行时持 PARTIAL 锁
+            PowerGovernor.refreshScreenState(this)
+            PowerGovernor.setTaskStatus(lastStatus)
+            syncWakeLock(PowerGovernor.wantWakeLock())
             try {
                 val json = fetchStatus()
                 if (json != null) {
@@ -119,8 +127,7 @@ class StatusBridgeService : Service() {
             } catch (t: Throwable) {
                 // ignore transient polling errors
             }
-            // 功耗档位：亮屏 1s / 灭屏+任务 5s / 灭屏+空闲 20s（见 PollPolicy）
-            try { Thread.sleep(PollPolicy.intervalMs(this, lastStatus)) } catch (e: InterruptedException) { break }
+            try { Thread.sleep(PowerGovernor.intervalMs()) } catch (e: InterruptedException) { break }
         }
     }
 
@@ -145,6 +152,29 @@ class StatusBridgeService : Service() {
         // 布尔标志会陈旧残留（跨重启持久化），普通通道因此永久让位 → 双通道全灭
         System.currentTimeMillis() - prefs().getLong(KeepAliveAccessibilityService.A11Y_TS_KEY, 0L) <
             KeepAliveAccessibilityService.A11Y_FRESH_MS
+
+    /** 任务后台运行期间持有 PARTIAL 唤醒锁（防 CPU 休眠打断生成）；其余场景立即释放。 */
+    private fun syncWakeLock(needed: Boolean) {
+        if (needed == wakeHeld) return
+        try {
+            val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+            if (needed) {
+                wakeLock = pm.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "dsh:task-running").apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+                wakeHeld = true
+                AppLog.i("PowerGov", "wake lock acquired (task running, screen off)")
+            } else {
+                runCatching { wakeLock?.release() }
+                wakeLock = null
+                wakeHeld = false
+            }
+        } catch (t: Throwable) {
+            AppLog.e("PowerGov", "wake lock sync failed: " + (t.message ?: t.toString()))
+            wakeHeld = false
+        }
+    }
 
     // ---------------- 悬浮窗 ----------------
 
@@ -267,8 +297,10 @@ class StatusBridgeService : Service() {
                 // 功耗关键：用非唤醒型 ELAPSED_REALTIME——灭屏待机不再每 30s 把设备从深睡
                 // 揍醒（旧 WAKEUP 版是待机掉电大头）；灭屏期间悬浮窗本就不显示，
                 // 待用户亮屏的瞬间积压闹钟立即触发补拉，体验无损。
+                val type = if (PowerGovernor.wantWakeupAlarm()) AlarmManager.ELAPSED_REALTIME_WAKEUP
+                           else AlarmManager.ELAPSED_REALTIME
                 am.setExactAndAllowWhileIdle(
-                    AlarmManager.ELAPSED_REALTIME,
+                    type,
                     SystemClock.elapsedRealtime() + 30_000L,
                     pi
                 )

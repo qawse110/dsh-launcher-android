@@ -84,6 +84,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(buildUi())
         requestStoragePermissions()
         maybePromptOverlayPermission()
+        maybePromptBatteryOptimization()
         syncAssetsOnApkUpdate()
         // 悬浮窗自动恢复：app 关闭后再打开，只要「悬浮窗显示」开关还开着就自动拉起
         // 状态桥接服务（服务已运行时幂等；无障碍通道由系统自动连接，无需此处处理）
@@ -546,6 +547,20 @@ class MainActivity : AppCompatActivity() {
 
     private fun openAccessibilitySettings() {
         runCatching { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+    }
+
+    /** 一次性引导「忽略电池优化」：ColorOS 等会在灭屏后冻结未白名单进程，
+     *  任务运行中被打断的最常见原因。已白名单则静默跳过。 */
+    private fun maybePromptBatteryOptimization() {
+        val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+        if (pm.isIgnoringBatteryOptimizations(packageName)) return
+        val prefs = getSharedPreferences("dsh_ui", MODE_PRIVATE)
+        if (prefs.getBoolean("batt_opt_prompted", false)) return
+        prefs.edit().putBoolean("batt_opt_prompted", true).apply()
+        appendMiniLog("建议授予「忽略电池优化」，防止息屏后任务被系统打断")
+        runCatching {
+            startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
+        }
     }
 
     private fun appendMiniLog(line: String) {

@@ -81,15 +81,17 @@ class KeepAliveAccessibilityService : AccessibilityService() {
         polling = true
         pollThread = thread {
             while (polling) {
-                // 存活心跳：普通通道据此判断无障碍通道是否真的活着（5 秒窗口）
+                // 自适应档位 + 心跳时间戳（普通通道据此判断本通道是否活着）
+                PowerGovernor.refreshScreenState(this)
+                PowerGovernor.setTaskStatus(lastStatus)
                 prefs().edit().putLong(A11Y_TS_KEY, System.currentTimeMillis()).apply()
                 val data = fetchStatus()
                 if (data == null) {
                     // dsh 进程不可达：watchdog 自动拉起（60s 冷却，双路幂等）
                     DshWatchdog.maybeRevive(this)
                     try {
-                        // 功耗档位同 PollPolicy（亮屏 1s / 灭屏+任务 5s / 灭屏+空闲 20s）
-                        Thread.sleep(PollPolicy.intervalMs(this, lastStatus))
+                        // 功耗档位见 PowerGovernor（亮屏 1s / 灭屏+任务 3s / 灭屏空闲分档放宽）
+                        Thread.sleep(PowerGovernor.intervalMs())
                     } catch (e: InterruptedException) {
                         break
                     }
@@ -105,7 +107,7 @@ class KeepAliveAccessibilityService : AccessibilityService() {
                     if (finished) StatusBridgeAlerts.onAiFinished(this, data.text)
                 }
                 try {
-                    Thread.sleep(PollPolicy.intervalMs(this, lastStatus))
+                    Thread.sleep(PowerGovernor.intervalMs())
                 } catch (e: InterruptedException) {
                     break
                 }
