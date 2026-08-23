@@ -17,29 +17,37 @@ import java.text.SimpleDateFormat
 import java.util.ArrayDeque
 import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Edge TTS —— 参考 rany2/edge-tts 的微软 Edge「大声朗读」接口实现：
- * wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1
- * 经 WebSocket 提交 SSML，回收 audio-24khz-48kbitrate-mono-mp3 音频帧。
+ * Edge TTS —— 严格对齐 rany2/edge-tts 上游实现（v7.x）：
  *
- * - WebSocket 用 OkHttp：Android 平台从未移植 OpenJDK 的 java.net.http
- *   （android.jar 编译桩有、真机运行时没有，曾导致 NoClassDefFoundError 闪退），
- *   OkHttp 全 API 版本可用；
- * - 防滥用令牌 Sec-MS-GEC：Windows 文件时间按 5 分钟取整后拼接 TrustedClientToken
- *   再 SHA-256 大写（与 rany2 v6.x 的 DRM 校验一致，缺了会被 403）；
- * - 单飞流水线：合成 → MediaPlayer 播放 → 完成后才取下一条；flush 清队并打断当前；
- * - 合成/播放失败回调 fallback（管理器回退系统 TTS），播报永不哑火；
- * - 临时 MP3 落在 cacheDir，播完即删。
+ * - WebSocket：OkHttp（Android 平台没有 OpenJDK java.net.http，桩有真机无）；
+ * - Sec-MS-GEC：unix_ts + WIN_EPOCH 后按 300s 取整 ×1e7 拼 TrustedClientToken，
+ *   SHA256 大写；403 时读响应 Date 头自动校正本机时钟偏移后即可恢复；
+ * - URL：base?TrustedClientToken&ConnectionId&Sec-MS-GEC&Sec-MS-GEC-Version；
+ * - 必要头：Origin(扩展 id)/UA(Chromium 主版本)/Pragma/Cache-Control/Accept-Language/
+ *   Cookie:muid=<随机 32 位大写 hex>；speech.config 消息尾部带 "\r\n"；
+ * - SSML 前剥离服务不兼容的控制字符并做 XML 转义；
+ * - 单飞流水线 + flush 打断 + 失败回退系统 TTS（原因写入 dsh.log）。
  */
 object EdgeTts {
 
     private const val TRUSTED_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4"
-    private const val GEC_VERSION = "1-130.0.2849.68"
+
+    /** 与 rany2/edge-tts constants.py 同步的 Edge/Chromium 版本（过期会被 403）。 */
+    private const val CHROMIUM_FULL_VERSION = "143.0.3650.75"
+    private const val CHROMIUM_MAJOR = "143"
+    private const val SEC_MS_GEC_VERSION = "1-$CHROMIUM_FULL_VERSION"
+    private const val USER_AGENT =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) " +
+            "Chrome/$CHROMIUM_MAJOR.0.0.0 Safari/537.36 Edg/$CHROMIUM_MAJOR.0.0.0"
+
+    private const val WIN_EPOCH = 11_644_473_600L
     private const val TIMEOUT_MS = 12_000L
 
     private class Item(val text: String, val voice: String, val flush: Boolean)
@@ -54,20 +62,21 @@ object EdgeTts {
     private var player: MediaPlayer? = null
     private var timeoutRunnable: Runnable? = null
 
+    /** 时钟偏移（秒）：403 时依据响应 Date 头自动校正。 */
+    @Volatile private var clockSkewSec = 0L
+
     private val client: OkHttpClient by lazy {
         OkHttpClient.Builder()
             .connectTimeout(10, TimeUnit.SECONDS)
-            .readTimeout(15, TimeUnit.SECONDS)   // 帧间最大静默；总时长由外层超时兜底
+            .readTimeout(15, TimeUnit.SECONDS)
             .build()
     }
 
-    /** 注册上下文与系统 TTS 回退通道。 */
     fun init(context: Context, onFallback: (text: String, flush: Boolean) -> Unit) {
         appCtx = context.applicationContext
         fallback = onFallback
     }
 
-    /** 提交一条播报。flush=true：清空队列并打断当前播放/合成，本条插队最前。 */
     fun enqueue(text: String, voice: String, flush: Boolean) {
         if (text.isBlank()) return
         synchronized(queue) {
@@ -80,7 +89,6 @@ object EdgeTts {
         pump()
     }
 
-    /** 全部停止并清空（管理器 release 时调用）。 */
     fun shutdown() {
         synchronized(queue) { queue.clear(); abortCurrent() }
         main.post { stopPlayer() }
@@ -103,50 +111,83 @@ object EdgeTts {
         pump()
     }
 
-    private fun failToSystem(item: Item) {
+    private fun failToSystem(item: Item, reason: String) {
+        AppLog.e("EdgeTts", "synth failed ($reason): " + item.text.take(40))
         busy.set(false)
         fallback?.invoke(item.text, item.flush)
         pump()
     }
 
-    // ── WebSocket 合成 ────────────────────────────────────
+    // ── DRM：Sec-MS-GEC 与时钟偏移 ────────────────────────
 
     private fun gecToken(): String {
-        // Windows 文件时间（100ns）；rany2/edge-tts：对齐到 300s 边界再拼 token 取 SHA256 大写
-        var ticks = System.currentTimeMillis() / 1000L + 11_644_473_600L
-        ticks -= ticks % 300L
-        ticks *= 10_000_000L
+        var ticks = System.currentTimeMillis() / 1000L + clockSkewSec + WIN_EPOCH
+        ticks -= ticks % 300L                       // 向下取整到最近 5 分钟
+        ticks *= 10_000_000L                        // 转 Windows 文件时间（100ns）
         val digest = MessageDigest.getInstance("SHA-256")
             .digest((ticks.toString() + TRUSTED_TOKEN).toByteArray())
         return digest.joinToString("") { "%02X".format(it) }
     }
 
+    /** 403 时用服务器 Date 头校正本地时钟偏移（上游 handle_client_response_error 等价物）。 */
+    private fun adjustSkewFrom(response: Response?) {
+        val dateHeader = response?.header("Date") ?: return
+        runCatching {
+            val fmt = SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss 'GMT'", Locale.US)
+            fmt.timeZone = TimeZone.getTimeZone("UTC")
+            val serverMs = fmt.parse(dateHeader)?.time ?: return
+            val deltaSec = (serverMs - System.currentTimeMillis()) / 1000L
+            if (Math.abs(deltaSec) > 60L) {
+                clockSkewSec += deltaSec
+                AppLog.i("EdgeTts", "clock skew adjusted +" + deltaSec + "s")
+            }
+        }
+    }
+
+    // ── 消息构造 ──────────────────────────────────────────
+
     private fun httpDate(): String =
         SimpleDateFormat("EEE MMM dd yyyy HH:mm:ss 'GMT+0000 (Coordinated Universal Time)'", Locale.US)
             .format(Date())
 
-    private fun ssml(text: String, voice: String): String {
-        val escaped = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            .replace("\"", "&quot;").replace("'", "&apos;")
-        return "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='zh-CN'>" +
-            "<voice name='$voice'><prosody pitch='+0Hz' rate='+0%' volume='+0%'>$escaped</prosody></voice></speak>"
+    /** 服务不支持的控制字符（含垂直制表符）必须剔除，否则接口报错。 */
+    private fun sanitize(text: String): String = buildString {
+        for (ch in text) {
+            val c = ch.code
+            if (c <= 8 || c == 11 || c == 12 || c in 14..31) continue
+            append(ch)
+        }
     }
 
-    private fun wssUrl(): String =
+    private fun ssml(rawText: String, voice: String): String {
+        val escaped = sanitize(rawText)
+            .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace("\"", "&quot;").replace("'", "&apos;")
+        // xml:lang 固定 en-US 为上游行为，中文音色不受影响
+        return "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>" +
+            "<voice name='$voice'>" +
+            "<prosody pitch='+0Hz' rate='+0%' volume='+0%'>$escaped</prosody></voice></speak>"
+    }
+
+    private fun wssUrl(connectionId: String): String =
         "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1" +
-            "?TrustedClientToken=$TRUSTED_TOKEN&Sec-MS-GEC=" + gecToken() +
-            "&Sec-MS-GEC-Version=$GEC_VERSION"
+            "?TrustedClientToken=$TRUSTED_TOKEN" +
+            "&ConnectionId=$connectionId" +
+            "&Sec-MS-GEC=" + gecToken() +
+            "&Sec-MS-GEC-Version=$SEC_MS_GEC_VERSION"
+
+    // ── 合成 ─────────────────────────────────────────────
 
     private fun startSynth(item: Item) {
-        val ctx = appCtx ?: run { failToSystem(item); return }
+        val ctx = appCtx ?: run { failToSystem(item, "no context"); return }
         val myGen = gen.incrementAndGet()
         val audio = ByteArrayOutputStream()
 
-        val config = "{\"context\":{\"synthesis\":{\"audio\":{\"metadataoptions\":" +
-            "{\"sentenceBoundaryEnabled\":\"false\",\"wordBoundaryEnabled\":\"false\"}," +
-            "\"outputFormat\":\"audio-24khz-48kbitrate-mono-mp3\"}}}}"
         val configMsg = "X-Timestamp:" + httpDate() +
-            "\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n" + config
+            "\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n" +
+            "{\"context\":{\"synthesis\":{\"audio\":{\"metadataoptions\":" +
+            "{\"sentenceBoundaryEnabled\":\"false\",\"wordBoundaryEnabled\":\"false\"}," +
+            "\"outputFormat\":\"audio-24khz-48kbitrate-mono-mp3\"}}}}\r\n"
         val requestMsg = "X-RequestId:" + UUID.randomUUID().toString().replace("-", "") +
             "\r\nContent-Type:application/ssml+xml\r\nX-Timestamp:" + httpDate() + "Z" +
             "\r\nPath:ssml\r\n\r\n" + ssml(item.text, item.voice)
@@ -178,30 +219,40 @@ object EdgeTts {
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                if (!stale(myGen)) failToSystem(item)
+                if (stale(myGen)) return
+                if (response != null && response.code == 403) {
+                    adjustSkewFrom(response)
+                }
+                val reason = t.message ?: response?.code?.toString() ?: "unknown"
+                failToSystem(item, "ws failure: $reason")
             }
         }
 
         try {
             val request = Request.Builder()
-                .url(wssUrl())
+                .url(wssUrl(UUID.randomUUID().toString()))
                 .header("Origin", "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold")
-                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.2849.68")
+                .header("User-Agent", USER_AGENT)
+                .header("Accept-Language", "en-US,en;q=0.9")
                 .header("Pragma", "no-cache")
                 .header("Cache-Control", "no-cache")
+                .header("Cookie", "muid=" + randHex32() + ";")
                 .build()
             ws = client.newWebSocket(request, listener)
         } catch (t: Throwable) {
-            failToSystem(item)
+            failToSystem(item, "connect: " + t.message)
         }
     }
 
+    private fun randHex32(): String =
+        buildString { repeat(16) { append("%02X".format((Math.random() * 256).toInt())) } }
+
     private fun finishSynth(myGen: Int, item: Item, ctx: Context, audioBytes: ByteArray) {
         disarmTimeout()
-        if (audioBytes.isEmpty()) { failToSystem(item); return }
+        if (audioBytes.isEmpty()) { failToSystem(item, "empty audio"); return }
         val out = File(ctx.cacheDir, "edge_tts_$myGen.mp3")
         runCatching { out.writeBytes(audioBytes) }
-            .onFailure { failToSystem(item); return }
+            .onFailure { failToSystem(item, "cache write: " + it.message); return }
         play(ctx, out, myGen, item)
     }
 
@@ -218,14 +269,14 @@ object EdgeTts {
                     it.release(); player = null; file.delete(); finishItem(item)
                 }
                 mp.setOnErrorListener { _, _, _ ->
-                    file.delete(); failToSystem(item); true
+                    file.delete(); failToSystem(item, "playback error"); true
                 }
                 mp.prepare()
                 mp.start()
                 player = mp
             } catch (t: Throwable) {
                 file.delete()
-                failToSystem(item)
+                failToSystem(item, "player prepare: " + t.message)
             }
         }
     }
@@ -241,8 +292,8 @@ object EdgeTts {
     private fun stale(myGen: Int): Boolean = gen.get() != myGen
 
     private fun abortCurrent() {
-        gen.incrementAndGet()          // 使所有在途回调失效
-        runCatching { ws?.cancel() }   // OkHttp 取消语义
+        gen.incrementAndGet()
+        runCatching { ws?.cancel() }
         ws = null
         disarmTimeout()
         stopPlayer()
@@ -253,7 +304,7 @@ object EdgeTts {
         val r = Runnable {
             if (!stale(myGen)) {
                 runCatching { ws?.cancel() }
-                failToSystem(item)
+                failToSystem(item, "timeout")
             }
         }
         timeoutRunnable = r
