@@ -135,13 +135,13 @@ object EdgeTts {
             "\r\nPath:ssml\r\n\r\n" + ssml(item.text, item.voice)
 
         val listener = object : WebSocket.Listener {
-            override fun onOpen(webSocket: WebSocket): CompletionStage<Void>? {
+            // android-35 桩里 Listener.onOpen 返回 void（与 OpenJDK 的 CompletionStage 不同），按平台签名覆写
+            override fun onOpen(webSocket: WebSocket) {
                 if (stale(myGen)) { webSocket.abort(); return null }
                 webSocket.sendText("X-Timestamp:" + httpDate() + "\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n$config", true)
                 webSocket.sendText(requestMsg, true)
                 armTimeout(myGen, item)
                 webSocket.request(1)
-                return null
             }
 
             override fun onText(webSocket: WebSocket, data: CharSequence, last: Boolean): CompletionStage<Void>? {
