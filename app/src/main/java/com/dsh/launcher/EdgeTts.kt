@@ -297,6 +297,9 @@ object EdgeTts {
         ws = null
         disarmTimeout()
         stopPlayer()
+        // 关键：被打断的旧任务不会再走 finish/fail 回调，必须在这里释放流水线，
+        // 否则 busy 永远卡在 true，后续所有 enqueue 都被静默丢弃（换音色即触发）
+        busy.set(false)
     }
 
     private fun armTimeout(myGen: Int, item: Item) {

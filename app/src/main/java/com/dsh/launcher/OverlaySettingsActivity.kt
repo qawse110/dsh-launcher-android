@@ -248,9 +248,8 @@ class OverlaySettingsActivity : AppCompatActivity() {
             )
             val voices = linkedMapOf(
                 "zh-CN-XiaoxiaoNeural" to "晓晓 · 女声自然",
+                "en-US-EmmaMultilingualNeural" to "艾玛 · 中英双语",
                 "zh-CN-XiaoyiNeural" to "晓伊 · 女声活泼",
-                "zh-CN-XiaohanNeural" to "晓涵 · 女声温暖",
-                "zh-CN-XiaomoNeural" to "晓墨 · 女声成熟",
                 "zh-CN-YunxiNeural" to "云希 · 男声年轻",
                 "zh-CN-YunjianNeural" to "云健 · 男声运动",
                 "zh-CN-YunyangNeural" to "云扬 · 男声新闻",
