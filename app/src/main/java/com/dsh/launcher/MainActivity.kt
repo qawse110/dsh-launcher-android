@@ -56,7 +56,7 @@ class MainActivity : AppCompatActivity() {
     private var phase = Phase.FIRST_INSTALL
 
     // ---- DSH 更新检测 ----
-    private lateinit var updateCard: LinearLayout
+    private lateinit var updateCard: ViewGroup
     private lateinit var updateLabel: TextView
     private lateinit var updateBtn: View
     @Volatile private var updateAvailable = false
