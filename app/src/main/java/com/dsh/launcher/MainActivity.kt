@@ -54,15 +54,35 @@ class MainActivity : AppCompatActivity() {
 
     private val logSb = StringBuilder()
     private var phase = Phase.FIRST_INSTALL
+
+    // ---- DSH 更新检测 ----
+    private lateinit var updateCard: LinearLayout
+    private lateinit var updateLabel: TextView
+    private lateinit var updateBtn: View
+    @Volatile private var updateAvailable = false
+    @Volatile private var updateVersion: String? = null
     private var flowing = false
     private var lastMode: DshFlow.Mode = DshFlow.Mode.INSTALL_AND_START
 
     /** 冷启动自动路由只做一次；从 WebUI 返回主界面不重复弹。 */
     private var autoRouteDone = false
 
+    private var updateCheckCount = 0
+
     private val pollRunnable = object : Runnable {
         override fun run() {
             if (!flowing) refreshRunState(silent = true)
+            // 每 50 轮（~150s）做一次 npm 版本检查
+            updateCheckCount++
+            if (updateCheckCount >= 50 && !flowing && DshFlow.isInstalled(this@MainActivity)) {
+                updateCheckCount = 0
+                thread {
+                    val latest = DshUpdater.checkRemote(this@MainActivity, false) { /* 静默 */ }
+                    if (latest != null) {
+                        runOnUiThread { showUpdateAvailable(latest) }
+                    }
+                }
+            }
             handler.postDelayed(this, 3_000)
         }
     }
@@ -407,6 +427,29 @@ class MainActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = dp(4) })
 
+        // ---- 更新检测卡（有新版时显示）----
+        updateCard = Ui.card(this, radiusDp = 14, background = Ui.SURFACE_CONTAINER, stroke = Ui.BRAND, elevationDp = 1f).apply {
+            visibility = View.GONE
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(8) }
+        }
+        val ucCol = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        updateLabel = TextView(this).apply {
+            textSize = 13f
+            setTextColor(Ui.BRAND)
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+        }
+        ucCol.addView(updateLabel)
+        updateBtn = Ui.button(this, "立即更新", { startUpdate() }, filled = true).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(44)
+            ).apply { topMargin = dp(8) }
+        }
+        ucCol.addView(updateBtn)
+        updateCard.addView(ucCol)
+        root.addView(updateCard)
+
         // ---- 次级操作网格 ----
         root.addView(LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -462,6 +505,50 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var envChipsRow: LinearLayout
     private lateinit var helpBody: TextView
+
+    /** 有新版可用时在概览卡下方展示更新提示卡。 */
+    private fun showUpdateAvailable(version: String) {
+        updateAvailable = true
+        updateVersion = version
+        updateCard.visibility = View.VISIBLE
+        updateLabel.text = "🆕 dsh v$version 可用（当前 v${DshUpdater.currentVersion(this)}）"
+        AppLog.i("Main", "update available: v$version")
+    }
+
+    /** 一键更新 DSH 核心 + 插件，完成后自动重启 web。 */
+    private fun startUpdate() {
+        if (!guardBusy("update")) return
+        setBusy(true)
+        appendMiniLog(">> 开始更新 DSH 核心…")
+        DshFlow.launch(
+            this, DshFlow.Mode.INSTALL_ONLY,
+            onLog = { line -> runOnUiThread { appendMiniLog(line) } },
+            onDone = { ok ->
+                runOnUiThread {
+                    setBusy(false)
+                    if (ok) {
+                        appendMiniLog("✓ 更新完成，正在重启服务…")
+                        handler.postDelayed({ beginFlow(DshFlow.Mode.START_ONLY) }, 800)
+                    } else {
+                        toast("更新失败，详见控制台日志")
+                    }
+                }
+            }
+        )
+    }
+
+    private fun guardBusy(action: String): Boolean =
+        if (flowing) { toast("请等待当前操作完成"); false } else true
+
+    private fun setBusy(b: Boolean) {
+        flowing = b
+        runOnUiThread {
+            progress.visibility = if (b) View.VISIBLE else View.GONE
+            primaryBtn.isEnabled = !b
+            primaryBtn.alpha = if (b) 0.5f else 1f
+            updateBtn.isEnabled = !b
+        }
+    }
 
     private fun onPrimaryClicked() {
         when (phase) {
