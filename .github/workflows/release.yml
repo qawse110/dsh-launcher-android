@@ -1,0 +1,87 @@
+name: Release APK
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
+
+      - name: Prepare signing keystore
+        env:
+          DSH_KEYSTORE_B64: ${{ secrets.DSH_KEYSTORE_B64 }}
+          DSH_KEYSTORE_PASS: ${{ secrets.DSH_KEYSTORE_PASS }}
+        run: |
+          mkdir -p signing
+          if [ -n "$DSH_KEYSTORE_B64" ]; then
+            echo "using keystore from repo secret"
+            echo "$DSH_KEYSTORE_B64" | base64 -d > signing/release.keystore
+          elif [ -f signing/release.keystore ]; then
+            echo "using committed release keystore"
+          else
+            echo "first run: generating release keystore (will be committed for stable signatures)"
+            keytool -genkeypair -v \
+              -keystore signing/release.keystore \
+              -alias dsh -keyalg RSA -keysize 2048 -validity 5475 \
+              -storepass dshlauncher123 -keypass dshlauncher123 \
+              -dname "CN=DshLauncher, O=dsh"
+            git config user.name "qawse110"
+            git config user.email "qawse110@users.noreply.github.com"
+            git add signing/release.keystore
+            git commit -m "chore(signing): bootstrap release keystore [skip ci]"
+            git push origin "HEAD:main" || echo "WARN: push keystore back failed (future releases will regenerate)"
+          fi
+
+      - name: Build release APK
+        env:
+          DSH_KEYSTORE_FILE: ${{ github.workspace }}/signing/release.keystore
+          DSH_KEYSTORE_PASS: dshlauncher123
+        run: chmod +x gradlew && ./gradlew :app:assembleRelease --no-daemon
+
+      - name: Rename APK
+        run: |
+          VERSION=$(grep -oP 'versionName = "\K[^"]+' app/build.gradle.kts)
+          cp app/build/outputs/apk/release/app-release.apk "DshLauncher-v${VERSION}.apk"
+          echo "APK=DshLauncher-v${VERSION}.apk" >> "$GITHUB_ENV"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NOTES="## DshLauncher ${GITHUB_REF_NAME}
+
+          - 自动安装/启动/打开 WebUI 的自适应启动流
+          - 悬浮窗双通道（前台服务 + 无障碍）与桌宠模式
+          - TTS 播报：系统引擎 / Edge 在线语音（整句增量播报）
+          - 插件管理：健康检查、一键重置修复、在线安装
+          - 自适应后台功耗策略（PowerGovernor）
+
+          安装前请先卸载旧版（签名密钥于 v4.3.4 首次引入）。"
+
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "$APK" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "$APK" --title "DshLauncher $GITHUB_REF_NAME" --notes "$NOTES"
+          fi
