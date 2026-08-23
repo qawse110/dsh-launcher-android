@@ -155,7 +155,6 @@ try {
 
 
 
-try {
   /* v2 视觉链路配套（dsh-launcher-android-att-vision-v1）：
      1) syncDirectory 对 Android 受限祖先目录（/data 等）降级 best-effort；
      2) link 发布在 SELinux/FUSE 失败时改 copy+摘要校验，
@@ -226,6 +225,8 @@ try {
       log('attachment-local vision patch applied: ' + attLocal);
     }
   } catch (e) { log('WARN attachment-local vision: ' + e.message); }
+
+
 
 try {
   const ap = findPkg('@deepseek-ai/dsh-host-apiproxy', 'lib/index.js');
