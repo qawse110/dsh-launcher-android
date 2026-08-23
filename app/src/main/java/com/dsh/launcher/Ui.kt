@@ -168,6 +168,8 @@ object Ui {
         this.text = text
         this.isAllCaps = false
         textSize = 14f
+        maxLines = 1
+        ellipsize = android.text.TextUtils.TruncateAt.END
         insetTop = if (compact) 0 else dp(context, 6)
         insetBottom = if (compact) 0 else dp(context, 6)
         cornerRadius = dp(context, 12)

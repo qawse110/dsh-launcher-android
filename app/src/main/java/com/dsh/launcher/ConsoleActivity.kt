@@ -461,6 +461,7 @@ class ConsoleActivity : AppCompatActivity() {
     }
 
     private fun appendLine(line: String) {
+        if (line.length > 200) line = line.take(197) + "…"
         runOnUiThread {
             sb.append(line).append("\n")
             // 防止长时间运行输出无限增长导致 UI 卡顿/内存膨胀：只保留末尾约 120K 字符

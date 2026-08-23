@@ -387,6 +387,8 @@ class MainActivity : AppCompatActivity() {
             setTextColor(Ui.TEXT_SECONDARY)
             setLineSpacing(dp(2).toFloat(), 1f)
             setPadding(0, dp(8), 0, 0)
+            maxLines = 2
+            ellipsize = android.text.TextUtils.TruncateAt.END
         }
         col.addView(phaseSub, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
