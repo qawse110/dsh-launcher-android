@@ -77,9 +77,13 @@ class MainActivity : AppCompatActivity() {
             if (updateCheckCount >= 50 && !flowing && DshFlow.isInstalled(this@MainActivity)) {
                 updateCheckCount = 0
                 thread {
-                    val latest = DshUpdater.checkRemote(this@MainActivity, false) { /* 静默 */ }
+                    val latest = runCatching { DshUpdater.checkRemote(this@MainActivity, false) { } }.getOrNull()
                     if (latest != null) {
-                        runOnUiThread { showUpdateAvailable(latest) }
+                        runOnUiThread {
+                            updateLabel.text = "🆕 发现新版本 v$latest"
+                            updateLabel.setTextColor(Ui.BRAND)
+                            updateBtn.visibility = View.VISIBLE
+                        }
                     }
                 }
             }
@@ -427,24 +431,45 @@ class MainActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = dp(4) })
 
-        // ---- 更新检测卡（有新版时显示）----
-        updateCard = Ui.card(this, radiusDp = 14, background = Ui.SURFACE_CONTAINER, stroke = Ui.BRAND, elevationDp = 1f).apply {
-            visibility = View.GONE
+        // ---- DSH 版本 / 更新 ----
+        updateCard = Ui.card(this, radiusDp = 14, background = Ui.SURFACE_CONTAINER_HIGH, elevationDp = 1f).apply {
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply { topMargin = dp(8) }
         }
         val ucCol = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        ucCol.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(TextView(this).apply {
+                text = "📦 DSH 核心"
+                textSize = 13f
+                typeface = android.graphics.Typeface.DEFAULT_BOLD
+                setTextColor(Ui.TEXT_SECONDARY)
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(TextView(this).apply {
+                text = "v" + DshUpdater.currentVersion(this@MainActivity)
+                textSize = 11f
+                setTextColor(Ui.TEXT_MUTED)
+            })
+        })
         updateLabel = TextView(this).apply {
-            textSize = 13f
-            setTextColor(Ui.BRAND)
-            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            textSize = 12.5f
+            setTextColor(Ui.TEXT_SECONDARY)
+            setPadding(0, dp(4), 0, 0)
         }
         ucCol.addView(updateLabel)
+        val checkBtn = Ui.button(this, "检查更新", { checkForUpdates(force = true) }, filled = false, compact = true).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(38)
+            ).apply { topMargin = dp(8) }
+        }
+        ucCol.addView(checkBtn)
         updateBtn = Ui.button(this, "立即更新", { startUpdate() }, filled = true).apply {
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(44)
-            ).apply { topMargin = dp(8) }
+            ).apply { topMargin = dp(6) }
+            visibility = View.GONE
         }
         ucCol.addView(updateBtn)
         updateCard.addView(ucCol)
@@ -505,6 +530,31 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var envChipsRow: LinearLayout
     private lateinit var helpBody: TextView
+
+    /** 用户主动触发：强制查 npm 并显示结果。 */
+    private fun checkForUpdates(force: Boolean) {
+        if (!::updateLabel.isInitialized) return
+        updateLabel.text = "正在检查更新…"
+        updateLabel.setTextColor(Ui.TEXT_SECONDARY)
+        thread {
+            val latest = runCatching { DshUpdater.checkRemote(this@MainActivity, force) { /* 静默 */ } }.getOrNull()
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                when {
+                    latest != null -> {
+                        updateLabel.text = "🆕 发现新版本 v$latest"
+                        updateLabel.setTextColor(Ui.BRAND)
+                        updateBtn.visibility = View.VISIBLE
+                    }
+                    else -> {
+                        updateLabel.text = "✓ 已是最新版本 v" + DshUpdater.currentVersion(this@MainActivity)
+                        updateLabel.setTextColor(Ui.SUCCESS)
+                        updateBtn.visibility = View.GONE
+                    }
+                }
+            }
+        }
+    }
 
     /** 有新版可用时在概览卡下方展示更新提示卡。 */
     private fun showUpdateAvailable(version: String) {
