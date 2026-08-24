@@ -222,7 +222,7 @@ object DshFlow {
         }
 
         fl(">> 3/4 官方 npm 安装/更新 dsh + dsh plugin 装配内置插件…")
-        val tag = ctx.getSharedPreferences("dsh_console", Context.MODE_PRIVATE)
+        val tag = ctx.getSharedPreferences(AppState.Prefs.CONSOLE, Context.MODE_PRIVATE)
             .getString("dsh_install_tag", "latest") ?: "latest"
         val installEnv = mapOf(
             "HOME" to ctx.filesDir.absolutePath,
@@ -239,7 +239,7 @@ object DshFlow {
         if (tag != "latest") fl("  （安装 dist-tag=$tag 预发布线）")
         val installExit = exec(ctx, "$nodeDir/bin/node ${installScript.absolutePath}", installEnv) { fl(it) }
         // 一次性安装 tag 已消费（无论成败），复位避免残留 next 影响下次普通安装
-        ctx.getSharedPreferences("dsh_console", Context.MODE_PRIVATE)
+        ctx.getSharedPreferences(AppState.Prefs.CONSOLE, Context.MODE_PRIVATE)
             .edit().remove("dsh_install_tag").apply()
         if (installExit != 0) {
             fl("FAIL 3/4 install script exit=$installExit，详见 install_log.txt")
@@ -310,7 +310,7 @@ object DshFlow {
 
     /** dsh 启动成功后联动拉起状态桥接服务（悬浮窗自动出现；尊重「悬浮窗显示」开关）。 */
     fun ensureBridge(ctx: Context) {
-        if (!ctx.getSharedPreferences("status_bridge", Context.MODE_PRIVATE)
+        if (!ctx.getSharedPreferences(AppState.Prefs.BRIDGE, Context.MODE_PRIVATE)
                 .getBoolean("overlay_enabled", true)
         ) return
         runCatching { StatusBridgeService.start(ctx) }

@@ -146,3 +146,17 @@ KeepAliveAccessibilityService、StatusBridgeService.scheduleWatchdog(Alarm)；
 
 内存泄漏模式（Activity 泄漏的 thread{} 持有均短生命周期）、SQL/序列化漏洞面、
 WebView JS bridge 暴露面（未注册 JS 接口）经抽查未见明显风险点。
+
+---
+
+## 执行状态
+
+| 阶段 | 状态 | 提交 |
+|---|---|---|
+| R1（P0-1/3、P1-1/2、P2-6） | ✅ 完成 | d33ad44 + 修复 fdc2e80 |
+| R1.5 横切 review | ✅ 完成（见 review-findings-r1.md） | 594dac8 |
+| R2 P1-3 TermuxRuntime 四拆 | ✅ 完成：BootstrapInstaller/PrefixPatcher/ProfileWriter/PackageKit + 门面 60 行 | 本提交 |
+| R2 P1-4 状态中心化（prefs 命名空间） | ✅ 完成：AppState.Prefs 单源（markers.json 迁移延后） | 本提交 |
+| R2 P1-5 Supervisor 归一 | ✅ 完成：期望态 + 冷却拉起单点；Watchdog/Receiver/BKS 接入 | 本提交 |
+| R2 P1-6 BridgeOverlayManager 拆分 | ⏸ 挂起（风险最大，需独立回归窗口） | — |
+| P0-2 keystore 出库 | ⏸ 待产品决策（签名影响） | — |

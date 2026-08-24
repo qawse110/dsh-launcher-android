@@ -80,7 +80,7 @@ class KeepAliveAccessibilityService : AccessibilityService() {
         super.onDestroy()
     }
 
-    private fun prefs() = getSharedPreferences("status_bridge", Context.MODE_PRIVATE)
+    private fun prefs() = getSharedPreferences(AppState.Prefs.BRIDGE, Context.MODE_PRIVATE)
 
     private fun startPolling() {
         if (polling) return
@@ -170,7 +170,7 @@ class KeepAliveAccessibilityService : AccessibilityService() {
 
         /** 无障碍通道近期活跃（供外部诊断）。 */
         fun isA11yChannelFresh(context: Context): Boolean =
-            System.currentTimeMillis() - context.getSharedPreferences("status_bridge", Context.MODE_PRIVATE)
+            System.currentTimeMillis() - context.getSharedPreferences(AppState.Prefs.BRIDGE, Context.MODE_PRIVATE)
                 .getLong(A11Y_TS_KEY, 0L) < A11Y_FRESH_MS
 
         /**

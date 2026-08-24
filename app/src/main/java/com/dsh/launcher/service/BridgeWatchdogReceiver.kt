@@ -17,9 +17,7 @@ class BridgeWatchdogReceiver : BroadcastReceiver() {
         if (intent?.action != StatusBridgeService.WATCHDOG_ACTION) return
         // 用户显式停止过（「停止 dsh 服务」）就不再自续、也不拉起，
         // 否则 watchdog 会永远唤醒；下次启动服务时 scheduleWatchdog 会重新接上链条
-        val expectRunning = context.getSharedPreferences("dsh_keepalive", Context.MODE_PRIVATE)
-            .getBoolean("running", false)
-        if (!expectRunning) return
+        if (!Supervisor.desiredRunning(context)) return
         StatusBridgeService.scheduleWatchdog(context)
         val alive = try {
             val f = File(context.filesDir, "status-bridge-heartbeat.json")

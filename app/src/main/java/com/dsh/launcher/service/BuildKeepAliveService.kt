@@ -21,7 +21,7 @@ class BuildKeepAliveService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        val running = prefs().getBoolean(KEY_RUNNING, false)
+        val running = Supervisor.desiredRunning(this)
         startForeground(
             1,
             buildNotification(
@@ -33,7 +33,7 @@ class BuildKeepAliveService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_UPDATE_RUNNING) {
-            prefs().edit().putBoolean(KEY_RUNNING, true).apply()
+            Supervisor.setDesiredRunning(this, true)
             startForeground(
                 1,
                 buildNotification("dsh 运行中", "dsh 正在后台运行，点击可进入管理")
@@ -49,7 +49,6 @@ class BuildKeepAliveService : Service() {
         }
     }
 
-    private fun prefs() = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
     private fun buildNotification(title: String, text: String): Notification {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
@@ -74,12 +73,10 @@ class BuildKeepAliveService : Service() {
 
     companion object {
         const val ACTION_UPDATE_RUNNING = "com.dsh.launcher.action.BUILD_KEEPALIVE_RUNNING"
-        private const val PREFS_NAME = "dsh_keepalive"
-        private const val KEY_RUNNING = "running"
 
+        /** 期望运行态唯一写入口（架构方案 P1-5，状态本体在 [com.dsh.launcher.core.Supervisor]）。 */
         fun updateRunning(context: Context) {
-            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                .edit().putBoolean(KEY_RUNNING, true).apply()
+            Supervisor.setDesiredRunning(context, true)
             val intent = Intent(context, BuildKeepAliveService::class.java)
                 .setAction(ACTION_UPDATE_RUNNING)
             runCatching {
@@ -92,8 +89,7 @@ class BuildKeepAliveService : Service() {
         }
 
         fun markStopped(context: Context) {
-            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                .edit().putBoolean(KEY_RUNNING, false).apply()
+            Supervisor.setDesiredRunning(context, false)
         }
     }
 }

@@ -158,7 +158,7 @@ class BridgeOverlayManager(
         override fun run() = stepWalk()
     }
 
-    private fun prefs() = context.getSharedPreferences("status_bridge", Context.MODE_PRIVATE)
+    private fun prefs() = context.getSharedPreferences(AppState.Prefs.BRIDGE, Context.MODE_PRIVATE)
     /** 悬浮窗统一开关状态：
      *  - 「悬浮窗显示」关闭 → 无论普通还是无障碍通道一律隐藏；
      *  - 无障碍通道 5 秒内刷新过存活时间戳 → 普通悬浮窗让位，避免双窗口叠加。

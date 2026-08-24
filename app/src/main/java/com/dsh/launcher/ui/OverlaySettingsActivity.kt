@@ -62,7 +62,7 @@ class OverlaySettingsActivity : AppCompatActivity() {
         setContentView(buildUi())
     }
 
-    private fun prefs() = getSharedPreferences("status_bridge", Context.MODE_PRIVATE)
+    private fun prefs() = getSharedPreferences(AppState.Prefs.BRIDGE, Context.MODE_PRIVATE)
 
     private fun buildUi(): ViewGroup {
         val root = LinearLayout(this).apply {

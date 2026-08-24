@@ -153,7 +153,7 @@ class StatusBridgeService : Service() {
 
     // ---------------- 配置读取 ----------------
 
-    private fun prefs() = getSharedPreferences("status_bridge", Context.MODE_PRIVATE)
+    private fun prefs() = getSharedPreferences(AppState.Prefs.BRIDGE, Context.MODE_PRIVATE)
 
     private fun overlayEnabled() = prefs().getBoolean("overlay_enabled", true) &&
         // 无障碍通道 5 秒内刷新过时间戳才视为激活：宿主被杀时 onUnbind/onDestroy 不回调，
@@ -302,7 +302,7 @@ class StatusBridgeService : Service() {
 
         /** 清除“点 × 已关闭”状态，下次轮询会重新显示悬浮窗。 */
         fun resetDismissed(context: Context) {
-            context.getSharedPreferences("status_bridge", Context.MODE_PRIVATE)
+            context.getSharedPreferences(AppState.Prefs.BRIDGE, Context.MODE_PRIVATE)
                 .edit().putBoolean("overlay_dismissed", false).apply()
         }
 

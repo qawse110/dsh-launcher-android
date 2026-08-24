@@ -116,7 +116,7 @@ class MainActivity : AppCompatActivity() {
         syncAssetsOnApkUpdate()
         // 悬浮窗自动恢复：app 关闭后再打开，只要「悬浮窗显示」开关还开着就自动拉起
         // 状态桥接服务（服务已运行时幂等；无障碍通道由系统自动连接，无需此处处理）
-        if (getSharedPreferences("status_bridge", Context.MODE_PRIVATE)
+        if (getSharedPreferences(AppState.Prefs.BRIDGE, Context.MODE_PRIVATE)
                 .getBoolean("overlay_enabled", true)
         ) {
             runCatching { StatusBridgeService.start(this) }
@@ -362,7 +362,7 @@ class MainActivity : AppCompatActivity() {
         })
 
         // APP 升级提示条：APK 更新后同步了内置插件源，提示重新装配
-        if (getSharedPreferences("dsh_ui", MODE_PRIVATE).getBoolean("rewire_hint", false)) {
+        if (getSharedPreferences(AppState.Prefs.UI, MODE_PRIVATE).getBoolean("rewire_hint", false)) {
             root.addView(buildUpdateBanner())
         }
 
@@ -666,7 +666,7 @@ class MainActivity : AppCompatActivity() {
      *   本权限是让悬浮窗稳定自启的根本解。） */
     private fun maybePromptOverlayPermission() {
         if (Settings.canDrawOverlays(this)) return
-        val prefs = getSharedPreferences("dsh_ui", MODE_PRIVATE)
+        val prefs = getSharedPreferences(AppState.Prefs.UI, MODE_PRIVATE)
         if (prefs.getBoolean("overlay_perm_prompted", false)) return
         prefs.edit().putBoolean("overlay_perm_prompted", true).apply()
         appendMiniLog("首次引导：授予「显示在其它应用上层」后，悬浮窗不依赖无障碍也能自启")
@@ -690,7 +690,7 @@ class MainActivity : AppCompatActivity() {
     private fun maybePromptBatteryOptimization() {
         val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
         if (pm.isIgnoringBatteryOptimizations(packageName)) return
-        val prefs = getSharedPreferences("dsh_ui", MODE_PRIVATE)
+        val prefs = getSharedPreferences(AppState.Prefs.UI, MODE_PRIVATE)
         if (prefs.getBoolean("batt_opt_prompted", false)) return
         prefs.edit().putBoolean("batt_opt_prompted", true).apply()
         appendMiniLog("建议授予「忽略电池优化」，防止息屏后任务被系统打断")
@@ -734,7 +734,7 @@ class MainActivity : AppCompatActivity() {
     private fun syncAssetsOnApkUpdate() {
         val current = AssetSync.apkVersion(this)
         if (current == 0L) return
-        val prefs = getSharedPreferences("dsh_ui", MODE_PRIVATE)
+        val prefs = getSharedPreferences(AppState.Prefs.UI, MODE_PRIVATE)
         val last = prefs.getLong("last_apk_version", 0L)
         if (current == last) return
         prefs.edit().putLong("last_apk_version", current).apply()
@@ -829,7 +829,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun dismissUpdateBanner() {
-        getSharedPreferences("dsh_ui", MODE_PRIVATE).edit().putBoolean("rewire_hint", false).apply()
+        getSharedPreferences(AppState.Prefs.UI, MODE_PRIVATE).edit().putBoolean("rewire_hint", false).apply()
         updateBanner?.let { contentRoot?.removeView(it) }
         updateBanner = null
     }
