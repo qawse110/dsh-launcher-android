@@ -59,8 +59,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var updateCard: ViewGroup
     private lateinit var updateLabel: TextView
     private lateinit var updateBtn: View
-    @Volatile private var updateAvailable = false
-    @Volatile private var updateVersion: String? = null
     private var flowing = false
     private var lastMode: DshFlow.Mode = DshFlow.Mode.INSTALL_AND_START
 
@@ -556,15 +554,6 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
-    }
-
-    /** 有新版可用时在概览卡下方展示更新提示卡。 */
-    private fun showUpdateAvailable(version: String) {
-        updateAvailable = true
-        updateVersion = version
-        updateCard.visibility = View.VISIBLE
-        updateLabel.text = "🆕 dsh v$version 可用（当前 v${DshUpdater.currentVersion(this)}）"
-        AppLog.i("Main", "update available: v$version")
     }
 
     /** 一键更新 DSH 核心 + 插件，完成后自动重启 web。 */
