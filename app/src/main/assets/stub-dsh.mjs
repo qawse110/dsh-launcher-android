@@ -155,74 +155,112 @@ try {
 
 
 
-  /* v2 视觉链路配套（dsh-launcher-android-att-vision-v1）：
-     1) syncDirectory 对 Android 受限祖先目录（/data 等）降级 best-effort；
-     2) link 发布在 SELinux/FUSE 失败时改 copy+摘要校验，
-        复制中途失败清理半写 target，防内容寻址路径被毒化。 */
+  /* v3 视觉链路配套（dsh-launcher-android-att-vision-v3），修复 v2 两处缺陷：
+     1) v2 的 syncDirectory 正则 [\s\S]*?\n\t\} 非贪婪匹配到上游 "} finally {" 行首，
+        半个旧函数残留成第二个 finally → 启动即 SyntaxError: Unexpected token 'finally'；
+     2) v2 的 helper 锚点注释在上游不存在，helper 从未插入但调用点已被改写，
+        且补丁标记随 helper 一起丢失 → 无标记，每次启动重复毒化。
+     v3 改为「起点签名 → 后继锚点注释」整段切片替换：无论干净源码还是 v2 毒化残留，
+     都归一到同一份正确实现，幂等并可自愈已损坏的安装。 */
   try {
     const attLocal = findPkg('@deepseek-ai/dsh-attachment-local', 'lib/index.js');
     if (!attLocal) {
       log('attachment-local: not found, skip vision patch');
-    } else if (readFileSync(attLocal, 'utf8').includes('dsh-launcher-android-att-vision-v1')) {
+    } else if (readFileSync(attLocal, 'utf8').includes('dsh-launcher-android-att-vision-v3')) {
       log('attachment-local vision patch already applied');
     } else {
       let src = readFileSync(attLocal, 'utf8');
 
-      const sdRe = /async function syncDirectory\(path\) \{[\s\S]*?\n\t\}/;
-      if (!sdRe.test(src)) { log('WARN vision patch: syncDirectory pattern miss'); }
-      else src = src.replace(sdRe, [
-        'async function syncDirectory(path) {',
-        '\tif (process.platform === "win32") return;',
-        '\tlet handle;',
-        '\ttry {',
-        '\t\thandle = await open(path, constants.O_RDONLY);',
-        '\t} catch (error) {',
-        '\t\t// Android: 应用 uid 对 /data 等祖先目录无 O_RDONLY 权限，降级跳过目录 fsync',
-        '\t\tif (error && (error.code === "EACCES" || error.code === "EPERM" || error.code === "ENOENT" || error.code === "ENOTDIR")) return;',
-        '\t\tthrow error;',
-        '\t}',
-        '\ttry { await handle.sync(); } catch (error) { if (process.platform === "android") return; throw error; }',
-        '\tfinally { await handle.close().catch(() => {}); }',
-        '}'
-      ].join('\n'));
-
-      const linkLine = 'await link(temporary, target);';
-      if (!src.includes(linkLine)) log('WARN vision patch: link anchor miss');
-      else {
-        src = src.replace(linkLine, 'await publishCopied(temporary, target, sha256);');
-        const helperAnchor = '/**\n* Save and verify immutable image bytes below a versioned attachment root.';
-        const helper = [
-          '/** dsh-launcher-android-att-vision-v1: link 优先；SELinux/FUSE 环境回退 copy，',
-          '* 复制中途失败清理半写 target 防止内容寻址路径被毒化。 */',
-          'async function publishCopied(temporary, target, sha256) {',
+      /* syncDirectory 整段规范化。Android 应用 uid 对 /data 等祖先目录无 O_RDONLY
+         权限：open 受限码（EACCES/EPERM/ENOENT/ENOTDIR）直接跳过目录 fsync；
+         文件本体 fsync 不变；sync 异常时确保关闭句柄。 */
+      const SYNC_START = 'async function syncDirectory(path) {';
+      const SYNC_END = '/**\n* Create one private directory tree';
+      const si = src.indexOf(SYNC_START);
+      const sj = src.indexOf(SYNC_END);
+      const seg = si !== -1 && sj > si ? src.slice(si, sj) : '';
+      if (seg && seg.length <= 4096 && seg.includes('handle')) {
+        src = src.slice(0, si) + [
+          'async function syncDirectory(path) {',
+          '\tif (process.platform === "win32") return;',
+          '\tlet handle;',
           '\ttry {',
-          '\t\tawait link(temporary, target);',
-          '\t\treturn;',
-          '\t} catch (linkError) {',
-          '\t\tconst code = linkError instanceof Error && "code" in linkError ? linkError.code : void 0;',
-          '\t\tif (code === "EEXIST") {',
-          '\t\t\tif (digest(new Uint8Array(await readFile(target))) !== sha256) throw new AttachmentError("Stored attachment failed integrity verification.", "ATTACHMENT_CORRUPT");',
-          '\t\t\treturn;',
-          '\t\t}',
-          '\t\tif (!(code === "EACCES" || code === "EPERM" || code === "ENOSYS" || code === "EXDEV")) throw linkError;',
-          '\t\ttry { await copyFile(temporary, target); } catch (copyError) {',
-          '\t\t\tawait unlink(target).catch(() => {});',
-          '\t\t\tthrow copyError;',
-          '\t\t}',
-          '\t\tif (digest(new Uint8Array(await readFile(target))) !== sha256) {',
-          '\t\t\tawait unlink(target).catch(() => {});',
-          '\t\t\tthrow new AttachmentError("Stored attachment failed integrity verification.", "ATTACHMENT_CORRUPT");',
-          '\t\t}',
+          '\t\thandle = await open(path, constants.O_RDONLY);',
+          '\t} catch (error) {',
+          '\t\tif (error && (error.code === "EACCES" || error.code === "EPERM" || error.code === "ENOENT" || error.code === "ENOTDIR")) return;',
+          '\t\tthrow error;',
           '\t}',
-          '}',
-          ''
-        ].join('\n');
-        if (!src.includes(helperAnchor)) log('WARN vision patch: helper anchor miss');
-        else src = src.replace(helperAnchor, helper + helperAnchor);
+          '\ttry { await handle.sync(); } catch (error) { await handle.close().catch(() => {}); if (process.platform === "android") return; throw error; }',
+          '\tawait handle.close().catch(() => {});',
+          '}'
+        ].join('\n') + '\n' + src.slice(sj);
+      } else {
+        log('WARN vision patch v3: syncDirectory segment not located, leave as-is');
+      }
+
+      /* link 发布回退：SELinux 拒绝应用 uid 的 link(2)、sdcard FUSE 不支持硬链接。
+         helper 与调用点成对落地，标记写在 helper 头部（保证与文件共存亡）。
+         兼容 v2 毒化残留：调用点已被改写为 publishCopied 但定义从未插入时，
+         先还原调用点，再按标准流程安装。 */
+      if (!src.includes('async function publishCopied(temporary, target, sha256)')) {
+        const v2Call = 'await publishCopied(temporary, target, sha256);';
+        const defAnchor = '/**\n* Publish one already verified normalized image';
+        const di = src.indexOf(defAnchor);
+        if (src.includes(v2Call)) {
+          src = src.replace(v2Call, 'await link(temporary, target);');
+          log('vision patch v3: restored v2-orphaned publishCopied call');
+        }
+        const ci = src.indexOf('await link(temporary, target);');
+        if (di === -1 || ci === -1 || ci < di) {
+          /* 锚点缺失或顺序异常（上游结构变化）：宁可跳过也不误插 */
+          log('WARN vision patch v3: link anchors unusable (call=' + (ci !== -1) + ',def=' + (di !== -1) + ')');
+        } else {
+          const helper = [
+            '/** dsh-launcher-android-att-vision-v3: link 优先；SELinux/FUSE 环境回退 copy，',
+            '* 复制中途失败清理半写 target 防止内容寻址路径被毒化。 */',
+            'async function publishCopied(temporary, target, sha256) {',
+            '\ttry {',
+            '\t\tawait link(temporary, target);',
+            '\t\treturn;',
+            '\t} catch (linkError) {',
+            '\t\tconst code = linkError instanceof Error && "code" in linkError ? linkError.code : void 0;',
+            '\t\tif (code === "EEXIST") {',
+            '\t\t\tif (digest$1(new Uint8Array(await readFile(target))) !== sha256) throw new AttachmentError("Stored attachment failed integrity verification.", "ATTACHMENT_CORRUPT");',
+            '\t\t\treturn;',
+            '\t\t}',
+            '\t\tif (!(code === "EACCES" || code === "EPERM" || code === "ENOSYS" || code === "EXDEV")) throw linkError;',
+            '\t\ttry { await copyFile(temporary, target); } catch (copyError) {',
+            '\t\t\tawait unlink(target).catch(() => {});',
+            '\t\t\tthrow copyError;',
+            '\t\t}',
+            '\t\tif (digest$1(new Uint8Array(await readFile(target))) !== sha256) {',
+            '\t\t\tawait unlink(target).catch(() => {});',
+            '\t\t\tthrow new AttachmentError("Stored attachment failed integrity verification.", "ATTACHMENT_CORRUPT");',
+            '\t\t}',
+            '\t}',
+            '}'
+          ].join('\n');
+          /* 上游未导入 copyFile，回退分支需要；锚定 fs/promises 导入语句精确追加 */
+          if (!src.includes('copyFile')) {
+            const impA = '} from "node:fs/promises";';
+            if (src.includes(impA)) src = src.replace(impA, ', copyFile' + impA);
+            else log('WARN vision patch v3: fs/promises import anchor miss');
+          }
+          /* 先改写调用点、后插入 helper：helper 内部同样含 await link 字面量，
+             若先插后换，首个匹配会命中 helper 自身，把回退函数改写成递归自调用 */
+          const patched = src.replace('await link(temporary, target);', 'await publishCopied(temporary, target, sha256);');
+          if (patched === src) {
+            log('WARN vision patch v3: link call rewrite miss');
+          } else {
+            src = patched;
+            src = src.slice(0, di) + helper + '\n' + src.slice(di);
+            log('vision patch v3: publishCopied installed');
+          }
+        }
       }
 
       writeFileSync(attLocal, src);
-      log('attachment-local vision patch applied: ' + attLocal);
+      log('attachment-local vision patch v3 applied: ' + attLocal);
     }
   } catch (e) { log('WARN attachment-local vision: ' + e.message); }
 
