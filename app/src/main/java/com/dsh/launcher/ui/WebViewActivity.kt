@@ -225,6 +225,6 @@ class WebViewActivity : AppCompatActivity() {
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
     companion object {
-        private const val TARGET_URL = "http://127.0.0.1:3080"
+        private const val TARGET_URL = "http://127.0.0.1:" + com.dsh.launcher.core.DshFlow.WEB_PORT
     }
 }

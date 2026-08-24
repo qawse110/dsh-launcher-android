@@ -26,7 +26,7 @@ object DshWatchdog {
 
     /** dsh web 端口是否可访问。 */
     fun isUp(): Boolean = try {
-        val conn = java.net.URL("http://127.0.0.1:3080/").openConnection() as java.net.HttpURLConnection
+        val conn = java.net.URL("http://127.0.0.1:$DshFlow.WEB_PORT/").openConnection() as java.net.HttpURLConnection
         conn.connectTimeout = 800
         conn.readTimeout = 800
         conn.requestMethod = "GET"

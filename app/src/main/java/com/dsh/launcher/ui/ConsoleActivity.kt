@@ -388,7 +388,7 @@ class ConsoleActivity : AppCompatActivity() {
     /** 通过 ProcessBuilder 执行命令，实时回显输出。 */
     private fun runCommand(raw: String) {
         setState("运行中…")
-        AppLog.i("Console", "cmd: $raw | env LD_LIBRARY_PATH=" + File(filesDir, "node/lib").absolutePath)
+        AppLog.i("Console", "cmd: $raw")
         thread {
             // 用户命令默认走内置 Termux bash；首次自动解压 bootstrap
             if (!TermuxRuntime.isReady(this)) {

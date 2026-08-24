@@ -119,37 +119,15 @@ class TerminalActivity : AppCompatActivity(), TerminalSessionClient, TerminalVie
 
     /** 创建 shell 会话；TerminalSession 只构造，真正的 PTY 由 attach 后的 size 回调创建。 */
     private fun createSession(): TerminalSession {
-        // v4.5 唯一环境：内置 Termux —— 缺失时同步准备（首次 10~60 秒）
+        // 唯一环境：内置 Termux —— 缺失时同步准备（首次 10~60 秒）
         if (!TermuxRuntime.isBashReady(this)) {
             android.widget.Toast.makeText(this, "正在准备内置 Termux 环境（10~60 秒）…", android.widget.Toast.LENGTH_SHORT).show()
             runCatching { TermuxRuntime.ensureExtracted(this) { } }
         }
         val shell = detectShell()
         val home = detectHome()
-        val usr = File(filesDir, "termux/usr")
-        val files = filesDir.absolutePath
-        val nodeLib = File(files, "node/lib").absolutePath
-        val toolsBin = File(files, ".tools/bin").absolutePath
-        val env = arrayOf(
-            "PATH=" + listOf(
-                "$usr/bin",
-                "$usr/bin/applets",
-                "$usr/local/bin",
-                "$files/node/bin",
-                "$toolsBin",
-                "/system/bin"
-            ).joinToString(":"),
-            "HOME=$home",
-            "TERM=xterm-256color",
-            "TMPDIR=$home",
-            "PREFIX=$usr",
-            "LD_LIBRARY_PATH=${nodeLib}:$usr/lib",
-            // termux-exec：运行时翻译脚本 shebang 官方前缀（存在才注入）
-            TermuxRuntime.ldPreloadPath(this)?.let { "LD_PRELOAD=$it" },
-            "LANG=C.UTF-8",
-            // 让 shell 的 cwd 与 HOME 一致，和主流终端行为保持一致
-            "PWD=$home"
-        ).filterNotNull().toTypedArray()
+        // 环境统一由 TermuxEnv 构造（架构方案 P0-1）
+        val env = TermuxEnv.terminalSessionEnv(this)
         return TerminalSession(shell, home, arrayOf("-l"), env, 2000, this)
     }
 

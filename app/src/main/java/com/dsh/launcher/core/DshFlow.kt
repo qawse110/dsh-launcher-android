@@ -44,6 +44,9 @@ object DshFlow {
     const val FLOW_LOG = "flow.log"
     const val WEB_LOG = "web.log"
 
+    /** web 启动脚本模板（assets 内，@TOKENS@ 由 [TermuxEnv] 渲染）。 */
+    private const val WEB_LAUNCHER_TPL = "web-launcher.sh.tpl"
+
     fun dshCli(ctx: Context): File =
         File(File(ctx.filesDir, "dsh-prefix"), "node_modules/@deepseek-ai/dsh/lib/bin.js")
 
@@ -392,35 +395,25 @@ object DshFlow {
             killAllNode(ctx, onLog)
             Thread.sleep(1500)
         }
-        // 生成启动脚本，由内置 Termux bash 后台执行
+        // 生成启动脚本（模板 assets/web-launcher.sh.tpl + TermuxEnv 渲染），由内置 Termux bash 后台执行
         File(ctx.filesDir, "tmp").mkdirs()
         val launcher = File(ctx.getExternalFilesDir(null) ?: ctx.filesDir, "dsh-web.sh")
         launcher.parentFile?.mkdirs()
-        val termuxUsr = TermuxRuntime.prefix(ctx).absolutePath
-        val termuxPath = "$termuxUsr/bin:$termuxUsr/bin/applets:$termuxUsr/local/bin:"
-        val ldLibrary = "${nodeDir.absolutePath}/lib:$termuxUsr/lib"
         val nodeCmd = "${nodeDir.absolutePath}/bin/node --expose-internals --import ${ctx.filesDir.absolutePath}/fs-register.mjs ${cli.absolutePath} web"
+        val tpl = runCatching { ctx.assets.open(WEB_LAUNCHER_TPL).use { it.readBytes().toString(Charsets.UTF_8) } }
+            .getOrElse {
+                onLog("WARN: 启动脚本模板缺失，回退内置模板")
+                DEFAULT_WEB_LAUNCHER_TPL
+            }
         launcher.writeText(
-            // shebang 仅作文档用途：脚本实际由内置 Termux bash 显式解释执行
-            "#!/data/user/0/com.dsh.launcher/t/usr/bin/bash\n" +
-            "export LD_LIBRARY_PATH=$ldLibrary\n" +
-            "export HOME=${ctx.filesDir.absolutePath}\n" +
-            "export TMPDIR=${ctx.filesDir.absolutePath}/tmp\n" +
-            "export OPENSSL_CONF=/dev/null\n" +
-            "export TERM=xterm-256color\n" +
-            "export PREFIX=$termuxUsr\n" +
-            // termux-exec：运行时翻译脚本 shebang 官方前缀（存在才注入）
-            (TermuxRuntime.ldPreloadPath(ctx)?.let { "export LD_PRELOAD=$it\n" } ?: "") +
-            "export PATH=${nodeDir.absolutePath}/bin:${termuxPath}${File(ctx.filesDir, ".tools").absolutePath}/bin:/system/bin:/bin:/usr/bin\n" +
-            // 应用进程默认 cwd=/（不可写）：web 进程及其 bash 子命令的相对路径操作会
-            // EACCES，显式 cd 到可写 HOME（dsh 状态目录 files/.dsh 也在这里）
-            "cd \"${ctx.filesDir.absolutePath}\" || exit 1\n" +
-            // Termux bash 必带 nohup，直接后台化
-            "nohup $nodeCmd > ${FileLog.dir(ctx).absolutePath}/$WEB_LOG 2>&1 &\n" +
-            "echo DSH_WEB_PID=$!\n"
+            tpl.replace("@EXPORTS@", TermuxEnv.webProcessExports(ctx, nodeDir)
+                .joinToString("") { (k, v) -> "export $k=$v\n" })
+                .replace("@HOME@", ctx.filesDir.absolutePath)
+                .replace("@NODE_CMD@", nodeCmd)
+                .replace("@LOG_FILE@", File(FileLog.dir(ctx), WEB_LOG).absolutePath)
         )
         launcher.setExecutable(true)
-        // v4.5：唯一解释器为内置 Termux bash
+        // 唯一解释器：内置 Termux bash
         exec(ctx, "${TermuxRuntime.bashPath(ctx).absolutePath} ${launcher.absolutePath}") { onLog(it) }
         onLog(">> dsh web 已后台启动，等待 web 就绪（http://127.0.0.1:$WEB_PORT）…")
         return waitForWebReady(ctx, 90_000, onLog)
@@ -537,87 +530,21 @@ object DshFlow {
 
     /**
      * 同步执行命令（阻塞直到结束），返回退出码；输出通过 onLine 实时回调。
-     * v4.5 起唯一执行环境为内置 Termux bash：bash 未就绪时自动准备
-     * （幂等，已就绪零开销），准备失败直接报错、不再回退系统 sh。
-     * 安装类命令临时放开 W^X。
+     * 唯一执行环境为内置 Termux bash（未就绪自动准备，失败拒绝执行）；
+     * 安装类命令自动放开 W^X。实现统一委托 [Proc]（P1-1 合并双执行器）。
      */
     fun exec(
         ctx: Context,
         raw: String,
         extraEnv: Map<String, String> = emptyMap(),
         onLine: (String) -> Unit = {}
-    ): Int {
-        AppLog.i("DshFlow", "cmd: $raw")
-        val bash = TermuxRuntime.bashPath(ctx)
-        if (!bash.isFile) {
-            onLine(">> 内置 Termux 未就绪，自动准备中（首次约 10~60 秒）…")
-            runCatching { TermuxRuntime.ensureExtracted(ctx) { onLine(it) } }
-        }
-        if (!bash.isFile) {
-            AppLog.e("DshFlow", "termux unavailable, reject cmd")
-            onLine("✗ 内置 Termux 不可用（v4.5 起仅支持 Termux 环境），命令未执行")
-            return -1
-        }
-        val wantsWrite = looksLikePackageInstall(raw)
-        return try {
-            if (wantsWrite) {
-                onLine(">> 检测到安装类命令：临时放开 bin/lib/share 写权限…")
-                TermuxRuntime.setRuntimeWritable(ctx, true)
-            }
-            val pb = ProcessBuilder(bash.absolutePath, "-c", raw)
-            pb.redirectErrorStream(true)
-            // 可写工作目录：应用进程默认 cwd=/ 不可写，相对路径读写会 EACCES
-            pb.directory(TermuxRuntime.home(ctx).apply { mkdirs() })
-            val env = pb.environment()
-            val usr = TermuxRuntime.prefix(ctx).absolutePath
-            env["PREFIX"] = usr
-            env["PATH"] = listOf(
-                "$usr/bin", "$usr/bin/applets", "$usr/local/bin",
-                File(ctx.filesDir, "node/bin").absolutePath,
-                "/system/bin", "/bin", "/usr/bin"
-            ).joinToString(":")
-            env["HOME"] = TermuxRuntime.home(ctx).absolutePath
-            env["TERM"] = "xterm-256color"
-            env["LANG"] = "C.UTF-8"
-            // 内置 node 也可能经此执行：LD_LIBRARY_PATH 必须含 node/lib（在前，
-            // 保证 node 优先解析自带的 openssl/zlib），termux usr/lib 兜底
-            env["LD_LIBRARY_PATH"] = listOf(
-                File(ctx.filesDir, "node/lib").absolutePath,
-                "$usr/lib"
-            ).joinToString(":")
-            env["TMPDIR"] = TermuxRuntime.tmp(ctx).absolutePath
-            // termux-exec：运行时翻译脚本 shebang 官方前缀（postinst / pip 入口依赖）
-            TermuxRuntime.ldPreloadPath(ctx)?.let { env["LD_PRELOAD"] = it }
-            env["OPENSSL_CONF"] = "/dev/null"
-            extraEnv.forEach { (k, v) -> env[k] = v }
-
-            val proc = pb.start()
-            // 实时逐行回调
-            proc.inputStream.bufferedReader().useLines { lines ->
-                lines.forEach { line ->
-                    onLine(line)
-                    AppLog.i("DshFlowOut", line)
-                }
-            }
-            val exit = proc.waitFor()
-            AppLog.i("DshFlow", "exit code: $exit")
-            exit
-        } catch (e: Exception) {
-            AppLog.e("DshFlow", "cmd failed: " + (e.message ?: e.toString()))
-            onLine("[执行失败: ${e.message}]")
-            -1
-        } finally {
-            if (wantsWrite) {
-                runCatching { TermuxRuntime.setRuntimeWritable(ctx, false) }
-                onLine(">> 安装命令结束，已恢复 bin/lib/share 只读（W^X 保护）")
-            }
-        }
-    }
-
-    /** 判断命令是否可能写入 bin/lib/share（apt/pkg/dpkg 安装类），用于临时放开 W^X。 */
-    private fun looksLikePackageInstall(raw: String): Boolean {
-        val lc = raw.lowercase()
-        return Regex("""\b(apt|apt-get|pkg)\b[^\n;&]*\b(install|reinstall|upgrade|dist-upgrade)\b""").containsMatchIn(lc) ||
-            Regex("""\bdpkg\b[^\n;&]*\b(-i|--install)\b""").containsMatchIn(lc)
-    }
+    ): Int = Proc.run(
+        ProcSpec(
+            ctx = ctx,
+            command = raw,
+            envOverrides = extraEnv,
+            autoUnlockWxOnInstall = true,
+            onLine = onLine,
+        )
+    )
 }

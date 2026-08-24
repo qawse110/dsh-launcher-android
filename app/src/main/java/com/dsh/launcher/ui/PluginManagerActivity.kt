@@ -1055,35 +1055,27 @@ class PluginManagerActivity : AppCompatActivity() {
     }
 
     private fun baseEnv(): MutableMap<String, String> {
-        val node = nodeDir
         val tools = File(filesDir, ".tools")
         val termux = File(filesDir, "termux/usr")
-        // v4.5 唯一环境：内置 Termux（不再按 termuxReady 分叉）
-        val path = listOf(
-            File(termux, "bin").absolutePath,
-            File(termux, "bin/applets").absolutePath,
-            File(termux, "local/bin").absolutePath,
-            File(node, "bin").absolutePath,
-            File(tools, "bin").absolutePath,
-            File(tools, "lib/node_modules/.bin").absolutePath,
-            "/system/bin"
-        ).joinToString(":")
+        // 基底环境统一来自 TermuxEnv（架构方案 P0-1）：HOME 用 filesDir（gitconfig 所在）、
+        // TMPDIR 用 files/tmp、PATH 在 node/bin 后插入 pnpm 工具目录
+        val env = TermuxEnv.childShellEnv(
+            this,
+            home = filesDir,
+            tmpDir = File(filesDir, "tmp"),
+            extraPath = listOf(
+                File(tools, "bin").absolutePath,
+                File(tools, "lib/node_modules/.bin").absolutePath,
+            ),
+        ).toMutableMap()
         val gitConfig = File(filesDir, ".gitconfig")
         if (!gitConfig.exists()) gitConfig.writeText("")
-        return mutableMapOf(
-            "PATH" to path,
-            "HOME" to filesDir.absolutePath,
-            "LD_LIBRARY_PATH" to "${File(node, "lib").absolutePath}:${File(termux, "lib").absolutePath}",
-            "PREFIX" to termux.absolutePath,
-            "GIT_EXEC_PATH" to File(termux, "libexec/git-core").absolutePath,
-            "GIT_CONFIG_NOSYSTEM" to "1",
-            "GIT_CONFIG_GLOBAL" to gitConfig.absolutePath,
-            "TMPDIR" to File(filesDir, "tmp").absolutePath,
-            "TMP" to File(filesDir, "tmp").absolutePath,
-            "TEMP" to File(filesDir, "tmp").absolutePath,
-            "TERM" to "xterm-256color",
-            "OPENSSL_CONF" to "/dev/null"
-        )
+        env["GIT_EXEC_PATH"] = File(termux, "libexec/git-core").absolutePath
+        env["GIT_CONFIG_NOSYSTEM"] = "1"
+        env["GIT_CONFIG_GLOBAL"] = gitConfig.absolutePath
+        env["TMP"] = env.getValue("TMPDIR")
+        env["TEMP"] = env.getValue("TMPDIR")
+        return env
     }
 
     private fun runProcess(cmd: String, env: Map<String, String>, label: String): Int {

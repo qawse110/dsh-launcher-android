@@ -79,24 +79,12 @@ object TermuxRuntime {
             writeInputRc(usr)
             if (harnessToolsReady(context)) return true
             val bash = bashPath(context).absolutePath
-            val home = home(context).absolutePath
-            val tmp = tmp(context).absolutePath
             val marker = File(context.filesDir, TOOLS_MARKER)
-            val env = mapOf(
-                "PREFIX" to usr.absolutePath,
-                "HOME" to home,
-                "TMPDIR" to tmp,
-                "TERM" to "xterm-256color",
-                "LANG" to "C.UTF-8",
-                "PATH" to listOf(
-                    "$usr/bin", "$usr/bin/applets", "$usr/local/bin",
-                    "/system/bin", "/bin"
-                ).joinToString(":"),
-                "LD_LIBRARY_PATH" to "$usr/lib"
-            )
+            // 环境基底统一由 Proc → TermuxEnv 提供，此处不再本地拼接（P0-1/P1-1）
+            val env = emptyMap<String, String>()
             progress("检查 Harness 工具（git / ripgrep / file / curl / less）…")
             val requiredCheck = "command -v git >/dev/null 2>&1 && git --version >/dev/null 2>&1 && command -v rg >/dev/null 2>&1 && rg --version >/dev/null 2>&1 && command -v file >/dev/null 2>&1 && file --version >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 && curl --version >/dev/null 2>&1 && command -v less >/dev/null 2>&1 && less --version >/dev/null 2>&1"
-            if (runBash(bash, requiredCheck, env, progress, timeoutSec = 120) == 0) {
+            if (runBash(context, bash, requiredCheck, env, progress, timeoutSec = 120) == 0) {
                 marker.writeText(TOOLS_MARKER_VERSION)
                 progress("Harness 工具已就绪（git / ripgrep / file / curl / less）")
                 return true
@@ -117,7 +105,7 @@ object TermuxRuntime {
                     if (!File(usr, "lib/libtermux-exec-ld-preload.so").isFile) add("termux-exec")
                 }
                 val installRc = if (missing.isNotEmpty()) {
-                    runBash(bash, "pkg install -o Acquire::Retries=3 -y --no-install-recommends ${missing.joinToString(" ")}", env, progress, timeoutSec = 1200)
+                    runBash(context, bash, "pkg install -o Acquire::Retries=3 -y --no-install-recommends ${missing.joinToString(" ")}", env, progress, timeoutSec = 1200)
                 } else {
                     0
                 }
@@ -127,7 +115,7 @@ object TermuxRuntime {
                     progress("WARN: pkg install 返回 $installRc，尝试 tpkg 手动解包兜底…")
                     writeTpkgScript(context, usr)
                     runBash(
-                        bash,
+                        context, bash,
                         "\"$usr/local/bin/tpkg\" install ${missing.joinToString(" ")}",
                         env, progress, timeoutSec = 1200
                     )
@@ -138,13 +126,13 @@ object TermuxRuntime {
                 progress("适配新装包路径并完成 dpkg 配置…")
                 patchPrefixAll(usr)
                 patchTextOfficialDirs(usr)
-                val cfgRc = runBash(bash, "dpkg --configure -a", env, progress, timeoutSec = 600)
+                val cfgRc = runBash(context, bash, "dpkg --configure -a", env, progress, timeoutSec = 600)
                 if (cfgRc != 0) {
                     progress("WARN: dpkg --configure -a 返回 $cfgRc，再试 apt-get -f install…")
-                    runBash(bash, "apt-get install -o Acquire::Retries=3 -y -f --no-install-recommends", env, progress, timeoutSec = 1200)
+                    runBash(context, bash, "apt-get install -o Acquire::Retries=3 -y -f --no-install-recommends", env, progress, timeoutSec = 1200)
                 }
 
-                val ready = runBash(bash, requiredCheck, env, progress, timeoutSec = 120) == 0
+                val ready = runBash(context, bash, requiredCheck, env, progress, timeoutSec = 120) == 0
                 val extra = buildList {
                     add("git")
                     add("ripgrep")
@@ -171,55 +159,27 @@ object TermuxRuntime {
     }
 
     /**
-     * 执行 bash 命令并流式回传输出。
+     * 执行 bash 命令并流式回传输出（委托统一执行器 [Proc]，P1-1 合并双执行器）。
      * [timeoutSec] 到期后强制结束进程并返回 -124，避免网络卡死时安装流程永远挂起。
      */
     private fun runBash(
+        context: Context,
         bash: String,
         script: String,
         env: Map<String, String>,
         progress: (String) -> Unit,
         timeoutSec: Long = 900L,
-    ): Int = try {
-        val pb = ProcessBuilder(bash, "-c", script)
-        pb.redirectErrorStream(true)
-        // 可写工作目录：避免应用默认 cwd=/ 导致子命令相对路径 EACCES
-        env["HOME"]?.let { h -> pb.directory(File(h).apply { mkdirs() }) }
-        val e = pb.environment()
-        env.forEach { (k, v) -> e[k] = v }
-        e.remove("LD_PRELOAD")
-        val p = pb.start()
-        // 输出在独立线程消费：waitFor(timeout) 期间管道持续排空，不会因缓冲区满而卡死子进程
-        val stopped = java.util.concurrent.atomic.AtomicBoolean(false)
-        val reader = Thread {
-            try {
-                p.inputStream.bufferedReader().useLines { lines ->
-                    for (line in lines) {
-                        if (stopped.get()) break
-                        progress(line)
-                    }
-                }
-            } catch (_: Throwable) {
-            }
-        }
-        reader.isDaemon = true
-        reader.start()
-        val done = p.waitFor(timeoutSec, java.util.concurrent.TimeUnit.SECONDS)
-        stopped.set(true)
-        if (!done) {
-            progress("TIMEOUT: 命令超过 ${timeoutSec}s 未完成，强制结束")
-            p.destroy()
-            if (!p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) p.destroyForcibly()
-            reader.join(2000)
-            -124
-        } else {
-            reader.join(5000)
-            p.exitValue()
-        }
-    } catch (t: Throwable) {
-        progress("bash 执行失败: ${t.message}")
-        -1
-    }
+    ): Int = Proc.run(
+        ProcSpec(
+            ctx = context,
+            command = script,
+            shell = File(bash),
+            envOverrides = env,
+            workdir = env["HOME"]?.let(::File),
+            timeoutSec = timeoutSec,
+            onLine = progress,
+        )
+    )
 
     /**
      * 解压并准备 Termux 环境（同步，可能耗时 10~60 秒）。
