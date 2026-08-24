@@ -14,10 +14,12 @@
 - **内置 Termux 工具链**：内置 bash/coreutils/apt，并在首次使用/一键安装时自动
   `pkg install git python ripgrep`，把 Termux `bin`、内置 Node `bin` 与 pnpm 工具目录纳入
   DSH 进程与内置终端 PATH，`TERM=xterm-256color`，满足 Harness 对 bash/git/ripgrep 的前置要求。
-- **默认环境 = 内置 Termux**（v4.4 起）：dsh 内部命令、web 启动脚本、watchdog 拉起
-  统一经内置 Termux bash 执行（未就绪自动回退系统 sh，不阻塞启动）；所有子进程显式指定
+- **唯一环境 = 内置 Termux**（v4.4 迁移，v4.5 起移除全部回退路径）：dsh 内部命令、
+  web 启动脚本、watchdog 拉起、内置终端、插件管理一律经内置 Termux bash 执行；
+  环境未就绪时自动准备（幂等），不再回退系统 sh 或外部 Termux app。所有子进程显式指定
   可写工作目录，修复应用进程默认 cwd=/ 导致的相对路径「权限不足」；web 进程 `LD_LIBRARY_PATH`
-  按 node/lib → termux usr/lib 顺序合并。
+  按 node/lib → termux usr/lib 顺序合并。快速启动自动识别旧代进程（cwd≠HOME）并迁移重启。
+  （仅进程清理类工具保留系统 toybox：ps/pkill/kill。）
 - **打开即用的自动启动流**（v4.2 起）：主界面即启动器——首次启动自动完成
   `解压 node → 复制官方安装脚本 + 内置插件源 → npm 官方安装/更新 dsh + dsh plugin 装配内置插件 →
   Android 兼容修复 → 启动 dsh web`，就绪后**自动进入 WebUI**；后续每次打开自动快速启动

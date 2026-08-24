@@ -53,10 +53,14 @@ object DshWatchdog {
             return
         }
         try {
-            // v4.4 迁移：与 DshFlow.startDshWeb 一致，优先用内置 Termux bash 执行启动脚本
+            // v4.5 唯一解释器：内置 Termux bash（与 DshFlow.startDshWeb 一致）；
+            // 未就绪则跳过本次拉起，下个冷却周期重试（exec/startDshWeb 会自动准备）
             val bash = TermuxRuntime.bashPath(context)
-            val interpreter = if (bash.isFile) bash.absolutePath else "/system/bin/sh"
-            val p = ProcessBuilder(interpreter, script.absolutePath)
+            if (!bash.isFile) {
+                AppLog.i(TAG, "watchdog: 内置 Termux 未就绪，跳过本次拉起")
+                return
+            }
+            val p = ProcessBuilder(bash.absolutePath, script.absolutePath)
                 .redirectErrorStream(true)
                 .start()
             // 抛掉输出流防阻塞，让拉起动作异步完成

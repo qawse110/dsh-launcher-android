@@ -29,7 +29,7 @@ import kotlin.concurrent.thread
  *
  * 说明：libtermux.so 的 createSubprocess 在第三方 app 中受 Android seccomp
  * 限制，无法可靠 fork/exec shell，导致 PTY 终端黑屏。这里改用 ProcessBuilder，
- * 稳定启动 /system/bin/sh 或内置 Node，并实时回显 stdout/stderr。
+ * 稳定启动内置 Termux bash 或内置 Node，并实时回显 stdout/stderr。
  */
 class ConsoleActivity : AppCompatActivity() {
 
@@ -369,10 +369,10 @@ class ConsoleActivity : AppCompatActivity() {
         )
     }
 
-    /** 同步执行命令（阻塞直到结束），返回退出码；输出实时回显（引擎见 [DshFlow.exec]）。 */
-    private fun runCommandAndWait(raw: String, extraEnv: Map<String, String> = emptyMap(), termux: Boolean = false): Int {
+    /** 同步执行命令（阻塞直到结束），返回退出码；输出实时回显（引擎见 [DshFlow.exec]，唯一环境为内置 Termux）。 */
+    private fun runCommandAndWait(raw: String, extraEnv: Map<String, String> = emptyMap()): Int {
         setState("运行中…")
-        val exit = DshFlow.exec(this, raw, extraEnv, termux) { line -> appendLine(line) }
+        val exit = DshFlow.exec(this, raw, extraEnv) { line -> appendLine(line) }
         AppLog.i("Console", "exit code: $exit")
         setState("完成（退出码 $exit）")
         appendLine("[退出码: $exit]")
@@ -392,14 +392,14 @@ class ConsoleActivity : AppCompatActivity() {
                     TermuxRuntime.ensureExtracted(this) { msg -> appendLine(msg) }
                     appendLine(">> Termux 环境已就绪（bash + coreutils + apt 等）")
                 } catch (t: Throwable) {
-                    appendLine("✗ Termux 环境准备失败（回退系统 sh）：${t.message}")
+                    appendLine("✗ Termux 环境准备失败：${t.message}")
                     android.util.Log.e("Console", "termux ensure failed", t)
                     setState("出错")
                     return@thread
                 }
             }
             TermuxRuntime.ensureHarnessTools(this) { msg -> appendLine(msg) }
-            runCommandAndWait(raw, termux = true)
+            runCommandAndWait(raw)
         }
     }
 

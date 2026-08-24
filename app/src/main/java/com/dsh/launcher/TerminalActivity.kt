@@ -114,31 +114,35 @@ class TerminalActivity : AppCompatActivity(), TerminalSessionClient, TerminalVie
 
     /** 创建 shell 会话；TerminalSession 只构造，真正的 PTY 由 attach 后的 size 回调创建。 */
     private fun createSession(): TerminalSession {
+        // v4.5 唯一环境：内置 Termux —— 缺失时同步准备（首次 10~60 秒）
+        if (!TermuxRuntime.isBashReady(this)) {
+            android.widget.Toast.makeText(this, "正在准备内置 Termux 环境（10~60 秒）…", android.widget.Toast.LENGTH_SHORT).show()
+            runCatching { TermuxRuntime.ensureExtracted(this) { } }
+        }
         val shell = detectShell()
         val home = detectHome()
         val usr = File(filesDir, "termux/usr")
-        val hasTermux = File(usr, "bin/bash").isFile
         val files = filesDir.absolutePath
         val nodeLib = File(files, "node/lib").absolutePath
         val toolsBin = File(files, ".tools/bin").absolutePath
         val env = arrayOf(
             "PATH=" + listOf(
-                if (hasTermux) "$usr/bin" else "/data/data/com.termux/files/usr/bin",
-                if (hasTermux) "$usr/bin/applets" else "/data/data/com.termux/files/usr/bin/applets",
-                if (hasTermux) "$usr/local/bin" else "/data/data/com.termux/files/usr/bin/local/bin",
+                "$usr/bin",
+                "$usr/bin/applets",
+                "$usr/local/bin",
                 "$files/node/bin",
                 "$toolsBin",
-                "/usr/bin", "/bin", "/system/bin"
+                "/system/bin"
             ).joinToString(":"),
             "HOME=$home",
             "TERM=xterm-256color",
             "TMPDIR=$home",
-            if (hasTermux) "PREFIX=$usr" else "",
-            if (hasTermux) "LD_LIBRARY_PATH=${nodeLib}:$usr/lib" else "LD_LIBRARY_PATH=$nodeLib",
+            "PREFIX=$usr",
+            "LD_LIBRARY_PATH=${nodeLib}:$usr/lib",
             "LANG=C.UTF-8",
             // 让 shell 的 cwd 与 HOME 一致，和主流终端行为保持一致
             "PWD=$home"
-        ).filter { it.isNotBlank() }.toTypedArray()
+        )
         return TerminalSession(shell, home, arrayOf("-l"), env, 2000, this)
     }
 
@@ -288,22 +292,13 @@ class TerminalActivity : AppCompatActivity(), TerminalSessionClient, TerminalVie
         }
     }
 
-    private fun detectShell(): String {
-        val candidates = arrayOf(
-            File(filesDir, "termux/usr/bin/bash").absolutePath,
-            "/data/data/com.termux/files/usr/bin/bash",
-            "/bin/bash",
-            "/system/bin/sh"
-        )
-        for (c in candidates) if (File(c).exists()) return c
-        return "/system/bin/sh"
-    }
+    /** v4.5 唯一 shell：内置 Termux bash（createSession 已确保就绪）。 */
+    private fun detectShell(): String = File(filesDir, "termux/usr/bin/bash").absolutePath
 
     private fun detectHome(): String {
         val builtin = File(filesDir, "termux/home")
         if (builtin.exists() || builtin.mkdirs()) return builtin.absolutePath
-        if (File("/data/data/com.termux/files/home").exists()) return "/data/data/com.termux/files/home"
-        return "/"
+        return filesDir.absolutePath
     }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()

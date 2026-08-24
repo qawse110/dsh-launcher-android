@@ -673,8 +673,11 @@ class PluginManagerActivity : AppCompatActivity() {
         val tgz = File(filesDir, "prebuilt.tgz")
         if (!tgz.isFile) return false
         return runCatching {
+            // v4.5 唯一 shell：内置 Termux bash
+            val bash = TermuxRuntime.bashPath(this)
+            if (!bash.isFile) return false
             val pb = ProcessBuilder(
-                "/system/bin/sh", "-c",
+                bash.absolutePath, "-c",
                 "tar -tzf '${tgz.absolutePath}' './third_party/$id/package.json' 2>/dev/null | head -n 1"
             )
             pb.redirectErrorStream(true)
@@ -1050,30 +1053,24 @@ class PluginManagerActivity : AppCompatActivity() {
         val node = nodeDir
         val tools = File(filesDir, ".tools")
         val termux = File(filesDir, "termux/usr")
-        val termuxReady = File(termux, "bin/bash").isFile
-        val termuxDirs = if (termuxReady) {
-            listOf(
-                File(termux, "bin").absolutePath,
-                File(termux, "bin/applets").absolutePath,
-                File(termux, "local/bin").absolutePath
-            )
-        } else emptyList()
-        val path = (termuxDirs + listOf(
+        // v4.5 唯一环境：内置 Termux（不再按 termuxReady 分叉）
+        val path = listOf(
+            File(termux, "bin").absolutePath,
+            File(termux, "bin/applets").absolutePath,
+            File(termux, "local/bin").absolutePath,
             File(node, "bin").absolutePath,
             File(tools, "bin").absolutePath,
             File(tools, "lib/node_modules/.bin").absolutePath,
-            "/system/bin", "/bin", "/usr/bin"
-        )).joinToString(":")
+            "/system/bin"
+        ).joinToString(":")
         val gitConfig = File(filesDir, ".gitconfig")
         if (!gitConfig.exists()) gitConfig.writeText("")
         return mutableMapOf(
             "PATH" to path,
             "HOME" to filesDir.absolutePath,
-            "LD_LIBRARY_PATH" to if (termuxReady) {
-                "${File(node, "lib").absolutePath}:${File(termux, "lib").absolutePath}"
-            } else {
-                File(node, "lib").absolutePath
-            },
+            "LD_LIBRARY_PATH" to "${File(node, "lib").absolutePath}:${File(termux, "lib").absolutePath}",
+            "PREFIX" to termux.absolutePath,
+            "GIT_EXEC_PATH" to File(termux, "libexec/git-core").absolutePath,
             "GIT_CONFIG_NOSYSTEM" to "1",
             "GIT_CONFIG_GLOBAL" to gitConfig.absolutePath,
             "TMPDIR" to File(filesDir, "tmp").absolutePath,
@@ -1081,18 +1078,19 @@ class PluginManagerActivity : AppCompatActivity() {
             "TEMP" to File(filesDir, "tmp").absolutePath,
             "TERM" to "xterm-256color",
             "OPENSSL_CONF" to "/dev/null"
-        ).apply {
-            if (termuxReady) {
-                put("PREFIX", termux.absolutePath)
-                put("GIT_EXEC_PATH", File(termux, "libexec/git-core").absolutePath)
-            }
-        }
+        )
     }
 
     private fun runProcess(cmd: String, env: Map<String, String>, label: String): Int {
         appendLog("   $ $cmd")
         return try {
-            val pb = ProcessBuilder("/system/bin/sh", "-c", cmd)
+            // v4.5 唯一 shell：内置 Termux bash
+            val bash = TermuxRuntime.bashPath(this)
+            if (!bash.isFile) {
+                appendLog("   ✗ 内置 Termux 未就绪，命令未执行")
+                return -1
+            }
+            val pb = ProcessBuilder(bash.absolutePath, "-c", cmd)
             pb.redirectErrorStream(true)
             // 可写工作目录：插件健康检查/重置命令的相对路径操作不受 cwd=/ 影响
             pb.directory(File(filesDir, "tmp").apply { mkdirs() })
