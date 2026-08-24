@@ -283,17 +283,17 @@ try {
           if (!src.includes('copyFile')) {
             const impA = '} from "node:fs/promises";';
             if (src.includes(impA)) src = src.replace(impA, ', copyFile' + impA);
-            else log('WARN vision patch v3: fs/promises import anchor miss');
+            else log('WARN vision patch v4: fs/promises import anchor miss');
           }
-          /* 先改写调用点、后插入 helper：helper 内部同样含 await link 字面量，
-             若先插后换，首个匹配会命中 helper 自身，把回退函数改写成递归自调用 */
+          /* 先改写调用点、后插入 helper（用字符串替换，不用索引切片，避免索引错位）：
+             helper 内部同样含 await link 字面量，先插后换会把 helper 自身改写成递归调用。 */
           const patched = src.replace('await link(temporary, target);', 'await publishCopied(temporary, target, sha256);');
           if (patched === src) {
-            log('WARN vision patch v3: link call rewrite miss');
+            log('WARN vision patch v4: link call rewrite miss');
           } else {
             src = patched;
-            src = src.slice(0, di) + helper + '\n' + src.slice(di);
-            log('vision patch v3: publishCopied installed');
+            src = src.replace(defAnchor, helper + '\n' + defAnchor);
+            log('vision patch v4: publishCopied installed');
           }
         }
       }
