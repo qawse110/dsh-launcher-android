@@ -409,6 +409,8 @@ object DshFlow {
             "export OPENSSL_CONF=/dev/null\n" +
             "export TERM=xterm-256color\n" +
             "export PREFIX=$termuxUsr\n" +
+            // termux-exec：运行时翻译脚本 shebang 官方前缀（存在才注入）
+            (TermuxRuntime.ldPreloadPath(ctx)?.let { "export LD_PRELOAD=$it\n" } ?: "") +
             "export PATH=${nodeDir.absolutePath}/bin:${termuxPath}${File(ctx.filesDir, ".tools").absolutePath}/bin:/system/bin:/bin:/usr/bin\n" +
             // 应用进程默认 cwd=/（不可写）：web 进程及其 bash 子命令的相对路径操作会
             // EACCES，显式 cd 到可写 HOME（dsh 状态目录 files/.dsh 也在这里）
@@ -584,7 +586,8 @@ object DshFlow {
                 "$usr/lib"
             ).joinToString(":")
             env["TMPDIR"] = TermuxRuntime.tmp(ctx).absolutePath
-            env.remove("LD_PRELOAD")
+            // termux-exec：运行时翻译脚本 shebang 官方前缀（postinst / pip 入口依赖）
+            TermuxRuntime.ldPreloadPath(ctx)?.let { env["LD_PRELOAD"] = it }
             env["OPENSSL_CONF"] = "/dev/null"
             extraEnv.forEach { (k, v) -> env[k] = v }
 

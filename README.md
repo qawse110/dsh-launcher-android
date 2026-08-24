@@ -20,6 +20,11 @@
   可写工作目录，修复应用进程默认 cwd=/ 导致的相对路径「权限不足」；web 进程 `LD_LIBRARY_PATH`
   按 node/lib → termux usr/lib 顺序合并。快速启动自动识别旧代进程（cwd≠HOME）并迁移重启。
   （仅进程清理类工具保留系统 toybox：ps/pkill/kill。）
+- **apt/dpkg 原生可用**（v4.6）：bin/lib/share 默认可写——W^X 只读锁会阻断 dpkg 解包与
+  postinst，是此前 `apt install` 失败的根因之一；集成 **termux-exec**（LD_PRELOAD 运行时
+  翻译脚本 shebang 的官方前缀，postinst/pip 入口脚本依赖）；另内置 `tpkg` 手动解包兜底
+  （dpkg-deb -x + dpkg 数据库同步 + shebang 修正），`pkg install` 失败时自动切换。
+  实测 `apt install python` 全链路成功：Python 3.14 + pip 26，ssl/sqlite3/ctypes/zlib 可用。
 - **打开即用的自动启动流**（v4.2 起）：主界面即启动器——首次启动自动完成
   `解压 node → 复制官方安装脚本 + 内置插件源 → npm 官方安装/更新 dsh + dsh plugin 装配内置插件 →
   Android 兼容修复 → 启动 dsh web`，就绪后**自动进入 WebUI**；后续每次打开自动快速启动

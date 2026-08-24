@@ -144,10 +144,12 @@ class TerminalActivity : AppCompatActivity(), TerminalSessionClient, TerminalVie
             "TMPDIR=$home",
             "PREFIX=$usr",
             "LD_LIBRARY_PATH=${nodeLib}:$usr/lib",
+            // termux-exec：运行时翻译脚本 shebang 官方前缀（存在才注入）
+            TermuxRuntime.ldPreloadPath(this)?.let { "LD_PRELOAD=$it" },
             "LANG=C.UTF-8",
             // 让 shell 的 cwd 与 HOME 一致，和主流终端行为保持一致
             "PWD=$home"
-        )
+        ).filterNotNull().toTypedArray()
         return TerminalSession(shell, home, arrayOf("-l"), env, 2000, this)
     }
 

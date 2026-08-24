@@ -26,6 +26,7 @@ import com.dsh.launcher.R
 object TermuxRuntime {
 
     private const val ASSET = "termux-bootstrap.zip"
+    private const val TPKG_ASSET = "tpkg.sh"
     private const val MARKER = ".termux-ok"
     private const val MARKER_VERSION = "6"
     private const val TOOLS_MARKER = ".harness-tools-ok"
@@ -49,6 +50,11 @@ object TermuxRuntime {
     fun tmp(context: Context): File = File(context.filesDir, "$DIR_NAME/tmp")
 
     fun bashPath(context: Context): File = File(prefix(context), "bin/bash")
+
+    /** termux-exec 的 LD_PRELOAD 库路径；未安装返回 null（调用方据此决定是否注入环境）。 */
+    fun ldPreloadPath(context: Context): String? =
+        File(prefix(context), "lib/libtermux-exec-ld-preload.so")
+            .takeIf { it.isFile }?.absolutePath
 
     fun isBashReady(context: Context): Boolean = bashPath(context).isFile
 
@@ -95,7 +101,9 @@ object TermuxRuntime {
                 progress("Harness 工具已就绪（git / ripgrep / file / curl / less）")
                 return true
             }
-            progress("补齐 Harness 工具（git / ripgrep / file / curl / less / wget，单次 pkg 完成）…")
+            progress("补齐 Harness 工具（git / ripgrep / file / curl / less / wget / termux-exec，单次 pkg 完成）…")
+            // v4.6：默认放开 W^X 且不再恢复 —— dpkg 解包/postinst/pip 均需可写前缀；
+            // 这里同时兜底升级设备上遗留的只读状态
             setRuntimeWritable(context, true)
             try {
                 val missing = buildList {
@@ -105,13 +113,25 @@ object TermuxRuntime {
                     if (!File(usr, "bin/curl").isFile) add("curl")
                     if (!File(usr, "bin/less").isFile) add("less")
                     if (!File(usr, "bin/wget").isFile) add("wget")
+                    // 运行时翻译脚本 shebang 的官方前缀（postinst/pip 入口依赖）
+                    if (!File(usr, "lib/libtermux-exec-ld-preload.so").isFile) add("termux-exec")
                 }
                 val installRc = if (missing.isNotEmpty()) {
                     runBash(bash, "pkg install -o Acquire::Retries=3 -y --no-install-recommends ${missing.joinToString(" ")}", env, progress, timeoutSec = 1200)
                 } else {
                     0
                 }
-                if (installRc != 0) progress("WARN: pkg install 返回 $installRc，将尝试完成未配置的包")
+                if (installRc != 0) {
+                    // dpkg 解包在搬迁前缀下必然失败（官方 deb 路径写死 com.termux），
+                    // 自动兜底走 tpkg 手动解包（dpkg-deb -x + status 同步 + shebang 修正）
+                    progress("WARN: pkg install 返回 $installRc，尝试 tpkg 手动解包兜底…")
+                    writeTpkgScript(context, usr)
+                    runBash(
+                        bash,
+                        "\"$usr/local/bin/tpkg\" install ${missing.joinToString(" ")}",
+                        env, progress, timeoutSec = 1200
+                    )
+                }
 
                 // 新装的包（二进制 + maintainer 脚本）仍带官方路径；先统一 patch，
                 // 再让 dpkg 重新 configure，避免 postinst 走官方 shebang 失败。
@@ -141,7 +161,8 @@ object TermuxRuntime {
                 }
                 return ready
             } finally {
-                setRuntimeWritable(context, false)
+                // v4.6：保持可写（不再恢复只读），原因见 ensureExtracted 内 W^X 注释
+                setRuntimeWritable(context, true)
             }
         } catch (t: Throwable) {
             progress("WARN: ensureHarnessTools 失败: ${t.message}")
@@ -270,10 +291,10 @@ object TermuxRuntime {
             File(usr, "var/cache/apt/archives/partial").mkdirs()
             File(usr, "var/log/apt").mkdirs()
 
-            // W^X：bin/lib/share 只读可执行；var 保持可写
-            makeUnwritable(File(usr, "bin"))
-            makeUnwritable(File(usr, "lib"))
-            makeUnwritable(File(usr, "share"))
+            // W^X 策略调整（v4.6）：bin/lib/share 保持可写。
+            // 实测（见 docs/python-install-issue-report.md）：只读锁会阻断 dpkg 解包与
+            // postinst/pip 落盘，是 apt 安装失败的根因之一；exec 安全由 targetSdk=28
+            // 豁免保证。如需临时收紧可调用 [setRuntimeWritable](writable=false)。
 
             File(context.filesDir, MARKER).writeText(MARKER_VERSION)
             progress("Termux 环境就绪（$usr）")
@@ -486,6 +507,26 @@ object TermuxRuntime {
     }
 
     /**
+     * 安装 tpkg 到 $PREFIX/local/bin：搬迁前缀环境下的 deb 手动安装器
+     * （dpkg-deb -x + status 同步 + shebang 修正，见 assets/tpkg.sh）。
+     * 原生 apt 在 W^X 放开 + termux-exec 下已可正常工作（v4.6），
+     * tpkg 仅作为 ensureHarnessTools 的安装失败兜底保留。
+     */
+    private fun writeTpkgScript(context: Context, usr: File) {
+        try {
+            val dst = File(usr, "local/bin/tpkg")
+            dst.parentFile?.mkdirs()
+            context.assets.open(TPKG_ASSET).use { input ->
+                dst.outputStream().use { output -> input.copyTo(output) }
+            }
+            dst.setExecutable(true, false)
+            android.util.Log.i("TermuxRuntime", "tpkg installed")
+        } catch (t: Throwable) {
+            android.util.Log.w("TermuxRuntime", "writeTpkgScript failed: ${t.message}")
+        }
+    }
+
+    /**
      * 给交互式 login shell（TerminalActivity）写 apt/pkg 自动 W^X 切换函数：
      * 在终端里敲 `apt install` 时自动放开 bin/lib/share，命令结束恢复只读。
      * ConsoleActivity 的命令行进程不走 profile，已由应用层自动切换覆盖。
@@ -498,7 +539,8 @@ object TermuxRuntime {
             helper.writeText(
                 """
                 # 内置 Termux：apt/pkg 安装类命令自动放开 W^X，结束后恢复
-                __dsh_writable() { chmod -R u+w "${'$'}PREFIX/bin" "${'$'}PREFIX/lib" "${'$'}PREFIX/share" 2>/dev/null || true; }
+                # （v4.6 默认已放开：-w 短路避免在大目录树上空跑 chmod）
+                __dsh_writable() { [ -w "${'$'}PREFIX/lib" ] || chmod -R u+w "${'$'}PREFIX/bin" "${'$'}PREFIX/lib" "${'$'}PREFIX/share" 2>/dev/null || true; }
                 __dsh_restore() { chmod -R u-w "${'$'}PREFIX/bin" "${'$'}PREFIX/lib" "${'$'}PREFIX/share" 2>/dev/null || true; }
                 apt() {
                   case " ${'$'}* " in
@@ -546,6 +588,11 @@ object TermuxRuntime {
                 export EDITOR=nano
                 export PAGER=less
                 export MANPAGER=less
+
+                # 运行时翻译脚本 shebang 的官方前缀（postinst / pip 入口脚本依赖）
+                if [ -f "${'$'}PREFIX/lib/libtermux-exec-ld-preload.so" ]; then
+                  export LD_PRELOAD="${'$'}PREFIX/lib/libtermux-exec-ld-preload.so"
+                fi
 
                 alias ls='ls --color=auto'
                 alias ll='ls -AlhF --color=auto'
