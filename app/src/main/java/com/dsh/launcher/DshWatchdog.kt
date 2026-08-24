@@ -53,7 +53,10 @@ object DshWatchdog {
             return
         }
         try {
-            val p = ProcessBuilder("/system/bin/sh", script.absolutePath)
+            // v4.4 迁移：与 DshFlow.startDshWeb 一致，优先用内置 Termux bash 执行启动脚本
+            val bash = TermuxRuntime.bashPath(context)
+            val interpreter = if (bash.isFile) bash.absolutePath else "/system/bin/sh"
+            val p = ProcessBuilder(interpreter, script.absolutePath)
                 .redirectErrorStream(true)
                 .start()
             // 抛掉输出流防阻塞，让拉起动作异步完成

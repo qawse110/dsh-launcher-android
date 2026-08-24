@@ -156,6 +156,8 @@ object TermuxRuntime {
     ): Int = try {
         val pb = ProcessBuilder(bash, "-c", script)
         pb.redirectErrorStream(true)
+        // 可写工作目录：避免应用默认 cwd=/ 导致子命令相对路径 EACCES
+        env["HOME"]?.let { h -> pb.directory(File(h).apply { mkdirs() }) }
         val e = pb.environment()
         env.forEach { (k, v) -> e[k] = v }
         e.remove("LD_PRELOAD")

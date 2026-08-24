@@ -21,6 +21,10 @@ import kotlin.concurrent.thread
  *   4) 执行 stub-dsh.mjs（Android 兼容修复），后台启动 dsh web 并等待 HTTP 就绪
  *
  * 通过 onLog / onState / onDone 回调向调用方输出；busy 时幂等拒绝重复触发。
+ *
+ * v4.4 默认环境迁移：所有子命令默认经内置 Termux bash 执行（完整 Linux 用户态），
+ * bash 未就绪时自动回退系统 sh（不触发解压阻塞）；并为全部子进程指定可写工作目录，
+ * 修复应用进程默认 cwd=/ 导致的相对路径 EACCES（「路径权限不足」的主要来源）。
  */
 object DshFlow {
 
@@ -380,6 +384,9 @@ object DshFlow {
             "export TERM=xterm-256color\n" +
             (if (termuxReady) "export PREFIX=$termuxUsr\n" else "") +
             "export PATH=${nodeDir.absolutePath}/bin:${termuxPath}${File(ctx.filesDir, ".tools").absolutePath}/bin:/system/bin:/bin:/usr/bin\n" +
+            // 应用进程默认 cwd=/（不可写）：web 进程及其 bash 子命令的相对路径操作会
+            // EACCES，显式 cd 到可写 HOME（dsh 状态目录 files/.dsh 也在这里）
+            "cd \"${ctx.filesDir.absolutePath}\" || exit 1\n" +
             "if command -v nohup >/dev/null 2>&1; then\n" +
             "  nohup $nodeCmd > ${ctx.filesDir.absolutePath}/dsh-web.log 2>&1 &\n" +
             "else\n" +
@@ -388,7 +395,11 @@ object DshFlow {
             "echo DSH_WEB_PID=$!\n"
         )
         launcher.setExecutable(true)
-        exec(ctx, "/system/bin/sh ${launcher.absolutePath}") { onLog(it) }
+        // v4.4 迁移：launcher 优先交由内置 Termux bash 执行（完整用户态、nohup 必可用）；
+        // bash 未就绪时回退系统 sh（脚本保持 POSIX 兼容，两种解释器都能跑）
+        val launchShell =
+            if (TermuxRuntime.isBashReady(ctx)) TermuxRuntime.bashPath(ctx).absolutePath else "/system/bin/sh"
+        exec(ctx, "$launchShell ${launcher.absolutePath}") { onLog(it) }
         onLog(">> dsh web 已后台启动，等待 web 就绪（http://127.0.0.1:$WEB_PORT）…")
         return waitForWebReady(ctx, 90_000, onLog)
     }
@@ -473,20 +484,21 @@ object DshFlow {
 
     /**
      * 同步执行命令（阻塞直到结束），返回退出码；输出通过 onLine 实时回调。
-     * termux=true 时走内置 Termux bash（安装类命令临时放开 W^X）。
+     * v4.4 起默认走内置 Termux bash（termux=true，完整用户态 + 可写工作目录）；
+     * bash 未就绪时自动回退系统 sh。安装类命令临时放开 W^X。
      */
     fun exec(
         ctx: Context,
         raw: String,
         extraEnv: Map<String, String> = emptyMap(),
-        termux: Boolean = false,
+        termux: Boolean = true,
         onLine: (String) -> Unit = {}
     ): Int {
         AppLog.i("DshFlow", "cmd: $raw")
         val termuxReady = termux && TermuxRuntime.isBashReady(ctx)
         val wantsWrite = termuxReady && looksLikePackageInstall(raw)
         return try {
-            // 用户命令用内置 Termux bash；内部 flow 命令仍用系统 sh（避免自动解压拖慢 dsh）
+            // v4.4 迁移：命令统一走内置 Termux bash；未就绪回退系统 sh（不会触发解压阻塞）
             val shell = if (termuxReady) TermuxRuntime.bashPath(ctx).absolutePath else "/system/bin/sh"
             if (wantsWrite) {
                 onLine(">> 检测到安装类命令：临时放开 bin/lib/share 写权限…")
@@ -494,6 +506,11 @@ object DshFlow {
             }
             val pb = ProcessBuilder(shell, "-c", raw)
             pb.redirectErrorStream(true)
+            // Android 应用进程默认 cwd=/（不可写）：子命令相对路径读写会 EACCES，
+            // 显式指定可写工作目录（termux 模式 → termux home，否则 files/tmp）
+            pb.directory(
+                (if (termuxReady) TermuxRuntime.home(ctx) else File(ctx.filesDir, "tmp")).apply { mkdirs() }
+            )
             val env = pb.environment()
             if (termuxReady) {
                 val usr = TermuxRuntime.prefix(ctx).absolutePath
@@ -508,7 +525,12 @@ object DshFlow {
                 env["HOME"] = home
                 env["TERM"] = "xterm-256color"
                 env["LANG"] = "C.UTF-8"
-                env["LD_LIBRARY_PATH"] = "$usr/lib"
+                // 内置 node 也可能经此分支执行：LD_LIBRARY_PATH 必须含 node/lib（在前，
+                // 保证 node 优先解析自带的 openssl/zlib），termux usr/lib 兜底
+                env["LD_LIBRARY_PATH"] = listOf(
+                    File(ctx.filesDir, "node/lib").absolutePath,
+                    "$usr/lib"
+                ).joinToString(":")
                 env["TMPDIR"] = tmp
                 env.remove("LD_PRELOAD")
                 env["OPENSSL_CONF"] = "/dev/null"

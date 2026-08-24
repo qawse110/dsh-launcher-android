@@ -1094,6 +1094,8 @@ class PluginManagerActivity : AppCompatActivity() {
         return try {
             val pb = ProcessBuilder("/system/bin/sh", "-c", cmd)
             pb.redirectErrorStream(true)
+            // 可写工作目录：插件健康检查/重置命令的相对路径操作不受 cwd=/ 影响
+            pb.directory(File(filesDir, "tmp").apply { mkdirs() })
             val e = pb.environment()
             env.forEach { (k, v) -> e[k] = v }
             val p = pb.start()
