@@ -51,6 +51,8 @@ class StatusBridgeService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        // 清理 v4.6 及之前无轮转的遗留心跳日志（新日志走 files/logs/heartbeat.log）
+        runCatching { File(filesDir, "status-bridge-heartbeat.log").delete() }
         startForeground(NOTIFICATION_ID, buildForegroundNotification("正在连接 dsh…"))
         overlayManager = BridgeOverlayManager(
             this,
@@ -236,29 +238,45 @@ class StatusBridgeService : Service() {
      *  轮询路径 5 秒节流（60 次/分钟的 flash 写盘纯属磨损，诊断价值不变）；
      *  created/started/destroyed 等生命周期事件用 force=true 立即落盘。 */
     private var lastHeartbeatAt = 0L
+
+    /** 心跳落盘专用单线程（review R1.5：主线程同步 I/O → 后台化；日志走 FileLog 轮转）。 */
+    private val heartbeatIo = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "heartbeat-io").apply { isDaemon = true }
+    }
+
     private fun writeHeartbeat(status: String, text: String, note: String? = null, force: Boolean = false) {
         val now = System.currentTimeMillis()
         if (!force && now - lastHeartbeatAt < 5_000L) return
         lastHeartbeatAt = now
-        try {
-            val f = File(filesDir, "status-bridge-heartbeat.json")
-            val obj = JSONObject()
-            obj.put("ts", System.currentTimeMillis())
-            obj.put("status", status)
-            obj.put("text", text.take(80))
-            obj.put("note", note ?: "")
-            obj.put("overlayExists", overlayManager?.hasOverlay() == true)
-            obj.put("running", running.get())
-            f.writeText(obj.toString())
+        // 状态快照在调用线程采集，落盘移交后台
+        val overlayOk = overlayManager?.hasOverlay() == true
+        val runningFlag = running.get()
+        heartbeatIo.execute {
+            try {
+                // 原子写：先 tmp 再改名，避免 watchdog 读到半截 JSON
+                val f = File(filesDir, "status-bridge-heartbeat.json")
+                val tmp = File(filesDir, "status-bridge-heartbeat.json.tmp")
+                tmp.writeText(
+                    JSONObject()
+                        .put("ts", now)
+                        .put("status", status)
+                        .put("text", text.take(80))
+                        .put("note", note ?: "")
+                        .put("overlayExists", overlayOk)
+                        .put("running", runningFlag)
+                        .toString()
+                )
+                f.delete()
+                tmp.renameTo(f)
 
-            val log = File(filesDir, "status-bridge-heartbeat.log")
-            log.appendText(
-                "${System.currentTimeMillis()} | $status | ${text.take(80)} | ${note ?: ""} | " +
-                    "overlayExists=${overlayManager?.hasOverlay() == true} " +
-                    "running=${running.get()}\n"
-            )
-        } catch (e: Exception) {
-            // 诊断文件写失败不影响主流程
+                // 追加日志改走 FileLog：可读时间戳 + 512KB 轮转（原实现无上限增长）
+                FileLog.log(
+                    this@StatusBridgeService, "heartbeat.log",
+                    "$status | ${text.take(80)} | ${note ?: ""} | overlay=$overlayOk running=$runningFlag"
+                )
+            } catch (_: Exception) {
+                // 诊断文件写失败不影响主流程
+            }
         }
     }
 

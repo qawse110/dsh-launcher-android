@@ -128,7 +128,8 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        handler.removeCallbacks(pollRunnable)
+        // 清空全部待执行回调（pollRunnable + 延迟 beginFlow 等），防销毁后触达视图/流程
+        handler.removeCallbacksAndMessages(null)
     }
 
     /** 冷启动自动流转：已在跑→直接进 WebUI；已装→自动快速启动；未装→自动完整安装。 */
@@ -143,6 +144,7 @@ class MainActivity : AppCompatActivity() {
             val installed = DshFlow.isInstalled(this)
             val up = installed && DshFlow.isWebUp()
             handler.post {
+                if (isFinishing || isDestroyed) return@post
                 when {
                     up -> { applyPhase(Phase.RUNNING); openWeb() }
                     installed -> beginFlow(DshFlow.Mode.START_ONLY)

@@ -35,7 +35,8 @@ object StatusBridgeAlerts {
         val now = System.currentTimeMillis()
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         if (now - prefs.getLong(LAST_ALERT_AT, 0L) < DEDUPE_MS) return
-        prefs.edit().putLong(LAST_ALERT_AT, now).commit()
+        // 主线程回调路径：apply 异步落盘即可（内存值即时可见，去重语义不变）
+        prefs.edit().putLong(LAST_ALERT_AT, now).apply()
 
         if (prefs.getBoolean("sound_enabled", true)) {
             playFinishSound()
