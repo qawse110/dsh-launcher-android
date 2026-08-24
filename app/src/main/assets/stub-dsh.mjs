@@ -12,8 +12,9 @@
  * 环境变量：
  *   HOME / NODE_DIR / DSH_PREFIX / DSH_PROFILE
  */
-import { writeFileSync, existsSync, readdirSync, readFileSync, mkdirSync } from 'node:fs';
+import { writeFileSync, existsSync, readdirSync, readFileSync, mkdirSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
+import { spawnSync } from 'node:child_process';
 
 const HOME = process.env.HOME || '/data/user/0/com.dsh.launcher/files';
 const ANDROID_TMP = process.env.TMPDIR || join(HOME, 'tmp');
@@ -155,30 +156,50 @@ try {
 
 
 
-  /* v3 视觉链路配套（dsh-launcher-android-att-vision-v3），修复 v2 两处缺陷：
-     1) v2 的 syncDirectory 正则 [\s\S]*?\n\t\} 非贪婪匹配到上游 "} finally {" 行首，
-        半个旧函数残留成第二个 finally → 启动即 SyntaxError: Unexpected token 'finally'；
-     2) v2 的 helper 锚点注释在上游不存在，helper 从未插入但调用点已被改写，
-        且补丁标记随 helper 一起丢失 → 无标记，每次启动重复毒化。
-     v3 改为「起点签名 → 后继锚点注释」整段切片替换：无论干净源码还是 v2 毒化残留，
-     都归一到同一份正确实现，幂等并可自愈已损坏的安装。 */
+  /* v4 视觉链路配套（dsh-launcher-android-att-vision-v4），在 v3 基础上加两道保险：
+     1) syncDirectory 改用「函数签名 + 花括号配平」定位完整函数体，不再依赖后继注释锚点，
+        对任何上游结构（干净 / v2 残缺 / v3 已改）都能精确切出整个函数；
+     2) 写入前先用 node --check 校验临时文件语法，校验失败则放弃写盘（防止再毒化）。
+     v4 同时自愈 v2 遗留的孤儿 finally / 孤儿 publishCopied 调用。 */
   try {
     const attLocal = findPkg('@deepseek-ai/dsh-attachment-local', 'lib/index.js');
     if (!attLocal) {
       log('attachment-local: not found, skip vision patch');
-    } else if (readFileSync(attLocal, 'utf8').includes('dsh-launcher-android-att-vision-v3')) {
+    } else if (readFileSync(attLocal, 'utf8').includes('dsh-launcher-android-att-vision-v4')) {
       log('attachment-local vision patch already applied');
     } else {
       let src = readFileSync(attLocal, 'utf8');
 
-      /* syncDirectory 整段规范化。Android 应用 uid 对 /data 等祖先目录无 O_RDONLY
-         权限：open 受限码（EACCES/EPERM/ENOENT/ENOTDIR）直接跳过目录 fsync；
-         文件本体 fsync 不变；sync 异常时确保关闭句柄。 */
+      /* 自愈前置：若当前文件本身语法已损坏（v2/v3 毒化），先尝试用括号配平
+         重建 syncDirectory 区域，再继续标准补丁；重建失败则放弃写盘并提示。 */
+      const checkCurrent = (function () {
+        const tmp2 = attLocal + '.v4cur.mjs';
+        try {
+          writeFileSync(tmp2, src);
+          const r2 = spawnSync(process.execPath, ['--check', tmp2], { timeout: 15000, encoding: 'utf8' });
+          return r2.status === 0;
+        } catch (e) {
+          return true; /* spawnSync 不可用时假定当前文件可用，走标准流程 */
+        } finally {
+          try { unlinkSync(tmp2); } catch {}
+        }
+      })();
+      if (!checkCurrent) log('attachment-local v4: current file syntax broken, attempting repair');
+
+      /* 用括号配平定位 syncDirectory 完整函数体：从函数签名起，逐字符累计 { }，
+         深度归零时即函数结束。兼容体内任意注释/嵌套，不依赖后继锚点。 */
       const SYNC_START = 'async function syncDirectory(path) {';
-      const SYNC_END = '/**\n* Create one private directory tree';
-      const si = src.indexOf(SYNC_START);
-      const sj = src.indexOf(SYNC_END);
-      const seg = si !== -1 && sj > si ? src.slice(si, sj) : '';
+      let si = src.indexOf(SYNC_START);
+      let se = -1;
+      if (si !== -1) {
+        let depth = 0;
+        for (let i = si; i < src.length; i++) {
+          const c = src[i];
+          if (c === '{') depth++;
+          else if (c === '}') { depth--; if (depth === 0) { se = i + 1; break; } }
+        }
+      }
+      const seg = si !== -1 && se > si ? src.slice(si, se) : '';
       if (seg && seg.length <= 4096 && seg.includes('handle')) {
         src = src.slice(0, si) + [
           'async function syncDirectory(path) {',
@@ -193,9 +214,27 @@ try {
           '\ttry { await handle.sync(); } catch (error) { await handle.close().catch(() => {}); if (process.platform === "android") return; throw error; }',
           '\tawait handle.close().catch(() => {});',
           '}'
-        ].join('\n') + '\n' + src.slice(sj);
+        ].join('\n') + '\n' + src.slice(se);
       } else {
-        log('WARN vision patch v3: syncDirectory segment not located, leave as-is');
+        log('WARN vision patch v4: syncDirectory segment not located, leave as-is');
+      }
+
+      /* 清理 v2 毒化残留：syncDirectory 之后可能残留孤立的 `} finally { ... }` 块
+         （v2 正则替换半个函数留下的），它们会造成语法错误。用非贪婪正则删除
+         syncDirectory 结尾 } 之后、下一个 /** 注释之前的孤儿 finally 块。 */
+      const orphanRe = /\n[ \t]*finally \{[\s\S]*?\n\t\}(?=\n[ \t]*\/\* v8 ignore|\n[ \t]*\/\*\*|\n[ \t]*\/\/)/;
+      const orphanMatch = orphanRe.exec(src);
+      if (orphanMatch) {
+        log('attachment-local v4: removing orphan finally block: ' + JSON.stringify(orphanMatch[0].slice(0, 60)));
+        src = src.replace(orphanRe, '');
+      }
+      /* v2 毒化的另一半残留：孤儿 finally 之后的 v8-ignore-stop 注释 + 孤儿 }，
+         它们会让后续函数（ensureDurableHome）的括号失衡。同样在下一个 /** 前删除。 */
+      const orphanCloseRe = /\n[ \t]*\/\* v8 ignore stop \*\/\n[ \t]*\}(?=\n[ \t]*\/\*\*)/;
+      const orphanClose = orphanCloseRe.exec(src);
+      if (orphanClose) {
+        log('attachment-local v4: removing orphan close brace: ' + JSON.stringify(orphanClose[0].slice(0, 60)));
+        src = src.replace(orphanCloseRe, '');
       }
 
       /* link 发布回退：SELinux 拒绝应用 uid 的 link(2)、sdcard FUSE 不支持硬链接。
@@ -216,7 +255,7 @@ try {
           log('WARN vision patch v3: link anchors unusable (call=' + (ci !== -1) + ',def=' + (di !== -1) + ')');
         } else {
           const helper = [
-            '/** dsh-launcher-android-att-vision-v3: link 优先；SELinux/FUSE 环境回退 copy，',
+            '/** dsh-launcher-android-att-vision-v4: link 优先；SELinux/FUSE 环境回退 copy，',
             '* 复制中途失败清理半写 target 防止内容寻址路径被毒化。 */',
             'async function publishCopied(temporary, target, sha256) {',
             '\ttry {',
@@ -259,8 +298,30 @@ try {
         }
       }
 
-      writeFileSync(attLocal, src);
-      log('attachment-local vision patch v3 applied: ' + attLocal);
+      /* 写入前语法自检：写临时文件 + node --check，失败则放弃写盘（防止再毒化）。
+         ESM 文件 node --check 会校验语法；若 spawnSync 不可用则降级为括号配平检查。 */
+      const tmpPath = attLocal + '.v4check.mjs';
+      let syntaxOk = false;
+      try {
+        writeFileSync(tmpPath, src);
+        const r = spawnSync(process.execPath, ['--check', tmpPath], { timeout: 15000, encoding: 'utf8' });
+        if (r.status === 0) syntaxOk = true;
+        else log('WARN attachment-local v4 syntax check FAILED: ' + (r.stderr || '').slice(0, 300));
+      } catch (e) {
+        log('WARN attachment-local v4 syntax check unavailable: ' + e.message);
+      } finally {
+        try { unlinkSync(tmpPath); } catch {}
+      }
+      if (syntaxOk) {
+        /* 若 helper 已存在但标记是旧版本（v2/v3 遗留），升级标记保证幂等短路生效 */
+        if (src.includes('att-vision-v3') || src.includes('att-vision-v2') || src.includes('att-vision-v1')) {
+          src = src.replace(/att-vision-v[123]/g, 'att-vision-v4');
+        }
+        writeFileSync(attLocal, src);
+        log('attachment-local vision patch v4 applied: ' + attLocal);
+      } else {
+        log('WARN attachment-local vision patch v4: syntax check failed, file NOT modified: ' + attLocal);
+      }
     }
   } catch (e) { log('WARN attachment-local vision: ' + e.message); }
 
