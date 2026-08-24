@@ -28,7 +28,7 @@
         android:usesCleartextTraffic="true">
 
         <activity
-            android:name=".MainActivity"
+            android:name=".ui.MainActivity"
             android:exported="true"
             android:label="@string/app_name">
             <intent-filter>
@@ -38,7 +38,7 @@
         </activity>
 
         <activity
-            android:name=".WebViewActivity"
+            android:name=".ui.WebViewActivity"
             android:exported="true"
             android:launchMode="singleTask"
             android:configChanges="orientation|screenSize|keyboardHidden">
@@ -52,41 +52,41 @@
         </activity>
 
         <activity
-            android:name=".TerminalActivity"
+            android:name=".ui.TerminalActivity"
             android:exported="false"
             android:configChanges="orientation|screenSize|keyboardHidden"
             android:windowSoftInputMode="adjustResize" />
         <activity
-            android:name=".ConsoleActivity"
+            android:name=".ui.ConsoleActivity"
             android:exported="true"
             android:configChanges="orientation|screenSize|keyboardHidden"
             android:windowSoftInputMode="adjustResize" />
         <activity
-            android:name=".PluginManagerActivity"
+            android:name=".ui.PluginManagerActivity"
             android:exported="false"
             android:configChanges="orientation|screenSize|keyboardHidden"
             android:windowSoftInputMode="adjustResize" />
         <activity
-            android:name=".OverlaySettingsActivity"
+            android:name=".ui.OverlaySettingsActivity"
             android:exported="false"
             android:configChanges="orientation|screenSize|keyboardHidden"
             android:windowSoftInputMode="adjustResize" />
 
         <service
-            android:name=".BuildKeepAliveService"
+            android:name=".service.BuildKeepAliveService"
             android:exported="false" />
         <service
-            android:name=".StatusBridgeService"
+            android:name=".service.StatusBridgeService"
             android:exported="false"
             android:foregroundServiceType="dataSync"
             android:stopWithTask="false" />
         <!-- 曾用 android:process=":status_bridge" 独立进程：SharedPreferences 跨进程
              不保证可见（设置页改开关服务进程读不到、a11y 让位标志失灵），已并回主进程。 -->
         <receiver
-            android:name=".BridgeWatchdogReceiver"
+            android:name=".service.BridgeWatchdogReceiver"
             android:exported="false" />
         <service
-            android:name=".KeepAliveAccessibilityService"
+            android:name=".service.KeepAliveAccessibilityService"
             android:exported="true"
             android:label="@string/app_name"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">

@@ -1,4 +1,4 @@
-package com.dsh.launcher
+package com.dsh.launcher.ui
 
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -18,6 +18,12 @@ import com.termux.view.TerminalView
 import com.termux.view.TerminalViewClient
 import java.io.File
 import kotlin.concurrent.thread
+import com.dsh.launcher.core.*
+import com.dsh.launcher.overlay.*
+import com.dsh.launcher.service.*
+import com.dsh.launcher.tts.*
+import com.dsh.launcher.ui.*
+import com.dsh.launcher.R
 
 /**
  * 内置终端：基于 Termux terminal-view/emulator，在单 App 内提供真实 PTY shell。

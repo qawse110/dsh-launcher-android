@@ -1,4 +1,4 @@
-package com.dsh.launcher
+package com.dsh.launcher.overlay
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -9,6 +9,12 @@ import android.content.Intent
 import android.media.AudioManager
 import android.media.ToneGenerator
 import android.os.Build
+import com.dsh.launcher.core.*
+import com.dsh.launcher.overlay.*
+import com.dsh.launcher.service.*
+import com.dsh.launcher.tts.*
+import com.dsh.launcher.ui.*
+import com.dsh.launcher.R
 
 /**
  * dsh 输出完成提醒：提示音 + 通知，两者完全独立。

@@ -1,4 +1,4 @@
-package com.dsh.launcher
+package com.dsh.launcher.ui
 
 import android.content.Context
 import android.content.Intent
@@ -22,6 +22,12 @@ import com.google.android.material.card.MaterialCardView
 import com.google.android.material.color.DynamicColors
 import com.google.android.material.switchmaterial.SwitchMaterial
 import java.io.File
+import com.dsh.launcher.core.*
+import com.dsh.launcher.overlay.*
+import com.dsh.launcher.service.*
+import com.dsh.launcher.tts.*
+import com.dsh.launcher.ui.*
+import com.dsh.launcher.R
 
 /**
  * dsh 状态桥接配置页：

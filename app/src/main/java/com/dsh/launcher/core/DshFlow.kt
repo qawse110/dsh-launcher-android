@@ -1,4 +1,4 @@
-package com.dsh.launcher
+package com.dsh.launcher.core
 
 import android.content.Context
 import android.content.Intent
@@ -6,6 +6,12 @@ import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import kotlin.concurrent.thread
+import com.dsh.launcher.core.*
+import com.dsh.launcher.overlay.*
+import com.dsh.launcher.service.*
+import com.dsh.launcher.tts.*
+import com.dsh.launcher.ui.*
+import com.dsh.launcher.R
 
 /**
  * dsh 启动流程引擎（无 UI 依赖）。
@@ -33,6 +39,10 @@ object DshFlow {
     private val busy = java.util.concurrent.atomic.AtomicBoolean(false)
 
     const val WEB_PORT = 3080
+
+    /** 统一日志文件名（files/logs/ 下，见 [FileLog]）。 */
+    const val FLOW_LOG = "flow.log"
+    const val WEB_LOG = "web.log"
 
     fun dshCli(ctx: Context): File =
         File(File(ctx.filesDir, "dsh-prefix"), "node_modules/@deepseek-ai/dsh/lib/bin.js")
@@ -72,6 +82,8 @@ object DshFlow {
                 onLog("FAIL: ${t.message}")
                 onState?.invoke(if (mode == Mode.INSTALL_ONLY) "出错" else "启动失败")
             } finally {
+                // 流程结束一次性导出流程日志到共享目录（替代旧的逐行 /sdcard 双写）
+                FileLog.exportToShared(ctx, FLOW_LOG)
                 busy.set(false)
                 onDone?.invoke(ok)
             }
@@ -80,12 +92,11 @@ object DshFlow {
 
     /** 流程主体（阻塞，后台线程调用）。 */
     private fun runFlow(ctx: Context, mode: Mode, forceFullInstall: Boolean, onLog: (String) -> Unit, onState: ((String) -> Unit)?): Boolean {
-        // 核心日志写私有目录（无需存储权限，run-as 可读）；共享目录尽力而为
-        val flowLog = File(ctx.filesDir, "dsh-flow.log")
-        val sharedFlowLog = File("/sdcard/Download/DshLauncher/dsh-flow.log")
+        // 统一文件日志：files/logs/flow.log（可读时间戳 + 自动轮转）；
+        // 共享目录改为流程结束时一次性导出，不再逐行双写 /sdcard
+        FileLog.reset(ctx, FLOW_LOG)
         fun fl(msg: String) {
-            runCatching { flowLog.appendText("${System.currentTimeMillis()} $msg\n") }
-            runCatching { sharedFlowLog.appendText("${System.currentTimeMillis()} $msg\n") }
+            FileLog.log(ctx, FLOW_LOG, msg)
             onLog(msg)
         }
 
@@ -107,8 +118,6 @@ object DshFlow {
 
         val nodeDir = NodeRuntime.ensureExtracted(ctx)
         val apkVer = AssetSync.apkVersion(ctx)
-        flowLog.parentFile?.mkdirs()
-        runCatching { flowLog.writeText("") }
         fl("OK 1/4 node=$nodeDir")
         val dshPrefix = File(ctx.filesDir, "dsh-prefix")
 
@@ -405,7 +414,7 @@ object DshFlow {
             // EACCES，显式 cd 到可写 HOME（dsh 状态目录 files/.dsh 也在这里）
             "cd \"${ctx.filesDir.absolutePath}\" || exit 1\n" +
             // Termux bash 必带 nohup，直接后台化
-            "nohup $nodeCmd > ${ctx.filesDir.absolutePath}/dsh-web.log 2>&1 &\n" +
+            "nohup $nodeCmd > ${FileLog.dir(ctx).absolutePath}/$WEB_LOG 2>&1 &\n" +
             "echo DSH_WEB_PID=$!\n"
         )
         launcher.setExecutable(true)
@@ -457,7 +466,7 @@ object DshFlow {
         true
     }
 
-    /** 轮询等待 dsh web 的 HTTP 真正可访问，超时后打印 dsh-web.log 尾部。
+    /** 轮询等待 dsh web 的 HTTP 真正可访问，超时后打印 web 日志尾部。
      *  前 6 秒每 150ms 探测一次（node 冷启动通常 1~3s，尽快感知就绪），之后放宽到 500ms。 */
     private fun waitForWebReady(ctx: Context, timeoutMs: Long, onLog: (String) -> Unit): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMs
@@ -473,7 +482,7 @@ object DshFlow {
             Thread.sleep(if (elapsed < 6_000) 150 else 500)
         }
         onLog("✗ dsh web 未在 ${timeoutMs / 1000} 秒内就绪，日志尾部：")
-        appendLogTail(File(ctx.filesDir, "dsh-web.log"), 25, onLog)
+        appendLogTail(File(FileLog.dir(ctx), WEB_LOG), 25, onLog)
         return false
     }
 

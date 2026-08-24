@@ -1,4 +1,4 @@
-package com.dsh.launcher
+package com.dsh.launcher.ui
 
 import android.os.Bundle
 import android.os.Handler
@@ -17,6 +17,12 @@ import com.google.android.material.color.DynamicColors
 import org.json.JSONObject
 import java.io.File
 import kotlin.concurrent.thread
+import com.dsh.launcher.core.*
+import com.dsh.launcher.overlay.*
+import com.dsh.launcher.service.*
+import com.dsh.launcher.tts.*
+import com.dsh.launcher.ui.*
+import com.dsh.launcher.R
 
 /**
  * 插件管理页 —— 整页重构后的信息架构：

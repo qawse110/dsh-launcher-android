@@ -1,10 +1,16 @@
-package com.dsh.launcher
+package com.dsh.launcher.core
 
 import android.content.Context
 import org.apache.commons.compress.archivers.zip.ZipFile
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.Paths
+import com.dsh.launcher.core.*
+import com.dsh.launcher.overlay.*
+import com.dsh.launcher.service.*
+import com.dsh.launcher.tts.*
+import com.dsh.launcher.ui.*
+import com.dsh.launcher.R
 
 /**
  * 内置 Termux 用户环境：从 APK assets 解压官方 Termux bootstrap（aarch64）到应用私有目录。

@@ -1,4 +1,4 @@
-package com.dsh.launcher
+package com.dsh.launcher.ui
 
 import android.content.Context
 import android.content.res.ColorStateList
@@ -12,6 +12,12 @@ import android.widget.TextView
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.card.MaterialCardView
 import com.google.android.material.color.MaterialColors
+import com.dsh.launcher.core.*
+import com.dsh.launcher.overlay.*
+import com.dsh.launcher.service.*
+import com.dsh.launcher.tts.*
+import com.dsh.launcher.ui.*
+import com.dsh.launcher.R
 
 /**
  * Modern UI helpers used by all programmatically-built screens.

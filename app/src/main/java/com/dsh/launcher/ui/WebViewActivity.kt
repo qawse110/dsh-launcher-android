@@ -1,4 +1,4 @@
-package com.dsh.launcher
+package com.dsh.launcher.ui
 
 import android.annotation.SuppressLint
 import android.content.res.ColorStateList
@@ -20,6 +20,12 @@ import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import com.google.android.material.color.DynamicColors
+import com.dsh.launcher.core.*
+import com.dsh.launcher.overlay.*
+import com.dsh.launcher.service.*
+import com.dsh.launcher.tts.*
+import com.dsh.launcher.ui.*
+import com.dsh.launcher.R
 
 /**
  * 内嵌 dsh Web UI 的界面。

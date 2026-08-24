@@ -1,4 +1,4 @@
-package com.dsh.launcher
+package com.dsh.launcher.overlay
 
 import android.content.Context
 import android.graphics.Bitmap
@@ -7,6 +7,12 @@ import android.os.Environment
 import org.json.JSONObject
 import java.io.File
 import java.io.InputStream
+import com.dsh.launcher.core.*
+import com.dsh.launcher.overlay.*
+import com.dsh.launcher.service.*
+import com.dsh.launcher.tts.*
+import com.dsh.launcher.ui.*
+import com.dsh.launcher.R
 
 /**
  * Codex 桌宠包加载器。

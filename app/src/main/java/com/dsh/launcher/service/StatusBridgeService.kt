@@ -1,4 +1,4 @@
-package com.dsh.launcher
+package com.dsh.launcher.service
 
 import android.app.AlarmManager
 import android.app.Notification
@@ -21,6 +21,12 @@ import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.atomic.AtomicBoolean
+import com.dsh.launcher.core.*
+import com.dsh.launcher.overlay.*
+import com.dsh.launcher.service.*
+import com.dsh.launcher.tts.*
+import com.dsh.launcher.ui.*
+import com.dsh.launcher.R
 
 /**
  * dsh-status-bridge 的 Android 桥接服务：
@@ -329,27 +335,3 @@ class StatusBridgeService : Service() {
     }
 }
 
-/** 看门狗：桥接服务被系统销毁后，定时检查心跳文件并尝试重新拉起服务。 */
-class BridgeWatchdogReceiver : BroadcastReceiver() {
-    override fun onReceive(context: Context, intent: Intent?) {
-        if (intent?.action != StatusBridgeService.WATCHDOG_ACTION) return
-        // 用户显式停止过（「停止 dsh 服务」）就不再自续、也不拉起，
-        // 否则 watchdog 会永远唤醒；下次启动服务时 scheduleWatchdog 会重新接上链条
-        val expectRunning = context.getSharedPreferences("dsh_keepalive", Context.MODE_PRIVATE)
-            .getBoolean("running", false)
-        if (!expectRunning) return
-        StatusBridgeService.scheduleWatchdog(context)
-        val alive = try {
-            val f = File(context.filesDir, "status-bridge-heartbeat.json")
-            val obj = JSONObject(f.readText())
-            val running = obj.optBoolean("running", false)
-            val ts = obj.optLong("ts", 0L)
-            running && System.currentTimeMillis() - ts < 60_000L
-        } catch (e: Exception) {
-            false
-        }
-        if (!alive) {
-            StatusBridgeService.start(context)
-        }
-    }
-}

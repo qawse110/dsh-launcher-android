@@ -1,4 +1,4 @@
-package com.dsh.launcher
+package com.dsh.launcher.core
 
 import android.content.Context
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry
@@ -6,6 +6,12 @@ import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
 import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream
 import java.io.File
 import java.io.InputStream
+import com.dsh.launcher.core.*
+import com.dsh.launcher.overlay.*
+import com.dsh.launcher.service.*
+import com.dsh.launcher.tts.*
+import com.dsh.launcher.ui.*
+import com.dsh.launcher.R
 
 /**
  * 内置 Node 运行时：从 assets 解压 Termux Node (aarch64, bionic) 到应用私有目录。

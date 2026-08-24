@@ -1,8 +1,14 @@
-package com.dsh.launcher
+package com.dsh.launcher.core
 
 import android.content.Context
 import android.os.Build
 import java.io.File
+import com.dsh.launcher.core.*
+import com.dsh.launcher.overlay.*
+import com.dsh.launcher.service.*
+import com.dsh.launcher.tts.*
+import com.dsh.launcher.ui.*
+import com.dsh.launcher.R
 
 /**
  * APK 内置资产同步统一工具。

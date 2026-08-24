@@ -1,4 +1,4 @@
-package com.dsh.launcher
+package com.dsh.launcher.ui
 
 import android.content.Context
 import android.content.Intent
@@ -23,6 +23,12 @@ import androidx.appcompat.app.AppCompatActivity
 import com.google.android.material.color.DynamicColors
 import java.io.File
 import kotlin.concurrent.thread
+import com.dsh.launcher.core.*
+import com.dsh.launcher.overlay.*
+import com.dsh.launcher.service.*
+import com.dsh.launcher.tts.*
+import com.dsh.launcher.ui.*
+import com.dsh.launcher.R
 
 /**
  * DeepSeek Harness 启动器主界面 —— 「打开即用」的自动启动流。
@@ -246,7 +252,7 @@ class MainActivity : AppCompatActivity() {
             )
             Phase.ERROR -> Triple(
                 "启动未完成",
-                "可重试；详情见「控制台」日志（install_log.txt / dsh-web.log）",
+                "可重试；详情见「控制台」日志（files/logs/ 下 flow.log / web.log）",
                 Ui.DANGER
             )
         }
