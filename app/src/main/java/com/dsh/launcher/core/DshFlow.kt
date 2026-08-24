@@ -47,6 +47,15 @@ object DshFlow {
     /** web 启动脚本模板（assets 内，@TOKENS@ 由 [TermuxEnv] 渲染）。 */
     private const val WEB_LAUNCHER_TPL = "web-launcher.sh.tpl"
 
+    /** 模板资产读取失败时的兜底内联模板（内容与 tpl 保持一致）。 */
+    private val DEFAULT_WEB_LAUNCHER_TPL = """
+        #!/data/user/0/com.dsh.launcher/t/usr/bin/bash
+        @EXPORTS@
+        cd "@HOME@" || exit 1
+        nohup @NODE_CMD@ > "@LOG_FILE@" 2>&1 &
+        echo DSH_WEB_PID=${'$'}!
+        """.trimIndent()
+
     fun dshCli(ctx: Context): File =
         File(File(ctx.filesDir, "dsh-prefix"), "node_modules/@deepseek-ai/dsh/lib/bin.js")
 
