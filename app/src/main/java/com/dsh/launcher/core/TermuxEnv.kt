@@ -6,7 +6,7 @@ import java.io.File
 /**
  * 子进程环境的唯一工厂（架构方案 P0-1）。
  *
- * 背景：PATH/LD_*/HOME/TMPDIR 曾在 6 处独立拼接，并因此发生过两次真实漂移事故
+ * 背景：PATH、LD_LIBRARY_PATH、HOME、TMPDIR 曾在 6 处独立拼接，并因此发生过两次真实漂移事故
  * （exec 分支漏拼 node/lib 导致 node 起不来；termux-exec 的 LD_PRELOAD 需多点注入易漏）。
  *
  * 约束：环境变量字面量只允许出现在本文件，以及 NodeRuntime（node 本地前缀环境，
