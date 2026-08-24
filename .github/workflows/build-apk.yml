@@ -2,6 +2,15 @@ name: Build APK
 
 on:
   workflow_dispatch:
+    inputs:
+      variant:
+        description: '构建变体'
+        type: choice
+        default: debug
+        options:
+          - debug
+          - release
+          - both
   push:
     branches:
       - main
@@ -29,10 +38,30 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x gradlew
 
-      - name: Build release APK
-        run: ./gradlew :app:assembleRelease --no-daemon
+      - name: Build APKs
+        run: |
+          VARIANT="${{ inputs.variant || 'release' }}"
+          case "$VARIANT" in
+            debug)
+              ./gradlew :app:assembleDebug --no-daemon ;;
+            release)
+              ./gradlew :app:assembleRelease --no-daemon ;;
+            both)
+              ./gradlew :app:assembleDebug :app:assembleRelease --no-daemon ;;
+            *)
+              echo "unknown variant: $VARIANT"; exit 1 ;;
+          esac
 
-      - name: Upload APK artifact
+      - name: Upload debug APK artifact
+        if: ${{ github.event_name == 'push' || inputs.variant == 'debug' || inputs.variant == 'both' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: ignore
+
+      - name: Upload release APK artifact
+        if: ${{ github.event_name == 'push' || inputs.variant == 'release' || inputs.variant == 'both' }}
         uses: actions/upload-artifact@v4
         with:
           name: app-release-apk
