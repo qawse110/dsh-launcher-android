@@ -749,11 +749,11 @@ class MainActivity : AppCompatActivity() {
                 }
                 val prebuilt = File(filesDir, "prebuilt.tgz")
                 if (AssetSync.copyAsset(this, "prebuilt.tgz", prebuilt)) {
-                    AssetSync.markSynced(File(filesDir, ".prebuilt-ok"), current)
+                    AssetSync.markSynced(this, "prebuilt", current)
                 }
                 val extraPlugins = File(filesDir, "extra-plugins")
                 if (AssetSync.copyAssetDir(this, "extra-plugins", extraPlugins, clearFirst = true)) {
-                    AssetSync.markSynced(File(filesDir, ".extra-plugins-ok"), current)
+                    AssetSync.markSynced(this, "extra-plugins", current)
                 }
                 val dshInstalled = File(filesDir, "plugins").exists() && File(filesDir, "dsh-prefix").exists()
                 if (dshInstalled) {
@@ -835,7 +835,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     /** 是否有内置 Node 解压完成标记。 */
-    private fun hasNodeMarker(): Boolean = File(filesDir, ".node-ok").exists()
+    private fun hasNodeMarker(): Boolean = MarkerStore.has(this, "node")
 
     /** 停止 dsh 服务：杀 node 相关进程 + 停保活服务 + 刷新状态。 */
     private fun stopDshAll() {

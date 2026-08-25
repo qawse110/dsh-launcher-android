@@ -34,8 +34,7 @@ object NodeRuntime {
     @Synchronized
     fun ensureExtracted(context: Context): File {
         val dir = File(context.filesDir, DIR)
-        val marker = File(context.filesDir, ".node-ok")
-        if (marker.exists()) return dir
+        if (MarkerStore.has(context, "node")) return dir
 
         dir.mkdirs()
         // 清理历史残留：旧版本/异常中断可能留下只读目录（W^X 取消写权限）
@@ -67,10 +66,10 @@ object NodeRuntime {
                 setReadable(true, false)
                 setExecutable(true, false)
             }
-            marker.writeText("ok")
+            MarkerStore.put(context, "node", "ok")
         } catch (t: Throwable) {
             runCatching { dir.deleteRecursively() }
-            runCatching { marker.delete() }
+            runCatching { MarkerStore.remove(context, "node") }
             throw t
         }
         return dir

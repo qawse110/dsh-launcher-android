@@ -160,3 +160,4 @@ WebView JS bridge 暴露面（未注册 JS 接口）经抽查未见明显风险�
 | R2 P1-5 Supervisor 归一 | ✅ 完成：期望态 + 冷却拉起单点；Watchdog/Receiver/BKS 接入 | 本提交 |
 | R2 P1-6 BridgeOverlayManager 拆分 | ⏸ 挂起（风险最大，需独立回归窗口） | — |
 | P0-2 keystore 出库 | ⏸ 待产品决策（签名影响） | — |
+| R2 P1-4 收尾：markers.json 迁移 | ✅ 完成：MarkerStore 单文件原子写 + 六种旧点文件一次性导入；AssetSync 改键值 API | 本提交 |

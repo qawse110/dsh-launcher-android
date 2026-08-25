@@ -14,13 +14,11 @@ import java.io.File
  */
 internal object PackageKit {
 
-    private const val TOOLS_MARKER = ".harness-tools-ok"
     private const val TOOLS_MARKER_VERSION = "4"
 
     /** Harness 附加工具是否已安装就绪。 */
-    fun ready(context: Context): Boolean = runCatching {
-        File(context.filesDir, TOOLS_MARKER).readText().trim() == TOOLS_MARKER_VERSION
-    }.getOrDefault(false)
+    fun ready(context: Context): Boolean =
+        MarkerStore.get(context, "harness-tools") == TOOLS_MARKER_VERSION
 
     /**
      * 确保工具齐备；一次 pkg 调用补齐缺失项，失败走 tpkg 兜底；
@@ -36,13 +34,12 @@ internal object PackageKit {
             ProfileWriter.writeInputRc(usr)
             if (ready(context)) return true
             val bash = TermuxRuntime.bashPath(context).absolutePath
-            val marker = File(context.filesDir, TOOLS_MARKER)
             // 环境基底统一由 Proc → TermuxEnv 提供，此处不再本地拼接（P0-1/P1-1）
             val env = emptyMap<String, String>()
             progress("检查 Harness 工具（git / ripgrep / file / curl / less）…")
             val requiredCheck = "command -v git >/dev/null 2>&1 && git --version >/dev/null 2>&1 && command -v rg >/dev/null 2>&1 && rg --version >/dev/null 2>&1 && command -v file >/dev/null 2>&1 && file --version >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 && curl --version >/dev/null 2>&1 && command -v less >/dev/null 2>&1 && less --version >/dev/null 2>&1"
             if (runBash(context, bash, requiredCheck, env, progress, timeoutSec = 120) == 0) {
-                marker.writeText(TOOLS_MARKER_VERSION)
+                MarkerStore.put(context, "harness-tools", TOOLS_MARKER_VERSION)
                 progress("Harness 工具已就绪（git / ripgrep / file / curl / less）")
                 return true
             }
@@ -95,7 +92,7 @@ internal object PackageKit {
                     if (File(usr, "bin/wget").isFile) add("wget")
                 }.joinToString(" + ")
                 if (readyNow) {
-                    marker.writeText(TOOLS_MARKER_VERSION)
+                    MarkerStore.put(context, "harness-tools", TOOLS_MARKER_VERSION)
                     progress("Harness 工具就绪（$extra）")
                 } else {
                     progress("WARN: Harness 工具未完全就绪（$extra），保留 marker 下次重试")

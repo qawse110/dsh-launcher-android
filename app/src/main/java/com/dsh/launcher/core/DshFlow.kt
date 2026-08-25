@@ -196,23 +196,21 @@ object DshFlow {
             return false
         }
         val prebuilt = File(ctx.filesDir, "prebuilt.tgz")
-        val prebuiltMarker = File(ctx.filesDir, ".prebuilt-ok")
-        if (AssetSync.isSynced(prebuiltMarker, prebuilt, apkVer)) {
+        if (AssetSync.isSynced(ctx, "prebuilt", prebuilt, apkVer)) {
             fl("  内置插件源已是最新，跳过复制")
         } else if (AssetSync.copyAsset(ctx, "prebuilt.tgz", prebuilt)) {
-            AssetSync.markSynced(prebuiltMarker, apkVer)
+            AssetSync.markSynced(ctx, "prebuilt", apkVer)
             fl("  内置插件源 ${prebuilt.length() / 1024 / 1024}MB")
         } else {
             fl("  WARN assets 无 prebuilt.tgz，继续使用已有插件源")
         }
         val extraPluginsDir = File(ctx.filesDir, "extra-plugins")
-        val extraMarker = File(ctx.filesDir, ".extra-plugins-ok")
-        if (AssetSync.isSynced(extraMarker, extraPluginsDir, apkVer)) {
+        if (AssetSync.isSynced(ctx, "extra-plugins", extraPluginsDir, apkVer)) {
             fl("  额外桥接插件源已是最新，跳过复制")
         } else {
             try {
                 if (AssetSync.copyAssetDir(ctx, "extra-plugins", extraPluginsDir, clearFirst = true)) {
-                    AssetSync.markSynced(extraMarker, apkVer)
+                    AssetSync.markSynced(ctx, "extra-plugins", apkVer)
                     val count = extraPluginsDir.walkTopDown().count { it.isFile }
                     fl("  额外桥接插件源 $count 个文件")
                     if (count == 0) fl("  WARN extra-plugins 复制后 0 个文件（assets 可能为空）")
@@ -350,8 +348,7 @@ object DshFlow {
     private fun runAndroidStubOnce(ctx: Context, nodeDir: File, dshPrefix: File, stubScript: File, fl: (String) -> Unit) {
         val apkVer = AssetSync.apkVersion(ctx)
         val expected = "apk:$apkVer|dsh:${DshUpdater.currentVersion(ctx)}"
-        val marker = File(ctx.filesDir, ".stub-applied")
-        if (marker.exists() && marker.readText().trim() == expected) {
+        if (MarkerStore.get(ctx, "stub-applied") == expected) {
             fl(">> Android 兼容修复已应用（$expected），跳过 stub")
             return
         }
@@ -366,7 +363,7 @@ object DshFlow {
             )
         ) { fl(it) }
         if (exit == 0) {
-            runCatching { marker.writeText(expected) }
+            MarkerStore.put(ctx, "stub-applied", expected)
         } else {
             fl("WARN stub-dsh 退出码 $exit（不写 marker，下次重跑）")
         }

@@ -964,11 +964,10 @@ class PluginManagerActivity : AppCompatActivity() {
     private fun syncExtraPluginsSource() {
         val apkVer = AssetSync.apkVersion(this)
         val dest = File(filesDir, "extra-plugins")
-        val marker = File(filesDir, ".extra-plugins-ok")
-        if (AssetSync.isSynced(marker, dest, apkVer)) return
+        if (AssetSync.isSynced(this, "extra-plugins", dest, apkVer)) return
         try {
             if (AssetSync.copyAssetDir(this, "extra-plugins", dest, clearFirst = true)) {
-                AssetSync.markSynced(marker, apkVer)
+                AssetSync.markSynced(this, "extra-plugins", apkVer)
                 appendLog("   extra-plugins 源已同步（${dest.walkTopDown().count { it.isFile }} 个文件）")
             }
         } catch (t: Throwable) {
@@ -985,11 +984,10 @@ class PluginManagerActivity : AppCompatActivity() {
             return -1
         }
         val prebuilt = File(filesDir, "prebuilt.tgz")
-        val prebuiltMarker = File(filesDir, ".prebuilt-ok")
-        if (AssetSync.isSynced(prebuiltMarker, prebuilt, apkVer)) {
+        if (AssetSync.isSynced(this, "prebuilt", prebuilt, apkVer)) {
             appendLog("   内置插件源已是最新，跳过复制")
         } else if (AssetSync.copyAsset(this, "prebuilt.tgz", prebuilt)) {
-            AssetSync.markSynced(prebuiltMarker, apkVer)
+            AssetSync.markSynced(this, "prebuilt", apkVer)
             appendLog("   内置插件源 ${prebuilt.length() / 1024 / 1024}MB")
         } else {
             appendLog("   WARN 无法复制 prebuilt.tgz，继续使用已有源")

@@ -15,12 +15,10 @@ import java.nio.file.Paths
 internal object BootstrapInstaller {
 
     private const val ASSET = "termux-bootstrap.zip"
-    private const val MARKER = ".termux-ok"
     private const val MARKER_VERSION = "6"
 
-    fun isMarked(context: Context): Boolean = runCatching {
-        File(context.filesDir, MARKER).readText().trim() == MARKER_VERSION
-    }.getOrDefault(false)
+    fun isMarked(context: Context): Boolean =
+        MarkerStore.get(context, "termux") == MARKER_VERSION
 
     /**
      * 解压并准备 Termux 环境（同步，可能耗时 10~60 秒）。
@@ -93,14 +91,14 @@ internal object BootstrapInstaller {
             // postinst/pip 落盘，是 apt 安装失败的根因之一；exec 安全由 targetSdk=28
             // 豁免保证。如需临时收紧可调用 [setRuntimeWritable](writable=false)。
 
-            File(context.filesDir, MARKER).writeText(MARKER_VERSION)
+            MarkerStore.put(context, "termux", MARKER_VERSION)
             progress("Termux 环境就绪（$usr）")
             cache.delete()
             return usr
         } catch (t: Throwable) {
             runCatching { cache.delete() }
             runCatching { usr.deleteRecursively() }
-            runCatching { File(context.filesDir, MARKER).delete() }
+            runCatching { MarkerStore.remove(context, "termux") }
             throw t
         }
     }

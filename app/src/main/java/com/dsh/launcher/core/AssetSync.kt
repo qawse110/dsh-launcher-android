@@ -33,17 +33,14 @@ object AssetSync {
         0L
     }
 
-    /** marker 内容为 "apk:<version>"，且目标文件/目录存在时视为已同步。 */
-    fun isSynced(marker: File, target: File, apkVersion: Long): Boolean {
+    /** marker（MarkerStore 键）值为 "apk:<version>"，且目标文件/目录存在时视为已同步。 */
+    fun isSynced(ctx: Context, key: String, target: File, apkVersion: Long): Boolean {
         if (apkVersion <= 0L || !target.exists()) return false
-        return runCatching { marker.readText().trim() == "apk:$apkVersion" }.getOrDefault(false)
+        return MarkerStore.get(ctx, key) == "apk:$apkVersion"
     }
 
-    fun markSynced(marker: File, apkVersion: Long) {
-        runCatching {
-            marker.parentFile?.mkdirs()
-            marker.writeText("apk:$apkVersion\n")
-        }
+    fun markSynced(ctx: Context, key: String, apkVersion: Long) {
+        MarkerStore.put(ctx, key, "apk:$apkVersion")
     }
 
     fun copyAsset(context: Context, assetName: String, dest: File): Boolean = try {
