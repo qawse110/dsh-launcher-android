@@ -166,3 +166,4 @@ WebView JS bridge 暴露面（未注册 JS 接口）经抽查未见明显风险�
 | P2-2 测试地基（第一批） | ✅ 完成：Robolectric+JUnit 接入；MarkerStore(6)/FileLog(4)/PrefixPatcher(3)/AssetSync(1)/TermuxEnv(3) 共 17 用例；CI 增 testDebugUnitTest 门禁 | 本提交 |
 | R2 P1-6 第二刀 | ✅ 完成：PetSpeaker 独立（TTS 生命周期/Edge 分流/状态台词/增量正文游标 ~140 行）；manager 1202→1073 | 本提交 |
 | 兼容路径退役 | ✅ v4.9.0 衔接版发布后移除：MarkerStore 旧点导入、DshFlow 环境代次检测（PackageKit W^X 断言保留为策略声明） | 本提交 |
+| 主干切换 | ✅ `main` = 新架构线（原 feat/termux-default-env）；旧 v4.3.x 线归档为分支 `legacy/main-v4.3.8`；杂散 tag `main` 已清理 | 本提交 |
