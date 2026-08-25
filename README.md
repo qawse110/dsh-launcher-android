@@ -40,16 +40,30 @@
   桌宠模式**兼容 Codex 桌宠包格式**（`pet.json` + `spritesheet.webp/.png`，8x9 精灵表），
   内置默认桌宠“小豆丁”，并可导入 awesome-codex-pet / petdex 等社区桌宠包（详见下文）。
 - **设备端免编译适配**（`assets/stub-dsh.mjs`，每次启动自动重打，幂等）：
+  原则上**只保留 Node 模块加载期与 WebView 引导期的必要修复**，凡能在插件运行时
+  实现的功能一律下沉为独立内置插件（逐项审计见
+  `docs/plugin-conversion-audit.md`）。现存：
   - `koffi` / `node-pty` / `sharp`：Android 无预编译产物（`node-addon-*`/libvips 缺失），
-    以 Proxy stub 顶替，保证模块可加载；
+    以 Proxy stub / 纯 JS shim 顶替，保证模块可加载；
+  - `dsh-attachment-local` 视觉链路 v4：SELinux 禁 link(2)、FUSE fsync 失败的
+    运行时行为修复（fs 兼容层不覆盖 CJS 盲区）；
+  - `dsh-llm-pi-ai` sendAttribution：`dsh-provider-headers` 插件「关闭归因 UA」的
+    schema 缝隙（上游明确注释 omission cannot suppress attribution，官方提供
+    抑制通道前保留）；
   - `sandbox-windows-acl`（仅 Windows 宿主）的 koffi 布局断言在执行前禁用；
+  - `@vscode/ripgrep` 解析器 Android 回退（优先 Termux 原生 rg）；`dsh-fs-local`
+    chmod 对 FUSE 的容错；
   - `--expose-internals`：vendor/loader 的 internal 加载器依赖它解析 workspace 包
     （`NODE_OPTIONS` 不允许该开关，必须用命令行参数）；
-  - **`AbortSignal.timeout` polyfill 注入 `dist/index.html`**：系统 WebView / Chrome ≤102
-    没有该 API，缺失会导致前端 client-connection 无限重连（详见下）。
+  - **`AbortSignal.timeout` polyfill 按需注入**：仅当 dist 内 app bundle 确实引用
+    该 API 时才写 `dist/index.html`（0.1.1-rc.2 前端无引用，自动跳过，不再无条件
+    改动上游产物；引导期必须先于 app bundle，client 插件时序上无法替代）。
+  已移除的旧补丁：apiproxy vision 白名单（上游已无此常量）、sandbox "/tmp"→TMPDIR
+  （上游已原生并入 os.tmpdir()）、directory-picker SD Card 条目（改由内置插件实现）。
 - 内置插件经官方 `dsh plugin --profile web add` 装配：`dsh-mobile-nav`、`dsh-super-injector`、
   `dsh-net-proxy`、`dsh-provider-headers`、`dsh-vision`、`dsh-oh-we-need`（Skill 化，不再注入
-  系统提示词）；`yjh051108/dsh-routing-suite`
+  系统提示词）、`dsh-android-links`（HOME 符号链接暴露 SD 卡给工作区目录浏览器，
+  替代旧的 directory-picker 源码补丁）；`yjh051108/dsh-routing-suite`
   走特殊适配（`routing-suite.mjs`：聚合仓库 + injector 装配 + agent-presets 拷贝）。
 - 自动初始化 `files/.dsh/profiles/web` 配置（含默认 LLM 提供方配置），
   界面内填入 DeepSeek API Key 即可使用。
