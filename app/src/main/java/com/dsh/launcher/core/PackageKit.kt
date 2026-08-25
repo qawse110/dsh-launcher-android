@@ -29,9 +29,11 @@ internal object PackageKit {
         try {
             val usr = TermuxRuntime.prefix(context)
             if (!TermuxRuntime.isBashReady(context)) return false
-            // 每次调用都刷新 profile/inputrc（幂等），保证交互式终端体验即时生效
+            // 每次调用都刷新 profile/inputrc/tpkg（幂等），保证交互式终端体验即时生效
+            // （tpkg 刷新兜底：真机 fresh 安装出现过 local/bin 单点缺失，此处保证补齐）
             ProfileWriter.writeLinuxProfile(usr)
             ProfileWriter.writeInputRc(usr)
+            ProfileWriter.writeTpkgScript(context, usr)
             if (ready(context)) return true
             val bash = TermuxRuntime.bashPath(context).absolutePath
             // 环境基底统一由 Proc → TermuxEnv 提供，此处不再本地拼接（P0-1/P1-1）

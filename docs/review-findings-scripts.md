@@ -56,3 +56,12 @@
 
 **退役候选**：无。所有脚本均有现行消费方。
 **已知限制（文档化，不改）**：fs 兼容层不覆盖 CJS/linkSync；tpkg 不执行维护脚本；routing-suite 解压无体积上限（来源为固定 HTTPS 仓库）。
+
+## 附：fresh 安装真机验证（debug @ v4.8.0）
+
+✅ 六键 markers.json 自动生成；logs/{flow,web,heartbeat}.log 就位；web cwd=filesDir；
+✅ 原生 apt 全链路（update+install rc=0，libcrypt ii）；termux-exec 随 PackageKit 自动安装。
+⚠️ 发现并修复：tpkg 未落盘（writeAll 单点静默失败，logcat 已轮转无法溯源）——
+   PackageKit.ensure 幂等刷新段补入 writeTpkgScript，此后每次 harness 准备强制补齐。
+ℹ️ `.plugins-extracted-ok` 为 install-dsh.mjs 内部幂等标记（提取成功语义必须由脚本侧
+   维护，注释已说明），保持脚本侧自管、不并入 MarkerStore。
