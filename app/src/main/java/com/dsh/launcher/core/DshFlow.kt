@@ -107,6 +107,9 @@ object DshFlow {
         // 统一文件日志：files/logs/flow.log（可读时间戳 + 自动轮转）；
         // 共享目录改为流程结束时一次性导出，不再逐行双写 /sdcard
         FileLog.reset(ctx, FLOW_LOG)
+        // 资产清理：v4.7 前散落在 files 根的旧日志（新位置见 FileLog）
+        runCatching { File(ctx.filesDir, "dsh-flow.log").delete() }
+        runCatching { File(ctx.filesDir, "dsh-web.log").delete() }
         fun fl(msg: String) {
             FileLog.log(ctx, FLOW_LOG, msg)
             onLog(msg)
