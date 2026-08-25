@@ -60,6 +60,9 @@ internal object PackageKit {
                     // 运行时翻译脚本 shebang 的官方前缀（postinst/pip 入口依赖）
                     if (!File(usr, "lib/libtermux-exec-ld-preload.so").isFile) add("termux-exec")
                 }
+                // P2-5 增量 patch 基线：安装窗口开始时间。之后所有新落盘文件
+                // （pkg/tpkg/apt-get -f）mtime 必然 >= 该值，patch 只扫这些文件
+                val patchBaseline = System.currentTimeMillis()
                 val installRc = if (missing.isNotEmpty()) {
                     runBash(context, bash, "pkg install -o Acquire::Retries=3 -y --no-install-recommends ${missing.joinToString(" ")}", env, progress, timeoutSec = 1200)
                 } else {
@@ -77,11 +80,12 @@ internal object PackageKit {
                     )
                 }
 
-                // 新装的包（二进制 + maintainer 脚本）仍带官方路径；先统一 patch，
-                // 再让 dpkg 重新 configure，避免 postinst 走官方 shebang 失败。
-                progress("适配新装包路径并完成 dpkg 配置…")
-                PrefixPatcher.patchAll(usr)
-                PrefixPatcher.patchTextOfficialDirs(usr)
+                // 新装的包（二进制 + maintainer 脚本）仍带官方路径；统一增量 patch
+                // （只扫基线之后的新文件），再让 dpkg 重新 configure。
+                progress("适配新装包路径并完成 dpkg 配置（增量 patch）…")
+                PrefixPatcher.patchAll(usr, patchBaseline)
+                PrefixPatcher.patchTextOfficialDirs(usr, patchBaseline)
+                MarkerStore.put(context, "prefix-patch-ts", System.currentTimeMillis().toString())
                 val cfgRc = runBash(context, bash, "dpkg --configure -a", env, progress, timeoutSec = 600)
                 if (cfgRc != 0) {
                     progress("WARN: dpkg --configure -a 返回 $cfgRc，再试 apt-get -f install…")

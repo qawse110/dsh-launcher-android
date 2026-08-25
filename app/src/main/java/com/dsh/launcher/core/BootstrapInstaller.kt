@@ -74,6 +74,8 @@ internal object BootstrapInstaller {
             progress("适配 Termux 官方硬编码路径（${PrefixPatcher.OFFICIAL_PREFIX} → ${PrefixPatcher.SHORT_PREFIX}）…")
             PrefixPatcher.patchAll(usr)
             PrefixPatcher.patchTextOfficialDirs(usr)
+            // 全量 patch 完成，落增量基线（后续 PackageKit 只扫基线后的新文件）
+            MarkerStore.put(context, "prefix-patch-ts", System.currentTimeMillis().toString())
             ProfileWriter.writeAll(context, usr)
 
             // 可写业务目录：home / tmp / var（apt/dpkg 需要 var 可写）

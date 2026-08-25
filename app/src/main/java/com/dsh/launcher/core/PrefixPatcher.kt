@@ -24,7 +24,8 @@ internal object PrefixPatcher {
      * 覆盖 ELF 二进制、动态库、shell 脚本、pkgconfig、dpkg 清单等，
      * 使 apt/dpkg/bash 等全部通过 `t` 符号链接访问真实目录。
      */
-    fun patchAll(usr: File) {
+    fun patchAll(usr: File, minLastModifiedMs: Long = 0L) {
+        val since = if (minLastModifiedMs > 0L) " (incremental, mtime>=$minLastModifiedMs)" else ""
         val old = OFFICIAL_PREFIX
         val new = SHORT_PREFIX
         if (old.length != new.length) {
@@ -32,8 +33,11 @@ internal object PrefixPatcher {
             return
         }
         var patched = 0
+        var skipped = 0
         usr.walkTopDown().forEach { f ->
             if (!f.isFile || Files.isSymbolicLink(f.toPath())) return@forEach
+            // P2-5 增量化：只处理基线时间之后新增/变动的文件，避免安装大包后全树逐字节重扫
+            if (minLastModifiedMs > 0L && f.lastModified() < minLastModifiedMs) { skipped++; return@forEach }
             try {
                 val bytes = Files.readAllBytes(f.toPath())
                 // Latin-1 保证字节级无损，且 old/new 同长，替换后所有其它字节不变
@@ -46,7 +50,7 @@ internal object PrefixPatcher {
                 // 单个文件失败不影响整体（例如权限/占用）
             }
         }
-        android.util.Log.i("PrefixPatcher", "prefix patched files=$patched")
+        android.util.Log.i("PrefixPatcher", "prefix patched files=$patched skipped=$skipped$since")
     }
 
     /**
@@ -55,7 +59,7 @@ internal object PrefixPatcher {
      * 让 profile.d 等脚本通过 dataDir 下的 `data/data/com.termux/files` 符号链接落到真实目录。
      * 只处理不含 NUL 的普通文本文件，避免破坏 ELF/其他二进制。
      */
-    fun patchTextOfficialDirs(usr: File) {
+    fun patchTextOfficialDirs(usr: File, minLastModifiedMs: Long = 0L) {
         try {
             val dataDir = usr.parentFile?.parentFile?.parentFile?.absolutePath
                 ?: throw IllegalStateException("invalid usr path: $usr")
@@ -69,6 +73,7 @@ internal object PrefixPatcher {
             var patched = 0
             usr.walkTopDown().forEach { f ->
                 if (!f.isFile || Files.isSymbolicLink(f.toPath())) return@forEach
+                if (minLastModifiedMs > 0L && f.lastModified() < minLastModifiedMs) return@forEach
                 try {
                     val bytes = Files.readAllBytes(f.toPath())
                     if (bytes.any { it == 0.toByte() }) return@forEach
