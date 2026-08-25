@@ -57,7 +57,6 @@ internal object PackageKit {
                     if (!File(usr, "bin/curl").isFile) add("curl")
                     if (!File(usr, "bin/less").isFile) add("less")
                     if (!File(usr, "bin/wget").isFile) add("wget")
-                    if (!File(usr, "bin/termux-open").isFile) add("termux-tools")
                     // 运行时翻译脚本 shebang 的官方前缀（postinst/pip 入口依赖）
                     if (!File(usr, "lib/libtermux-exec-ld-preload.so").isFile) add("termux-exec")
                 }
