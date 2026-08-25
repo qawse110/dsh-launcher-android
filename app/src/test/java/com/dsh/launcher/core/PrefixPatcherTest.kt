@@ -45,7 +45,7 @@ class PrefixPatcherTest {
         val target = write("lib/libx.so", "PREFIX=/data/data/com.termux/files/usr/bin")
         val innocent = write("lib/ok.txt", "no official prefix here")
         PrefixPatcher.patchAll(usr)
-        assertEquals("PREFIX=/data/user/0/com.dsh.launcher/t/usr/bin", target.readText())
+        assertEquals("actual=${target.readText()}", "PREFIX=/data/user/0/com.dsh.launcher/t/usr/bin", target.readText())
         assertEquals("no official prefix here", innocent.readText())
     }
 
@@ -56,9 +56,9 @@ class PrefixPatcherTest {
         PrefixPatcher.patchAll(usr, minLastModifiedMs = System.currentTimeMillis())
 
         // 基线前的旧文件被跳过，未替换；新文件已替换
-        assertTrue(oldFile.readText().contains("/data/data/com.termux"))
-        assertFalse(newFile.readText().contains("/data/data/com.termux"))
-        assertTrue(newFile.readText().contains("/data/user/0/com.dsh.launcher/t/usr/bin/y"))
+        assertTrue("old=${oldFile.readText()}", oldFile.readText().contains("/data/data/com.termux"))
+        assertTrue("new=${newFile.readText()}", !newFile.readText().contains("/data/data/com.termux"))
+        assertTrue("new2=${newFile.readText()}", newFile.readText().contains("/data/user/0/com.dsh.launcher/t/usr/bin/y"))
     }
 
     @Test fun `文本 patch 幂等——连续两次结果一致`() {
@@ -66,7 +66,7 @@ class PrefixPatcherTest {
         PrefixPatcher.patchTextOfficialDirs(usr)
         val once = script.readText()
         PrefixPatcher.patchTextOfficialDirs(usr)
-        assertEquals(once, script.readText())
+        assertEquals("once=$once|now=${script.readText()}", once, script.readText())
         // home 走镜像长路径；cache 走真实 var 路径
         assertTrue(once.contains("/data/user/0/com.dsh.launcher/data/data/com.termux/files/home"))
         assertTrue(once.contains("/data/user/0/com.dsh.launcher/files/termux/usr/var/cache/apt"))
