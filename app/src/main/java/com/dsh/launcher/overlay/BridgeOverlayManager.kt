@@ -651,14 +651,6 @@ class BridgeOverlayManager(
         petView?.play(PetOverlayView.ROW_WAVING)
     }
 
-    /** 状态转折时播报固定台词（同状态只播一次，且间隔 ≥4s 防反弹连播）。 */
-
-
-     * 播报总入口：按设置分流 Edge 在线语音 / 系统引擎。
-     * @param append false=FLUSH 语义（打断当前播报，如状态转折/互动台词）；
-     *               true =ADD 语义（正文整句接续排队）。
-     */
-
     /** 释放 TTS 资源（服务销毁时调用；委托 PetSpeaker）。 */
     fun release() {
         petSpeaker.release()
