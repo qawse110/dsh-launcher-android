@@ -1,0 +1,7 @@
+{
+  "name": "@dsh-external/dsh-android-compat",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "lib/index.js",
+  "description": "Android 内嵌环境适配插件：逐步承接原 stub-dsh 设备端补丁中可插件化的能力"
+}

@@ -1,0 +1,5 @@
+# Android 兼容适配层：以受支持的 cordis insert 方式装配，
+# 取代对 dsh 安装树的脚本式改写（方向：docs/review-findings-scripts.md 迁移映射表）。
+- insert:
+    - id: dsh-android-compat
+      name: '@dsh-external/dsh-android-compat'

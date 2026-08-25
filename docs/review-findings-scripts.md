@@ -65,3 +65,23 @@
    PackageKit.ensure 幂等刷新段补入 writeTpkgScript，此后每次 harness 准备强制补齐。
 ℹ️ `.plugins-extracted-ok` 为 install-dsh.mjs 内部幂等标记（提取成功语义必须由脚本侧
    维护，注释已说明），保持脚本侧自管、不并入 MarkerStore。
+
+## 附2：stub 补丁 → 插件迁移映射表（方向：尽量减少脚本对 dsh 的修改）
+
+参考：https://deepseek-harness.github.io/deepseek-harness/develop/basic/
+（插件=导出 apply(ctx) 的 cordis 模块；项目内样例：extra-plugins/dsh-status-bridge）
+
+| stub 补丁 | 插件化可行性 | 依据 / 所需确认点 | 落点 |
+|---|---|---|---|
+| directory-picker SD Card 快捷入口 | 高（待确认） | 目录浏览 entries 组合点是否经服务暴露 | 已建 extra-plugins/dsh-android-compat 骨架，迁移代码写其 apply |
+| host-apiproxy openPath 委托宿主 App | 中（待确认） | open 动作路由/事件覆写点 | 同上 |
+| dsh-sandbox 可写根→TMPDIR | 中（待确认） | sandbox 是否读 ctx.config | 同上 |
+| dsh-fs-local chmod FUSE 容错 | 低 | 函数体级包裹，无钩子 | 保留 stub |
+| koffi/node-pty/sharp 模块桩 | 低 | 依赖装载前介入，晚于插件加载 | 保留 stub |
+| @vscode/ripgrep resolver | 低-中 | 若 fs-search 支持 rg 路径配置则转配置 | 评估后定 |
+| attachment-local 视觉补丁 | 低 | 函数体级源码改写 | 保留 stub |
+
+已落地：
+- extra-plugins/dsh-android-compat（package.json + cordis.patch.yml + lib/index.js 骨架）
+  接入 install-dsh BUILTIN_PLUGINS/BUILTIN_NAMES 与 extra-plugins 直拷通道；
+  真机验证路径 = 重装 debug 后 `dsh plugin --profile web list` 应含 dsh-android-compat。
