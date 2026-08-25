@@ -7,9 +7,9 @@ import org.json.JSONObject
 /**
  * 统一 marker 状态存储（架构方案 P1-4 收尾）。
  *
- * 取代散落在 filesDir 根的 6 个点文件（.termux-ok / .node-ok / .prebuilt-ok /
- * .extra-plugins-ok / .harness-tools-ok / .stub-applied），收敛为
  * files/state/markers.json 单文件，原子写（tmp+rename），进程内缓存。
+ * 旧散落点文件的导入逻辑随衔接版 v4.9.0 发布、已于 v4.9.1 移除
+ * （存量设备升级到 v4.9.0 即完成一次性迁移）。
  *
  * 首次访问时执行一次性旧导入：读取旧点文件内容入映射后删除原文件，
  * 保证升级设备无双重真源。键名即语义：termux/node/prebuilt/
@@ -69,34 +69,12 @@ object MarkerStore {
                     val obj = JSONObject(f.readText())
                     for (k in obj.keys()) map[k] = obj.optString(k)
                 }
-            } else {
-                // 首代：导入旧散落 marker 并删除原文件（单一真源）
-                map.putAll(legacyImport(ctx))
-                runCatching { persist(ctx) }
             }
+            // v4.9.1 起不再导入旧散落点文件：衔接版 v4.9.0 已完成全部存量迁移
             loaded = true
         }
     }
 
-    private fun legacyImport(ctx: Context): Map<String, String> {
-        val out = mutableMapOf<String, String>()
-        fun take(legacyName: String, key: String) {
-            runCatching {
-                val f = File(ctx.filesDir, legacyName)
-                if (f.isFile) {
-                    out[key] = f.readText().trim()
-                    f.delete()
-                }
-            }
-        }
-        take(".termux-ok", "termux")
-        take(".node-ok", "node")
-        take(".prebuilt-ok", "prebuilt")
-        take(".extra-plugins-ok", "extra-plugins")
-        take(".harness-tools-ok", "harness-tools")
-        take(".stub-applied", "stub-applied")
-        return out
-    }
 
     private fun persist(ctx: Context) {
         runCatching {

@@ -388,19 +388,13 @@ object DshFlow {
         }
         // 幂等：3080 已有监听 → 只有 HTTP 真正响应才算已启动；
         // 残留（端口被占但 web 不响应）视为脏状态，先清理再重启。
-        // v4.4.1 起额外校验「环境代次」：nohup 拉起的 web 是孤儿进程，可跨 APK
-        // 更新存活。旧脚本（v4.4 前）不带 cd，其进程 cwd=/ 且永远不会自愈，
-        // 直接复用会让新环境永不生效 —— 检测到旧代进程则清理后按新脚本重启。
+        // （v4.9.1 起移除「环境代次」检测：衔接版 v4.9.0 已让全部存量进程完成迁移）
         if (isPortListening(WEB_PORT)) {
-            val reused = waitForWebReady(ctx, 5_000, onLog)
-            if (reused && isCurrentGenWebProcess(ctx)) {
+            if (waitForWebReady(ctx, 5_000, onLog)) {
                 onLog(">> dsh web 已在运行 (http://127.0.0.1:$WEB_PORT)")
                 return true
             }
-            onLog(
-                if (reused) ">> 检测到旧环境代的 web 进程（cwd≠HOME），清理后迁移重启…"
-                else ">> 端口 $WEB_PORT 被残留进程占用但 web 无响应，清理后重新启动…"
-            )
+            onLog(">> 端口 $WEB_PORT 被残留进程占用但 web 无响应，清理后重新启动…")
             killAllNode(ctx, onLog)
             Thread.sleep(1500)
         }
@@ -428,36 +422,6 @@ object DshFlow {
         return waitForWebReady(ctx, 90_000, onLog)
     }
 
-    /**
-     * 3080 端口上的 node web 进程是否由当前代启动脚本拉起。
-     * 判据：进程 cmdline 匹配 dsh CLI 的 `…bin.js web`（或开发态 bin.ts），且
-     * cwd == HOME(filesDir)——新脚本显式 cd；v4.4 前的旧进程继承应用默认 cwd=/。
-     * 探测失败保守返回 true（视为当前代），避免误杀正常进程。
-     */
-    private fun isCurrentGenWebProcess(ctx: Context): Boolean = try {
-        val home = ctx.filesDir.absolutePath
-        var found = false
-        var current = false
-        File("/proc").listFiles { f -> f.name.toIntOrNull() != null }?.forEach { p ->
-            if (found) return@forEach
-            val args = runCatching {
-                File(p, "cmdline").readBytes().toString(Charsets.UTF_8).split('\u0000').filter { it.isNotBlank() }
-            }.getOrDefault(emptyList())
-            val isDshWeb = args.isNotEmpty() &&
-                args.any { it.endsWith("@deepseek-ai/dsh/lib/bin.js") || it.endsWith("/bin.ts") } &&
-                args.last() == "web"
-            if (isDshWeb) {
-                found = true
-                val cwd = runCatching {
-                    java.nio.file.Files.readSymbolicLink(java.nio.file.Paths.get(p.absolutePath, "cwd")).toString()
-                }.getOrDefault("")
-                current = cwd == home
-            }
-        }
-        !found || current
-    } catch (t: Throwable) {
-        true
-    }
 
     /** 检测本机端口是否已有监听（用于幂等启动）。 */
     fun isPortListening(port: Int): Boolean = try {
