@@ -52,23 +52,8 @@ class MarkerStoreTest {
         assertNull(MarkerStore.get(ctx, "node"))
     }
 
-    @Test fun `首次访问导入旧点文件并删除原文件`() {
-        val root = ctx.filesDir
-        File(root, ".termux-ok").writeText("6")
-        File(root, ".node-ok").writeText("ok")
-        File(root, ".prebuilt-ok").writeText("apk:29\n")
-        MarkerStore.resetForTest()
 
-        assertEquals("6", MarkerStore.get(ctx, "termux"))
-        assertEquals("ok", MarkerStore.get(ctx, "node"))
-        assertEquals("apk:29", MarkerStore.get(ctx, "prebuilt"))
-        // 导入后原文件应被删除（单一真源）
-        assertFalse(File(root, ".termux-ok").exists())
-        assertFalse(File(root, ".node-ok").exists())
-        assertTrue(File(root, "state/markers.json").isFile)
-    }
-
-    @Test fun `已有 json 时不重复导入旧点文件`() {
+    @Test fun `已有 json 时直接加载，不读取历史点文件`() {
         MarkerStore.put(ctx, "existing", "1") // 触发 json 创建
         File(ctx.filesDir, ".termux-ok").writeText("9")
         MarkerStore.resetForTest()
