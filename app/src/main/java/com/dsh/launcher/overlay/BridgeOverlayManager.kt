@@ -11,6 +11,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
 import android.text.TextUtils
+import android.text.method.ScrollingMovementMethod
 import java.util.Locale
 import android.view.Gravity
 import android.view.MotionEvent
@@ -96,13 +97,13 @@ class BridgeOverlayManager(
     private var transientRunnable: Runnable? = null
 
     // 互动与闲时行为（参考 codex-pet-live 的 patpat / 主动气泡模型）
-    private var tapCount = 0
-    private var tapWindowStart = 0L
+    // 连点爆发检测：每次点击即时挥手，静默 tapSettleMs 后按爆发内总点击数一次性分发。
+    // 旧实现里双击分支会把计数清零——快速连点每两击就触发一次双击、计数在 0/1/2 间震荡，
+    // 「连点 5 次戳烦了」只有按 400ms~4s 间隔慢慢点才可能达成，与「连点」语义矛盾。
+    private var burstCount = 0
+    private var burstDispatch: Runnable? = null
     private var ambientRunnable: Runnable? = null
     private var greeted = false
-
-    // 双击检测：单击随机台词 / 双击展开完整内容
-    private var lastTapAt = 0L
 
     // 待机随机小动作：idle 时每 20~45s 随机挥手一次，打破无限循环待机的机械感
     private var idleActRunnable: Runnable? = null
@@ -128,6 +129,10 @@ class BridgeOverlayManager(
     // 长按切换样式阈值：原 600ms 与双击窗（400ms）之间留有死区——按住 400~600ms
     // 松手会误触发"单击台词"；压到 350ms 后快速点按归点击、稳住即切换，语义清晰
     private val longPressToggleMs = 350L
+    /** 连点爆发判定窗：两次点击间隔 ≤ 此值算同一次连点（也是单击台词的分发节拍延迟）。 */
+    private val tapSettleMs = 320L
+    /** 触发「被戳烦了」跳起吐槽所需的连点次数。 */
+    private val annoyTapCount = 5
     // 略大的拖动阈值：点击时手指微抖（几像素）不误判为拖动，避免误触"轻放/抛出落地"
     private val dragSlop = dp(12)
 
@@ -367,7 +372,7 @@ class BridgeOverlayManager(
         }
         overlayView = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
-            contentDescription = "dsh 桌宠：单击互动，双击展开内容，拖动可扔进底部垃圾桶关闭，长按切回状态条"
+            contentDescription = "dsh 桌宠：单击互动，双击展开完整回复，快速连点 5 次它会跳起来吐槽；拖动可扔进底部垃圾桶关闭，长按切回状态条"
             if (Build.VERSION.SDK_INT >= 21) elevation = dp(6).toFloat()
             // 宠物窗只包精灵本体；气泡在独立窗口，空白区域触摸自然透传给下层应用
             addView(pet, LinearLayout.LayoutParams(petW, petH))
@@ -423,6 +428,9 @@ class BridgeOverlayManager(
                 bubble.maxLines = 2
                 bubble.ellipsize = TextUtils.TruncateAt.END
                 bubble.maxWidth = minOf((context.resources.displayMetrics.widthPixels * 0.45).toInt(), dp(230))
+                // 常规两行状态气泡：还原滚动/限高（上一轮可能是可滚动的长文视图）
+                bubble.movementMethod = null
+                bubble.maxHeight = Int.MAX_VALUE
                 bubble.text = bubbleText
                 bubble.visibility = View.VISIBLE
                 petSpeaker.speakContent(lastText, status, event)
@@ -484,7 +492,9 @@ class BridgeOverlayManager(
         petBubbleParams = null
     }
 
-    /** 同步气泡窗位置：默认在上方（留 4dp 间距），顶部放不下则翻到宠物下方；水平朝屏幕内侧对齐并夹紧在屏内。 */
+    /** 同步气泡窗位置：优先宠物上方（留 4dp 间距）；上方放不下且下方放得下则翻到下方；
+     *  两端都放不下（超长内容）→ 贴上下两端中空间更大的一端并夹紧在屏内（配合限高滚动，
+     *  保证全文可读且不再把气泡压到宠物身上）；水平朝屏幕内侧对齐并夹紧在屏内。 */
     private fun syncBubbleWindow() {
         if (!petBubbleAdded) return
         val b = petBubble ?: return
@@ -498,11 +508,20 @@ class BridgeOverlayManager(
         val bw = b.width
         val bh = b.height
         if (bw == 0 || bh == 0) return
+        val gap = dp(4)
+        val margin = dp(8)
         val towardRight = p.x + petW / 2 >= dm.widthPixels / 2
         val x = if (towardRight) p.x + petW - bw else p.x
-        val y = if (p.y - bh - dp(4) >= 0) p.y - bh - dp(4) else p.y + petH + dp(4)
+        val spaceAbove = p.y - gap
+        val spaceBelow = dm.heightPixels - (p.y + petH) - gap
+        val y = when {
+            bh <= spaceAbove -> p.y - bh - gap       // 上方放得下：首选上方
+            bh <= spaceBelow -> p.y + petH + gap     // 上方放不下、下方放得下：翻到下方
+            spaceAbove >= spaceBelow -> margin       // 两端都放不下：贴顶端夹紧
+            else -> dm.heightPixels - bh - margin    // 下方更宽裕：贴底端夹紧
+        }
         val nx = x.coerceIn(0, (dm.widthPixels - bw).coerceAtLeast(0))
-        val ny = y.coerceIn(0, (dm.heightPixels - bh).coerceAtLeast(0))
+        val ny = y.coerceIn(margin, (dm.heightPixels - bh - margin).coerceAtLeast(margin))
         if (pp.x != nx || pp.y != ny) {
             pp.x = nx
             pp.y = ny
@@ -510,63 +529,81 @@ class BridgeOverlayManager(
         }
     }
 
-    /** 点击桌宠本体（参考 codex-pet-live patpat）：
-     *  快速连点 ≥5 次 → 被戳烦了跳一下 + 吐槽台词；
-     *  单击 → 挥手互动 + 随机台词短气泡；
-     *  双击（400ms 内第二击）→ 挥手 + 气泡展开最近完整内容。 */
+    /** 点击桌宠本体（参考 codex-pet-live patpat）：每击即时挥手反馈；静默 [tapSettleMs]
+     *  后按本次连点爆发的总次数一次性分发：
+     *  快速连点 ≥[annoyTapCount] 次 → 被戳烦了跳一下 + 吐槽台词；
+     *  双击 → 挥手 + 气泡展开最近完整回复；
+     *  其余（单击 / 3~4 击未达阈值）→ 随机台词短气泡。
+     *  爆发期间不提前分发台词，计数不会被双击清零——快速连点 5 次稳定可触发。 */
     private fun showTapFeedback() {
-        val now = SystemClock.uptimeMillis()
-        lastInteractAt = now // 互动动作保护窗：轮询不抢占挥手/跳跃动画
-        if (now - tapWindowStart > 4000L) {
-            tapCount = 1
-            tapWindowStart = now
-        } else {
-            tapCount++
+        lastInteractAt = SystemClock.uptimeMillis() // 互动动作保护窗：轮询不抢占挥手/跳跃动画
+        petView?.play(PetOverlayView.ROW_WAVING)
+        burstCount++
+        burstDispatch?.let { handler.removeCallbacks(it) }
+        val r = Runnable {
+            val n = burstCount
+            burstCount = 0
+            burstDispatch = null
+            dispatchTapBurst(n)
         }
-        if (tapCount >= 5) {
-            tapCount = 0
-            lastTapAt = 0L
+        burstDispatch = r
+        handler.postDelayed(r, tapSettleMs)
+    }
+
+    /** 按一次连点爆发的总点击数分发互动结果。 */
+    private fun dispatchTapBurst(n: Int) {
+        if (n >= annoyTapCount) {
             petView?.play(PetOverlayView.ROW_JUMPING)
             postTransient("主人别戳啦～", 2, 0.6f, 3500L)
             petSpeaker.speak("主人别戳啦～")
             return
         }
-        petView?.play(PetOverlayView.ROW_WAVING)
-        if (now - lastTapAt < 400L) {
-            // 双击：展开完整内容（较长展示，8 秒或状态变化后收起）
-            tapCount = 0
-            lastTapAt = 0L
+        if (n == 2) {
+            // 双击：展开完整回复（较长展示，8 秒或状态变化后收起）
             val full = lastText?.takeIf { it.isNotBlank() }
             if (full != null) {
                 val dm = context.resources.displayMetrics
-                val overlay = overlayParams
-                val avail = if (overlay != null) dm.widthPixels - overlay.x - dp(8)
-                else dm.widthPixels - dp(8)
-                // 宽度上限 55% 屏幕，避免长文本把窗口撑得过宽
-                val width = minOf((dm.widthPixels * 0.55f).toInt(), avail.coerceAtLeast(dp(120)))
+                val p = overlayParams
+                val petW = overlayView?.width ?: 0
+                // 气泡朝屏幕内侧展开：取宠物左右两侧更宽的一侧计算可用宽度。
+                // 旧实现只按右侧余量算——宠物贴右边缘时长回复被压成一条窄竖条。
+                val spaceLeft = if (p != null) p.x + petW else dm.widthPixels
+                val spaceRight = if (p != null) dm.widthPixels - p.x else dm.widthPixels
+                val avail = maxOf(spaceLeft, spaceRight) - dp(8)
+                // 宽度上限 62% 屏幕，避免长文本把窗口撑得过宽
+                val width = minOf((dm.widthPixels * 0.62f).toInt(), avail.coerceAtLeast(dp(140)))
                 postTransient(full, 1000, width.toFloat(), 8000L)
             } else {
                 val reply = randomQuip()
                 postTransient(reply, 2, 0.6f, 8000L)
                 petSpeaker.speak(reply)
             }
-        } else {
-            // 单击：随机台词短气泡（快速、不挡视线）
-            lastTapAt = now
-            val quip = randomQuip()
-            postTransient(quip, 2, 0.6f, 5000L)
-            petSpeaker.speak(quip)
+            return
         }
+        // 单击（或 3~4 击未达阈值）：随机台词短气泡（快速、不挡视线）
+        val quip = randomQuip()
+        postTransient(quip, 2, 0.6f, 5000L)
+        petSpeaker.speak(quip)
     }
 
-    /** 统一气泡临时内容：设置文本与样式，durationMs 后或状态变化时自动收起恢复常规气泡。 */
+    /** 统一气泡临时内容：设置文本与样式，durationMs 后或状态变化时自动收起恢复常规气泡。
+     *  maxLines > 2 视为「完整回复」视图：高度封顶半屏 + 手指拖动滚动（否则超屏长文
+     *  尾部被截在屏幕外无法阅读）；短台词视图则还原为不可滚动。 */
     private fun postTransient(text: String, maxLines: Int, maxWidth: Float, durationMs: Long) {
         val bubble = petBubble ?: return
         showBubbleWindow() // 即使「显示气泡」关闭，互动台词也以独立气泡窗展示
         cancelTransient()
+        val dm = context.resources.displayMetrics
         bubble.maxLines = maxLines
         bubble.ellipsize = if (maxLines > 2) null else TextUtils.TruncateAt.END
         bubble.maxWidth = maxWidth.toInt()
+        if (maxLines > 2) {
+            bubble.movementMethod = ScrollingMovementMethod()
+            bubble.maxHeight = (dm.heightPixels * 0.5f).toInt()
+        } else {
+            bubble.movementMethod = null
+            bubble.maxHeight = Int.MAX_VALUE
+        }
         bubble.text = text
         bubble.visibility = View.VISIBLE
         transientText = text
@@ -580,6 +617,7 @@ class BridgeOverlayManager(
         transientRunnable = r
         handler.postDelayed(r, durationMs)
         syncBubbleWindow()
+        bubble.post { syncBubbleWindow() } // 大段文本重排后高度变化，布局完成后再校正一次位置
     }
 
     private fun cancelTransient() {
@@ -673,7 +711,9 @@ class BridgeOverlayManager(
         ambientRunnable?.let { handler.removeCallbacks(it) }
         ambientRunnable = null
         greeted = false
-        tapCount = 0
+        burstCount = 0
+        burstDispatch?.let { handler.removeCallbacks(it) }
+        burstDispatch = null
         petView?.stop()
         petSpeaker.resetTransientState()
         pendingRow = -1
