@@ -10,7 +10,6 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
-import android.speech.tts.TextToSpeech
 import android.text.TextUtils
 import java.util.Locale
 import android.view.Gravity
@@ -61,6 +60,7 @@ class BridgeOverlayManager(
 
     /** 偏好读取门面（P1-6 拆分）。 */
     private val bp = BridgePrefs(context)
+    private val petSpeaker = PetSpeaker(context, bp)
     /** dp→px 密度（OverlayStyle.roundedDrawable 需要）。 */
     private val density: Float get() = context.resources.displayMetrics.density
 
@@ -113,17 +113,6 @@ class BridgeOverlayManager(
     private var pendingRowCount = 0
     /** 互动动作（点击挥手/连点跳跃/待机挥手）开始时间：保护窗内轮询不抢占动作，避免"点击招手后突然跳起/落地"。 */
     private var lastInteractAt = 0L
-    private var lastSpokeAt = 0L
-
-    // TTS 发声（桌宠模式）
-    private var tts: TextToSpeech? = null
-    private var ttsReady = false
-    private var ttsReleased = false
-    private var lastSpokenKey: String? = null
-    // 正文增量朗读游标：记录 lastText 已读到哪，流式输出每凑齐一个完整句才播报
-    @Volatile private var spokenLen = 0
-    private val sentenceEndRe = Regex("[。！？!?…；;]|\\n")
-    private val softPuncts = charArrayOf('，', ',', '、', '：', ':', ' ')
 
     private var currentStyle: String? = null
     private var lastStatus: String? = null
@@ -421,7 +410,7 @@ class BridgeOverlayManager(
             }
             if (pendingRowCount >= 2) petView?.play(target, "$status|${event ?: ""}")
         }
-        speakForStatus(status, event)
+        petSpeaker.speakForStatus(status, event)
         petBubble?.let { bubble ->
             val key = "$status|${event ?: ""}"
             if (transientText != null) {
@@ -436,7 +425,7 @@ class BridgeOverlayManager(
                 bubble.maxWidth = minOf((context.resources.displayMetrics.widthPixels * 0.45).toInt(), dp(230))
                 bubble.text = bubbleText
                 bubble.visibility = View.VISIBLE
-                speakContentIncremental(status, event)
+                petSpeaker.speakContent(lastText, status, event)
             } else {
                 // 无内容（或关闭气泡）时不显示空框：气泡窗口整体移除，触摸透传
                 bubble.visibility = View.GONE
@@ -457,47 +446,6 @@ class BridgeOverlayManager(
         val label = if (bp.showStatus()) statusLabel(status, event) else ""
         val snippet = if (bp.showLastText() && text.isNotBlank()) text.take(40) else ""
         return listOf(namePart, label, snippet).filter { it.isNotBlank() }.joinToString(" · ")
-    }
-
-    /**
-     * 正文增量朗读：只读「上次读到之后」的新增完整句——旧实现读 40 字预览，
-     * 总在半句处截断，且流式增长时反复重读近似前缀。
-     * - 句界：。！？!?…；; 换行；凑齐一句即入队（QUEUE_ADD，接续不打断前句）；
-     * - 160 字内无句界时按逗号/顿号兜底断句，硬切上限 160；
-     * - 新消息（文本变短）或 turn/start 重置游标；
-     * - 完成/失败/空闲不追加正文：状态转折有固定台词，且 FLUSH 会打断正文。
-     */
-    private fun speakContentIncremental(status: String, event: String?) {
-        if (!bp.petTts() || ttsReleased) return
-        val text = lastText ?: return
-        if (event == "turn/start" || event == "user/message") spokenLen = 0
-        if (text.length < spokenLen) spokenLen = 0
-        if (status != "running" || event != "assistant/message") return
-        if (spokenLen >= text.length) return
-
-        var start = spokenLen
-        var advanced = false
-        while (start < text.length) {
-            val remain = text.substring(start)
-            val window = remain.substring(0, minOf(remain.length, 160))
-            val ends = sentenceEndRe.findAll(window).toList()
-            val utterance: String
-            if (ends.isNotEmpty()) {
-                val m = ends.last()
-                utterance = window.substring(0, m.range.last + 1)
-            } else if (remain.length > 160) {
-                // 积压超限仍无句界：软标点兜底断句，再不行硬切
-                val softIdx = window.lastIndexOfAny(softPuncts)
-                utterance = if (softIdx > 40) window.substring(0, softIdx + 1) else window
-            } else {
-                break // 句子尚未写完，等下一轮轮询
-            }
-            val trimmed = utterance.trim()
-            if (trimmed.isNotEmpty()) speak(trimmed, append = true)
-            start += utterance.length
-            advanced = true
-        }
-        if (advanced) spokenLen = start
     }
 
     /** 气泡独立悬浮窗：显示在宠物窗上方/下方（视空间而定），可点击，贴边时朝屏幕内侧对齐。 */
@@ -580,7 +528,7 @@ class BridgeOverlayManager(
             lastTapAt = 0L
             petView?.play(PetOverlayView.ROW_JUMPING)
             postTransient("主人别戳啦～", 2, 0.6f, 3500L)
-            speak("主人别戳啦～")
+            petSpeaker.speak("主人别戳啦～")
             return
         }
         petView?.play(PetOverlayView.ROW_WAVING)
@@ -600,14 +548,14 @@ class BridgeOverlayManager(
             } else {
                 val reply = randomQuip()
                 postTransient(reply, 2, 0.6f, 8000L)
-                speak(reply)
+                petSpeaker.speak(reply)
             }
         } else {
             // 单击：随机台词短气泡（快速、不挡视线）
             lastTapAt = now
             val quip = randomQuip()
             postTransient(quip, 2, 0.6f, 5000L)
-            speak(quip)
+            petSpeaker.speak(quip)
         }
     }
 
@@ -679,7 +627,7 @@ class BridgeOverlayManager(
         if (petBubble == null) return
         val phrase = randomPetPhrase()
         postTransient(phrase, 2, 0.6f, 5000L)
-        speak(phrase)
+        petSpeaker.speak(phrase)
     }
 
     /** 待机随机小动作（参考 codex-pet-live 的随机动作池）：idle 时随机挥手，纯动作不打扰气泡。 */
@@ -703,94 +651,17 @@ class BridgeOverlayManager(
         petView?.play(PetOverlayView.ROW_WAVING)
     }
 
-    // ---------------- 桌宠 TTS 发声 ----------------
-
     /** 状态转折时播报固定台词（同状态只播一次，且间隔 ≥4s 防反弹连播）。 */
-    private fun speakForStatus(status: String, event: String?) {
-        val key = "$status|${event ?: ""}"
-        if (key == lastSpokenKey) return
-        lastSpokenKey = key
-        if (SystemClock.uptimeMillis() - lastSpokeAt < 4000L) return
-        val phrase = when {
-            status == "finished" -> "任务完成，太棒了！"
-            status == "failed" -> "出错了，快打开 Web 看看吧"
-            status == "running" && event == "tool/call" -> "正在调用工具，稍等一下"
-            status == "running" && event == "turn/start" -> "收到新任务，开始干活！"
-            else -> null
-        }
-        if (phrase != null) {
-            lastSpokeAt = SystemClock.uptimeMillis()
-            speak(phrase)
-        }
-    }
 
-    /** 朗读文本（懒初始化 TTS；初始化完成前的请求挂起补播——否则登场问候大概率无声；
-     *  无中文引擎自动回退系统默认语言；失败静默）。 */
-    private var pendingSpeak: String? = null
 
-    /**
      * 播报总入口：按设置分流 Edge 在线语音 / 系统引擎。
      * @param append false=FLUSH 语义（打断当前播报，如状态转折/互动台词）；
      *               true =ADD 语义（正文整句接续排队）。
      */
-    private fun speak(text: String, append: Boolean = false) {
-        if (!bp.petTts() || text.isBlank()) return
-        val engine = prefs().getString("tts_engine", "system") ?: "system"
-        if (engine == "edge") {
-            if (!edgeTtsInited) {
-                edgeTtsInited = true
-                EdgeTts.init(context.applicationContext) { t, fl -> speakSystem(t, fl) }
-            }
-            val voice = prefs().getString("tts_edge_voice", "zh-CN-XiaoxiaoNeural") ?: "zh-CN-XiaoxiaoNeural"
-            EdgeTts.enqueue(text, voice, !append)
-            return
-        }
-        speakSystem(text, append)
-    }
 
-    /** 系统 TextToSpeech 播报（含懒初始化与初始化期补播）。 */
-    private var edgeTtsInited = false
-
-    private fun speakSystem(text: String, append: Boolean) {
-        if (ttsReleased || text.isBlank()) return
-        if (tts == null) {
-            pendingSpeak = text
-            tts = TextToSpeech(context) { status ->
-                ttsReady = status == TextToSpeech.SUCCESS
-                if (ttsReady) {
-                    val ok = (tts?.isLanguageAvailable(Locale.CHINA) ?: -1) >= TextToSpeech.LANG_AVAILABLE
-                    tts?.setLanguage(if (ok) Locale.CHINA else Locale.getDefault())
-                }
-                // 初始化期间积压的最后一句话在此刻补播
-                val p = pendingSpeak
-                pendingSpeak = null
-                if (p != null && ttsReady) {
-                    try {
-                        tts?.speak(p, TextToSpeech.QUEUE_FLUSH, null, "dsh_pet")
-                    } catch (_: Exception) {
-                    }
-                }
-            }
-            return
-        }
-        if (!ttsReady) {
-            pendingSpeak = text
-            return
-        }
-        try {
-            tts?.speak(text, if (append) TextToSpeech.QUEUE_ADD else TextToSpeech.QUEUE_FLUSH, null, "dsh_pet")
-        } catch (_: Exception) {
-            // TTS 不可用时静默
-        }
-    }
-
-    /** 释放 TTS 资源（服务销毁时调用；释放后不再重建）。 */
+    /** 释放 TTS 资源（服务销毁时调用；委托 PetSpeaker）。 */
     fun release() {
-        ttsReleased = true
-        EdgeTts.shutdown()
-        tts?.shutdown()
-        tts = null
-        ttsReady = false
+        petSpeaker.release()
     }
 
     // ---------------- 公共移除/切换 ----------------

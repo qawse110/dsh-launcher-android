@@ -19,6 +19,8 @@ class BridgePrefs(private val context: Context) {
         prefs().getString("pet_id", CodexPetStore.DEFAULT_PET_ID) ?: CodexPetStore.DEFAULT_PET_ID
     fun showPetBubble(): Boolean = prefs().getBoolean("pet_show_bubble", true)
     fun petTts(): Boolean = prefs().getBoolean("pet_tts", true)
+    fun ttsEngine(): String = prefs().getString("tts_engine", "system") ?: "system"
+    fun ttsEdgeVoice(): String = prefs().getString("tts_edge_voice", "zh-CN-XiaoxiaoNeural") ?: "zh-CN-XiaoxiaoNeural"
     fun showPetName(): Boolean = prefs().getBoolean("pet_show_name", true)
     fun showAmbientBubble(): Boolean = prefs().getBoolean("pet_ambient_bubble", true)
 
