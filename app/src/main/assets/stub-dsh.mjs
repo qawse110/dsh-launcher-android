@@ -574,11 +574,7 @@ try {
   }
 } catch (e) { log('WARN directory-picker-browse: ' + e.message); }
 
-try {
-  // 保持旧版占位补丁文件为空（koffi 已 stub，无需禁用行）
-  const patch = join(HOME, 'patch-koffi.yml');
-  writeFileSync(patch, '# native stubs in place, no disables\n');
-  log('patch ok (empty)');
-} catch (e) { log('WARN patch: ' + e.message); }
+// v4.8.1 资产清理：移除 patch-koffi.yml 占位写入——全仓库无任何消费方，
+// koffi 已由上方 Proxy stub 直接顶替，无需禁用行文件。
 
 log('=== android fixup done ===');

@@ -14,12 +14,16 @@
  */
 import { existsSync, writeFileSync, mkdirSync, readFileSync, readdirSync, rmSync, cpSync, renameSync, statSync, symlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
+ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { gunzipSync } from 'node:zlib';
 
-const HOME = process.env.HOME || '/data/user/0/com.dsh.launcher/files';
-const NODE_BIN = process.env.NODE_BIN || join(HOME, 'node/bin/node');
-const DSH_PREFIX = process.env.DSH_PREFIX || join(HOME, 'dsh-prefix');
+ // 文件根推导优先级：调用方注入的 HOME（应用内恒为 filesDir）→ 脚本自身位置
+ // （Kotlin 把本脚本复制到 filesDir 根，故 dirname 即 filesDir；多用户 /data/user/10 也正确）。
+ const FILES_DIR = process.env.DSH_FILES_DIR
+   || (process.env.HOME && existsSync(join(process.env.HOME, 'dsh-prefix')) ? process.env.HOME : null)
+   || dirname(fileURLToPath(import.meta.url));
+ const HOME = FILES_DIR;
 const DSH_PROFILE = process.env.DSH_PROFILE || 'web';
 const ROUTING_DIR = process.env.DSH_ROUTING_DIR || join(HOME, 'routing-suite');
 const PLUGINS_DIR = process.env.DSH_PLUGINS_DIR || join(HOME, 'plugins');
