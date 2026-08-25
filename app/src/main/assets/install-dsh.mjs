@@ -25,16 +25,18 @@ import { spawnSync } from 'node:child_process';
 import { gunzipSync } from 'node:zlib';
 
 const HOME = process.env.HOME || '/data/user/0/com.dsh.launcher/files';
-const NODE_BIN = process.env.NODE_BIN || join(HOME, 'node/bin/node');
-const NPM_BIN = process.env.NPM_BIN || join(HOME, 'node/bin/npm');
+// 显式文件根：不依赖调用方是否导出 HOME（契约加固，P1）——所有状态路径由此派生
+const FILES_DIR = dirname(process.env.DSH_PREFIX || join(HOME, 'dsh-prefix'));
+const NODE_BIN = process.env.NODE_BIN || join(FILES_DIR, 'node/bin/node');
+const NPM_BIN = process.env.NPM_BIN || join(FILES_DIR, 'node/bin/npm');
 const DSH_PREFIX = process.env.DSH_PREFIX || join(HOME, 'dsh-prefix');
 const DSH_PROFILE = process.env.DSH_PROFILE || 'web';
 const PREBUILT = process.env.DSH_PREBUILT || '';
 const DSH_APK_VER = process.env.DSH_APK_VER || '';
-const PLUGINS_DIR = process.env.DSH_PLUGINS_DIR || join(HOME, 'plugins');
-const EXTRA_PLUGINS_SRC = process.env.DSH_EXTRA_PLUGINS_SRC || join(HOME, 'extra-plugins');
-const TOOLS = join(HOME, '.tools');
-const TERMUX = process.env.TERMUX_PREFIX || join(HOME, 'termux/usr');
+const PLUGINS_DIR = process.env.DSH_PLUGINS_DIR || join(FILES_DIR, 'plugins');
+const EXTRA_PLUGINS_SRC = process.env.DSH_EXTRA_PLUGINS_SRC || join(FILES_DIR, 'extra-plugins');
+const TOOLS = join(FILES_DIR, '.tools');
+const TERMUX = process.env.TERMUX_PREFIX || join(FILES_DIR, 'termux/usr');
 const REGISTRY = process.env.NPM_REGISTRY || 'https://registry.npmmirror.com';
 const REGISTRY_FALLBACK = process.env.NPM_REGISTRY_FALLBACK || 'https://registry.npmjs.org';
 const PNPM_VERSION = '11.7.0';
@@ -44,13 +46,13 @@ const PLUGIN_TIMEOUT_MS = Number(process.env.DSH_PLUGIN_TIMEOUT_MS || 5 * 60_000
 const NPM_NET_ARGS = [
   '--prefer-offline',
   // 非 TTY 下让 npm 逐请求输出（等价于 _logs 里的 http fetch 行），避免长阶段静默被误判卡死
-  '--loglevel=http',
+  '--loglevel=notice',
   '--fetch-timeout=120000',
   '--fetch-retries=5',
   '--fetch-retry-mintimeout=2000',
   '--fetch-retry-maxtimeout=60000',
 ];
-const OUT = join(HOME, 'install_log.txt');
+const OUT = join(FILES_DIR, 'install_log.txt');
 const OUT_SHARED = '/sdcard/Download/DshLauncher/install_log.txt';
 const BUILTIN_PLUGINS = [
   'dsh-mobile-nav',
@@ -83,7 +85,7 @@ function log(m) {
   const l = `${new Date().toISOString()} [install] ${m}`;
   console.log(l);
   try { writeFileSync(OUT, l + '\n', { flag: 'a' }); } catch {}
-  try { writeFileSync(OUT_SHARED, l + '\n', { flag: 'a' }); } catch {}
+  try { if (process.env.DSH_SHARED_LOG === '1') writeFileSync(OUT_SHARED, l + '\n', { flag: 'a' }); } catch {}
 }
 
 function runEx(cmd, args, opts = {}) {
@@ -118,31 +120,31 @@ function isOom(r) {
 
 function envBase(extra = {}) {
   const pnpmDirs = [
-    join(TOOLS, 'bin'),
-    join(TOOLS, 'lib/node_modules/.bin'),
-    join(TOOLS, 'lib/node_modules/pnpm/bin'),
+    join(FILES_DIR, '.tools', 'bin'),
+    join(FILES_DIR, '.tools', 'lib/node_modules/.bin'),
+    join(FILES_DIR, '.tools', 'lib/node_modules/pnpm/bin'),
   ];
   const termuxReady = existsSync(join(TERMUX, 'bin/bash'));
   const termuxDirs = termuxReady
     ? [join(TERMUX, 'bin'), join(TERMUX, 'bin/applets'), join(TERMUX, 'local/bin')]
     : [];
-  const pathParts = [...termuxDirs, join(HOME, 'node/bin')];
+  const pathParts = [...termuxDirs, join(FILES_DIR, 'node/bin')];
   for (const d of pnpmDirs) if (existsSync(d)) pathParts.push(d);
   pathParts.push('/system/bin', '/bin', '/usr/bin');
-  const gitConfig = join(HOME, '.gitconfig');
+  const gitConfig = join(FILES_DIR, '.gitconfig');
   try {
     if (!existsSync(gitConfig)) writeFileSync(gitConfig, '');
   } catch {}
   const env = {
     ...process.env,
     LD_LIBRARY_PATH: termuxReady
-      ? join(HOME, 'node/lib') + ':' + join(TERMUX, 'lib')
-      : join(HOME, 'node/lib'),
+      ? join(FILES_DIR, 'node/lib') + ':' + join(TERMUX, 'lib')
+      : join(FILES_DIR, 'node/lib'),
     GIT_CONFIG_NOSYSTEM: '1',
     GIT_CONFIG_GLOBAL: gitConfig,
-    TMPDIR: join(HOME, 'tmp'),
-    TMP: join(HOME, 'tmp'),
-    TEMP: join(HOME, 'tmp'),
+    TMPDIR: join(FILES_DIR, 'tmp'),
+    TMP: join(FILES_DIR, 'tmp'),
+    TEMP: join(FILES_DIR, 'tmp'),
     TERM: 'xterm-256color',
     CI: '1',
     // pnpm 在非 TTY 下默认静默；append-only 是它专为管道日志设计的行式进度。
@@ -169,7 +171,7 @@ function dshInstalled() {
 
 function ensurePnpm() {
   mkdirSync(TOOLS, { recursive: true });
-  const pnpmRoot = join(TOOLS, 'lib/node_modules/pnpm');
+  const pnpmRoot = join(FILES_DIR, '.tools', 'lib/node_modules/pnpm');
   const pnpmMjs = join(pnpmRoot, 'bin/pnpm.mjs');
   let pnpmCjs = join(pnpmRoot, 'bin/pnpm.cjs');
 
@@ -181,12 +183,12 @@ function ensurePnpm() {
       log('pnpm.mjs corrupted, reinstalling pnpm@' + PNPM_VERSION + ' ...');
       rmSync(pnpmRoot, { recursive: true, force: true });
       for (const name of ['pnpm', 'pn', 'pnpx', 'pnx']) {
-        rmSync(join(TOOLS, 'bin', name), { recursive: true, force: true });
+        rmSync(join(FILES_DIR, '.tools', 'bin', name), { recursive: true, force: true });
       }
       pnpmCjs = join(pnpmRoot, 'bin/pnpm.cjs');
     }
   }
-  if (!existsSync(pnpmCjs)) pnpmCjs = join(TOOLS, 'bin/pnpm.cjs');
+  if (!existsSync(pnpmCjs)) pnpmCjs = join(FILES_DIR, '.tools', 'bin/pnpm.cjs');
   if (!existsSync(pnpmCjs)) {
     log('installing pnpm@' + PNPM_VERSION + ' ...');
     const r = run(NPM_BIN, [
@@ -198,13 +200,13 @@ function ensurePnpm() {
       process.exit(1);
     }
     pnpmCjs = join(pnpmRoot, 'bin/pnpm.cjs');
-    if (!existsSync(pnpmCjs)) pnpmCjs = join(TOOLS, 'bin/pnpm.cjs');
+    if (!existsSync(pnpmCjs)) pnpmCjs = join(FILES_DIR, '.tools', 'bin/pnpm.cjs');
   }
   // dsh plugin 通过 PATH 里的 `pnpm` 命令转发；Android 没有 /usr/bin/env，
   // 所以写一个 system sh wrapper 保证 pnpm 可执行。
   // 注意：TOOLS/bin/pnpm 可能是 npm 生成的符号链接，必须先删掉再写文件，
   // 否则 writeFileSync 会跟着符号链接覆盖真正的 pnpm.mjs。
-  const wrapper = join(TOOLS, 'bin/pnpm');
+  const wrapper = join(FILES_DIR, '.tools', 'bin/pnpm');
   const wrapperBody = `#!/system/bin/sh\nexec "${NODE_BIN}" "${pnpmCjs}" "$@"\n`;
   try {
     if (existsSync(wrapper) && readFileSync(wrapper, 'utf8') === wrapperBody) {
@@ -241,9 +243,9 @@ function ensureDsh() {
   ensureHostPkg();
   const tag = process.env.DSH_TAG || 'latest';
   const pkgSpec = `@deepseek-ai/dsh@${tag}`;
-  const pnpmBin = join(TOOLS, 'bin', 'pnpm');
-  const pnpmStoreEnv = { npm_config_store_dir: join(TOOLS, 'pnpm-store') };
-  const pnpmCommon = ['--ignore-scripts', '--prefer-offline', '--reporter', 'append-only'];
+  const pnpmBin = join(FILES_DIR, '.tools', 'bin', 'pnpm');
+  const pnpmStoreEnv = { npm_config_store_dir: join(FILES_DIR, '.tools', 'pnpm-store') };
+  const pnpmCommon = ['--ignore-scripts', '--prefer-offline', '--reporter', 'append-only', '--loglevel', 'warn'];
 
   log(`install/update ${pkgSpec} ...`);
   // 引擎优先级：pnpm（内存占用远低于 npm；npm Arborist 在设备上解析 150+ 包
@@ -261,21 +263,24 @@ function ensureDsh() {
   ];
   let succeeded = false;
   for (const a of attempts) {
-    if (a.engine === 'pnpm') {
-      // 一次性迁移：npm 装出来的扁平 node_modules 没有 pnpm-lock，pnpm 无法增量接管；
-      // 清空后由 pnpm 重建（之后走 content-addressable store，更新很快）。
-      const nm = join(DSH_PREFIX, 'node_modules');
-      if (existsSync(nm) && !existsSync(join(DSH_PREFIX, 'pnpm-lock.yaml'))) {
-        log('pnpm: removing npm-layout node_modules before first pnpm install');
-        try { rmSync(nm, { recursive: true, force: true }); } catch (e) { log('WARN clean node_modules: ' + e.message); }
-      }
-    }
     const args = a.engine === 'pnpm'
       ? ['add', '--dir', DSH_PREFIX, pkgSpec, '--registry', a.registry, ...pnpmCommon]
       : ['install', '--prefix', DSH_PREFIX, pkgSpec, '--registry', a.registry,
         '--no-audit', '--no-fund', '--ignore-scripts', '--force', ...NPM_NET_ARGS];
     if (a !== attempts[0]) log(`retrying with engine ${a.label} ...`);
-    const r = runEx(a.cmd, args, { env: { ...envBase(), ...a.env }, timeoutMs: NPM_TIMEOUT_MS });
+    let r = runEx(a.cmd, args, { env: { ...envBase(), ...a.env }, timeoutMs: NPM_TIMEOUT_MS });
+    // P0 修复：npm 布局 → pnpm 需清空重建，但绝不在安装前预删——弱网下
+    // "先删后装"一次失败就把可用安装毁成零安装。改为：pnpm 首次失败且
+    // 检测到 npm 布局（无 pnpm-lock）时才清理，并就地重试一次。
+    if ((!r.ok || !dshInstalled()) && a.engine === 'pnpm' && !a._migrated &&
+        existsSync(join(DSH_PREFIX, 'node_modules')) &&
+        !existsSync(join(DSH_PREFIX, 'pnpm-lock.yaml'))) {
+      a._migrated = true;
+      log('pnpm: npm-layout node_modules detected after failure, cleaning and retrying once');
+      try { rmSync(join(DSH_PREFIX, 'node_modules'), { recursive: true, force: true }); }
+      catch (e) { log('WARN clean node_modules: ' + e.message); }
+      r = runEx(a.cmd, args, { env: { ...envBase(), ...a.env }, timeoutMs: NPM_TIMEOUT_MS });
+    }
     if (isOom(r)) log(`OOM detected on ${a.label}, switching engine`);
     if (r.ok && dshInstalled()) {
       log('installed via ' + a.label);
@@ -310,7 +315,7 @@ function ensureRipgrepFallback() {
     log('@vscode/ripgrep not installed, skip ripgrep fallback');
     return;
   }
-  const termuxRg = join(HOME, 'termux/usr/bin/rg');
+  const termuxRg = join(FILES_DIR, 'termux/usr/bin/rg');
   if (existsSync(termuxRg)) {
     log('Termux ripgrep already installed, skip npm fallback: ' + termuxRg);
     return;
@@ -338,12 +343,12 @@ function ensureRipgrepFallback() {
   log('installing ripgrep linux-arm64 fallback @' + rgVersion + ' ...');
   // 引擎跟随 dsh 主安装：pnpm 管理的目录绝不能再用 npm 写（会破坏 .pnpm 布局）
   const pnpmManaged = existsSync(join(DSH_PREFIX, 'pnpm-lock.yaml'));
-  const pnpmBin = join(TOOLS, 'bin', 'pnpm');
+  const pnpmBin = join(FILES_DIR, '.tools', 'bin', 'pnpm');
   const installFallback = (spec, registry) => {
     if (pnpmManaged) {
       return run(pnpmBin, ['add', '--dir', DSH_PREFIX, spec, '--registry', registry,
-        '--ignore-scripts', '--prefer-offline', '--reporter', 'append-only'], {
-        env: { ...envBase(), npm_config_store_dir: join(TOOLS, 'pnpm-store') },
+        '--ignore-scripts', '--prefer-offline', '--reporter', 'append-only', '--loglevel', 'warn'], {
+        env: { ...envBase(), npm_config_store_dir: join(FILES_DIR, '.tools', 'pnpm-store') },
         timeoutMs: NPM_TIMEOUT_MS,
       });
     }
@@ -422,7 +427,7 @@ function extractPlugins() {
   // 提取完成标记由脚本自己维护（不能由 prebuilt 拷贝侧维护）：APK 升级后
   // prebuilt 可能已覆盖为新包，但 plugins 目录还是旧包，必须在提取成功后
   // 才写标记；否则会误跳过新包的提取。
-  const extractedMarker = join(HOME, '.plugins-extracted-ok');
+  const extractedMarker = join(FILES_DIR, '.plugins-extracted-ok');
   let markerOk = false;
   if (DSH_APK_VER && existsSync(extractedMarker)) {
     try { markerOk = readFileSync(extractedMarker, 'utf8').trim() === 'apk:' + DSH_APK_VER; } catch {}
@@ -489,7 +494,7 @@ function copyPresets() {
     log('router-preset not bundled, skip preset copy');
     return;
   }
-  const destRoot = join(HOME, '.dsh/.agent-presets');
+  const destRoot = join(FILES_DIR, '.dsh/.agent-presets');
   mkdirSync(destRoot, { recursive: true });
   try {
     const sourceNames = new Set();
@@ -648,7 +653,7 @@ function linkPluginDeps() {
 
 /** 清理旧版遗留的 profile patch 内置插件 insert，避免与 dsh.profile.bundles 重复装配。 */
 function cleanBuiltinPatch() {
-  const patch = join(HOME, '.dsh/profiles', DSH_PROFILE, 'cordis.patch.yml');
+  const patch = join(FILES_DIR, '.dsh/profiles', DSH_PROFILE, 'cordis.patch.yml');
   if (!existsSync(patch)) return;
   try {
     const lines = readFileSync(patch, 'utf8').split(/\r?\n/);
@@ -692,7 +697,7 @@ function cleanBuiltinPatch() {
 // ── main ─────────────────────────────────────────────
 log('=== official dsh install start ===');
 log('HOME=' + HOME + ' DSH_PREFIX=' + DSH_PREFIX + ' PROFILE=' + DSH_PROFILE);
-try { mkdirSync(join(HOME, 'tmp'), { recursive: true }); } catch {}
+try { mkdirSync(join(FILES_DIR, 'tmp'), { recursive: true }); } catch {}
 
 const pluginsOnly = process.argv.includes('--plugins-only');
 

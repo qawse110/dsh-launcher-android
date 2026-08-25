@@ -32,7 +32,7 @@ function log(m) {
   const l = `${new Date().toISOString()} [stub] ${m}`;
   console.log(l);
   try { writeFileSync(OUT, l + '\n', { flag: 'a' }); } catch {}
-  try { writeFileSync(OUT_SHARED, l + '\n', { flag: 'a' }); } catch {}
+  try { if (process.env.DSH_SHARED_LOG === '1') writeFileSync(OUT_SHARED, l + '\n', { flag: 'a' }); } catch {}
 }
 
 /** 缓存 .pnpm 目录列表，避免几十次 findPkg 反复 readdirSync 同一个大目录。 */

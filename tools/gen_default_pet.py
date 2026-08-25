@@ -315,14 +315,20 @@ def main():
             "今天也要加油哦！",
         ],
     }
+    # 先校验后写盘（review：避免失败时留下不一致产物）
+    validate_atlas(atlas)
     with open(os.path.join(out_dir, "pet.json"), "w", encoding="utf-8") as f:
         json.dump(pet_json, f, ensure_ascii=False, indent=2)
     print(f"written: {sheet_path} ({atlas.size[0]}x{atlas.size[1]})")
     print(f"written: {os.path.join(out_dir, 'pet.json')}")
-    # 校验：尺寸 + 非透明单元格分布
-    assert atlas.size == (CELL_W * COLS, CELL_H * ROWS), "atlas size mismatch"
+
+
+def validate_atlas(atlas):
+    """尺寸 + 非透明单元格分布校验；失败显式 raise（不用 assert，避免 -O 剥离）。"""
+    if atlas.size != (CELL_W * COLS, CELL_H * ROWS):
+        raise SystemExit(f"FAIL: atlas size {atlas.size} != {(CELL_W * COLS, CELL_H * ROWS)}")
     for row in range(ROWS):
-        for col in range(8):
+        for col in range(COLS):
             cell = atlas.crop((col * CELL_W, row * CELL_H, (col + 1) * CELL_W, (row + 1) * CELL_H))
             has_px = cell.getbbox() is not None
             expect = col < USE_COLS[row]

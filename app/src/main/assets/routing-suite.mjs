@@ -109,20 +109,20 @@ function dshPlugin(args) {
 
 async function download(url, dest) {
   log('GET ' + url);
-  // Android 网络栈可能卡死在一个无响应的 TCP 连接上，给单次请求加超时，
-  // 让 fetchRepo 的 main/master 分支重试逻辑真正生效。
+  // Android 网络栈可能卡死在一个无响应的 TCP 连接上，给单次请求加超时。
+  // P1 修复：body 读取也必须在计时器保护内——此前 clearTimeout 在拿到
+  // 响应头后立即执行，arrayBuffer() 阶段卡死无超时（正是本注释要修的场景）。
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error('timeout after 30s')), 30_000);
-  let res;
   try {
-    res = await fetch(url, { redirect: 'follow', signal: controller.signal });
+    const res = await fetch(url, { redirect: 'follow', signal: controller.signal });
+    if (!res.ok) throw new Error('HTTP ' + res.status + ' for ' + url);
+    const buf = Buffer.from(await res.arrayBuffer());
+    writeFileSync(dest, buf);
+    log('downloaded ' + dest + ' (' + (buf.length / 1024).toFixed(0) + 'KB)');
   } finally {
     clearTimeout(timer);
   }
-  if (!res.ok) throw new Error('HTTP ' + res.status + ' for ' + url);
-  const buf = Buffer.from(await res.arrayBuffer());
-  writeFileSync(dest, buf);
-  log('downloaded ' + dest + ' (' + (buf.length / 1024).toFixed(0) + 'KB)');
 }
 
 function stripSingleTop(dir) {
@@ -162,6 +162,8 @@ function untar(buf, dest) {
       mkdirSync(p, { recursive: true });
     } else if (type === '2') {
       const target = h.subarray(157, 257).toString('utf8').replace(/\0[\s\S]*$/, '');
+      // tar slip 防护：拒绝绝对路径与 .. 穿越的链接目标
+      if (target.startsWith('/') || target.split('/').includes('..')) { log('  skip unsafe symlink: ' + target); continue; }
       mkdirSync(dirname(p), { recursive: true });
       try { symlinkSync(target, p); } catch {}
     } else if (type === '0' || type === '\0') {
@@ -218,7 +220,7 @@ async function installSuite() {
     run('/system/bin/sh', ['-c', 'cd ' + injector + ' && bash scripts/build.sh'], { env: envBase() });
   }
   if (existsSync(join(injector, 'package.json'))) {
-    dshPlugin(['add', injector]);
+    if (!dshPlugin(['add', injector])) { log('injector add FAILED'); process.exitCode = 1; }
   } else {
     log('injector package missing, skip');
   }
