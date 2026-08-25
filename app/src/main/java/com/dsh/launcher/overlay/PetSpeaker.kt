@@ -138,6 +138,12 @@ internal class PetSpeaker(
         }
     }
 
+    /** 悬浮窗重置时清空播报节流/去重状态（保持既有行为：与视图计数一同归零）。 */
+    fun resetTransientState() {
+        lastSpokenKey = null
+        lastSpokeAt = 0L
+    }
+
     /** 释放 TTS 与 Edge 引擎资源（释放后不再重建）。 */
     fun release() {
         ttsReleased = true

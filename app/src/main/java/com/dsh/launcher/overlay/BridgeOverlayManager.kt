@@ -675,8 +675,7 @@ class BridgeOverlayManager(
         greeted = false
         tapCount = 0
         petView?.stop()
-        lastSpokenKey = null
-        lastSpokeAt = 0L
+        petSpeaker.resetTransientState()
         pendingRow = -1
         pendingRowCount = 0
         try {
