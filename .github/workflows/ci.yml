@@ -34,3 +34,6 @@ jobs:
 
       - name: Assemble debug（编译门禁）
         run: chmod +x gradlew && ./gradlew :app:assembleDebug --no-daemon
+
+      - name: Unit tests（P2-2 单测门禁）
+        run: ./gradlew :app:testDebugUnitTest --no-daemon

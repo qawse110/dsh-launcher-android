@@ -56,6 +56,14 @@ android {
     lint {
         disable += "ExpiredTargetSdkVersion"
     }
+
+    // P2-2 测试地基：JVM 单测允许 android.* 桩默认值（Log 等返回 0/null 不抛错）
+    testOptions {
+        unitTests {
+            isReturnDefaultValues = true
+            isIncludeAndroidResources = true
+        }
+    }
 }
 
 dependencies {
@@ -66,4 +74,7 @@ dependencies {
     implementation("androidx.documentfile:documentfile:1.0.1")
     implementation("com.google.android.material:material:1.12.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.13")
 }

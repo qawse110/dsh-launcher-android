@@ -46,6 +46,14 @@ object MarkerStore {
         }
     }
 
+    /** 仅供单元测试：清空进程内缓存与加载标记，下个访问重新从盘加载。 */
+    internal fun resetForTest() {
+        synchronized(lock) {
+            loaded = false
+            map.clear()
+        }
+    }
+
     // ---------------- 内部 ----------------
 
     private fun storeFile(ctx: Context) = File(File(ctx.filesDir, DIR), FILE)
