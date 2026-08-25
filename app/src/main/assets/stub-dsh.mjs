@@ -435,10 +435,18 @@ try {
     } else {
       let consumerFound = false;
       try {
-        const assetsDir = join(dirname(idx), 'assets');
-        for (const f of readdirSync(assetsDir)) {
-          if (!f.endsWith('.js')) continue;
-          if (readFileSync(join(assetsDir, f), 'utf8').includes('AbortSignal.timeout')) { consumerFound = true; break; }
+        // 递归扫描 assets（含子目录 chunk，布局变化不丢失消费者检测）。
+        // 误报无害：shim 自带 `if(!AbortSignal.timeout)` 守卫，已定义时不生效。
+        const stack = [join(dirname(idx), 'assets')];
+        while (stack.length && !consumerFound) {
+          const dir = stack.pop();
+          let ents;
+          try { ents = readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+          for (const ent of ents) {
+            if (ent.isDirectory()) { stack.push(join(dir, ent.name)); continue; }
+            if (!ent.name.endsWith('.js')) continue;
+            if (readFileSync(join(dir, ent.name), 'utf8').includes('AbortSignal.timeout')) { consumerFound = true; break; }
+          }
         }
       } catch (e) {
         /* 资产目录不可读（布局变化）：宁可保守注入，回到旧行为 */
