@@ -838,7 +838,6 @@ class BridgeOverlayManager(
         remove()
     }
 
-    private fun OverlayStyle.overlayFlags(): Int = OverlayStyle.OverlayStyle.overlayFlags()
 
     // ---------------- 样式工具（已迁移 OverlayStyle） ----------------
 

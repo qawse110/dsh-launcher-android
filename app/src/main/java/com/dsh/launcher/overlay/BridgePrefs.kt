@@ -2,7 +2,6 @@ package com.dsh.launcher.overlay
 
 import android.content.Context
 import com.dsh.launcher.core.AppState
-import com.dsh.launcher.core.CodexPetStore
 
 /**
  * 状态桥接悬浮窗的偏好读取门面（架构方案 P1-6 第一刀）。
