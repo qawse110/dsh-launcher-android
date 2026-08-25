@@ -59,6 +59,11 @@ class BridgeOverlayManager(
     private var overlayDot: View? = null
     private var overlayParams: WindowManager.LayoutParams? = null
 
+    /** 偏好读取门面（P1-6 拆分）。 */
+    private val bp = BridgePrefs(context)
+    /** dp→px 密度（OverlayStyle.roundedDrawable 需要）。 */
+    private val density: Float get() = context.resources.displayMetrics.density
+
     // 垃圾桶：拖动悬浮窗时出现在屏幕底部，拖上去停留片刻（防误关）再松手关闭悬浮窗
     private var trashView: TextView? = null
     private var trashParams: WindowManager.LayoutParams? = null
@@ -174,38 +179,7 @@ class BridgeOverlayManager(
         }
         return true
     }
-    private fun showStatus() = prefs().getBoolean("show_status", true)
-    private fun showLastText() = prefs().getBoolean("show_last_text", true)
-    private fun overlayStyle(): String = prefs().getString("overlay_style", "pill") ?: "pill"
-    private fun petId(): String =
-        prefs().getString("pet_id", CodexPetStore.DEFAULT_PET_ID) ?: CodexPetStore.DEFAULT_PET_ID
-    private fun showPetBubble() = prefs().getBoolean("pet_show_bubble", true)
-    private fun petTts() = prefs().getBoolean("pet_tts", true)
-    private fun showPetName() = prefs().getBoolean("pet_show_name", true)
-    private fun showAmbientBubble() = prefs().getBoolean("pet_ambient_bubble", true)
-    private fun petHeightDp(): Int = when (prefs().getString("pet_size", "medium")) {
-        "small" -> 88
-        "large" -> 160
-        else -> 120
-    }
-    private fun displayMode(): String {
-        return if (prefs().getBoolean("display_mode_auto", true)) {
-            "auto"
-        } else {
-            prefs().getString("display_mode", "compact") ?: "compact"
-        }
-    }
-
-    private fun useFullMode(text: String): Boolean {
-        val mode = displayMode()
-        return when (mode) {
-            "full" -> true
-            "compact" -> false
-            else -> text.length > 20
-        }
-    }
-
-    private fun hideWhenIdle() = prefs().getBoolean("hide_when_idle", false)
+    // 偏好读取已迁移至 BridgePrefs（bp）；样式工厂迁移至 OverlayStyle。
 
     /** 屏幕当前可见（亮屏且未锁）才允许挂悬浮窗；查询失败按可见处理（宁可多画不可失联）。 */
     private fun screenVisible(): Boolean = try {
@@ -231,7 +205,7 @@ class BridgeOverlayManager(
             remove()
             return
         }
-        if (hideWhenIdle() && status == "idle") {
+        if (bp.hideWhenIdle() && status == "idle") {
             remove()
             return
         }
@@ -239,7 +213,7 @@ class BridgeOverlayManager(
             remove()
             return
         }
-        val style = overlayStyle()
+        val style = bp.overlayStyle()
         if (currentStyle != style) {
             remove()
             currentStyle = style
@@ -271,14 +245,14 @@ class BridgeOverlayManager(
         }
         windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
         overlayDot = View(context).apply {
-            background = circleDrawable(statusColor(status))
+            background = OverlayStyle.circleDrawable(OverlayStyle.statusColor(status))
         }
         overlayText = TextView(context).apply {
             textSize = 12f
             setTextColor(0xFFF2F5FA.toInt())
             includeFontPadding = false
-            isSingleLine = displayMode() != "full"
-            maxLines = if (displayMode() == "full") 3 else 1
+            isSingleLine = bp.displayMode() != "full"
+            maxLines = if (bp.displayMode() == "full") 3 else 1
             ellipsize = TextUtils.TruncateAt.END
             maxWidth = (context.resources.displayMetrics.widthPixels * 0.72).toInt()
         }
@@ -286,7 +260,7 @@ class BridgeOverlayManager(
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             contentDescription = "dsh 状态条：点击打开 Web，拖动时底部出现垃圾桶，拖上去松手关闭"
-            background = roundedDrawable(0xDD101722.toInt(), 14, 1, 0x33283A55.toInt())
+            background = OverlayStyle.roundedDrawable(0xDD101722.toInt(), 14, density, 1, 0x33283A55.toInt())
             if (Build.VERSION.SDK_INT >= 21) elevation = dp(6).toFloat()
             setPadding(dp(12), dp(8), dp(6), dp(8))
             addView(overlayDot, LinearLayout.LayoutParams(dp(8), dp(8)).apply { rightMargin = dp(6) })
@@ -300,7 +274,7 @@ class BridgeOverlayManager(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
             windowType,
-            overlayFlags(),
+            OverlayStyle.overlayFlags(),
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
@@ -318,20 +292,21 @@ class BridgeOverlayManager(
 
     private fun updateText(status: String, text: String, event: String?) {
         val tv = overlayText ?: return
-        overlayDot?.background = circleDrawable(statusColor(status))
-        overlayView?.background = roundedDrawable(
-            statusBackground(status),
+        overlayDot?.background = OverlayStyle.circleDrawable(OverlayStyle.statusColor(status))
+        overlayView?.background = OverlayStyle.roundedDrawable(
+            OverlayStyle.statusBackground(status),
             14,
+            density,
             1,
-            statusBorder(status)
+            OverlayStyle.statusBorder(status)
         )
-        val full = useFullMode(text)
+        val full = bp.useFullMode(text)
         tv.text = buildOverlayText(
             status,
             event,
             text,
-            showStatus(),
-            showLastText(),
+            bp.showStatus(),
+            bp.showLastText(),
             full
         )
         tv.isSingleLine = !full
@@ -342,10 +317,10 @@ class BridgeOverlayManager(
 
     private fun showPet(status: String, text: String, event: String?) {
         if (prefs().getBoolean("overlay_dismissed", false)) return
-        val wantedId = petId()
+        val wantedId = bp.petId()
         if (overlayView != null) {
             if (overlayView?.isAttachedToWindow == true) {
-                if (petLoadedId == wantedId && petBuiltHeightDp == petHeightDp()) {
+                if (petLoadedId == wantedId && petBuiltHeightDp == bp.petHeightDp()) {
                     updatePet(status, text, event)
                     return
                 }
@@ -355,7 +330,7 @@ class BridgeOverlayManager(
                 resetViews()
             }
         }
-        if (petAtlas == null || petLoadedId != wantedId || petAtlasForHeightDp != petHeightDp()) {
+        if (petAtlas == null || petLoadedId != wantedId || petAtlasForHeightDp != bp.petHeightDp()) {
             petAtlas = null
             val pets = CodexPetStore.scanPets(context)
             val pet = pets.firstOrNull { it.id == wantedId }
@@ -363,26 +338,26 @@ class BridgeOverlayManager(
                 ?: CodexPetStore.defaultPet()
             petName = pet.displayName
             petReplies = pet.replies
-            petAtlas = CodexPetStore.openAtlas(context, pet, petHeightDp())
+            petAtlas = CodexPetStore.openAtlas(context, pet, bp.petHeightDp())
             petLoadedId = if (petAtlas != null) pet.id else null
             if (petAtlas == null) {
                 // 用户包加载失败时回退内置默认（petLoadedId 保持默认，后续轮询可自愈）；
                 // 默认图集缓存，避免每轮重新解码
-                if (defaultAtlas == null || defaultAtlasForHeightDp != petHeightDp()) {
-                    defaultAtlas = CodexPetStore.openAtlas(context, CodexPetStore.defaultPet(), petHeightDp())
-                    defaultAtlasForHeightDp = if (defaultAtlas != null) petHeightDp() else defaultAtlasForHeightDp
+                if (defaultAtlas == null || defaultAtlasForHeightDp != bp.petHeightDp()) {
+                    defaultAtlas = CodexPetStore.openAtlas(context, CodexPetStore.defaultPet(), bp.petHeightDp())
+                    defaultAtlasForHeightDp = if (defaultAtlas != null) bp.petHeightDp() else defaultAtlasForHeightDp
                 }
                 petAtlas = defaultAtlas
                 petLoadedId = if (petAtlas != null) CodexPetStore.DEFAULT_PET_ID else null
                 petName = CodexPetStore.defaultPet().displayName
                 petReplies = CodexPetStore.defaultPet().replies
             }
-            petAtlasForHeightDp = if (petAtlas != null) petHeightDp() else petAtlasForHeightDp
+            petAtlasForHeightDp = if (petAtlas != null) bp.petHeightDp() else petAtlasForHeightDp
         }
         val atlas = petAtlas ?: return
         windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
 
-        petBuiltHeightDp = petHeightDp()
+        petBuiltHeightDp = bp.petHeightDp()
         val petH = dp(petBuiltHeightDp)
         val petW = if (atlas.cellH > 0) (petH * atlas.cellW / atlas.cellH.toFloat()).toInt() else petH
         val pet = PetOverlayView(context, atlas)
@@ -395,7 +370,7 @@ class BridgeOverlayManager(
             ellipsize = TextUtils.TruncateAt.END
             maxWidth = minOf((context.resources.displayMetrics.widthPixels * 0.45).toInt(), dp(230))
             setPadding(dp(10), dp(5), dp(10), dp(5))
-            background = roundedDrawable(0xE0101722.toInt(), 12, 1, 0x336C8CFF.toInt())
+            background = OverlayStyle.roundedDrawable(0xE0101722.toInt(), 12, density, 1, 0x336C8CFF.toInt())
             // 气泡独立成窗（可点）：有临时气泡（点击台词/展开内容）时点击立即收起；无则打开 dsh Web
             setOnClickListener {
                 if (transientText != null) cancelTransient() else openWeb()
@@ -413,7 +388,7 @@ class BridgeOverlayManager(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
             windowType,
-            overlayFlags(),
+            OverlayStyle.overlayFlags(),
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
@@ -454,7 +429,7 @@ class BridgeOverlayManager(
                 cancelTransient() // 状态变化：收起，恢复常规气泡
             }
             val bubbleText = buildPetBubbleText(status, text, event, petName)
-            if (showPetBubble() && bubbleText.isNotBlank()) {
+            if (bp.showPetBubble() && bubbleText.isNotBlank()) {
                 showBubbleWindow()
                 bubble.maxLines = 2
                 bubble.ellipsize = TextUtils.TruncateAt.END
@@ -470,7 +445,7 @@ class BridgeOverlayManager(
             syncBubbleWindow() // 气泡窗独立定位：跟随宠物窗，朝屏幕内侧
             if (!greeted) {
                 greeted = true
-                if (showPetBubble()) showGreeting()
+                if (bp.showPetBubble()) showGreeting()
             }
             if (ambientRunnable == null) scheduleAmbient()
             if (idleActRunnable == null) scheduleIdleAct()
@@ -478,9 +453,9 @@ class BridgeOverlayManager(
     }
 
     private fun buildPetBubbleText(status: String, text: String, event: String?, name: String): String {
-        val namePart = if (showPetName()) name else ""
-        val label = if (showStatus()) statusLabel(status, event) else ""
-        val snippet = if (showLastText() && text.isNotBlank()) text.take(40) else ""
+        val namePart = if (bp.showPetName()) name else ""
+        val label = if (bp.showStatus()) statusLabel(status, event) else ""
+        val snippet = if (bp.showLastText() && text.isNotBlank()) text.take(40) else ""
         return listOf(namePart, label, snippet).filter { it.isNotBlank() }.joinToString(" · ")
     }
 
@@ -493,7 +468,7 @@ class BridgeOverlayManager(
      * - 完成/失败/空闲不追加正文：状态转折有固定台词，且 FLUSH 会打断正文。
      */
     private fun speakContentIncremental(status: String, event: String?) {
-        if (!petTts() || ttsReleased) return
+        if (!bp.petTts() || ttsReleased) return
         val text = lastText ?: return
         if (event == "turn/start" || event == "user/message") spokenLen = 0
         if (text.length < spokenLen) spokenLen = 0
@@ -534,7 +509,7 @@ class BridgeOverlayManager(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
             windowType,
-            overlayFlags(),
+            OverlayStyle.overlayFlags(),
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
@@ -698,7 +673,7 @@ class BridgeOverlayManager(
     }
 
     private fun maybeShowAmbientBubble() {
-        if (!showAmbientBubble()) return
+        if (!bp.showAmbientBubble()) return
         if (lastStatus != "idle") return // 只在闲时冒泡
         if (transientText != null) return
         if (petBubble == null) return
@@ -759,7 +734,7 @@ class BridgeOverlayManager(
      *               true =ADD 语义（正文整句接续排队）。
      */
     private fun speak(text: String, append: Boolean = false) {
-        if (!petTts() || text.isBlank()) return
+        if (!bp.petTts() || text.isBlank()) return
         val engine = prefs().getString("tts_engine", "system") ?: "system"
         if (engine == "edge") {
             if (!edgeTtsInited) {
@@ -858,55 +833,15 @@ class BridgeOverlayManager(
 
     /** 长按切换状态条/桌宠模式，下次状态轮询（≤1s）生效。 */
     private fun toggleStyle() {
-        val next = if (overlayStyle() == "pet") "pill" else "pet"
+        val next = if (bp.overlayStyle() == "pet") "pill" else "pet"
         prefs().edit().putString("overlay_style", next).apply()
         remove()
     }
 
-    private fun overlayFlags(): Int =
-        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+    private fun OverlayStyle.overlayFlags(): Int = OverlayStyle.OverlayStyle.overlayFlags()
 
-    // ---------------- 样式工具 ----------------
+    // ---------------- 样式工具（已迁移 OverlayStyle） ----------------
 
-    private fun statusBackground(status: String): Int = when (status) {
-        "running" -> 0xEE182238.toInt()
-        "finished" -> 0xEE1B2A24.toInt()
-        "failed" -> 0xEE2A1418.toInt()
-        else -> 0xDD101722.toInt()
-    }
-
-    private fun statusBorder(status: String): Int = when (status) {
-        "running" -> 0x446C8CFF.toInt()
-        "finished" -> 0x445FD68A.toInt()
-        "failed" -> 0x44FF6B6B.toInt()
-        else -> 0x33283A55.toInt()
-    }
-
-    private fun statusColor(status: String): Int = when (status) {
-        "running" -> 0xFF6C8CFF.toInt()
-        "finished" -> 0xFF5FD68A.toInt()
-        "failed" -> 0xFFFF6B6B.toInt()
-        else -> 0xFF7A8496.toInt()
-    }
-
-    private fun circleDrawable(color: Int): GradientDrawable =
-        GradientDrawable().apply {
-            shape = GradientDrawable.OVAL
-            setColor(color)
-        }
-
-    private fun roundedDrawable(
-        color: Int,
-        radiusDp: Int,
-        strokeWidth: Int = 0,
-        strokeColor: Int = 0
-    ): GradientDrawable = GradientDrawable().apply {
-        shape = GradientDrawable.RECTANGLE
-        setColor(color)
-        cornerRadius = dp(radiusDp).toFloat()
-        if (strokeWidth > 0) setStroke(strokeWidth, strokeColor)
-    }
 
     // ---------------- 垃圾桶（替代 × 关闭按钮） ----------------
 
@@ -920,7 +855,7 @@ class BridgeOverlayManager(
             text = "🗑️"
             textSize = 30f
             gravity = Gravity.CENTER
-            background = roundedDrawable(0xB3101722.toInt(), 29, 2, 0x88FF6C6C.toInt())
+            background = OverlayStyle.roundedDrawable(0xB3101722.toInt(), 29, density, 2, 0x88FF6C6C.toInt())
             elevation = dp(4).toFloat()
         }
         trashParams = WindowManager.LayoutParams(
@@ -976,9 +911,9 @@ class BridgeOverlayManager(
     private fun highlightTrash(on: Boolean) {
         val tv = trashView ?: return
         tv.background = if (on) {
-            roundedDrawable(0xFFD9303E.toInt(), 29, 2, 0xFFFF8A8A.toInt())
+            OverlayStyle.roundedDrawable(0xFFD9303E.toInt(), 29, density, 2, 0xFFFF8A8A.toInt())
         } else {
-            roundedDrawable(0xB3101722.toInt(), 29, 2, 0x88FF6C6C.toInt())
+            OverlayStyle.roundedDrawable(0xB3101722.toInt(), 29, density, 2, 0x88FF6C6C.toInt())
         }
         tv.textSize = if (on) 40f else 30f
     }
@@ -1046,7 +981,7 @@ class BridgeOverlayManager(
                         toggleStyle()
                     } else if (downOnPet) {
                         showTapFeedback()
-                    } else if (overlayStyle() != "pet") {
+                    } else if (bp.overlayStyle() != "pet") {
                         openWeb() // 状态条整条可点击打开 Web
                     }
                     // 桌宠模式空白区域：不响应（不打开 Web）
@@ -1057,7 +992,7 @@ class BridgeOverlayManager(
                         remove()
                     } else {
                         savePosition(p)
-                        if (overlayStyle() == "pet" && petFall()) {
+                        if (bp.overlayStyle() == "pet" && petFall()) {
                             if (estimateThrowSpeed() < placeSpeedThreshold()) {
                                 // 轻放 = 放置停靠位（家）：不坠落，原地待命
                                 setHome(p.x, p.y)
@@ -1081,7 +1016,7 @@ class BridgeOverlayManager(
     }
 
     private fun savePosition(p: WindowManager.LayoutParams) {
-        val isPet = overlayStyle() == "pet"
+        val isPet = bp.overlayStyle() == "pet"
         prefs().edit()
             .putInt(if (isPet) "pet_x" else "overlay_x", p.x)
             .putInt(if (isPet) "pet_y" else "overlay_y", p.y)

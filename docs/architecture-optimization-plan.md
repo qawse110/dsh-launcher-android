@@ -161,3 +161,4 @@ WebView JS bridge 暴露面（未注册 JS 接口）经抽查未见明显风险�
 | R2 P1-6 BridgeOverlayManager 拆分 | ⏸ 挂起（风险最大，需独立回归窗口） | — |
 | P0-2 keystore 出库 | ⏸ 待产品决策（签名影响） | — |
 | R2 P1-4 收尾：markers.json 迁移 | ✅ 完成：MarkerStore 单文件原子写 + 六种旧点文件一次性导入；AssetSync 改键值 API | 本提交 |
+| R2 P1-6 第一刀 | ✅ 完成：BridgePrefs(15 getter) + OverlayStyle(样式工厂) 拆出；manager 1268→1203。剩余桌宠物理/气泡/TTS 簇（~500 行强耦合）需真机回归窗口，挂起至下一回归周期 | 本提交 |
