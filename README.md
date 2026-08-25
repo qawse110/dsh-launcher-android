@@ -1,84 +1,101 @@
 # DshLauncher (Android)
 
 单 APK 的 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）Android 启动器：
-内置 Node.js aarch64 运行时，通过官方 npm 包 `@deepseek-ai/dsh` 安装/更新 dsh，
-并在设备本机直接启动 `dsh web`（127.0.0.1:3080），
-并自带 WebView 界面——**不需要 Termux、不需要外部 Node**；联网仅用于 npm 首次安装与后续更新。
+内置 Node.js aarch64 运行时与 Termux 工具链，通过官方 npm 包 `@deepseek-ai/dsh` 安装/更新 dsh，
+并在设备本机直接启动 `dsh web`（`http://127.0.0.1:3080`），自带 WebView 界面。
 
-**包名**：`com.dsh.launcher`（AGP 9.0 / Kotlin / Gradle 8.x）。
+**不需要 Termux、不需要外部 Node**；联网仅用于 npm 首次安装与后续更新。
 
-## 特性
+- 包名 `com.dsh.launcher` · 当前版本 **v4.10.0**（versionCode 31）
+- 架构：AGP 9.0 / Kotlin / Gradle 8.x · minSdk 24 / targetSdk 28 / compileSdk 35
 
-- **内置 Node 运行时**：`assets/node/…` 打进 APK，首次启动解压到应用私有目录并
-  `makeUnwritable`（解除 Android W^X 执行限制）。
-- **内置 Termux 工具链**：内置 bash/coreutils/apt，并在首次使用/一键安装时自动
-  `pkg install git python ripgrep`，把 Termux `bin`、内置 Node `bin` 与 pnpm 工具目录纳入
-  DSH 进程与内置终端 PATH，`TERM=xterm-256color`，满足 Harness 对 bash/git/ripgrep 的前置要求。
-- **唯一环境 = 内置 Termux**（v4.4 迁移，v4.5 起移除全部回退路径）：dsh 内部命令、
-  web 启动脚本、watchdog 拉起、内置终端、插件管理一律经内置 Termux bash 执行；
-  环境未就绪时自动准备（幂等），不再回退系统 sh 或外部 Termux app。所有子进程显式指定
-  可写工作目录，修复应用进程默认 cwd=/ 导致的相对路径「权限不足」；web 进程 `LD_LIBRARY_PATH`
-  按 node/lib → termux usr/lib 顺序合并。快速启动自动识别旧代进程（cwd≠HOME）并迁移重启。
-  （仅进程清理类工具保留系统 toybox：ps/pkill/kill。）
-- **apt/dpkg 原生可用**（v4.6）：bin/lib/share 默认可写——W^X 只读锁会阻断 dpkg 解包与
-  postinst，是此前 `apt install` 失败的根因之一；集成 **termux-exec**（LD_PRELOAD 运行时
-  翻译脚本 shebang 的官方前缀，postinst/pip 入口脚本依赖）；另内置 `tpkg` 手动解包兜底
-  （dpkg-deb -x + dpkg 数据库同步 + shebang 修正），`pkg install` 失败时自动切换。
-  实测 `apt install python` 全链路成功：Python 3.14 + pip 26，ssl/sqlite3/ctypes/zlib 可用。
-- **打开即用的自动启动流**（v4.2 起）：主界面即启动器——首次启动自动完成
-  `解压 node → 复制官方安装脚本 + 内置插件源 → npm 官方安装/更新 dsh + dsh plugin 装配内置插件 →
-  Android 兼容修复 → 启动 dsh web`，就绪后**自动进入 WebUI**；后续每次打开自动快速启动
-  （秒级，已运行则跳过）并直接进入 WebUI。流程引擎统一在 `DshFlow`，
-  命令控制台（`dsh / dsh_install / dsh_start` extras）与主界面共用同一份逻辑。
-- **内置 WebView 界面**：应用内加载 `http://127.0.0.1:3080`
-  （无需跳外部浏览器）；也可用任意浏览器访问同一地址。
-- **双 TTS 引擎**：桌宠播报可选系统引擎（离线）或 Edge 在线语音（微软神经网络音色，
-  参考 rany2/edge-tts 协议：WebSocket + SSML + Sec-MS-GEC 令牌，零额外依赖实现）；
-  正文按完整句增量朗读，失败自动回退系统引擎。
-- **悬浮窗 + 安卓桌宠模式**：主界面的「状态悬浮窗」可显示 dsh 运行状态；支持两种样式
-  （设置页或长按悬浮窗切换）：**状态条**（紧凑文字）与**桌宠**（动画角色跟随 dsh 状态）。
-  桌宠模式**兼容 Codex 桌宠包格式**（`pet.json` + `spritesheet.webp/.png`，8x9 精灵表），
-  内置默认桌宠“小豆丁”，并可导入 awesome-codex-pet / petdex 等社区桌宠包（详见下文）。
-- **设备端免编译适配**（`assets/stub-dsh.mjs`，每次启动自动重打，幂等）：
-  原则上**只保留 Node 模块加载期与 WebView 引导期的必要修复**，凡能在插件运行时
-  实现的功能一律下沉为独立内置插件（逐项审计见
-  `docs/plugin-conversion-audit.md`）。现存：
-  - `koffi` / `node-pty` / `sharp`：Android 无预编译产物（`node-addon-*`/libvips 缺失），
-    以 Proxy stub / 纯 JS shim 顶替，保证模块可加载；
-  - `dsh-attachment-local` 视觉链路 v4：SELinux 禁 link(2)、FUSE fsync 失败的
-    运行时行为修复（fs 兼容层不覆盖 CJS 盲区）；
-  - `dsh-llm-pi-ai` sendAttribution：`dsh-provider-headers` 插件「关闭归因 UA」的
-    schema 缝隙（上游明确注释 omission cannot suppress attribution，官方提供
-    抑制通道前保留）；
-  - `sandbox-windows-acl`（仅 Windows 宿主）的 koffi 布局断言在执行前禁用；
-  - `@vscode/ripgrep` 解析器 Android 回退（优先 Termux 原生 rg）；`dsh-fs-local`
-    chmod 对 FUSE 的容错；
-  - `--expose-internals`：vendor/loader 的 internal 加载器依赖它解析 workspace 包
-    （`NODE_OPTIONS` 不允许该开关，必须用命令行参数）；
-  - **`AbortSignal.timeout` polyfill 按需注入**：仅当 dist 内 app bundle 确实引用
-    该 API 时才写 `dist/index.html`（0.1.1-rc.2 前端无引用，自动跳过，不再无条件
-    改动上游产物；引导期必须先于 app bundle，client 插件时序上无法替代）。
-  已移除的旧补丁：apiproxy vision 白名单（上游已无此常量）、sandbox "/tmp"→TMPDIR
-  （上游已原生并入 os.tmpdir()）、directory-picker SD Card 条目（改由内置插件实现）。
-- 内置插件经官方 `dsh plugin --profile web add` 装配：`dsh-mobile-nav`、`dsh-super-injector`、
-  `dsh-net-proxy`、`dsh-provider-headers`、`dsh-vision`、`dsh-oh-we-need`（Skill 化，不再注入
-  系统提示词）、`dsh-android-links`（HOME 符号链接暴露 SD 卡给工作区目录浏览器，
-  替代旧的 directory-picker 源码补丁）；`yjh051108/dsh-routing-suite`
-  走特殊适配（`routing-suite.mjs`：聚合仓库 + injector 装配 + agent-presets 拷贝）。
-- 自动初始化 `files/.dsh/profiles/web` 配置（含默认 LLM 提供方配置），
-  界面内填入 DeepSeek API Key 即可使用。
+## 目录
+
+- [特性概览](#特性概览)
+- [架构：最小脚本干预，能力插件化](#架构最小脚本干预能力插件化)
+- [内置插件](#内置插件)
+- [构建](#构建)
+- [安装与运行](#安装与运行)
+- [桌宠模式（兼容 Codex 桌宠）](#桌宠模式兼容-codex-桌宠)
+- [实机验证](#实机验证)
+- [已知限制](#已知限制)
+- [文档索引](#文档索引)
+- [发布](#发布)
+
+---
+
+## 特性概览
+
+| 领域 | 能力 |
+|---|---|
+| **运行时** | 内置 Node aarch64 + Termux bash/coreutils/apt；唯一执行环境 = 内置 Termux |
+| **安装** | 官方 npm 安装/更新 `@deepseek-ai/dsh` + `dsh plugin` 装配内置插件（非源码克隆） |
+| **启动** | 打开即自动引导（解压→安装→适配→启动 web），秒级快速启动，就绪自动进 WebUI |
+| **界面** | 内嵌 WebView（Chromium）+ 任意浏览器访问同一地址 |
+| **语音** | 双 TTS：系统引擎（离线）/ Edge 在线语音（微软神经音色，零依赖实现） |
+| **悬浮窗** | 状态条 + 桌宠动画双样式；普通服务 + 无障碍双通道保活 |
+| **插件化适配** | 能由插件实现的功能一律下沉为独立内置插件（8 个），脚本补丁降至最低 |
+| **环境** | apt/dpkg 原生可用；Termux 环境自动准备（幂等） |
+
+## 架构：最小脚本干预，能力插件化
+
+启动器对 dsh 本体的干预遵循一条原则：
+
+> **凡能在 Cordis 插件运行时实现的功能，一律做成独立内置插件，走官方 `dsh plugin --profile web add` / bundle patch 通道；脚本只保留 Node 模块加载期与 WebView 引导期无法被插件替代的必要修复。**
+
+逐项审计见 [`docs/plugin-conversion-audit.md`](docs/plugin-conversion-audit.md)（对 `stub-dsh.mjs` 全部 12 处补丁给出「保留 / 移除 / 插件化」三向结论与证据）。
+
+**流水线**（`DshFlow` 统一驱动，主界面与命令控制台共用）：
+
+```
+APK assets
+  ├─ node/  termux-bootstrap.zip    → 解压、makeUnwritable（W^X）、Termux 环境准备
+  ├─ install-dsh.mjs                → npm 安装/更新 @deepseek-ai/dsh + dsh plugin 装配内置插件
+  ├─ stub-dsh.mjs                   → Android 兼容修复（仅剩加载期/引导期必需项，幂等）
+  ├─ extra-plugins/…                → 内置插件源（随 APK 同步，装配进 web profile）
+  └─ web-launcher.sh.tpl            → 可重现的 web 启动环境（TermuxEnv 单源渲染）
+        │
+        ▼
+files/.dsh/profiles/web ──cordis 装配──▶ dsh web @ 127.0.0.1:3080 ◀── WebView/浏览器
+```
+
+**脚本职责边界**：
+
+| 脚本 | 职责 | 是否改写 dsh 本体 |
+|---|---|---|
+| `install-dsh.mjs` | 官方 npm 安装/更新 + `dsh plugin` 装配 | 否（官方通道） |
+| `stub-dsh.mjs` | 加载期/引导期修复（native 模块顶替、CJS 盲区、HTML shim） | 是，仅剩 8 处必需项（带审计） |
+| `fs-register/loader/promises-compat` | Node `--import` 会话级兼容层（SELinux 禁硬链接） | 否 |
+| `routing-suite.mjs` | 第三方聚合仓库的一次性适配安装 | 否（官方 plugin add + 预设拷贝） |
+| `tpkg.sh` | `apt install` 失败时的 deb 手动兜底 | 否（Termux 层） |
+| `web-launcher.sh.tpl` | web 进程启动环境 | 否 |
+
+## 内置插件
+
+经官方 `dsh plugin --profile web add` 装配到 `files/.dsh/profiles/web`（bundle 层），
+随 dsh 升级自动保持，不被启动器补丁破坏：
+
+| 插件 | 作用 |
+|---|---|
+| `dsh-mobile-nav` | Web 界面移动端导航适配 |
+| `dsh-super-injector` | 运行时插件注入器（开发/热装通道） |
+| `dsh-net-proxy` | 网络代理配置 |
+| `dsh-provider-headers` | LLM 提供方请求头（归因 UA 开关） |
+| `dsh-vision` | 视觉能力（经 settings 服务自注册命名空间） |
+| `dsh-oh-we-need` | 推理风格 Skill（不再注入系统提示词） |
+| `dsh-status-bridge` | dsh 运行状态桥接到悬浮窗/通知（本地 HTTP :3190） |
+| `dsh-android-links` | 在 dsh HOME 创建 `sdcard → /storage/emulated/0` 符号链接，让工作区目录浏览器直达 SD 卡（**零 dsh 文件改动**，替代旧源码补丁） |
 
 ## 构建
 
 ```sh
-# 0) （可选）在项目根放 release.keystore，或设置 DSH_KEYSTORE_FILE
-# 1) 构建（release 优先用 keystore 签名；缺省回退 debug 签名）
+# 在项目根放 signing/release.keystore（或设置 DSH_KEYSTORE_FILE/DSH_KEYSTORE_PASS）
 ./gradlew assembleRelease        # 或 assembleDebug
 ```
 
-密钥由 `app/build.gradle.kts` 从 `DSH_KEYSTORE_FILE`（默认根目录 `release.keystore`）
-与 `DSH_KEYSTORE_PASS`（默认 `dshlauncher123`）读取。**不要把 keystore 及其密码提交进仓库**；
-内置默认值仅用于本地开发。
+- 签名：release 优先用 `signing/release.keystore` 正式签名（**自 v4.3.4 起提交入库以保证跨版本签名稳定**，是绕过部分 ROM 对 debug 签名 app 的 exec 过滤的关键假设）；缺 keystore 时回退 debug 签名（仅本地开发）。
+- 密码：`DSH_KEYSTORE_PASS`（默认 `dshlauncher123`）。
+- ⚠️ 已知权衡：公开签名密钥意味着任何人都能用相同签名构造"升级"包——该风险（P0-2）与「出库换新钥」决策记录在 [`docs/architecture-optimization-plan.md`](docs/architecture-optimization-plan.md)。
 
 ## 安装与运行
 
@@ -91,114 +108,65 @@ adb shell am start -n com.dsh.launcher/.MainActivity   # 或直接点应用图�
 ```
 
 - 主界面按钮「打开 Web 界面」进入内嵌 WebView；填写 API Key（设置 → 添加 API Key）后即可对话。
-- Android 11+ 可在主界面点击「存储权限 / 所有文件访问」并允许，以完整读写 `/sdcard`
-  （尤其当 dsh 工作区放在 `/sdcard/Download` 时）。
+- Android 11+ 可在主界面开启「存储权限 / 所有文件访问」，以完整读写 `/sdcard`（尤其 dsh 工作区放 `/sdcard/Download` 时）。
 - 日志：应用私有目录 `files/dsh-flow.log`（引导流程）、`files/dsh-web.log`（web 进程）。
-- 部分 ColorOS 设备从 `/sdcard` 安装 APK 会遇到 FUSE 上下文问题，先推送到
-  `/data/local/tmp/` 再 `pm install -r` 即可。
+- 部分 ColorOS 设备从 `/sdcard` 安装 APK 会遇到 FUSE 上下文问题：先推到 `/data/local/tmp/` 再 `pm install -r`。
+- 环境特性：唯一执行环境 = 内置 Termux（bash/coreutils/apt），首次使用自动 `pkg install git python ripgrep`；apt/dpkg 原生可用（W^X 放开 + termux-exec 集成），`apt install` 失败自动切 `tpkg` 手动兜底。
 
-### 桌宠模式（兼容 Codex 桌宠）
+## 桌宠模式（兼容 Codex 桌宠）
 
-- **切换**：主界面 →「状态悬浮窗」→「悬浮窗样式」选「状态条」或「桌宠」；
-  也可以**长按悬浮窗本体**快速来回切换。切换后 1 秒内自动生效（状态轮询周期）。
-- **开关统一**：设置页「悬浮窗显示」是唯一总开关——关闭后**普通服务与无障碍保活
-  两条通道的悬浮窗一并隐藏**（下次轮询 1 秒内生效，无需重启）；无障碍悬浮窗激活
-  时普通悬浮窗自动让位，避免叠加；垃圾桶关闭悬浮窗后，重新打开「悬浮窗显示」即恢复。
-  锁屏/灭屏（含息屏指纹界面）期间悬浮窗自动隐藏，解锁后恢复。
-- **交互**：**单击**桌宠本体——挥手互动一次 + 随机台词短气泡（5 秒，会朗读）；
-  **双击**——气泡展开**最近完整内容**（8 秒或状态变化后收起），**点击气泡立即收起**；
-  **快速连点 ≥5 次**触发"主人别戳啦～"吐槽；无临时气泡时点击**气泡**打开 dsh Web；
-  **触摸透传**：气泡与精灵分离成两个独立悬浮窗——只有**桌宠本体**和**气泡**两个窗口
-  会拦截触摸，**其余所有区域（含拖动空隙）的触摸 100% 透传给下层应用**，打字、点
-  按钮零遮挡；**拖动松手**（设置页「拖拽抛落」开启时）有两种语义：
-  **轻放**＝当前位置记为桌宠的**停靠位（家）**，原地待命不坠落；
-  **用力抛出**＝抛物坠落，撞左右墙反弹、落地小弹跳后**自动走回停靠位（家）**——
-  未设置过家时默认停在**屏幕最底部（贴地）**，左右取较近侧边；关掉「拖拽抛落」
-  则恢复普通拖动定位；**关闭悬浮窗**：拖动时屏幕底部
-  出现垃圾桶，把悬浮窗拖到垃圾桶上**停留片刻（≥0.35 秒，垃圾桶变红放大）**再松手才
-  关闭——快速甩过或路过不会误关（「悬浮窗显示」重新开启后恢复），原 × 按钮已移除；
-  长按切换模式。
-- **问候与闲时冒泡**：桌宠登场时问候一次；dsh 空闲时每隔 2.5~5 分钟随机说一句台词
-  （设置页「闲时主动冒泡」可关，说时会朗读）——参考 [codex-pet-live](https://github.com/VectorPeak/codex-pet-live)
-  的 patpat / ambient 气泡模型。
-- **外观**：设置页可调桌宠大小（小/中/大）、气泡开关与**桌宠名称开关**（气泡中是否显示
-  名字）；气泡是**独立悬浮窗**：**宽度有上限**（状态气泡 ≤45% 屏宽/230dp，展开 ≤55%
-  屏宽），超长文本自动换行截断；**无内容时气泡自动隐藏**（不显示空气泡框，该区域
-  触摸透传）；气泡**朝向随停靠边自动翻转**——贴左边缘时气泡靠左、
-  贴右边缘时靠右（朝屏幕内侧，不贴屏幕边）；宠物在屏幕顶部放不下气泡时气泡**翻到
-  宠物下方**；气泡变宽**不影响桌宠本体位置**；精灵表按单元格像素全分辨率解码
-  （兼容 v1/v2 规格，内置默认包及常见社区包均清晰显示）。
-- **发声（TTS）**：设置页「桌宠发声」开关（默认开）。除固定状态台词（任务完成/出错/
-  新任务/调工具）与互动台词外，**气泡内容发生变化时也会朗读全文**（≥5 秒节流防连读，
-  与固定短台词互不重复）。使用系统 TTS 引擎：优先中文，无中文引擎自动回退系统默认语言，
-  无引擎时静默不报错。
-- **动作稳定**：动画行切换带 ≈2 秒稳定窗口——同一动作持续两个轮询周期才真正切换，
-  避免 `tool/call ↔ assistant/message` 状态抖动导致桌宠频繁换动作；帧时长遵循 Codex
-  规范。**循环策略**：常驻状态行（idle/跑动/等待/思考/失败）在状态持续期间循环；
-  一次性表演行（跳跃庆祝）播完一轮即**落地回 idle** 继续呼吸，同一动作不重播
-  （完成状态会一直保持到下一任务开始，若不落地桌宠会永远跳个不停）。
-  待机时每 **20~45 秒随机挥手一次**，打破无限循环待机的机械感（纯动作、不打扰气泡）。
-- **动作映射**：dsh 空闲 → `idle` 呼吸；思考/输出 → `review` 思考（`tool/call` 时
-  `running` 跑动，`assistant/message` 时 `waiting`）；输出完成 → `jumping` 庆祝；
-  出错 → `failed`。
-- **导入 Codex 桌宠包**：一个桌宠包 = 文件夹内的 `pet.json`（`id`/`displayName`/
-  `description`/`author`/`version`/`replies` 可选，`spritesheetPath`）+ `spritesheet.webp`
-  或 `.png`（8 列 x 9 行，单元格 192x208，兼容 v2 的 8x11 表）。两种方式：
-  1. 设置页「桌宠」→「导入桌宠包」，用系统文件选择器选中包含 `pet.json` 的文件夹；
-  2. 直接把桌宠包文件夹复制到 `/sdcard/Download/DshLauncher/codex-pets/` 下
-     （或应用私有目录 `files/codex-pets/`），再在设置页「刷新列表」。
-  列表会显示每只宠物的作者/版本信息；`pet.json` 中 `replies`（或 `interactions[].replies`）
-  会被用作点击互动台词。
-- 社区桌宠包来源：<https://codexpet.top>（awesome-codex-pet）、<https://petdex.dev> 等。
-- 内置默认桌宠资源由 `tools/gen_default_pet.py` 生成（Pillow），产物为
-  `app/src/main/assets/codex-pets/default/`（本身就是合法 Codex 桌宠包）。
+- **切换**：主界面 →「状态悬浮窗」→「悬浮窗样式」选「状态条」或「桌宠」；长按悬浮窗本体可快速切换。
+- **开关统一**：设置页「悬浮窗显示」为唯一总开关（普通服务 + 无障碍双通道一并控制）；锁屏/灭屏自动隐藏，解锁恢复。
+- **交互**：单击 → 挥手 + 随机台词气泡（5 秒，会朗读）；双击 → 气泡展开最近完整内容；连点 ≥5 次 → 吐槽；点击气泡 → 打开 dsh Web；**触摸透传**：仅桌宠本体与气泡拦截触摸，其余区域 100% 透传。
+- **拖动**：轻放 = 记停靠位（家）；用力抛出 = 抛物坠落、撞墙反弹、自动走回停靠位；未设家默认贴地；拖动到底部垃圾桶停留 ≥0.35 秒关闭悬浮窗。
+- **闲时冒泡**：dsh 空闲时每 2.5~5 分钟随机台词（可关）。
+- **外观**：大小（小/中/大）、气泡开关、名称开关；气泡独立悬浮窗、宽度有上限、朝停靠边自动翻转。
+- **发声**：双引擎（系统 TTS / Edge 在线）；状态台词 + 气泡变化全文朗读（≥5 秒节流）。
+- **动作映射**：空闲 → `idle`；思考/输出 → `review`/`waiting`；调工具 → `running`；完成 → `jumping` 庆祝；出错 → `failed`。动画行切换带 ≈2 秒稳定窗口防抖动；待机每 20~45 秒随机挥手。
+- **导入社区桌宠包**：设置页「导入桌宠包」选择含 `pet.json` + `spritesheet.webp/.png`（8x9 精灵表）的文件夹，或复制到 `/sdcard/Download/DshLauncher/codex-pets/` 后刷新列表。来源：<https://codexpet.top>、<https://petdex.dev> 等。
+- 内置默认桌宠“小豆丁”由 `tools/gen_default_pet.py` 生成（产物即合法 Codex 桌宠包）。
 
-## 实机验证（Sharp 803SH）
+## 实机验证
 
-以下链路已在 Sharp 803SH（Android 12 / 骁龙 6 系 / 3.7GB 内存）实测通过：
+已在 Sharp 803SH（Android 12 / 骁龙 6 系 / 3.7GB）实测通过：
 
-1. 安装 → 引导 4/4 全绿 → `dsh web` 监听 `127.0.0.1:3080`；
-2. `describe`（HTTP RPC）、`/api/events.mux`、`/api/events.host`（WebSocket 双流）全部可用；
-3. 应用内 WebView（Chromium 94）完整渲染 dsh GUI：侧边栏、会话、命令、设置；
-   client-connection 握手成功（连上后无重连告警），首屏出现「添加 API Key」配置卡；
-4. PC 侧可经 `adb forward tcp:13080 tcp:3080` 直接访问同一实例。
+1. 引导 4/4 全绿 → `dsh web` 监听 `127.0.0.1:3080`；
+2. HTTP RPC / WebSocket 双流（events.mux / events.host）可用；
+3. 内嵌 WebView（Chromium 94）完整渲染 GUI，client-connection 握手成功；
+4. PC 经 `adb forward tcp:13080 tcp:3080` 访问同一实例。
 
-### 关键兼容性修复（按发现顺序）
+关键兼容性修复（按发现顺序）：
 
 | 问题 | 修复 |
-| --- | --- |
-| vendor/loader 无法解析 `@deepseek-ai/…` 包 | `node --expose-internals <cli> web`（命令行参数，而非 NODE_OPTIONS） |
-| `sharp` 加载失败（无 android-arm64 运行时） | Proxy stub（已装/未装两条路径都覆盖） |
-| `node-pty` 被嵌套安装在 `@deepseek-ai/dsh-subprocess-local/node_modules` 下，Android 无 `pty.node` 预编译产物，导致 dsh plugin tree 加载失败、web 无法启动 | `stub-dsh.mjs` 递归查找嵌套 `node_modules` 并打 Proxy stub |
-| `dsh-provider-headers` 的 `sendAttribution: false` 不生效（`@deepseek-ai/dsh-llm-pi-ai` 仍强制注入 `deepseek-harness` User-Agent） | `stub-dsh.mjs` 给 `llm-pi-ai` schema/header 逻辑打补丁，关闭归因后改用自定义 User-Agent |
-| `sandbox-windows-acl` 加载期布局断言崩溃 | 正则禁用 `STARTUPINFOW` / `PROCESS_INFORMATION` 断言 |
-| **WebView 无限 `connection lost` 重连** | **`AbortSignal.timeout` polyfill**：WebView/Chrome ≤102 无此 API，`host.describe` 前置超时调用直接抛错，`loop()` 每次 attempt 立即失败 → 无限重试；在 `dist/index.html` 注入 shim 后握手全部成功 |
+|---|---|
+| vendor/loader 无法解析 `@deepseek-ai/…` | `node --expose-internals`（命令行参数，非 NODE_OPTIONS） |
+| `sharp` / `node-pty` 无 Android 预编译产物 | Proxy stub / 纯 JS shim（import 期顶替） |
+| `sendAttribution:false` 不生效（归因 UA 仍被强制注入） | `llm-pi-ai` schema/header 补丁（待上游提供官方抑制缝隙） |
+| `sandbox-windows-acl` 布局断言崩溃 | 正则禁用 STARTUPINFOW/PROCESS_INFORMATION 断言 |
+| WebView 无限 `connection lost` 重连 | `AbortSignal.timeout` polyfill——**按需注入**：仅当 dist 内 bundle 确实引用该 API 才写 `index.html`（rc.2 前端无消费者，自动跳过） |
 
 ## 已知限制
 
-- 系统 WebView 版本较旧（本机 Chromium 94）：除 `AbortSignal.timeout` 外若上游引入更新的
-  Web API，可能需要补充 polyfill（位置：`stub-dsh.mjs` 的 index shim 段）。
-- `sharp` 为 stub 实现：`attachment-local` 等依赖图片处理的能力不可用，不影响核心会话功能。
-- 设备内存有限，**不要在设备上执行 `pnpm build` / 类型检查**（tsc 全量构建会 OOM）；
-  内置插件源码打包在 `assets/prebuilt.tgz`（提取到 `files/plugins`），引导阶段使用官方
-  `dsh plugin` 装配，不进行设备端源码编译。
-- 重新安装 APK 会终止旧 web 进程，安装后需再次触发一键引导（幂等；dsh 已安装时
-  `install-dsh.mjs` 会走 npm 增量更新，通常更快）。
-- `dsh web` 只监听 loopback，仅本机（及 adb forward 的 PC）可访问；`dsh-status-bridge`
-  的 `/status` 同样只绑 loopback，但本机任意 app 均可读取（lastText 已截断到 200 字符）。
-- 状态桥接普通通道（`StatusBridgeService`）无开机自启：重启后由无障碍通道自动恢复，
-  或打开一次 app 自动拉起。
-- 部分 ROM（ColorOS 等）对无障碍服务**冷启懒绑定**：设置里开关登记着、但服务没被系统
-  重连，悬浮窗因此不出现——把无障碍关一次再开即可。主界面环境芯片与悬浮窗设置页会
-  实时显示双通道状态（`无障碍 ⚠ 未连接`）；授予「显示在其它应用上层」权限后，普通通道
-  可脱离无障碍独立自启，不再受此怪癖影响。
-- 悬浮窗 watchdog 为 30s 自续式精确闹钟；系统 Doze 深度休眠下可能被合并到 ≥9 分钟一次。
-- **自适应后台策略（PowerGovernor）**：按「屏幕 × 任务态 × 后台时长」分档——
-  亮屏 1s；灭屏+任务运行 3s 且持 PARTIAL 唤醒锁防打断；灭屏+空闲 10s 起步、
-  超 10 分钟放宽到 30s。看门狗闹钟仅在任务运行中或刚灭屏 5 分钟内允许唤醒设备；
-  前台通知仅内容变化时刷新。首次进入主界面会一次性引导「忽略电池优化」白名单。
-  任务结束后自动回到省电档，不额外耗电。
+- 系统 WebView 版本较旧（本机 Chromium 94）：上游若引入更新的 Web API，可能需要补充 polyfill（`stub-dsh.mjs` index shim 段）。
+- `sharp` 为 stub：依赖图片处理的能力不可用，不影响核心会话功能。
+- 设备内存有限：**不要在设备上执行 `pnpm build` / 类型检查**（会 OOM）；内置插件以源码打包进 APK，装配用官方 `dsh plugin`，不在设备端编译。
+- 重新安装 APK 会终止旧 web 进程，需再次触发一键引导（幂等；已安装时走 npm 增量更新）。
+- `dsh web` 只监听 loopback（本机 + adb forward 可访问）；`dsh-status-bridge` `/status` 同绑 loopback。
+- 状态桥接普通通道无开机自启：重启后由无障碍通道自动恢复，或打开一次 app 拉起；部分 ROM 对无障碍冷启懒绑定（关一次再开即可）。
+- 悬浮窗 watchdog 为 30s 自续式精确闹钟；Doze 深度休眠下可能被合并到 ≥9 分钟一次。
+- **PowerGovernor** 自适应后台：按「屏幕 × 任务态 × 后台时长」分档轮询（亮屏 1s / 灭屏任务 3s+唤醒锁 / 灭屏空闲 10~30s），看门狗仅在任务运行或刚灭屏 5 分钟内允许唤醒。
+
+## 文档索引
+
+| 文档 | 内容 |
+|---|---|
+| [`docs/plugin-conversion-audit.md`](docs/plugin-conversion-audit.md) | 脚本式 dsh 修改审计：12 处补丁逐项判定 + 升级守护清单 |
+| [`docs/architecture-optimization-plan.md`](docs/architecture-optimization-plan.md) | 架构优化路线图（P0/P1/P2 + 执行状态） |
+| [`docs/review-findings-scripts.md`](docs/review-findings-scripts.md) | 脚本层全量 review 记录 |
+| [`docs/review-findings-r1.md`](docs/review-findings-r1.md) | overlay/service/ui 横切 review 记录 |
+| [`docs/plugin-conversion-recon.md`](docs/plugin-conversion-recon.md) | directory-picker 插件化侦察（ctx.directoryPicker 服务缝） |
 
 ## 发布
 
 预编译签名 APK 发布在 [Releases](https://github.com/qawse110/dsh-launcher-android/releases) 页。
+发布流程：推 `v*` tag → GitHub Actions 构建签名 APK 并创建 Release（`release.yml`）。
