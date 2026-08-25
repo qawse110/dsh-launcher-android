@@ -36,7 +36,9 @@ class PrefixPatcherTest {
     }
 
     @After
-    fun cleanup() = File(ctx.filesDir, "patchtest").deleteRecursively()
+    fun cleanup() {
+        File(ctx.filesDir, "patchtest").deleteRecursively()
+    }
 
     @Test fun `patchAll 等长替换官方前缀且不碰其他文件`() {
         // 构造含官方 31 字符前缀的内容（OFFICIAL_PREFIX 本身即 31 长度）

@@ -52,7 +52,8 @@ class TermuxEnvTest {
     }
 
     @Test fun `安装 termux-exec 后 LD_PRELOAD 注入子 shell 环境`() {
-        File(ctx.filesDir, "termux/usr/lib/libtermux-exec-ld-preload.so").writeText("fake")
+        val lib = File(ctx.filesDir, "termux/usr/lib").apply { mkdirs() }
+        File(lib, "libtermux-exec-ld-preload.so").writeText("fake")
         MarkerStore.resetForTest()
         val env = TermuxEnv.childShellEnv(ctx)
         assertEquals(
