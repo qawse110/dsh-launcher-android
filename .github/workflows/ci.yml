@@ -37,3 +37,10 @@ jobs:
 
       - name: Unit tests（P2-2 单测门禁）
         run: ./gradlew :app:testDebugUnitTest --no-daemon
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-results
+          path: app/build/test-results/testDebugUnitTest/*.xml
