@@ -11,6 +11,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.Handler
+import kotlin.concurrent.thread
 import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
@@ -119,6 +120,7 @@ class StatusBridgeService : Service() {
                         updateOverlay(status, text, event)
                         updateForeground(status, text)
                         writeHeartbeat(status, text)
+                        consumeOpenPathRequest()
                     }
                     if (prev == "running" && status == "finished") {
                         if (updatedAt > lastFinishedAt) {
@@ -279,6 +281,67 @@ class StatusBridgeService : Service() {
             }
         }
     }
+
+
+    /**
+     * 消费 dsh 插件侧写入的「代开文件」请求（files/open-path-request.json）。
+     * 流程：复制到应用可见目录 → FileProvider content:// → 系统 VIEW。
+     * 幂等：处理完即删除请求文件；解析失败静默清理。
+     */
+    private var lastOpenReqTs = 0L
+    private fun consumeOpenPathRequest() {
+        val f = File(filesDir, "open-path-request.json")
+        if (!f.isFile) return
+        val obj = try { JSONObject(f.readText()) } catch (_: Exception) { runCatching { f.delete() }; return }
+        val ts = obj.optLong("ts", 0L)
+        if (ts != 0L && ts == lastOpenReqTs) return // 同一请求不重复打开
+        lastOpenReqTs = ts
+        val path = obj.optString("path")
+        if (path.isBlank()) { runCatching { f.delete() }; return }
+        thread {
+            try {
+                val src = File(path)
+                if (!src.isFile) return@thread
+                val dstDir = File(getExternalFilesDir(null), "opened").apply { mkdirs() }
+                val dst = File(dstDir, src.name)
+                src.copyTo(dst, overwrite = true)
+                mainHandler.post {
+                    try {
+                        val uri = androidx.core.content.FileProvider.getUriForFile(
+                            this@StatusBridgeService,
+                            "$packageName.fileprovider",
+                            dst
+                        )
+                        val intent = Intent(Intent.ACTION_VIEW)
+                            .setDataAndType(uri, guessMime(dst.name))
+                            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                                Intent.FLAG_ACTIVITY_NEW_TASK)
+                        startActivity(intent)
+                        appendLog?.invoke("已通过系统查看器打开: ${dst.name}")
+                    } catch (t: Throwable) {
+                        android.util.Log.w("StatusBridge", "open failed: ${t.message}")
+                    } finally {
+                        runCatching { f.delete() }
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private fun guessMime(name: String): String {
+        val ext = name.substringAfterLast('.', "").lowercase()
+        return when (ext) {
+            "md", "txt", "log" -> "text/plain"
+            "pdf" -> "application/pdf"
+            "png" -> "image/png"; "jpg", "jpeg" -> "image/jpeg"; "webp" -> "image/webp"
+            "html", "htm" -> "text/html"
+            else -> "application/octet-stream"
+        }
+    }
+
+    /** 供 open-path 日志可选输出（无 UI 时为空）。 */
+    internal var appendLog: ((String) -> Unit)? = null
 
     companion object {
         private const val NOTIFICATION_ID = 0x5A17

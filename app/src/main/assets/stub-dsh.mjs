@@ -577,4 +577,54 @@ try {
 // v4.8.1 资产清理：移除 patch-koffi.yml 占位写入——全仓库无任何消费方，
 // koffi 已由上方 Proxy stub 直接顶替，无需禁用行文件。
 
+try {
+  // Android 打开路径：委托宿主 App 代开（P1-6 配套方案）。
+  // 平台分发注入 android 分支：把目标路径写入约定请求文件，
+  // 宿主前台服务轮询消费后经 FileProvider content:// 调系统查看器。
+  // （termux-open 在内嵌 Termux 中因跨包 getIntentSender 被拒，不可用。）
+  const MARKER_OVA = 'dsh-launcher-android-open-via-app';
+  const apiproxy2 = findPkg('@deepseek-ai/dsh-host-apiproxy', 'lib/index.js');
+  if (!apiproxy2) {
+    log('dsh-host-apiproxy: not found, skip open-via-app patch');
+  } else {
+    let src = readFileSync(apiproxy2, 'utf8');
+    if (src.includes(MARKER_OVA)) {
+      log('open-via-app already patched');
+    } else {
+      const ANCHOR = '\tif (platform === "linux") {\n\t\tif (wsl) {';
+      const INJ = [
+        '\tif (platform === "android") {',
+        '\t\ttry {',
+        "\t\t\tconst fsM = await import(\"node:fs\");",
+        '\t\t\tfsM.writeFileSync(process.env.HOME + "/open-path-request.json",',
+        "\t\t\t\tJSON.stringify({ action: \"view\", path, ts: Date.now() }));",
+        '\t\t} catch {}',
+        '\t\treturn;',
+        '\t}',
+        ANCHOR,
+      ].join('\n');
+      const CAN_OLD = '\tif (platform !== "linux") return false;';
+      const CAN_NEW = '\tif (platform === "android") return true;\n' + CAN_OLD;
+      if (!src.includes(ANCHOR) || !src.includes(CAN_OLD)) {
+        log('open-via-app anchors not found, skip（上游结构变化）');
+      } else {
+        src = src.replace(ANCHOR, INJ).replace(CAN_OLD, CAN_NEW);
+        const patched = '/* ' + MARKER_OVA + ' */\n' + src;
+        const chk = join(dirname(apiproxy2), '.ova.check.mjs');
+        writeFileSync(chk, patched);
+        const vr = spawnSync(process.execPath, ['--check', chk], { timeout: 15000 });
+        rmSync(chk, { force: true });
+        if (vr.status !== 0) {
+          log('WARN open-via-app failed syntax check, abort');
+        } else {
+          writeFileSync(apiproxy2, patched);
+          log('open-via-app patched: request-file delegation');
+        }
+      }
+    }
+  }
+} catch (e) {
+  log('WARN open-via-app: ' + (e.stack || e.message));
+}
+
 log('=== android fixup done ===');
