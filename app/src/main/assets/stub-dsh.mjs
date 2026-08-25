@@ -3,11 +3,35 @@
  * stub-dsh.mjs — Android 兼容性修复（dsh 官方 npm 安装版）。
  *
  * 旧版同时负责“插件装配 + 启动 web”；新版 dsh 本体与插件都改用官方
- * npm / `dsh plugin` 安装，这里只保留 Android 特有修复：
- *   1) koffi / node-pty / sharp：Android 无预编译产物，用 Proxy stub 顶替；
- *   2) sandbox-windows-acl 的 koffi 布局断言在执行前禁用；
- *   3) WebView/旧 Chrome 的 AbortSignal.timeout polyfill 注入前端 dist；
- *   4) 保持 fs link 兼容层文件（由 ConsoleActivity 负责复制）。
+ * npm / `dsh plugin` 安装，这里只保留 Android 特有修复。
+ *
+ * 原则：**只修 Node/原生模块加载期与 WebView 引导期的问题**——凡是能在
+ * Cordis 插件运行时实现的功能一律下沉为独立内置插件（见
+ * docs/plugin-conversion-audit.md），避免每次 dsh 升级都要重新对表补锚点。
+ *
+ * 现存修复：
+ *   1) koffi / node-pty / sharp：Android 无预编译产物，用 Proxy stub / 纯 JS
+ *      shim 顶替（模块 import 期，插件通道无法介入）；
+ *   2) @deepseek-ai/dsh-attachment-local 视觉链路 v4：SELinux 禁 link(2)、FUSE
+ *      上 fsync 失败的运行时行为修复（fs 兼容层不覆盖 CJS 盲区，只能改源）；
+ *   3) @deepseek-ai/dsh-llm-pi-ai sendAttribution：dsh-provider-headers 内置
+ *      插件的「关闭归因 UA」依赖该 schema 字段，上游明确注释
+ *      “omission cannot suppress attribution”，在官方提供抑制缝隙前保留；
+ *   4) sandbox-windows-acl 的 koffi 布局断言禁用（防御性，koffi 已被顶替）；
+ *   5) WebView/旧 Chrome AbortSignal.timeout polyfill——仅当前端产物确实引用
+ *      该 API 时才注入（rc.2 前端与全部内置插件 client 均无引用，自动跳过，
+ *      不再无条件改写 dist/index.html；引导期早于 app bundle，插件无法替代）；
+ *   6) @vscode/ripgrep 解析器 Android 回退（import 期解析，优先 Termux 原生 rg）；
+ *   7) dsh-fs-local chmod 对 FUSE 的 EACCES/EPERM 容错（原子写内部路径，
+ *      无插件缝隙）。
+ *
+ * 已移除（详见审计文档）：
+ *   - apiproxy WEB_SETTINGS_NAMESPACES += vision（上游已无该常量，
+ *     dsh-vision 改经 settings 服务自行注册命名空间）；
+ *   - dsh-sandbox/-local "/tmp"→TMPDIR（上游 writableRoots 已原生并入
+ *     os.tmpdir()，启动器导出 TMPDIR 即可）；
+ *   - directory-picker-browse SD Card 条目（由内置插件
+ *     @dsh-external/dsh-android-links 以 HOME 符号链接实现）。
  *
  * 环境变量：
  *   HOME / NODE_DIR / DSH_PREFIX / DSH_PROFILE
@@ -17,7 +41,6 @@ import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 
 const HOME = process.env.HOME || '/data/user/0/com.dsh.launcher/files';
-const ANDROID_TMP = process.env.TMPDIR || join(HOME, 'tmp');
 const NODE = process.env.NODE_DIR || join(HOME, 'node');
 const DSH_PREFIX = process.env.DSH_PREFIX || join(HOME, 'dsh-prefix');
 const PROFILE = process.env.DSH_PROFILE || 'web';
@@ -325,32 +348,10 @@ try {
     }
   } catch (e) { log('WARN attachment-local vision: ' + e.message); }
 
-
-
-try {
-  const ap = findPkg('@deepseek-ai/dsh-host-apiproxy', 'lib/index.js');
-  if (ap) {
-    let src = readFileSync(ap, 'utf8');
-    const hasVision = /["']vision["']/.test(src);
-    if (!hasVision) {
-      const re = /(const WEB_SETTINGS_NAMESPACES\s*=\s*\[)([\s\S]*?)(\];)/;
-      const replaced = src.replace(re, (m, open, body, close) => {
-        if (body.includes('"vision"') || body.includes("'vision'")) return m;
-        return open + body + (body.trim() ? ',' : '') + '\n\t"vision"' + close;
-      });
-      if (replaced !== src) {
-        writeFileSync(ap, replaced);
-        log('apiproxy WEB_SETTINGS_NAMESPACES += vision: ' + ap);
-      } else {
-        log('apiproxy WEB_SETTINGS_NAMESPACES pattern not found, skip');
-      }
-    } else {
-      log('apiproxy vision already exposed');
-    }
-  } else {
-    log('apiproxy: not found, skip');
-  }
-} catch (e) { log('WARN apiproxy: ' + e.message); }
+/* apiproxy WEB_SETTINGS_NAMESPACES += vision 补丁已移除（v4.10 审计）：
+ * 上游 0.1.x 已无该常量，补丁永远命中 "pattern not found, skip" 死分支；
+ * dsh-vision 现通过 @deepseek-ai/dsh-settings 的 settingsNamespace('vision')
+ * 直接注册设置命名空间，无需 api 网关白名单。 */
 
 try {
   // dsh-provider-headers: sendAttribution=false 时不再强制注入 deepseek-harness User-Agent
@@ -421,17 +422,45 @@ try {
 } catch (e) { log('WARN sandbox-windows-acl: ' + e.message); }
 
 try {
-  // WebView / Chrome ≤102 无 AbortSignal.timeout
+  // WebView / Chrome ≤102 无 AbortSignal.timeout。
+  // v4.10 起**按需注入**：仅当 dist 内 app bundle 确实引用了该 API 才写
+  // index.html；0.1.1-rc.2 前端与全部内置插件 client 均无引用，自动跳过，
+  // 不再无条件改写上游产物。必须留在引导期脚本里：polyfill 需要先于
+  // /assets/index-*.js 与模块系统条目执行，client 插件通道时序上做不到。
   const idx = findPkg('@deepseek-ai/dsh-web-frontend', 'dist/index.html');
   if (idx && existsSync(idx)) {
     let html = readFileSync(idx, 'utf8');
-    if (!html.includes('dsh-timeout-shim')) {
-      const shim = '<script id="dsh-timeout-shim">if(!AbortSignal.timeout)AbortSignal.timeout=(ms)=>{const c=new AbortController();setTimeout(()=>c.abort(new DOMException(\'TimeoutError\',\'TimeoutError\')),ms);return c.signal;};</script>';
-      html = html.replace('<head>', '<head>' + shim);
-      writeFileSync(idx, html);
-      log('index.html AbortSignal.timeout shim injected');
-    } else {
+    if (html.includes('dsh-timeout-shim')) {
       log('index.html shim already present');
+    } else {
+      let consumerFound = false;
+      try {
+        // 递归扫描 assets（含子目录 chunk，布局变化不丢失消费者检测）。
+        // 误报无害：shim 自带 `if(!AbortSignal.timeout)` 守卫，已定义时不生效。
+        const stack = [join(dirname(idx), 'assets')];
+        while (stack.length && !consumerFound) {
+          const dir = stack.pop();
+          let ents;
+          try { ents = readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+          for (const ent of ents) {
+            if (ent.isDirectory()) { stack.push(join(dir, ent.name)); continue; }
+            if (!ent.name.endsWith('.js')) continue;
+            if (readFileSync(join(dir, ent.name), 'utf8').includes('AbortSignal.timeout')) { consumerFound = true; break; }
+          }
+        }
+      } catch (e) {
+        /* 资产目录不可读（布局变化）：宁可保守注入，回到旧行为 */
+        consumerFound = true;
+        log('WARN index shim asset scan failed (' + e.message + '), inject conservatively');
+      }
+      if (!consumerFound) {
+        log('index.html shim skipped: no AbortSignal.timeout consumer in app bundle');
+      } else {
+        const shim = '<script id="dsh-timeout-shim">if(!AbortSignal.timeout)AbortSignal.timeout=(ms)=>{const c=new AbortController();setTimeout(()=>c.abort(new DOMException(\'TimeoutError\',\'TimeoutError\')),ms);return c.signal;};</script>';
+        html = html.replace('<head>', '<head>' + shim);
+        writeFileSync(idx, html);
+        log('index.html AbortSignal.timeout shim injected');
+      }
     }
   } else {
     log('dsh-web-frontend dist not found, skip shim');
@@ -494,37 +523,11 @@ export const rgPath = resolved;
   }
 } catch (e) { log('WARN @vscode/ripgrep: ' + e.message); }
 
-try {
-  // dsh sandbox 把宿主 /tmp 当作固定可写根；Android 上 /tmp 属于 shell 用户、app 不可写，
-  // 导致子进程写 /tmp 报 Permission denied。这里把沙箱的可写临时根改成应用私有 TMPDIR。
-  const MARKER_SANDBOX_TMP = 'dsh-launcher-android-sandbox-tmp';
-  const sandboxMain = findPkg('@deepseek-ai/dsh-sandbox', 'lib/index.js');
-  if (sandboxMain) {
-    let src = readFileSync(sandboxMain, 'utf8');
-    if (src.includes(MARKER_SANDBOX_TMP)) {
-      log('dsh-sandbox tmp path already patched');
-    } else {
-      src = src.split('"/tmp"').join(JSON.stringify(ANDROID_TMP));
-      writeFileSync(sandboxMain, `// ${MARKER_SANDBOX_TMP}\n` + src);
-      log('dsh-sandbox tmp path patched: ' + ANDROID_TMP);
-    }
-  } else {
-    log('dsh-sandbox: not found, skip tmp patch');
-  }
-  const sandboxLocal = findPkg('@deepseek-ai/dsh-sandbox-local', 'lib/index.js');
-  if (sandboxLocal) {
-    let src = readFileSync(sandboxLocal, 'utf8');
-    if (src.includes(MARKER_SANDBOX_TMP)) {
-      log('dsh-sandbox-local tmp path already patched');
-    } else {
-      src = src.split('"/tmp"').join(JSON.stringify(ANDROID_TMP));
-      writeFileSync(sandboxLocal, `// ${MARKER_SANDBOX_TMP}\n` + src);
-      log('dsh-sandbox-local tmp path patched: ' + ANDROID_TMP);
-    }
-  } else {
-    log('dsh-sandbox-local: not found, skip tmp patch');
-  }
-} catch (e) { log('WARN dsh-sandbox tmp: ' + e.message); }
+/* dsh-sandbox / dsh-sandbox-local 的 "/tmp"→TMPDIR 补丁已移除（v4.10 审计）：
+ * 上游 writableRoots() 现原生并入 os.tmpdir()（Node 会优先读 TMPDIR 环境变量，
+ * 启动器 web 进程恒导出应用私有 tmp），沙箱白名单无需再改写源码；
+ * sandbox-local 的 --tmpfs/readWrite 分支依赖 bubblewrap，Android 上本就不可达。
+ * 旧补丁在 rc.2 上零替换仍会向上游文件追加 marker 头，属纯污染。 */
 
 try {
   // Android 共享存储（/storage/emulated/0，FUSE）不支持 chmod；dsh-fs-local 原子写
@@ -549,30 +552,11 @@ try {
   }
 } catch (e) { log('WARN dsh-fs-local chmod: ' + e.message); }
 
-try {
-  // 工作区目录浏览器：Android 在默认 home 列表里增加一个 SD Card 快捷入口，
-  // 让 dsh 的“添加工作区”可以直接进入 /sdcard 并选择其中的目录。
-  const dp = findPkg('@deepseek-ai/dsh-host-directory-picker-browse', 'lib/index.js');
-  if (dp) {
-    let src = readFileSync(dp, 'utf8');
-    if (src.includes('dsh-launcher-android-sdcard-shortcut')) {
-      log('directory-picker-browse sdcard shortcut already patched');
-    } else {
-      const marker = 'dsh-launcher-android-sdcard-shortcut';
-      const insertion = `\n\t\tif (process.platform === "android" && target === home) {\n\t\t\ttry {\n\t\t\t\tif ((await stat("/sdcard")).isDirectory() && !entries.some((entry) => entry.path === "/sdcard")) {\n\t\t\t\t\tentries.unshift({ name: "SD Card", path: "/sdcard", hidden: false, /* ${marker} */ });\n\t\t\t\t}\n\t\t\t} catch {}\n\t\t}`;
-      const re = /(\n\t\t\tentries\.push\(row\);\n\t\t\}\n)(\t\treturn \{)/;
-      const replaced = src.replace(re, `$1${insertion}\n$2`);
-      if (replaced !== src) {
-        writeFileSync(dp, replaced);
-        log('directory-picker-browse sdcard shortcut patched: ' + dp);
-      } else {
-        log('directory-picker-browse sdcard shortcut pattern not found, skip');
-      }
-    }
-  } else {
-    log('directory-picker-browse: not found, skip');
-  }
-} catch (e) { log('WARN directory-picker-browse: ' + e.message); }
+/* directory-picker-browse "SD Card" 条目补丁已移除（v4.10 审计）：
+ * 改由独立内置插件 @dsh-external/dsh-android-links 在 HOME 下创建指向
+ * /storage/emulated/0 的符号链接——browse 的 list() 原生保留符号链接项、
+ * directoryRow() stat 跟随判定可进入，无需改动上游任何文件。
+ * 插件经官方 `dsh plugin --profile web add` 装配（install-dsh.mjs 内置清单）。 */
 
 // v4.8.1 资产清理：移除 patch-koffi.yml 占位写入——全仓库无任何消费方，
 // koffi 已由上方 Proxy stub 直接顶替，无需禁用行文件。
