@@ -1,0 +1,8 @@
+# dsh-android-links bundle 层：在 dsh HOME 下创建 Android 共享存储符号链接。
+# 取代旧 stub-dsh.mjs 对 @deepseek-ai/dsh-host-directory-picker-browse 的源码补丁：
+# browse 的 list() 原生列出 home 目录下的符号链接项（dirent.isSymbolicLink 分支），
+# directoryRow() 会 stat 跟随链接判定可进入，因此只需在 HOME 放符号链接即可，
+# 无需改动 dsh 本体任何文件。
+- insert:
+    - id: dsh-android-links
+      name: '@dsh-external/dsh-android-links'
