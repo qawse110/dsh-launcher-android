@@ -36,3 +36,23 @@
 - cwd 迁移（filesDir→termux home）：三组脚本全部使用绝对路径或 import.meta.url 推导，**无回归**
 - LD_PRELOAD 注入：install-dsh 经 `{...process.env}` 透传保留；pnpm wrapper 用 `#!/system/bin/sh` 不依赖翻译；NPM_BIN shebang 依赖 termux-exec——链路自洽
 - 本地校验：6 个 mjs `node --check` 全过；py_compile 过
+
+---
+
+## 逐脚本符合度审查（对照 v4.8.0 当前需要）
+
+| 脚本 | 程序当前需要 | 符合度 | 处置 |
+|---|---|---|---|
+| install-dsh.mjs | npm 渠道安装/升级 dsh + 装配 7 内置插件；弱网鲁棒 | ✅（本轮 P0/P1 已修） | 保留 |
+| stub-dsh.mjs | 上游无 android 产物模块的免编译适配 + WebView polyfill | ✅ 全补丁幂等带校验 | 保留；删除 patch-koffi.yml 死写入 |
+| fs-register/loader/promises-compat | SELinux 禁硬链接的会话落盘兼容 | ✅ loader 补齐裸说明符；并发语义修正 | 保留 |
+| routing-suite.mjs | 用户手动安装 yjh051108/dsh-routing-suite 时的特殊适配（按需触发，非主流程） | ⚠️→✅ 文件根三级推导修复多用户/手动运行错位；超时/退出码/slip 防护已修 | 保留 |
+| tpkg.sh | pkg 安装失败时的 deb 手动兜底 | ✅ 与原生 apt 主链路互补，职责清晰 | 保留 |
+| web-launcher.sh.tpl | 可重现的 web 启动环境 | ✅ 模板化后由 TermuxEnv 单源渲染 | 保留 |
+| tools/gen_default_pet.py | 重新生成默认桌宠资产的开发工具 | ✅ 校验前置已修 | 保留 |
+| （生成物）00-dsh-env.sh | 交互终端 Linux 化体验 + termux-exec 预载 | ✅ | 保留 |
+| （生成物）00-dsh-apt.sh | W^X 包装器——v4.6 默认可写后近乎空转 | ◑ 保留作未来收紧保险（-w 短路无开销） | 保留 |
+| （生成物）apt.conf 00-dsh | instdir+镜像+admindir：dpkg 原生可用的基石 | ✅ 关键路径 | 保留 |
+
+**退役候选**：无。所有脚本均有现行消费方。
+**已知限制（文档化，不改）**：fs 兼容层不覆盖 CJS/linkSync；tpkg 不执行维护脚本；routing-suite 解压无体积上限（来源为固定 HTTPS 仓库）。
