@@ -224,7 +224,7 @@ object Ui {
         onSelect: (T) -> Unit
     ): ChipGroup = ChipGroup(context).apply {
         isSingleSelection = true
-        selectionRequired = true
+        setSelectionRequired(true) // 该版本无 isSelectionRequired getter，只能用 setter
         chipSpacingHorizontal = dp(context, 8)
         chipSpacingVertical = dp(context, 2)
         val idToValue = LinkedHashMap<Int, T>()
