@@ -330,14 +330,16 @@ class MainActivity : AppCompatActivity() {
         }
         contentRoot = root
 
-        /** 次级动作流式行：按钮按内容自然宽度排布、放不下自动换行
-         *  （旧实现固定 dp(44) 高 + 等宽两列，长文案既窄又可能被裁剪）。 */
+        /** 次级动作区：两列等宽网格，行列严格对齐；配合 Ui.button 的换行能力，
+         *  长文案完整可读且不会被挤压。 */
         fun addPairRow(vararg items: Pair<String, () -> Unit>): View =
-            Ui.flowRow(this).apply {
-                items.forEach { (label, onClick) ->
-                    addView(Ui.button(this@MainActivity, label, onClick, filled = false))
-                }
-            }
+            Ui.buttonGrid(
+                this,
+                items.map { (label, onClick) ->
+                    Ui.button(this@MainActivity, label, onClick, filled = false)
+                },
+                columns = 2
+            )
 
         // Header
         root.addView(TextView(this).apply {

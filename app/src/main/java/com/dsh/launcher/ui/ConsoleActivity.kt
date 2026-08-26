@@ -235,10 +235,10 @@ class ConsoleActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = dp(6) })
 
-        // ---- 工具行（流式布局：按钮按内容自然宽度，一行放不下自动换行，
-        //      替代等宽挤压——四五个按钮一排时「插件管理/检查更新」会被压得过窄） ----
-        fun rowOf(vararg buttons: View): com.google.android.material.chip.ChipGroup =
-            Ui.flowRow(this).apply { buttons.forEach { addView(it) } }
+        // ---- 工具区（两列等宽网格：行列严格对齐、按钮不挤压长文案，
+        //      替代流式排布的参差感与旧等宽四列的过窄问题） ----
+        fun gridOf(vararg buttons: View): LinearLayout =
+            Ui.buttonGrid(this, buttons.toList(), columns = 2)
 
         val nodeBtn = Ui.button(this, "Node", { runNodeCmd() }, filled = false)
         val termBtn = Ui.button(this, "终端", {
@@ -269,11 +269,12 @@ class ConsoleActivity : AppCompatActivity() {
         val clearBtn = Ui.button(this, "清空", { sb.clear(); output.text = "" }, filled = false)
         val closeBtn = Ui.button(this, "退出", { finish() }, filled = false, color = Ui.DANGER)
 
-        root.addView(rowOf(nodeBtn, termBtn, pluginBtn, updateBtn), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = dp(6) })
-        root.addView(rowOf(updateNextBtn, clearBtn, closeBtn), LinearLayout.LayoutParams(
+        root.addView(gridOf(
+            nodeBtn, termBtn,
+            pluginBtn, updateBtn,
+            updateNextBtn, clearBtn,
+            closeBtn
+        ), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = dp(6) })

@@ -246,10 +246,43 @@ object Ui {
 
     /**
      * 流式动作行（ChipGroup 作 FlowLayout 使用）：子控件按内容自然宽度排布，
-     * 一行放不下自动换行——替代把 N 个动作按钮硬压成等宽 N 列的排法。
+     * 一行放不下自动换行——适合数量少、长短不一的动作。
      */
     fun flowRow(context: Context): ChipGroup = ChipGroup(context).apply {
         chipSpacingHorizontal = dp(context, 8)
         chipSpacingVertical = dp(context, 4)
+    }
+
+    /**
+     * 等宽按钮网格：[columns] 列等分、行内等高对齐、末行补空位保持网格整齐。
+     * 兼顾两点：按钮不因等分被挤压（配合 Ui.button 的换行能力，长文案完整可读），
+     * 同时行列严格对齐、视觉整齐。
+     */
+    fun buttonGrid(
+        context: Context,
+        buttons: List<View>,
+        columns: Int = 2,
+        rowSpacingDp: Int = 8,
+        colSpacingDp: Int = 8
+    ): LinearLayout = LinearLayout(context).apply {
+        orientation = LinearLayout.VERTICAL
+        buttons.chunked(columns).forEachIndexed { r, rowButtons ->
+            val row = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
+            rowButtons.forEachIndexed { c, b ->
+                row.addView(b, LinearLayout.LayoutParams(
+                    0, LinearLayout.LayoutParams.MATCH_PARENT, 1f
+                ).apply {
+                    if (c < rowButtons.lastIndex) rightMargin = dp(context, colSpacingDp)
+                })
+            }
+            // 末行空位补齐，保持网格对齐
+            repeat(columns - rowButtons.size) {
+                row.addView(View(context), LinearLayout.LayoutParams(0, 1, 1f))
+            }
+            addView(row, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { if (r > 0) topMargin = dp(context, rowSpacingDp) })
+        }
     }
 }
