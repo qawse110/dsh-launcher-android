@@ -102,25 +102,15 @@ class OverlaySettingsActivity : AppCompatActivity() {
             return c
         }
 
-        // 悬浮窗样式：状态条 / 桌宠
+        // 悬浮窗样式：状态条 / 桌宠（单选 Chip 组，宽度贴合内容不再挤压）
         val style = prefs().getString("overlay_style", "pill") ?: "pill"
         root.addView(section("悬浮窗样式"))
         card {
-            val row = LinearLayout(this@OverlaySettingsActivity).apply {
-                orientation = LinearLayout.HORIZONTAL
-            }
-            row.addView(
-                Ui.button(this@OverlaySettingsActivity, "状态条", { setStyle("pill") },
-                    filled = style != "pet", compact = true),
-                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            )
-            row.addView(
-                Ui.button(this@OverlaySettingsActivity, "桌宠", { setStyle("pet") },
-                    filled = style == "pet", compact = true),
-                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-                    .apply { leftMargin = dp(8) }
-            )
-            addView(row, LinearLayout.LayoutParams(
+            addView(Ui.optionChips(
+                this@OverlaySettingsActivity,
+                listOf("状态条" to "pill", "桌宠" to "pet"),
+                style
+            ) { setStyle(it) }, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
             ))
@@ -135,31 +125,16 @@ class OverlaySettingsActivity : AppCompatActivity() {
         if (style == "pet") {
             root.addView(section("桌宠"))
             card {
-                // 桌宠大小
+                // 桌宠大小（单选 Chip 组）
                 val currentSize = prefs().getString("pet_size", "medium") ?: "medium"
-                val sizeRow = LinearLayout(this@OverlaySettingsActivity).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                }
-                val sizeOptions = listOf(
-                    "小" to "small",
-                    "中" to "medium",
-                    "大" to "large"
-                )
-                sizeOptions.forEachIndexed { idx, (label, value) ->
-                    sizeRow.addView(
-                        Ui.button(
-                            this@OverlaySettingsActivity, label,
-                            {
-                                prefs().edit().putString("pet_size", value).apply()
-                                rebuild()
-                            },
-                            filled = currentSize == value, compact = true
-                        ),
-                        LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-                            .apply { if (idx > 0) leftMargin = dp(8) }
-                    )
-                }
-                addView(sizeRow, LinearLayout.LayoutParams(
+                addView(Ui.optionChips(
+                    this@OverlaySettingsActivity,
+                    listOf("小" to "small", "中" to "medium", "大" to "large"),
+                    currentSize
+                ) { value ->
+                    prefs().edit().putString("pet_size", value).apply()
+                    rebuild()
+                }, LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT
                 ))
@@ -358,7 +333,7 @@ class OverlaySettingsActivity : AppCompatActivity() {
             ).apply { topMargin = dp(8) })
         }
 
-        // 后台保活（灭屏空闲保活窗）
+        // 后台保活（灭屏空闲保活窗，单选 Chip 组：五档文案不再挤成一排窄按钮）
         root.addView(section("后台保活"))
         card {
             val options = linkedMapOf(
@@ -369,24 +344,14 @@ class OverlaySettingsActivity : AppCompatActivity() {
                 -1 to "常驻"
             )
             val current = prefs().getInt("idle_keepalive_min", PowerGovernor.DEFAULT_IDLE_KEEPALIVE_MIN)
-            val row = LinearLayout(this@OverlaySettingsActivity).apply {
-                orientation = LinearLayout.HORIZONTAL
-            }
-            options.entries.forEachIndexed { idx, (minutes, label) ->
-                row.addView(
-                    Ui.button(
-                        this@OverlaySettingsActivity, label,
-                        {
-                            prefs().edit().putInt("idle_keepalive_min", minutes).apply()
-                            PowerGovernor.setIdleKeepAliveMinutes(minutes) // 立即生效
-                        },
-                        filled = current == minutes, compact = true
-                    ),
-                    LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-                        .apply { if (idx > 0) leftMargin = dp(6) }
-                )
-            }
-            addView(row, LinearLayout.LayoutParams(
+            addView(Ui.optionChips(
+                this@OverlaySettingsActivity,
+                options.map { (minutes, label) -> label to minutes },
+                current
+            ) { minutes ->
+                prefs().edit().putInt("idle_keepalive_min", minutes).apply()
+                PowerGovernor.setIdleKeepAliveMinutes(minutes) // 立即生效
+            }, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
             ))

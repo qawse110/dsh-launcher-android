@@ -330,18 +330,12 @@ class MainActivity : AppCompatActivity() {
         }
         contentRoot = root
 
-        /** 两列等宽小按钮行。 */
+        /** 次级动作流式行：按钮按内容自然宽度排布、放不下自动换行
+         *  （旧实现固定 dp(44) 高 + 等宽两列，长文案既窄又可能被裁剪）。 */
         fun addPairRow(vararg items: Pair<String, () -> Unit>): View =
-            LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                items.forEachIndexed { i, (label, onClick) ->
-                    addView(
-                        Ui.button(this@MainActivity, label, onClick, filled = false),
-                        LinearLayout.LayoutParams(0, dp(44), 1f).apply {
-                            if (i < items.lastIndex) rightMargin = dp(8)
-                        }
-                    )
+            Ui.flowRow(this).apply {
+                items.forEach { (label, onClick) ->
+                    addView(Ui.button(this@MainActivity, label, onClick, filled = false))
                 }
             }
 

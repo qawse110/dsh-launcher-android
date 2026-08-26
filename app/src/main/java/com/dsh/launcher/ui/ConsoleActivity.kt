@@ -235,15 +235,10 @@ class ConsoleActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = dp(6) })
 
-        // ---- 工具行 ----
-        fun rowOf(vararg buttons: View): LinearLayout = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            buttons.forEachIndexed { index, button ->
-                addView(button, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-                    if (index < buttons.lastIndex) rightMargin = dp(6)
-                })
-            }
-        }
+        // ---- 工具行（流式布局：按钮按内容自然宽度，一行放不下自动换行，
+        //      替代等宽挤压——四五个按钮一排时「插件管理/检查更新」会被压得过窄） ----
+        fun rowOf(vararg buttons: View): com.google.android.material.chip.ChipGroup =
+            Ui.flowRow(this).apply { buttons.forEach { addView(it) } }
 
         val nodeBtn = Ui.button(this, "Node", { runNodeCmd() }, filled = false)
         val termBtn = Ui.button(this, "终端", {

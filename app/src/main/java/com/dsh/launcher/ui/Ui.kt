@@ -11,6 +11,8 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.card.MaterialCardView
+import com.google.android.material.chip.Chip
+import com.google.android.material.chip.ChipGroup
 import com.google.android.material.color.MaterialColors
 import com.dsh.launcher.core.*
 import com.dsh.launcher.overlay.*
@@ -210,4 +212,44 @@ object Ui {
             letterSpacing = 0.06f
         }
 
+    /**
+     * 单选选项组（Material Choice Chip，流式布局）：替代等宽挤压的多按钮行——
+     * 选项多、文案长时按钮会被压得过窄不可读；Chip 宽度贴合内容，一行放不下
+     * 自动换到下一行。选中态由控件自身管理，无需整页刷新。
+     */
+    fun <T> optionChips(
+        context: Context,
+        options: List<Pair<String, T>>,
+        selected: T?,
+        onSelect: (T) -> Unit
+    ): ChipGroup = ChipGroup(context).apply {
+        isSingleSelection = true
+        selectionRequired = true
+        chipSpacingHorizontal = dp(context, 8)
+        chipSpacingVertical = dp(context, 2)
+        val idToValue = LinkedHashMap<Int, T>()
+        options.forEach { (label, value) ->
+            val chip = Chip(context).apply {
+                text = label
+                isCheckable = true
+                isChecked = value == selected
+                id = View.generateViewId()
+            }
+            idToValue[chip.id] = value
+            addView(chip)
+        }
+        // 填充完成后再挂监听：避免构建期 isChecked=true 触发回调
+        setOnCheckedStateChangeListener { _, checkedIds ->
+            checkedIds.firstOrNull()?.let { id -> idToValue[id]?.let(onSelect) }
+        }
     }
+
+    /**
+     * 流式动作行（ChipGroup 作 FlowLayout 使用）：子控件按内容自然宽度排布，
+     * 一行放不下自动换行——替代把 N 个动作按钮硬压成等宽 N 列的排法。
+     */
+    fun flowRow(context: Context): ChipGroup = ChipGroup(context).apply {
+        chipSpacingHorizontal = dp(context, 8)
+        chipSpacingVertical = dp(context, 4)
+    }
+}
