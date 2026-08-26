@@ -161,6 +161,10 @@ object Ui {
      * Material 3 buttons:
      * filled -> primary filled button;
      * otherwise -> tonal button using primary/secondary container.
+     *
+     * 长文案可读性：允许换行（最多 3 行、居中），不再硬截成一行省略号——
+     * 旧实现 maxLines=1 + END 省略在窄按钮（等宽分栏选项行等）里把文案截到
+     * 完全不可读。字号保持 14sp 全局一致。
      */
     fun button(
         context: Context,
@@ -174,8 +178,10 @@ object Ui {
         this.text = text
         this.isAllCaps = false
         textSize = 14f
-        maxLines = 1
-        ellipsize = android.text.TextUtils.TruncateAt.END
+        maxLines = 3
+        ellipsize = android.text.TextUtils.TruncateAt.END // 超过 3 行才兜底省略
+        gravity = android.view.Gravity.CENTER
+        setHorizontallyScrolling(false) // 允许在按钮宽度内换行，而不是单行横向排开
         insetTop = if (compact) 0 else dp(context, 6)
         insetBottom = if (compact) 0 else dp(context, 6)
         cornerRadius = dp(context, 12)

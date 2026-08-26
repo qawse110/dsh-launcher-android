@@ -410,7 +410,7 @@ class OverlaySettingsActivity : AppCompatActivity() {
             val a11yBtn = Ui.button(this@OverlaySettingsActivity, "无障碍保活（可选，强烈推荐）", {
                 startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
             }, filled = false)
-            val a11yFixBtn = Ui.button(this@OverlaySettingsActivity, "一键修复无障碍通道（已开启但悬浮窗不出现时用）", {
+            val a11yFixBtn = Ui.button(this@OverlaySettingsActivity, "一键修复无障碍通道（悬浮窗不出现时用）", {
                 repairA11yChannel()
             }, filled = false)
             val webBtn = Ui.button(this@OverlaySettingsActivity, "打开 dsh Web", {

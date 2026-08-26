@@ -393,7 +393,7 @@ class MainActivity : AppCompatActivity() {
             setTextColor(Ui.TEXT_SECONDARY)
             setLineSpacing(dp(2).toFloat(), 1f)
             setPadding(0, dp(8), 0, 0)
-            maxLines = 2
+            maxLines = 4 // 安装阶段说明可能较长：放宽到 4 行，避免截断后不可读
             ellipsize = android.text.TextUtils.TruncateAt.END
         }
         col.addView(phaseSub, LinearLayout.LayoutParams(
