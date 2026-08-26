@@ -358,6 +358,46 @@ class OverlaySettingsActivity : AppCompatActivity() {
             ).apply { topMargin = dp(8) })
         }
 
+        // 后台保活（灭屏空闲保活窗）
+        root.addView(section("后台保活"))
+        card {
+            val options = linkedMapOf(
+                0 to "关闭",
+                15 to "15分钟",
+                PowerGovernor.DEFAULT_IDLE_KEEPALIVE_MIN to "30分钟",
+                60 to "1小时",
+                -1 to "常驻"
+            )
+            val current = prefs().getInt("idle_keepalive_min", PowerGovernor.DEFAULT_IDLE_KEEPALIVE_MIN)
+            val row = LinearLayout(this@OverlaySettingsActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+            }
+            options.entries.forEachIndexed { idx, (minutes, label) ->
+                row.addView(
+                    Ui.button(
+                        this@OverlaySettingsActivity, label,
+                        {
+                            prefs().edit().putInt("idle_keepalive_min", minutes).apply()
+                            PowerGovernor.setIdleKeepAliveMinutes(minutes) // 立即生效
+                        },
+                        filled = current == minutes, compact = true
+                    ),
+                    LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                        .apply { if (idx > 0) leftMargin = dp(6) }
+                )
+            }
+            addView(row, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ))
+            addView(TextView(this@OverlaySettingsActivity).apply {
+                text = "灭屏且无任务时，在所选时长内保持 dsh 与状态桥接活跃（唤醒锁 + 看门狗可唤醒），亮屏回来立即可用；到期后转入系统深度省电。任务运行中始终全程保活、不受此时长限制。「常驻」会增加待机耗电。"
+                textSize = 11f
+                setTextColor(Ui.TEXT_MUTED)
+                setPadding(0, dp(6), 0, 0)
+            })
+        }
+
         // 权限与保活
         root.addView(section("权限与保活"))
         card {
@@ -369,6 +409,9 @@ class OverlaySettingsActivity : AppCompatActivity() {
             }, filled = false)
             val a11yBtn = Ui.button(this@OverlaySettingsActivity, "无障碍保活（可选，强烈推荐）", {
                 startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+            }, filled = false)
+            val a11yFixBtn = Ui.button(this@OverlaySettingsActivity, "一键修复无障碍通道（已开启但悬浮窗不出现时用）", {
+                repairA11yChannel()
             }, filled = false)
             val webBtn = Ui.button(this@OverlaySettingsActivity, "打开 dsh Web", {
                 startActivity(Intent(this@OverlaySettingsActivity, WebViewActivity::class.java))
@@ -382,6 +425,10 @@ class OverlaySettingsActivity : AppCompatActivity() {
                 ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply { topMargin = dp(8) })
             addView(a11yBtn, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(8) })
+            addView(a11yFixBtn, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply { topMargin = dp(8) })
@@ -546,17 +593,18 @@ class OverlaySettingsActivity : AppCompatActivity() {
     }
 
     /** 双通道健康度提示：悬浮窗权限 + 无障碍连接状态。
-     *  「已开启但未连接」= ROM 懒绑定（开关登记着、服务没连上，悬浮窗不出现），
-     *  补救方式是把无障碍关闭再打开一次。 */
+     *  连接判定用 90s 诊断窗口（isA11yActiveForDiag）：灭屏深睡会冻结轮询线程几十秒，
+     *  用 5s 让位窗口会把「正在深睡」误报成「已开启但未连接」，让用户误以为权限出问题。
+     *  真·掉线（ROM 懒绑定/强停后未重绑）才提示，并指向下方「一键修复」。 */
     private fun refreshPermissionHint() {
         val can = Settings.canDrawOverlays(this)
         val a11yEnabled = KeepAliveAccessibilityService.isEnabledInSystemSettings(this)
-        val a11yFresh = a11yEnabled && KeepAliveAccessibilityService.isA11yChannelFresh(this)
+        val a11yFresh = a11yEnabled && KeepAliveAccessibilityService.isA11yActiveForDiag(this)
         val overlayPart = if (can) "✓ 悬浮窗权限已授予" else "⚠ 未授予悬浮窗权限，悬浮窗不会显示"
         val a11yPart = when {
+            !a11yEnabled -> "无障碍通道未开启（可选，强烈推荐）"
             a11yFresh -> "✓ 无障碍通道已连接"
-            a11yEnabled -> "⚠ 无障碍已开启但未连接（请关闭再打开一次以重绑）"
-            else -> "无障碍通道未开启（可选，强烈推荐）"
+            else -> "⚠ 无障碍已开启但未连接（可点下方「一键修复」，或到系统设置关闭再打开）"
         }
         permissionHint.text = "$overlayPart\n$a11yPart"
         permissionHint.setTextColor(
@@ -567,6 +615,58 @@ class OverlaySettingsActivity : AppCompatActivity() {
                 else -> Ui.TEXT_MUTED
             }
         )
+    }
+
+    /**
+     * 一键修复无障碍通道：应用被杀后 ROM 可能保持「开关已登记、服务未连接」的死状态。
+     * 已授予 WRITE_SECURE_SETTINGS（adb 一次性授权）时直接重置服务强制系统重绑；
+     * 否则弹出引导（展示可复制的授权命令 + 跳转系统无障碍设置手动开关）。
+     */
+    private fun repairA11yChannel() {
+        val granted = try {
+            checkSelfPermission(android.Manifest.permission.WRITE_SECURE_SETTINGS) ==
+                PackageManager.PERMISSION_GRANTED
+        } catch (_: Exception) {
+            false
+        }
+        if (granted) {
+            permissionHint.text = "正在重置无障碍服务…"
+            permissionHint.setTextColor(Ui.TEXT_MUTED)
+            Thread {
+                val ok = KeepAliveAccessibilityService.repairViaSecureSettings(this)
+                runOnUiThread {
+                    if (ok) {
+                        permissionHint.text = "✓ 已重置无障碍服务，系统将在数秒内重新连接；若悬浮窗仍未出现请稍候或重启应用"
+                        permissionHint.setTextColor(Ui.SUCCESS)
+                    } else {
+                        permissionHint.text = "⚠ 重置失败，请到系统无障碍设置手动关闭再打开"
+                        permissionHint.setTextColor(Ui.WARNING)
+                    }
+                }
+            }.start()
+        } else {
+            AlertDialog.Builder(this)
+                .setTitle("一键修复需要一次授权")
+                .setMessage(
+                    "修复原理：把本应用的无障碍服务从系统设置中摘除再写回，强制系统重新绑定。\n\n" +
+                        "需要电脑执行一次 adb 授权（永久有效）：\n" +
+                        "adb shell pm grant $packageName android.permission.WRITE_SECURE_SETTINGS\n\n" +
+                        "未授权也可手动修复：到系统无障碍设置把本服务关闭再打开。"
+                )
+                .setPositiveButton("复制命令") { _, _ ->
+                    val cb = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                    cb.setPrimaryClip(android.content.ClipData.newPlainText(
+                        "adb", "adb shell pm grant $packageName android.permission.WRITE_SECURE_SETTINGS"
+                    ))
+                    permissionHint.text = "✓ 命令已复制，电脑执行后再点「一键修复」"
+                    permissionHint.setTextColor(Ui.SUCCESS)
+                }
+                .setNeutralButton("打开无障碍设置") { _, _ ->
+                    startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                }
+                .setNegativeButton("取消", null)
+                .show()
+        }
     }
 
     private fun openOverlaySettings() {

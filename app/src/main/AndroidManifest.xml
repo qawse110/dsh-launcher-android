@@ -16,6 +16,10 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- 开机/应用更新后自动恢复保活链（CoreRestoreReceiver） -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- 可选：经 adb 授予后支持「一键修复无障碍通道」（不授予则回退手动引导） -->
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
 
     <application
         android:allowBackup="true"
@@ -85,6 +89,15 @@
         <receiver
             android:name=".service.BridgeWatchdogReceiver"
             android:exported="false" />
+        <!-- 开机/升级自恢复：action 均为受保护广播（仅系统可发），exported 安全 -->
+        <receiver
+            android:name=".service.CoreRestoreReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
         <service
             android:name=".service.KeepAliveAccessibilityService"
             android:exported="true"

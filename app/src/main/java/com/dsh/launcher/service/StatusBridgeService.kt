@@ -102,8 +102,12 @@ class StatusBridgeService : Service() {
 
     private fun pollLoop() {
         while (running.get()) {
-            // 自适应策略：屏幕/任务态喂给治理器，按档位取间隔；任务后台运行时持 PARTIAL 锁
+            // 自适应策略：屏幕/任务态/空闲保活窗喂给治理器，按档位取间隔；
+            // 任务后台运行时持 PARTIAL 锁（空闲灭屏在保活窗内也持，见 PowerGovernor）
             PowerGovernor.refreshScreenState(this)
+            PowerGovernor.setIdleKeepAliveMinutes(
+                prefs().getInt("idle_keepalive_min", PowerGovernor.DEFAULT_IDLE_KEEPALIVE_MIN)
+            )
             PowerGovernor.setTaskStatus(lastStatus)
             syncWakeLock(PowerGovernor.wantWakeLock())
             try {
@@ -161,22 +165,33 @@ class StatusBridgeService : Service() {
         System.currentTimeMillis() - prefs().getLong(KeepAliveAccessibilityService.A11Y_TS_KEY, 0L) <
             KeepAliveAccessibilityService.A11Y_FRESH_MS
 
-    /** 任务后台运行期间持有 PARTIAL 唤醒锁（防 CPU 休眠打断生成）；其余场景立即释放。 */
+    /**
+     * 任务后台运行期间（及空闲保活窗内）持有 PARTIAL 唤醒锁；其余场景立即释放。
+     * 每次持锁都带 10 分钟超时并由轮询循环续期（轮询间隔 ≤30s）——即使任务态误判
+     * 卡死，锁也会在超时后自动释放，不会变成永久耗电源。
+     */
     private fun syncWakeLock(needed: Boolean) {
-        if (needed == wakeHeld) return
         try {
             val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
             if (needed) {
-                wakeLock = pm.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "dsh:task-running").apply {
-                    setReferenceCounted(false)
-                    acquire()
+                if (wakeLock == null) {
+                    wakeLock = pm.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "dsh:task-running").apply {
+                        setReferenceCounted(false)
+                    }
                 }
-                wakeHeld = true
-                AppLog.i("PowerGov", "wake lock acquired (task running, screen off)")
-            } else {
+                // 非引用计数锁重复 acquire = 重置超时；轮询每轮续期
+                wakeLock?.acquire(WAKELOCK_RENEW_MS)
+                if (!wakeHeld) {
+                    wakeHeld = true
+                    AppLog.i("PowerGov", "wake lock acquired (screen off, keep-alive active)")
+                }
+            } else if (wakeHeld || wakeLock != null) {
                 runCatching { wakeLock?.release() }
                 wakeLock = null
-                wakeHeld = false
+                if (wakeHeld) {
+                    wakeHeld = false
+                    AppLog.i("PowerGov", "wake lock released")
+                }
             }
         } catch (t: Throwable) {
             AppLog.e("PowerGov", "wake lock sync failed: " + (t.message ?: t.toString()))
@@ -283,6 +298,8 @@ class StatusBridgeService : Service() {
     companion object {
         private const val NOTIFICATION_ID = 0x5A17
         private const val WATCHDOG_REQUEST_CODE = 0x5A19
+        /** 唤醒锁单次持有超时：轮询循环每轮（≤30s）续期，超时兜底防误判后永久持锁。 */
+        private const val WAKELOCK_RENEW_MS = 10 * 60_000L
         const val WATCHDOG_ACTION = "com.dsh.launcher.action.BRIDGE_WATCHDOG"
 
         fun start(context: Context) {
