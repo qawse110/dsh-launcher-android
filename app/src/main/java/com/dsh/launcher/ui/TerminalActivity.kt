@@ -7,6 +7,7 @@ import android.os.Bundle
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.View
 import android.view.inputmethod.InputMethodManager
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
@@ -41,8 +42,12 @@ class TerminalActivity : AppCompatActivity(), TerminalSessionClient, TerminalVie
     private lateinit var terminalView: TerminalView
     private lateinit var statusLabel: TextView
     private lateinit var fontLabel: TextView
+    private lateinit var ctrlBadge: TextView
     private var session: TerminalSession? = null
     private var currentTextSize = 16
+    /** Termux 风格：按一下音量键 = Ctrl 修饰键（针对硬件键盘；软键盘用底部 CTRL 键）。
+     *  下次任意字母键按下即发送 Ctrl+字母，并自动清除。 */
+    private var ctrlModifier = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         DynamicColors.applyToActivityIfAvailable(this)
@@ -73,6 +78,15 @@ class TerminalActivity : AppCompatActivity(), TerminalSessionClient, TerminalVie
             setTextColor(Ui.TEXT_SECONDARY)
             setPadding(dp(4), dp(6), dp(4), dp(6))
         }
+        // Termux 风格 Ctrl 修饰键徽章：按音量键激活后显示，发送后自动隐藏
+        ctrlBadge = TextView(this).apply {
+            text = "⌃ Ctrl"
+            textSize = 11f
+            setTextColor(Ui.BRAND)
+            background = Ui.rounded(this@TerminalActivity, Ui.withAlpha(Ui.BRAND, 0x22), 6)
+            setPadding(dp(8), dp(2), dp(8), dp(2))
+            visibility = View.GONE
+        }
         val pasteBtn = Ui.button(this, "📋 粘贴", { pasteFromClipboard() }, filled = false, compact = true)
         val fontMinusBtn = Ui.button(this, "A−", { setFontSize(currentTextSize - 1) }, filled = false, compact = true)
         val fontPlusBtn = Ui.button(this, "A+", { setFontSize(currentTextSize + 1) }, filled = false, compact = true)
@@ -87,6 +101,9 @@ class TerminalActivity : AppCompatActivity(), TerminalSessionClient, TerminalVie
             addView(statusLabel, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
                 rightMargin = dp(4)
             })
+            addView(ctrlBadge, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { rightMargin = dp(4) })
             addView(fontLabel, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
             addView(pasteBtn)
             addView(fontMinusBtn)
@@ -107,9 +124,9 @@ class TerminalActivity : AppCompatActivity(), TerminalSessionClient, TerminalVie
             LinearLayout.LayoutParams.MATCH_PARENT, dp(40)
         ))
 
-        // ── 提示条：返回键可退出，避免「进得去出不来」 ─────
+        // ── 提示条：返回键可退出、辅助功能提示 ───────────
         root.addView(TextView(this).apply {
-            text = "返回键退出终端 · 会话有命令在跑时会先弹确认"
+            text = "返回键退出 · 音量键=下一按 Ctrl（硬件键盘）· 长按选词可复制"
             textSize = 10f
             setTextColor(Ui.TEXT_MUTED)
             gravity = Gravity.CENTER
@@ -129,6 +146,12 @@ class TerminalActivity : AppCompatActivity(), TerminalSessionClient, TerminalVie
                     session?.write(("内置终端启动失败: " + t.message + "\n"))
                     statusLabel.text = "内置终端 · 启动失败"
                 }
+            }
+            // Termux 风格：进入终端直接弹出软键盘，避免再点一次
+            runOnUiThread {
+                terminalView.requestFocus()
+                val ime = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+                ime.showSoftInput(terminalView, InputMethodManager.SHOW_IMPLICIT)
             }
         }
     }
@@ -184,11 +207,29 @@ class TerminalActivity : AppCompatActivity(), TerminalSessionClient, TerminalVie
     }
 
     /**
-     * 返回键可靠处理：TerminalView 持有焦点时会拦截按键，导致系统返回不生效
-     * （表现为「进入终端后无法返回」）。这里在 Activity 层直接接管返回键：
-     * 软键盘展开时先收键盘；否则退出（有运行中的命令先弹确认）。
+     * 按键可靠处理：
+     * - 返回键：TerminalView 持有焦点时会拦截按键，导致系统返回不生效
+     *   （表现为「进入终端后无法返回」）。这里在 Activity 层直接接管返回键：
+     *   软键盘展开时先收键盘；否则退出（有运行中的命令先弹确认）。
+     * - 音量键：Termux 风格——按一下音量下/上 = 激活 Ctrl 修饰（硬件键盘用），
+     *   下一个字母键按下即发送 Ctrl+字母；激活时顶栏显示 ⌃ Ctrl 徽章。
      */
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.action == KeyEvent.ACTION_DOWN &&
+            useVolumeCtrl() &&
+            (event.keyCode == KeyEvent.KEYCODE_VOLUME_DOWN || event.keyCode == KeyEvent.KEYCODE_VOLUME_UP)
+        ) {
+            ctrlModifier = true
+            updateCtrlBadge()
+            // 安全网：5 秒内没按下字母键则自动取消修饰，避免误触后残留
+            terminalView.postDelayed({
+                if (ctrlModifier) {
+                    ctrlModifier = false
+                    updateCtrlBadge()
+                }
+            }, 5000)
+            return true // 拦截：不调节音量，作为 Ctrl 修饰
+        }
         if (event.keyCode == KeyEvent.KEYCODE_BACK && event.action == KeyEvent.ACTION_UP) {
             val ime = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
             if (ime.isAcceptingText) {
@@ -254,7 +295,21 @@ class TerminalActivity : AppCompatActivity(), TerminalSessionClient, TerminalVie
     override fun shouldUseCtrlSpaceWorkaround(): Boolean = false
     override fun isTerminalViewSelected(): Boolean = true
     override fun copyModeChanged(copyMode: Boolean) {}
-    override fun onKeyDown(keyCode: Int, e: KeyEvent, session: TerminalSession): Boolean = false
+    override fun onKeyDown(keyCode: Int, e: KeyEvent, session: TerminalSession): Boolean {
+        // Termux 风格：ctrlModifier 激活后，下一个字母键按下即发送 Ctrl+字母并清除
+        if (ctrlModifier) {
+            ctrlModifier = false
+            updateCtrlBadge()
+            val c = ctrlCode(keyCode)
+            if (c > 0) {
+                session.write("" + c.toChar())
+                return true
+            }
+            // 非字母键：当作取消修饰，继续默认处理
+            return false
+        }
+        return false
+    }
     override fun onKeyUp(keyCode: Int, e: KeyEvent): Boolean = false
     override fun onLongPress(event: MotionEvent): Boolean = false
     override fun readControlKey(): Boolean = false
@@ -285,14 +340,19 @@ class TerminalActivity : AppCompatActivity(), TerminalSessionClient, TerminalVie
     }
 
     private fun buildKeyStrip(): HorizontalScrollView {
+        // 参考 Termux 快捷条：ESC/TAB、方向键（历史/行内移动）、常用符号、
+        // CTRL 组合键（视觉高亮）——软键盘打不出的键都放这里
         val keys = arrayOf(
-            "ESC" to "\u001b", "TAB" to "\t", "|" to "|", "/" to "/", "-" to "-",
-            "_" to "_", "\"" to "\"", "'" to "'", "(" to "(", ")" to ")",
+            "ESC" to "\u001b", "TAB" to "\t",
+            "↑" to "\u001b[A", "↓" to "\u001b[B", "←" to "\u001b[D", "→" to "\u001b[C",
+            "|" to "|", "/" to "/", "-" to "-", "_" to "_",
+            "\"" to "\"", "'" to "'", "(" to "(", ")" to ")",
             "[" to "[", "]" to "]", "{" to "{", "}" to "}", "<" to "<", ">" to ">",
             "&" to "&", "!" to "!", "^" to "^", "=" to "=", "+" to "+",
             "%" to "%", "#" to "#", "$" to "$", "~" to "~", "." to ".", "," to ",",
-            ":" to ":", ";" to ";", "?" to "?", "*" to "*",
-            "CTRL+C" to "\u0003", "CTRL+L" to "\u000c"
+            ":" to ":", ";" to ";", "?" to "?", "*" to "*", "@" to "@",
+            "CTRL+C" to "\u0003", "CTRL+D" to "\u0004", "CTRL+Z" to "\u001A",
+            "CTRL+L" to "\u000c", "CTRL+U" to "\u0015"
         )
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -310,12 +370,19 @@ class TerminalActivity : AppCompatActivity(), TerminalSessionClient, TerminalVie
     }
 
     private fun keyButton(label: String, ch: String): TextView {
+        val isCtrl = label.startsWith("CTRL")
         return TextView(this).apply {
             text = label
             textSize = 11f
-            setTextColor(Ui.TEXT_PRIMARY)
             gravity = Gravity.CENTER
-            background = Ui.rounded(this@TerminalActivity, Ui.withAlpha(Ui.SURFACE_CONTAINER_HIGHEST, 0xE0), 8)
+            if (isCtrl) {
+                // CTRL 组合键高亮：品牌色描边文字，一眼区分
+                setTextColor(Ui.BRAND)
+                background = Ui.rounded(this@TerminalActivity, Ui.withAlpha(Ui.BRAND, 0x1F), 8)
+            } else {
+                setTextColor(Ui.TEXT_PRIMARY)
+                background = Ui.rounded(this@TerminalActivity, Ui.withAlpha(Ui.SURFACE_CONTAINER_HIGHEST, 0xE0), 8)
+            }
             setPadding(dp(10), 0, dp(10), 0)
             setOnClickListener {
                 terminalView.requestFocus()
@@ -325,6 +392,24 @@ class TerminalActivity : AppCompatActivity(), TerminalSessionClient, TerminalVie
                 LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.MATCH_PARENT
             ).apply { rightMargin = dp(4) }
         }
+    }
+
+    // ---- Termux 风格音量=Ctrl 辅助 ----
+
+    private fun termPrefs() = getSharedPreferences(AppState.Prefs.UI, Context.MODE_PRIVATE)
+
+    /** 音量键 → Ctrl 修饰开关（默认开；设置页/未来 UI 可关）。 */
+    private fun useVolumeCtrl(): Boolean = termPrefs().getBoolean("term_volume_ctrl", true)
+
+    /** KEYCODE_A..Z → Ctrl 控制码（1..26）；其它键返回 -1。 */
+    private fun ctrlCode(keyCode: Int): Int {
+        val a = KeyEvent.KEYCODE_A
+        val z = KeyEvent.KEYCODE_Z
+        return if (keyCode in a..z) keyCode - a + 1 else -1
+    }
+
+    private fun updateCtrlBadge() {
+        ctrlBadge.visibility = if (ctrlModifier) View.VISIBLE else View.GONE
     }
 
     /** v4.5 唯一 shell：内置 Termux bash（createSession 已确保就绪）。 */
