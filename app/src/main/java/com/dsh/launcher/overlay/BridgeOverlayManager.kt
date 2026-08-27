@@ -96,6 +96,12 @@ class BridgeOverlayManager(
     private var transientKey: String? = null
     private var transientRunnable: Runnable? = null
 
+    // 任务完成气泡自动收起：显示 completionClearDelayMs 后清除「已完成」状态，
+    // 避免气泡一直停留在完成态；状态变化（新任务/空闲）后重置，下次完成再显示
+    private var completionClearKey: String? = null
+    private var completionClearRunnable: Runnable? = null
+    private val completionClearDelayMs = 10_000L
+
     // 互动与闲时行为（参考 codex-pet-live 的 patpat / 主动气泡模型）
     // 连点爆发检测：每次点击即时挥手，静默 tapSettleMs 后按爆发内总点击数一次性分发。
     // 旧实现里双击分支会把计数清零——快速连点每两击就触发一次双击、计数在 0/1/2 间震荡，
@@ -422,22 +428,38 @@ class BridgeOverlayManager(
                 if (key == transientKey) return@let // 展开完整内容中且状态未变：保持不动
                 cancelTransient() // 状态变化：收起，恢复常规气泡
             }
+            val isFinished = status == "finished"
+            if (!isFinished) {
+                // 离开完成态（新任务/空闲）：重置完成气泡收起标记，下次完成再显示
+                completionClearKey = null
+                completionClearRunnable?.let { handler.removeCallbacks(it) }
+                completionClearRunnable = null
+            }
             val bubbleText = buildPetBubbleText(status, text, event, petName)
-            if (bp.showPetBubble() && bubbleText.isNotBlank()) {
-                showBubbleWindow()
-                bubble.maxLines = 2
-                bubble.ellipsize = TextUtils.TruncateAt.END
-                bubble.maxWidth = minOf((context.resources.displayMetrics.widthPixels * 0.45).toInt(), dp(230))
-                // 常规两行状态气泡：还原滚动/限高（上一轮可能是可滚动的长文视图）
-                bubble.movementMethod = null
-                bubble.maxHeight = Int.MAX_VALUE
-                bubble.text = bubbleText
-                bubble.visibility = View.VISIBLE
-                petSpeaker.speakContent(lastText, status, event)
-            } else {
-                // 无内容（或关闭气泡）时不显示空框：气泡窗口整体移除，触摸透传
-                bubble.visibility = View.GONE
-                hideBubbleWindow()
+            when {
+                // 完成气泡已到点收起：状态变化前保持收起，不被每轮轮询重新显示
+                isFinished && completionClearKey == key -> {
+                    bubble.visibility = View.GONE
+                    hideBubbleWindow()
+                }
+                bp.showPetBubble() && bubbleText.isNotBlank() -> {
+                    showBubbleWindow()
+                    bubble.maxLines = 2
+                    bubble.ellipsize = TextUtils.TruncateAt.END
+                    bubble.maxWidth = minOf((context.resources.displayMetrics.widthPixels * 0.45).toInt(), dp(230))
+                    // 常规两行状态气泡：还原滚动/限高（上一轮可能是可滚动的长文视图）
+                    bubble.movementMethod = null
+                    bubble.maxHeight = Int.MAX_VALUE
+                    bubble.text = bubbleText
+                    bubble.visibility = View.VISIBLE
+                    petSpeaker.speakContent(lastText, status, event)
+                    if (isFinished) scheduleCompletionClear(key, bubble)
+                }
+                else -> {
+                    // 无内容（或关闭气泡）时不显示空框：气泡窗口整体移除，触摸透传
+                    bubble.visibility = View.GONE
+                    hideBubbleWindow()
+                }
             }
             syncBubbleWindow() // 气泡窗独立定位：跟随宠物窗，朝屏幕内侧
             if (!greeted) {
@@ -447,6 +469,22 @@ class BridgeOverlayManager(
             if (ambientRunnable == null) scheduleAmbient()
             if (idleActRunnable == null) scheduleIdleAct()
         }
+    }
+
+    /** 任务完成后延时自动收起完成气泡；期间用户展开完整回复（transient 非空）不打扰。 */
+    private fun scheduleCompletionClear(key: String, bubble: TextView) {
+        completionClearKey = key
+        completionClearRunnable?.let { handler.removeCallbacks(it) }
+        val r = Runnable {
+            completionClearRunnable = null
+            if (completionClearKey == key && transientText == null) {
+                // 清除完成状态：收起气泡，直到状态变化前保持收起
+                bubble.visibility = View.GONE
+                hideBubbleWindow()
+            }
+        }
+        completionClearRunnable = r
+        handler.postDelayed(r, completionClearDelayMs)
     }
 
     private fun buildPetBubbleText(status: String, text: String, event: String?, name: String): String {
@@ -714,6 +752,9 @@ class BridgeOverlayManager(
         burstCount = 0
         burstDispatch?.let { handler.removeCallbacks(it) }
         burstDispatch = null
+        completionClearKey = null
+        completionClearRunnable?.let { handler.removeCallbacks(it) }
+        completionClearRunnable = null
         petView?.stop()
         petSpeaker.resetTransientState()
         pendingRow = -1
