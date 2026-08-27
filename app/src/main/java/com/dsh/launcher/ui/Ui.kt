@@ -179,6 +179,7 @@ object Ui {
     ): MaterialButton = MaterialButton(context).apply {
         this.text = text
         this.isAllCaps = false
+        minWidth = 0 // 去掉 MaterialButton 默认 88dp 最小宽：compact 按钮贴合内容，窄栏（如终端顶栏）不再溢出
         textSize = 14f
         maxLines = 3
         ellipsize = android.text.TextUtils.TruncateAt.END // 超过 3 行才兜底省略

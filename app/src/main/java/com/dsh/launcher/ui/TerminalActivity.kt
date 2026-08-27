@@ -7,9 +7,11 @@ import android.os.Bundle
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.inputmethod.InputMethodManager
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import com.google.android.material.color.DynamicColors
 import com.termux.terminal.TerminalSession
@@ -52,6 +54,7 @@ class TerminalActivity : AppCompatActivity(), TerminalSessionClient, TerminalVie
         terminalView.setTextSize(currentTextSize)
         terminalView.setBackgroundColor(0xFF0B0B0F.toInt())
         terminalView.isFocusableInTouchMode = true
+        terminalView.contentDescription = "dsh 内置终端"
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -70,20 +73,21 @@ class TerminalActivity : AppCompatActivity(), TerminalSessionClient, TerminalVie
             setTextColor(Ui.TEXT_SECONDARY)
             setPadding(dp(4), dp(6), dp(4), dp(6))
         }
-        val pasteBtn = Ui.button(this, "粘贴", { pasteFromClipboard() }, filled = false, compact = true)
-        val fontMinusBtn = Ui.button(this, "A-", { setFontSize(currentTextSize - 1) }, filled = false, compact = true)
+        val pasteBtn = Ui.button(this, "📋 粘贴", { pasteFromClipboard() }, filled = false, compact = true)
+        val fontMinusBtn = Ui.button(this, "A−", { setFontSize(currentTextSize - 1) }, filled = false, compact = true)
         val fontPlusBtn = Ui.button(this, "A+", { setFontSize(currentTextSize + 1) }, filled = false, compact = true)
-        val restartBtn = Ui.button(this, "重启", { restartSession() }, filled = false, compact = true)
-        val exitBtn = Ui.button(this, "退出", { finish() }, filled = false, compact = true)
+        val restartBtn = Ui.button(this, "⟳ 重启", { restartSession() }, filled = false, compact = true)
+        val exitBtn = Ui.button(this, "✕ 退出", { maybeExit() }, filled = false, compact = true, color = Ui.DANGER)
 
         val topBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setBackgroundColor(Ui.SURFACE_CONTAINER_HIGH)
-            addView(statusLabel, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-            addView(fontLabel, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(8), 0, dp(8), 0)
+            addView(statusLabel, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                rightMargin = dp(4)
             })
+            addView(fontLabel, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
             addView(pasteBtn)
             addView(fontMinusBtn)
             addView(fontPlusBtn)
@@ -101,6 +105,18 @@ class TerminalActivity : AppCompatActivity(), TerminalSessionClient, TerminalVie
         val keyStrip = buildKeyStrip()
         root.addView(keyStrip, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, dp(40)
+        ))
+
+        // ── 提示条：返回键可退出，避免「进得去出不来」 ─────
+        root.addView(TextView(this).apply {
+            text = "返回键退出终端 · 会话有命令在跑时会先弹确认"
+            textSize = 10f
+            setTextColor(Ui.TEXT_MUTED)
+            gravity = Gravity.CENTER
+            setPadding(0, dp(3), 0, dp(3))
+            setBackgroundColor(Ui.SURFACE_CONTAINER_LOW)
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, dp(20)
         ))
 
         setContentView(root)
@@ -165,6 +181,40 @@ class TerminalActivity : AppCompatActivity(), TerminalSessionClient, TerminalVie
     override fun onDestroy() {
         runCatching { session?.finishIfRunning() }
         super.onDestroy()
+    }
+
+    /**
+     * 返回键可靠处理：TerminalView 持有焦点时会拦截按键，导致系统返回不生效
+     * （表现为「进入终端后无法返回」）。这里在 Activity 层直接接管返回键：
+     * 软键盘展开时先收键盘；否则退出（有运行中的命令先弹确认）。
+     */
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.keyCode == KeyEvent.KEYCODE_BACK && event.action == KeyEvent.ACTION_UP) {
+            val ime = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+            if (ime.isAcceptingText) {
+                ime.hideSoftInputFromWindow(currentFocus?.windowToken, 0)
+                terminalView.requestFocus()
+            } else {
+                maybeExit()
+            }
+            return true
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    /** 退出终端：会话里还有活动命令时先确认，避免误触返回键丢掉会话。 */
+    private fun maybeExit() {
+        val pid = session?.getPid()?.takeIf { it > 0 } ?: 0
+        if (pid <= 0) {
+            finish()
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("退出终端？")
+            .setMessage("终端会话中可能还有正在运行的命令，退出将终止该会话。")
+            .setPositiveButton("退出", { _, _ -> finish() })
+            .setNegativeButton("取消", null)
+            .show()
     }
 
     // ============ TerminalSessionClient ============
