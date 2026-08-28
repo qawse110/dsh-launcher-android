@@ -67,7 +67,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var updateLabel: TextView
     private lateinit var updateBtn: View
     /** 临时更新回滚卡片（isTempWindow 时显示）。 */
-    private lateinit var rollbackCard: View
+    private lateinit var rollbackCard: ViewGroup
     private var flowing = false
     private var lastMode: DshFlow.Mode = DshFlow.Mode.INSTALL_AND_START
 
