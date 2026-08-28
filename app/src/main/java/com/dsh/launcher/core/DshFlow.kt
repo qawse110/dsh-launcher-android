@@ -145,6 +145,7 @@ object DshFlow {
             }
             return if (quickStartWeb(ctx, nodeDir, dshPrefix, ::fl)) {
                 fl("OK 启动完成 (http://127.0.0.1:$WEB_PORT)")
+                DshUpdater.noteSuccessfulBoot(ctx, ::fl)
                 onState?.invoke("运行中")
                 BuildKeepAliveService.updateRunning(ctx)
                 ensureBridge(ctx)
@@ -161,6 +162,7 @@ object DshFlow {
             fl(">> 快速启动：已安装 dsh v${DshUpdater.currentVersion(ctx)}，跳过 npm/插件装配…")
             return if (quickStartWeb(ctx, nodeDir, dshPrefix, ::fl)) {
                 fl("OK 快速启动完成 (http://127.0.0.1:$WEB_PORT)")
+                DshUpdater.noteSuccessfulBoot(ctx, ::fl)
                 onState?.invoke("运行中")
                 BuildKeepAliveService.updateRunning(ctx)
                 ensureBridge(ctx)
@@ -222,80 +224,93 @@ object DshFlow {
             }
         }
 
-        fl(">> 3/4 官方 npm 安装/更新 dsh + dsh plugin 装配内置插件…")
-        val tag = ctx.getSharedPreferences(AppState.Prefs.CONSOLE, Context.MODE_PRIVATE)
-            .getString("dsh_install_tag", "latest") ?: "latest"
-        val installEnv = mapOf(
-            "HOME" to ctx.filesDir.absolutePath,
-            "NODE_BIN" to "$nodeDir/bin/node",
-            "NPM_BIN" to "$nodeDir/bin/npm",
-            "DSH_PREFIX" to dshPrefix.absolutePath,
-            "DSH_PROFILE" to "web",
-            "DSH_PREBUILT" to prebuilt.absolutePath,
-            "DSH_PLUGINS_DIR" to pluginsDir.absolutePath,
-            "DSH_EXTRA_PLUGINS_SRC" to extraPluginsDir.absolutePath,
-            "DSH_TAG" to tag,
-            "DSH_APK_VER" to apkVer.toString()
-        )
-        if (tag != "latest") fl("  （安装 dist-tag=$tag 预发布线）")
-        val installExit = exec(ctx, "$nodeDir/bin/node ${installScript.absolutePath}", installEnv) { fl(it) }
-        // 一次性安装 tag 已消费（无论成败），复位避免残留 next 影响下次普通安装
-        ctx.getSharedPreferences(AppState.Prefs.CONSOLE, Context.MODE_PRIVATE)
-            .edit().remove("dsh_install_tag").apply()
-        if (installExit != 0) {
-            fl("FAIL 3/4 install script exit=$installExit，详见 install_log.txt")
-            onState?.invoke("出错")
-            return false
-        }
-        if (!dshCli(ctx).exists()) {
-            fl("FAIL 3/4 官方 dsh CLI 未安装到 $dshPrefix")
-            onState?.invoke("出错")
-            return false
-        }
-        fl("OK 3/4 dsh + builtin plugins installed")
+        // —— 3/4~4/4 安装 + 启动（临时更新保护：异常时自动回滚一次，最多两轮）——
+        // 第一轮用用户指定 tag（latest / next / 回滚版本）正常安装；
+        // 若安装失败或 web 启动失败且处于临时更新窗口 → 自动置 tag=上一版本重装一次。
+        var attempt = 0
+        while (attempt < 2) {
+            attempt++
+            val tag = ctx.getSharedPreferences(AppState.Prefs.CONSOLE, Context.MODE_PRIVATE)
+                .getString("dsh_install_tag", "latest") ?: "latest"
+            // 走到这里必然执行 npm 安装 → 版本可能变化 → 记录回滚基线。
+            // （自动回滚重装中被标记跳过，保持原始基线；未变化时 afterInstall 会撤销）
+            DshUpdater.recordRollbackBaselineIfChanging(ctx, true, ::fl)
 
-        fl(">> 3.5/4 Android 兼容修复…")
-        val stubScript = File(ctx.filesDir, "stub-dsh.mjs")
-        try {
-            ctx.assets.open("stub-dsh.mjs").use { input ->
-                stubScript.outputStream().use { output -> input.copyTo(output) }
+            fl(">> 3/4 官方 npm 安装/更新 dsh + dsh plugin 装配内置插件…")
+            if (tag != "latest") fl("  （安装 dist-tag=$tag 预发布/回滚线）")
+            val installEnv = mapOf(
+                "HOME" to ctx.filesDir.absolutePath,
+                "NODE_BIN" to "$nodeDir/bin/node",
+                "NPM_BIN" to "$nodeDir/bin/npm",
+                "DSH_PREFIX" to dshPrefix.absolutePath,
+                "DSH_PROFILE" to "web",
+                "DSH_PREBUILT" to prebuilt.absolutePath,
+                "DSH_PLUGINS_DIR" to pluginsDir.absolutePath,
+                "DSH_EXTRA_PLUGINS_SRC" to extraPluginsDir.absolutePath,
+                "DSH_TAG" to tag,
+                "DSH_APK_VER" to apkVer.toString()
+            )
+            val installExit = exec(ctx, "$nodeDir/bin/node ${installScript.absolutePath}", installEnv) { fl(it) }
+            // 一次性安装 tag 已消费（无论成败），复位避免残留影响下次普通安装
+            ctx.getSharedPreferences(AppState.Prefs.CONSOLE, Context.MODE_PRIVATE)
+                .edit().remove("dsh_install_tag").apply()
+            if (installExit != 0 || !dshCli(ctx).exists()) {
+                fl("FAIL 3/4 install exit=$installExit / CLI missing，详见 install_log.txt")
+                if (DshUpdater.maybeAutoRollback(ctx, ::fl)) continue
+                onState?.invoke("出错")
+                return false
             }
-        } catch (t: Throwable) {
-            fl("FAIL 3.5/4 assets copy stub-dsh.mjs: ${t.message}")
-        }
-        // SELinux 禁止 app 对 data 文件硬链接；dsh session 首次落盘用 link()。
-        // 通过 Node loader 把 node:fs/promises 的 link 重定向为 rename 兼容实现。
-        for (name in listOf("fs-register.mjs", "fs-loader.mjs", "fs-promises-compat.mjs")) {
+            DshUpdater.afterInstall(ctx, ::fl)
+            fl("OK 3/4 dsh + builtin plugins installed")
+
+            fl(">> 3.5/4 Android 兼容修复…")
+            val stubScript = File(ctx.filesDir, "stub-dsh.mjs")
             try {
-                ctx.assets.open(name).use { input ->
-                    File(ctx.filesDir, name).outputStream().use { output -> input.copyTo(output) }
+                ctx.assets.open("stub-dsh.mjs").use { input ->
+                    stubScript.outputStream().use { output -> input.copyTo(output) }
                 }
             } catch (t: Throwable) {
-                fl("WARN assets copy $name: ${t.message}")
+                fl("FAIL 3.5/4 assets copy stub-dsh.mjs: ${t.message}")
             }
-        }
-        runAndroidStubOnce(ctx, nodeDir, dshPrefix, stubScript, ::fl)
+            // SELinux 禁止 app 对 data 文件硬链接；dsh session 首次落盘用 link()。
+            // 通过 Node loader 把 node:fs/promises 的 link 重定向为 rename 兼容实现。
+            for (name in listOf("fs-register.mjs", "fs-loader.mjs", "fs-promises-compat.mjs")) {
+                try {
+                    ctx.assets.open(name).use { input ->
+                        File(ctx.filesDir, name).outputStream().use { output -> input.copyTo(output) }
+                    }
+                } catch (t: Throwable) {
+                    fl("WARN assets copy $name: ${t.message}")
+                }
+            }
+            // stub 标记含 dsh 版本：回滚重装后版本变化会自动重新打补丁
+            runAndroidStubOnce(ctx, nodeDir, dshPrefix, stubScript, ::fl)
 
-        // 仅安装/更新模式：到此结束，不启动 web（不置 running，watchdog 不会拉起）
-        if (mode == Mode.INSTALL_ONLY) {
-            fl("OK 安装/更新完成（未启动 web，可随时一键启动）")
-            onState?.invoke("安装完成")
-            startKeepAlive(ctx)
-            return true
-        }
+            // 仅安装/更新模式：到此结束，不启动 web（不置 running，watchdog 不会拉起）
+            if (mode == Mode.INSTALL_ONLY) {
+                fl("OK 安装/更新完成（未启动 web，可随时一键启动）")
+                onState?.invoke("安装完成")
+                startKeepAlive(ctx)
+                return true
+            }
 
-        fl(">> 4/4 校验 dsh web…")
-        return if (startDshWeb(ctx, nodeDir, dshPrefix, ::fl)) {
-            fl("OK 4/4 dsh web started (http://127.0.0.1:$WEB_PORT)")
-            onState?.invoke("运行中")
-            BuildKeepAliveService.updateRunning(ctx)
-            ensureBridge(ctx)
-            true
-        } else {
+            fl(">> 4/4 校验 dsh web…")
+            if (startDshWeb(ctx, nodeDir, dshPrefix, ::fl)) {
+                fl("OK 4/4 dsh web started (http://127.0.0.1:$WEB_PORT)")
+                DshUpdater.noteSuccessfulBoot(ctx, ::fl)
+                onState?.invoke("运行中")
+                BuildKeepAliveService.updateRunning(ctx)
+                ensureBridge(ctx)
+                return true
+            }
             fl("FAIL 4/4 dsh web 启动失败（见上方日志尾部）")
+            if (DshUpdater.maybeAutoRollback(ctx, ::fl)) continue
             onState?.invoke("出错")
-            false
+            return false
         }
+        fl("FAIL 安装/启动连续失败且自动回滚未生效，请手动回滚或查看控制台日志")
+        onState?.invoke("出错")
+        return false
     }
 
     /** 前台服务保活，防止长时间 build 被系统回收。 */

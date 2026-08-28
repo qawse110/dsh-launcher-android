@@ -163,4 +163,115 @@ object DshUpdater {
         val pre = if (parts.size > 1 && parts[1].isNotBlank()) parts[1].split('.') else null
         return core to pre
     }
+
+    // ================= 临时更新 / 回滚保护 =================
+    // 语义：任何「版本会变化的全量安装」都被视为临时更新——保留上一版本作为回滚基线，
+    // 若新版本装完/启动异常（如插件不兼容）自动回滚；新版本连续 3 次稳定启动后自动确认。
+    // 状态存在 CONSOLE prefs：KEY_PREV_VERSION=回滚基线、KEY_TEMP_VERSION=当前临时版本、
+    // KEY_TEMP_BOOTS=临时版本连续成功启动次数、KEY_AUTO_ROLLED=本次窗口已自动回滚过。
+
+    private const val KEY_PREV_VERSION = "dsh_prev_version"
+    private const val KEY_TEMP_VERSION = "dsh_temp_version"
+    private const val KEY_TEMP_BOOTS = "dsh_temp_boots"
+    private const val KEY_AUTO_ROLLED = "dsh_auto_rolled"
+    /** 临时版本连续成功启动几次后自动确认（撤销回滚基线）。 */
+    private const val AUTO_CONFIRM_BOOTS = 3
+
+    private fun console(ctx: Context) =
+        ctx.getSharedPreferences(AppState.Prefs.CONSOLE, Context.MODE_PRIVATE)
+
+    /** 回滚基线版本（更新前的可用版本）；null = 无临时窗口。 */
+    fun prevVersion(ctx: Context): String? = console(ctx).getString(KEY_PREV_VERSION, null)
+
+    /** 当前是否处于临时更新窗口（更新已装、尚未确认/未自动确认）。 */
+    fun isTempWindow(ctx: Context): Boolean = prevVersion(ctx) != null
+
+    /** 当前临时版本号（null 表示不在临时窗口）。 */
+    fun tempVersion(ctx: Context): String? = console(ctx).getString(KEY_TEMP_VERSION, null)
+
+    /**
+     * 全量安装/更新前调用：把当前已装版本记为回滚基线（仅当本次会改变版本且
+     * 非回滚重装途中时）。首次安装（未装过）不记录。返回是否记录了基线。
+     */
+    fun recordRollbackBaselineIfChanging(ctx: Context, changing: Boolean, onLog: (String) -> Unit): Boolean {
+        if (!changing) return false
+        // 自动回滚触发的重装：保持原始基线，不被回滚目标覆盖
+        if (console(ctx).getBoolean(KEY_AUTO_ROLLED, false)) return false
+        val cur = installedVersion(ctx) ?: return false
+        console(ctx).edit()
+            .putString(KEY_PREV_VERSION, cur)
+            .remove(KEY_TEMP_VERSION)
+            .remove(KEY_TEMP_BOOTS)
+            .apply()
+        onLog("临时更新保护开启：可回滚到 v$cur")
+        return true
+    }
+
+    /**
+     * 安装脚本成功后调用：比较实际安装版本与基线——
+     * 版本确实变化 → 进入临时窗口；未变化（重装同版本）→ 撤销基线。
+     */
+    fun afterInstall(ctx: Context, onLog: (String) -> Unit) {
+        val prev = console(ctx).getString(KEY_PREV_VERSION, null) ?: return
+        val cur = installedVersion(ctx)
+        if (cur == null) return
+        if (cur == prev) {
+            onLog("安装后版本未变化，撤销临时更新保护")
+            clearTemp(ctx)
+            return
+        }
+        console(ctx).edit().putString(KEY_TEMP_VERSION, cur).apply()
+        onLog("已临时更新到 v$cur（回滚保护中，可回滚到 v$prev）")
+    }
+
+    /**
+     * web 成功启动后调用：临时版本连续稳定启动 [AUTO_CONFIRM_BOOTS] 次即自动确认
+     * （撤销回滚基线），避免一直挂着「回滚」提示。
+     */
+    fun noteSuccessfulBoot(ctx: Context, onLog: (String) -> Unit) {
+        if (!isTempWindow(ctx)) return
+        val cur = installedVersion(ctx)
+        val temp = console(ctx).getString(KEY_TEMP_VERSION, null)
+        if (temp == null || cur != temp) {
+            clearTemp(ctx) // 版本与临时窗口不一致：直接结束窗口
+            return
+        }
+        val n = console(ctx).getInt(KEY_TEMP_BOOTS, 0) + 1
+        console(ctx).edit().putInt(KEY_TEMP_BOOTS, n).apply()
+        if (n >= AUTO_CONFIRM_BOOTS) {
+            onLog("临时版本 v$cur 连续 ${n} 次稳定启动，自动确认此版本")
+            clearTemp(ctx)
+        }
+    }
+
+    /**
+     * 尝试自动回滚：仅当临时窗口激活且本窗口尚未回滚过时生效——
+     * 置一次性安装 tag=上一版本并标记已回滚，随后安装流程会重装旧版本。
+     * @return true=已触发自动回滚（调用方应重跑安装流程）
+     */
+    fun maybeAutoRollback(ctx: Context, onLog: (String) -> Unit): Boolean {
+        val prev = prevVersion(ctx) ?: return false
+        if (console(ctx).getBoolean(KEY_AUTO_ROLLED, false)) return false
+        console(ctx).edit().putBoolean(KEY_AUTO_ROLLED, true).apply()
+        // install-dsh.mjs 支持精确版本号：@deepseek-ai/dsh@<prev> 直接重装旧版
+        console(ctx).edit().putString("dsh_install_tag", prev).apply()
+        onLog("检测到更新后异常，自动回滚到 v$prev …")
+        return true
+    }
+
+    /** 用户「确认此版本」或回滚完成后调用：清除临时窗口与回滚基线。 */
+    fun confirmVersion(ctx: Context, onLog: (String) -> Unit = {}) {
+        val prev = prevVersion(ctx)
+        if (prev != null) onLog("已确认当前版本，回滚基线 v$prev 已清除")
+        clearTemp(ctx)
+    }
+
+    private fun clearTemp(ctx: Context) {
+        console(ctx).edit()
+            .remove(KEY_PREV_VERSION)
+            .remove(KEY_TEMP_VERSION)
+            .remove(KEY_TEMP_BOOTS)
+            .remove(KEY_AUTO_ROLLED)
+            .apply()
+    }
 }

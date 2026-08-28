@@ -19,6 +19,7 @@ import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import com.google.android.material.color.DynamicColors
 import java.io.File
@@ -65,6 +66,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var updateCard: ViewGroup
     private lateinit var updateLabel: TextView
     private lateinit var updateBtn: View
+    /** 临时更新回滚卡片（isTempWindow 时显示）。 */
+    private lateinit var rollbackCard: View
     private var flowing = false
     private var lastMode: DshFlow.Mode = DshFlow.Mode.INSTALL_AND_START
 
@@ -147,7 +150,18 @@ class MainActivity : AppCompatActivity() {
                 if (isFinishing || isDestroyed) return@post
                 when {
                     up -> { applyPhase(Phase.RUNNING); openWeb() }
-                    installed -> beginFlow(DshFlow.Mode.START_ONLY)
+                    installed -> {
+                        // 临时更新窗口内 web 起不来：自动触发回滚（每个临时窗口最多一次，
+                        // 见 DshUpdater.maybeAutoRollback 的 autoRolled 守卫），
+                        // 避免「更新后插件不兼容 → 程序打不开」的卡死
+                        if (DshUpdater.isTempWindow(this) &&
+                            DshUpdater.maybeAutoRollback(this) { /* 日志走 flow */ }
+                        ) {
+                            beginFlow(DshFlow.Mode.INSTALL_AND_START, forceFullInstall = true)
+                        } else {
+                            beginFlow(DshFlow.Mode.START_ONLY)
+                        }
+                    }
                     else -> beginFlow(DshFlow.Mode.INSTALL_AND_START)
                 }
             }
@@ -157,11 +171,12 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         refreshEnvChips()
+        refreshRollbackCard()
     }
 
     // ---------------- 自动启动流程 ----------------
 
-    private fun beginFlow(mode: DshFlow.Mode) {
+    private fun beginFlow(mode: DshFlow.Mode, forceFullInstall: Boolean = false) {
         if (flowing) {
             toast("启动流程进行中，请稍候…")
             return
@@ -194,6 +209,7 @@ class MainActivity : AppCompatActivity() {
                     primaryBtn.alpha = 1f
                     if (ok && mode != DshFlow.Mode.INSTALL_ONLY) {
                         applyPhase(Phase.RUNNING)
+                        refreshRollbackCard() // 更新后可能进入临时窗口：刷新回滚卡片
                         openWeb()
                     } else if (ok) {
                         // 仅安装模式（当前主界面不触发，防御性兜底）
@@ -203,7 +219,8 @@ class MainActivity : AppCompatActivity() {
                         toast("启动流程未完成，可点「重试」或查看控制台日志")
                     }
                 }
-            }
+            },
+            forceFullInstall = forceFullInstall
         )
     }
 
@@ -479,6 +496,50 @@ class MainActivity : AppCompatActivity() {
         updateCard.addView(ucCol)
         root.addView(updateCard)
 
+        // ---- 临时更新回滚卡片（仅临时更新窗口内可见） ----
+        rollbackCard = Ui.card(this, radiusDp = 14, background = Ui.SURFACE_CONTAINER_HIGH, elevationDp = 1f).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(8) }
+        }
+        val rcCol = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        rcCol.addView(TextView(this).apply {
+            text = "⏪ 临时更新"
+            textSize = 13f
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            setTextColor(Ui.WARNING)
+        })
+        val rcPrev = DshUpdater.prevVersion(this)
+        val rcCur = DshUpdater.tempVersion(this) ?: DshUpdater.currentVersion(this)
+        rcCol.addView(TextView(this).apply {
+            text = buildString {
+                append("dsh 已临时更新到 v$rcCur，处于回滚保护期")
+                if (rcPrev != null) append("（可回滚到 v$rcPrev）")
+                append("：连续 3 次稳定启动后自动确认；若插件不兼容导致异常，可随时一键回到上一版本。")
+            }
+            textSize = 12f
+            setTextColor(Ui.TEXT_SECONDARY)
+            setPadding(0, dp(6), 0, dp(8))
+        })
+        rcCol.addView(
+            Ui.buttonGrid(
+                this,
+                listOf(
+                    Ui.button(
+                        this,
+                        if (rcPrev != null) "回滚到 v$rcPrev" else "回滚到上一版本",
+                        { confirmRollback() },
+                        filled = false, color = Ui.WARNING
+                    ),
+                    Ui.button(this, "确认此版本", { confirmTempVersion() }, filled = true)
+                ),
+                columns = 2
+            )
+        )
+        rollbackCard.addView(rcCol)
+        rollbackCard.visibility = if (DshUpdater.isTempWindow(this)) View.VISIBLE else View.GONE
+        root.addView(rollbackCard)
+
         // ---- 次级操作网格 ----
         root.addView(LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -580,6 +641,39 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         )
+    }
+
+    /** 回滚到上一版本：置安装 tag=上一版本并执行完整安装+启动（走 DshUpdater 回滚保护）。 */
+    private fun confirmRollback() {
+        val prev = DshUpdater.prevVersion(this) ?: run {
+            toast("暂无可回滚版本")
+            return
+        }
+        if (!guardBusy("rollback")) return
+        AlertDialog.Builder(this)
+            .setTitle("回滚到 v$prev？")
+            .setMessage("将重新安装上一版本 dsh 并重启 web，当前临时版本会被替换。\n\n若插件与临时版本不兼容导致异常，回滚即可恢复。")
+            .setPositiveButton("回滚") { _, _ ->
+                appendMiniLog(">> 开始回滚到 v$prev …")
+                DshUpdater.maybeAutoRollback(this) { }
+                DshFlow.killAllNode(this) { }
+                beginFlow(DshFlow.Mode.INSTALL_AND_START, forceFullInstall = true)
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /** 用户确认当前临时版本稳定：关闭回滚保护。 */
+    private fun confirmTempVersion() {
+        DshUpdater.confirmVersion(this) { l -> appendMiniLog(l) }
+        refreshRollbackCard()
+        toast("已确认此版本，回滚保护关闭")
+    }
+
+    private fun refreshRollbackCard() {
+        if (::rollbackCard.isInitialized) {
+            rollbackCard.visibility = if (DshUpdater.isTempWindow(this)) View.VISIBLE else View.GONE
+        }
     }
 
     private fun guardBusy(action: String): Boolean =
