@@ -136,6 +136,7 @@ class WebViewActivity : AppCompatActivity() {
             override fun onPageFinished(view: WebView?, url: String?) {
                 progressBar.visibility = View.GONE
                 maybeInjectPrompt()
+                injectComposerLayoutFix()
             }
 
             override fun onReceivedError(
@@ -220,6 +221,95 @@ class WebViewActivity : AppCompatActivity() {
                 android.widget.Toast.makeText(this, "指令已复制，请在输入框粘贴", android.widget.Toast.LENGTH_LONG).show()
             }
         }
+    }
+
+    /**
+     * WebUI 输入框下方控件行的布局修复（上游 dsh 的样式问题，本地注入规避）：
+     * 模型名 / 思考强度过长时模型座位变宽，把这一行挤到换行（该行是
+     * flex-wrap:wrap + space-between），左侧控件因此被顶到上一行。
+     * 上游 CSS 中「思考强度」是 flex:none（永不压缩），只有模型名在省略，
+     * 所以光省略模型名压不掉整行宽度。
+     *
+     * 不依赖构建哈希类名（每次发版都会变）：改用结构特征定位——
+     * button[aria-haspopup="menu"] 且有 >=2 个直接子 span（模型名 + 思考强度）。
+     * 注入后由 MutationObserver + resize 自维持，SPA 重渲染后自动重贴。
+     */
+    private fun injectComposerLayoutFix() {
+        val js = """
+            (function(){
+              if (window.__dshComposerFix) return 'skip';
+              window.__dshComposerFix = true;
+
+              function findModelTrigger(){
+                var btns = document.querySelectorAll('button[aria-haspopup="menu"]');
+                var fallback = null;
+                for (var i = 0; i < btns.length; i++) {
+                  var b = btns[i];
+                  var spans = b.querySelectorAll(':scope > span');
+                  if (spans.length < 2) continue;      // 模型名 + 思考强度
+                  var title = b.getAttribute('title') || '';
+                  if (title !== '') return b;           // 模型触发器带 title=模型名
+                  if (!fallback) fallback = b;
+                }
+                return fallback;
+              }
+              function findWrapRow(t){
+                var row = t.parentElement;
+                while (row && row !== document.body) {
+                  var cs = getComputedStyle(row);
+                  if (cs.display === 'flex' && cs.flexWrap === 'wrap') return row;
+                  row = row.parentElement;
+                }
+                return null;
+              }
+              function fix(){
+                var t = findModelTrigger();
+                if (!t) return false;
+                var row = findWrapRow(t);
+                // 去重键带上文案：切换模型/思考强度后文案变化也能重新评估
+                var cap = 'min(190px,36cqw)';
+                var key = cap + '|' + (t.textContent || '');
+                if (t.__dshCap === key && (!row || row.style.flexWrap === 'nowrap')) return true;
+                t.__dshCap = key;
+
+                if (row) {
+                  row.style.flexWrap = 'nowrap';
+                  for (var r = 0; r < row.children.length; r++) {
+                    var c = row.children[r];
+                    if (c.style) { c.style.minWidth = '0'; c.style.flexShrink = '1'; }
+                  }
+                }
+                t.style.maxWidth = cap;
+                t.style.minWidth = '0';
+                t.style.flexShrink = '1';
+                var spans = t.querySelectorAll(':scope > span');
+                for (var i = 0; i < spans.length; i++) {
+                  var s = spans[i];
+                  s.style.minWidth = '0';
+                  s.style.overflow = 'hidden';
+                  s.style.textOverflow = 'ellipsis';
+                  s.style.whiteSpace = 'nowrap';
+                  if (i > 0) s.style.flex = '0 1 auto';
+                }
+                if (spans.length > 1) {
+                  spans[1].style.display = '';
+                  if (t.scrollWidth > t.clientWidth + 2) spans[1].style.display = 'none';
+                }
+                return true;
+              }
+              var timer = null;
+              function schedule(){
+                if (timer) clearTimeout(timer);
+                timer = setTimeout(fix, 60);
+              }
+              fix();
+              setTimeout(fix, 800);
+              new MutationObserver(schedule).observe(document.body, {childList:true, subtree:true});
+              window.addEventListener('resize', schedule);
+              return 'ok';
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(js) { }
     }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
