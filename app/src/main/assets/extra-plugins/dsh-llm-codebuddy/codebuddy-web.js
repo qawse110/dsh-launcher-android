@@ -1,5 +1,5 @@
 import { credentialRef } from "@deepseek-ai/dsh-credentials";
-import { CODEBUDDY_REGIONS, loginCodeBuddy, serializeCodeBuddySession } from "./codebuddy-auth.js";
+import { CODEBUDDY_REGIONS, createCodeBuddyLogin, serializeCodeBuddySession, waitForCodeBuddyLogin } from "./codebuddy-auth.js";
 
 const ROUTE_BY_PROVIDER = {
   "codebuddy-cn": "/dsh-llm-codebuddy/auth",
@@ -80,24 +80,42 @@ export function installCodeBuddyWeb(ctx) {
         if (req.method !== "POST") return json(res, 405, { ok: false, message: "Method not allowed" });
         if (!localPost(req)) return json(res, 403, { ok: false, message: "只允许从本机 DSH 页面登录" });
         try {
-          loginPromises.set(region.provider, (async () => {
-            const session = await loginCodeBuddy(undefined, undefined, region.authBaseUrl);
-            await webCtx.credentials.set(sessionRef, serializeCodeBuddySession(session));
-            await setMode(webCtx.settings, "token", region);
-          })().finally(() => {
-            loginPromises.delete(region.provider);
-          }));
-          await loginPromises.get(region.provider);
-          json(res, 200, { ok: true, mode: "token", authenticated: true });
+          let entry = loginPromises.get(region.provider);
+          if (entry?.settled) loginPromises.delete(region.provider);
+          entry = loginPromises.get(region.provider);
+          if (!entry) {
+            const state = await createCodeBuddyLogin(region.authBaseUrl);
+            entry = { state, authUrl: state.authUrl, settled: false, error: undefined };
+            loginPromises.set(region.provider, entry);
+            entry.promise = (async () => {
+              const session = await waitForCodeBuddyLogin(entry.state, undefined, region.authBaseUrl);
+              await webCtx.credentials.set(sessionRef, serializeCodeBuddySession(session));
+              await setMode(webCtx.settings, "token", region);
+            })().then(
+              () => { entry.settled = true; },
+              (error) => { entry.settled = true; entry.error = error instanceof Error ? error.message : "CodeBuddy 登录失败"; },
+            );
+          }
+          // 非阻塞：立即把登录链接交还给浏览器端，由浏览器自行打开登录页。
+          json(res, 200, { ok: true, mode: "token", authenticated: false, pending: true, authUrl: entry.authUrl });
         } catch (error) {
           json(res, 500, { ok: false, message: error instanceof Error ? error.message : "CodeBuddy 登录失败" });
         }
+      };
+      const loginStatus = async (_req, res) => {
+        const entry = loginPromises.get(region.provider);
+        const state = await currentState();
+        if (!entry) return json(res, 200, { ...state, pending: false });
+        if (entry.settled) loginPromises.delete(region.provider);
+        if (entry.settled && entry.error) return json(res, 200, { ...state, pending: false, error: entry.error });
+        json(res, 200, { ...state, pending: !entry.settled });
       };
       registrations.push(
         webCtx.webServer.register({ kind: "exact", path: `${route}/status`, handler: status }),
         webCtx.webServer.register({ kind: "exact", path: `${route}/api-key`, handler: apiKey }),
         webCtx.webServer.register({ kind: "exact", path: `${route}/token`, handler: token }),
         webCtx.webServer.register({ kind: "exact", path: `${route}/login`, handler: login }),
+        webCtx.webServer.register({ kind: "exact", path: `${route}/login-status`, handler: loginStatus }),
       );
     }
 

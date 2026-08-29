@@ -124,20 +124,20 @@ function normalizeAccount(account) {
   };
 }
 
-export async function loginCodeBuddy(onAuthUrl, signal, baseUrl = DEFAULT_AUTH_BASE_URL) {
+/** 创建一次网页登录会话：返回 {state, authUrl}。打开浏览器与轮询等待由调用方分离处理，
+* WebUI 场景由浏览器端自行打开登录页（服务端进程在 Android 等环境拉不起浏览器）。 */
+export async function createCodeBuddyLogin(baseUrl = DEFAULT_AUTH_BASE_URL) {
   const state = await request("/auth/state?platform=CLI", {
     method: "POST",
     headers: { ...REQUEST_HEADERS, ...NO_ACCOUNT_HEADERS },
     body: "{}",
-    signal,
   }, "创建 CodeBuddy 登录会话", baseUrl);
   if (!state?.state || !state?.authUrl) throw new Error("CodeBuddy 登录接口没有返回登录地址");
-  try {
-    await openBrowser(state.authUrl);
-    onAuthUrl?.(state.authUrl, true);
-  } catch {
-    onAuthUrl?.(state.authUrl, false);
-  }
+  return state;
+}
+
+/** 拿 createCodeBuddyLogin 返回的 state 轮询等待登录完成，返回完整会话。 */
+export async function waitForCodeBuddyLogin(state, signal, baseUrl = DEFAULT_AUTH_BASE_URL) {
   const auth = calculateExpiresAt(await poll(
     `/auth/token?state=${encodeURIComponent(state.state)}`,
     NO_ACCOUNT_HEADERS,
@@ -156,6 +156,17 @@ export async function loginCodeBuddy(onAuthUrl, signal, baseUrl = DEFAULT_AUTH_B
     baseUrl,
   );
   return { auth, account: normalizeAccount(account) };
+}
+
+export async function loginCodeBuddy(onAuthUrl, signal, baseUrl = DEFAULT_AUTH_BASE_URL) {
+  const state = await createCodeBuddyLogin(baseUrl);
+  try {
+    await openBrowser(state.authUrl);
+    onAuthUrl?.(state.authUrl, true);
+  } catch {
+    onAuthUrl?.(state.authUrl, false);
+  }
+  return waitForCodeBuddyLogin(state, signal, baseUrl);
 }
 
 export async function refreshCodeBuddySession(session, signal, baseUrl = DEFAULT_AUTH_BASE_URL) {

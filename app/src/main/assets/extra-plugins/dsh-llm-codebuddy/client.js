@@ -106,17 +106,62 @@ window.__ModuleLoader__.load({
       });
       tokenButton.addEventListener("click", async () => {
         setBusy(true);
-        tokenButton.textContent = "等待浏览器登录…";
-        message.textContent = "请在浏览器中完成 CodeBuddy 登录";
-        try {
-          const path = current.mode === "api-key" && current.authenticated ? "token" : "login";
-          render(await request(route, path));
-        } catch (error) {
-          message.textContent = error instanceof Error ? error.message : "登录失败";
-          message.style.color = "var(--dsw-text-danger, #c62828)";
-        } finally {
+        const danger = "var(--dsw-text-danger, #c62828)";
+        const success = "var(--dsw-text-success, #2e7d32)";
+        // 已有令牌：仅切换认证模式，无需开浏览器。
+        if (current.authenticated) {
+          try {
+            render(await request(route, "token"));
+          } catch (error) {
+            message.textContent = error instanceof Error ? error.message : "切换失败";
+            message.style.color = danger;
+          } finally {
+            tokenButton.textContent = "令牌登录";
+            setBusy(false);
+          }
+          return;
+        }
+        tokenButton.textContent = "等待登录…";
+        message.textContent = "正在创建登录会话…";
+        message.style.color = "";
+        let pollTimer;
+        const finish = (ok, text) => {
+          clearInterval(pollTimer);
+          message.textContent = text;
+          message.style.color = ok ? success : danger;
           tokenButton.textContent = "令牌登录";
           setBusy(false);
+        };
+        try {
+          const started = await request(route, "login");
+          const authUrl = started.authUrl;
+          // WebUI 就运行在本机浏览器里：由浏览器端打开登录页（服务端进程拉不起浏览器）。
+          let win = null;
+          try { win = window.open(authUrl, "_blank", "noopener"); } catch { /* 弹窗被拦截时走链接兜底 */ }
+          if (win) message.textContent = "已打开登录页，请在浏览器中完成 CodeBuddy 登录…";
+          else {
+            message.replaceChildren();
+            const link = document.createElement("a");
+            link.href = authUrl;
+            link.target = "_blank";
+            link.rel = "noopener";
+            link.textContent = "点此打开 CodeBuddy 登录页";
+            message.append(link, document.createTextNode("（或复制链接：" + authUrl + "）"));
+          }
+          const deadline = Date.now() + 10 * 60_000;
+          pollTimer = setInterval(async () => {
+            try {
+              const s = await fetch(`${route}/login-status`, { cache: "no-store" }).then((r) => r.json());
+              if (s.error) return finish(false, s.error);
+              if (s.authenticated && !s.pending) {
+                render(s);
+                return finish(true, "令牌已登录");
+              }
+            } catch { /* 瞬时网络抖动，继续轮询 */ }
+            if (Date.now() > deadline) finish(false, "等待登录超时，请重试");
+          }, 2000);
+        } catch (error) {
+          finish(false, error instanceof Error ? error.message : "登录失败");
         }
       });
       fetch(`${route}/status`, { cache: "no-store" })
