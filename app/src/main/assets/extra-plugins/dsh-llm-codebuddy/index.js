@@ -275,16 +275,11 @@ export function apply(ctx, config) {
     });
   }
 
-  const effectiveConfig = () => {
-    const raw = current() ?? {};
-    return {
-      ...raw,
-      providers: {
-        ...Object.fromEntries(Object.values(CODEBUDDY_REGIONS).map((region) => [region.provider, { apiKeyEnv: region.apiKeyEnv }])),
-        ...(raw.providers ?? {}),
-      },
-    };
-  };
+  // 共存模式：不注入默认 Provider。目录条目（见 directoryEntries）始终保留，
+  // 使两个 CodeBuddy Provider 在「添加提供方」下拉框里始终可选；但只有用户
+  // 真正添加过（配置里存在条目）才注册适配器路由——删除配置后模型选择器里
+  // 不再出现该 Provider，需要时可从下拉框重新添加。
+  const effectiveConfig = () => current() ?? {};
 
   const regionProfile = (state) => {
     if (state.memoRaw === current() && state.memoGeneration === state.generation && state.memoized) return state.memoized;
@@ -412,13 +407,27 @@ export function apply(ctx, config) {
   ];
 
   let directory = ctx.llm.registerConfigurableProviders(directoryEntries());
-  let registration = ctx.llm.registerAdapter([...profiles().keys()], adapter);
+  // 两个 Provider 都没配置时不能注册空路由（内置 llm-pi-ai 对空路由同样是延后注册），
+  // 这里延迟到首次出现路由时再创建注册句柄。
+  let registration;
+  const syncRegistration = () => {
+    const routes = [...profiles().keys()];
+    if (!registration) {
+      if (routes.length === 0) return;
+      registration = ctx.llm.registerAdapter(routes, adapter);
+      return;
+    }
+    registration.replace(routes);
+  };
+  syncRegistration();
 
   ctx.llm.registerModelDiscovery(NS, async (request) => {
     if (Object.hasOwn(CODEBUDDY_REGIONS, request.provider)) {
       const region = CODEBUDDY_REGIONS[request.provider];
       const state = states.get(request.provider);
-      const profile = profiles().get(request.provider);
+      // 未配置（或刚删除）的 Provider 仍可从目录条目发起发现，此时回退到区域默认
+      // 凭据引用，避免命中 undefined profile 导致 TypeError。
+      const profile = profiles().get(request.provider) ?? { apiKeyEnv: region.apiKeyEnv };
       const credential = request.apiKey
         ? { value: request.apiKey, kind: "api-key", ref: region.apiKeyEnv }
         : await resolveCredential(request.provider, profile);
@@ -435,16 +444,15 @@ export function apply(ctx, config) {
   });
 
   // 共存模式：CodeBuddy 配置存于独立命名空间 llm-codebuddy（不复用 llm-pi-ai，
-  // 避免与内置适配器竞争同一命名空间）。默认在 base 层声明两个 CodeBuddy Provider，
-  // 使其出现在 WebUI「添加提供方」下拉框；选中后仅持久化凭据引用。
+  // 避免与内置适配器竞争同一命名空间）。目录条目恒定注册，使两个 Provider 始终
+  // 可从 WebUI「添加提供方」下拉框选取；适配器路由只覆盖用户实际添加过的 Provider。
   installSettingsSection(ctx, NS, Config, config ?? { providers: {} }, {
     setSource(source) {
       current = source;
     },
     onChange() {
       for (const state of states.values()) state.memoRaw = undefined;
-      const providers = profiles();
-      registration.replace([...providers.keys()]);
+      syncRegistration();
       directory.replace(directoryEntries());
     },
   });
