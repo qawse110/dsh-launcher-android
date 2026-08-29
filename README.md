@@ -6,7 +6,7 @@
 
 **不需要 Termux、不需要外部 Node**；联网仅用于 npm 首次安装与后续更新。
 
-- 包名 `com.dsh.launcher` · 当前版本 **v4.10.0**（versionCode 31）
+- 包名 `com.dsh.launcher` · 当前版本 **v4.10.2**（versionCode 33）
 - 架构：AGP 9.0 / Kotlin / Gradle 8.x · minSdk 24 / targetSdk 28 / compileSdk 35
 
 ## 目录
