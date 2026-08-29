@@ -63,6 +63,7 @@ const BUILTIN_PLUGINS = [
   'dsh-oh-we-need',
   'dsh-status-bridge',
   'dsh-android-links',
+  'dsh-llm-codebuddy',
 ];
 const BUILTIN_NAMES = new Set([
   '@dsh-external/dsh-mobile-nav',
@@ -73,6 +74,7 @@ const BUILTIN_NAMES = new Set([
   '@dsh-external/dsh-oh-we-need',
   '@dsh-external/dsh-status-bridge',
   '@dsh-external/dsh-android-links',
+  'dsh-llm-codebuddy',
 ]);
 const BUILTIN_IDS = new Set([
   'dsh-mobile-nav',
@@ -83,6 +85,7 @@ const BUILTIN_IDS = new Set([
   'dsh-oh-we-need',
   'dsh-status-bridge',
   'dsh-android-links',
+  'llm-codebuddy',
 ]);
 function log(m) {
   const l = `${new Date().toISOString()} [install] ${m}`;

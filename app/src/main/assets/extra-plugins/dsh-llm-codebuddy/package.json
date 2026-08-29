@@ -1,0 +1,49 @@
+{
+  "name": "dsh-llm-codebuddy",
+  "version": "1.4.0",
+  "description": "CodeBuddy 中国区/国际版 LLM Provider（共存模式，不接管 llm-pi-ai）",
+  "author": "Axiaohungry",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "codebuddy",
+    "workbuddy",
+    "llm",
+    "provider"
+  ],
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "codebuddy-auth.js",
+    "codebuddy-web.js",
+    "client.js",
+    "cordis.patch.yml",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "client": {
+      "inject": [],
+      "platform": "web"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-credentials": ">=0.1.0-rc.6 <0.2",
+    "@deepseek-ai/dsh-launch-environment": ">=0.1.0-rc.6 <0.2",
+    "@deepseek-ai/dsh-llm": ">=0.1.0-rc.6 <0.2",
+    "@deepseek-ai/dsh-llm-pi-ai": ">=0.1.0-rc.6 <0.2",
+    "@deepseek-ai/dsh-settings": ">=0.1.0-rc.6 <0.2",
+    "@earendil-works/pi-ai": "0.82.x"
+  },
+  "license": "MIT"
+}

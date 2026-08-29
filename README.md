@@ -34,7 +34,7 @@
 | **界面** | 内嵌 WebView（Chromium）+ 任意浏览器访问同一地址 |
 | **语音** | 双 TTS：系统引擎（离线）/ Edge 在线语音（微软神经音色，零依赖实现） |
 | **悬浮窗** | 状态条 + 桌宠动画双样式；普通服务 + 无障碍双通道保活 |
-| **插件化适配** | 能由插件实现的功能一律下沉为独立内置插件（8 个），脚本补丁降至最低 |
+| **插件化适配** | 能由插件实现的功能一律下沉为独立内置插件（9 个），脚本补丁降至最低 |
 | **环境** | apt/dpkg 原生可用；Termux 环境自动准备（幂等） |
 
 ## 架构：最小脚本干预，能力插件化
@@ -85,6 +85,7 @@ files/.dsh/profiles/web ──cordis 装配──▶ dsh web @ 127.0.0.1:3080 �
 | `dsh-oh-we-need` | 推理风格 Skill（不再注入系统提示词） |
 | `dsh-status-bridge` | dsh 运行状态桥接到悬浮窗/通知（本地 HTTP :3190） |
 | `dsh-android-links` | 在 dsh HOME 创建 `sdcard → /storage/emulated/0` 符号链接，让工作区目录浏览器直达 SD 卡（**零 dsh 文件改动**，替代旧源码补丁） |
+| `dsh-llm-codebuddy` | CodeBuddy 中国区/国际版 LLM Provider（**共存模式**：独立命名空间 `llm-codebuddy`，只新增 Provider，不禁用 `llm-pi-ai`，现有自定义 Provider 不受影响；支持 WorkBuddy API Key 与网页令牌登录，DSH 依赖走 peerDependencies 复用宿主实例） |
 
 ## 构建
 
