@@ -468,6 +468,33 @@ try {
 } catch (e) { log('WARN index shim: ' + e.message); }
 
 try {
+  // CodeBuddy 共存 Provider 的编辑布局：settings-models 客户端按命名空间白名单
+  // 选择 Provider 编辑器布局（layoutOf：llm-deepseek→deepseek、llm-pi-ai→pi-ai，
+  // 其余→unknown）。unknown 布局只渲染“高级提示”且保存按钮永久禁用，卡片无法
+  // 填写/保存。dsh-llm-codebuddy 内置插件以独立命名空间 llm-codebuddy 与内置
+  // llm-pi-ai 共存（互不抢占 settings 注册），必须让客户端把它按 pi-ai 布局渲染。
+  // 必须留在引导期脚本里：layoutOf 是编译产物内的闭包函数，client 插件通道改不到。
+  const smClient = findPkg('@deepseek-ai/dsh-client-ui-settings-models', 'lib/client.js');
+  if (smClient && existsSync(smClient)) {
+    let smSrc = readFileSync(smClient, 'utf8');
+    if (smSrc.includes('llm-codebuddy") return "pi-ai"')) {
+      log('settings-models codebuddy layout already patched');
+    } else if (smSrc.includes('if (ns === "llm-pi-ai") return "pi-ai";')) {
+      smSrc = smSrc.replace(
+        'if (ns === "llm-pi-ai") return "pi-ai";',
+        'if (ns === "llm-pi-ai") return "pi-ai";\n\t\t\tif (ns === "llm-codebuddy") return "pi-ai";'
+      );
+      writeFileSync(smClient, smSrc);
+      log('settings-models codebuddy layout patched (llm-codebuddy -> pi-ai)');
+    } else {
+      log('WARN settings-models layoutOf pattern not found, skip (dsh 升级后需核对)');
+    }
+  } else {
+    log('settings-models client not found, skip codebuddy layout patch');
+  }
+} catch (e) { log('WARN codebuddy layout patch: ' + e.message); }
+
+try {
   // @vscode/ripgrep：Android 没有 @vscode/ripgrep-android-arm64 平台包，
   // 导致 dsh-tool-fs-search 的 glob/grep 报 “ripgrep launch failed”。
   // 这里把解析器改为优先使用 Termux `pkg install -y ripgrep` 安装的原生 rg，
