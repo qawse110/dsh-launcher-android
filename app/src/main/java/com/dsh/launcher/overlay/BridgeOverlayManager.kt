@@ -421,6 +421,9 @@ class BridgeOverlayManager(
             if (pendingRowCount >= 2) petView?.play(target, "$status|${event ?: ""}")
         }
         petSpeaker.speakForStatus(status, event)
+        // TTS 朗读最近输出与气泡显示无关：在气泡分支之外无条件调用，
+        // 否则关闭「显示气泡」后 TTS 朗读会一并失效
+        petSpeaker.speakContent(lastText, status, event)
         petBubble?.let { bubble ->
             val key = "$status|${event ?: ""}"
             if (transientText != null) {
@@ -451,7 +454,6 @@ class BridgeOverlayManager(
                     bubble.maxHeight = Int.MAX_VALUE
                     bubble.text = bubbleText
                     bubble.visibility = View.VISIBLE
-                    petSpeaker.speakContent(lastText, status, event)
                     if (isFinished) scheduleCompletionClear(key, bubble)
                 }
                 else -> {

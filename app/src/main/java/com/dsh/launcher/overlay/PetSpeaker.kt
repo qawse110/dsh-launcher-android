@@ -20,11 +20,14 @@ internal class PetSpeaker(
     private var tts: TextToSpeech? = null
     private var ttsReady = false
     private var ttsReleased = false
-    private var pendingSpeak: String? = null
+    /** 懒初始化期间积压的待播句（按序补播；旧实现是单值，首轮多句只剩最后一句）。 */
+    private val pendingQueue = ArrayDeque<String>()
     private var edgeTtsInited = false
     private var lastSpokenKey: String? = null
     private var lastSpokeAt = 0L
     private var spokenLen = 0
+    /** 上一次实际朗读过的全文：用于区分「同消息续写」与「换新消息」。 */
+    private var prevRead: String? = null
 
     private val sentenceEndRe = Regex("[。！？!?…；;]|\\n")
     private val softPuncts = charArrayOf('，', ',', '、', '：', ':', ' ')
@@ -52,13 +55,20 @@ internal class PetSpeaker(
      * 正文增量朗读：只读「上次读到之后」的新增完整句。
      * - 句界：。！？!?…；; 换行；凑齐一句即入队（QUEUE_ADD 接续）；
      * - 160 字内无句界按软标点兜底，硬切上限 160；
-     * - 新消息变短或 turn/start 重置游标；完成/失败不追加正文。
+     * - 换新消息（当前文本不以已读内容开头）或 turn/start/user/message 重置游标；
+     *   完成/失败不追加正文。
      */
     fun speakContent(text: String?, status: String, event: String?) {
         if (!prefs.petTts() || ttsReleased) return
         if (text.isNullOrEmpty()) return
-        if (event == "turn/start" || event == "user/message") spokenLen = 0
-        if (text.length < spokenLen) spokenLen = 0
+        if (event == "turn/start" || event == "user/message") {
+            spokenLen = 0
+            prevRead = null
+        } else if (prevRead != null && !text.startsWith(prevRead)) {
+            // 换新消息：旧游标可能落在新文本中间（尤其新消息更长时），跳读开头——归零重读
+            spokenLen = 0
+            prevRead = null
+        }
         if (status != "running" || event != "assistant/message") return
         if (spokenLen >= text.length) return
 
@@ -84,7 +94,10 @@ internal class PetSpeaker(
             start += utterance.length
             advanced = true
         }
-        if (advanced) spokenLen = start
+        if (advanced) {
+            spokenLen = start
+            prevRead = text
+        }
     }
 
     /**
@@ -109,27 +122,28 @@ internal class PetSpeaker(
     private fun speakSystem(text: String, append: Boolean) {
         if (ttsReleased || text.isBlank()) return
         if (tts == null) {
-            pendingSpeak = text
+            pendingQueue.addLast(text)
             tts = TextToSpeech(context) { status ->
                 ttsReady = status == TextToSpeech.SUCCESS
                 if (ttsReady) {
                     val ok = (tts?.isLanguageAvailable(Locale.CHINA) ?: -1) >= TextToSpeech.LANG_AVAILABLE
                     tts?.setLanguage(if (ok) Locale.CHINA else Locale.getDefault())
-                }
-                // 初始化期间积压的最后一句话在此刻补播
-                val p = pendingSpeak
-                pendingSpeak = null
-                if (p != null && ttsReady) {
-                    try {
-                        tts?.speak(p, TextToSpeech.QUEUE_FLUSH, null, "dsh_pet")
-                    } catch (_: Exception) {
+                    // 初始化期间积压的句子按序补播（不再只补最后一局）
+                    while (pendingQueue.isNotEmpty()) {
+                        val p = pendingQueue.removeFirst()
+                        try {
+                            tts?.speak(p, TextToSpeech.QUEUE_ADD, null, "dsh_pet")
+                        } catch (_: Exception) {
+                        }
                     }
+                } else {
+                    pendingQueue.clear()
                 }
             }
             return
         }
         if (!ttsReady) {
-            pendingSpeak = text
+            pendingQueue.addLast(text)
             return
         }
         try {
@@ -148,6 +162,7 @@ internal class PetSpeaker(
     /** 释放 TTS 与 Edge 引擎资源（释放后不再重建）。 */
     fun release() {
         ttsReleased = true
+        pendingQueue.clear()
         EdgeTts.shutdown()
         tts?.shutdown()
         tts = null
