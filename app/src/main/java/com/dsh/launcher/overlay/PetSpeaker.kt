@@ -61,10 +61,11 @@ internal class PetSpeaker(
     fun speakContent(text: String?, status: String, event: String?) {
         if (!prefs.petTts() || ttsReleased) return
         if (text.isNullOrEmpty()) return
+        val prev = prevRead // 局部副本：避免可变属性导致智能转换失败
         if (event == "turn/start" || event == "user/message") {
             spokenLen = 0
             prevRead = null
-        } else if (prevRead != null && !text.startsWith(prevRead)) {
+        } else if (prev != null && !text.startsWith(prev)) {
             // 换新消息：旧游标可能落在新文本中间（尤其新消息更长时），跳读开头——归零重读
             spokenLen = 0
             prevRead = null
