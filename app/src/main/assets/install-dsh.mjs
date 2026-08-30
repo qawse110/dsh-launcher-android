@@ -471,23 +471,63 @@ function dshPlugin(args) {
   return run(NODE_BIN, [dshCli(), 'plugin', '--profile', DSH_PROFILE, ...args], { env: envBase(), timeoutMs: PLUGIN_TIMEOUT_MS });
 }
 
+function pkgVersion(dir) {
+  try { return JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')).version || ''; } catch { return ''; }
+}
+
+/** profile package.json 的 dependencies（插件装配登记处：name -> link:路径）。 */
+function profileDeps() {
+  try {
+    const pkg = JSON.parse(readFileSync(join(FILES_DIR, '.dsh/profiles', DSH_PROFILE, 'package.json'), 'utf8'));
+    return pkg.dependencies || {};
+  } catch { return {}; }
+}
+
+/**
+ * 把 APK 内置的 extra-plugins 源同步到 plugins 目录：以「版本@APK版本」为签名，
+ * 签名一致则跳过；APK 升级或插件版本变化（哪怕没 bump version）都整目录替换——
+ * 修复旧逻辑「目标存在即永不更新」导致 APK 升级后内置插件停留在旧版本的问题。
+ */
+const EXTRA_SYNC_MARKER = join(FILES_DIR, '.extra-plugins-synced.json');
+function readSyncMarker() {
+  try { return JSON.parse(readFileSync(EXTRA_SYNC_MARKER, 'utf8')); } catch { return {}; }
+}
+function syncExtraPlugin(dir, dest) {
+  const src = join(EXTRA_PLUGINS_SRC, dir);
+  if (!existsSync(join(src, 'package.json'))) return false;
+  const srcVer = pkgVersion(src);
+  const sig = srcVer + '@apk:' + (DSH_APK_VER || '0');
+  const markers = readSyncMarker();
+  if (markers[dir] === sig && existsSync(join(dest, 'package.json'))) return false;
+  const dstVer = pkgVersion(dest);
+  try {
+    rmSync(dest, { recursive: true, force: true });
+    cpSync(src, dest, { recursive: true, force: true });
+    markers[dir] = sig;
+    try { writeFileSync(EXTRA_SYNC_MARKER, JSON.stringify(markers)); } catch {}
+    log(`extra plugin ${dir} synced: ${dstVer || 'absent'} -> ${srcVer} (apk ${DSH_APK_VER || '0'})`);
+    return true;
+  } catch (e) {
+    log(`WARN sync extra plugin ${dir}: ${e.message}`);
+    return false;
+  }
+}
+
 function addLocalPlugin(dir) {
   const p = join(PLUGINS_DIR, dir);
+  // 1) APK 内置源同步（版本变化才覆盖）
+  syncExtraPlugin(dir, p);
   if (!existsSync(join(p, 'package.json'))) {
-    // 新内置插件可能以源码形式随 APK 放在 extra-plugins/，首次安装时复制到 plugins 目录。
-    const src = join(EXTRA_PLUGINS_SRC, dir);
-    if (existsSync(join(src, 'package.json'))) {
-      log(`copy extra plugin ${dir} -> plugins`);
-      try {
-        cpSync(src, p, { recursive: true, force: true });
-      } catch (e) {
-        log(`WARN copy extra plugin ${dir}: ${e.message}`);
-        return false;
-      }
-    } else {
-      log(`skip builtin plugin ${dir}: not bundled`);
-      return false;
-    }
+    log(`skip builtin plugin ${dir}: not bundled`);
+    return false;
+  }
+  // 2) 幂等跳过：profile 已按 link: 登记同一路径 → 无需再跑 dsh plugin add
+  //    （每次安装 9 个插件逐个起 CLI 很慢；profile 重置后登记消失会自动重装）
+  const link = 'link:' + p;
+  const deps = profileDeps();
+  if (Object.values(deps).some((v) => v === link)) {
+    log(`plugin ${dir} already wired, skip add`);
+    return true;
   }
   log(`dsh plugin add ${dir}`);
   return dshPlugin(['add', p]);
@@ -541,7 +581,11 @@ function copyPresets() {
 }
 
 function installBuiltins() {
-  for (const d of BUILTIN_PLUGINS) addLocalPlugin(d);
+  let ok = 0, fail = 0;
+  for (const d of BUILTIN_PLUGINS) {
+    if (addLocalPlugin(d)) ok++; else fail++;
+  }
+  log(`builtin plugins assembled: ${ok} ok, ${fail} failed / ${BUILTIN_PLUGINS.length} total`);
   copyPresets();
   cleanBuiltinPatch();
 }
