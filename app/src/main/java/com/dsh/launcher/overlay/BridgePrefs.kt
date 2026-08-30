@@ -24,6 +24,12 @@ class BridgePrefs(private val context: Context) {
     fun showPetName(): Boolean = prefs().getBoolean("pet_show_name", true)
     fun showAmbientBubble(): Boolean = prefs().getBoolean("pet_ambient_bubble", true)
 
+    /**
+     * 任务完成后「已完成」气泡的停留时长（毫秒）；<=0 表示不自动收起，
+     * 一直显示到状态变化为止。
+     */
+    fun petCompletionHoldMs(): Long = prefs().getLong("pet_completion_hold_ms", 30_000L)
+
     fun petHeightDp(): Int = when (prefs().getString("pet_size", "medium")) {
         "small" -> 88
         "large" -> 160

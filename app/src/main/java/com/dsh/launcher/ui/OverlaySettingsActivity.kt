@@ -144,6 +144,32 @@ class OverlaySettingsActivity : AppCompatActivity() {
                 addSwitch(this, "闲时主动冒泡", "dsh 空闲时桌宠每隔几分钟随机说一句台词（可关闭），说时会朗读", "pet_ambient_bubble", true)
                 addSwitch(this, "拖拽抛落", "松手后桌宠沿抛出方向做抛物线坠落，落地带小弹跳（可关闭改为普通拖动定位）", "pet_fall", true)
 
+                // 任务完成气泡停留时长（单选 Chip 组；<=0 = 不自动收起）
+                val holdOptions = linkedMapOf(
+                    10_000L to "10秒",
+                    30_000L to "30秒",
+                    60_000L to "1分钟",
+                    120_000L to "2分钟",
+                    0L to "不收起"
+                )
+                val holdCur = prefs().getLong("pet_completion_hold_ms", 30_000L)
+                addView(Ui.optionChips(
+                    this@OverlaySettingsActivity,
+                    holdOptions.map { (ms, label) -> label to ms },
+                    holdCur
+                ) { ms ->
+                    prefs().edit().putLong("pet_completion_hold_ms", ms).apply()
+                }, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ))
+                addView(TextView(this@OverlaySettingsActivity).apply {
+                    text = "任务完成后「已完成」气泡的停留时长；「不收起」则一直显示到新任务开始。"
+                    textSize = 11f
+                    setTextColor(Ui.TEXT_MUTED)
+                    setPadding(0, dp(4), 0, dp(4))
+                })
+
                 val pets = CodexPetStore.scanPets(this@OverlaySettingsActivity)
                 val selected = prefs().getString("pet_id", CodexPetStore.DEFAULT_PET_ID)
                 for (pet in pets) {

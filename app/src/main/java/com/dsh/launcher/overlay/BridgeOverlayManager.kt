@@ -96,11 +96,10 @@ class BridgeOverlayManager(
     private var transientKey: String? = null
     private var transientRunnable: Runnable? = null
 
-    // 任务完成气泡自动收起：显示 completionClearDelayMs 后清除「已完成」状态，
+    // 任务完成气泡自动收起：显示 bp.petCompletionHoldMs() 后清除「已完成」状态，
     // 避免气泡一直停留在完成态；状态变化（新任务/空闲）后重置，下次完成再显示
     private var completionClearKey: String? = null
     private var completionClearRunnable: Runnable? = null
-    private val completionClearDelayMs = 10_000L
 
     // 互动与闲时行为（参考 codex-pet-live 的 patpat / 主动气泡模型）
     // 连点爆发检测：每次点击即时挥手，静默 tapSettleMs 后按爆发内总点击数一次性分发。
@@ -471,10 +470,15 @@ class BridgeOverlayManager(
         }
     }
 
-    /** 任务完成后延时自动收起完成气泡；期间用户展开完整回复（transient 非空）不打扰。 */
+    /**
+     * 任务完成后延时自动收起完成气泡（时长可在设置页调，<=0 表示不自动收起）；
+     * 期间用户展开完整回复（transient 非空）不打扰。
+     */
     private fun scheduleCompletionClear(key: String, bubble: TextView) {
         completionClearKey = key
         completionClearRunnable?.let { handler.removeCallbacks(it) }
+        val holdMs = bp.petCompletionHoldMs()
+        if (holdMs <= 0L) return // 不自动收起：显示到状态变化为止
         val r = Runnable {
             completionClearRunnable = null
             if (completionClearKey == key && transientText == null) {
@@ -484,7 +488,7 @@ class BridgeOverlayManager(
             }
         }
         completionClearRunnable = r
-        handler.postDelayed(r, completionClearDelayMs)
+        handler.postDelayed(r, holdMs)
     }
 
     private fun buildPetBubbleText(status: String, text: String, event: String?, name: String): String {
