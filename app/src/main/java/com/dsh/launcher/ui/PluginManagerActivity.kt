@@ -459,17 +459,28 @@ class PluginManagerActivity : AppCompatActivity() {
             orientation = LinearLayout.HORIZONTAL
             setPadding(0, dp(10), 0, 0)
         }
+        fun addBtn(b: View, hasRightMargin: Boolean) {
+            btnRow.addView(b, LinearLayout.LayoutParams(0, dp(44), 1f).apply {
+                if (hasRightMargin) rightMargin = dp(6)
+            })
+        }
         if (issues.isNotEmpty()) {
+            // 异常态三钮：一键重置修复（主） / 重新装配 / 重启服务
             resetBtn = Ui.button(this, "⚡ 一键重置修复", { resetBuiltins() }, filled = true)
             wireBtn = Ui.button(this, "重新装配", { rewireBuiltins() }, filled = false)
+            restartBtn = Ui.button(this, "重启服务", { restartFlow() }, filled = false)
+            addBtn(resetBtn, true)
+            addBtn(wireBtn, true)
+            addBtn(restartBtn, false)
         } else {
-            resetBtn = Ui.button(this, "重新装配", { rewireBuiltins() }, filled = false)
+            // 正常态两钮：旧实现把 resetBtn 又赋成了重复的「重新装配」且无条件加入行内，
+            // 导致页面上出现两个功能相同的「重新装配」；此处不再创建 resetBtn
+            // （setBusy 已按 isInitialized 逐个判空，lateinit 未初始化安全）
             wireBtn = Ui.button(this, "⚡ 重新装配", { rewireBuiltins() }, filled = true)
+            restartBtn = Ui.button(this, "重启服务", { restartFlow() }, filled = false)
+            addBtn(wireBtn, true)
+            addBtn(restartBtn, false)
         }
-        restartBtn = Ui.button(this, "重启服务", { restartFlow() }, filled = false)
-        btnRow.addView(resetBtn, LinearLayout.LayoutParams(0, dp(44), 1f).apply { rightMargin = dp(6) })
-        btnRow.addView(wireBtn, LinearLayout.LayoutParams(0, dp(44), 1f).apply { rightMargin = dp(6) })
-        btnRow.addView(restartBtn, LinearLayout.LayoutParams(0, dp(44), 1f))
         col.addView(btnRow, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ))
