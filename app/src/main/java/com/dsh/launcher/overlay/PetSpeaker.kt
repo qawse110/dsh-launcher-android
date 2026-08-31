@@ -32,23 +32,37 @@ internal class PetSpeaker(
     private val sentenceEndRe = Regex("[。！？!?…；;]|\\n")
     private val softPuncts = charArrayOf('，', ',', '、', '：', ':', ' ')
 
-    /** 状态转折固定台词（4 秒节流；同一 key 不重复播）。 */
+    /**
+     * 状态转折固定台词（4 秒节流；同一 key 不重复播）。
+     *
+     * flush 策略按语义分流（关键修复）：正文句子是 append 入队的，而朗读游标已推进、
+     * 被冲掉的句子不会重读——所以任何「无差别 flush」都等于把正文整段静音。
+     * 只允许在「积压内容已过时」的时机 flush：
+     *  - turn/start：上一条消息的遗留队列作废（游标同步归零）→ flush；
+     *  - failed：错误提示优先于积压正文 → flush；
+     *  - tool/call：不打断正文，且正文朗读中（spokenLen>0）直接免打扰；
+     *  - finished：排在积压正文之后播，让尾巴读完再报完成。
+     */
     fun speakForStatus(status: String, event: String?) {
         val key = "$status|${event ?: ""}"
         if (key == lastSpokenKey) return
         lastSpokenKey = key
         if (SystemClock.uptimeMillis() - lastSpokeAt < 4000L) return
-        val phrase = when {
-            status == "finished" -> "任务完成，太棒了！"
-            status == "failed" -> "出错了，快打开 Web 看看吧"
-            status == "running" && event == "tool/call" -> "正在调用工具，稍等一下"
-            status == "running" && event == "turn/start" -> "收到新任务，开始干活！"
-            else -> null
+        val phrase: String
+        val flush: Boolean
+        when {
+            status == "finished" -> { phrase = "任务完成，太棒了！"; flush = false }
+            status == "failed" -> { phrase = "出错了，快打开 Web 看看吧"; flush = true }
+            status == "running" && event == "tool/call" -> {
+                // 正文朗读中报「正在调用工具」纯属打断：跳过（key 已记录，不重复触发）
+                if (spokenLen > 0) return
+                phrase = "正在调用工具，稍等一下"; flush = false
+            }
+            status == "running" && event == "turn/start" -> { phrase = "收到新任务，开始干活！"; flush = true }
+            else -> return
         }
-        if (phrase != null) {
-            lastSpokeAt = SystemClock.uptimeMillis()
-            speak(phrase)
-        }
+        lastSpokeAt = SystemClock.uptimeMillis()
+        speak(phrase, append = !flush)
     }
 
     /**

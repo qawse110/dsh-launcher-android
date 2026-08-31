@@ -197,13 +197,21 @@ object EdgeTts {
         val requestMsg = "X-RequestId:" + UUID.randomUUID().toString().replace("-", "") +
             "\r\nContent-Type:application/ssml+xml\r\nX-Timestamp:" + httpDate() + "Z" +
             "\r\nPath:ssml\r\n\r\n" + ssml(item.text, item.voice)
+        // 本监听器只允许结算一次：turn.end 正常路径 close 后 onClosed 也会回调
+        var settled = false
+        fun settleOnce(fail: Boolean, why: String) {
+            if (settled) return
+            settled = true
+            if (fail) failToSystem(item, why)
+            else finishSynth(myGen, item, ctx, audio.toByteArray())
+        }
 
         val listener = object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 if (stale(myGen)) { webSocket.cancel(); return }
                 webSocket.send(configMsg)
                 webSocket.send(requestMsg)
-                armTimeout(myGen, item)
+                armTimeout(myGen, item) { settleOnce(fail = true, why = "timeout") }
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
@@ -211,7 +219,7 @@ object EdgeTts {
                 if (text.contains("Path:turn.end")) {
                     disarmTimeout()
                     webSocket.close(1000, null)
-                    finishSynth(myGen, item, ctx, audio.toByteArray())
+                    settleOnce(fail = false, why = "")
                 }
             }
 
@@ -224,13 +232,22 @@ object EdgeTts {
                 }
             }
 
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                // 服务器干净断开但未到 turn.end（截断/连接复用超时）：不处理会让流水线
+                // 卡到 12s 超时才释放，正文逐句合成会持续落后于生成速度
+                if (stale(myGen)) return
+                disarmTimeout()
+                settleOnce(fail = audio.isEmpty(), why = "closed before audio: $code")
+            }
+
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 if (stale(myGen)) return
                 if (response != null && response.code == 403) {
                     adjustSkewFrom(response)
                 }
                 val reason = t.message ?: response?.code?.toString() ?: "unknown"
-                failToSystem(item, "ws failure: $reason")
+                disarmTimeout()
+                settleOnce(fail = true, why = "ws failure: $reason")
             }
         }
 
@@ -308,12 +325,12 @@ object EdgeTts {
         busy.set(false)
     }
 
-    private fun armTimeout(myGen: Int, item: Item) {
+    private fun armTimeout(myGen: Int, item: Item, settleTimeout: () -> Unit) {
         disarmTimeout()
         val r = Runnable {
             if (!stale(myGen)) {
                 runCatching { ws?.cancel() }
-                failToSystem(item, "timeout")
+                settleTimeout()
             }
         }
         timeoutRunnable = r

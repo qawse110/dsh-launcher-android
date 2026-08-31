@@ -471,6 +471,7 @@ class BridgeOverlayManager(
                     bubble.text = bubbleText
                     bubble.visibility = View.VISIBLE
                     if (isFinished) scheduleCompletionClear(key, bubble)
+                    relayoutBubble()
                 }
                 else -> {
                     // 无内容（或关闭气泡）时不显示空框：气泡窗口整体移除，触摸透传
@@ -541,6 +542,19 @@ class BridgeOverlayManager(
             petBubbleAdded = false
             petBubbleParams = null
         }
+    }
+
+    /**
+     * 文本/样式变更后强制重排并重新定位：WindowManager 下 WRAP_CONTENT 窗口的
+     * size 只在 updateViewLayout 时重算，setText 后立刻读 b.height 拿到的是
+     * 上一轮的旧值——长文收短时气泡保持旧高度、下半截空白（偶发「气泡远高于
+     * 文字」即此）。requestLayout 触发重测量，post 回调等测量完成后再 sync。
+     */
+    private fun relayoutBubble() {
+        val b = petBubble ?: return
+        if (!petBubbleAdded) return
+        b.requestLayout()
+        b.post { syncBubbleWindow() }
     }
 
     private fun hideBubbleWindow() {
@@ -676,8 +690,7 @@ class BridgeOverlayManager(
         }
         transientRunnable = r
         handler.postDelayed(r, durationMs)
-        syncBubbleWindow()
-        bubble.post { syncBubbleWindow() } // 大段文本重排后高度变化，布局完成后再校正一次位置
+        relayoutBubble() // 大段文本重排后高度变化，等测量完成再定位（旧高度会让气泡悬空）
     }
 
     private fun cancelTransient() {
