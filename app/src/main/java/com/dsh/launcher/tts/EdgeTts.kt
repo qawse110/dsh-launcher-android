@@ -100,6 +100,9 @@ object EdgeTts {
         main.post { stopPlayer() }
     }
 
+    /** 是否有播报在进行（合成中或播放中）或有排队句：低优先级播报让路判断用。 */
+    fun isActive(): Boolean = busy.get() || synchronized(queue) { queue.isNotEmpty() }
+
     // ── 流水线 ────────────────────────────────────────────
 
     private fun pump() {

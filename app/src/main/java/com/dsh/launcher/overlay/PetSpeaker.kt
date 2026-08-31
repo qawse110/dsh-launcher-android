@@ -33,37 +33,53 @@ internal class PetSpeaker(
     private val softPuncts = charArrayOf('，', ',', '、', '：', ':', ' ')
 
     /**
-     * 状态转折固定台词（4 秒节流；同一 key 不重复播）。
-     *
-     * flush 策略按语义分流（关键修复）：正文句子是 append 入队的，而朗读游标已推进、
-     * 被冲掉的句子不会重读——所以任何「无差别 flush」都等于把正文整段静音。
-     * 只允许在「积压内容已过时」的时机 flush：
-     *  - turn/start：上一条消息的遗留队列作废（游标同步归零）→ flush；
-     *  - failed：错误提示优先于积压正文 → flush；
-     *  - tool/call：不打断正文，且正文朗读中（spokenLen>0）直接免打扰；
-     *  - finished：排在积压正文之后播，让尾巴读完再报完成。
+     * 状态转折固定台词——播报优先级：
+     *  - failed（错误）最高：绕过 4s 节流，打断一切立即播；
+     *  - finished（成功）与正文同级：排队接续播（不打断积压正文）；
+     *  - tool/call（调用工具）最低：有任何内容在播/排队则直接不读；
+     *  - turn/start：新任务开始，上一条消息的遗留队列已过时（游标同步归零）→
+     *    清队后播——属「过期内容作废」，不是优先级插队。
+     * 4 秒节流与同 key 去重仍适用（错误除外）。
      */
     fun speakForStatus(status: String, event: String?) {
         val key = "$status|${event ?: ""}"
         if (key == lastSpokenKey) return
         lastSpokenKey = key
-        if (SystemClock.uptimeMillis() - lastSpokeAt < 4000L) return
-        val phrase: String
-        val flush: Boolean
-        when {
-            status == "finished" -> { phrase = "任务完成，太棒了！"; flush = false }
-            status == "failed" -> { phrase = "出错了，快打开 Web 看看吧"; flush = true }
-            status == "running" && event == "tool/call" -> {
-                // 正文朗读中报「正在调用工具」纯属打断：跳过（key 已记录，不重复触发）
-                if (spokenLen > 0) return
-                phrase = "正在调用工具，稍等一下"; flush = false
-            }
-            status == "running" && event == "turn/start" -> { phrase = "收到新任务，开始干活！"; flush = true }
-            else -> return
+        if (status == "failed") {
+            // 错误最高优先级：不等节流，直接打断一切
+            lastSpokeAt = SystemClock.uptimeMillis()
+            speak("出错了，快打开 Web 看看吧", append = false)
+            return
         }
-        lastSpokeAt = SystemClock.uptimeMillis()
-        speak(phrase, append = !flush)
+        if (SystemClock.uptimeMillis() - lastSpokeAt < 4000L) return
+        when {
+            status == "finished" -> {
+                lastSpokeAt = SystemClock.uptimeMillis()
+                speak("任务完成，太棒了！", append = true) // 与正文同级：排队接续
+            }
+            status == "running" && event == "turn/start" -> {
+                lastSpokeAt = SystemClock.uptimeMillis()
+                speak("收到新任务，开始干活！", append = false) // 遗留队列作废
+            }
+            status == "running" && event == "tool/call" -> {
+                // 最低优先级：有内容在播/排队就不读（key 已记录，本轮事件内不重试）
+                if (isSpeakingActive()) return
+                lastSpokeAt = SystemClock.uptimeMillis()
+                speak("正在调用工具，稍等一下", append = true)
+            }
+        }
     }
+
+    /**
+     * 是否有播报在进行或排队（低优先级让路判断）。
+     * Edge 引擎除查自身队列外还要看系统 TTS：Edge 失败会回落系统引擎播放，
+     * 此刻 busy 已释放但音频仍占着声道。
+     */
+    private fun isSpeakingActive(): Boolean =
+        tts?.isSpeaking == true || pendingQueue.isNotEmpty() || when (prefs.ttsEngine()) {
+            "edge" -> EdgeTts.isActive()
+            else -> false
+        }
 
     /**
      * 正文增量朗读：只读「上次读到之后」的新增完整句。
