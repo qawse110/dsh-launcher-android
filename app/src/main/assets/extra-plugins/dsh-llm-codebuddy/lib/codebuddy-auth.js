@@ -15,6 +15,9 @@ export const CODEBUDDY_REGIONS = {
     baseUrl: "https://copilot.tencent.com/v2",
     configUrl: "https://copilot.tencent.com/v3/config",
     authBaseUrl: "https://copilot.tencent.com/v2/plugin",
+    // 账单/用量域名：与登录域名（copilot.tencent.com）不同的独立站点，
+    // 两者都接受同一枚 accessToken；这里选个人中心所在域名。
+    billingBaseUrl: "https://www.codebuddy.cn",
   },
   "codebuddy-intl": {
     provider: "codebuddy-intl",
@@ -24,12 +27,13 @@ export const CODEBUDDY_REGIONS = {
     baseUrl: "https://www.codebuddy.ai/v2",
     configUrl: "https://www.codebuddy.ai/v3/config",
     authBaseUrl: "https://www.codebuddy.ai/v2/plugin",
+    billingBaseUrl: "https://www.codebuddy.ai",
   },
 };
 
 const DEFAULT_AUTH_BASE_URL = CODEBUDDY_REGIONS["codebuddy-cn"].authBaseUrl;
 const USER_AGENT = "CLI/unknown CodeBuddy/2.137.1";
-const REQUEST_HEADERS = {
+export const REQUEST_HEADERS = {
   accept: "application/json",
   "content-type": "application/json",
   "user-agent": USER_AGENT,

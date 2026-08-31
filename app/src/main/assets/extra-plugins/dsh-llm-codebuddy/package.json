@@ -12,17 +12,21 @@
     "provider"
   ],
   "type": "module",
-  "main": "index.js",
+  "main": "lib/index.js",
+  "scripts": {
+    "build": "node build.mjs",
+    "build:client": "node build.mjs",
+    "build:all": "node build.mjs"
+  },
   "exports": {
-    ".": "./index.js",
-    "./client": "./client.js",
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },
   "files": [
-    "index.js",
-    "codebuddy-auth.js",
-    "codebuddy-web.js",
-    "client.js",
+    "lib",
+    "src",
+    "build.mjs",
     "cordis.patch.yml",
     "docs",
     "README.md",
@@ -30,7 +34,11 @@
   ],
   "dsh": {
     "client": {
-      "inject": [],
+      "inject": [
+        "react",
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
       "platform": "web"
     },
     "bundle": {

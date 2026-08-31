@@ -1,5 +1,15 @@
 import { credentialRef } from "@deepseek-ai/dsh-credentials";
-import { CODEBUDDY_REGIONS, createCodeBuddyLogin, serializeCodeBuddySession, waitForCodeBuddyLogin } from "./codebuddy-auth.js";
+import {
+  CODEBUDDY_REGIONS,
+  createCodeBuddyLogin,
+  parseCodeBuddySession,
+  refreshCodeBuddySession,
+  serializeCodeBuddySession,
+  sessionCacheDeadline,
+  sessionNeedsRefresh,
+  waitForCodeBuddyLogin,
+} from "./codebuddy-auth.js";
+import { fetchCodeBuddyUsage } from "./codebuddy-usage.js";
 
 const ROUTE_BY_PROVIDER = {
   "codebuddy-cn": "/dsh-llm-codebuddy/auth",
@@ -46,10 +56,36 @@ async function setMode(settings, mode, region) {
   }]);
 }
 
+/**
+ * 用量查询用的会话解析：与 index.js 的 resolveLoginSession 语义一致
+ * （读凭据 → 按需续期 → 回写），但独立实现一份，因为 web 注入点拿不到
+ * LLM 侧的 state；凭据存储是共享的，所以续期结果对两侧都生效。
+ */
+function createUsageSessionResolver(webCtx) {
+  const cache = new Map();
+  return async function resolveUsageSession(region) {
+    const cached = cache.get(region.provider);
+    if (cached && cached.expiresAt > Date.now()) return cached;
+    const ref = credentialRef(region.sessionRef);
+    const stored = await webCtx.credentials.resolve(ref);
+    const value = stored?.value;
+    if (!value) throw new Error("尚未保存 CodeBuddy 登录令牌");
+    let session = parseCodeBuddySession(value);
+    if (sessionNeedsRefresh(session)) {
+      session = await refreshCodeBuddySession(session, undefined, region.authBaseUrl);
+      await webCtx.credentials.set(ref, serializeCodeBuddySession(session));
+    }
+    const result = { ...session, expiresAt: sessionCacheDeadline(session) };
+    cache.set(region.provider, result);
+    return result;
+  };
+}
+
 export function installCodeBuddyWeb(ctx) {
   ctx.inject(["webServer", "settings", "credentials"], (webCtx) => {
     const loginPromises = new Map();
     const registrations = [];
+    const resolveUsageSession = createUsageSessionResolver(webCtx);
 
     for (const region of Object.values(CODEBUDDY_REGIONS)) {
       const route = ROUTE_BY_PROVIDER[region.provider];
@@ -110,12 +146,30 @@ export function installCodeBuddyWeb(ctx) {
         if (entry.settled && entry.error) return json(res, 200, { ...state, pending: false, error: entry.error });
         json(res, 200, { ...state, pending: !entry.settled });
       };
+      const usage = async (_req, res) => {
+        try {
+          const state = await currentState();
+          if (!state.authenticated) {
+            return json(res, 401, { ok: false, message: "尚未保存 CodeBuddy 登录令牌" });
+          }
+          const session = await resolveUsageSession(region);
+          const usage$ = await fetchCodeBuddyUsage(region, session);
+          json(res, 200, { ok: true, provider: region.provider, ...usage$ });
+        } catch (error) {
+          json(res, 200, {
+            ok: false,
+            provider: region.provider,
+            message: error instanceof Error ? error.message : "CodeBuddy 用量查询失败",
+          });
+        }
+      };
       registrations.push(
         webCtx.webServer.register({ kind: "exact", path: `${route}/status`, handler: status }),
         webCtx.webServer.register({ kind: "exact", path: `${route}/api-key`, handler: apiKey }),
         webCtx.webServer.register({ kind: "exact", path: `${route}/token`, handler: token }),
         webCtx.webServer.register({ kind: "exact", path: `${route}/login`, handler: login }),
         webCtx.webServer.register({ kind: "exact", path: `${route}/login-status`, handler: loginStatus }),
+        webCtx.webServer.register({ kind: "exact", path: `${route}/usage`, handler: usage }),
       );
     }
 

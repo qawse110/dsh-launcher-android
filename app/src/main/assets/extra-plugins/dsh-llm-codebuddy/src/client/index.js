@@ -1,6 +1,7 @@
 window.__ModuleLoader__.load({
   id: "dsh-llm-codebuddy",
-  factory: () => {
+  factory: (require) => {
+    const React = require("react");
     const MARKER = "data-codebuddy-auth-switch";
     const PROVIDER_FIELD = "data-codebuddy-auth-field";
     const PROVIDER_ATTR = "data-codebuddy-provider";
@@ -8,6 +9,10 @@ window.__ModuleLoader__.load({
       "codebuddy-cn": "/dsh-llm-codebuddy/auth",
       "codebuddy-intl": "/dsh-llm-codebuddy/auth-intl",
     };
+    const REGIONS = [
+      { provider: "codebuddy-cn", label: "中国区" },
+      { provider: "codebuddy-intl", label: "国际版" },
+    ];
 
     function button(text) {
       const element = document.createElement("button");
@@ -181,7 +186,230 @@ window.__ModuleLoader__.load({
       }
     }
 
+    // ---- 设置页「CodeBuddy 用量」板块 ----
+    // 数据源：GET /dsh-llm-codebuddy/auth/usage（中国区）与 /auth-intl/usage（国际版）。
+    // 与网页端 plans-usage 页面同源同接口，仅读取、不写入。
+
+    function fmt(n) {
+      if (n === null || n === undefined || Number.isNaN(n)) return "0";
+      return Number(n).toLocaleString(undefined, { maximumFractionDigits: 2 });
+    }
+
+    function usageCardStyle() {
+      return {
+        display: "flex",
+        flexDirection: "column",
+        gap: 4,
+        padding: "10px 14px",
+        borderRadius: 8,
+        minWidth: 110,
+        background: "var(--dsw-alias-bg-layer-1, var(--dsh-bg-secondary, rgba(128,128,128,0.08)))",
+        border: "1px solid var(--dsw-alias-border-l1, var(--dsh-border, rgba(128,128,128,0.35)))",
+      };
+    }
+
+    function UsageCard(props) {
+      return React.createElement(
+        "div",
+        { style: usageCardStyle() },
+        React.createElement(
+          "span",
+          { style: { fontSize: 16, fontWeight: 600, color: "var(--dsw-alias-label-primary, var(--dsh-text, inherit))" } },
+          props.value
+        ),
+        React.createElement(
+          "span",
+          { style: { fontSize: 12, color: "var(--dsw-alias-label-secondary, var(--dsh-text-secondary, #888))" } },
+          props.label
+        )
+      );
+    }
+
+    function UsageBar(props) {
+      const ratio = props.total > 0 ? Math.max(0, Math.min(1, props.remaining / props.total)) : 0;
+      const percent = Math.round(ratio * 100);
+      return React.createElement(
+        "div",
+        { style: { display: "flex", flexDirection: "column", gap: 4 } },
+        React.createElement(
+          "div",
+          { style: { display: "flex", justifyContent: "space-between", fontSize: 12 } },
+          React.createElement(
+            "span",
+            { style: { color: "var(--dsw-alias-label-primary, var(--dsh-text, inherit))" } },
+            props.label
+          ),
+          React.createElement(
+            "span",
+            { style: { color: "var(--dsw-alias-label-secondary, #888)", fontVariantNumeric: "tabular-nums" } },
+            `${fmt(props.remaining)} / ${fmt(props.total)} ${props.unit || "credits"}（${percent}%）`
+          )
+        ),
+        React.createElement(
+          "div",
+          {
+            style: {
+              height: 8,
+              width: "100%",
+              borderRadius: 4,
+              overflow: "hidden",
+              background: "var(--dsw-alias-bg-layer-2, rgba(128,128,128,0.18))",
+            },
+          },
+          React.createElement("div", {
+            style: {
+              height: "100%",
+              width: `${percent}%`,
+              background: "var(--dsw-alias-brand-primary, var(--dsh-accent, #4a90d9))",
+              opacity: 0.85,
+            },
+          })
+        )
+      );
+    }
+
+    function UsagePanel() {
+      const [provider, setProvider] = React.useState("codebuddy-cn");
+      const [data, setData] = React.useState(null);
+      const [error, setError] = React.useState("");
+      const [loading, setLoading] = React.useState(false);
+      const providerRef = React.useRef(provider);
+      providerRef.current = provider;
+
+      const load = React.useCallback((which) => {
+        setLoading(true);
+        setError("");
+        const route = ROUTES[which];
+        return fetch(`${route}/usage`, { cache: "no-store" })
+          .then((response) => response.json())
+          .then((body) => {
+            if (!body || body.ok === false) {
+              setData(null);
+              setError(body?.message || "用量查询失败");
+            } else {
+              setData(body);
+              setError("");
+            }
+          })
+          .catch((e) => {
+            setData(null);
+            setError(`用量加载失败：${e instanceof Error ? e.message : String(e)}`);
+          })
+          .finally(() => setLoading(false));
+      }, []);
+
+      React.useEffect(() => {
+        load(provider);
+      }, [provider, load]);
+
+      const secondary = "var(--dsw-alias-label-secondary, #888)";
+      const danger = "var(--dsw-alias-state-error-primary, #c62828)";
+      const packages = Array.isArray(data?.packages) ? data.packages : [];
+
+      return React.createElement(
+        "div",
+        { style: { display: "flex", flexDirection: "column", gap: 14, padding: "4px 0" } },
+        React.createElement(
+          "div",
+          { style: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" } },
+          REGIONS.map((region) => {
+            const active = region.provider === provider;
+            return React.createElement(
+              "button",
+              {
+                key: region.provider,
+                onClick: () => setProvider(region.provider),
+                style: {
+                  fontSize: 12,
+                  padding: "4px 12px",
+                  borderRadius: 6,
+                  cursor: "pointer",
+                  border: "1px solid var(--dsw-alias-border-l1, var(--dsh-border, rgba(128,128,128,0.35)))",
+                  background: active ? "var(--dsw-alias-brand-primary, var(--dsh-accent, #4a90d9))" : "transparent",
+                  color: active ? "#fff" : "var(--dsw-alias-label-primary, var(--dsh-text, inherit))",
+                },
+              },
+              region.label
+            );
+          }),
+          React.createElement(
+            "button",
+            {
+              onClick: () => load(providerRef.current),
+              disabled: loading,
+              style: {
+                fontSize: 12,
+                padding: "4px 12px",
+                borderRadius: 6,
+                cursor: loading ? "default" : "pointer",
+                border: "1px solid var(--dsw-alias-border-l1, var(--dsh-border, rgba(128,128,128,0.35)))",
+                background: "transparent",
+                color: "var(--dsw-alias-label-primary, var(--dsh-text, inherit))",
+              },
+            },
+            loading ? "刷新中…" : "刷新"
+          ),
+          error
+            ? React.createElement("span", { style: { fontSize: 12, color: danger } }, error)
+            : React.createElement(
+                "span",
+                { style: { fontSize: 12, color: secondary } },
+                data?.servedAt ? `更新于 ${new Date(data.servedAt).toLocaleString()}` : ""
+              )
+        ),
+        error
+          ? null
+          : React.createElement(
+              React.Fragment,
+              null,
+              React.createElement(
+                "div",
+                { style: { display: "flex", gap: 10, flexWrap: "wrap" } },
+                React.createElement(UsageCard, { label: "剩余", value: fmt(data?.remaining) }),
+                React.createElement(UsageCard, { label: "本周期已用", value: fmt(data?.used) }),
+                React.createElement(UsageCard, { label: "总额度", value: fmt(data?.total) }),
+                React.createElement(UsageCard, {
+                  label: "订阅状态",
+                  value: data?.isPaidUser ? "付费版" : "免费版",
+                })
+              ),
+              React.createElement(
+                "div",
+                { style: { display: "flex", flexDirection: "column", gap: 10 } },
+                packages.length === 0
+                  ? React.createElement("div", { style: { fontSize: 12, color: secondary } }, "暂无资源包")
+                  : packages.map((item) =>
+                      React.createElement(UsageBar, {
+                        key: `${provider}:${item.packageCode || item.name}:${item.cycleStart || ""}`,
+                        label: item.cycleEnd ? `${item.name}（至 ${item.cycleEnd}）` : item.name,
+                        remaining: item.remaining,
+                        total: item.total,
+                        unit: item.unit,
+                      })
+                    )
+              )
+            ),
+        React.createElement(
+          "div",
+          { style: { fontSize: 11, color: secondary, lineHeight: 1.6 } },
+          "数据与 CodeBuddy 个人中心「套餐与用量」页面同源，存在 2-3 小时延迟；本面板仅读取用量，不会进行任何领取或扣费操作。"
+        )
+      );
+    }
+
     function apply(ctx) {
+      const slots = ctx.get("slots");
+      if (slots !== undefined) {
+        ctx.effect(
+          () =>
+            slots.inject("settings.section", () =>
+              slots.register({
+                name: "settings.section", id: "codebuddy-usage", order: 25, label: "CodeBuddy 用量"
+              }, () => React.createElement(UsagePanel))
+            ),
+          "llm-codebuddy: usage section"
+        );
+      }
       ctx.effect(() => {
         const style = document.createElement("style");
         style.textContent = `
@@ -204,6 +432,6 @@ window.__ModuleLoader__.load({
       }, "llm-codebuddy: auth switch");
     }
 
-    return { name: "dsh-llm-codebuddy-client", inject: [], apply };
+    return { name: "dsh-llm-codebuddy-client", inject: ["slots"], apply };
   },
 });
