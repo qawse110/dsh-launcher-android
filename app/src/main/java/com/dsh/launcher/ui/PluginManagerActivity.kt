@@ -42,11 +42,11 @@ class PluginManagerActivity : AppCompatActivity() {
 
     companion object {
         // 内置插件（随 APK 分发；首次 flow 已通过 dsh plugin add 装配）
-        // 与 install-dsh.mjs 的 BUILTIN_PLUGINS 保持一致（9 个）
+        // 与 install-dsh.mjs 的 BUILTIN_PLUGINS 保持一致（8 个）
         val BUNDLED = setOf(
             "dsh-mobile-nav", "dsh-super-injector",
             "dsh-net-proxy", "dsh-provider-headers", "dsh-vision",
-            "dsh-oh-we-need", "dsh-status-bridge",
+            "dsh-status-bridge",
             "dsh-android-links", "dsh-llm-codebuddy",
         )
         val BUNDLED_DESC = mapOf(
@@ -55,7 +55,6 @@ class PluginManagerActivity : AppCompatActivity() {
             "dsh-net-proxy" to "网络代理（web_search/web_fetch 走代理）",
             "dsh-provider-headers" to "自定义 provider 请求头（设置页配置）",
             "dsh-vision" to "视觉（view_image 工具 + VLM 后端）",
-            "dsh-oh-we-need" to "oh-we-need 推理风格 Skill（按需调用，不再注入系统提示词）",
             "dsh-status-bridge" to "状态桥接（悬浮窗/通知显示 dsh 运行情况）",
             "dsh-android-links" to "Android 存储桥接（共享存储软链入 dsh home，目录选择器可浏览 /storage）",
             "dsh-llm-codebuddy" to "CodeBuddy Provider（中国区/国际版共存模式）",
@@ -63,7 +62,6 @@ class PluginManagerActivity : AppCompatActivity() {
         const val PRESET_DIR = "router-preset"
         const val PRESET_DESC = "思维模式路由预设（router-spec / router-standard，agent-presets）"
         const val ROUTING_REPO = "yjh051108/dsh-routing-suite"
-        const val OH_WE_NEED_REPO = "scp3500/oh-we-need"
         private val BASE_BUNDLES = setOf(
             "@deepseek-ai/dsh-base",
             "@deepseek-ai/dsh-web-app",
@@ -622,7 +620,7 @@ class PluginManagerActivity : AppCompatActivity() {
         }
         col.addView(installBtn)
         col.addView(TextView(this).apply {
-            text = "特殊适配：$ROUTING_REPO（聚合装配）· $OH_WE_NEED_REPO（内置提示词插件）"
+            text = "特殊适配：$ROUTING_REPO（聚合装配）"
             textSize = 10.5f
             setTextColor(Ui.TEXT_MUTED)
             setPadding(0, dp(6), 0, 0)
@@ -818,10 +816,6 @@ class PluginManagerActivity : AppCompatActivity() {
             ROUTING_REPO -> {
                 appendLog(">> 特殊适配安装 $repo …")
                 runRoutingSuite()
-            }
-            OH_WE_NEED_REPO -> {
-                appendLog(">> $repo 是纯提示词仓库，已内置为 dsh-oh-we-need 插件；触发重新装配…")
-                rewireBuiltins()
             }
             else -> runDshPlugin(listOf("add", "github:$repo"), "安装 $repo")
         }
