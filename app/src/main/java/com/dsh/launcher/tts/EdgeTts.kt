@@ -237,7 +237,7 @@ object EdgeTts {
                 // 卡到 12s 超时才释放，正文逐句合成会持续落后于生成速度
                 if (stale(myGen)) return
                 disarmTimeout()
-                settleOnce(fail = audio.isEmpty(), why = "closed before audio: $code")
+                settleOnce(fail = audio.size() == 0, why = "closed before audio: $code")
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
