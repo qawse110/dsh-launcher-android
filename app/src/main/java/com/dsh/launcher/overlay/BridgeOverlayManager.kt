@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
+import android.hardware.display.DisplayManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -13,6 +14,7 @@ import android.provider.Settings
 import android.text.TextUtils
 import android.text.method.ScrollingMovementMethod
 import java.util.Locale
+import android.view.Display
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -180,11 +182,25 @@ class BridgeOverlayManager(
     }
     // 偏好读取已迁移至 BridgePrefs（bp）；样式工厂迁移至 OverlayStyle。
 
-    /** 屏幕当前可见（亮屏且未锁）才允许挂悬浮窗；查询失败按可见处理（宁可多画不可失联）。 */
+    /**
+     * 屏幕当前可见（亮屏、非 AOD/息屏、且未锁屏）才允许挂悬浮窗；查询失败按可见处理
+     * （宁可多画不可失联）。
+     *
+     * 息屏指纹界面的两个坑（实测回归）：
+     *  - 部分 ROM 的 AOD 会令 PowerManager.isInteractive 报 true（屏微亮），需用
+     *    Display 的 DOZE 态兜底——AOD 时 displayState 为 STATE_DOZE/DOZE_SUSPEND；
+     *  - 指纹认证窗口会把 KeyguardManager.isKeyguardLocked 短暂翻回 false（设备仍未解锁），
+     *    需用 inKeyguardRestrictedInputMode 兜底——锁屏/灭屏期间输入受限恒为 true。
+     */
+    @Suppress("DEPRECATION") // inKeyguardRestrictedInputMode 于 API 29 起弃用，但覆盖锁屏/灭屏更全，targetSdk 28 下仍可靠
     private fun screenVisible(): Boolean = try {
         val pm = context.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
         val km = context.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
-        pm.isInteractive && !km.isKeyguardLocked
+        val dm = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+        val displayState = dm.getDisplay(Display.DEFAULT_DISPLAY)?.state ?: Display.STATE_ON
+        val displayOn = displayState == Display.STATE_ON || displayState == Display.STATE_UNKNOWN
+        val inputFree = !km.isKeyguardLocked && !km.inKeyguardRestrictedInputMode()
+        pm.isInteractive && displayOn && inputFree
     } catch (_: Exception) {
         true
     }
