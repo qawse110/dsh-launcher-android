@@ -18,13 +18,16 @@ const LAST_TEXT_CAP = 2000 // 有界防泄露，同时覆盖长正文朗读（�
 const cap = (s) => String(s ?? '').slice(0, LAST_TEXT_CAP)
 
 let server = null
-let state = {
+// 状态放 globalThis 单例：HTTP 处理器与事件订阅可能分属新旧两次热重载的模块实例，
+// 若各自持有私有 state，会出现「新实例收事件、旧实例服务 HTTP」导致 /status 冻结。
+// 共享同一对象后，任一实例的 updateState 写入都能被服务端读到。
+const state = globalThis.__dshStatusBridgeState ?? (globalThis.__dshStatusBridgeState = {
   status: 'idle',
   sessionId: null,
   lastText: '',
   lastEvent: null,
   updatedAt: 0,
-}
+})
 // 当前 step 的流式文本累积（仅 text-delta，不含 reasoning/tool-call）：
 // dsh 的 assistant/message 整条组装完成后才发射一次，1s 轮询几乎必然错过它；
 // 监听 assistant/chunk 让 lastText 随生成实时增长，Android 端据此按句朗读。
@@ -104,10 +107,16 @@ function sendJson(res, payload, statusCode = 200) {
 }
 
 // 单飞合成服务：监听失败（如重启瞬间的端口竞争）按 3s 退避重试至多 60s，
-// 并由守卫定时器周期性自愈；成功后经 globalThis 跨热重载复用。
+// 并由守卫定时器周期性自愈。成功后经 globalThis 跨热重载复用。
 function ensureServer(attempt = 0) {
   const g = globalThis
-  if (g.__dshStatusBridgeServer?.listening) { server = g.__dshStatusBridgeServer; return }
+  // 热重载后旧实例的 server 处理器闭包仍持有旧私有 state（状态已冻结不再更新）。
+  // 新实例加载时必须关闭旧 server 并重建——新处理器读取 globalThis 共享 state，
+  // 否则出现「新实例收事件、旧实例服务 HTTP」导致 /status 数据永不刷新。
+  if (g.__dshStatusBridgeServer?.listening) {
+    try { g.__dshStatusBridgeServer.close() } catch (_) {}
+    g.__dshStatusBridgeServer = null
+  }
   const s = createServer((req, res) => {
     const url = (req.url || '/').split('?')[0]
     if (url === '/' || url === '/status') {
