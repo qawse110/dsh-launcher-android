@@ -60,7 +60,12 @@ internal class PetSpeaker(
      */
     fun speakContent(text: String?, status: String, event: String?) {
         if (!prefs.petTts() || ttsReleased) return
-        if (text.isNullOrEmpty()) return
+        if (text.isNullOrEmpty()) {
+            // 新任务清空 lastText：归零游标与已读记录，等待新正文
+            spokenLen = 0
+            prevRead = null
+            return
+        }
         val prev = prevRead // 局部副本：避免可变属性导致智能转换失败
         if (event == "turn/start" || event == "user/message") {
             spokenLen = 0
@@ -70,7 +75,13 @@ internal class PetSpeaker(
             spokenLen = 0
             prevRead = null
         }
-        if (status != "running" || event != "assistant/message") return
+        // 关键门禁修正：dsh 的 assistant/message 在整条消息组装完成后才发射一次，随后立刻被
+        // turn/end（或 tool/call）顶掉——1s 轮询几乎永远看不到「running + assistant/message」
+        // 这个瞬时状态，旧门禁让正文永远不读。改为按任务态放行：
+        //  - running：生成中（流式 text-delta 让 lastText 实时增长）或轮询偶遇正文事件；
+        //  - finished：整条答案已落盘在 lastText，补读兜底；
+        //  - idle / failed 不读正文（failed 的 lastText 是错误前缀，固定台词已覆盖）。
+        if (status != "running" && status != "finished") return
         if (spokenLen >= text.length) return
 
         var start = spokenLen
@@ -87,8 +98,12 @@ internal class PetSpeaker(
                 // 积压超限仍无句界：软标点兜底断句，再不行硬切
                 val softIdx = window.lastIndexOfAny(softPuncts)
                 utterance = if (softIdx > 40) window.substring(0, softIdx + 1) else window
+            } else if (status == "finished") {
+                // 任务完成兜底：剩余尾巴无句界也读完（如「好的」「明白」这类短答），
+                // 避免生成结束后末尾内容永远不读
+                utterance = window
             } else {
-                break // 句子尚未写完，等下一轮轮询
+                break // 生成中句子尚未写完，等下一轮轮询
             }
             val trimmed = utterance.trim()
             if (trimmed.isNotEmpty()) speak(trimmed, append = true)

@@ -1,6 +1,6 @@
 {
   "name": "@dsh-external/dsh-status-bridge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Bridge dsh runtime status to the Android launcher floating window / notifications.",
   "type": "module",
   "main": "lib/index.js",

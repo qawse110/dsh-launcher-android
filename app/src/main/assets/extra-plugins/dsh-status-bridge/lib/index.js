@@ -12,8 +12,9 @@ export const name = 'dsh-status-bridge'
 
 const PORT = Number(process.env.DSH_STATUS_BRIDGE_PORT || 3190)
 // /status 对本机任意有 INTERNET 权限的 app 可读（loopback 无 per-app 访问控制），
-// lastText 只保留悬浮窗实际用到的长度（气泡 ≤40 字、full 模式 ≤160 字），不暴露全文
-const LAST_TEXT_CAP = 400 // TTS 增量整句播报需要更长上下文；仍为有界防泄露
+// lastText 只保留悬浮窗/TTS 实际用到的长度（气泡 ≤40 字、full 模式 ≤160 字、
+// TTS 整句增量播报需要更长上下文），不暴露全文
+const LAST_TEXT_CAP = 2000 // 有界防泄露，同时覆盖长正文朗读（≈10 分钟中文语音）
 const cap = (s) => String(s ?? '').slice(0, LAST_TEXT_CAP)
 
 let server = null
@@ -24,6 +25,10 @@ let state = {
   lastEvent: null,
   updatedAt: 0,
 }
+// 当前 step 的流式文本累积（仅 text-delta，不含 reasoning/tool-call）：
+// dsh 的 assistant/message 整条组装完成后才发射一次，1s 轮询几乎必然错过它；
+// 监听 assistant/chunk 让 lastText 随生成实时增长，Android 端据此按句朗读。
+let streamBuf = ''
 
 function textFromMessage(message) {
   if (!message || !message.content) return ''
@@ -45,14 +50,29 @@ function updateState(session, event) {
     case 'turn/start':
       state.status = 'running'
       state.lastText = ''
+      streamBuf = ''
       break
     case 'user/message':
       state.status = 'running'
       break
+    case 'assistant/chunk': {
+      // 流式增量：text-delta 逐段累积成实时 lastText，供桌宠生成中按句朗读；
+      // reasoning-delta（链式思考）与 tool-call-delta 不朗读不外放。
+      const chunk = event.data?.chunk
+      if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') {
+        streamBuf += chunk.text
+        state.lastText = cap(streamBuf)
+      } else if (chunk?.type === 'block' && chunk.block?.type === 'text' && typeof chunk.block.text === 'string') {
+        streamBuf += chunk.block.text
+        state.lastText = cap(streamBuf)
+      }
+      break
+    }
     case 'assistant/message':
       state.status = 'running'
       const text = textFromMessage(event.data?.message)
       if (text) state.lastText = cap(text)
+      streamBuf = '' // 本条消息已完成：累积缓冲作废，下一 step 重新累积
       break
     case 'turn/end': {
       // 失败识别：agent-loop 失败时 turn/end 仍会发出，但 reason.kind === "error"
