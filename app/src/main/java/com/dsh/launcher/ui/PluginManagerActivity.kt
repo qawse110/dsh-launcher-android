@@ -34,7 +34,7 @@ import com.dsh.launcher.R
  * ├ 路由预设：router-spec / router-standard 安装状态
  * ├ 在线扩展：已装配扩展卡片 + 仓库安装入口（输入框内联在本区）
  * ├ 引导卡：插件源未就绪时提供「自动安装并启动」（复用 DshFlow 全量引擎）
- * └ 日志：可折叠控制台，操作输出实时回显
+ * └ 日志：可折叠控制台（常驻屏幕底部，默认折叠；任何操作开始自动展开），操作输出实时回显
  *
  * 全部操作走 busy 锁防并发；后台线程只经 refreshListSafe 触碰视图。
  */
@@ -138,7 +138,7 @@ class PluginManagerActivity : AppCompatActivity() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Ui.BG)
-            setPadding(dp(16), dp(14), dp(16), dp(12))
+            setPadding(dp(14), dp(12), dp(14), dp(10))
         }
 
         // ---- 头部：标题 + 服务状态 + 刷新 ----
@@ -148,25 +148,27 @@ class PluginManagerActivity : AppCompatActivity() {
         }
         header.addView(TextView(this).apply {
             text = "插件管理"
-            textSize = 22f
+            textSize = 20f
             typeface = android.graphics.Typeface.DEFAULT_BOLD
             setTextColor(Ui.TEXT_PRIMARY)
+            letterSpacing = 0.01f
         }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         servicePill = Ui.pill(this, "○ dsh 检测中", Ui.TEXT_MUTED)
         header.addView(servicePill, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { rightMargin = dp(8) })
+        ).apply { rightMargin = dp(6) })
         header.addView(Ui.button(this, "刷新", { onManualRefresh() }, filled = false, compact = true).apply {
-            minWidth = dp(64); textSize = 12.5f
+            minWidth = dp(56); textSize = 12f
         })
         root.addView(header, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ))
         root.addView(TextView(this).apply {
             text = "内置插件随 app 自动装配；在线安装走官方 dsh plugin --profile web add"
-            textSize = 12f
+            textSize = 11.5f
             setTextColor(Ui.TEXT_SECONDARY)
-            setPadding(0, dp(2), 0, 0)
+            setPadding(0, dp(3), 0, 0)
+            setLineSpacing(dp(1).toFloat(), 1f)
         }, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ))
@@ -182,17 +184,20 @@ class PluginManagerActivity : AppCompatActivity() {
         ).apply { topMargin = dp(8) })
 
         // ---- 动态列表（概览/内置/预设/在线扩展/引导卡全部在此重建）----
-        listBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        listBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 0, 0, dp(6))
+        }
         val listScroll = ScrollView(this).apply { addView(listBox) }
         root.addView(listScroll, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
         ).apply { topMargin = dp(8) })
 
-        // ---- 可折叠日志 ----
+        // ---- 可折叠日志（常驻底部，默认折叠；操作开始自动展开）----
         root.addView(buildLogCard(), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = dp(8) })
+        ).apply { topMargin = dp(6) })
 
         return root
     }
@@ -200,6 +205,7 @@ class PluginManagerActivity : AppCompatActivity() {
     /** 日志卡：标题行点击折叠/展开；内容固定高度滚动。 */
     private fun buildLogCard(): View {
         val card = Ui.card(this, radiusDp = 12, background = Ui.SURFACE_CONTAINER_LOW, elevationDp = 0f)
+        card.setContentPadding(dp(12), dp(9), dp(12), dp(9))
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
         val head = LinearLayout(this).apply {
@@ -216,14 +222,18 @@ class PluginManagerActivity : AppCompatActivity() {
             letterSpacing = 0.06f
         }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         logToggle = TextView(this).apply {
-            text = "▾ 收起"
+            text = "▸ 展开"
             textSize = 11.5f
             setTextColor(Ui.BRAND)
         }
         head.addView(logToggle)
         col.addView(head)
 
-        logBody = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        // 默认折叠：日志常驻底部但不再长期占用 120dp 高度
+        logBody = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+        }
         logView = TextView(this).apply {
             textSize = 11f
             typeface = android.graphics.Typeface.MONOSPACE
@@ -236,7 +246,7 @@ class PluginManagerActivity : AppCompatActivity() {
             ))
         }
         logBody.addView(logScroll, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, dp(140)
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(120)
         ).apply { topMargin = dp(4) })
         col.addView(logBody)
 
@@ -367,6 +377,7 @@ class PluginManagerActivity : AppCompatActivity() {
     /** 健康检测期间的概览占位。 */
     private fun buildOverviewSkeleton(): View {
         val card = Ui.card(this, radiusDp = 16, background = Ui.SURFACE_CONTAINER_HIGH, elevationDp = 1f)
+        card.setContentPadding(dp(14), dp(12), dp(14), dp(12))
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         col.addView(TextView(this).apply {
             text = "正在扫描插件健康状态…"
@@ -390,19 +401,25 @@ class PluginManagerActivity : AppCompatActivity() {
             gravity = android.view.Gravity.CENTER_VERTICAL
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(14); bottomMargin = dp(6) }
+            ).apply { topMargin = dp(12); bottomMargin = dp(6) }
             addView(Ui.sectionLabel(this@PluginManagerActivity, title),
                 LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             if (count != null) addView(TextView(this@PluginManagerActivity).apply {
                 text = count
-                textSize = 11f
+                textSize = 10.5f
                 setTextColor(Ui.TEXT_MUTED)
+                gravity = android.view.Gravity.CENTER
+                background = Ui.rounded(
+                    this@PluginManagerActivity, Ui.withAlpha(Ui.TEXT_MUTED, 0x14), 8
+                )
+                setPadding(dp(7), dp(2), dp(7), dp(2))
             })
         }
 
     /** 概览卡：数量总览 + 异常明细 + 主操作行。 */
     private fun buildOverviewCard(bundledCount: Int, extraCount: Int, issues: List<Pair<String, String>>): View {
         val card = Ui.card(this, radiusDp = 16, background = Ui.SURFACE_CONTAINER_HIGH, elevationDp = 1f)
+        card.setContentPadding(dp(14), dp(12), dp(14), dp(12))
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
         val countsRow = LinearLayout(this).apply {
@@ -413,24 +430,29 @@ class PluginManagerActivity : AppCompatActivity() {
             countsRow.addView(LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 gravity = android.view.Gravity.CENTER_HORIZONTAL
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    if (countsRow.childCount > 0) leftMargin = dp(6)
+                }
+                background = Ui.rounded(this@PluginManagerActivity, Ui.withAlpha(color, 0x12), 12)
+                setPadding(dp(6), dp(7), dp(6), dp(7))
                 addView(TextView(this@PluginManagerActivity).apply {
                     text = num.toString()
-                    textSize = 20f
+                    textSize = 18f
                     typeface = android.graphics.Typeface.DEFAULT_BOLD
                     setTextColor(color)
                     gravity = android.view.Gravity.CENTER
                 })
                 addView(TextView(this@PluginManagerActivity).apply {
                     text = label
-                    textSize = 11f
+                    textSize = 10.5f
                     setTextColor(Ui.TEXT_MUTED)
                     gravity = android.view.Gravity.CENTER
+                    setPadding(0, dp(1), 0, 0)
                 })
             })
         }
         countBlock(bundledCount, "内置", Ui.TEXT_PRIMARY)
-        countBlock(extraCount, "在线扩展", Ui.TEXT_PRIMARY)
+        countBlock(extraCount, "在线扩展", Ui.BRAND)
         countBlock(issues.size, "异常", if (issues.isEmpty()) Ui.SUCCESS else Ui.DANGER)
         col.addView(countsRow, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
@@ -451,7 +473,7 @@ class PluginManagerActivity : AppCompatActivity() {
 
         val btnRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setPadding(0, dp(10), 0, 0)
+            setPadding(0, dp(9), 0, 0)
         }
         if (issues.isNotEmpty()) {
             resetBtn = Ui.button(this, "⚡ 一键重置修复", { resetBuiltins() }, filled = true)
@@ -461,9 +483,9 @@ class PluginManagerActivity : AppCompatActivity() {
             wireBtn = Ui.button(this, "⚡ 重新装配", { rewireBuiltins() }, filled = true)
         }
         restartBtn = Ui.button(this, "重启服务", { restartFlow() }, filled = false)
-        btnRow.addView(resetBtn, LinearLayout.LayoutParams(0, dp(44), 1f).apply { rightMargin = dp(6) })
-        btnRow.addView(wireBtn, LinearLayout.LayoutParams(0, dp(44), 1f).apply { rightMargin = dp(6) })
-        btnRow.addView(restartBtn, LinearLayout.LayoutParams(0, dp(44), 1f))
+        btnRow.addView(resetBtn, LinearLayout.LayoutParams(0, dp(40), 1f).apply { rightMargin = dp(6) })
+        btnRow.addView(wireBtn, LinearLayout.LayoutParams(0, dp(40), 1f).apply { rightMargin = dp(6) })
+        btnRow.addView(restartBtn, LinearLayout.LayoutParams(0, dp(40), 1f))
         col.addView(btnRow, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ))
@@ -475,6 +497,7 @@ class PluginManagerActivity : AppCompatActivity() {
     /** 未就绪引导卡：一键走完整自动安装引擎。 */
     private fun buildBootstrapCard(): View {
         val card = Ui.card(this, radiusDp = 16, background = Ui.SURFACE_CONTAINER_HIGH, stroke = Ui.WARNING, elevationDp = 1f)
+        card.setContentPadding(dp(14), dp(12), dp(14), dp(12))
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         col.addView(TextView(this).apply {
             text = "插件源尚未就绪"
@@ -517,10 +540,14 @@ class PluginManagerActivity : AppCompatActivity() {
     // ── 卡片工厂 ──────────────────────────────────────────
 
     private fun makeCard(name: String, desc: String, ver: String, status: String, actions: List<Pair<String, () -> Unit>>): View {
-        val card = Ui.card(this, radiusDp = 14, background = Ui.SURFACE_CONTAINER, elevationDp = 1f)
+        val card = Ui.card(
+            this, radiusDp = 12, background = Ui.SURFACE_CONTAINER,
+            stroke = Ui.withAlpha(Ui.OUTLINE, 0x66), elevationDp = 0f
+        )
+        card.setContentPadding(dp(13), dp(10), dp(13), dp(10))
         card.layoutParams = LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { bottomMargin = dp(6) }
+        ).apply { bottomMargin = dp(8) }
 
         val content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         card.addView(content, ViewGroup.LayoutParams(
@@ -533,40 +560,52 @@ class PluginManagerActivity : AppCompatActivity() {
         }
         titleRow.addView(TextView(this).apply {
             text = name
-            textSize = 15f
+            textSize = 14f
             typeface = android.graphics.Typeface.DEFAULT_BOLD
             setTextColor(Ui.TEXT_PRIMARY)
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
         }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        titleRow.addView(TextView(this).apply {
-            text = ver
-            textSize = 11f
-            setTextColor(Ui.TEXT_MUTED)
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { rightMargin = dp(6) }
-        })
+        if (ver.isNotEmpty()) {
+            titleRow.addView(TextView(this).apply {
+                text = ver
+                textSize = 10.5f
+                setTextColor(Ui.TEXT_MUTED)
+                maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
+                background = Ui.rounded(this@PluginManagerActivity, Ui.withAlpha(Ui.TEXT_MUTED, 0x12), 8)
+                setPadding(dp(6), dp(2), dp(6), dp(2))
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { rightMargin = dp(6) }
+            })
+        }
         titleRow.addView(Ui.pill(this, status, statusColor(status)))
         content.addView(titleRow)
 
         if (desc.isNotEmpty()) {
             content.addView(TextView(this).apply {
                 text = desc
-                textSize = 12f
+                textSize = 11.5f
                 setTextColor(Ui.TEXT_SECONDARY)
-                setPadding(0, dp(4), 0, 0)
+                setPadding(0, dp(3), 0, 0)
                 setLineSpacing(dp(1).toFloat(), 1f)
             })
         }
         if (actions.isNotEmpty()) {
             val actRow = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
-                setPadding(0, dp(8), 0, 0)
+                gravity = android.view.Gravity.CENTER_VERTICAL
+                setPadding(0, dp(7), 0, 0)
             }
+            // 弹性占位把操作按钮推到右侧，比左对齐更接近 MD3 卡片观感
+            actRow.addView(View(this), LinearLayout.LayoutParams(0, 0, 1f))
             for ((label, fn) in actions) {
                 actRow.addView(Ui.button(this, label, { fn() }, filled = false, compact = true).apply {
+                    textSize = 12f
                     layoutParams = LinearLayout.LayoutParams(
                         ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
-                    ).apply { rightMargin = dp(6) }
+                    ).apply { leftMargin = dp(6) }
                 })
             }
             content.addView(actRow)
@@ -576,11 +615,15 @@ class PluginManagerActivity : AppCompatActivity() {
 
     /** 在线安装入口卡：仓库输入 + 安装按钮（内联在「在线扩展」区尾部）。 */
     private fun buildInstallCard(): View {
-        val card = Ui.card(this, radiusDp = 14, background = Ui.SURFACE_CONTAINER_LOW, elevationDp = 0f)
+        val card = Ui.card(
+            this, radiusDp = 12, background = Ui.SURFACE_CONTAINER_LOW,
+            stroke = Ui.withAlpha(Ui.OUTLINE, 0x66), elevationDp = 0f
+        )
+        card.setContentPadding(dp(13), dp(11), dp(13), dp(11))
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         col.addView(TextView(this).apply {
             text = "从 GitHub 仓库安装"
-            textSize = 13f
+            textSize = 12.5f
             typeface = android.graphics.Typeface.DEFAULT_BOLD
             setTextColor(Ui.TEXT_SECONDARY)
         })
@@ -589,26 +632,27 @@ class PluginManagerActivity : AppCompatActivity() {
             textSize = 13f
             setTextColor(Ui.TEXT_PRIMARY)
             setHintTextColor(Ui.TEXT_MUTED)
-            background = Ui.rounded(this@PluginManagerActivity, Ui.SURFACE_INPUT, 10, Ui.OUTLINE)
-            setPadding(dp(12), dp(9), dp(12), dp(9))
+            background = Ui.rounded(this@PluginManagerActivity, Ui.SURFACE_INPUT, 12, Ui.OUTLINE)
+            setPadding(dp(11), dp(8), dp(11), dp(8))
             maxLines = 1
             inputType = android.text.InputType.TYPE_CLASS_TEXT
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(8) }
+            ).apply { topMargin = dp(7) }
         }
         col.addView(input)
         installBtn = Ui.button(this, "安装 / 更新", { installFromRepo() }, filled = true).apply {
+            textSize = 13.5f
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(8) }
+            ).apply { topMargin = dp(7) }
         }
         col.addView(installBtn)
         col.addView(TextView(this).apply {
-            text = "特殊适配：$ROUTING_REPO（聚合装配）"
+            text = "特殊适配 · $ROUTING_REPO（聚合装配）"
             textSize = 10.5f
             setTextColor(Ui.TEXT_MUTED)
-            setPadding(0, dp(6), 0, 0)
+            setPadding(0, dp(5), 0, 0)
         })
         card.addView(col)
         return card
@@ -626,6 +670,11 @@ class PluginManagerActivity : AppCompatActivity() {
         busy = b
         runOnUiThread {
             progress.visibility = if (b) View.VISIBLE else View.GONE
+            // 操作开始时自动展开底部日志，方便实时观察进度（平时保持折叠，不挤压列表）
+            if (b && logBody.visibility != View.VISIBLE) {
+                logBody.visibility = View.VISIBLE
+                logToggle.text = "▾ 收起"
+            }
             // 引导卡路径（插件源未就绪）不会创建主操作按钮：逐个判 isInitialized 防崩
             val btns = mutableListOf<View>()
             if (::resetBtn.isInitialized) btns.add(resetBtn)
