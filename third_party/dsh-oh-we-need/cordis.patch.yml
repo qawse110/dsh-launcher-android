@@ -1,4 +1,0 @@
-# dsh-oh-we-need bundle 层：注册 oh-we-need Skill（按需调用）。
-- insert:
-    - id: dsh-oh-we-need
-      name: '@dsh-external/dsh-oh-we-need'

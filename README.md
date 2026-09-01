@@ -61,9 +61,8 @@
   已移除的旧补丁：apiproxy vision 白名单（上游已无此常量）、sandbox "/tmp"→TMPDIR
   （上游已原生并入 os.tmpdir()）、directory-picker SD Card 条目（改由内置插件实现）。
 - 内置插件经官方 `dsh plugin --profile web add` 装配：`dsh-mobile-nav`、`dsh-super-injector`、
-  `dsh-net-proxy`、`dsh-provider-headers`、`dsh-vision`、`dsh-oh-we-need`（Skill 化，不再注入
-  系统提示词）、`dsh-android-links`（HOME 符号链接暴露 SD 卡给工作区目录浏览器，
-  替代旧的 directory-picker 源码补丁）；`yjh051108/dsh-routing-suite`
+  `dsh-net-proxy`、`dsh-provider-headers`、`dsh-vision`、`dsh-android-links`（HOME 符号链接暴露
+  SD 卡给工作区目录浏览器，替代旧的 directory-picker 源码补丁）；`yjh051108/dsh-routing-suite`
   走特殊适配（`routing-suite.mjs`：聚合仓库 + injector 装配 + agent-presets 拷贝）。
 - 自动初始化 `files/.dsh/profiles/web` 配置（含默认 LLM 提供方配置），
   界面内填入 DeepSeek API Key 即可使用。

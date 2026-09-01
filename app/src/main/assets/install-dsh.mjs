@@ -60,7 +60,6 @@ const BUILTIN_PLUGINS = [
   'dsh-net-proxy',
   'dsh-provider-headers',
   'dsh-vision',
-  'dsh-oh-we-need',
   'dsh-status-bridge',
   'dsh-android-links',
 ];
@@ -70,7 +69,6 @@ const BUILTIN_NAMES = new Set([
   'dsh-net-proxy',
   'dsh-provider-headers',
   '@dsh-external/dsh-vision',
-  '@dsh-external/dsh-oh-we-need',
   '@dsh-external/dsh-status-bridge',
   '@dsh-external/dsh-android-links',
 ]);
@@ -80,7 +78,6 @@ const BUILTIN_IDS = new Set([
   'net-proxy',
   'provider-headers',
   'dsh-vision',
-  'dsh-oh-we-need',
   'dsh-status-bridge',
   'dsh-android-links',
 ]);
