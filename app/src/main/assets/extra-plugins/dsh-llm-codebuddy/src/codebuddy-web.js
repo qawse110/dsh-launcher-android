@@ -9,7 +9,7 @@ import {
   sessionNeedsRefresh,
   waitForCodeBuddyLogin,
 } from "./codebuddy-auth.js";
-import { fetchCodeBuddyUsage } from "./codebuddy-usage.js";
+import { fetchCodeBuddyUsage, probeCodeBuddyHy4 } from "./codebuddy-usage.js";
 
 const ROUTE_BY_PROVIDER = {
   "codebuddy-cn": "/dsh-llm-codebuddy/auth",
@@ -163,6 +163,25 @@ export function installCodeBuddyWeb(ctx) {
           });
         }
       };
+      // hy4-preview 免费档的「用量/限流窗口」探测：与用量查询同会话、同鉴权，
+      // 在用量页加载或点「刷新」时调用（探测会发一次最小请求，见 codebuddy-usage.js）。
+      const usageHy4 = async (_req, res) => {
+        try {
+          const state = await currentState();
+          if (!state.authenticated) {
+            return json(res, 401, { ok: false, message: "尚未保存 CodeBuddy 登录令牌" });
+          }
+          const session = await resolveUsageSession(region);
+          const status = await probeCodeBuddyHy4(region, session);
+          json(res, 200, { ok: true, provider: region.provider, ...status });
+        } catch (error) {
+          json(res, 200, {
+            ok: false,
+            provider: region.provider,
+            message: error instanceof Error ? error.message : "hy4-preview 用量探测失败",
+          });
+        }
+      };
       registrations.push(
         webCtx.webServer.register({ kind: "exact", path: `${route}/status`, handler: status }),
         webCtx.webServer.register({ kind: "exact", path: `${route}/api-key`, handler: apiKey }),
@@ -170,6 +189,7 @@ export function installCodeBuddyWeb(ctx) {
         webCtx.webServer.register({ kind: "exact", path: `${route}/login`, handler: login }),
         webCtx.webServer.register({ kind: "exact", path: `${route}/login-status`, handler: loginStatus }),
         webCtx.webServer.register({ kind: "exact", path: `${route}/usage`, handler: usage }),
+        webCtx.webServer.register({ kind: "exact", path: `${route}/usage/hy4`, handler: usageHy4 }),
       );
     }
 

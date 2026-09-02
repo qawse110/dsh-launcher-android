@@ -152,3 +152,98 @@ export async function fetchCodeBuddyUsage(region, session, signal) {
     servedAt: new Date().toISOString(),
   };
 }
+
+const HY4_MODEL_ID = "hy4-preview";
+
+/**
+ * 探测 hy4-preview 的免费「用量 / 限流窗口」状态。
+ *
+ * hy4-preview 是免费（x0.00）的 preview 推理模型，按固定窗口做频率限制：
+ * 窗口内用量触顶后，任何请求都会返回 HTTP 429 + 业务码 6000，body.msg 里写明
+ * 重置时间（"…将在 2026-09-02 17:55:20 UTC+8 重置…"），且不带 Retry-After 头。
+ * 因此这里用一次最小请求（model=hy4-preview + max_tokens=1）探测：
+ *   - 200            → 当前可用（不消费响应体，直接释放连接）
+ *   - 429 / code6000 → 限流中，解析 msg 里的重置时间（UTC+8，转成绝对时间）
+ *   - 其它（400 等）  → 原样报告（如模型未授权 / 该区域无此模型）
+ * 探测本身不扣额度（x0.00），但会占一丁点窗口配额，所以在用量页加载或点
+ * 「刷新」时才调用（不放在常驻轮询里）。
+ */
+export async function probeCodeBuddyHy4(region, session, signal) {
+  const headers = {
+    authorization: `Bearer ${session.auth.accessToken}`,
+    ...(session.account?.userId ? { "X-User-Id": session.account.userId } : {}),
+    ...(session.account?.enterpriseId
+      ? { "X-Enterprise-Id": session.account.enterpriseId, "X-Tenant-Id": session.account.enterpriseId }
+      : {}),
+    ...(session.auth.domain ? { "X-Domain": session.auth.domain } : {}),
+  };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  const onAbort = () => controller.abort();
+  signal?.addEventListener("abort", onAbort, { once: true });
+  let response;
+  try {
+    response = await fetch(`${region.baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: { ...REQUEST_HEADERS, ...headers },
+      body: JSON.stringify({
+        model: HY4_MODEL_ID,
+        // 国际版要求首条消息是 system prompt（否则 400/11128），中国区对两种都兼容；
+        // 统一带 system 首条，保证两个区域都能探测。
+        messages: [
+          { role: "system", content: "ping" },
+          { role: "user", content: "ping" },
+        ],
+        stream: true,
+        max_tokens: 1,
+      }),
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (signal?.aborted || controller.signal.aborted) {
+      throw new Error("hy4-preview 用量探测已取消");
+    }
+    throw new Error("无法连接 CodeBuddy 模型接口", { cause: error });
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
+  }
+
+  if (response.ok) {
+    // 200 = 可用；不消费流内容，直接释放连接。
+    response.body?.cancel().catch(() => {});
+    return {
+      model: HY4_MODEL_ID,
+      available: true,
+      limited: false,
+      resetAt: null,
+      httpStatus: response.status,
+      servedAt: new Date().toISOString(),
+    };
+  }
+
+  const payload = await response.json().catch(() => undefined);
+  const code = payload?.code ?? response.status;
+  const msg = payload?.msg ?? payload?.message ?? "";
+  const resetMatch = typeof msg === "string" ? msg.match(/(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})/) : null;
+  return {
+    model: HY4_MODEL_ID,
+    available: false,
+    limited: response.status === 429 || code === 6000,
+    resetAt: resetMatch ? parseResetTime(resetMatch[1]) : null,
+    resetRaw: resetMatch?.[1] ?? "",
+    httpStatus: response.status,
+    code,
+    message: msg || `HTTP ${response.status}`,
+    servedAt: new Date().toISOString(),
+  };
+}
+
+/** 把服务端 msg 里的 "2026-09-02 17:55:20"（UTC+8 本地时间）转成绝对时间 ISO。 */
+function parseResetTime(raw) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})$/.exec(String(raw).trim());
+  if (!match) return null;
+  const [, year, month, day, hour, minute, second] = match.map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day, hour - 8, minute, second));
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}

@@ -268,11 +268,30 @@ window.__ModuleLoader__.load({
       );
     }
 
+    // hy4-preview 免费档限流窗口倒计时（重置时刻 - 当前时刻）。
+    function formatCountdown(targetIso, nowMs) {
+      const target = new Date(targetIso).getTime();
+      if (!Number.isFinite(target)) return "";
+      const diff = Math.max(0, target - nowMs);
+      const totalMinutes = Math.floor(diff / 60000);
+      const hours = Math.floor(totalMinutes / 60);
+      const minutes = totalMinutes % 60;
+      const seconds = Math.floor((diff % 60000) / 1000);
+      if (hours > 0) return `${hours} 小时 ${minutes} 分 ${seconds} 秒`;
+      if (minutes > 0) return `${minutes} 分 ${seconds} 秒`;
+      return `${seconds} 秒`;
+    }
+
     function UsagePanel() {
       const [provider, setProvider] = React.useState("codebuddy-cn");
       const [data, setData] = React.useState(null);
       const [error, setError] = React.useState("");
       const [loading, setLoading] = React.useState(false);
+      const [hy4, setHy4] = React.useState(null);
+      const [hy4Loading, setHy4Loading] = React.useState(false);
+      const [hy4Error, setHy4Error] = React.useState("");
+      const [now, setNow] = React.useState(Date.now());
+      const hy4InflightRef = React.useRef(new Map());
       const providerRef = React.useRef(provider);
       providerRef.current = provider;
 
@@ -298,12 +317,53 @@ window.__ModuleLoader__.load({
           .finally(() => setLoading(false));
       }, []);
 
+      const loadHy4 = React.useCallback((which) => {
+        // 同一区域并发探测去重（面板挂载/StrictMode 双触发时只发一次）。
+        if (hy4InflightRef.current.get(which)) return hy4InflightRef.current.get(which);
+        setHy4Loading(true);
+        setHy4Error("");
+        const route = ROUTES[which];
+        const promise = fetch(`${route}/usage/hy4`, { cache: "no-store" })
+          .then((response) => response.json())
+          .then((body) => {
+            if (!body || body.ok === false) {
+              setHy4(null);
+              setHy4Error(body?.message || "hy4 用量查询失败");
+            } else {
+              setHy4(body);
+              setHy4Error("");
+            }
+          })
+          .catch((e) => {
+            setHy4(null);
+            setHy4Error(`hy4 用量加载失败：${e instanceof Error ? e.message : String(e)}`);
+          })
+          .finally(() => {
+            setHy4Loading(false);
+            hy4InflightRef.current.delete(which);
+          });
+        hy4InflightRef.current.set(which, promise);
+        return promise;
+      }, []);
+
       React.useEffect(() => {
+        // 切换区域时清掉旧区域的 hy4 状态（重置时间是按区域/模型计的，不能串着显示）。
+        setHy4(null);
+        setHy4Error("");
         load(provider);
-      }, [provider, load]);
+        loadHy4(provider);
+      }, [provider, load, loadHy4]);
+
+      // 限流中且带重置时间时，每秒刷新一次倒计时。
+      React.useEffect(() => {
+        if (!hy4?.limited || !hy4?.resetAt) return undefined;
+        const timer = setInterval(() => setNow(Date.now()), 1000);
+        return () => clearInterval(timer);
+      }, [hy4?.limited, hy4?.resetAt]);
 
       const secondary = "var(--dsw-alias-label-secondary, #888)";
       const danger = "var(--dsw-alias-state-error-primary, #c62828)";
+      const success = "var(--dsw-alias-state-success-primary, #2e7d32)";
       const packages = Array.isArray(data?.packages) ? data.packages : [];
 
       return React.createElement(
@@ -335,19 +395,22 @@ window.__ModuleLoader__.load({
           React.createElement(
             "button",
             {
-              onClick: () => load(providerRef.current),
-              disabled: loading,
+              onClick: () => {
+                load(providerRef.current);
+                loadHy4(providerRef.current);
+              },
+              disabled: loading || hy4Loading,
               style: {
                 fontSize: 12,
                 padding: "4px 12px",
                 borderRadius: 6,
-                cursor: loading ? "default" : "pointer",
+                cursor: loading || hy4Loading ? "default" : "pointer",
                 border: "1px solid var(--dsw-alias-border-l1, var(--dsh-border, rgba(128,128,128,0.35)))",
                 background: "transparent",
                 color: "var(--dsw-alias-label-primary, var(--dsh-text, inherit))",
               },
             },
-            loading ? "刷新中…" : "刷新"
+            loading || hy4Loading ? "刷新中…" : "刷新"
           ),
           error
             ? React.createElement("span", { style: { fontSize: 12, color: danger } }, error)
@@ -372,6 +435,78 @@ window.__ModuleLoader__.load({
                   label: "订阅状态",
                   value: data?.isPaidUser ? "付费版" : "免费版",
                 })
+              ),
+              React.createElement(
+                "div",
+                { style: { display: "flex", flexDirection: "column", gap: 8 } },
+                React.createElement(
+                  "div",
+                  { style: { fontSize: 12, fontWeight: 600, color: secondary } },
+                  "hy4-preview 用量 / 限流"
+                ),
+                hy4Loading && !hy4
+                  ? React.createElement(
+                      "div",
+                      { style: { fontSize: 12, color: secondary } },
+                      "正在探测 hy4-preview 限流窗口…"
+                    )
+                  : hy4Error
+                    ? React.createElement(
+                        "div",
+                        { style: { fontSize: 12, color: danger } },
+                        hy4Error
+                      )
+                    : hy4
+                      ? React.createElement(
+                          "div",
+                          {
+                            style: {
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 10,
+                              flexWrap: "wrap",
+                              padding: "10px 14px",
+                              borderRadius: 8,
+                              background: "var(--dsw-alias-bg-layer-1, var(--dsh-bg-secondary, rgba(128,128,128,0.08)))",
+                              border: `1px solid ${hy4.limited ? danger : "var(--dsw-alias-border-l1, var(--dsh-border, rgba(128,128,128,0.35)))"}`,
+                            },
+                          },
+                          React.createElement(
+                            "span",
+                            { style: { fontSize: 14, fontWeight: 600, color: hy4.available ? success : danger } },
+                            hy4.available ? "可用" : "限流中"
+                          ),
+                          hy4.limited && hy4.resetAt
+                            ? React.createElement(
+                                "span",
+                                {
+                                  style: {
+                                    fontSize: 12,
+                                    color: secondary,
+                                    fontVariantNumeric: "tabular-nums",
+                                  },
+                                },
+                                `重置于 ${new Date(hy4.resetAt).toLocaleString()}（剩余 ${formatCountdown(hy4.resetAt, now)}）`
+                              )
+                            : hy4.limited
+                              ? React.createElement(
+                                  "span",
+                                  { style: { fontSize: 12, color: secondary } },
+                                  "（服务端未给出重置时间）"
+                                )
+                              : hy4.httpStatus && hy4.httpStatus !== 200
+                                ? React.createElement(
+                                    "span",
+                                    { style: { fontSize: 12, color: secondary } },
+                                    `探测返回 ${hy4.httpStatus}：${hy4.message || ""}`
+                                  )
+                                : null
+                        )
+                      : React.createElement(
+                          "div",
+                          { style: { fontSize: 12, color: secondary } },
+                          "暂无 hy4-preview 状态"
+                        )
               ),
               React.createElement(
                 "div",
