@@ -231,16 +231,37 @@ export async function probeCodeBuddyHy4(region, session, signal) {
   const payload = await response.json().catch(() => undefined);
   const code = payload?.code ?? response.status;
   const msg = payload?.msg ?? payload?.message ?? "";
+  const limited = response.status === 429 || code === 6000;
+  // 重置时间优先取 body.msg 里的 "2026-09-02 17:55:20"；body 缺失（纯 429）时
+  // 兜底解析 Retry-After 头（秒数或 HTTP-date），拿不到就只报「限流中」。
   const resetMatch = typeof msg === "string" ? msg.match(/(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})/) : null;
+  let resetAt = resetMatch ? parseResetTime(resetMatch[1]) : null;
+  let resetRaw = resetMatch?.[1] ?? "";
+  if (!resetAt) {
+    const retryAfter = response.headers.get("retry-after");
+    if (retryAfter) {
+      const seconds = Number.parseFloat(retryAfter);
+      if (Number.isFinite(seconds) && seconds > 0 && seconds < 24 * 3600) {
+        resetAt = new Date(Date.now() + seconds * 1000).toISOString();
+        resetRaw = `${seconds}s`;
+      } else {
+        const parsed = Date.parse(retryAfter);
+        if (Number.isFinite(parsed)) {
+          resetAt = new Date(parsed).toISOString();
+          resetRaw = retryAfter;
+        }
+      }
+    }
+  }
   return {
     model: HY4_MODEL_ID,
     available: false,
-    limited: response.status === 429 || code === 6000,
-    resetAt: resetMatch ? parseResetTime(resetMatch[1]) : null,
-    resetRaw: resetMatch?.[1] ?? "",
+    limited,
+    resetAt,
+    resetRaw,
     httpStatus: response.status,
     code,
-    message: msg || `HTTP ${response.status}`,
+    message: msg || (limited ? "服务端限流（未返回重置时间）" : `HTTP ${response.status}`),
     servedAt: new Date().toISOString(),
   };
 }
