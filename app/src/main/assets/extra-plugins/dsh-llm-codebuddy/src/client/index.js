@@ -282,6 +282,80 @@ window.__ModuleLoader__.load({
       return `${seconds} 秒`;
     }
 
+    // hy4-preview 用量/限流状态块：独立于额度查询渲染（额度接口挂了也要能看出限流）。
+    function Hy4StatusBlock(props) {
+      const { hy4, hy4Loading, hy4Error, now, secondary, danger, success } = props;
+      const content = hy4Loading && !hy4
+        ? React.createElement("div", { style: { fontSize: 12, color: secondary } }, "正在探测 hy4-preview 限流窗口…")
+        : hy4Error
+          ? React.createElement(
+              "div",
+              { style: { fontSize: 12, color: secondary } },
+              `状态未知（${hy4Error}），请点「刷新」重试`
+            )
+          : hy4
+            ? React.createElement(
+                "div",
+                {
+                  style: {
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 10,
+                    flexWrap: "wrap",
+                    padding: "10px 14px",
+                    borderRadius: 8,
+                    background: "var(--dsw-alias-bg-layer-1, var(--dsh-bg-secondary, rgba(128,128,128,0.08)))",
+                    border: `1px solid ${hy4.limited ? danger : "var(--dsw-alias-border-l1, var(--dsh-border, rgba(128,128,128,0.35)))"}`,
+                  },
+                },
+                React.createElement(
+                  "span",
+                  { style: { fontSize: 14, fontWeight: 600, color: hy4.available ? success : danger } },
+                  hy4.available ? "可用" : "限流中"
+                ),
+                hy4.limited && hy4.resetAt
+                  ? React.createElement(
+                      "span",
+                      {
+                        style: {
+                          fontSize: 12,
+                          color: secondary,
+                          fontVariantNumeric: "tabular-nums",
+                        },
+                      },
+                      `重置于 ${new Date(hy4.resetAt).toLocaleString()}（剩余 ${formatCountdown(hy4.resetAt, now)}）`
+                    )
+                  : hy4.limited
+                    ? React.createElement(
+                        "span",
+                        { style: { fontSize: 12, color: secondary } },
+                        "（服务端未给出重置时间）"
+                      )
+                    : hy4.httpStatus && hy4.httpStatus !== 200
+                      ? React.createElement(
+                          "span",
+                          { style: { fontSize: 12, color: secondary } },
+                          `探测返回 ${hy4.httpStatus}：${hy4.message || ""}`
+                        )
+                      : React.createElement(
+                          "span",
+                          { style: { fontSize: 12, color: secondary } },
+                          hy4.servedAt ? `探测于 ${new Date(hy4.servedAt).toLocaleString()}` : ""
+                        )
+              )
+            : React.createElement("div", { style: { fontSize: 12, color: secondary } }, "暂无 hy4-preview 状态");
+      return React.createElement(
+        "div",
+        { style: { display: "flex", flexDirection: "column", gap: 8 } },
+        React.createElement(
+          "div",
+          { style: { fontSize: 12, fontWeight: 600, color: secondary } },
+          "hy4-preview 用量 / 限流"
+        ),
+        content
+      );
+    }
+
     function UsagePanel() {
       const [provider, setProvider] = React.useState("codebuddy-cn");
       const [data, setData] = React.useState(null);
@@ -438,78 +512,6 @@ window.__ModuleLoader__.load({
               ),
               React.createElement(
                 "div",
-                { style: { display: "flex", flexDirection: "column", gap: 8 } },
-                React.createElement(
-                  "div",
-                  { style: { fontSize: 12, fontWeight: 600, color: secondary } },
-                  "hy4-preview 用量 / 限流"
-                ),
-                hy4Loading && !hy4
-                  ? React.createElement(
-                      "div",
-                      { style: { fontSize: 12, color: secondary } },
-                      "正在探测 hy4-preview 限流窗口…"
-                    )
-                  : hy4Error
-                    ? React.createElement(
-                        "div",
-                        { style: { fontSize: 12, color: danger } },
-                        hy4Error
-                      )
-                    : hy4
-                      ? React.createElement(
-                          "div",
-                          {
-                            style: {
-                              display: "flex",
-                              alignItems: "center",
-                              gap: 10,
-                              flexWrap: "wrap",
-                              padding: "10px 14px",
-                              borderRadius: 8,
-                              background: "var(--dsw-alias-bg-layer-1, var(--dsh-bg-secondary, rgba(128,128,128,0.08)))",
-                              border: `1px solid ${hy4.limited ? danger : "var(--dsw-alias-border-l1, var(--dsh-border, rgba(128,128,128,0.35)))"}`,
-                            },
-                          },
-                          React.createElement(
-                            "span",
-                            { style: { fontSize: 14, fontWeight: 600, color: hy4.available ? success : danger } },
-                            hy4.available ? "可用" : "限流中"
-                          ),
-                          hy4.limited && hy4.resetAt
-                            ? React.createElement(
-                                "span",
-                                {
-                                  style: {
-                                    fontSize: 12,
-                                    color: secondary,
-                                    fontVariantNumeric: "tabular-nums",
-                                  },
-                                },
-                                `重置于 ${new Date(hy4.resetAt).toLocaleString()}（剩余 ${formatCountdown(hy4.resetAt, now)}）`
-                              )
-                            : hy4.limited
-                              ? React.createElement(
-                                  "span",
-                                  { style: { fontSize: 12, color: secondary } },
-                                  "（服务端未给出重置时间）"
-                                )
-                              : hy4.httpStatus && hy4.httpStatus !== 200
-                                ? React.createElement(
-                                    "span",
-                                    { style: { fontSize: 12, color: secondary } },
-                                    `探测返回 ${hy4.httpStatus}：${hy4.message || ""}`
-                                  )
-                                : null
-                        )
-                      : React.createElement(
-                          "div",
-                          { style: { fontSize: 12, color: secondary } },
-                          "暂无 hy4-preview 状态"
-                        )
-              ),
-              React.createElement(
-                "div",
                 { style: { display: "flex", flexDirection: "column", gap: 10 } },
                 packages.length === 0
                   ? React.createElement("div", { style: { fontSize: 12, color: secondary } }, "暂无资源包")
@@ -524,6 +526,7 @@ window.__ModuleLoader__.load({
                     )
               )
             ),
+        React.createElement(Hy4StatusBlock, { hy4, hy4Loading, hy4Error, now, secondary, danger, success }),
         React.createElement(
           "div",
           { style: { fontSize: 11, color: secondary, lineHeight: 1.6 } },

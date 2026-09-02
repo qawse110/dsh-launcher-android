@@ -177,37 +177,43 @@ export async function probeCodeBuddyHy4(region, session, signal) {
       : {}),
     ...(session.auth.domain ? { "X-Domain": session.auth.domain } : {}),
   };
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-  const onAbort = () => controller.abort();
-  signal?.addEventListener("abort", onAbort, { once: true });
+  // 探测走一次最小请求；网络层偶发抖动时重试一次再报错（429/400 等业务响应不算抖动，直接返回）。
   let response;
-  try {
-    response = await fetch(`${region.baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: { ...REQUEST_HEADERS, ...headers },
-      body: JSON.stringify({
-        model: HY4_MODEL_ID,
-        // 国际版要求首条消息是 system prompt（否则 400/11128），中国区对两种都兼容；
-        // 统一带 system 首条，保证两个区域都能探测。
-        messages: [
-          { role: "system", content: "ping" },
-          { role: "user", content: "ping" },
-        ],
-        stream: true,
-        max_tokens: 1,
-      }),
-      signal: controller.signal,
-    });
-  } catch (error) {
-    if (signal?.aborted || controller.signal.aborted) {
-      throw new Error("hy4-preview 用量探测已取消");
+  let lastError;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    const onAbort = () => controller.abort();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    try {
+      response = await fetch(`${region.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: { ...REQUEST_HEADERS, ...headers },
+        body: JSON.stringify({
+          model: HY4_MODEL_ID,
+          // 国际版要求首条消息是 system prompt（否则 400/11128），中国区对两种都兼容；
+          // 统一带 system 首条，保证两个区域都能探测。
+          messages: [
+            { role: "system", content: "ping" },
+            { role: "user", content: "ping" },
+          ],
+          stream: true,
+          max_tokens: 1,
+        }),
+        signal: controller.signal,
+      });
+      break;
+    } catch (error) {
+      lastError = error;
+      if (signal?.aborted || controller.signal.aborted) {
+        throw new Error("hy4-preview 用量探测已取消");
+      }
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
     }
-    throw new Error("无法连接 CodeBuddy 模型接口", { cause: error });
-  } finally {
-    clearTimeout(timer);
-    signal?.removeEventListener("abort", onAbort);
   }
+  if (!response) throw new Error("无法连接 CodeBuddy 模型接口", { cause: lastError });
 
   if (response.ok) {
     // 200 = 可用；不消费流内容，直接释放连接。
