@@ -35,6 +35,18 @@ const COMPAT = {
   thinkingFormat: "openai",
 };
 
+// CodeBuddy 默认重试策略：不重试 RATE_LIMIT（429）。
+// hy4-preview 这类免费 preview 模型按固定窗口限流，窗口内重试必败——DSH 默认
+// 会把 429 退避重试 5 次（累计几十秒），让会话看起来「一直报 429」。这里默认
+// 让 429 立即失败并报出清晰错误，只对瞬时错误（空响应/服务端/超时/传输）最多
+// 重试 2 次；用户仍可在 provider 配置里用 retryPolicy 覆盖。
+const CODEBUDDY_RETRY_POLICY = Object.freeze({
+  mode: "normal",
+  maxRetries: 2,
+  retryableCodes: ["EMPTY_RESPONSE", "SERVER", "TIMEOUT", "TRANSPORT"],
+  backoff: { initialDelayMs: 500, maxDelayMs: 4000, jitterRatio: 0.1 },
+});
+
 function codeBuddyRequestOptions(options) {
   return { ...options, headers: { ...(options?.headers ?? {}), "user-agent": USER_AGENT } };
 }
@@ -203,7 +215,7 @@ function resolvedProfile(provider, source, piProvider, configuredMaxTokens = new
     displayName: source.displayName ?? piProvider.name ?? provider,
     ...(apiKeyEnv === undefined ? {} : { apiKeyEnv }),
     streamIdleTimeoutMs: source.streamIdleTimeoutMs ?? STREAM_IDLE_TIMEOUT_MS,
-    retryPolicy: resolveRetryPolicy(source.retryPolicy, `${name}: provider "${provider}" retryPolicy`),
+    retryPolicy: resolveRetryPolicy(source.retryPolicy ?? CODEBUDDY_RETRY_POLICY, `${name}: provider "${provider}" retryPolicy`),
     configuredMaxTokens,
     piProvider,
   };
