@@ -244,7 +244,8 @@ function ensureHostPkg() {
 function ensureDsh() {
   mkdirSync(DSH_PREFIX, { recursive: true });
   ensureHostPkg();
-  const tag = process.env.DSH_TAG || 'latest';
+  // dsh 本体版本钉死为 0.1.1-rc.1（DSH_TAG 环境变量可覆盖）
+  const tag = process.env.DSH_TAG || '0.1.1-rc.1';
   const pkgSpec = `@deepseek-ai/dsh@${tag}`;
   const pkgDir = join(DSH_PREFIX, 'node_modules/@deepseek-ai/dsh');
   const beforeVersion = (() => {
