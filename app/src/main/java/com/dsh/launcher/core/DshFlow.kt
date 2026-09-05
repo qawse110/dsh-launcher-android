@@ -437,7 +437,7 @@ object DshFlow {
         File(ctx.filesDir, "tmp").mkdirs()
         val launcher = webLauncherFile(ctx)
         launcher.parentFile?.mkdirs()
-        val nodeCmd = "${nodeDir.absolutePath}/bin/node --expose-internals --import ${ctx.filesDir.absolutePath}/fs-register.mjs ${cli.absolutePath} web"
+        val nodeCmd = "${nodeDir.absolutePath}/bin/node --expose-internals --import ${ctx.filesDir.absolutePath}/fs-register.mjs ${cli.absolutePath} web --no-open"
         // 兼容状态自查：用户日志里出现 MISSING 即可立刻定位是脚本没拷到还是 stub 没跑
         onLog(">> compat: fs-register=${if (File(ctx.filesDir, "fs-register.mjs").isFile) "ok" else "MISSING"}" +
             ", sharp-shim=${if (File(ctx.filesDir, "sharp-shim.cjs").isFile) "ok" else "missing(loader 会自补)"}" +
@@ -486,8 +486,10 @@ object DshFlow {
     private fun waitForWebReady(ctx: Context, timeoutMs: Long, onLog: (String) -> Unit): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMs
         var lastLog = 0L
+        var lastProbe = 0
         while (System.currentTimeMillis() < deadline) {
-            if (httpResponds(WEB_PORT)) return true
+            lastProbe = httpProbeCode(WEB_PORT)
+            if (lastProbe >= 200) return true
             val now = System.currentTimeMillis()
             if (now - lastLog >= 5000) {
                 lastLog = now
@@ -496,29 +498,39 @@ object DshFlow {
             val elapsed = timeoutMs - (deadline - now)
             Thread.sleep(if (elapsed < 6_000) 150 else 500)
         }
-        onLog("✗ dsh web 未在 ${timeoutMs / 1000} 秒内就绪，日志尾部：")
+        val probeDesc = if (lastProbe > 0) "HTTP $lastProbe" else "无响应"
+        onLog("✗ dsh web 未在 ${timeoutMs / 1000} 秒内就绪（最后探测: $probeDesc），日志尾部：")
         appendLogTail(File(FileLog.dir(ctx), WEB_LOG), 25, onLog)
         return false
     }
 
-    fun httpResponds(port: Int): Boolean {
+    /**
+     * 返回对 http://127.0.0.1:port/ 的探测结果：HTTP 状态码（>=200 即收到了真实
+     * HTTP 响应），0 = 连接失败/超时。
+     * 注意不能只认 2xx/3xx：dsh web 现在带 token 认证，无 token 访问 `/` 返回
+     * 401/403 —— 服务明明已就绪，旧判据（200..399）却永远等不到，90 秒超时假失败。
+     * 对「web 进程是否起来」而言，任何合法 HTTP 响应都是充分证据。
+     */
+    fun httpProbeCode(port: Int): Int {
         val conn = try {
             URL("http://127.0.0.1:$port/").openConnection() as HttpURLConnection
         } catch (e: Exception) {
-            return false
+            return 0
         }
         return try {
             conn.connectTimeout = 800
             conn.readTimeout = 800
             conn.requestMethod = "GET"
-            conn.responseCode in 200..399
+            conn.responseCode
         } catch (e: Exception) {
-            false
+            0
         } finally {
             // disconnect 必须放 finally：responseCode 抛异常时连接也要释放
             runCatching { conn.disconnect() }
         }
     }
+
+    fun httpResponds(port: Int): Boolean = httpProbeCode(port) >= 200
 
     private fun appendLogTail(file: File, maxLines: Int, onLog: (String) -> Unit) {
         try {
