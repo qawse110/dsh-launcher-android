@@ -22,7 +22,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          # 完整历史：debug 版本号依赖 git 提交计数（shallow clone 下恒为 1）
           lfs: true
+          fetch-depth: 0
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -51,6 +53,17 @@ jobs:
             *)
               echo "unknown variant: $VARIANT"; exit 1 ;;
           esac
+
+      - name: Rename debug APK with commit info
+        if: ${{ github.event_name == 'push' || inputs.variant == 'debug' || inputs.variant == 'both' }}
+        run: |
+          SHORT=$(git rev-parse --short HEAD)
+          COUNT=$(git rev-list --count HEAD)
+          for f in app/build/outputs/apk/debug/*.apk; do
+            [ -e "$f" ] || continue
+            mv "$f" "app/build/outputs/apk/debug/dsh-launcher-debug-r${COUNT}-${SHORT}.apk"
+          done
+          ls -la app/build/outputs/apk/debug/
 
       - name: Upload debug APK artifact
         if: ${{ github.event_name == 'push' || inputs.variant == 'debug' || inputs.variant == 'both' }}

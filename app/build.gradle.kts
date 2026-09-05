@@ -2,6 +2,33 @@ plugins {
     id("com.android.application")
 }
 
+// ---- 版本号自动注入（来自 git commit）----
+// commitShort: HEAD 短哈希；commitCount: 提交总数（单调递增，适合做 debug versionCode）
+// git 不可用时回退到环境变量（CI 可显式传入），再回退到固定值。
+fun runGit(vararg args: String): String? = try {
+    val p = ProcessBuilder(listOf("git") + args.toList())
+        .redirectErrorStream(true)
+        .start()
+    val out = p.inputStream.bufferedReader().readText().trim()
+    p.waitFor()
+    if (p.exitValue() == 0 && out.isNotEmpty() && !out.contains("fatal")) out else null
+} catch (_: Exception) {
+    null
+}
+
+val commitShort: String =
+    runGit("rev-parse", "--short", "HEAD")
+        ?: System.getenv("DSH_COMMIT_SHORT")?.takeIf { it.isNotBlank() }
+        ?: "unknown"
+val commitCount: Int =
+    runGit("rev-list", "--count", "HEAD")?.toIntOrNull()
+        ?: System.getenv("DSH_COMMIT_COUNT")?.toIntOrNull()
+        ?: 1
+
+// 基线版本号（release 使用；debug 的 versionCode 也不会低于它，防止历史重写导致回退）
+val baseVersionCode = 37
+val baseVersionName = "4.10.2-fix6"
+
 android {
     namespace = "com.dsh.launcher"
     // compileSdk=35：与现有本地 SDK 环境匹配（android-36 platform 需另行下载）；
@@ -12,8 +39,8 @@ android {
         applicationId = "com.dsh.launcher"
         minSdk = 24
         targetSdk = 28
-        versionCode = 37
-        versionName = "4.10.2-fix6"
+        versionCode = baseVersionCode
+        versionName = baseVersionName
     }
 
     buildTypes {
@@ -62,6 +89,20 @@ android {
         unitTests {
             isReturnDefaultValues = true
             isIncludeAndroidResources = true
+        }
+    }
+}
+
+// debug 变体版本号自动带 commit 编号（AGP Variant API）：
+//   versionName = 4.10.2-fix6-debug.<短哈希>
+//   versionCode = 提交总数（保证覆盖安装递增，且不低于基线）
+androidComponents {
+    onVariants { variant ->
+        if (variant.buildType == "debug") {
+            variant.outputs.forEach { out ->
+                out.versionCode.set(maxOf(baseVersionCode, commitCount))
+                out.versionName.set("$baseVersionName-debug.$commitShort")
+            }
         }
     }
 }
