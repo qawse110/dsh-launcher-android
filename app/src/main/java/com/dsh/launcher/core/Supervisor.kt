@@ -95,4 +95,25 @@ object Supervisor {
     fun noteWebUp(ctx: Context) {
         if (failStreak(ctx) != 0) prefs(ctx).edit().putInt(KEY_FAIL_STREAK, 0).apply()
     }
+
+    /** 触发崩溃循环自动回滚的连续无效拉起次数（约 32 分钟冷却累计）。 */
+    private const val CRASH_LOOP_ROLLBACK_STREAK = 5
+
+    /**
+     * 崩溃循环自动回滚判定：期望运行、连续 [CRASH_LOOP_ROLLBACK_STREAK] 次
+     * 拉起后 web 仍不可达——判定新版本大概率损坏（启动即崩）。临时窗口内
+     * 置回滚 tag 并由调用方重跑安装流程；每窗口最多一次（KEY_AUTO_ROLLED 守卫）。
+     *
+     * @return true=已触发自动回滚（调用方应重跑安装流程）
+     */
+    fun maybeRollbackOnCrashLoop(ctx: Context, onLog: (String) -> Unit): Boolean {
+        if (failStreak(ctx) < CRASH_LOOP_ROLLBACK_STREAK) return false
+        if (!desiredRunning(ctx)) return false
+        // 安装流程进行中不抢跑（流程自身已有安装失败→回滚的两轮逻辑）
+        if (DshFlow.isBusy()) return false
+        if (!DshUpdater.isTempWindow(ctx)) return false
+        // 消费本次判定：无论回滚是否被守卫拦截，都归零退避重试拉起
+        noteWebUp(ctx)
+        return DshUpdater.maybeAutoRollback(ctx, onLog)
+    }
 }

@@ -11,6 +11,8 @@ import android.content.Context
  */
 object DshWatchdog {
 
+    private const val TAG_WATCHDOG = "DshWatchdog"
+
     /** dsh web 端口是否可访问。 */
     fun isUp(): Boolean {
         val conn = try {
@@ -40,6 +42,16 @@ object DshWatchdog {
         if (isUp()) {
             // web 正常：归零 revive 失败退避计数，恢复基础冷却
             Supervisor.noteWebUp(context)
+            return
+        }
+        // 崩溃循环检测：连续多次拉起无效 + 临时窗口内 → 自动回滚重装上一版本
+        if (Supervisor.maybeRollbackOnCrashLoop(context) { AppLog.i(TAG_WATCHDOG, it) }) {
+            AppLog.i(TAG_WATCHDOG, "crash-loop in temp window, auto-rollback reinstall triggered")
+            DshFlow.launch(
+                context, DshFlow.Mode.INSTALL_AND_START,
+                forceFullInstall = true,
+                onLog = { AppLog.i(TAG_WATCHDOG, it) },
+            )
             return
         }
         Supervisor.reviveWebIfDue(context)

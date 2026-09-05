@@ -190,8 +190,16 @@ object DshUpdater {
     private const val KEY_AUTO_ROLLED = "dsh_auto_rolled"
     /** auto-rolled 守卫置位时间：超过守卫期后允许下一次更新重新记录基线（防死锁）。 */
     private const val KEY_ROLLED_AT = "dsh_auto_rolled_at"
+    /** 临时窗口开启时刻（afterInstall 时写）：自动确认的最短观察期起点。 */
+    private const val KEY_TEMP_AT = "dsh_temp_at"
     /** 临时版本连续成功启动几次后自动确认（撤销回滚基线）。 */
     private const val AUTO_CONFIRM_BOOTS = 3
+    /**
+     * 自动确认的最短观察期：插件不兼容往往在启动成功数小时后才暴露
+     * （如 attachment/视觉链路、provider 相关功能），「3 次快速启动」
+     * 就撤掉基线太松。需 3 次启动 **且** 窗口开启满 24h 才自动确认。
+     */
+    private const val AUTO_CONFIRM_MIN_AGE_MS = 24L * 60 * 60 * 1000
     /**
      * auto-rolled 守卫最大生效时长：回滚重装应在两次 attempt（分钟级）内结束，
      * 超时仍未清理视为回滚安装失败/中断，守卫失效，允许后续更新重新记录基线。
@@ -225,6 +233,7 @@ object DshUpdater {
             .putString(KEY_PREV_VERSION, cur)
             .remove(KEY_TEMP_VERSION)
             .remove(KEY_TEMP_BOOTS)
+            .remove(KEY_TEMP_AT)
             .apply()
         onLog("临时更新保护开启：可回滚到 v$cur")
         return true
@@ -251,13 +260,17 @@ object DshUpdater {
             clearTemp(ctx)
             return
         }
-        console(ctx).edit().putString(KEY_TEMP_VERSION, cur).apply()
-        onLog("已临时更新到 v$cur（回滚保护中，可回滚到 v$prev）")
+        console(ctx).edit()
+            .putString(KEY_TEMP_VERSION, cur)
+            .putLong(KEY_TEMP_AT, System.currentTimeMillis())
+            .apply()
+        onLog("已临时更新到 v$cur（回滚保护中，可回滚到 v$prev；24h 观察期后自动确认）")
     }
 
     /**
-     * web 成功启动后调用：临时版本连续稳定启动 [AUTO_CONFIRM_BOOTS] 次即自动确认
-     * （撤销回滚基线），避免一直挂着「回滚」提示。
+     * web 成功启动后调用：临时版本连续成功启动 [AUTO_CONFIRM_BOOTS] 次
+     * **且**窗口开启满 [AUTO_CONFIRM_MIN_AGE_MS] 后自动确认（撤销回滚基线），
+     * 避免一直挂着「回滚」提示；观察期防止「启动正常但功能不兼容」被过早确认。
      */
     fun noteSuccessfulBoot(ctx: Context, onLog: (String) -> Unit) {
         if (!isTempWindow(ctx)) return
@@ -269,8 +282,12 @@ object DshUpdater {
         }
         val n = console(ctx).getInt(KEY_TEMP_BOOTS, 0) + 1
         console(ctx).edit().putInt(KEY_TEMP_BOOTS, n).apply()
-        if (n >= AUTO_CONFIRM_BOOTS) {
-            onLog("临时版本 v$cur 连续 ${n} 次稳定启动，自动确认此版本")
+        // 兼容旧数据：窗口时间戳缺失时以本次启动时刻起算（保守，不会提前确认）
+        val tempAt = console(ctx).getLong(KEY_TEMP_AT, 0L)
+        if (tempAt <= 0L) console(ctx).edit().putLong(KEY_TEMP_AT, System.currentTimeMillis()).apply()
+        val ageOk = tempAt > 0L && System.currentTimeMillis() - tempAt >= AUTO_CONFIRM_MIN_AGE_MS
+        if (n >= AUTO_CONFIRM_BOOTS && ageOk) {
+            onLog("临时版本 v$cur 连续 ${n} 次稳定启动且观察期已满，自动确认此版本")
             clearTemp(ctx)
         }
     }
@@ -316,6 +333,7 @@ object DshUpdater {
             .remove(KEY_PREV_VERSION)
             .remove(KEY_TEMP_VERSION)
             .remove(KEY_TEMP_BOOTS)
+            .remove(KEY_TEMP_AT)
             .remove(KEY_AUTO_ROLLED)
             .remove(KEY_ROLLED_AT)
             .apply()

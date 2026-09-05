@@ -148,16 +148,45 @@ class DshUpdaterTest {
         assertFalse(DshUpdater.isTempWindow(ctx))
     }
 
-    @Test fun `noteSuccessfulBoot 连续3次自动确认`() {
+    @Test fun `noteSuccessfulBoot 3次启动且观察期已满才自动确认`() {
         fakeInstall("1.0.0")
         DshUpdater.recordRollbackBaselineIfChanging(ctx, changing = true, ::log)
         fakeInstall("2.0.0")
         DshUpdater.afterInstall(ctx, ::log)
+        // 把窗口时间拨回 25h 前（观察期 24h 已满）
+        console().edit().putLong("dsh_temp_at", System.currentTimeMillis() - 25L * 3600_000).commit()
         DshUpdater.noteSuccessfulBoot(ctx, ::log)
         DshUpdater.noteSuccessfulBoot(ctx, ::log)
         assertTrue(DshUpdater.isTempWindow(ctx)) // 前 2 次仍保护
         DshUpdater.noteSuccessfulBoot(ctx, ::log)
-        assertFalse(DshUpdater.isTempWindow(ctx)) // 第 3 次自动确认
+        assertFalse(DshUpdater.isTempWindow(ctx)) // 第 3 次 + 观察期已满 → 自动确认
+    }
+
+    @Test fun `noteSuccessfulBoot 3次启动但观察期未满不确认`() {
+        fakeInstall("1.0.0")
+        DshUpdater.recordRollbackBaselineIfChanging(ctx, changing = true, ::log)
+        fakeInstall("2.0.0")
+        DshUpdater.afterInstall(ctx, ::log) // temp_at = now
+        repeat(3) { DshUpdater.noteSuccessfulBoot(ctx, ::log) }
+        assertTrue(DshUpdater.isTempWindow(ctx)) // 3 次了，但窗口刚开 → 保护不撤
+        // 观察期满后再启动一次即确认
+        console().edit().putLong("dsh_temp_at", System.currentTimeMillis() - 25L * 3600_000).commit()
+        DshUpdater.noteSuccessfulBoot(ctx, ::log)
+        assertFalse(DshUpdater.isTempWindow(ctx))
+    }
+
+    @Test fun `noteSuccessfulBoot 旧数据无 temp_at 时间戳时保守起算`() {
+        fakeInstall("1.0.0")
+        DshUpdater.recordRollbackBaselineIfChanging(ctx, changing = true, ::log)
+        fakeInstall("2.0.0")
+        DshUpdater.afterInstall(ctx, ::log)
+        console().edit().remove("dsh_temp_at").commit()
+        repeat(3) { DshUpdater.noteSuccessfulBoot(ctx, ::log) }
+        assertTrue(DshUpdater.isTempWindow(ctx)) // 时间戳缺失以本次起算，不会提前确认
+        // 补上 25h 前的时间戳后确认
+        console().edit().putLong("dsh_temp_at", System.currentTimeMillis() - 25L * 3600_000).commit()
+        DshUpdater.noteSuccessfulBoot(ctx, ::log)
+        assertFalse(DshUpdater.isTempWindow(ctx))
     }
 
     @Test fun `noteSuccessfulBoot 版本与窗口不一致直接关窗`() {
@@ -288,5 +317,68 @@ class DshUpdaterTest {
         assertEquals("1.0.0", DshUpdater.prevVersion(ctx))
         assertNull(DshUpdater.tempVersion(ctx))
         assertEquals(0, console().getInt("dsh_temp_boots", 0))
+        // temp_at 也一并清理
+        assertEquals(0L, console().getLong("dsh_temp_at", 0L))
+    }
+
+    // ================= 崩溃循环自动回滚（Supervisor.maybeRollbackOnCrashLoop） =================
+
+    private fun keepalive() =
+        ctx.getSharedPreferences(AppState.Prefs.KEEPALIVE, Context.MODE_PRIVATE)
+
+    private fun bumpCrashStreak(n: Int) {
+        keepalive().edit().putInt("watchdog_fail_streak", n).commit()
+    }
+
+    private fun crashStreak(): Int = keepalive().getInt("watchdog_fail_streak", 0)
+
+    @Test fun `crashLoop 达阈值且临时窗口内触发回滚并归零计数`() {
+        fakeInstall("1.0.0")
+        DshUpdater.recordRollbackBaselineIfChanging(ctx, changing = true, ::log)
+        fakeInstall("2.0.0")
+        DshUpdater.afterInstall(ctx, ::log)
+        // 期望运行态置 true（crash-loop 判定前置条件）
+        keepalive().edit().putBoolean("running", true).commit()
+        bumpCrashStreak(5)
+
+        assertTrue(Supervisor.maybeRollbackOnCrashLoop(ctx, ::log))
+        assertEquals("1.0.0", console().getString("dsh_install_tag", null))
+        assertEquals(0, crashStreak()) // 判定消费后归零
+        assertTrue(DshUpdater.isTempWindow(ctx)) // 窗口保持，等回滚安装后关闭
+    }
+
+    @Test fun `crashLoop 阈值未到不触发`() {
+        fakeInstall("1.0.0")
+        DshUpdater.recordRollbackBaselineIfChanging(ctx, changing = true, ::log)
+        fakeInstall("2.0.0")
+        DshUpdater.afterInstall(ctx, ::log)
+        keepalive().edit().putBoolean("running", true).commit()
+        bumpCrashStreak(4)
+
+        assertFalse(Supervisor.maybeRollbackOnCrashLoop(ctx, ::log))
+        assertNull(console().getString("dsh_install_tag", null))
+    }
+
+    @Test fun `crashLoop 不在临时窗口时不触发且不误清计数`() {
+        // 无临时窗口：dsh 一直没更新过，web 起不来可能是别的原因
+        fakeInstall("1.0.0")
+        keepalive().edit().putBoolean("running", true).commit()
+        bumpCrashStreak(7)
+
+        assertFalse(Supervisor.maybeRollbackOnCrashLoop(ctx, ::log))
+        assertEquals(7, crashStreak()) // 未消费
+        assertNull(console().getString("dsh_install_tag", null))
+    }
+
+    @Test fun `crashLoop 用户已显式停止时不触发`() {
+        fakeInstall("1.0.0")
+        DshUpdater.recordRollbackBaselineIfChanging(ctx, changing = true, ::log)
+        fakeInstall("2.0.0")
+        DshUpdater.afterInstall(ctx, ::log)
+        // running=false（用户点过「停止 dsh 服务」）
+        bumpCrashStreak(6)
+
+        assertFalse(Supervisor.maybeRollbackOnCrashLoop(ctx, ::log))
+        assertNull(console().getString("dsh_install_tag", null))
     }
 }

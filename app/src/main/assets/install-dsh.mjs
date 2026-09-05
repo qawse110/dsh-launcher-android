@@ -422,6 +422,19 @@ function untarWithPrefix(buf, dest, prefix) {
   return files;
 }
 
+/** 轻量内容指纹（fnv1a 32bit + 字节数）：本地 debug 重建 versionCode 不变时，
+ *  也能感知资产内容变化。文件取长度+头 64KB；目录由调用方聚合。 */
+function contentFingerprint(buf) {
+  let h = 0x811c9dc5;
+  const n = Math.min(buf.length, 64 * 1024);
+  const step = Math.max(1, Math.floor(n / 4096)); // 最多采样 4KB 点
+  for (let i = 0; i < n; i += step) {
+    h ^= buf[i];
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16) + '-' + buf.length;
+}
+
 function extractPlugins() {
   if (!PREBUILT || !existsSync(PREBUILT)) {
     log('DSH_PREBUILT not set or missing, skip bundled plugin extraction');
@@ -430,19 +443,21 @@ function extractPlugins() {
   // 提取完成标记由脚本自己维护（不能由 prebuilt 拷贝侧维护）：APK 升级后
   // prebuilt 可能已覆盖为新包，但 plugins 目录还是旧包，必须在提取成功后
   // 才写标记；否则会误跳过新包的提取。
+  // 标记格式：apk:<ver>/<指纹>——指纹覆盖同 versionCode 换包的场景（本地 debug 重建）。
   const extractedMarker = join(FILES_DIR, '.plugins-extracted-ok');
+  const raw = readFileSync(PREBUILT);
+  const buf = (raw[0] === 0x1f && raw[1] === 0x8b) ? gunzipSync(raw) : raw;
+  const prebuiltFp = contentFingerprint(buf);
   let markerOk = false;
   if (DSH_APK_VER && existsSync(extractedMarker)) {
-    try { markerOk = readFileSync(extractedMarker, 'utf8').trim() === 'apk:' + DSH_APK_VER; } catch {}
+    try { markerOk = readFileSync(extractedMarker, 'utf8').trim() === 'apk:' + DSH_APK_VER + '/' + prebuiltFp; } catch {}
   }
   if (markerOk && BUILTIN_PLUGINS.every((d) => existsSync(join(PLUGINS_DIR, d, 'package.json')))) {
-    log('bundled plugins already extracted for apk:' + DSH_APK_VER + ', skip untar');
+    log('bundled plugins already extracted for apk:' + DSH_APK_VER + '/' + prebuiltFp + ', skip untar');
     return;
   }
   try {
     mkdirSync(PLUGINS_DIR, { recursive: true });
-    const raw = readFileSync(PREBUILT);
-    const buf = (raw[0] === 0x1f && raw[1] === 0x8b) ? gunzipSync(raw) : raw;
     let extractedFiles = untarWithPrefix(buf, PLUGINS_DIR, 'third_party');
     // 兼容直接打包 plugins.tgz（顶层就是插件目录而非 third_party/）：
     // 如果上面没解出任何东西且包内没有 third_party 前缀，再整体解到 plugins。
@@ -453,7 +468,7 @@ function extractPlugins() {
     }
     const builtinReady = BUILTIN_PLUGINS.some((d) => existsSync(join(PLUGINS_DIR, d, 'package.json')));
     if (extractedFiles > 0 && builtinReady && DSH_APK_VER) {
-      try { writeFileSync(extractedMarker, 'apk:' + DSH_APK_VER + '\n'); } catch {}
+      try { writeFileSync(extractedMarker, 'apk:' + DSH_APK_VER + '/' + prebuiltFp + '\n'); } catch {}
     }
   } catch (t) {
     log('WARN extract plugins failed: ' + t.message);
@@ -489,11 +504,38 @@ const EXTRA_SYNC_MARKER = join(FILES_DIR, '.extra-plugins-synced.json');
 function readSyncMarker() {
   try { return JSON.parse(readFileSync(EXTRA_SYNC_MARKER, 'utf8')); } catch { return {}; }
 }
+/** 目录内容聚合指纹：递归每个文件取 fnv1a(相对路径+长度+头 64KB 采样) 后再聚合。
+ *  覆盖「版本号没 bump 但内容变了」与同 versionCode 换包两种场景。 */
+function dirFingerprint(dir) {
+  let h = 0x811c9dc5;
+  const update = (s) => {
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i) & 0xff;
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+  };
+  const walk = (d, rel) => {
+    let ents;
+    try { ents = readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of ents.sort((a, b) => a.name < b.name ? -1 : 1)) {
+      const r = rel ? rel + '/' + e.name : e.name;
+      if (e.isDirectory()) { walk(join(d, e.name), r); continue; }
+      if (!e.isFile()) continue;
+      try {
+        const buf = readFileSync(join(d, e.name));
+        update(r + ':' + contentFingerprint(buf));
+      } catch {}
+    }
+  };
+  walk(dir, '');
+  return h.toString(16);
+}
+
 function syncExtraPlugin(dir, dest) {
   const src = join(EXTRA_PLUGINS_SRC, dir);
   if (!existsSync(join(src, 'package.json'))) return false;
   const srcVer = pkgVersion(src);
-  const sig = srcVer + '@apk:' + (DSH_APK_VER || '0');
+  const sig = srcVer + '@apk:' + (DSH_APK_VER || '0') + '/' + dirFingerprint(src);
   const markers = readSyncMarker();
   if (markers[dir] === sig && existsSync(join(dest, 'package.json'))) return false;
   const dstVer = pkgVersion(dest);

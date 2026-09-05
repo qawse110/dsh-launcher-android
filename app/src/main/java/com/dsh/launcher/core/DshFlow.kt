@@ -38,6 +38,9 @@ object DshFlow {
 
     private val busy = java.util.concurrent.atomic.AtomicBoolean(false)
 
+    /** 是否有启动/安装流程正在执行（崩溃循环回滚判定用它避免抢跑）。 */
+    fun isBusy(): Boolean = busy.get()
+
     const val WEB_PORT = 3080
 
     /** 统一日志文件名（files/logs/ 下，见 [FileLog]）。 */
@@ -232,9 +235,17 @@ object DshFlow {
             attempt++
             val tag = ctx.getSharedPreferences(AppState.Prefs.CONSOLE, Context.MODE_PRIVATE)
                 .getString("dsh_install_tag", "latest") ?: "latest"
-            // 走到这里必然执行 npm 安装 → 版本可能变化 → 记录回滚基线。
-            // （自动回滚重装中被标记跳过，保持原始基线；未变化时 afterInstall 会撤销）
-            DshUpdater.recordRollbackBaselineIfChanging(ctx, true, ::fl)
+            // 回滚重装（tag=精确旧版本）显式跳过基线记录：此时要回到的就是基线本身，
+            // 记录会把它覆盖成回滚目标——此前行为正确只是靠 afterInstall 的 cur==prev
+            // 分支兜底，这里把语义显式化。
+            val isRollbackAttempt = tag != "latest" && tag != "next"
+            if (isRollbackAttempt) {
+                fl("  回滚重装 attempt：保持原基线，不重新记录")
+            } else {
+                // 走到这里必然执行 npm 安装 → 版本可能变化 → 记录回滚基线。
+                // （自动回滚重装中被 auto-rolled 守卫跳过；未变化时 afterInstall 会撤销）
+                DshUpdater.recordRollbackBaselineIfChanging(ctx, true, ::fl)
+            }
 
             fl(">> 3/4 官方 npm 安装/更新 dsh + dsh plugin 装配内置插件…")
             if (tag != "latest") fl("  （安装 dist-tag=$tag 预发布/回滚线）")

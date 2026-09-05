@@ -515,7 +515,8 @@ class MainActivity : AppCompatActivity() {
             text = buildString {
                 append("dsh 已临时更新到 v$rcCur，处于回滚保护期")
                 if (rcPrev != null) append("（可回滚到 v$rcPrev）")
-                append("：连续 3 次稳定启动后自动确认；若插件不兼容导致异常，可随时一键回到上一版本。")
+                append("：连续 3 次稳定启动且观察满 24h 后自动确认；若新版本启动异常，")
+                append("多次拉起失败后也会自动回滚。插件不兼容可随时一键回到上一版本。")
             }
             textSize = 12f
             setTextColor(Ui.TEXT_SECONDARY)
