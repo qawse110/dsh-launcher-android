@@ -68,6 +68,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var updateBtn: View
     /** 临时更新回滚卡片（isTempWindow 时显示）。 */
     private lateinit var rollbackCard: ViewGroup
+    /** 回滚卡片内容容器（renderRollbackCard 每次重建其子视图）。 */
+    private lateinit var rollbackCardBody: LinearLayout
     private var flowing = false
     private var lastMode: DshFlow.Mode = DshFlow.Mode.INSTALL_AND_START
 
@@ -79,6 +81,8 @@ class MainActivity : AppCompatActivity() {
     private val pollRunnable = object : Runnable {
         override fun run() {
             if (!flowing) refreshRunState(silent = true)
+            // 回滚卡片动态刷新（boot 进度 / 观察期倒计时 / 崩溃循环进度随时间变化）
+            if (!flowing) refreshRollbackCard()
             // 每 50 轮（~150s）做一次 npm 版本检查
             updateCheckCount++
             if (updateCheckCount >= 50 && !flowing && DshFlow.isInstalled(this@MainActivity)) {
@@ -496,50 +500,17 @@ class MainActivity : AppCompatActivity() {
         updateCard.addView(ucCol)
         root.addView(updateCard)
 
-        // ---- 临时更新回滚卡片（仅临时更新窗口内可见） ----
+        // ---- 临时更新回滚卡片（仅临时更新窗口内可见；内容由 renderRollbackCard 动态刷新） ----
         rollbackCard = Ui.card(this, radiusDp = 14, background = Ui.SURFACE_CONTAINER_HIGH, elevationDp = 1f).apply {
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply { topMargin = dp(8) }
         }
-        val rcCol = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        rcCol.addView(TextView(this).apply {
-            text = "⏪ 临时更新"
-            textSize = 13f
-            typeface = android.graphics.Typeface.DEFAULT_BOLD
-            setTextColor(Ui.WARNING)
-        })
-        val rcPrev = DshUpdater.prevVersion(this)
-        val rcCur = DshUpdater.tempVersion(this) ?: DshUpdater.currentVersion(this)
-        rcCol.addView(TextView(this).apply {
-            text = buildString {
-                append("dsh 已临时更新到 v$rcCur，处于回滚保护期")
-                if (rcPrev != null) append("（可回滚到 v$rcPrev）")
-                append("：连续 3 次稳定启动且观察满 24h 后自动确认；若新版本启动异常，")
-                append("多次拉起失败后也会自动回滚。插件不兼容可随时一键回到上一版本。")
-            }
-            textSize = 12f
-            setTextColor(Ui.TEXT_SECONDARY)
-            setPadding(0, dp(6), 0, dp(8))
-        })
-        rcCol.addView(
-            Ui.buttonGrid(
-                this,
-                listOf(
-                    Ui.button(
-                        this,
-                        if (rcPrev != null) "回滚到 v$rcPrev" else "回滚到上一版本",
-                        { confirmRollback() },
-                        filled = false, color = Ui.WARNING
-                    ),
-                    Ui.button(this, "确认此版本", { confirmTempVersion() }, filled = true)
-                ),
-                columns = 2
-            )
-        )
-        rollbackCard.addView(rcCol)
-        rollbackCard.visibility = if (DshUpdater.isTempWindow(this)) View.VISIBLE else View.GONE
+        rollbackCardBody = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        rollbackCard.addView(rollbackCardBody)
         root.addView(rollbackCard)
+        // 首帧先按当前窗口状态渲染（早于 autoRoute 的异步回调，避免闪现空卡）
+        refreshRollbackCard()
 
         // ---- 次级操作网格 ----
         root.addView(LinearLayout(this).apply {
@@ -678,10 +649,91 @@ class MainActivity : AppCompatActivity() {
         toast("已确认此版本，回滚保护关闭")
     }
 
+    /**
+     * 重建回滚卡片内容（主界面 3s 轮询 + onResume + 流程结束触发）。
+     * 展示：回滚保护状态、boot 进度（n/3）、观察期倒计时（剩余小时/分钟）、
+     * 崩溃循环进度（web 起不来时）、回滚/确认按钮。窗口关闭时整卡隐藏。
+     */
     private fun refreshRollbackCard() {
-        if (::rollbackCard.isInitialized) {
-            rollbackCard.visibility = if (DshUpdater.isTempWindow(this)) View.VISIBLE else View.GONE
+        if (!::rollbackCard.isInitialized || !::rollbackCardBody.isInitialized) return
+        val inWindow = DshUpdater.isTempWindow(this)
+        rollbackCard.visibility = if (inWindow) View.VISIBLE else View.GONE
+        if (!inWindow) return
+        val ctx = this
+        val prev = DshUpdater.prevVersion(ctx)
+        val cur = DshUpdater.tempVersion(ctx) ?: DshUpdater.currentVersion(ctx)
+        val boots = DshUpdater.tempBoots(ctx)
+        val bootsLeft = DshUpdater.bootsRemaining(ctx)
+        val observeLeftMs = DshUpdater.observeRemainingMs(ctx)
+        val rolled = DshUpdater.autoRollbackUsed(ctx)
+        val streak = Supervisor.failStreakCount(ctx)
+        val streakLeft = Supervisor.CRASH_LOOP_ROLLBACK_STREAK_PUBLIC - streak
+
+        rollbackCardBody.removeAllViews()
+        rollbackCardBody.addView(TextView(ctx).apply {
+            text = "⏪ 临时更新 · 回滚保护中"
+            textSize = 13f
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            setTextColor(Ui.WARNING)
+        })
+        // 状态行：版本 + 自动确认进度
+        val confirmLine = buildString {
+            append("dsh 已临时更新到 v$cur")
+            if (prev != null) append("（可回滚到 v$prev）")
+            append("\n自动确认：")
+            append(
+                when {
+                    bootsLeft > 0 -> "稳定启动 $boots/$bootDotTotal${" ".repeat(0)}"
+                    observeLeftMs > 0L -> "启动次数已满，观察期剩 " + formatDuration(observeLeftMs)
+                    else -> "条件已满足，下次启动后确认"
+                }
+            )
+            if (rolled) append("\n本窗口自动回滚已用过（升级失败时仅剩手动回滚）")
         }
+        rollbackCardBody.addView(TextView(ctx).apply {
+            text = confirmLine
+            textSize = 12f
+            setTextColor(Ui.TEXT_SECONDARY)
+            setPadding(0, dp(6), 0, dp(4))
+        })
+        // 崩溃循环进度：仅当 web 未运行且已有拉起失败累计时显示
+        if (!DshFlow.isWebUp() && streak > 0 && streakLeft > 0) {
+            rollbackCardBody.addView(TextView(ctx).apply {
+                text = "⚠ web 拉起失败 $streak/${Supervisor.CRASH_LOOP_ROLLBACK_STREAK_PUBLIC}，" +
+                    "再失败 $streakLeft 次将自动回滚到 v$prev"
+                textSize = 12f
+                setTextColor(Ui.WARNING)
+                setPadding(0, 0, 0, dp(4))
+            })
+        }
+        rollbackCardBody.addView(
+            Ui.buttonGrid(
+                ctx,
+                listOf(
+                    Ui.button(
+                        ctx,
+                        if (prev != null) "回滚到 v$prev" else "回滚到上一版本",
+                        { confirmRollback() },
+                        filled = false, color = Ui.WARNING
+                    ),
+                    Ui.button(ctx, "确认此版本", { confirmTempVersion() }, filled = true)
+                ),
+                columns = 2
+            )
+        )
+    }
+
+    /** 秒数格式化成「Xh Ym / Ym Zs」短文案。 */
+    private fun formatDuration(ms: Long): String {
+        val totalMin = ms / 60_000
+        val h = totalMin / 60
+        val m = totalMin % 60
+        return if (h > 0) "${h}h ${m}m" else "${m}m"
+    }
+
+    private companion object {
+        /** 与 DshUpdater.AUTO_CONFIRM_BOOTS 一致，仅用于文案展示。 */
+        const val bootDotTotal = 3
     }
 
     private fun guardBusy(action: String): Boolean =

@@ -193,7 +193,7 @@ object DshUpdater {
     /** 临时窗口开启时刻（afterInstall 时写）：自动确认的最短观察期起点。 */
     private const val KEY_TEMP_AT = "dsh_temp_at"
     /** 临时版本连续成功启动几次后自动确认（撤销回滚基线）。 */
-    private const val AUTO_CONFIRM_BOOTS = 3
+    const val AUTO_CONFIRM_BOOTS = 3
     /**
      * 自动确认的最短观察期：插件不兼容往往在启动成功数小时后才暴露
      * （如 attachment/视觉链路、provider 相关功能），「3 次快速启动」
@@ -217,6 +217,24 @@ object DshUpdater {
 
     /** 当前临时版本号（null 表示不在临时窗口）。 */
     fun tempVersion(ctx: Context): String? = console(ctx).getString(KEY_TEMP_VERSION, null)
+
+    // ---- 供 UI 渲染的窗口状态（只读，不产生副作用） ----
+
+    /** 临时窗口已累计的成功启动次数。 */
+    fun tempBoots(ctx: Context): Int = console(ctx).getInt(KEY_TEMP_BOOTS, 0)
+
+    /** 自动确认还差几次成功启动（0 = 次数已满足，仅剩观察期）。 */
+    fun bootsRemaining(ctx: Context): Int = (AUTO_CONFIRM_BOOTS - tempBoots(ctx)).coerceAtLeast(0)
+
+    /** 观察期剩余毫秒数（0 = 已满；无窗口/无时间戳返回 0 由调用方处理）。 */
+    fun observeRemainingMs(ctx: Context): Long {
+        val tempAt = console(ctx).getLong(KEY_TEMP_AT, 0L)
+        if (tempAt <= 0L) return 0L
+        return (AUTO_CONFIRM_MIN_AGE_MS - (System.currentTimeMillis() - tempAt)).coerceAtLeast(0L)
+    }
+
+    /** 本窗口是否已触发过自动回滚（true = 回滚额度已用，UI 可提示仅剩手动回滚）。 */
+    fun autoRollbackUsed(ctx: Context): Boolean = console(ctx).getBoolean(KEY_AUTO_ROLLED, false)
 
     /**
      * 全量安装/更新前调用：把当前已装版本记为回滚基线（仅当本次会改变版本且

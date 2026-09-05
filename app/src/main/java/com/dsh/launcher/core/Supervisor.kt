@@ -96,6 +96,12 @@ object Supervisor {
         if (failStreak(ctx) != 0) prefs(ctx).edit().putInt(KEY_FAIL_STREAK, 0).apply()
     }
 
+    /** 触发崩溃循环自动回滚的连续无效拉起次数阈值（UI 显示用）。 */
+    val CRASH_LOOP_ROLLBACK_STREAK_PUBLIC = CRASH_LOOP_ROLLBACK_STREAK
+
+    /** 当前连续无效拉起次数（UI 崩溃循环进度显示用，只读）。 */
+    fun failStreakCount(ctx: Context): Int = failStreak(ctx)
+
     /** 触发崩溃循环自动回滚的连续无效拉起次数（约 32 分钟冷却累计）。 */
     private const val CRASH_LOOP_ROLLBACK_STREAK = 5
 
