@@ -246,11 +246,15 @@ function ensureDsh() {
   ensureHostPkg();
   const tag = process.env.DSH_TAG || 'latest';
   const pkgSpec = `@deepseek-ai/dsh@${tag}`;
+  const pkgDir = join(DSH_PREFIX, 'node_modules/@deepseek-ai/dsh');
+  const beforeVersion = (() => {
+    try { return JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8')).version || ''; } catch { return ''; }
+  })();
   const pnpmBin = join(FILES_DIR, '.tools', 'bin', 'pnpm');
   const pnpmStoreEnv = { npm_config_store_dir: join(FILES_DIR, '.tools', 'pnpm-store') };
   const pnpmCommon = ['--ignore-scripts', '--prefer-offline', '--reporter', 'append-only', '--loglevel', 'warn'];
 
-  log(`install/update ${pkgSpec} ...`);
+  log(`install/update ${pkgSpec} ... (currently ${beforeVersion || 'absent'})`);
   // 引擎优先级：pnpm（内存占用远低于 npm；npm Arborist 在设备上解析 150+ 包
   // 依赖树会把 2GB 堆吃爆 OOM）→ 换官方源再试 pnpm → 最后才用 npm 兜底并调大堆。
   const attempts = [
@@ -296,11 +300,49 @@ function ensureDsh() {
     log('FATAL: official dsh install/update failed after all engines/registries');
     process.exit(1);
   }
+  // 升级有效性校验：包管理器在已有依赖满足 spec（如 ^0.1.1-rc.2 对 latest
+  // 解析出 0.1.2-rc.1 视为已满足）时会 exit=0 但什么都不装。这里对照
+  // dist-tag 实际解析版本；未达 tag 则 remove 后强制重装一次。
+  let afterVersion = beforeVersion;
+  let distTagVersion = '';
   try {
-    const pkg = JSON.parse(readFileSync(join(DSH_PREFIX, 'node_modules/@deepseek-ai/dsh/package.json'), 'utf8'));
-    const lock = existsSync(join(DSH_PREFIX, 'pnpm-lock.yaml')) ? 'pnpm' : 'npm';
-    log(`dsh version: ${pkg.version || 'unknown'} (lockfile=${lock})`);
+    afterVersion = JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8')).version || '';
   } catch {}
+  try {
+    const regBody = runCapture(NODE_BIN, [
+      '-e',
+      `fetch((process.env.DSH_REG_URL||'')+'/@deepseek-ai/dsh').then(r=>r.json()).then(j=>{console.log(JSON.stringify(j['dist-tags']||{}))}).catch(()=>console.log('{}'))`,
+    ], { env: { ...envBase(), DSH_REG_URL: REGISTRY }, timeoutMs: 60_000 });
+    distTagVersion = String(JSON.parse(regBody || '{}')[tag] || '');
+  } catch (e) {
+    log('WARN dist-tag probe failed: ' + e.message);
+  }
+  const tagSatisfied = !distTagVersion || afterVersion === distTagVersion ||
+    (typeof cmpVer === 'function' && cmpVer(afterVersion, distTagVersion) >= 0);
+  if (!tagSatisfied) {
+    log(`stale install detected: ${afterVersion} != dist-tag ${tag}=${distTagVersion}, force reinstall`);
+    runEx(pnpmBin, ['remove', '--dir', DSH_PREFIX, '@deepseek-ai/dsh', ...pnpmCommon],
+      { env: { ...envBase(), ...pnpmStoreEnv }, timeoutMs: NPM_TIMEOUT_MS });
+    const fr = runEx(pnpmBin, ['add', '--dir', DSH_PREFIX, pkgSpec, '--registry', REGISTRY, ...pnpmCommon],
+      { env: { ...envBase(), ...pnpmStoreEnv }, timeoutMs: NPM_TIMEOUT_MS });
+    try {
+      afterVersion = JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8')).version || afterVersion;
+    } catch {}
+    if (!fr.ok || afterVersion === beforeVersion) {
+      log(`WARN forced reinstall still at ${afterVersion} (registry mirror may lag upstream)`);
+    }
+  }
+  try {
+    const lock = existsSync(join(DSH_PREFIX, 'pnpm-lock.yaml')) ? 'pnpm' : 'npm';
+    log(`dsh version: ${afterVersion || 'unknown'} (lockfile=${lock}, dist-tag ${tag}=${distTagVersion || '?'})`);
+  } catch {}
+}
+
+/** runEx 的静默变体：不回显命令行、输出不进终端日志，返回 stdout。 */
+function runCapture(cmd, args, opts = {}) {
+  const r = spawnSync(cmd, args, { timeout: opts.timeoutMs ?? 60_000, encoding: 'utf8', env: opts.env || process.env });
+  if (r.error) throw r.error;
+  return r.stdout || '';
 }
 
 /**
