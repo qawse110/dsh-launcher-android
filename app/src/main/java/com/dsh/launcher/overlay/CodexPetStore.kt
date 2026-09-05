@@ -136,6 +136,19 @@ object CodexPetStore {
         null
     }
 
+    /** 读取桌宠包元数据（M8）：支持内置 assets 包与用户文件夹两种来源。 */
+    private fun readMetaOf(context: Context, pet: CodexPetInfo): JSONObject? = when (val src = pet.source) {
+        is PetSource.BundledDefault -> try {
+            JSONObject(
+                context.assets.open("$BUNDLED_DIR/pet.json")
+                    .bufferedReader().use { it.readText() }
+            )
+        } catch (e: Exception) {
+            null
+        }
+        is PetSource.Folder -> readMeta(src.dir)
+    }
+
     /** 打开精灵表（按目标显示尺寸采样解码），失败返回 null。
      *  targetHeightDp：桌宠显示高度（dp），决定解码清晰度（默认 132）。 */
     fun openAtlas(context: Context, pet: CodexPetInfo, targetHeightDp: Int = 132): CodexPetAtlas? {
@@ -144,14 +157,23 @@ object CodexPetStore {
                 val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
                 BitmapFactory.decodeStream(first, null, bounds)
                 if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
-                val baseCellW: Int
-                val baseCellH: Int
-                if (bounds.outWidth == 1536 && (bounds.outHeight == 1872 || bounds.outHeight == 2288)) {
-                    baseCellW = 192
-                    baseCellH = 208
-                } else {
-                    baseCellW = bounds.outWidth / 8
-                    baseCellH = bounds.outHeight / 9
+                // 网格推断优先级（M8）：
+                //  1. pet.json 显式声明的 columns/rows（作者最清楚自己的表）；
+                //  2. 官方 v1/v2 标准尺寸（1536×1872 / 1536×2288 → 192×208）；
+                //  3. 兜底按 8 列猜，行数用「列宽整除」反推，避免把 8x11 表按 9 行错切。
+                val meta = readMetaOf(context, pet)
+                val cols = meta?.optInt("columns", 0)?.takeIf { it > 0 }
+                    ?: if (bounds.outWidth == 1536) 8 else 0
+                val rows = meta?.optInt("rows", 0)?.takeIf { it > 0 }
+                val baseCellW = when {
+                    cols > 0 -> bounds.outWidth / cols
+                    else -> bounds.outWidth / 8
+                }
+                val baseCellH = when {
+                    rows != null && rows > 0 -> bounds.outHeight / rows
+                    bounds.outWidth == 1536 && (bounds.outHeight == 1872 || bounds.outHeight == 2288) ->
+                        bounds.outHeight / if (bounds.outHeight == 2288) 11 else 9
+                    else -> bounds.outHeight / 9
                 }
                 if (baseCellW <= 0 || baseCellH <= 0) return null
                 // 按「单元格显示像素」采样：保证解码后每格像素不低于屏幕显示所需，
@@ -159,10 +181,10 @@ object CodexPetStore {
                 val density = context.resources.displayMetrics.density
                 val displayCellW = (targetHeightDp * density * baseCellW / baseCellH.toFloat()).toInt()
                 var sample = 1
-                while (sample * 2 <= 16 &&
-                    baseCellW / (sample * 2) >= displayCellW &&
-                    bounds.outWidth / (sample * 2) >= 2048
-                ) {
+                // 降采样上界：解码后单元格仍不小于显示所需即可（原第二个条件要求
+                // 「整表宽度 ≥2048」——对标准 1536 宽的表恒为假，整个循环一次都不进，
+                // 等于没有上限约束；改为只看单元格，语义与注释一致）
+                while (sample * 2 <= 16 && baseCellW / (sample * 2) >= displayCellW) {
                     sample *= 2
                 }
                 // 内存兜底：解码后总像素不超过约 12M（ARGB_8888 ≈ 48MB）
@@ -177,7 +199,7 @@ object CodexPetStore {
                         inPreferredConfig = Bitmap.Config.ARGB_8888
                     }
                     val bmp = BitmapFactory.decodeStream(second, null, opts) ?: return null
-                    // v1/v2 均按采样后的基准单元格尺寸计算，避免 8x11（v2）表按 height/9 错切
+                    // 网格按解码前的基准单元格除以采样倍数，v1/v2/自定义表都一致
                     CodexPetAtlas(bmp, baseCellW / sample, baseCellH / sample)
                 }
             }
@@ -188,21 +210,16 @@ object CodexPetStore {
 
     private fun openSheetStream(context: Context, pet: CodexPetInfo): InputStream? {
         return when (val src = pet.source) {
-            is PetSource.BundledDefault -> {
-                try {
-                    val meta = JSONObject(
-                        context.assets.open("$BUNDLED_DIR/pet.json")
-                            .bufferedReader().use { it.readText() }
-                    )
-                    val path = meta.optString("spritesheetPath", "spritesheet.png")
-                    context.assets.open("$BUNDLED_DIR/$path")
-                } catch (e: Exception) {
-                    null
-                }
+            is PetSource.BundledDefault -> try {
+                val path = readMetaOf(context, pet)?.optString("spritesheetPath", "spritesheet.png")
+                    ?: "spritesheet.png"
+                context.assets.open("$BUNDLED_DIR/$path")
+            } catch (e: Exception) {
+                null
             }
             is PetSource.Folder -> {
-                val meta = readMeta(src.dir)
-                val path = meta?.optString("spritesheetPath", "spritesheet.webp") ?: "spritesheet.webp"
+                val path = readMetaOf(context, pet)?.optString("spritesheetPath", "spritesheet.webp")
+                    ?: "spritesheet.webp"
                 val file = when {
                     File(src.dir, path).isFile -> File(src.dir, path)
                     File(src.dir, "spritesheet.webp").isFile -> File(src.dir, "spritesheet.webp")

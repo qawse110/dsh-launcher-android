@@ -20,7 +20,6 @@ import java.util.Locale
 import java.util.TimeZone
 import java.util.UUID
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import com.dsh.launcher.core.*
 import com.dsh.launcher.overlay.*
@@ -39,9 +38,31 @@ import com.dsh.launcher.R
  * - 必要头：Origin(扩展 id)/UA(Chromium 主版本)/Pragma/Cache-Control/Accept-Language/
  *   Cookie:muid=<随机 32 位大写 hex>；speech.config 消息尾部带 "\r\n"；
  * - SSML 前剥离服务不兼容的控制字符并做 XML 转义；
- * - 单飞流水线 + flush 打断 + 失败回退系统 TTS（原因写入 dsh.log）。
+ * - 单飞流水线 + 打断 + 失败回退系统 TTS（原因写入 dsh.log）。
+ *
+ * ## 多持有者（S2）
+ * 本对象是进程级单例，而 `StatusBridgeService`（普通通道）与
+ * `KeepAliveAccessibilityService`（无障碍通道）同进程并存、各持一个 PetSpeaker。
+ * 旧实现用单次 `init/shutdown`：任一通道销毁都会 `shutdown()` 掐断另一通道正在播的
+ * 语音，且 `appCtx` 被清后合成一律失败回落。改为引用计数：所有持有者都 release
+ * 之后才真正停机；`init` 重复调用只更新 fallback，不再互相覆盖。
  */
 object EdgeTts {
+
+    /** 入队模式：决定新句与既有队列/当前播放的关系。 */
+    enum class Mode {
+        /** 接续排队：放在队尾，不打断任何正在播或排队的内容。 */
+        APPEND,
+
+        /** 打断当前播放，但**保留**尚未播出的排队句（用于真正的错误插播）。 */
+        INTERRUPT,
+
+        /**
+         * 清空全部排队句 + 打断当前（新任务开始 → 上一条消息的遗留队列已过时）。
+         * 语义是「过期内容作废」，不是插队。
+         */
+        FLUSH,
+    }
 
     private const val TRUSTED_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4"
 
@@ -56,17 +77,23 @@ object EdgeTts {
     private const val WIN_EPOCH = 11_644_473_600L
     private const val TIMEOUT_MS = 12_000L
 
-    private class Item(val text: String, val voice: String, val flush: Boolean)
+    private class Item(val text: String, val voice: String, val mode: Mode)
 
     private val queue = ArrayDeque<Item>()
+    /** 队列与 busy 的共用锁：二者必须一起判定，否则会出现「队列非空却无人泵」的窗口。 */
+    private val lock = Any()
+    /** 流水线占用中（合成或播放），由 [lock] 保护。 */
+    private var busy = false
     private var appCtx: Context? = null
     private var fallback: ((text: String, flush: Boolean) -> Unit)? = null
     private val main = Handler(Looper.getMainLooper())
     private val gen = AtomicInteger(0)
-    private val busy = AtomicBoolean(false)
     private var ws: WebSocket? = null
     private var player: MediaPlayer? = null
     private var timeoutRunnable: Runnable? = null
+
+    /** 持有者引用计数（S2）：归零才真正停机。由 EdgeTts 自身监视器保护。 */
+    private var holders = 0
 
     /** 时钟偏移（秒）：403 时依据响应 Date 头自动校正。 */
     @Volatile private var clockSkewSec = 0L
@@ -78,53 +105,103 @@ object EdgeTts {
             .build()
     }
 
+    /**
+     * 登记一个持有者并设定失败回落回调（S2）。
+     * 重复调用只更新上下文与回调，不再像旧实现那样把别人的 fallback 覆盖掉；计数 +1。
+     * 必须与 [release] 成对调用。
+     */
+    @Synchronized
     fun init(context: Context, onFallback: (text: String, flush: Boolean) -> Unit) {
         appCtx = context.applicationContext
         fallback = onFallback
+        holders++
     }
 
-    fun enqueue(text: String, voice: String, flush: Boolean) {
-        if (text.isBlank()) return
-        synchronized(queue) {
-            if (flush) {
-                queue.clear()
-                abortCurrent()
-            }
-            if (flush) queue.addFirst(Item(text, voice, true)) else queue.addLast(Item(text, voice, false))
-        }
-        pump()
-    }
-
-    fun shutdown() {
-        synchronized(queue) { queue.clear(); abortCurrent() }
+    /**
+     * 注销一个持有者（S2）：归零后才真正停机（清队列、停播放、断 WS）；
+     * 仍有持有者时什么都不做，避免其中一方销毁就掐断另一方正在播的语音。
+     */
+    @Synchronized
+    fun release() {
+        if (holders > 0) holders--
+        if (holders > 0) return
+        fallback = null
+        synchronized(lock) { queue.clear(); abortCurrent() }
         main.post { stopPlayer() }
     }
 
+    /**
+     * 强制停机（无视引用计数）：仅用于「确知所有持有者都不再发声」的整体收尾。
+     * 常规路径请用 [release]；直接调这里会掐断别的通道正在播的语音。
+     */
+    fun shutdown() {
+        synchronized(this) { holders = 0 }
+        synchronized(lock) { queue.clear(); abortCurrent() }
+        main.post { stopPlayer() }
+    }
+
+    /**
+     * 入队一句。
+     * @param mode 见 [Mode]：APPEND 接续；INTERRUPT 只打断当前、保留排队；
+     *             FLUSH 清空排队并打断当前。
+     */
+    fun enqueue(text: String, voice: String, mode: Mode) {
+        if (text.isBlank()) return
+        synchronized(lock) {
+            when (mode) {
+                Mode.APPEND -> Unit // 排队即可，绝不打断
+                // 插播：只停掉正在播的那一句，队列里尚未播出的内容原样保留（S4'）。
+                // 本句插到队首——插播的意义就是「现在就说」，否则会排到整队之后才响。
+                Mode.INTERRUPT -> abortCurrent()
+                Mode.FLUSH -> {
+                    queue.clear()
+                    abortCurrent()
+                }
+            }
+            if (mode == Mode.APPEND) queue.addLast(Item(text, voice, mode))
+            else queue.addFirst(Item(text, voice, mode))
+        }
+        pump()
+    }
+
+    /** 兼容旧调用点：布尔 flush 映射为 FLUSH / APPEND。 */
+    fun enqueue(text: String, voice: String, flush: Boolean) =
+        enqueue(text, voice, if (flush) Mode.FLUSH else Mode.APPEND)
+
     /** 是否有播报在进行（合成中或播放中）或有排队句：低优先级播报让路判断用。 */
-    fun isActive(): Boolean = busy.get() || synchronized(queue) { queue.isNotEmpty() }
+    fun isActive(): Boolean = synchronized(lock) { busy || queue.isNotEmpty() }
+
+    /** 尚未播出的条数（含正在播的那一句）：[PetSpeaker] 据此回退正文游标（S4）。 */
+    fun pendingCount(): Int = synchronized(lock) { queue.size + if (busy) 1 else 0 }
 
     // ── 流水线 ────────────────────────────────────────────
 
-    private fun pump() {
-        if (!busy.compareAndSet(false, true)) return
-        val item = synchronized(queue) { queue.pollFirst() }
-        if (item == null) {
-            busy.set(false)
-            return
+    /** 释放流水线并立即尝试接管下一条（仍在锁内复查，杜绝「队列非空却无人泵」）。 */
+    private fun releaseAndPump() {
+        val next = synchronized(lock) {
+            busy = false
+            queue.pollFirst()?.also { busy = true }
         }
-        startSynth(item)
+        if (next != null) startSynth(next)
+    }
+
+    /** 外部入队后的驱动入口；已在流水线中则直接返回，由持锁方自行续接。 */
+    private fun pump() {
+        val item = synchronized(lock) {
+            if (busy) return
+            queue.pollFirst()?.also { busy = true }
+        }
+        if (item != null) startSynth(item)
     }
 
     private fun finishItem(item: Item?) {
-        busy.set(false)
-        pump()
+        releaseAndPump()
     }
 
     private fun failToSystem(item: Item, reason: String) {
         AppLog.e("EdgeTts", "synth failed ($reason): " + item.text.take(40))
-        busy.set(false)
-        fallback?.invoke(item.text, item.flush)
-        pump()
+        fallback?.invoke(item.text, item.mode == Mode.FLUSH)
+        releaseAndPump()
     }
 
     // ── DRM：Sec-MS-GEC 与时钟偏移 ────────────────────────
@@ -286,21 +363,35 @@ object EdgeTts {
 
     private fun play(ctx: Context, file: File, myGen: Int, item: Item) {
         main.post {
-            if (stale(myGen)) { file.delete(); pump(); return@post }
+            if (stale(myGen)) { file.delete(); releaseAndPump(); return@post }
+            // 局部变量持有：任何提前返回/异常路径都要能回收，否则泄漏 fd 与解码器
+            var mp: MediaPlayer? = null
             try {
                 stopPlayer()
-                val mp = MediaPlayer()
-                mp.setDataSource(file.absolutePath)
-                mp.setOnCompletionListener {
-                    it.release(); player = null; file.delete(); finishItem(item)
+                mp = MediaPlayer()
+                val created = mp
+                created.setDataSource(file.absolutePath)
+                created.setOnCompletionListener {
+                    it.release()
+                    if (player === it) player = null
+                    file.delete()
+                    finishItem(item)
                 }
-                mp.setOnErrorListener { _, _, _ ->
-                    file.delete(); failToSystem(item, "playback error"); true
+                created.setOnErrorListener { p, _, _ ->
+                    // 原实现未 release/置空：出错后 player 仍指向已失效实例，
+                    // 下次 stopPlayer() 会去 stop 一个错误态播放器（并泄漏 fd）
+                    runCatching { p.release() }
+                    if (player === p) player = null
+                    file.delete()
+                    failToSystem(item, "playback error")
+                    true
                 }
-                mp.prepare()
-                mp.start()
-                player = mp
+                created.prepare()
+                created.start()
+                player = created
+                return@post
             } catch (t: Throwable) {
+                runCatching { mp?.release() }
                 file.delete()
                 failToSystem(item, "player prepare: " + t.message)
             }
@@ -308,24 +399,33 @@ object EdgeTts {
     }
 
     private fun stopPlayer() {
-        runCatching { player?.stop() }
-        runCatching { player?.release() }
+        val p = player
         player = null
+        runCatching { p?.stop() }
+        runCatching { p?.release() }
     }
 
     // ── 超时/代数 ────────────────────────────────────────
 
     private fun stale(myGen: Int): Boolean = gen.get() != myGen
 
+    /**
+     * 打断当前合成/播放。必须在 [lock] 内调用。
+     *
+     * 注意两点：
+     * 1. 被打断的旧任务不会再走 finish/fail 回调（ws 已 cancel、player 的
+     *    onCompletion 也不会来），必须在这里释放流水线，否则 busy 永远卡住，
+     *    后续所有 enqueue 都被静默丢弃（换音色即触发）；
+     * 2. MediaPlayer 只能在主线程碰：enqueue 可能来自 OkHttp 回调线程（INTERRUPT
+     *    路径尤甚），故停播放器一律切到主线程，避免跨线程调用播放器。
+     */
     private fun abortCurrent() {
         gen.incrementAndGet()
         runCatching { ws?.cancel() }
         ws = null
         disarmTimeout()
-        stopPlayer()
-        // 关键：被打断的旧任务不会再走 finish/fail 回调，必须在这里释放流水线，
-        // 否则 busy 永远卡在 true，后续所有 enqueue 都被静默丢弃（换音色即触发）
-        busy.set(false)
+        if (Looper.myLooper() == main.looper) stopPlayer() else main.post { stopPlayer() }
+        busy = false
     }
 
     private fun armTimeout(myGen: Int, item: Item, settleTimeout: () -> Unit) {

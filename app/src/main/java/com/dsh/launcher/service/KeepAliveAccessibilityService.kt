@@ -28,9 +28,10 @@ import com.dsh.launcher.R
  * - 不读取、不处理任何屏幕内容，只轮询本机 dsh status HTTP 接口。
  *
  * 与普通通道（StatusBridgeService）的协调：
- * - 每次轮询刷新 prefs 的 [A11Y_TS_KEY] 时间戳，普通通道仅在时间窗口内刷新过才让位——
- *   宿主被杀时 onUnbind/onDestroy 不回调，旧布尔标志会陈旧残留（跨重启持久化），
- *   曾导致双通道互相谦让全灭；
+ * - 轮询经 [touchTs] 刷新存活时间戳（内存权威 + prefs 低频落盘），普通通道经
+ *   [shouldYieldToA11y] 判断是否让位——宿主被杀时 onUnbind/onDestroy 不回调，
+ *   旧布尔标志会陈旧残留（跨重启持久化），曾导致双通道互相谦让全灭；时间戳化后
+ *   自动过期自愈，通道下线时经 [invalidateTs] 显式失效以保留该自愈语义；
  * - 锁屏/灭屏判断统一由 BridgeOverlayManager 用 KeyguardManager 实时查询，
  *   不再依赖本服务维护的 screen_visible 共享键（a11y 关闭时无人更新会让门禁失效）。
  */
@@ -50,7 +51,7 @@ class KeepAliveAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         // 立即刷新时间戳：连接瞬间就让普通通道开始让位（不等第一次轮询）
-        prefs().edit().putLong(A11Y_TS_KEY, System.currentTimeMillis()).apply()
+        touchTs(this, force = true)
         overlayManager = BridgeOverlayManager(
             this,
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
@@ -69,19 +70,30 @@ class KeepAliveAccessibilityService : AccessibilityService() {
     }
 
     override fun onUnbind(intent: Intent?): Boolean {
-        stopPolling()
-        overlayManager?.remove()
-        overlayManager?.release()
-        overlayManager = null
+        onChannelDown()
         return super.onUnbind(intent)
     }
 
     override fun onDestroy() {
+        onChannelDown()
+        super.onDestroy()
+    }
+
+    /**
+     * 通道下线：必须**显式失效**时间戳（M5 的关键约束）。
+     *
+     * 原设计靠「时间戳自然过期」自愈——宿主被杀时 onUnbind/onDestroy 可能不回调，
+     * 落盘的旧值 5s 后过期，普通通道自动接管。引入进程内内存值后，若不显式归零，
+     * 内存里的新鲜时间戳永不过期 → 普通通道永久让位 → 双通道全灭（正是这套设计
+     * 当初要防的故障）。故此处无论如何都要把内存值清零。
+     */
+    private fun onChannelDown() {
         stopPolling()
+        invalidateTs()
+        StatusBridgeAlerts.release() // 释放提示音句柄（M6）
         overlayManager?.remove()
         overlayManager?.release()
         overlayManager = null
-        super.onDestroy()
     }
 
     private fun prefs() = getSharedPreferences(AppState.Prefs.BRIDGE, Context.MODE_PRIVATE)
@@ -97,7 +109,7 @@ class KeepAliveAccessibilityService : AccessibilityService() {
                     prefs().getInt("idle_keepalive_min", PowerGovernor.DEFAULT_IDLE_KEEPALIVE_MIN)
                 )
                 PowerGovernor.setTaskStatus(lastStatus)
-                prefs().edit().putLong(A11Y_TS_KEY, System.currentTimeMillis()).apply()
+                touchTs(this)
                 syncWakeLock(PowerGovernor.wantWakeLock())
                 val data = fetchStatus()
                 if (data == null) {
@@ -202,6 +214,57 @@ class KeepAliveAccessibilityService : AccessibilityService() {
         /** 无障碍通道存活时间戳的 prefs 键（值 = System.currentTimeMillis()）。 */
         const val A11Y_TS_KEY = "a11y_overlay_ts"
 
+        /**
+         * 进程内权威时间戳（M5）。
+         *
+         * 两个通道同进程（独立进程方案已废弃，见 AndroidManifest 注释），本可用纯内存
+         * 单例；但 SharedPreferences 每秒一次 apply() 会把整个 bridge xml 重写一遍
+         * （该文件还混着全部设置项），亮屏档位下是持续的 flash 写入。
+         *
+         * 折中：内存变量供热路径（普通通道让位判定、诊断）读取，prefs 每
+         * [A11Y_TS_PERSIST_MS] 落一次盘，仅作冷启动首帧的兜底参考。
+         */
+        @Volatile private var a11yTs = 0L
+
+        /** 时间戳落盘节流间隔：远大于让位窗口（5s），避免每次轮询都重写 prefs。 */
+        private const val A11Y_TS_PERSIST_MS = 5_000L
+
+        /** 以内存值为准读取存活时间戳（冷启动由 prefs 兜底）。供双通道让位判定共用。 */
+        internal fun readTs(context: Context): Long {
+            val mem = a11yTs
+            if (mem != 0L) return mem
+            return context.getSharedPreferences(AppState.Prefs.BRIDGE, Context.MODE_PRIVATE)
+                .getLong(A11Y_TS_KEY, 0L)
+        }
+
+        /** 普通通道让位判定：无障碍通道 5s 内刷新过存活时间戳则普通通道让位。 */
+        internal fun shouldYieldToA11y(context: Context): Boolean =
+            System.currentTimeMillis() - readTs(context) < A11Y_FRESH_MS
+
+        /**
+         * 让存活时间戳立即失效（通道下线时调用）。
+         * 内存值归零后 [readTs] 回落到 prefs 的旧值，由「自然过期」继续兜底，
+         * 与原设计的自愈语义保持一致。
+         */
+        internal fun invalidateTs() {
+            a11yTs = 0L
+        }
+
+        /**
+         * 刷新存活时间戳（轮询线程每轮调用）。
+         * 只更新内存值，落盘按 [A11Y_TS_PERSIST_MS] 节流——让位判定的精度不受影响
+         * （它读的是同一份内存值），但 flash 写入从每秒一次降到每 5 秒一次。
+         */
+        internal fun touchTs(context: Context, force: Boolean = false) {
+            val now = System.currentTimeMillis()
+            a11yTs = now
+            val sp = context.getSharedPreferences(AppState.Prefs.BRIDGE, Context.MODE_PRIVATE)
+            // force：连接/断开这类状态跃迁立即落盘，避免冷启动首帧读到陈旧值
+            if (force || now - sp.getLong(A11Y_TS_KEY, 0L) >= A11Y_TS_PERSIST_MS) {
+                sp.edit().putLong(A11Y_TS_KEY, now).apply()
+            }
+        }
+
         /** 普通通道让位判定窗口。 */
         const val A11Y_FRESH_MS = 5_000L
 
@@ -213,14 +276,11 @@ class KeepAliveAccessibilityService : AccessibilityService() {
         private const val A11Y_DIAG_FRESH_MS = 90_000L
 
         /** 无障碍通道近期活跃（供外部诊断；5s 窗口仅用于双通道让位判定）。 */
-        fun isA11yChannelFresh(context: Context): Boolean =
-            System.currentTimeMillis() - context.getSharedPreferences(AppState.Prefs.BRIDGE, Context.MODE_PRIVATE)
-                .getLong(A11Y_TS_KEY, 0L) < A11Y_FRESH_MS
+        fun isA11yChannelFresh(context: Context): Boolean = shouldYieldToA11y(context)
 
         /** 无障碍通道近期活跃（诊断口径：90s 内有心跳即视为已连接，避免把深睡冻结误报成掉线）。 */
         fun isA11yActiveForDiag(context: Context): Boolean =
-            System.currentTimeMillis() - context.getSharedPreferences(AppState.Prefs.BRIDGE, Context.MODE_PRIVATE)
-                .getLong(A11Y_TS_KEY, 0L) < A11Y_DIAG_FRESH_MS
+            System.currentTimeMillis() - readTs(context) < A11Y_DIAG_FRESH_MS
 
         /**
          * 系统无障碍设置里是否登记了本服务（不代表当前已连接）。

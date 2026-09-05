@@ -82,6 +82,8 @@ class StatusBridgeService : Service() {
         thread?.interrupt()
         mainHandler.post { overlayManager?.remove() }
         overlayManager?.release()
+        overlayManager = null
+        StatusBridgeAlerts.release() // 释放提示音句柄（M6）
         writeHeartbeat("service", "destroyed", "destroyed", force = true)
         super.onDestroy()
     }
@@ -159,11 +161,18 @@ class StatusBridgeService : Service() {
 
     private fun prefs() = getSharedPreferences(AppState.Prefs.BRIDGE, Context.MODE_PRIVATE)
 
+    /**
+     * 本通道是否应当显示悬浮窗。
+     *
+     * 逻辑与 [BridgeOverlayManager.overlayEnabled] 保持一致：无障碍通道活跃时
+     * 普通通道**让位**（返回 false），避免两个窗口叠加。
+     *
+     * 修正：此处原写法是 `&& a11yFresh` —— 方向反了，a11y 活跃时反而放行，
+     * 与 Manager 内的让位判断直接矛盾。实际被 [BridgeOverlayManager.update] 的
+     * 二次检查兜住才没出现双窗口，属于潜伏的方向性错误，此处一并纠正。
+     */
     private fun overlayEnabled() = prefs().getBoolean("overlay_enabled", true) &&
-        // 无障碍通道 5 秒内刷新过时间戳才视为激活：宿主被杀时 onUnbind/onDestroy 不回调，
-        // 布尔标志会陈旧残留（跨重启持久化），普通通道因此永久让位 → 双通道全灭
-        System.currentTimeMillis() - prefs().getLong(KeepAliveAccessibilityService.A11Y_TS_KEY, 0L) <
-            KeepAliveAccessibilityService.A11Y_FRESH_MS
+        !KeepAliveAccessibilityService.shouldYieldToA11y(this)
 
     /**
      * 任务后台运行期间（及空闲保活窗内）持有 PARTIAL 唤醒锁；其余场景立即释放。

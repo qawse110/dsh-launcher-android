@@ -48,6 +48,14 @@ class OverlaySettingsActivity : AppCompatActivity() {
     private lateinit var hideWhenIdleSwitch: SwitchMaterial
     private lateinit var permissionHint: TextView
     private var importHint: TextView? = null
+    /** TTS 试听结果提示（失败时告知已回退系统引擎，别让用户对着没声音的按钮发愣）。 */
+    private var previewHint: TextView? = null
+    /** 试听用的系统 TTS（懒初始化，页面销毁时释放）。 */
+    private var previewTts: android.speech.tts.TextToSpeech? = null
+    /** 本页是否已登记过 EdgeTts 持有者（决定 onDestroy 是否需要 release）。 */
+    private var previewBtnUsed = false
+    /** 试听状态文案（跨 rebuild 保留：切换引擎/音色会重建 View 树，提示不该被冲掉）。 */
+    private var previewStatus: Pair<String, Int>? = null
 
     private val importPet = registerForActivityResult(
         ActivityResultContracts.OpenDocumentTree()
@@ -265,11 +273,31 @@ class OverlaySettingsActivity : AppCompatActivity() {
             )
             val engineBtn = Ui.button(this@OverlaySettingsActivity, "", { }, filled = false)
             val voiceBtn = Ui.button(this@OverlaySettingsActivity, "", { }, filled = false)
+            fun setPreviewStatus(text: String, color: Int) {
+                previewStatus = text to color
+                applyPreviewStatus()
+            }
             val previewBtn = Ui.button(this@OverlaySettingsActivity, "▶ 试听当前音色", {
                 val ctx = this@OverlaySettingsActivity
-                val v = prefs().getString("tts_edge_voice", "zh-CN-XiaoxiaoNeural") ?: "zh-CN-XiaoxiaoNeural"
-                EdgeTts.init(ctx) { t, fl -> /* 合成失败静默回退：此处仅试听 */ }
-                EdgeTts.enqueue("你好，这是当前的语音效果。", v, true)
+                val v = prefs().getString("tts_edge_voice", "zh-CN-XiaoxiaoNeural")
+                    ?: "zh-CN-XiaoxiaoNeural"
+                // 试听也走持有者登记（S2/L4）：旧实现每次点击都调 init 会覆盖桌宠注册的
+                // fallback，试听一次之后桌宠的 Edge 失败回落就断了；而且计数会虚高，
+                // 页面销毁后仍有残留持有者，EdgeTts 永远停不了机。
+                setPreviewStatus("正在合成…", Ui.TEXT_MUTED)
+                if (!previewBtnUsed) {
+                    previewBtnUsed = true
+                    EdgeTts.init(ctx) { text, flush ->
+                        runOnUiThread {
+                            setPreviewStatus(
+                                "在线合成失败，已回退系统引擎播放（检查网络）",
+                                Ui.WARNING
+                            )
+                            speakFallback(text, flush)
+                        }
+                    }
+                }
+                EdgeTts.enqueue("你好，这是当前的语音效果。", v, EdgeTts.Mode.FLUSH)
             }, filled = false)
             fun refresh() {
                 val cur = prefs().getString("tts_engine", "system") ?: "system"
@@ -313,12 +341,16 @@ class OverlaySettingsActivity : AppCompatActivity() {
             addView(previewBtn, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply { topMargin = dp(8) })
-            addView(TextView(this@OverlaySettingsActivity).apply {
+            previewHint = TextView(this@OverlaySettingsActivity).apply {
                 text = "音色点击弹窗直选；试听与播报均需联网，失败自动回退系统引擎。"
                 textSize = 11f
                 setTextColor(Ui.TEXT_MUTED)
                 setPadding(0, dp(8), 0, 0)
-            })
+            }
+            addView(previewHint, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ))
+            applyPreviewStatus() // rebuild 后回填上一次的试听状态
         }
 
         permissionHint = TextView(this).apply {
@@ -690,9 +722,58 @@ class OverlaySettingsActivity : AppCompatActivity() {
         }
     }
 
+    /** 把 [previewStatus] 写进当前 hint 视图（rebuild 后视图换了也要回填）。 */
+    private fun applyPreviewStatus() {
+        val (text, color) = previewStatus ?: return
+        val tv = previewHint ?: return
+        tv.text = text
+        tv.setTextColor(color)
+    }
+
+    /**
+     * 试听失败时的系统引擎兜底播放：与桌宠共用同一套系统 TTS 语义
+     * （flush=true 打断，false 排队），失败原因已由 EdgeTts 写入 dsh.log。
+     */
+    private fun speakFallback(text: String, flush: Boolean) {
+        val queueMode = if (flush) android.speech.tts.TextToSpeech.QUEUE_FLUSH
+        else android.speech.tts.TextToSpeech.QUEUE_ADD
+        val existing = previewTts
+        if (existing != null) {
+            runCatching { existing.speak(text, queueMode, null, "dsh_preview") }
+            return
+        }
+        // 初始化是异步的：回调里的 speak 才是安全的第一句；若回调前已销毁则跳过
+        var pending: String? = text
+        previewTts = android.speech.tts.TextToSpeech(this) { status: Int ->
+            val tts = previewTts
+            if (tts != null && status == android.speech.tts.TextToSpeech.SUCCESS) {
+                val ok = tts.isLanguageAvailable(java.util.Locale.CHINA)
+                tts.setLanguage(
+                    if (ok >= android.speech.tts.TextToSpeech.LANG_AVAILABLE) java.util.Locale.CHINA
+                    else java.util.Locale.getDefault()
+                )
+                pending?.let { runCatching { tts.speak(it, queueMode, null, "dsh_preview") } }
+                pending = null
+            }
+        }
+    }
+
     override fun onResume() {
         super.onResume()
         refreshPermissionHint()
+    }
+
+    override fun onDestroy() {
+        // 试听登记过 EdgeTts 持有者：不 release 会永久占着计数，
+        // 让真正该停机的通道停机失效（S2）
+        if (previewBtnUsed) {
+            previewBtnUsed = false
+            EdgeTts.release()
+        }
+        runCatching { previewTts?.shutdown() }
+        previewTts = null
+        previewHint = null
+        super.onDestroy()
     }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()

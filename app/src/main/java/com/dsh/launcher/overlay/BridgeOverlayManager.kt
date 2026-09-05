@@ -76,14 +76,26 @@ class BridgeOverlayManager(
 
     // 桌宠模式
     private var petView: PetOverlayView? = null
-    private var petAtlas: CodexPetAtlas? = null
     private var petLoadedId: String? = null
     private var petName: String = ""
     private var petReplies: List<String> = emptyList()
-    private var petBuiltHeightDp = 120
-    private var petAtlasForHeightDp = 120
-    private var defaultAtlas: CodexPetAtlas? = null
-    private var defaultAtlasForHeightDp = 120
+
+    /**
+     * 图集及其解码时所用的高度（L2）。
+     *
+     * 旧实现用三个可分离的字段（petAtlas / petAtlasForHeightDp / defaultAtlasForHeightDp）
+     * 分别记录，且在失败回退分支里用 `if (x != null) 赋值 else 保持旧值` 的写法，
+     * 极易出现「图集是 A 高度解码的、标记却是 B 高度」的错配 → 用错图集或反复重解码。
+     * 把二者绑成一个值对象后，图集与高度永远同步变化。
+     */
+    private class SizedAtlas(val atlas: CodexPetAtlas?, val heightDp: Int) {
+        val valid: Boolean get() = atlas != null
+    }
+
+    /** 当前生效图集（含其解码高度）。 */
+    private var petSized: SizedAtlas = SizedAtlas(null, 120)
+    /** 内置默认图集缓存（含其解码高度）。 */
+    private var defaultSized: SizedAtlas = SizedAtlas(null, 120)
 
     // 气泡独立悬浮窗（可点击，跟随宠物窗，贴边翻转朝向；其余区域触摸自然透传）
     private var petBubble: TextView? = null
@@ -123,6 +135,15 @@ class BridgeOverlayManager(
     private var lastInteractAt = 0L
 
     private var currentStyle: String? = null
+    /**
+     * 当前窗口构建时所用的样式（S1）。
+     * 位置偏好的键（pet_x/y 与 overlay_x/y）必须按「这个窗口是哪种样式」来选，
+     * 不能按 [bp.overlayStyle()] 的实时值——样式切换后到下一轮轮询生效之间存在
+     * 最多一个轮询周期（≤1s）的窗口，此时若发生拖动/落地保存，坐标会写进另一种
+     * 样式的键里：桌宠的坐标被写进 overlay_x/y，下次切回状态条就跳到屏幕角落。
+     * 同理，show()/showPet() 建窗时各自只认自己的键，才不会互相污染。
+     */
+    private var builtStyle: String? = null
     private var lastStatus: String? = null
     private var lastText: String? = null
     private var lastEvent: String? = null
@@ -172,9 +193,9 @@ class BridgeOverlayManager(
      *     曾让普通通道永久让位 → 双通道全灭；时间戳化后自动过期自愈。） */
     private fun overlayEnabled(): Boolean {
         if (!prefs().getBoolean("overlay_enabled", true)) return false
+        // 无障碍通道自己不参与让位；普通通道在 a11y 活跃时让位
         if (windowType != WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY &&
-            System.currentTimeMillis() - prefs().getLong(KeepAliveAccessibilityService.A11Y_TS_KEY, 0L) <
-            KeepAliveAccessibilityService.A11Y_FRESH_MS
+            KeepAliveAccessibilityService.shouldYieldToA11y(context)
         ) {
             return false
         }
@@ -193,16 +214,48 @@ class BridgeOverlayManager(
      *    需用 inKeyguardRestrictedInputMode 兜底——锁屏/灭屏期间输入受限恒为 true。
      */
     @Suppress("DEPRECATION") // inKeyguardRestrictedInputMode 于 API 29 起弃用，但覆盖锁屏/灭屏更全，targetSdk 28 下仍可靠
-    private fun screenVisible(): Boolean = try {
-        val pm = context.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
-        val km = context.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
-        val dm = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
-        val displayState = dm.getDisplay(Display.DEFAULT_DISPLAY)?.state ?: Display.STATE_ON
-        val displayOn = displayState == Display.STATE_ON || displayState == Display.STATE_UNKNOWN
-        val inputFree = !km.isKeyguardLocked && !km.inKeyguardRestrictedInputMode()
-        pm.isInteractive && displayOn && inputFree
+    private fun screenVisible(): Boolean {
+        // 记忆化（M7）：本方法每轮轮询（亮屏档位 1s × 两个通道）都会调用，而
+        // inKeyguardRestrictedInputMode 是到 KeyguardService 的 binder IPC。
+        // 亮屏/锁屏状态变化的时间尺度是秒级，500ms 内复用上次结论即可，
+        // 悬浮窗的挂载/移除因此最多延迟半个轮询周期，用户无感。
+        val now = android.os.SystemClock.uptimeMillis()
+        if (now - screenVisibleAt < SCREEN_VISIBLE_TTL_MS) return screenVisibleCached
+        val visible = queryScreenVisible()
+        screenVisibleCached = visible
+        screenVisibleAt = now
+        return visible
+    }
+
+    private fun queryScreenVisible(): Boolean = try {
+        val pm = systemService(Context.POWER_SERVICE) as? android.os.PowerManager
+        val km = systemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+        val dm = systemService(Context.DISPLAY_SERVICE) as? DisplayManager
+        if (pm == null || km == null || dm == null) {
+            true
+        } else {
+            val displayState = dm.getDisplay(Display.DEFAULT_DISPLAY)?.state ?: Display.STATE_ON
+            val displayOn = displayState == Display.STATE_ON || displayState == Display.STATE_UNKNOWN
+            val inputFree = !km.isKeyguardLocked && !km.inKeyguardRestrictedInputMode()
+            pm.isInteractive && displayOn && inputFree
+        }
     } catch (_: Exception) {
         true
+    }
+
+    /** getSystemService 缓存：ContextImpl 内部本有缓存，这里再省一次查找与类型转换。 */
+    private fun systemService(name: String): Any? =
+        systemServices.getOrPut(name) { context.getSystemService(name) }
+
+    private val systemServices = HashMap<String, Any?>()
+
+    /** 屏幕可见性缓存值与采集时间（主线程专用，无并发）。 */
+    private var screenVisibleCached = true
+    private var screenVisibleAt = 0L
+
+    private companion object {
+        /** 屏幕状态记忆化窗口：远小于轮询间隔变化的时间尺度。 */
+        const val SCREEN_VISIBLE_TTL_MS = 500L
     }
 
     fun update(status: String, text: String, event: String? = null) {
@@ -259,6 +312,7 @@ class BridgeOverlayManager(
             resetViews()
         }
         windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        builtStyle = "pill" // 位置键按本窗口的实际样式选取（S1）
         overlayDot = View(context).apply {
             background = OverlayStyle.circleDrawable(OverlayStyle.statusColor(status))
         }
@@ -333,9 +387,10 @@ class BridgeOverlayManager(
     private fun showPet(status: String, text: String, event: String?) {
         if (prefs().getBoolean("overlay_dismissed", false)) return
         val wantedId = bp.petId()
+        val wantedHeight = bp.petHeightDp()
         if (overlayView != null) {
             if (overlayView?.isAttachedToWindow == true) {
-                if (petLoadedId == wantedId && petBuiltHeightDp == bp.petHeightDp()) {
+                if (petLoadedId == wantedId && petSized.heightDp == wantedHeight) {
                     updatePet(status, text, event)
                     return
                 }
@@ -345,35 +400,32 @@ class BridgeOverlayManager(
                 resetViews()
             }
         }
-        if (petAtlas == null || petLoadedId != wantedId || petAtlasForHeightDp != bp.petHeightDp()) {
-            petAtlas = null
+        if (petSized.atlas == null || petLoadedId != wantedId || petSized.heightDp != wantedHeight) {
             val pets = CodexPetStore.scanPets(context)
             val pet = pets.firstOrNull { it.id == wantedId }
                 ?: pets.firstOrNull()
                 ?: CodexPetStore.defaultPet()
             petName = pet.displayName
             petReplies = pet.replies
-            petAtlas = CodexPetStore.openAtlas(context, pet, bp.petHeightDp())
-            petLoadedId = if (petAtlas != null) pet.id else null
-            if (petAtlas == null) {
+            val loaded = SizedAtlas(CodexPetStore.openAtlas(context, pet, wantedHeight), wantedHeight)
+            petSized = if (loaded.valid) loaded else {
                 // 用户包加载失败时回退内置默认（petLoadedId 保持默认，后续轮询可自愈）；
                 // 默认图集缓存，避免每轮重新解码
-                if (defaultAtlas == null || defaultAtlasForHeightDp != bp.petHeightDp()) {
-                    defaultAtlas = CodexPetStore.openAtlas(context, CodexPetStore.defaultPet(), bp.petHeightDp())
-                    defaultAtlasForHeightDp = if (defaultAtlas != null) bp.petHeightDp() else defaultAtlasForHeightDp
+                if (!defaultSized.valid || defaultSized.heightDp != wantedHeight) {
+                    defaultSized = SizedAtlas(
+                        CodexPetStore.openAtlas(context, CodexPetStore.defaultPet(), wantedHeight),
+                        wantedHeight
+                    )
                 }
-                petAtlas = defaultAtlas
-                petLoadedId = if (petAtlas != null) CodexPetStore.DEFAULT_PET_ID else null
-                petName = CodexPetStore.defaultPet().displayName
-                petReplies = CodexPetStore.defaultPet().replies
+                defaultSized
             }
-            petAtlasForHeightDp = if (petAtlas != null) bp.petHeightDp() else petAtlasForHeightDp
+            petLoadedId = if (petSized.valid) pet.id else null
         }
-        val atlas = petAtlas ?: return
+        val atlas = petSized.atlas ?: return
         windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        builtStyle = "pet" // 位置键按本窗口的实际样式选取（S1）
 
-        petBuiltHeightDp = bp.petHeightDp()
-        val petH = dp(petBuiltHeightDp)
+        val petH = dp(wantedHeight)
         val petW = if (atlas.cellH > 0) (petH * atlas.cellW / atlas.cellH.toFloat()).toInt() else petH
         val pet = PetOverlayView(context, atlas)
         petView = pet
@@ -438,8 +490,10 @@ class BridgeOverlayManager(
         }
         petSpeaker.speakForStatus(status, event)
         // TTS 朗读最近输出与气泡显示无关：在气泡分支之外无条件调用，
-        // 否则关闭「显示气泡」后 TTS 朗读会一并失效
-        petSpeaker.speakContent(lastText, status, event)
+        // 否则关闭「显示气泡」后 TTS 朗读会一并失效。
+        // 用形参 text 而非字段 lastText：二者此刻相等，但形参才是本帧的真实输入，
+        // 未来若有人在别处调用 updatePet 也不会错位（M3）。
+        petSpeaker.speakContent(text, status, event)
         petBubble?.let { bubble ->
             val key = "$status|${event ?: ""}"
             if (transientText != null) {
@@ -629,7 +683,9 @@ class BridgeOverlayManager(
         if (n >= annoyTapCount) {
             petView?.play(PetOverlayView.ROW_JUMPING)
             postTransient("主人别戳啦～", 2, 0.6f, 3500L)
-            petSpeaker.speak("主人别戳啦～")
+            // 互动台词：排队接续即可（APPEND）。旧默认参数是 FLUSH，会把排队中的
+            // 正文整队清掉——用户戳一下桌宠，正在朗读的回答就再也不续播了（S4'）。
+            petSpeaker.speak("主人别戳啦～", EdgeTts.Mode.APPEND)
             return
         }
         if (n == 2) {
@@ -648,16 +704,16 @@ class BridgeOverlayManager(
                 val width = minOf((dm.widthPixels * 0.62f).toInt(), avail.coerceAtLeast(dp(140)))
                 postTransient(full, 1000, width.toFloat(), 8000L)
             } else {
-                val reply = randomQuip()
+                val reply = randomPhrase()
                 postTransient(reply, 2, 0.6f, 8000L)
-                petSpeaker.speak(reply)
+                petSpeaker.speak(reply, EdgeTts.Mode.APPEND)
             }
             return
         }
         // 单击（或 3~4 击未达阈值）：随机台词短气泡（快速、不挡视线）
-        val quip = randomQuip()
+        val quip = randomPhrase()
         postTransient(quip, 2, 0.6f, 5000L)
-        petSpeaker.speak(quip)
+        petSpeaker.speak(quip, EdgeTts.Mode.APPEND)
     }
 
     /** 统一气泡临时内容：设置文本与样式，durationMs 后或状态变化时自动收起恢复常规气泡。
@@ -700,16 +756,20 @@ class BridgeOverlayManager(
         transientKey = null
     }
 
-    private fun randomPetPhrase(): String =
-        if (petReplies.isNotEmpty()) petReplies[Random.nextInt(petReplies.size)] else "主人，我在呢～"
-
-    /** 点击互动随机台词：优先宠物包台词，否则内置短句池。 */
+    /**
+     * 随机台词（L5）：优先宠物包自带的 replies，其次内置短句池，最后兜底固定句。
+     * 原实现有两个几乎相同的函数（randomPetPhrase / randomQuip），仅兜底不同，
+     * 已合并——冒泡与点击互动共用同一套台词来源。
+     */
     private val quipPool = listOf(
         "主人，我在呢～", "怎么啦？", "嘿嘿，戳我干嘛～", "我在认真盯任务呢！", "想我了吗～"
     )
-    private fun randomQuip(): String =
-        if (petReplies.isNotEmpty()) petReplies[Random.nextInt(petReplies.size)]
-        else quipPool[Random.nextInt(quipPool.size)]
+
+    private fun randomPhrase(): String = when {
+        petReplies.isNotEmpty() -> petReplies[Random.nextInt(petReplies.size)]
+        quipPool.isNotEmpty() -> quipPool[Random.nextInt(quipPool.size)]
+        else -> "主人，我在呢～"
+    }
 
     /** 登场问候一次（参考 codex-pet-live 的 greeting 气泡）。 */
     private fun showGreeting() {
@@ -736,9 +796,9 @@ class BridgeOverlayManager(
         if (lastStatus != "idle") return // 只在闲时冒泡
         if (transientText != null) return
         if (petBubble == null) return
-        val phrase = randomPetPhrase()
+        val phrase = randomPhrase()
         postTransient(phrase, 2, 0.6f, 5000L)
-        petSpeaker.speak(phrase)
+        petSpeaker.speak(phrase, EdgeTts.Mode.APPEND)
     }
 
     /** 待机随机小动作（参考 codex-pet-live 的随机动作池）：idle 时随机挥手，纯动作不打扰气泡。 */
@@ -772,6 +832,7 @@ class BridgeOverlayManager(
     fun remove() {
         resetViews()
         currentStyle = null
+        builtStyle = null
     }
 
     /** 彻底拆除当前悬浮窗（含窗口移除、动画停止、临时气泡取消），引用全部置空。 */
@@ -794,6 +855,7 @@ class BridgeOverlayManager(
         petSpeaker.resetTransientState()
         pendingRow = -1
         pendingRowCount = 0
+        builtStyle = null // 窗口已拆：后续保存位置须等新窗口重建后重新确定样式（S1）
         try {
             overlayView?.let { windowManager?.removeView(it) }
         } catch (e: Exception) {
@@ -993,7 +1055,8 @@ class BridgeOverlayManager(
     }
 
     private fun savePosition(p: WindowManager.LayoutParams) {
-        val isPet = bp.overlayStyle() == "pet"
+        // 用窗口构建时的样式，而非实时偏好（S1）：见 [builtStyle] 注释
+        val isPet = (builtStyle ?: bp.overlayStyle()) == "pet"
         prefs().edit()
             .putInt(if (isPet) "pet_x" else "overlay_x", p.x)
             .putInt(if (isPet) "pet_y" else "overlay_y", p.y)

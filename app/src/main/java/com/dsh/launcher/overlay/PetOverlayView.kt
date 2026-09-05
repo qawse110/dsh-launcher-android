@@ -115,11 +115,18 @@ class PetOverlayView(context: Context, private val atlas: CodexPetAtlas) : View(
         val safeRow = row.coerceIn(0, maxRow())
         if (playing && safeRow == this.row) {
             // 已在该行：若回到常驻行则重新武装一次性动作（落地后再次换行可再表演）
-            if (safeRow in LOOP_ROWS) settledRow = -1
+            if (safeRow in LOOP_ROWS) {
+                settledRow = -1
+                // 必须同时清 key：只清 settledRow 会让「完成→运行中→再次完成」被
+                // 下面的 lastOneShotKey 判重挡住，第二次任务完成不跳跃（同一 stateKey）。
+                lastOneShotKey = null
+            }
             return
         }
         if (safeRow !in LOOP_ROWS && settledRow == safeRow) return // 同一一次性动作已表演过
         if (safeRow !in LOOP_ROWS && stateKey != null && lastOneShotKey == stateKey) return
+        // 切到常驻行（含跳跃落地回 idle）即表示上一次「状态键」已结束，放行同键的下次表演
+        if (safeRow in LOOP_ROWS) lastOneShotKey = null
         if (safeRow !in LOOP_ROWS && stateKey != null) lastOneShotKey = stateKey
         this.row = safeRow
         col = 0

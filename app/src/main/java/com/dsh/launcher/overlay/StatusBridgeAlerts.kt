@@ -54,8 +54,26 @@ object StatusBridgeAlerts {
         try {
             val t = tone ?: ToneGenerator(AudioManager.STREAM_MUSIC, 80).also { tone = it }
             t.startTone(ToneGenerator.TONE_PROP_BEEP2, 500)
+        } catch (t: Throwable) {
+            // 音频服务不可用时静默失败，不影响通知；坏实例不缓存，下次重建
+            tone = null
+        }
+    }
+
+    /**
+     * 释放提示音资源（M6）。
+     *
+     * ToneGenerator 持有底层音频设备句柄，进程存活期间从不释放会一直占着
+     * AUDIO_DEVICE 句柄（部分 ROM 上还会阻止其它应用拿到独占音频焦点）。
+     * 两个桥接服务收尾时调用；下次播报会懒加载重建，仅损失一次打开延迟。
+     */
+    fun release() {
+        val t = tone
+        tone = null
+        try {
+            t?.release()
         } catch (_: Exception) {
-            // 音频服务不可用时静默失败，不影响通知
+            // 已失效的实例释放失败可忽略
         }
     }
 
