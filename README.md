@@ -141,7 +141,7 @@ adb shell am start -n com.dsh.launcher/.MainActivity   # 或直接点应用图�
 | 问题 | 修复 |
 |---|---|
 | vendor/loader 无法解析 `@deepseek-ai/…` | `node --expose-internals`（命令行参数，非 NODE_OPTIONS） |
-| `sharp` / `node-pty` 无 Android 预编译产物 | Proxy stub / 纯 JS shim（import 期顶替）。`sharp` 为双层防御：① `stub-dsh.mjs` 遍历**所有**副本改写入口（含 pnpm 只读硬链接的 chmod/删除重写兜底）；② `fs-loader.mjs` 在解析期把裸说明符 `sharp` 重定向到 `$HOME/sharp-shim.cjs`，与安装顺序、副本数量、写盘权限无关 |
+| `sharp` / `node-pty` 无 Android 预编译产物 | Proxy stub / 纯 JS shim（import 期顶替） |
 | `sendAttribution:false` 不生效（归因 UA 仍被强制注入） | `llm-pi-ai` schema/header 补丁（待上游提供官方抑制缝隙） |
 | `sandbox-windows-acl` 布局断言崩溃 | 正则禁用 STARTUPINFOW/PROCESS_INFORMATION 断言 |
 | WebView 无限 `connection lost` 重连 | `AbortSignal.timeout` polyfill——**按需注入**：仅当 dist 内 bundle 确实引用该 API 才写 `index.html`（rc.2 前端无消费者，自动跳过） |

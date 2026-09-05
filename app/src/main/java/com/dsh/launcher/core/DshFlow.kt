@@ -368,22 +368,13 @@ object DshFlow {
     }
 
     /**
-     * Android 兼容修复（stub-dsh.mjs）按内容只跑一次：
-     * marker 记录「APK 版本 + stub 脚本内容指纹 + dsh 版本」，三者都没变则跳过
-     * （省 2~5 秒启动时间）。
-     * 关键：指纹绑定 stub-dsh.mjs 的内容而非仅 versionCode —— versionCode 恒定
-     * 的历史构建下，APK 带着新补丁更新也会命中旧 marker 而跳过 stub（真机表现：
-     * 更新后 sharp 照旧崩溃）。脚本内容一变，指纹必变，必然重跑。
+     * Android 兼容修复（stub-dsh.mjs）按版本只跑一次：
+     * marker 记录「APK 版本 + dsh 版本」，两者都没变则跳过（省 2~5 秒启动时间）。
      */
     private fun runAndroidStubOnce(ctx: Context, nodeDir: File, dshPrefix: File, stubScript: File, fl: (String) -> Unit) {
         val apkVer = AssetSync.apkVersion(ctx)
-        val stubFp = AssetSync.fingerprint(stubScript)
-        val expected = "apk:$apkVer#$stubFp|dsh:${DshUpdater.currentVersion(ctx)}"
-        // sharp-shim.cjs 是 fs-loader 的运行时兜底源，由 stub-dsh.mjs 写出。
-        // 它缺失说明补丁产物被清掉（清数据/外部存储回收/被 pnpm 重写），
-        // 此时即使版本 marker 匹配也必须重跑，否则 sharp 会重新在 import 期炸掉。
-        val runtimeShim = File(ctx.filesDir, "sharp-shim.cjs")
-        if (MarkerStore.get(ctx, "stub-applied") == expected && runtimeShim.exists()) {
+        val expected = "apk:$apkVer|dsh:${DshUpdater.currentVersion(ctx)}"
+        if (MarkerStore.get(ctx, "stub-applied") == expected) {
             fl(">> Android 兼容修复已应用（$expected），跳过 stub")
             return
         }
@@ -437,11 +428,7 @@ object DshFlow {
         File(ctx.filesDir, "tmp").mkdirs()
         val launcher = webLauncherFile(ctx)
         launcher.parentFile?.mkdirs()
-        val nodeCmd = "${nodeDir.absolutePath}/bin/node --expose-internals --import ${ctx.filesDir.absolutePath}/fs-register.mjs ${cli.absolutePath} web --no-open"
-        // 兼容状态自查：用户日志里出现 MISSING 即可立刻定位是脚本没拷到还是 stub 没跑
-        onLog(">> compat: fs-register=${if (File(ctx.filesDir, "fs-register.mjs").isFile) "ok" else "MISSING"}" +
-            ", sharp-shim=${if (File(ctx.filesDir, "sharp-shim.cjs").isFile) "ok" else "missing(loader 会自补)"}" +
-            ", cli=${if (cli.exists()) "ok" else "MISSING"}")
+        val nodeCmd = "${nodeDir.absolutePath}/bin/node --expose-internals --import ${ctx.filesDir.absolutePath}/fs-register.mjs ${cli.absolutePath} web"
         val tpl = runCatching { ctx.assets.open(WEB_LAUNCHER_TPL).use { it.readBytes().toString(Charsets.UTF_8) } }
             .getOrElse {
                 onLog("WARN: 启动脚本模板缺失，回退内置模板")
@@ -486,10 +473,8 @@ object DshFlow {
     private fun waitForWebReady(ctx: Context, timeoutMs: Long, onLog: (String) -> Unit): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMs
         var lastLog = 0L
-        var lastProbe = 0
         while (System.currentTimeMillis() < deadline) {
-            lastProbe = httpProbeCode(WEB_PORT)
-            if (lastProbe >= 200) return true
+            if (httpResponds(WEB_PORT)) return true
             val now = System.currentTimeMillis()
             if (now - lastLog >= 5000) {
                 lastLog = now
@@ -498,64 +483,28 @@ object DshFlow {
             val elapsed = timeoutMs - (deadline - now)
             Thread.sleep(if (elapsed < 6_000) 150 else 500)
         }
-        val probeDesc = if (lastProbe > 0) "HTTP $lastProbe" else "无响应"
-        onLog("✗ dsh web 未在 ${timeoutMs / 1000} 秒内就绪（最后探测: $probeDesc），日志尾部：")
+        onLog("✗ dsh web 未在 ${timeoutMs / 1000} 秒内就绪，日志尾部：")
         appendLogTail(File(FileLog.dir(ctx), WEB_LOG), 25, onLog)
         return false
     }
 
-    /**
-     * 返回对 http://127.0.0.1:port/ 的探测结果：HTTP 状态码（>=200 即收到了真实
-     * HTTP 响应），0 = 连接失败/超时。
-     * 注意不能只认 2xx/3xx：dsh web 现在带 token 认证，无 token 访问 `/` 返回
-     * 401/403 —— 服务明明已就绪，旧判据（200..399）却永远等不到，90 秒超时假失败。
-     * 对「web 进程是否起来」而言，任何合法 HTTP 响应都是充分证据。
-     */
-    fun httpProbeCode(port: Int): Int {
+    fun httpResponds(port: Int): Boolean {
         val conn = try {
             URL("http://127.0.0.1:$port/").openConnection() as HttpURLConnection
         } catch (e: Exception) {
-            return 0
+            return false
         }
         return try {
             conn.connectTimeout = 800
             conn.readTimeout = 800
             conn.requestMethod = "GET"
-            conn.responseCode
+            conn.responseCode in 200..399
         } catch (e: Exception) {
-            0
+            false
         } finally {
             // disconnect 必须放 finally：responseCode 抛异常时连接也要释放
             runCatching { conn.disconnect() }
         }
-    }
-
-    fun httpResponds(port: Int): Boolean = httpProbeCode(port) >= 200
-
-    /**
-     * 从 web 日志提取 dsh web 的访问 token（每次 web 启动轮换）。
-     * dsh web 启动时会打印 `dsh web: http://127.0.0.1:3080/?token=...`，
-     * WebView 必须带 token 访问，否则得到 401/403 页面。
-     * 只扫日志尾部 64KB（token 行在启动输出里），失败返回 null。
-     */
-    fun webToken(ctx: Context): String? {
-        return try {
-            val log = File(FileLog.dir(ctx), WEB_LOG)
-            if (!log.exists()) return null
-            val bytes = log.readBytes()
-            val tail = if (bytes.size > 65_536) String(bytes, bytes.size - 65_536, 65_536, Charsets.UTF_8)
-            else String(bytes, Charsets.UTF_8)
-            Regex("""token=([A-Za-z0-9._~\-]+)""").findAll(tail).lastOrNull()?.groupValues?.get(1)
-        } catch (e: Exception) {
-            null
-        }
-    }
-
-    /** WebUI 完整地址：日志里有 token 就带上，没有则退回裸地址。 */
-    fun webUrl(ctx: Context): String {
-        val base = "http://127.0.0.1:$WEB_PORT"
-        val token = webToken(ctx) ?: return base
-        return "$base/?token=$token"
     }
 
     private fun appendLogTail(file: File, maxLines: Int, onLog: (String) -> Unit) {
