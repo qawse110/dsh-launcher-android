@@ -877,4 +877,21 @@ try {
   }, null, 2));
 } catch (e) { log('WARN state file: ' + e.message); }
 
+/* dsh 本体（重）安装可能还原被 stub-dsh.mjs 改写过的包文件（sharp /
+ * @deepseek-ai/dsh-settings 等），而 stub 的 marker 不含包文件指纹 ——
+ * 若不清掉，本次安装后 runAndroidStubOnce 会命中旧 marker 而跳过，
+ * 补丁丢失（Android 兼容修复就永远追不上重装）。markers.json 是
+ * MarkerStore 的落盘格式（files/state/markers.json），直接编辑即可。 */
+try {
+  const mf = join(FILES_DIR, 'state', 'markers.json');
+  if (existsSync(mf)) {
+    const obj = JSON.parse(readFileSync(mf, 'utf8'));
+    if (Object.prototype.hasOwnProperty.call(obj, 'stub-applied')) {
+      delete obj['stub-applied'];
+      writeFileSync(mf, JSON.stringify(obj));
+      log('stub marker reset (dsh reinstalled, stub will re-run)');
+    }
+  }
+} catch (e) { log('WARN reset stub marker: ' + e.message); }
+
 log('=== official dsh install done ===');

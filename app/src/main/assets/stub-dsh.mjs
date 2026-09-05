@@ -268,6 +268,35 @@ try {
   else log(`sharp shim summary: ${n} patched, ${failed} failed, ${writtenShims.length} shim file(s)`);
 } catch (e) { log('WARN sharp shim: ' + e.message); }
 
+  /* dsh-settings 兼容注入：内置插件（dsh-llm-codebuddy）与用户加装的新式插件
+     （如 dsh-llm-qoder）import 了 installSettingsSection / settingsNamespace，
+     但 npm 安装的 dsh 本体（如 0.1.2-rc.1）自带的 @deepseek-ai/dsh-settings
+     偏旧、没有这两个导出 → ESM 命名导入在求值期 SyntaxError → cordis 插件树
+     整体失败 → dsh web 起不来（与 sharp 同一类「顶层 import 拖死全树」故障）。
+     新版实现（prebuilt packages/settings）：settingsNamespace 校验后透传；
+     installSettingsSection 注册 WebUI 设置面板。兼容实现照此降级：
+     namespace 原样透传、设置面板 no-op —— 牺牲插件设置 UI，换取 web 能启动。 */
+  try {
+    let nsFiles = 0;
+    for (const rel of ['lib/index.js', 'index.js', 'dist/index.js', 'dist/index.mjs']) {
+      for (const p of findPkgAll('@deepseek-ai/dsh-settings', rel)) {
+        let src;
+        try { src = readFileSync(p, 'utf8'); } catch { continue; }
+        if (src.includes('installSettingsSection')) continue; // 新版本体或已注入过
+        if (!src.includes('export')) continue; // 仅处理 ESM 主体
+        const add = ['// === dsh-launcher compat polyfill (auto-injected by stub-dsh.mjs) ==='];
+        if (!src.includes('settingsNamespace')) {
+          add.push('export const settingsNamespace = (value) => value;');
+        }
+        add.push('export const installSettingsSection = () => {};');
+        writeFileForce(p, src + '\n' + add.join('\n') + '\n');
+        log('dsh-settings compat: ' + p);
+        nsFiles++;
+      }
+    }
+    log('dsh-settings compat summary: ' + nsFiles + ' file(s) patched');
+  } catch (e) { log('WARN dsh-settings compat: ' + e.message); }
+
 
 
   /* v4 视觉链路配套（dsh-launcher-android-att-vision-v4），在 v3 基础上加两道保险：
