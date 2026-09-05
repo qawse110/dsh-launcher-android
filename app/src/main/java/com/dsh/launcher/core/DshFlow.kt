@@ -433,6 +433,10 @@ object DshFlow {
         val launcher = webLauncherFile(ctx)
         launcher.parentFile?.mkdirs()
         val nodeCmd = "${nodeDir.absolutePath}/bin/node --expose-internals --import ${ctx.filesDir.absolutePath}/fs-register.mjs ${cli.absolutePath} web"
+        // 兼容状态自查：用户日志里出现 MISSING 即可立刻定位是脚本没拷到还是 stub 没跑
+        onLog(">> compat: fs-register=${if (File(ctx.filesDir, "fs-register.mjs").isFile) "ok" else "MISSING"}" +
+            ", sharp-shim=${if (File(ctx.filesDir, "sharp-shim.cjs").isFile) "ok" else "missing(loader 会自补)"}" +
+            ", cli=${if (cli.exists()) "ok" else "MISSING"}")
         val tpl = runCatching { ctx.assets.open(WEB_LAUNCHER_TPL).use { it.readBytes().toString(Charsets.UTF_8) } }
             .getOrElse {
                 onLog("WARN: 启动脚本模板缺失，回退内置模板")
