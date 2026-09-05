@@ -53,6 +53,9 @@ object AssetSync {
         MarkerStore.put(ctx, key, "apk:$apkVersion#${fingerprintOf(target)}")
     }
 
+    /** 公开内容指纹（文件 = 长度 + 头 64KB CRC32）。供 stub marker 等外部判定使用。 */
+    fun fingerprint(file: File): String = fingerprintOf(file)
+
     /**
      * 轻量内容指纹：文件 = 长度 + 头 64KB CRC32；目录 = 递归各文件（长度+CRC）的聚合 CRC。
      * 预算：prebuilt.tgz ~30MB 只读头 64KB；extra-plugins 目录数百个小文件全读但都是文本，

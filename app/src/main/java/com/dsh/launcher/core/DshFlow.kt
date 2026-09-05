@@ -368,12 +368,17 @@ object DshFlow {
     }
 
     /**
-     * Android 兼容修复（stub-dsh.mjs）按版本只跑一次：
-     * marker 记录「APK 版本 + dsh 版本」，两者都没变则跳过（省 2~5 秒启动时间）。
+     * Android 兼容修复（stub-dsh.mjs）按内容只跑一次：
+     * marker 记录「APK 版本 + stub 脚本内容指纹 + dsh 版本」，三者都没变则跳过
+     * （省 2~5 秒启动时间）。
+     * 关键：指纹绑定 stub-dsh.mjs 的内容而非仅 versionCode —— versionCode 恒定
+     * 的历史构建下，APK 带着新补丁更新也会命中旧 marker 而跳过 stub（真机表现：
+     * 更新后 sharp 照旧崩溃）。脚本内容一变，指纹必变，必然重跑。
      */
     private fun runAndroidStubOnce(ctx: Context, nodeDir: File, dshPrefix: File, stubScript: File, fl: (String) -> Unit) {
         val apkVer = AssetSync.apkVersion(ctx)
-        val expected = "apk:$apkVer|dsh:${DshUpdater.currentVersion(ctx)}"
+        val stubFp = AssetSync.fingerprint(stubScript)
+        val expected = "apk:$apkVer#$stubFp|dsh:${DshUpdater.currentVersion(ctx)}"
         // sharp-shim.cjs 是 fs-loader 的运行时兜底源，由 stub-dsh.mjs 写出。
         // 它缺失说明补丁产物被清掉（清数据/外部存储回收/被 pnpm 重写），
         // 此时即使版本 marker 匹配也必须重跑，否则 sharp 会重新在 import 期炸掉。
