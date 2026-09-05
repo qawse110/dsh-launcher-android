@@ -297,6 +297,53 @@ try {
     log('dsh-settings compat summary: ' + nsFiles + ' file(s) patched');
   } catch (e) { log('WARN dsh-settings compat: ' + e.message); }
 
+  // dsh-provider-headers 浏览器半区（lib/client.js）require 的
+  // "@deepseek-ai/dsh-client-runtime/client" 在旧 dsh 本体（0.1.2-rc.1）的
+  // client-modules module table 里没有注册（build-time externals drift），
+  // 宿主组装 client bundle 时抛错 → loader entry 导入失败 → 插件树整体失败。
+  // 该外部模块在 client.js 里只用了 createSnapshotStore（update/subscribe/
+  // getSnapshot 三件套），这里直接内联等价实现，绕开 module table。
+  try {
+    const ph = join(HOME, 'plugins', 'dsh-provider-headers', 'lib', 'client.js');
+    if (!existsSync(ph)) {
+      log('provider-headers client not found, skip');
+    } else {
+      const src = readFileSync(ph, 'utf8');
+      const MARK = '/* dsh-android: client-runtime inline */';
+      if (src.includes(MARK)) {
+        log('provider-headers client already patched');
+      } else {
+        const NEEDLE = 'let _client_runtime_client = require("@deepseek-ai/dsh-client-runtime/client");';
+        if (!src.includes(NEEDLE)) {
+          log('WARN provider-headers client pattern not found, skip (上游升级后需核对)');
+        } else {
+          const INLINE = [
+            'let _client_runtime_client = ' + MARK,
+            '  (() => {',
+            '    function createSnapshotStore(initial) {',
+            '      let snapshot = initial;',
+            '      const listeners = new Set();',
+            '      return {',
+            '        getSnapshot: () => snapshot,',
+            '        subscribe: (cb) => { listeners.add(cb); return () => { listeners.delete(cb); }; },',
+            '        update: (fn) => {',
+            '          const draft = JSON.parse(JSON.stringify(snapshot));',
+            '          fn(draft);',
+            '          snapshot = draft;',
+            '          for (const cb of listeners) cb();',
+            '        },',
+            '      };',
+            '    }',
+            '    return { createSnapshotStore };',
+            '  })();',
+          ].join('\n');
+          writeFileSync(ph, src.replace(NEEDLE, INLINE));
+          log('provider-headers client-runtime inline patched: ' + ph);
+        }
+      }
+    }
+  } catch (e) { log('WARN provider-headers client: ' + e.message); }
+
 
 
   /* v4 视觉链路配套（dsh-launcher-android-att-vision-v4），在 v3 基础上加两道保险：

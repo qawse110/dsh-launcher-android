@@ -158,7 +158,8 @@ class WebViewActivity : AppCompatActivity() {
             }
         }
 
-        webView.loadUrl(TARGET_URL)
+        // dsh web 带 token 认证：不带 token 的裸地址只会得到 401/403 页面
+        webView.loadUrl(com.dsh.launcher.core.DshFlow.webUrl(this))
     }
 
     override fun onBackPressed() {
@@ -315,6 +316,7 @@ class WebViewActivity : AppCompatActivity() {
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
     companion object {
+        // 基址（token 由 DshFlow.webUrl 运行时拼接，每次 web 启动会轮换）
         private const val TARGET_URL = "http://127.0.0.1:" + com.dsh.launcher.core.DshFlow.WEB_PORT
     }
 }

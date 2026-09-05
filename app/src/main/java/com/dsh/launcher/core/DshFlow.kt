@@ -532,6 +532,32 @@ object DshFlow {
 
     fun httpResponds(port: Int): Boolean = httpProbeCode(port) >= 200
 
+    /**
+     * 从 web 日志提取 dsh web 的访问 token（每次 web 启动轮换）。
+     * dsh web 启动时会打印 `dsh web: http://127.0.0.1:3080/?token=...`，
+     * WebView 必须带 token 访问，否则得到 401/403 页面。
+     * 只扫日志尾部 64KB（token 行在启动输出里），失败返回 null。
+     */
+    fun webToken(ctx: Context): String? {
+        return try {
+            val log = File(FileLog.dir(ctx), WEB_LOG)
+            if (!log.exists()) return null
+            val bytes = log.readBytes()
+            val tail = if (bytes.size > 65_536) String(bytes, bytes.size - 65_536, 65_536, Charsets.UTF_8)
+            else String(bytes, Charsets.UTF_8)
+            Regex("""token=([A-Za-z0-9._~\-]+)""").findAll(tail).lastOrNull()?.groupValues?.get(1)
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /** WebUI 完整地址：日志里有 token 就带上，没有则退回裸地址。 */
+    fun webUrl(ctx: Context): String {
+        val base = "http://127.0.0.1:$WEB_PORT"
+        val token = webToken(ctx) ?: return base
+        return "$base/?token=$token"
+    }
+
     private fun appendLogTail(file: File, maxLines: Int, onLog: (String) -> Unit) {
         try {
             if (!file.exists()) {
