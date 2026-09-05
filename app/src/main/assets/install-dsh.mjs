@@ -596,20 +596,42 @@ function installBuiltins() {
  * 把每个唯一包名（作用域包、多版本取最高）也桥接进去，恢复扁平解析语义。
  */
 function cmpVer(a, b) {
-  const pa = String(a).split('-');
-  const pb = String(b).split('-');
-  const na = pa[0].split('.').map((n) => parseInt(n, 10) || 0);
-  const nb = pb[0].split('.').map((n) => parseInt(n, 10) || 0);
+  // 语义化版本比较，与 Kotlin 侧 DshUpdater.compareVersions 保持一致：
+  // ① core 逐段数字比较；② prerelease 低于正式版；③ prerelease 逐段比较，
+  //    纯数字段按数值比（"rc.10" > "rc.6"），非数字段按字典序，数字段 < 非数字段；
+  // ④ prerelease 段数多者更高（1.0.0-rc.1.1 > 1.0.0-rc.1）。
+  const parse = (v) => {
+    const noBuild = String(v).trim().split('+')[0];
+    const dash = noBuild.indexOf('-');
+    const coreStr = dash === -1 ? noBuild : noBuild.slice(0, dash);
+    const preStr = dash === -1 ? '' : noBuild.slice(dash + 1);
+    const core = coreStr.split('.').map((n) => parseInt(n, 10) || 0);
+    const pre = preStr ? preStr.split('.') : null;
+    return { core, pre };
+  };
+  const pa = parse(a);
+  const pb = parse(b);
   for (let i = 0; i < 3; i++) {
-    const d = (na[i] || 0) - (nb[i] || 0);
+    const d = (pa.core[i] || 0) - (pb.core[i] || 0);
     if (d) return d;
   }
-  const ra = pa[1] || '';
-  const rb = pb[1] || '';
-  if (ra === rb) return 0;
-  if (!ra) return 1; // 无 prerelease 更高
-  if (!rb) return -1;
-  return ra > rb ? 1 : -1;
+  if (!pa.pre && !pb.pre) return 0;
+  if (!pa.pre) return 1;
+  if (!pb.pre) return -1;
+  const len = Math.min(pa.pre.length, pb.pre.length);
+  for (let i = 0; i < len; i++) {
+    const x = pa.pre[i];
+    const y = pb.pre[i];
+    const xn = /^\d+$/.test(x) ? parseInt(x, 10) : null;
+    const yn = /^\d+$/.test(y) ? parseInt(y, 10) : null;
+    let cmp;
+    if (xn !== null && yn !== null) cmp = xn - yn;
+    else if (xn !== null) cmp = -1; // 数字段 < 非数字段（semver 规则）
+    else if (yn !== null) cmp = 1;
+    else cmp = x < y ? -1 : x > y ? 1 : 0;
+    if (cmp) return cmp;
+  }
+  return pa.pre.length - pb.pre.length;
 }
 
 function linkPluginDeps() {

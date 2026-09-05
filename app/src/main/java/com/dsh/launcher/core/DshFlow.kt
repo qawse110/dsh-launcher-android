@@ -469,16 +469,23 @@ object DshFlow {
         return false
     }
 
-    fun httpResponds(port: Int): Boolean = try {
-        val conn = URL("http://127.0.0.1:$port/").openConnection() as HttpURLConnection
-        conn.connectTimeout = 800
-        conn.readTimeout = 800
-        conn.requestMethod = "GET"
-        val code = conn.responseCode
-        conn.disconnect()
-        code in 200..399
-    } catch (e: Exception) {
-        false
+    fun httpResponds(port: Int): Boolean {
+        val conn = try {
+            URL("http://127.0.0.1:$port/").openConnection() as HttpURLConnection
+        } catch (e: Exception) {
+            return false
+        }
+        return try {
+            conn.connectTimeout = 800
+            conn.readTimeout = 800
+            conn.requestMethod = "GET"
+            conn.responseCode in 200..399
+        } catch (e: Exception) {
+            false
+        } finally {
+            // disconnect 必须放 finally：responseCode 抛异常时连接也要释放
+            runCatching { conn.disconnect() }
+        }
     }
 
     private fun appendLogTail(file: File, maxLines: Int, onLog: (String) -> Unit) {

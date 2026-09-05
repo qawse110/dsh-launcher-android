@@ -12,16 +12,23 @@ import android.content.Context
 object DshWatchdog {
 
     /** dsh web 端口是否可访问。 */
-    fun isUp(): Boolean = try {
-        val conn = java.net.URL("http://127.0.0.1:${DshFlow.WEB_PORT}/").openConnection() as java.net.HttpURLConnection
-        conn.connectTimeout = 800
-        conn.readTimeout = 800
-        conn.requestMethod = "GET"
-        val ok = conn.responseCode in 200..399
-        conn.disconnect()
-        ok
-    } catch (e: Exception) {
-        false
+    fun isUp(): Boolean {
+        val conn = try {
+            java.net.URL("http://127.0.0.1:${DshFlow.WEB_PORT}/").openConnection()
+                as java.net.HttpURLConnection
+        } catch (e: Exception) {
+            return false
+        }
+        return try {
+            conn.connectTimeout = 800
+            conn.readTimeout = 800
+            conn.requestMethod = "GET"
+            conn.responseCode in 200..399
+        } catch (e: Exception) {
+            false
+        } finally {
+            runCatching { conn.disconnect() }
+        }
     }
 
     /**

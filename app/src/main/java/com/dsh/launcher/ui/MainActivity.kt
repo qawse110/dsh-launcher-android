@@ -634,7 +634,11 @@ class MainActivity : AppCompatActivity() {
                     setBusy(false)
                     if (ok) {
                         appendMiniLog("✓ 更新完成，正在重启服务…")
-                        handler.postDelayed({ beginFlow(DshFlow.Mode.START_ONLY) }, 800)
+                        // 更新期间 web 一直在跑旧代码：必须先杀掉旧 node 进程，
+                        // 否则 START_ONLY 检测到端口占用且 HTTP 响应正常会直接
+                        // 视为「已在运行」返回，新版本永远不会被拉起（假更新）。
+                        thread { DshFlow.killAllNode(this@MainActivity) { } }
+                        handler.postDelayed({ beginFlow(DshFlow.Mode.START_ONLY) }, 1500)
                     } else {
                         toast("更新失败，详见控制台日志")
                     }
@@ -655,7 +659,10 @@ class MainActivity : AppCompatActivity() {
             .setMessage("将重新安装上一版本 dsh 并重启 web，当前临时版本会被替换。\n\n若插件与临时版本不兼容导致异常，回滚即可恢复。")
             .setPositiveButton("回滚") { _, _ ->
                 appendMiniLog(">> 开始回滚到 v$prev …")
-                DshUpdater.maybeAutoRollback(this) { }
+                // 手动回滚不走 maybeAutoRollback：该函数有每窗口一次（KEY_AUTO_ROLLED）守卫，
+                // 自动回滚已触发过时它返回 false 且不置 tag，随后安装会用默认 latest
+                // 把临时版本原样装回（「假回滚」）。手动回滚必须强制生效。
+                DshUpdater.forceRollbackTag(this, prev)
                 DshFlow.killAllNode(this) { }
                 beginFlow(DshFlow.Mode.INSTALL_AND_START, forceFullInstall = true)
             }

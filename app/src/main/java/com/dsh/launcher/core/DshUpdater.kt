@@ -26,24 +26,27 @@ object DshUpdater {
     private const val NPM_REGISTRY = "https://registry.npmmirror.com/@deepseek-ai/dsh"
     private const val NPM_REGISTRY_FALLBACK = "https://registry.npmjs.org/@deepseek-ai/dsh"
     private const val AUTO_CHECK_INTERVAL_MS = 6L * 60 * 60 * 1000 // 自动检查间隔 6 小时
+    /** 检查失败（无网/超时/解析失败）后的最短重试间隔：避免弱网下每次轮询都空耗 50s 超时。 */
+    private const val FAILED_CHECK_BACKOFF_MS = 15L * 60 * 1000
 
-    data class State(val checkedAt: Long)
+    data class State(val checkedAt: Long, val lastOk: Boolean = true)
 
     private fun stateFile(ctx: Context): File = File(ctx.filesDir, "dsh-update.json")
 
     private fun readState(ctx: Context): State {
         return try {
             val j = JSONObject(stateFile(ctx).readText())
-            State(j.optLong("checkedAt"))
+            State(j.optLong("checkedAt"), j.optBoolean("lastOk", true))
         } catch (_: Throwable) {
             State(0L)
         }
     }
 
-    private fun writeState(ctx: Context, checkedAt: Long) {
+    private fun writeState(ctx: Context, checkedAt: Long, ok: Boolean = true) {
         try {
             val j = JSONObject()
             j.put("checkedAt", checkedAt)
+            j.put("lastOk", ok)
             stateFile(ctx).writeText(j.toString())
         } catch (_: Throwable) {
         }
@@ -84,8 +87,9 @@ object DshUpdater {
 
     private fun checkRemoteTag(ctx: Context, tag: String, force: Boolean, log: (String) -> Unit): String? {
         val state = readState(ctx)
-        if (!force && state.checkedAt > 0 && System.currentTimeMillis() - state.checkedAt < AUTO_CHECK_INTERVAL_MS) {
-            log("检查跳过（距上次 ${(System.currentTimeMillis() - state.checkedAt) / 1000}s < 6h）")
+        val interval = if (state.lastOk) AUTO_CHECK_INTERVAL_MS else FAILED_CHECK_BACKOFF_MS
+        if (!force && state.checkedAt > 0 && System.currentTimeMillis() - state.checkedAt < interval) {
+            log("检查跳过（距上次 ${(System.currentTimeMillis() - state.checkedAt) / 1000}s，${if (state.lastOk) "< 6h" else "失败退避 < 15min"}）")
             return null
         }
         val cur = installedVersion(ctx) ?: run {
@@ -93,10 +97,19 @@ object DshUpdater {
             return null
         }
         return try {
-            val body = fetchOrNull(NPM_REGISTRY) ?: fetchOrNull(NPM_REGISTRY_FALLBACK) ?: return null
+            val body = fetchOrNull(NPM_REGISTRY) ?: fetchOrNull(NPM_REGISTRY_FALLBACK)
+            if (body == null) {
+                // 失败也要节流：否则 UI 轮询每次都会空耗两个 20s+30s 的连接超时
+                writeState(ctx, System.currentTimeMillis(), ok = false)
+                log("版本检查失败（网络不可用），${FAILED_CHECK_BACKOFF_MS / 60000} 分钟内不再重试")
+                return null
+            }
             val j = JSONObject(body)
-            val remote = j.optJSONObject("dist-tags")?.optString(tag)?.takeIf { it.isNotBlank() } ?: return null
-            writeState(ctx, System.currentTimeMillis())
+            val remote = j.optJSONObject("dist-tags")?.optString(tag)?.takeIf { it.isNotBlank() } ?: run {
+                writeState(ctx, System.currentTimeMillis(), ok = false)
+                return null
+            }
+            writeState(ctx, System.currentTimeMillis(), ok = true)
             if (compareVersions(remote, cur) <= 0) {
                 log("已是新版（本地 $cur，远端 $tag=$remote）")
                 null
@@ -105,6 +118,7 @@ object DshUpdater {
                 remote
             }
         } catch (t: Throwable) {
+            writeState(ctx, System.currentTimeMillis(), ok = false)
             log("版本检查失败：${t.message}")
             null
         }
@@ -174,8 +188,15 @@ object DshUpdater {
     private const val KEY_TEMP_VERSION = "dsh_temp_version"
     private const val KEY_TEMP_BOOTS = "dsh_temp_boots"
     private const val KEY_AUTO_ROLLED = "dsh_auto_rolled"
+    /** auto-rolled 守卫置位时间：超过守卫期后允许下一次更新重新记录基线（防死锁）。 */
+    private const val KEY_ROLLED_AT = "dsh_auto_rolled_at"
     /** 临时版本连续成功启动几次后自动确认（撤销回滚基线）。 */
     private const val AUTO_CONFIRM_BOOTS = 3
+    /**
+     * auto-rolled 守卫最大生效时长：回滚重装应在两次 attempt（分钟级）内结束，
+     * 超时仍未清理视为回滚安装失败/中断，守卫失效，允许后续更新重新记录基线。
+     */
+    private const val AUTO_ROLLED_GUARD_MS = 2L * 60 * 60 * 1000
 
     private fun console(ctx: Context) =
         ctx.getSharedPreferences(AppState.Prefs.CONSOLE, Context.MODE_PRIVATE)
@@ -195,8 +216,10 @@ object DshUpdater {
      */
     fun recordRollbackBaselineIfChanging(ctx: Context, changing: Boolean, onLog: (String) -> Unit): Boolean {
         if (!changing) return false
-        // 自动回滚触发的重装：保持原始基线，不被回滚目标覆盖
-        if (console(ctx).getBoolean(KEY_AUTO_ROLLED, false)) return false
+        // 自动回滚触发的重装：保持原始基线，不被回滚目标覆盖。
+        // 守卫有时限：回滚安装失败/中断导致 KEY_AUTO_ROLLED 残留时，
+        // 超过守卫期后不再无限阻断新基线记录（否则永久失去回滚保护）。
+        if (autoRolledGuardActive(ctx)) return false
         val cur = installedVersion(ctx) ?: return false
         console(ctx).edit()
             .putString(KEY_PREV_VERSION, cur)
@@ -205,6 +228,14 @@ object DshUpdater {
             .apply()
         onLog("临时更新保护开启：可回滚到 v$cur")
         return true
+    }
+
+    /** auto-rolled 守卫是否仍在生效期内（置位后 [AUTO_ROLLED_GUARD_MS] 内）。 */
+    private fun autoRolledGuardActive(ctx: Context): Boolean {
+        val c = console(ctx)
+        if (!c.getBoolean(KEY_AUTO_ROLLED, false)) return false
+        val rolledAt = c.getLong(KEY_ROLLED_AT, 0L)
+        return rolledAt <= 0L || System.currentTimeMillis() - rolledAt < AUTO_ROLLED_GUARD_MS
     }
 
     /**
@@ -252,11 +283,25 @@ object DshUpdater {
     fun maybeAutoRollback(ctx: Context, onLog: (String) -> Unit): Boolean {
         val prev = prevVersion(ctx) ?: return false
         if (console(ctx).getBoolean(KEY_AUTO_ROLLED, false)) return false
-        console(ctx).edit().putBoolean(KEY_AUTO_ROLLED, true).apply()
-        // install-dsh.mjs 支持精确版本号：@deepseek-ai/dsh@<prev> 直接重装旧版
-        console(ctx).edit().putString("dsh_install_tag", prev).apply()
-        onLog("检测到更新后异常，自动回滚到 v$prev …")
+        forceRollbackTag(ctx, prev, onLog)
         return true
+    }
+
+    /**
+     * 强制置回滚 tag（手动/自动回滚共用）：置一次性安装 tag=prev、
+     * 标记本窗口已回滚（防自动回滚再次触发）、清零 boots 计数
+     * （回滚重装后 afterInstall 会按 cur==prev 撤销窗口，但若回滚安装
+     * 中途失败，残留状态不能带着旧 boots 计数自愈）。
+     */
+    fun forceRollbackTag(ctx: Context, prev: String, onLog: (String) -> Unit = {}) {
+        console(ctx).edit()
+            .putBoolean(KEY_AUTO_ROLLED, true)
+            .putLong(KEY_ROLLED_AT, System.currentTimeMillis())
+            .putString("dsh_install_tag", prev)
+            .remove(KEY_TEMP_BOOTS)
+            .apply()
+        // install-dsh.mjs 支持精确版本号：@deepseek-ai/dsh@<prev> 直接重装旧版
+        onLog("置回滚目标 v$prev，下次安装将重装此版本")
     }
 
     /** 用户「确认此版本」或回滚完成后调用：清除临时窗口与回滚基线。 */
@@ -272,6 +317,7 @@ object DshUpdater {
             .remove(KEY_TEMP_VERSION)
             .remove(KEY_TEMP_BOOTS)
             .remove(KEY_AUTO_ROLLED)
+            .remove(KEY_ROLLED_AT)
             .apply()
     }
 }
