@@ -15,7 +15,10 @@ object Supervisor {
 
     private const val KEY_RUNNING = "running"
     private const val KEY_LAST_REVIVE = "watchdog_last_revive"
+    private const val KEY_FAIL_STREAK = "watchdog_fail_streak"
     private const val COOLDOWN_MS = 60_000L
+    /** 连续拉起无效的退避上限（30 分钟）。 */
+    private const val MAX_BACKOFF_MS = 30L * 60 * 1000
     private const val TAG = "Supervisor"
 
     private fun prefs(ctx: Context) =
@@ -32,6 +35,9 @@ object Supervisor {
     /**
      * 若期望运行且冷却到期，用复用的 dsh-web.sh 拉起 web。
      * 幂等：多路触发可安全并发调用，先到者占住冷却时间戳。
+     * 失败退避：连续拉起后 web 仍不可达时冷却指数增长（60s→2m→8m→30m 封顶），
+     * 避免「安装损坏 → watchdog 每分钟空拉必败进程」的耗电与日志刷屏；
+     * web 恢复可达后由 [noteWebUp] 归零。
      *
      * @return 是否实际执行了拉起动作（不含是否拉起成功——脚本异步生效）
      */
@@ -40,10 +46,11 @@ object Supervisor {
         if (!desiredRunning(ctx)) return false
         val now = System.currentTimeMillis()
         val last = prefs(ctx).getLong(KEY_LAST_REVIVE, 0L)
-        if (now - last < COOLDOWN_MS) return false
+        val cooldown = currentCooldown(ctx)
+        if (now - last < cooldown) return false
         prefs(ctx).edit().putLong(KEY_LAST_REVIVE, now).apply() // 先占位，防并发双拉
 
-        val script = File(ctx.getExternalFilesDir(null), "dsh-web.sh")
+        val script = DshFlow.webLauncherFile(ctx)
         if (!script.exists() || !script.canRead()) {
             AppLog.i(TAG, "revive: 启动脚本缺失（${script.absolutePath}），跳过")
             return false
@@ -59,11 +66,33 @@ object Supervisor {
                 .start()
             // 抛掉输出流防阻塞，让拉起动作异步完成
             Thread { try { p.inputStream.readBytes() } catch (_: Exception) {} }.start()
-            AppLog.i(TAG, "revive: 已拉起 dsh web（${script.absolutePath}）")
+            // 拉起已执行但结果未知：记一次「待验证」；下次 revive 前若 isUp 则归零
+            bumpFailStreak(ctx)
+            AppLog.i(TAG, "revive: 已拉起 dsh web（${script.absolutePath}，streak=${failStreak(ctx)}）")
             true
         } catch (t: Throwable) {
             AppLog.i(TAG, "revive: 拉起失败 ${t.message}")
+            bumpFailStreak(ctx)
             false
         }
+    }
+
+    /** 当前生效冷却：基础 60s，按连续无效拉起次数指数退避（60s→2m→8m→30m 封顶）。 */
+    private fun currentCooldown(ctx: Context): Long {
+        val streak = failStreak(ctx)
+        if (streak <= 0) return COOLDOWN_MS
+        val backoff = COOLDOWN_MS * (1L shl minOf(streak, 5))
+        return minOf(backoff, MAX_BACKOFF_MS)
+    }
+
+    private fun failStreak(ctx: Context): Int = prefs(ctx).getInt(KEY_FAIL_STREAK, 0)
+
+    private fun bumpFailStreak(ctx: Context) {
+        prefs(ctx).edit().putInt(KEY_FAIL_STREAK, failStreak(ctx) + 1).apply()
+    }
+
+    /** web 探测可达后调用：归零失败计数，恢复基础 60s 冷却。 */
+    fun noteWebUp(ctx: Context) {
+        if (failStreak(ctx) != 0) prefs(ctx).edit().putInt(KEY_FAIL_STREAK, 0).apply()
     }
 }

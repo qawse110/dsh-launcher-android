@@ -846,11 +846,11 @@ class MainActivity : AppCompatActivity() {
                 }
                 val prebuilt = File(filesDir, "prebuilt.tgz")
                 if (AssetSync.copyAsset(this, "prebuilt.tgz", prebuilt)) {
-                    AssetSync.markSynced(this, "prebuilt", current)
+                    AssetSync.markSyncedWithFingerprint(this, "prebuilt", prebuilt, current)
                 }
                 val extraPlugins = File(filesDir, "extra-plugins")
                 if (AssetSync.copyAssetDir(this, "extra-plugins", extraPlugins, clearFirst = true)) {
-                    AssetSync.markSynced(this, "extra-plugins", current)
+                    AssetSync.markSyncedWithFingerprint(this, "extra-plugins", extraPlugins, current)
                 }
                 val dshInstalled = File(filesDir, "plugins").exists() && File(filesDir, "dsh-prefix").exists()
                 if (dshInstalled) {

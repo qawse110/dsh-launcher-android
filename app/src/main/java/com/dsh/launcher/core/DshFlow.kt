@@ -201,7 +201,7 @@ object DshFlow {
         if (AssetSync.isSynced(ctx, "prebuilt", prebuilt, apkVer)) {
             fl("  内置插件源已是最新，跳过复制")
         } else if (AssetSync.copyAsset(ctx, "prebuilt.tgz", prebuilt)) {
-            AssetSync.markSynced(ctx, "prebuilt", apkVer)
+            AssetSync.markSyncedWithFingerprint(ctx, "prebuilt", prebuilt, apkVer)
             fl("  内置插件源 ${prebuilt.length() / 1024 / 1024}MB")
         } else {
             fl("  WARN assets 无 prebuilt.tgz，继续使用已有插件源")
@@ -212,7 +212,7 @@ object DshFlow {
         } else {
             try {
                 if (AssetSync.copyAssetDir(ctx, "extra-plugins", extraPluginsDir, clearFirst = true)) {
-                    AssetSync.markSynced(ctx, "extra-plugins", apkVer)
+                    AssetSync.markSyncedWithFingerprint(ctx, "extra-plugins", extraPluginsDir, apkVer)
                     val count = extraPluginsDir.walkTopDown().count { it.isFile }
                     fl("  额外桥接插件源 $count 个文件")
                     if (count == 0) fl("  WARN extra-plugins 复制后 0 个文件（assets 可能为空）")
@@ -415,7 +415,7 @@ object DshFlow {
         }
         // 生成启动脚本（模板 assets/web-launcher.sh.tpl + TermuxEnv 渲染），由内置 Termux bash 后台执行
         File(ctx.filesDir, "tmp").mkdirs()
-        val launcher = File(ctx.getExternalFilesDir(null) ?: ctx.filesDir, "dsh-web.sh")
+        val launcher = webLauncherFile(ctx)
         launcher.parentFile?.mkdirs()
         val nodeCmd = "${nodeDir.absolutePath}/bin/node --expose-internals --import ${ctx.filesDir.absolutePath}/fs-register.mjs ${cli.absolutePath} web"
         val tpl = runCatching { ctx.assets.open(WEB_LAUNCHER_TPL).use { it.readBytes().toString(Charsets.UTF_8) } }
@@ -437,6 +437,14 @@ object DshFlow {
         return waitForWebReady(ctx, 90_000, onLog)
     }
 
+
+    /**
+     * dsh web 启动脚本唯一路径：优先外置私有目录（可执行），不可用时回退 filesDir。
+     * Supervisor.reviveWebIfDue 与 startDshWeb 必须共用本函数——此前两处独立解析
+     * （一处 null 崩溃 / 一处兜底），外置存储不可用时会崩溃或看门狗静默失效。
+     */
+    fun webLauncherFile(ctx: Context): File =
+        File(ctx.getExternalFilesDir(null) ?: ctx.filesDir, "dsh-web.sh")
 
     /** 检测本机端口是否已有监听（用于幂等启动）。 */
     fun isPortListening(port: Int): Boolean = try {

@@ -976,7 +976,7 @@ class PluginManagerActivity : AppCompatActivity() {
         if (AssetSync.isSynced(this, "extra-plugins", dest, apkVer)) return
         try {
             if (AssetSync.copyAssetDir(this, "extra-plugins", dest, clearFirst = true)) {
-                AssetSync.markSynced(this, "extra-plugins", apkVer)
+                AssetSync.markSyncedWithFingerprint(this, "extra-plugins", dest, apkVer)
                 appendLog("   extra-plugins 源已同步（${dest.walkTopDown().count { it.isFile }} 个文件）")
             }
         } catch (t: Throwable) {
@@ -996,7 +996,7 @@ class PluginManagerActivity : AppCompatActivity() {
         if (AssetSync.isSynced(this, "prebuilt", prebuilt, apkVer)) {
             appendLog("   内置插件源已是最新，跳过复制")
         } else if (AssetSync.copyAsset(this, "prebuilt.tgz", prebuilt)) {
-            AssetSync.markSynced(this, "prebuilt", apkVer)
+            AssetSync.markSyncedWithFingerprint(this, "prebuilt", prebuilt, apkVer)
             appendLog("   内置插件源 ${prebuilt.length() / 1024 / 1024}MB")
         } else {
             appendLog("   WARN 无法复制 prebuilt.tgz，继续使用已有源")

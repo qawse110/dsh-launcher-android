@@ -34,7 +34,9 @@ object NodeRuntime {
     @Synchronized
     fun ensureExtracted(context: Context): File {
         val dir = File(context.filesDir, DIR)
-        if (MarkerStore.has(context, "node")) return dir
+        // marker 命中还不够：bin/node 必须真实存在（文件被清理/误删后自动重解压，
+        // 而不是让下游 install-dsh.mjs 以含混的 node: not found 失败）。
+        if (MarkerStore.has(context, "node") && File(dir, "bin/node").isFile) return dir
 
         dir.mkdirs()
         // 清理历史残留：旧版本/异常中断可能留下只读目录（W^X 取消写权限）
@@ -81,6 +83,11 @@ object NodeRuntime {
             var e: TarArchiveEntry? = tar.nextEntry
             while (e != null) {
                 val name = e.name.removePrefix("./").removePrefix("/") // 防路径穿越
+                // 显式拒绝穿越段与绝对路径（与 install-dsh.mjs untarWithPrefix 对齐）
+                if (name.isEmpty() || name.contains("..") || name.startsWith("/")) {
+                    e = tar.nextEntry
+                    continue
+                }
                 val out = File(dir, name)
                 if (e.isDirectory) {
                     out.mkdirs()

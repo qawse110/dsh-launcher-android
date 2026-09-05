@@ -37,7 +37,11 @@ object DshWatchdog {
      * 用户点「停止 dsh 服务」后不会复活。
      */
     fun maybeRevive(context: Context) {
-        if (isUp()) return
+        if (isUp()) {
+            // web 正常：归零 revive 失败退避计数，恢复基础冷却
+            Supervisor.noteWebUp(context)
+            return
+        }
         Supervisor.reviveWebIfDue(context)
     }
 }

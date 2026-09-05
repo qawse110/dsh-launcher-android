@@ -77,6 +77,10 @@ object Proc {
                 p.destroy()
                 if (!p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) p.destroyForcibly()
                 reader.join(2000)
+                // destroy 只杀 shell 本身，spawnSync 出的 npm/pnpm 孙进程会被孤儿化，
+                // 继续写 node_modules 与下一轮安装并发。统一按 node 进程清理兜底
+                // （安装/更新链路的子进程全部是 node 生态；killAllNode 幂等、无 node 时为 no-op）。
+                runCatching { DshFlow.killAllNode(s.ctx) { s.onLine(it) } }
                 EXIT_TIMEOUT
             } else {
                 reader.join(5000)

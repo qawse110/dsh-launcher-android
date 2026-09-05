@@ -33,14 +33,56 @@ object AssetSync {
         0L
     }
 
-    /** marker（MarkerStore 键）值为 "apk:<version>"，且目标文件/目录存在时视为已同步。 */
+    /** marker（MarkerStore 键）值为 "apk:<version>#<fingerprint>"，且目标文件/目录存在时视为已同步。 */
     fun isSynced(ctx: Context, key: String, target: File, apkVersion: Long): Boolean {
         if (apkVersion <= 0L || !target.exists()) return false
-        return MarkerStore.get(ctx, key) == "apk:$apkVersion"
+        val marker = MarkerStore.get(ctx, key) ?: return false
+        if (!marker.startsWith("apk:$apkVersion#")) return false
+        // 内容指纹：versionCode 相同（本地 debug 重建）但资产变了 → 签名不匹配 → 重新拷贝。
+        // 兼容旧格式 marker（无 #）：视为未同步，本次拷贝后升级为新格式。
+        val fp = fingerprintOf(target)
+        return marker == "apk:$apkVersion#$fp"
     }
 
     fun markSynced(ctx: Context, key: String, apkVersion: Long) {
         MarkerStore.put(ctx, key, "apk:$apkVersion")
+    }
+
+    /** 携带目标内容指纹写入 marker（isSynced 校验用）。 */
+    fun markSyncedWithFingerprint(ctx: Context, key: String, target: File, apkVersion: Long) {
+        MarkerStore.put(ctx, key, "apk:$apkVersion#${fingerprintOf(target)}")
+    }
+
+    /**
+     * 轻量内容指纹：文件 = 长度 + 头 64KB CRC32；目录 = 递归各文件（长度+CRC）的聚合 CRC。
+     * 预算：prebuilt.tgz ~30MB 只读头 64KB；extra-plugins 目录数百个小文件全读但都是文本，
+     * 总量 MB 级，冷缓存下 ~百毫秒，仅资产拷贝判定路径调用（非每帧）。
+     */
+    private fun fingerprintOf(target: File): String = try {
+        val crc = java.util.zip.CRC32()
+        if (target.isDirectory) {
+            target.walkTopDown().filter { it.isFile }.sortedBy { it.relativeTo(target).path }
+                .forEach { f ->
+                    val rel = f.relativeTo(target).path
+                    crc.update(rel.toByteArray())
+                    updateCrcWithHead(crc, f)
+                }
+        } else {
+            updateCrcWithHead(crc, target)
+        }
+        java.lang.Long.toHexString(crc.value)
+    } catch (t: Throwable) {
+        "err"
+    }
+
+    private fun updateCrcWithHead(crc: java.util.zip.CRC32, f: File) {
+        crc.update(f.length().toString().toByteArray())
+        if (f.length() <= 0L) return
+        java.io.FileInputStream(f).use { input ->
+            val buf = ByteArray(64 * 1024)
+            val n = input.read(buf)
+            if (n > 0) crc.update(buf, 0, n)
+        }
     }
 
     fun copyAsset(context: Context, assetName: String, dest: File): Boolean = try {
