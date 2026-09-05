@@ -15,3 +15,9 @@ local.properties
 .DS_Store
 __pycache__/
 *.pyc
+
+# 本机抓取的设备日志（dsh.log / dsh-web.log）
+/*.log
+
+# WorkBuddy 项目数据（记忆与会话数据，不入库）
+.workbuddy/

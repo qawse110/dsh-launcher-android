@@ -374,7 +374,11 @@ object DshFlow {
     private fun runAndroidStubOnce(ctx: Context, nodeDir: File, dshPrefix: File, stubScript: File, fl: (String) -> Unit) {
         val apkVer = AssetSync.apkVersion(ctx)
         val expected = "apk:$apkVer|dsh:${DshUpdater.currentVersion(ctx)}"
-        if (MarkerStore.get(ctx, "stub-applied") == expected) {
+        // sharp-shim.cjs 是 fs-loader 的运行时兜底源，由 stub-dsh.mjs 写出。
+        // 它缺失说明补丁产物被清掉（清数据/外部存储回收/被 pnpm 重写），
+        // 此时即使版本 marker 匹配也必须重跑，否则 sharp 会重新在 import 期炸掉。
+        val runtimeShim = File(ctx.filesDir, "sharp-shim.cjs")
+        if (MarkerStore.get(ctx, "stub-applied") == expected && runtimeShim.exists()) {
             fl(">> Android 兼容修复已应用（$expected），跳过 stub")
             return
         }
