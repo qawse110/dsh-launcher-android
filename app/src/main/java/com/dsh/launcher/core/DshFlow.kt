@@ -408,6 +408,10 @@ object DshFlow {
             onLog("✗ 未找到官方 dsh CLI（安装可能未完成）")
             return false
         }
+        // 预检：会话存储根（files/.dsh/sessions）必须可写。
+        // 真机故障：dsh 新建会话时 mkdir 报 EACCES permission denied——应用私有目录
+        // 正常不可能 EACCES，多为换机/备份恢复把目录属主改乱。快速失败 + 能修则修。
+        if (!ensureHomeWritable(ctx, onLog)) return false
         // v4.5 唯一环境：内置 Termux —— 未就绪时先准备（已就绪零开销），失败即中止
         if (!TermuxRuntime.isBashReady(ctx)) {
             onLog(">> 内置 Termux 未就绪，自动准备中（首次约 10~60 秒）…")
@@ -452,6 +456,57 @@ object DshFlow {
         exec(ctx, "${TermuxRuntime.bashPath(ctx).absolutePath} ${launcher.absolutePath}") { onLog(it) }
         onLog(">> dsh web 已后台启动，等待 web 就绪（http://127.0.0.1:$WEB_PORT）…")
         return waitForWebReady(ctx, 90_000, onLog)
+    }
+
+    /**
+     * 预检 files/.dsh/sessions（dsh 会话存储根）可写。
+     * 不存在则创建；不可写先尝试补 755 权限位（属主正常时有效）；
+     * 仍失败则打印逐级属主/权限诊断并给出可读的处理建议，返回 false 中止启动。
+     */
+    private fun ensureHomeWritable(ctx: Context, onLog: (String) -> Unit): Boolean {
+        val home = ctx.filesDir
+        val chain = listOf(home, File(home, ".dsh"), File(home, ".dsh/sessions"))
+
+        fun probe(): Boolean {
+            val p = File(chain.last(), ".probe-${System.currentTimeMillis()}")
+            return try {
+                p.mkdirs() && p.delete()
+            } catch (_: Throwable) {
+                false
+            }
+        }
+
+        runCatching { chain.last().mkdirs() }
+        if (probe()) return true
+
+        onLog(">> ${chain.last().absolutePath} 不可写，尝试修复权限位…")
+        for (d in chain) {
+            runCatching {
+                d.setReadable(true, false)
+                d.setWritable(true, false)
+                d.setExecutable(true, false)
+            }
+        }
+        if (probe()) {
+            onLog("OK 已修复 .dsh 目录权限")
+            return true
+        }
+
+        // 仍失败：逐级打印属主/权限，方便定位是哪一级坏了
+        val myUid = android.os.Process.myUid()
+        for (d in chain) {
+            val diag = runCatching {
+                val st = android.system.Os.stat(d.absolutePath)
+                val mode = "%o".format(st.st_mode and 0xFFF)
+                val owner = if (st.st_uid != myUid) " ←属主异常(应用uid=$myUid)" else ""
+                "mode=$mode uid=${st.st_uid}$owner"
+            }.getOrElse { "stat 失败: ${it.message}" }
+            val rel = d.absolutePath.removePrefix(home.absolutePath).ifEmpty { "/" }
+            onLog("DIAG ~$rel: $diag")
+        }
+        onLog("✗ 应用私有目录权限异常：dsh 无法保存会话（.dsh/sessions 不可写）。")
+        onLog("  多为换机/备份恢复导致目录属主错乱，请到 系统设置 → 应用 → DeepSeek Harness → 存储 → 清除数据；无效则卸载重装。")
+        return false
     }
 
 
