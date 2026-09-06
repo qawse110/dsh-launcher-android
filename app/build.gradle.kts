@@ -12,7 +12,8 @@ android {
         applicationId = "com.dsh.launcher"
         minSdk = 24
         targetSdk = 28
-        versionCode = 37
+        // 300 > 历史所有包（曾临时用过 commit 计数到 248）：保证任何情况下可直接覆盖安装
+        versionCode = 300
         versionName = "4.10.2-fix6"
     }
 

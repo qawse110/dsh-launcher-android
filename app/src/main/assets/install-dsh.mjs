@@ -337,6 +337,11 @@ function ensureDsh() {
     const lock = existsSync(join(DSH_PREFIX, 'pnpm-lock.yaml')) ? 'pnpm' : 'npm';
     log(`dsh version: ${afterVersion || 'unknown'} (lockfile=${lock}, dist-tag ${tag}=${distTagVersion || '?'})`);
   } catch {}
+  // 钉死版本校验：DSH_TAG 为精确版本号时，装完必须精确等于该版本，
+  // 否则说明镜像滞后/解析漂移——日志大声报出来，别让版本静默漂移。
+  if (tag !== 'latest' && tag !== 'next' && afterVersion && afterVersion !== tag) {
+    log(`WARN pinned version mismatch: installed ${afterVersion}, expected ${tag}`);
+  }
 }
 
 /** runEx 的静默变体：不回显命令行、输出不进终端日志，返回 stdout。 */
