@@ -174,6 +174,13 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        // 从「所有文件访问」系统页回来后复查：没给就提示（可点「存储」芯片重试）
+        if (awaitingAllFiles) {
+            awaitingAllFiles = false
+            if (Build.VERSION.SDK_INT >= 30 && !Environment.isExternalStorageManager()) {
+                toast("存储权限未授予，安装/写入外部目录会失败；可点状态区的「存储」芯片重新授权")
+            }
+        }
         refreshEnvChips()
         refreshRollbackCard()
     }
@@ -303,15 +310,17 @@ class MainActivity : AppCompatActivity() {
 
     // ---------------- 权限 ----------------
 
-    /** 申请存储权限（Android 11+ 走“所有文件访问”，旧版走运行时授权）。 */
+    /** 申请存储权限（Android 11+ 走“所有文件访问”，旧版走运行时授权）。
+     *  注意：不能用「只提示一次」的标记——用户第一次没授权（退出了系统页）
+     *  之后 app 就再也不问，表现为“没有自动获取存储权限”。
+     *  改为每次冷启动未授权就引导一次（仅 onCreate 触发，不会骚扰）。 */
+    private var awaitingAllFiles = false
+
     private fun requestStoragePermissions() {
         if (Build.VERSION.SDK_INT >= 30) {
             if (!Environment.isExternalStorageManager()) {
-                val prefs = getSharedPreferences("storage", MODE_PRIVATE)
-                if (!prefs.getBoolean("all_files_prompted", false)) {
-                    prefs.edit().putBoolean("all_files_prompted", true).apply()
-                    openAllFilesAccessSettings()
-                }
+                awaitingAllFiles = true
+                openAllFilesAccessSettings()
             }
             return
         }
@@ -784,8 +793,14 @@ class MainActivity : AppCompatActivity() {
 
         chip("Node ${if (hasNodeMarker()) "✓" else "…"}", if (hasNodeMarker()) Ui.SUCCESS else Ui.TEXT_MUTED)
         chip("Termux ${if (TermuxRuntime.isReady(this)) "✓" else "…"}", if (TermuxRuntime.isReady(this)) Ui.SUCCESS else Ui.TEXT_MUTED)
-        chip("存储 ${if (Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager()) "✓" else "…"}",
-            if (Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager()) Ui.SUCCESS else Ui.TEXT_MUTED)
+        val storageOk = Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager()
+        chip("存储 ${if (storageOk) "✓" else "⚠ 授权"}",
+            if (storageOk) Ui.SUCCESS else Ui.WARNING) {
+            if (!storageOk) {
+                awaitingAllFiles = true
+                openAllFilesAccessSettings()
+            }
+        }
 
         // ---- 悬浮窗双通道 ----
         val overlayGranted = Settings.canDrawOverlays(this)
