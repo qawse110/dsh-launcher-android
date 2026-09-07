@@ -50,6 +50,10 @@ class KeepAliveAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
+        // 系统重绑无障碍服务（开机/修复/进程重启）可能在同一实例上再次回调：
+        // 先拆掉旧 manager 的悬浮窗再重建，避免新旧窗口叠加成「悬浮窗重复出现」。
+        overlayManager?.remove()
+        overlayManager?.release()
         // 立即刷新时间戳：连接瞬间就让普通通道开始让位（不等第一次轮询）
         touchTs(this, force = true)
         overlayManager = BridgeOverlayManager(
@@ -57,7 +61,9 @@ class KeepAliveAccessibilityService : AccessibilityService() {
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
             false
         )
-        overlayManager?.resetDismissed()
+        // 不再无条件 resetDismissed：用户把悬浮窗拖进垃圾桶关闭（overlay_dismissed=true）
+        // 是明确的「不要显示」意图，系统自动重连不应把它清掉让悬浮窗自己又冒出来；
+        // 重新显示只能由用户显式操作触发（设置页开关/启动按钮已调用 resetDismissed）。
         startPolling()
     }
 
@@ -101,43 +107,70 @@ class KeepAliveAccessibilityService : AccessibilityService() {
     private fun startPolling() {
         if (polling) return
         polling = true
+        mainHandler.removeCallbacks(staleSweep)
+        mainHandler.postDelayed(staleSweep, STALE_SWEEP_MS)
         pollThread = thread {
             while (polling) {
-                // 自适应档位 + 心跳时间戳（普通通道据此判断本通道是否活着）
-                PowerGovernor.refreshScreenState(this)
-                PowerGovernor.setIdleKeepAliveMinutes(
-                    prefs().getInt("idle_keepalive_min", PowerGovernor.DEFAULT_IDLE_KEEPALIVE_MIN)
-                )
-                PowerGovernor.setTaskStatus(lastStatus)
-                touchTs(this)
-                syncWakeLock(PowerGovernor.wantWakeLock())
-                val data = fetchStatus()
-                if (data == null) {
-                    // dsh 进程不可达：watchdog 自动拉起（60s 冷却，双路幂等）
-                    DshWatchdog.maybeRevive(this)
+                try {
+                    // 自适应档位 + 心跳时间戳（普通通道据此判断本通道是否活着）
+                    PowerGovernor.refreshScreenState(this)
+                    PowerGovernor.setIdleKeepAliveMinutes(
+                        prefs().getInt("idle_keepalive_min", PowerGovernor.DEFAULT_IDLE_KEEPALIVE_MIN)
+                    )
+                    PowerGovernor.setTaskStatus(lastStatus)
+                    touchTs(this)
+                    syncWakeLock(PowerGovernor.wantWakeLock())
+                    val data = fetchStatus()
+                    if (data == null) {
+                        // dsh 进程不可达：watchdog 自动拉起（60s 冷却，双路幂等）
+                        DshWatchdog.maybeRevive(this)
+                        try {
+                            // 功耗档位见 PowerGovernor（亮屏 1s / 灭屏+任务 3s / 灭屏空闲分档放宽）
+                            Thread.sleep(PowerGovernor.intervalMs())
+                        } catch (e: InterruptedException) {
+                            break
+                        }
+                        continue
+                    }
+                    val prev = lastStatus
+                    lastStatus = data.status
+                    val finished = prev == "running" && data.status == "finished" &&
+                        data.updatedAt > lastFinishedAt
+                    if (finished) lastFinishedAt = data.updatedAt
+                    mainHandler.post {
+                        overlayManager?.update(data.status, data.text, data.event)
+                        if (finished) StatusBridgeAlerts.onAiFinished(this, data.text)
+                    }
                     try {
-                        // 功耗档位见 PowerGovernor（亮屏 1s / 灭屏+任务 3s / 灭屏空闲分档放宽）
                         Thread.sleep(PowerGovernor.intervalMs())
                     } catch (e: InterruptedException) {
                         break
                     }
-                    continue
-                }
-                val prev = lastStatus
-                lastStatus = data.status
-                val finished = prev == "running" && data.status == "finished" &&
-                    data.updatedAt > lastFinishedAt
-                if (finished) lastFinishedAt = data.updatedAt
-                mainHandler.post {
-                    overlayManager?.update(data.status, data.text, data.event)
-                    if (finished) StatusBridgeAlerts.onAiFinished(this, data.text)
-                }
-                try {
-                    Thread.sleep(PowerGovernor.intervalMs())
-                } catch (e: InterruptedException) {
-                    break
+                } catch (t: Throwable) {
+                    // 单轮异常（网络/磁盘/瞬时竞态）绝不杀死轮询线程：线程一死 ts 停止
+                    // 刷新，普通通道让位判定失效后自己起窗，与本通道残留窗口叠成双窗。
+                    // 兜底睡一小段再续跑，保证时间戳持续新鲜、窗口生命周期由 update() 统一裁决。
+                    AppLog.e("A11y", "poll loop error: " + (t.message ?: t.toString()))
+                    try {
+                        Thread.sleep(2_000L)
+                    } catch (e: InterruptedException) {
+                        break
+                    }
                 }
             }
+        }
+    }
+
+    /** 僵尸窗清扫周期：a11y ts 过期（轮询线程死亡/被冻结）时撤掉本通道窗口。 */
+    private val staleSweep = object : Runnable {
+        override fun run() {
+            // 轮询线程还在正常刷新 ts（fresh）→ 无事可做；仅当 ts 过期（线程已死/冻结、
+            // 不再有 update() 来撤窗）时，主动移除本通道悬浮窗，把显示权交还普通通道，
+            // 避免「a11y 残留窗 + 普通通道接管窗」永久双窗口叠加。
+            if (!KeepAliveAccessibilityService.shouldYieldToA11y(this@KeepAliveAccessibilityService)) {
+                overlayManager?.remove()
+            }
+            mainHandler.postDelayed(this, STALE_SWEEP_MS)
         }
     }
 
@@ -145,6 +178,7 @@ class KeepAliveAccessibilityService : AccessibilityService() {
         polling = false
         pollThread?.interrupt()
         pollThread = null
+        mainHandler.removeCallbacks(staleSweep)
         syncWakeLock(false)
     }
 
@@ -207,6 +241,9 @@ class KeepAliveAccessibilityService : AccessibilityService() {
 
     companion object {
         private const val STATUS_URL = "http://127.0.0.1:3190/status"
+
+        /** 僵尸窗清扫周期：a11y ts 过期（轮询线程死亡/被冻结）时撤掉本通道窗口。 */
+        private const val STALE_SWEEP_MS = 3_000L
 
         /** 唤醒锁单次持有超时：轮询循环每轮（≤30s）续期，超时兜底防误判后永久持锁。 */
         private const val WAKELOCK_RENEW_MS = 10 * 60_000L

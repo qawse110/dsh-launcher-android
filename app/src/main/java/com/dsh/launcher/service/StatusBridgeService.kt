@@ -80,9 +80,14 @@ class StatusBridgeService : Service() {
         running.set(false)
         syncWakeLock(false)
         thread?.interrupt()
-        mainHandler.post { overlayManager?.remove() }
-        overlayManager?.release()
+        // 必须在置空引用前同步拆窗：旧实现 post 到主线程后再把字段置 null，
+        // runnable 执行时读到的是 null → remove() 永不执行 → 悬浮窗残留，
+        // 服务被 watchdog/开机/打开 app 重新拉起后新旧窗口叠加成「悬浮窗重复出现」。
+        // onDestroy 本就在主线程，直接同步拆除即可（remove() 内部已捕获重复移除异常）。
+        val mgr = overlayManager
         overlayManager = null
+        mgr?.remove()
+        mgr?.release()
         StatusBridgeAlerts.release() // 释放提示音句柄（M6）
         writeHeartbeat("service", "destroyed", "destroyed", force = true)
         super.onDestroy()

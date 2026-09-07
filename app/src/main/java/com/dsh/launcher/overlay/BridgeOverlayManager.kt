@@ -188,18 +188,22 @@ class BridgeOverlayManager(
     private fun prefs() = context.getSharedPreferences(AppState.Prefs.BRIDGE, Context.MODE_PRIVATE)
     /** 悬浮窗统一开关状态：
      *  - 「悬浮窗显示」关闭 → 无论普通还是无障碍通道一律隐藏；
-     *  - 无障碍通道 5 秒内刷新过存活时间戳 → 普通悬浮窗让位，避免双窗口叠加。
+     *  - 对称让位：a11y ts 新鲜 → 仅 a11y 通道显示（普通通道让位）；ts 过期 →
+     *    仅普通通道显示（a11y 通道自撤，避免残留窗 + 接管窗双窗口叠加）。
      *    （旧布尔 a11y_overlay_active 在宿主被杀时回调不执行、陈旧残留且跨重启持久化，
      *     曾让普通通道永久让位 → 双通道全灭；时间戳化后自动过期自愈。） */
     private fun overlayEnabled(): Boolean {
         if (!prefs().getBoolean("overlay_enabled", true)) return false
-        // 无障碍通道自己不参与让位；普通通道在 a11y 活跃时让位
-        if (windowType != WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY &&
-            KeepAliveAccessibilityService.shouldYieldToA11y(context)
-        ) {
-            return false
+        val a11yFresh = KeepAliveAccessibilityService.shouldYieldToA11y(context)
+        return if (windowType == WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY) {
+            // 无障碍通道自己也参与让位：a11y ts 过期 = 本通道轮询线程已死/被冻结，
+            // 此时再挂着自己的窗口会让普通通道「让位判定失效后另起窗口」叠成双窗口。
+            // 对称让位后任一时刻最多一个通道显示（a11y 活跃→a11y 显示；否则普通通道显示）。
+            a11yFresh
+        } else {
+            // 普通通道：a11y 活跃时让位
+            !a11yFresh
         }
-        return true
     }
     // 偏好读取已迁移至 BridgePrefs（bp）；样式工厂迁移至 OverlayStyle。
 
