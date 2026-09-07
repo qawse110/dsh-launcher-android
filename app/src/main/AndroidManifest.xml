@@ -75,6 +75,11 @@
             android:exported="false"
             android:configChanges="orientation|screenSize|keyboardHidden"
             android:windowSoftInputMode="adjustResize" />
+        <activity
+            android:name=".ui.BackupActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:windowSoftInputMode="adjustResize" />
 
         <service
             android:name=".service.BuildKeepAliveService"

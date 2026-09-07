@@ -114,6 +114,18 @@ adb shell am start -n com.dsh.launcher/.MainActivity   # 或直接点应用图�
 - 部分 ColorOS 设备从 `/sdcard` 安装 APK 会遇到 FUSE 上下文问题：先推到 `/data/local/tmp/` 再 `pm install -r`。
 - 环境特性：唯一执行环境 = 内置 Termux（bash/coreutils/apt），首次使用自动 `pkg install git python ripgrep`；apt/dpkg 原生可用（W^X 放开 + termux-exec 集成），`apt install` 失败自动切 `tpkg` 手动兜底。
 
+## 备份与恢复
+
+主界面 →「备份与恢复」：
+
+- **创建备份**：按需勾选三类内容打包成单个 zip（默认存 `/sdcard/Download/DshLauncher/backup/`，无共享存储权限自动回退应用私有目录）：
+  - `dsh 数据`：`files/.dsh/**`（会话 / profiles / agent 预设 / 凭据 / settings.yaml / storages 等不可重建状态）；
+  - `启动器配置`：应用 SharedPreferences（`dsh_console`/`keepalive`/`ui`/`status_bridge`）+ `state/markers.json` + `dsh-update.json`；
+  - `插件目录`：`files/plugins/**`（已装配插件源码）。
+  - **不入库**：node 运行时 / termux / dsh-prefix（264MB npm 产物）/ prebuilt.tgz / 日志 —— 均可由「一键安装」重新生成；`node_modules` 链接农场与所有符号链接一律跳过。
+- **恢复**：选中一份备份 → 二次确认 → 自动「先停 dsh → 快照当前状态（`pre-restore` 包）→ 合并覆盖回档」。恢复只覆盖包内文件、不删除现有额外文件；完成后手动重启 dsh 生效。
+- 自动保留最近 5 份，超出按时间从旧到新清理。
+
 ## 桌宠模式（兼容 Codex 桌宠）
 
 - **切换**：主界面 →「状态悬浮窗」→「悬浮窗样式」选「状态条」或「桌宠」；长按悬浮窗本体可快速切换。

@@ -535,8 +535,16 @@ class MainActivity : AppCompatActivity() {
             ), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(8) })
             addView(addPairRow(
                 getString(R.string.btn_stop_all) to { stopDshAll() },
-                "📖 操作指南" to { toggleHelp() }
-            ), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+                "💾 备份与恢复" to { startActivity(Intent(this@MainActivity, BackupActivity::class.java)) }
+            ), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(8) })
+            addView(
+                Ui.button(this@MainActivity, "📖 操作指南", { toggleHelp() }, filled = false).apply {
+                    layoutParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                    )
+                },
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            )
         })
 
         // 环境状态 chips
@@ -554,7 +562,8 @@ class MainActivity : AppCompatActivity() {
                    内置插件装配、Android 兼容修复，然后启动本地服务并自动进入 WebUI；
                 ② 之后的每次打开：自动快速启动（秒级）并直接进入 WebUI，无需任何操作；
                 ③ 「控制台」可看完整安装/运行日志，「终端」提供完整 Linux 环境；
-                ④ 「停止 dsh 服务」结束后台进程与保活。
+                ④ 「停止 dsh 服务」结束后台进程与保活；
+                ⑤ 「备份与恢复」可把 dsh 数据、启动器配置、插件目录打包成 zip 存档或回档。
                 
                 提示：
                 · 全程免 Termux 配置，内置 aarch64 Node 运行时；

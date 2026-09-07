@@ -54,6 +54,19 @@ object MarkerStore {
         }
     }
 
+    /**
+     * 让进程内缓存失效，下个访问重新从盘加载。
+     *
+     * 供备份恢复使用：markers.json 被外部（恢复流程）整体替换后，
+     * 缓存仍持有旧值，下次 persist 会把恢复的内容覆盖回去。
+     */
+    fun invalidate() {
+        synchronized(lock) {
+            loaded = false
+            map.clear()
+        }
+    }
+
     // ---------------- 内部 ----------------
 
     private fun storeFile(ctx: Context) = File(File(ctx.filesDir, DIR), FILE)
