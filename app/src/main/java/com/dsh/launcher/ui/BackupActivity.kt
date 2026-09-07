@@ -165,8 +165,7 @@ class BackupActivity : AppCompatActivity() {
             setTextColor(Ui.TEXT_PRIMARY)
         })
         col.addView(TextView(this).apply {
-            text = "打包为 zip，只包含不可重建的状态；node / termux / dsh-prefix / 日志不入库"
-                + "（这些由「一键安装」重新生成）。"
+            text = "打包为 zip，只包含不可重建的状态；node / termux / dsh-prefix / 日志不入库（这些由「一键安装」重新生成）。"
             textSize = 11.5f
             setTextColor(Ui.TEXT_SECONDARY)
             setLineSpacing(dp(2).toFloat(), 1f)

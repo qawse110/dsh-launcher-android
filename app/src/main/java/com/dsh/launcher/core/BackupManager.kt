@@ -25,16 +25,16 @@ import com.dsh.launcher.R
  *
  * ```
  * manifest.json          备份元信息（格式版本 / 时间 / 版本 / 各分区文件数与字节数）
- * dsh/…                  files/.dsh/**  （会话 sessions、profiles、agent-presets、
+ * dsh/…                  files/.dsh 目录（会话 sessions、profiles、agent-presets、
  *                        credentials.yaml、settings.yaml、storages、super-injector）
- * plugins/…              files/plugins/**（已装配插件源码；符号链接跳过）
- * launcher/prefs/*.json  启动器 SharedPreferences（dsh_console/keepalive/ui/status_bridge）
+ * plugins/…              files/plugins 目录（已装配插件源码；符号链接跳过）
+ * launcher/prefs/…       启动器 SharedPreferences（dsh_console/keepalive/ui/status_bridge）
  * launcher/state/…       files/state/markers.json、files/dsh-update.json
  * ```
  *
  * 关键取舍：
- * - **符号链接一律跳过，且不下钻任何 node_modules**：plugins/node_modules 与
- *   .dsh/profiles/*/node_modules 是指向 dsh-prefix（264MB）的 link 农场，
+ * - **符号链接一律跳过，且不下钻任何 node_modules**：plugins 与 .dsh/profiles 下的
+ *   node_modules 是指向 dsh-prefix（264MB）的 link 农场，
  *   跟随会把备份撑到几百 MB 且恢复时互相踩踏；这些 link 由
  *   `dsh plugin add` 装配时自动重建，不属于「不可重建的状态」。
  * - **排除大块可重建物**：node（内置运行时）、termux、dsh-prefix（npm 安装产物）、
@@ -62,9 +62,9 @@ object BackupManager {
 
     /**
      * 即使勾选了「插件目录」也不打包的真实依赖林：
-     * - plugins/node_modules：pnpm 把 dsh-prefix 里的包 link 进来，跟随等于把
+     * - plugins 下的 node_modules：pnpm 把 dsh-prefix 里的包 link 进来，跟随等于把
      *   264MB 的 npm 安装产物整份复制进备份，且目录里绝大部分是链接而非实体文件；
-     * - .dsh/profiles/*/node_modules：同理，装配 junction 林，由 `dsh plugin add` 重建。
+     * - .dsh/profiles 下的 node_modules：同理，装配 junction 林，由 `dsh plugin add` 重建。
      */
     private val SKIP_DIR_NAMES = setOf("node_modules")
 
