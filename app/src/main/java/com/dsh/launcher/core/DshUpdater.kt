@@ -3,8 +3,6 @@ package com.dsh.launcher.core
 import android.content.Context
 import org.json.JSONObject
 import java.io.File
-import java.net.HttpURLConnection
-import java.net.URL
 import com.dsh.launcher.core.*
 import com.dsh.launcher.overlay.*
 import com.dsh.launcher.service.*
@@ -13,44 +11,15 @@ import com.dsh.launcher.ui.*
 import com.dsh.launcher.R
 
 /**
- * dsh 自动更新：通过 npm 官方包 `@deepseek-ai/dsh` 检查/安装/更新。
+ * dsh 版本读取 + 安装回滚保护状态机。
  *
- * 协议：
- *   - 版本源：npm registry 的 `@deepseek-ai/dsh` `dist-tags.latest`。
- *   - 安装/更新动作：由 ConsoleActivity 调用 install-dsh.mjs 执行
- *     `npm install --prefix files/dsh-prefix @deepseek-ai/dsh@latest`。
- *   - 本地状态：`files/dsh-update.json`，记录最近检查时间。
+ * dsh 本体版本已钉死（[DshFlow.PINNED_DSH_TAG]；install-dsh.mjs 按精确版本安装），
+ * 不再检查 npm registry 远端版本、也不提供在线更新入口。本对象保留：
+ *   - 版本读取：`files/dsh-prefix/node_modules/@deepseek-ai/dsh/package.json`；
+ *   - 临时更新/回滚保护：全量安装导致版本变化（如 APK 升级抬高了钉死版本）时
+ *     保留回滚基线，新版本异常自动回滚、稳定后自动确认。
  */
 object DshUpdater {
-
-    private const val NPM_REGISTRY = "https://registry.npmmirror.com/@deepseek-ai/dsh"
-    private const val NPM_REGISTRY_FALLBACK = "https://registry.npmjs.org/@deepseek-ai/dsh"
-    private const val AUTO_CHECK_INTERVAL_MS = 6L * 60 * 60 * 1000 // 自动检查间隔 6 小时
-    /** 检查失败（无网/超时/解析失败）后的最短重试间隔：避免弱网下每次轮询都空耗 50s 超时。 */
-    private const val FAILED_CHECK_BACKOFF_MS = 15L * 60 * 1000
-
-    data class State(val checkedAt: Long, val lastOk: Boolean = true)
-
-    private fun stateFile(ctx: Context): File = File(ctx.filesDir, "dsh-update.json")
-
-    private fun readState(ctx: Context): State {
-        return try {
-            val j = JSONObject(stateFile(ctx).readText())
-            State(j.optLong("checkedAt"), j.optBoolean("lastOk", true))
-        } catch (_: Throwable) {
-            State(0L)
-        }
-    }
-
-    private fun writeState(ctx: Context, checkedAt: Long, ok: Boolean = true) {
-        try {
-            val j = JSONObject()
-            j.put("checkedAt", checkedAt)
-            j.put("lastOk", ok)
-            stateFile(ctx).writeText(j.toString())
-        } catch (_: Throwable) {
-        }
-    }
 
     /** 当前生效版本：读取 npm 安装目录里的 @deepseek-ai/dsh；未安装时返回 0.0.0（待安装）。 */
     fun currentVersion(ctx: Context): String {
@@ -67,115 +36,6 @@ object DshUpdater {
         } catch (_: Throwable) {
             null
         }
-    }
-
-    /**
-     * 检查 npm registry 是否有新版本（latest 稳定线）。
-     * @param force true 忽略检查间隔强制检查。
-     * @return 新版本号（有更新），或 null（已是最新/无网络/失败）。
-     */
-    fun checkRemote(ctx: Context, force: Boolean, log: (String) -> Unit): String? =
-        checkRemoteTag(ctx, "latest", force, log)
-
-    /**
-     * 检查 npm registry 是否有新版本（next 预发布线）。
-     * @param force true 忽略检查间隔强制检查。
-     * @return 新版本号（有更新），或 null（已是最新/无网络/失败）。
-     */
-    fun checkRemoteNext(ctx: Context, force: Boolean, log: (String) -> Unit): String? =
-        checkRemoteTag(ctx, "next", force, log)
-
-    private fun checkRemoteTag(ctx: Context, tag: String, force: Boolean, log: (String) -> Unit): String? {
-        val state = readState(ctx)
-        val interval = if (state.lastOk) AUTO_CHECK_INTERVAL_MS else FAILED_CHECK_BACKOFF_MS
-        if (!force && state.checkedAt > 0 && System.currentTimeMillis() - state.checkedAt < interval) {
-            log("检查跳过（距上次 ${(System.currentTimeMillis() - state.checkedAt) / 1000}s，${if (state.lastOk) "< 6h" else "失败退避 < 15min"}）")
-            return null
-        }
-        val cur = installedVersion(ctx) ?: run {
-            log("dsh 尚未安装，跳过版本检查（首次运行直接安装）")
-            return null
-        }
-        return try {
-            val body = fetchOrNull(NPM_REGISTRY) ?: fetchOrNull(NPM_REGISTRY_FALLBACK)
-            if (body == null) {
-                // 失败也要节流：否则 UI 轮询每次都会空耗两个 20s+30s 的连接超时
-                writeState(ctx, System.currentTimeMillis(), ok = false)
-                log("版本检查失败（网络不可用），${FAILED_CHECK_BACKOFF_MS / 60000} 分钟内不再重试")
-                return null
-            }
-            val j = JSONObject(body)
-            val remote = j.optJSONObject("dist-tags")?.optString(tag)?.takeIf { it.isNotBlank() } ?: run {
-                writeState(ctx, System.currentTimeMillis(), ok = false)
-                return null
-            }
-            writeState(ctx, System.currentTimeMillis(), ok = true)
-            if (compareVersions(remote, cur) <= 0) {
-                log("已是新版（本地 $cur，远端 $tag=$remote）")
-                null
-            } else {
-                log("发现新版本 $remote（本地 $cur，dist-tag=$tag）")
-                remote
-            }
-        } catch (t: Throwable) {
-            writeState(ctx, System.currentTimeMillis(), ok = false)
-            log("版本检查失败：${t.message}")
-            null
-        }
-    }
-
-    private fun fetchOrNull(url: String): String? {
-        var conn: HttpURLConnection? = null
-        return try {
-            conn = URL(url).openConnection() as HttpURLConnection
-            conn.connectTimeout = 20_000
-            conn.readTimeout = 30_000
-            conn.instanceFollowRedirects = true
-            conn.setRequestProperty("User-Agent", "DshLauncher/4.0")
-            conn.connect()
-            if (conn.responseCode !in 200..399) return null
-            conn.inputStream.bufferedReader().use { it.readText() }
-        } catch (_: Throwable) {
-            null
-        } finally {
-            runCatching { conn?.disconnect() }
-        }
-    }
-
-    /** 语义化版本比较：a > b 返回正数。支持 x / x.y / x.y.z 与 prerelease（如 0.1.0-rc.6）。 */
-    fun compareVersions(a: String, b: String): Int {
-        val (pa, preA) = parseSemVer(a)
-        val (pb, preB) = parseSemVer(b)
-        for (i in 0 until maxOf(pa.size, pb.size)) {
-            val x = pa.getOrElse(i) { 0 }
-            val y = pb.getOrElse(i) { 0 }
-            if (x != y) return x - y
-        }
-        if (preA == null && preB == null) return 0
-        if (preA == null) return 1
-        if (preB == null) return -1
-        for (i in 0 until minOf(preA.size, preB.size)) {
-            val x = preA[i]
-            val y = preB[i]
-            val xn = x.toIntOrNull()
-            val yn = y.toIntOrNull()
-            val cmp = when {
-                xn != null && yn != null -> xn.compareTo(yn)
-                xn != null -> -1
-                yn != null -> 1
-                else -> x.compareTo(y)
-            }
-            if (cmp != 0) return cmp
-        }
-        return preA.size.compareTo(preB.size)
-    }
-
-    private fun parseSemVer(s: String): Pair<List<Int>, List<String>?> {
-        val noBuild = s.trim().substringBefore('+')
-        val parts = noBuild.split('-', limit = 2)
-        val core = parts[0].split('.').mapNotNull { it.toIntOrNull() }
-        val pre = if (parts.size > 1 && parts[1].isNotBlank()) parts[1].split('.') else null
-        return core to pre
     }
 
     // ================= 临时更新 / 回滚保护 =================

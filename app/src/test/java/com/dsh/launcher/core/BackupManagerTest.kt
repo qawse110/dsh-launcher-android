@@ -27,7 +27,6 @@ class BackupManagerTest {
         File(ctx.filesDir, "plugins").deleteRecursively()
         File(ctx.filesDir, "backups").deleteRecursively()
         File(ctx.filesDir, "state").deleteRecursively()
-        File(ctx.filesDir, "dsh-update.json").delete()
         // Robolectric 下共享下载目录常可写，备份可能落在 filesDir 外：整个备份目录统一清空
         runCatching {
             BackupManager.backupDir(ctx).listFiles()?.forEach { it.deleteRecursively() }

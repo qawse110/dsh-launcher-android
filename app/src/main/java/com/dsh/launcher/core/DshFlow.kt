@@ -43,7 +43,7 @@ object DshFlow {
 
     const val WEB_PORT = 3080
 
-    /** dsh 本体钉死版本：普通安装始终装这个精确版本（DSH_TAG 可被 UI/回滚显式覆盖）。 */
+    /** dsh 本体钉死版本：普通安装始终装这个精确版本（仅回滚流程经 dsh_install_tag 覆盖）。 */
     const val PINNED_DSH_TAG = "0.1.1-rc.1"
 
     /** 统一日志文件名（files/logs/ 下，见 [FileLog]）。 */
@@ -189,7 +189,7 @@ object DshFlow {
             fl("WARN 1.5/4 termux prepare failed: ${t.message}（继续 dsh 安装，dsh bash 工具可能不可用）")
         }
         fl("dsh 版本 v${DshUpdater.currentVersion(ctx)}")
-        // 安装/更新统一交给 install-dsh.mjs 的 `npm install @deepseek-ai/dsh@latest`；
+        // 安装/更新统一交给 install-dsh.mjs（按钉死精确版本安装 @deepseek-ai/dsh）；
         val pluginsDir = File(ctx.filesDir, "plugins")
 
         fl(">> 2/4 复制官方安装脚本与内置插件源…")
@@ -231,19 +231,22 @@ object DshFlow {
         }
 
         // —— 3/4~4/4 安装 + 启动（临时更新保护：异常时自动回滚一次，最多两轮）——
-        // 第一轮用用户指定 tag（latest / next / 回滚版本）正常安装；
+        // 第一轮按钉死版本正常安装；
         // 若安装失败或 web 启动失败且处于临时更新窗口 → 自动置 tag=上一版本重装一次。
         var attempt = 0
         while (attempt < 2) {
             attempt++
-            // dsh 本体版本钉死为 0.1.1-rc.1（仅 UI 显式选择 tag 时才覆盖）
+            // dsh 本体版本钉死为 PINNED_DSH_TAG；dsh_install_tag 仅由回滚流程写入
+            // （精确旧版本号）。旧版本遗留的 latest/next 一律按钉死版本处理。
             val tag = ctx.getSharedPreferences(AppState.Prefs.CONSOLE, Context.MODE_PRIVATE)
-                .getString("dsh_install_tag", "0.1.1-rc.1") ?: "0.1.1-rc.1"
+                .getString("dsh_install_tag", null)
+                ?.takeIf { it != "latest" && it != "next" }
+                ?: PINNED_DSH_TAG
             // 回滚重装（tag=精确旧版本）显式跳过基线记录：此时要回到的就是基线本身，
             // 记录会把它覆盖成回滚目标——此前行为正确只是靠 afterInstall 的 cur==prev
             // 分支兜底，这里把语义显式化。
-            // 注意：钉死的默认版本 0.1.1-rc.1 也是精确版本，但它不是回滚 attempt。
-            val isRollbackAttempt = tag != "latest" && tag != "next" && tag != PINNED_DSH_TAG
+            // 注意：钉死版本也是精确版本，但它不是回滚 attempt。
+            val isRollbackAttempt = tag != PINNED_DSH_TAG
             if (isRollbackAttempt) {
                 fl("  回滚重装 attempt：保持原基线，不重新记录")
             } else {
@@ -253,8 +256,8 @@ object DshFlow {
             }
 
             fl(">> 3/4 官方 npm 安装/更新 dsh + dsh plugin 装配内置插件…")
-            if (tag != "latest" && tag != PINNED_DSH_TAG) fl("  （安装 dist-tag=$tag 预发布/回滚线）")
-            else if (tag == PINNED_DSH_TAG) fl("  （dsh 版本钉死：$tag）")
+            if (tag == PINNED_DSH_TAG) fl("  （dsh 版本钉死：$tag）")
+            else fl("  （回滚重装目标：v$tag）")
             val installEnv = mapOf(
                 "HOME" to ctx.filesDir.absolutePath,
                 "NODE_BIN" to "$nodeDir/bin/node",

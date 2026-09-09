@@ -29,7 +29,7 @@ import com.dsh.launcher.R
  *                        credentials.yaml、settings.yaml、storages、super-injector）
  * plugins/…              files/plugins 目录（已装配插件源码；符号链接跳过）
  * launcher/prefs/…       启动器 SharedPreferences（dsh_console/keepalive/ui/status_bridge）
- * launcher/state/…       files/state/markers.json、files/dsh-update.json
+ * launcher/state/…       files/state/markers.json
  * ```
  *
  * 关键取舍：
@@ -79,7 +79,6 @@ object BackupManager {
     /** 纳入备份的私有散文件（相对 filesDir）。 */
     private val LOOSE_FILES = listOf(
         "state/markers.json",
-        "dsh-update.json",
     )
 
     /** 备份内容选项——与 UI 三个开关一一对应；字段可变以便 UI 直接改。 */

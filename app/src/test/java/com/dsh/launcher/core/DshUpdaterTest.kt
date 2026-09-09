@@ -15,7 +15,7 @@ import org.robolectric.annotation.Config
 import java.io.File
 
 /**
- * DshUpdater 回归测试：semver 比较（prerelease 数字段）+ 临时更新/回滚状态机。
+ * DshUpdater 回归测试：版本读取 + 临时更新/回滚状态机。
  * 用 Robolectric 提供真实 SharedPreferences / filesDir；
  * 用一个假的 dsh-prefix 安装目录模拟 installedVersion。
  */
@@ -43,58 +43,12 @@ class DshUpdaterTest {
     fun setup() {
         console().edit().clear().commit()
         File(ctx.filesDir, "dsh-prefix").deleteRecursively()
-        File(ctx.filesDir, "dsh-update.json").delete()
     }
 
     @After
     fun cleanup() {
         console().edit().clear().commit()
         File(ctx.filesDir, "dsh-prefix").deleteRecursively()
-        File(ctx.filesDir, "dsh-update.json").delete()
-    }
-
-    // ================= compareVersions =================
-
-    @Test fun `core 版本逐段比较`() {
-        assertTrue(DshUpdater.compareVersions("2.0.0", "1.9.9") > 0)
-        assertTrue(DshUpdater.compareVersions("1.10.0", "1.9.0") > 0)
-        assertTrue(DshUpdater.compareVersions("1.2.3", "1.2.4") < 0)
-        assertEquals(0, DshUpdater.compareVersions("1.2.3", "1.2.3"))
-    }
-
-    @Test fun `prerelease 低于正式版`() {
-        assertTrue(DshUpdater.compareVersions("1.0.0-rc.1", "1.0.0") < 0)
-        assertTrue(DshUpdater.compareVersions("1.0.0", "1.0.0-rc.1") > 0)
-    }
-
-    @Test fun `prerelease 数字段按数值比较（rc10 gt rc6）`() {
-        assertTrue(DshUpdater.compareVersions("0.1.0-rc.10", "0.1.0-rc.6") > 0)
-        assertTrue(DshUpdater.compareVersions("0.1.0-rc.6", "0.1.0-rc.10") < 0)
-        assertEquals(0, DshUpdater.compareVersions("0.1.0-rc.6", "0.1.0-rc.6"))
-    }
-
-    @Test fun `prerelease 字母段字典序`() {
-        assertTrue(DshUpdater.compareVersions("1.0.0-beta", "1.0.0-alpha") > 0)
-        assertTrue(DshUpdater.compareVersions("1.0.0-alpha", "1.0.0-beta") < 0)
-    }
-
-    @Test fun `数字标识符低于字母数字标识符（semver 第11条）`() {
-        assertTrue(DshUpdater.compareVersions("1.0.0-1", "1.0.0-alpha") < 0)
-    }
-
-    @Test fun `prerelease 段数多者更高`() {
-        assertTrue(DshUpdater.compareVersions("1.0.0-rc.1.1", "1.0.0-rc.1") > 0)
-    }
-
-    @Test fun `build metadata 忽略与缺段补零`() {
-        assertEquals(0, DshUpdater.compareVersions("1.0.0+build.1", "1.0.0"))
-        assertEquals(0, DshUpdater.compareVersions("1.2", "1.2.0"))
-        assertEquals(0, DshUpdater.compareVersions("1", "1.0.0"))
-    }
-
-    @Test fun `脏输入静默按 0_0_0 处理不崩溃`() {
-        assertEquals(0, DshUpdater.compareVersions("abc", "0.0.0"))
-        assertTrue(DshUpdater.compareVersions("abc", "1.0.0") < 0)
     }
 
     // ================= currentVersion / installedVersion =================

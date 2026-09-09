@@ -38,7 +38,7 @@ import com.dsh.launcher.R
  * - 首次启动（未安装）：自动 解压内置 Node → npm 安装 dsh → 装配内置插件 →
  *   Android 兼容修复 → 启动 dsh web → 自动进入 WebUI；
  * - 后续启动：自动快速启动 dsh web（已运行则跳过）→ 自动进入 WebUI；
- * - 安装/更新、控制台等高级操作保留为次级入口。
+ * - 控制台（修复重装）等高级操作保留为次级入口；dsh 版本随应用钉死，不做在线更新。
  *
  * 启动引擎在 [DshFlow]（与命令控制台共用同一份逻辑），本类只负责状态展示与路由。
  */
@@ -62,10 +62,6 @@ class MainActivity : AppCompatActivity() {
     private val logSb = StringBuilder()
     private var phase = Phase.FIRST_INSTALL
 
-    // ---- DSH 更新检测 ----
-    private lateinit var updateCard: ViewGroup
-    private lateinit var updateLabel: TextView
-    private lateinit var updateBtn: View
     /** 临时更新回滚卡片（isTempWindow 时显示）。 */
     private lateinit var rollbackCard: ViewGroup
     /** 回滚卡片内容容器（renderRollbackCard 每次重建其子视图）。 */
@@ -76,28 +72,11 @@ class MainActivity : AppCompatActivity() {
     /** 冷启动自动路由只做一次；从 WebUI 返回主界面不重复弹。 */
     private var autoRouteDone = false
 
-    private var updateCheckCount = 0
-
     private val pollRunnable = object : Runnable {
         override fun run() {
             if (!flowing) refreshRunState(silent = true)
             // 回滚卡片动态刷新（boot 进度 / 观察期倒计时 / 崩溃循环进度随时间变化）
             if (!flowing) refreshRollbackCard()
-            // 每 50 轮（~150s）做一次 npm 版本检查
-            updateCheckCount++
-            if (updateCheckCount >= 50 && !flowing && DshFlow.isInstalled(this@MainActivity)) {
-                updateCheckCount = 0
-                thread {
-                    val latest = runCatching { DshUpdater.checkRemote(this@MainActivity, false) { } }.getOrNull()
-                    if (latest != null) {
-                        runOnUiThread {
-                            updateLabel.text = "🆕 发现新版本 v$latest"
-                            updateLabel.setTextColor(Ui.BRAND)
-                            updateBtn.visibility = View.VISIBLE
-                        }
-                    }
-                }
-            }
             handler.postDelayed(this, 3_000)
         }
     }
@@ -465,50 +444,6 @@ class MainActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = dp(4) })
 
-        // ---- DSH 版本 / 更新 ----
-        updateCard = Ui.card(this, radiusDp = 14, background = Ui.SURFACE_CONTAINER_HIGH, elevationDp = 1f).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(8) }
-        }
-        val ucCol = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        ucCol.addView(LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            addView(TextView(this@MainActivity).apply {
-                text = "📦 DSH 核心"
-                textSize = 13f
-                typeface = android.graphics.Typeface.DEFAULT_BOLD
-                setTextColor(Ui.TEXT_SECONDARY)
-            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(TextView(this@MainActivity).apply {
-                text = "v" + DshUpdater.currentVersion(this@MainActivity)
-                textSize = 11f
-                setTextColor(Ui.TEXT_MUTED)
-            })
-        })
-        updateLabel = TextView(this).apply {
-            textSize = 12.5f
-            setTextColor(Ui.TEXT_SECONDARY)
-            setPadding(0, dp(4), 0, 0)
-        }
-        ucCol.addView(updateLabel)
-        val checkBtn = Ui.button(this, "检查更新", { checkForUpdates(force = true) }, filled = false, compact = true).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(38)
-            ).apply { topMargin = dp(8) }
-        }
-        ucCol.addView(checkBtn)
-        updateBtn = Ui.button(this, "立即更新", { startUpdate() }, filled = true).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(44)
-            ).apply { topMargin = dp(6) }
-            visibility = View.GONE
-        }
-        ucCol.addView(updateBtn)
-        updateCard.addView(ucCol)
-        root.addView(updateCard)
-
         // ---- 临时更新回滚卡片（仅临时更新窗口内可见；内容由 renderRollbackCard 动态刷新） ----
         rollbackCard = Ui.card(this, radiusDp = 14, background = Ui.SURFACE_CONTAINER_HIGH, elevationDp = 1f).apply {
             layoutParams = LinearLayout.LayoutParams(
@@ -568,7 +503,7 @@ class MainActivity : AppCompatActivity() {
                 提示：
                 · 全程免 Termux 配置，内置 aarch64 Node 运行时；
                 · 安装日志：/sdcard/Download/DshLauncher/install_log.txt；
-                · dsh 更新：控制台右上角「更新」。
+                · dsh 版本随应用固定发布，无需手动更新。
             """.trimIndent()
             textSize = 12f
             setTextColor(Ui.TEXT_MUTED)
@@ -586,57 +521,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var envChipsRow: LinearLayout
     private lateinit var helpBody: TextView
 
-    /** 用户主动触发：强制查 npm 并显示结果。 */
-    private fun checkForUpdates(force: Boolean) {
-        if (!::updateLabel.isInitialized) return
-        updateLabel.text = "正在检查更新…"
-        updateLabel.setTextColor(Ui.TEXT_SECONDARY)
-        thread {
-            val latest = runCatching { DshUpdater.checkRemote(this@MainActivity, force) { /* 静默 */ } }.getOrNull()
-            runOnUiThread {
-                if (isFinishing || isDestroyed) return@runOnUiThread
-                when {
-                    latest != null -> {
-                        updateLabel.text = "🆕 发现新版本 v$latest"
-                        updateLabel.setTextColor(Ui.BRAND)
-                        updateBtn.visibility = View.VISIBLE
-                    }
-                    else -> {
-                        updateLabel.text = "✓ 已是最新版本 v" + DshUpdater.currentVersion(this@MainActivity)
-                        updateLabel.setTextColor(Ui.SUCCESS)
-                        updateBtn.visibility = View.GONE
-                    }
-                }
-            }
-        }
-    }
-
-    /** 一键更新 DSH 核心 + 插件，完成后自动重启 web。 */
-    private fun startUpdate() {
-        if (!guardBusy("update")) return
-        setBusy(true)
-        appendMiniLog(">> 开始更新 DSH 核心…")
-        DshFlow.launch(
-            this, DshFlow.Mode.INSTALL_ONLY,
-            onLog = { line -> runOnUiThread { appendMiniLog(line) } },
-            onDone = { ok ->
-                runOnUiThread {
-                    setBusy(false)
-                    if (ok) {
-                        appendMiniLog("✓ 更新完成，正在重启服务…")
-                        // 更新期间 web 一直在跑旧代码：必须先杀掉旧 node 进程，
-                        // 否则 START_ONLY 检测到端口占用且 HTTP 响应正常会直接
-                        // 视为「已在运行」返回，新版本永远不会被拉起（假更新）。
-                        thread { DshFlow.killAllNode(this@MainActivity) { } }
-                        handler.postDelayed({ beginFlow(DshFlow.Mode.START_ONLY) }, 1500)
-                    } else {
-                        toast("更新失败，详见控制台日志")
-                    }
-                }
-            }
-        )
-    }
-
     /** 回滚到上一版本：置安装 tag=上一版本并执行完整安装+启动（走 DshUpdater 回滚保护）。 */
     private fun confirmRollback() {
         val prev = DshUpdater.prevVersion(this) ?: run {
@@ -650,7 +534,7 @@ class MainActivity : AppCompatActivity() {
             .setPositiveButton("回滚") { _, _ ->
                 appendMiniLog(">> 开始回滚到 v$prev …")
                 // 手动回滚不走 maybeAutoRollback：该函数有每窗口一次（KEY_AUTO_ROLLED）守卫，
-                // 自动回滚已触发过时它返回 false 且不置 tag，随后安装会用默认 latest
+                // 自动回滚已触发过时它返回 false 且不置 tag，随后安装会用默认钉死版本
                 // 把临时版本原样装回（「假回滚」）。手动回滚必须强制生效。
                 DshUpdater.forceRollbackTag(this, prev)
                 DshFlow.killAllNode(this) { }
@@ -763,7 +647,6 @@ class MainActivity : AppCompatActivity() {
             progress.visibility = if (b) View.VISIBLE else View.GONE
             primaryBtn.isEnabled = !b
             primaryBtn.alpha = if (b) 0.5f else 1f
-            updateBtn.isEnabled = !b
         }
     }
 

@@ -11,7 +11,7 @@ import android.content.Context
 object AppState {
 
     object Prefs {
-        /** 控制台：一次性安装 tag（dsh_install_tag=next）等。 */
+        /** 控制台：回滚重装的一次性安装 tag（dsh_install_tag）与临时更新/回滚保护状态。 */
         const val CONSOLE = "dsh_console"
 
         /** 保活/拉起：期望运行态 running、watchdog 冷却时间戳。 */

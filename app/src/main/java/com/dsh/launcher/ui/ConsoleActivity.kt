@@ -7,7 +7,6 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
-import android.content.Context
 import android.content.Intent
 import android.os.IBinder
 import android.view.Gravity
@@ -52,11 +51,6 @@ class ConsoleActivity : AppCompatActivity() {
         }
     }
     private val sb = StringBuilder()
-
-    companion object {
-        /** 控制台自身 prefs：一次性安装 tag（dsh_install_tag=next）等。 */
-        private const val CONSOLE_PREFS = "dsh_console"
-    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         DynamicColors.applyToActivityIfAvailable(this)
@@ -264,15 +258,12 @@ class ConsoleActivity : AppCompatActivity() {
         val pluginBtn = Ui.button(this, "插件管理", {
             startActivity(Intent(this@ConsoleActivity, PluginManagerActivity::class.java))
         }, filled = false)
-        val updateBtn = Ui.button(this, "检查更新", { startUpdateCheck(true) }, filled = false)
-        val updateNextBtn = Ui.button(this, "更新 next", { startUpdateCheckNext(true) }, filled = false)
         val clearBtn = Ui.button(this, "清空", { sb.clear(); output.text = "" }, filled = false)
         val closeBtn = Ui.button(this, "退出", { finish() }, filled = false, color = Ui.DANGER)
 
         root.addView(gridOf(
             nodeBtn, termBtn,
-            pluginBtn, updateBtn,
-            updateNextBtn, clearBtn,
+            pluginBtn, clearBtn,
             closeBtn
         ), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
@@ -344,11 +335,6 @@ class ConsoleActivity : AppCompatActivity() {
         }
     }
 
-
-
-
-
-
     /**
      * dsh 安装/启动流程：具体步骤统一在 [DshFlow] 引擎中（主界面自动启动与
      * 控制台手动触发共用同一份逻辑）。通过 intent extras 触发：
@@ -403,47 +389,6 @@ class ConsoleActivity : AppCompatActivity() {
             runCommandAndWait(raw)
         }
     }
-
-    /**
-     * 主动检查 dsh 更新（「更新」按钮，force=true 忽略 6h 间隔）。
-     * 发现新版本时杀掉 node 进程并重启 flow，由 install-dsh.mjs 执行 npm 官方更新。
-     */
-    private fun startUpdateCheck(force: Boolean, onLog: ((String) -> Unit)? = null) {
-        val log: (String) -> Unit = onLog ?: { appendLine(it) }
-        thread {
-            val version = DshUpdater.checkRemote(this, force, log)
-            if (version != null) {
-                log("发现 dsh v$version，重启流程执行 npm 官方更新…")
-                Thread.sleep(3_000)
-                DshFlow.killAllNode(this@ConsoleActivity) { appendLine(it) }
-                runOnUiThread { runDshFlow(forceFullInstall = true) }
-            }
-        }
-    }
-
-    /**
-     * 更新到 next 预发布线（「更新 next」按钮）：检查 dist-tag=next，
-     * 有更新则置一次性安装 tag=next 并重启安装流程（install-dsh.mjs 按 DSH_TAG 安装）。
-     * 安装完成后 tag 自动复位为 latest。
-     */
-    private fun startUpdateCheckNext(force: Boolean, onLog: ((String) -> Unit)? = null) {
-        val log: (String) -> Unit = onLog ?: { appendLine(it) }
-        thread {
-            val version = DshUpdater.checkRemoteNext(this, force, log)
-            if (version != null) {
-                log("发现 dsh 预发布 v$version（next），重启流程安装…")
-                getSharedPreferences(CONSOLE_PREFS, Context.MODE_PRIVATE)
-                    .edit().putString("dsh_install_tag", "next").apply()
-                Thread.sleep(3_000)
-                DshFlow.killAllNode(this@ConsoleActivity) { appendLine(it) }
-                runOnUiThread { runDshFlow(forceFullInstall = true) }
-            } else {
-                log("next 线暂无更新（或已是最新预发布版）")
-            }
-        }
-    }
-
-
 
     private fun setState(s: String) {
         runOnUiThread {

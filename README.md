@@ -120,7 +120,7 @@ adb shell am start -n com.dsh.launcher/.MainActivity   # 或直接点应用图�
 
 - **创建备份**：按需勾选三类内容打包成单个 zip（默认存 `/sdcard/Download/DshLauncher/backup/`，无共享存储权限自动回退应用私有目录）：
   - `dsh 数据`：`files/.dsh/**`（会话 / profiles / agent 预设 / 凭据 / settings.yaml / storages 等不可重建状态）；
-  - `启动器配置`：应用 SharedPreferences（`dsh_console`/`keepalive`/`ui`/`status_bridge`）+ `state/markers.json` + `dsh-update.json`；
+  - `启动器配置`：应用 SharedPreferences（`dsh_console`/`keepalive`/`ui`/`status_bridge`）+ `state/markers.json`；
   - `插件目录`：`files/plugins/**`（已装配插件源码）。
   - **不入库**：node 运行时 / termux / dsh-prefix（264MB npm 产物）/ prebuilt.tgz / 日志 —— 均可由「一键安装」重新生成；`node_modules` 链接农场与所有符号链接一律跳过。
 - **恢复**：选中一份备份 → 二次确认 → 自动「先停 dsh → 快照当前状态（`pre-restore` 包）→ 合并覆盖回档」。恢复只覆盖包内文件、不删除现有额外文件；完成后手动重启 dsh 生效。

@@ -686,7 +686,7 @@ function installBuiltins() {
  * 把每个唯一包名（作用域包、多版本取最高）也桥接进去，恢复扁平解析语义。
  */
 function cmpVer(a, b) {
-  // 语义化版本比较，与 Kotlin 侧 DshUpdater.compareVersions 保持一致：
+  // 语义化版本比较（Kotlin 侧的对照实现已随「检查更新」功能一并移除）：
   // ① core 逐段数字比较；② prerelease 低于正式版；③ prerelease 逐段比较，
   //    纯数字段按数值比（"rc.10" > "rc.6"），非数字段按字典序，数字段 < 非数字段；
   // ④ prerelease 段数多者更高（1.0.0-rc.1.1 > 1.0.0-rc.1）。
