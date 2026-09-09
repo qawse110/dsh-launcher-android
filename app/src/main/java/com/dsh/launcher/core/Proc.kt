@@ -24,6 +24,14 @@ data class ProcSpec(
     val timeoutSec: Long? = null,
     /** 安装类命令（apt/pkg/dpkg install 形态）自动临时放开 W^X。 */
     val autoUnlockWxOnInstall: Boolean = false,
+    /**
+     * 超时强杀后是否连带清理 node 孙进程（killAllNode）。
+     * 安装/更新链路（npm/pnpm 全是 node 生态）应保持 true——只杀 shell 会孤儿化
+     * npm 孙进程，继续写 node_modules 并与下一轮安装并发。
+     * 非安装命令（tar 列表、dsh plugin add 等与 dsh web 共存的命令）必须 false——
+     * 否则一次 tar 卡死会把正在运行的 dsh web 一并杀掉。
+     */
+    val killNodeOrphansOnTimeout: Boolean = true,
     val onLine: (String) -> Unit = {},
 )
 
@@ -78,9 +86,12 @@ object Proc {
                 if (!p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) p.destroyForcibly()
                 reader.join(2000)
                 // destroy 只杀 shell 本身，spawnSync 出的 npm/pnpm 孙进程会被孤儿化，
-                // 继续写 node_modules 与下一轮安装并发。统一按 node 进程清理兜底
-                // （安装/更新链路的子进程全部是 node 生态；killAllNode 幂等、无 node 时为 no-op）。
-                runCatching { DshFlow.killAllNode(s.ctx) { s.onLine(it) } }
+                // 继续写 node_modules 与下一轮安装并发。安装/更新链路统一按 node 进程
+                // 清理兜底（killAllNode 幂等、无 node 时为 no-op）；
+                // 与 dsh web 共存的普通命令不清理（见 ProcSpec.killNodeOrphansOnTimeout）。
+                if (s.killNodeOrphansOnTimeout) {
+                    runCatching { DshFlow.killAllNode(s.ctx) { s.onLine(it) } }
+                }
                 EXIT_TIMEOUT
             } else {
                 reader.join(5000)

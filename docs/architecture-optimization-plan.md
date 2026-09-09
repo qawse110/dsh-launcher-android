@@ -165,5 +165,7 @@ WebView JS bridge 暴露面（未注册 JS 接口）经抽查未见明显风险�
 | P2-5 PrefixPatcher 增量化 | ✅ 完成：patchAll/patchTextOfficialDirs 增加 minLastModifiedMs 基线参数；PackageKit 安装窗口取基线、完成后落 prefix-patch-ts；BootstrapInstaller 全量后落基线 | 本提交 |
 | P2-2 测试地基（第一批） | ✅ 完成：Robolectric+JUnit 接入；MarkerStore(6)/FileLog(4)/PrefixPatcher(3)/AssetSync(1)/TermuxEnv(3) 共 17 用例；CI 增 testDebugUnitTest 门禁 | 本提交 |
 | R2 P1-6 第二刀 | ✅ 完成：PetSpeaker 独立（TTS 生命周期/Edge 分流/状态台词/增量正文游标 ~140 行）；manager 1202→1073 | 本提交 |
+| R2 全量复审（R2） | ✅ 完成：见 [review-findings-r2.md](review-findings-r2.md)——修复 P0×3（tpkg dpkg status 损坏 / routing-suite 未声明常量 / stub 半补丁写入）、P1×4（主线程 IO、桌宠图集重试风暴+自愈失效、执行器统一、轮询循环加固）、P2×5（死代码/常量收敛/WebView 生命周期/README 同步） | 本提交 |
+| P1-1 收尾：插件管理页执行器统一 | ✅ 完成：`runProcess`/`bundledSourceAvailable` 委托 `Proc`（补超时）；新增 `ProcSpec.killNodeOrphansOnTimeout` 区分安装链与「与 web 共存」命令 | 本提交 |
 | 兼容路径退役 | ✅ v4.9.0 衔接版发布后移除：MarkerStore 旧点导入、DshFlow 环境代次检测（PackageKit W^X 断言保留为策略声明） | 本提交 |
 | 主干切换 | ✅ `main` = 新架构线（原 feat/termux-default-env）；旧 v4.3.x 线归档为分支 `legacy/main-v4.3.8`；杂散 tag `main` 已清理 | 本提交 |

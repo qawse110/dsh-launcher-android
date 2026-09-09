@@ -58,6 +58,25 @@ function log(m) {
   try { if (process.env.DSH_SHARED_LOG === '1') writeFileSync(OUT_SHARED, l + '\n', { flag: 'a' }); } catch {}
 }
 
+/**
+ * 写盘前语法自检：把内容落到临时文件交给 `node --check`。
+ * 补丁写坏一个上游文件会直接拖死 dsh 启动（历史事故），因此所有改写上游源码的
+ * 分支都应在 writeFileSync 之前过这一关；spawnSync 不可用时保守放行
+ * （假定内容可用，由后续启动暴露问题，好过误判成损坏而漏打补丁）。
+ */
+function syntaxOk(content) {
+  const tmp = join(HOME, '.stub-syntax-check.mjs');
+  try {
+    writeFileSync(tmp, content);
+    const r = spawnSync(process.execPath, ['--check', tmp], { timeout: 15000, encoding: 'utf8' });
+    return r.status === 0;
+  } catch {
+    return true;
+  } finally {
+    try { unlinkSync(tmp); } catch {}
+  }
+}
+
 /** 缓存 .pnpm 目录列表，避免几十次 findPkg 反复 readdirSync 同一个大目录。 */
 function getPnpmEntries() {
   if (pnpmEntries !== null) return pnpmEntries;
@@ -361,34 +380,62 @@ try {
     const marker = 'sendAttribution: z.boolean().default(true)';
     if (!src.includes(marker)) {
       let out = src;
-      out = out.replace(
-        /sendAttribution: z\.boolean\(\)\.optional\(\),/,
-        'sendAttribution: z.boolean().default(true),'
-      );
-      out = out.replace(
-        /headers: z\.dict\(z\.string\(\)\),/,
-        'headers: z.dict(z.string()),\n\tsendAttribution: z.boolean().default(true),'
-      );
-      out = out.replace(
-        /function requestHeaders\(headers\) \{/,
-        'function requestHeaders(headers, sendAttribution = true) {'
-      );
-      out = out.replace(
-        /function requestHeaders\(headers, sendAttribution = true\) \{\n(\s*)const attribution = attributionHeaders\(\);/,
-        (m, indent) => m.replace(
-          'const attribution = attributionHeaders();',
-          `if (sendAttribution === false) return { ...(headers ?? {}) };\n${indent}const attribution = attributionHeaders();`
-        )
-      );
-      out = out.replace(
-        /headers: requestHeaders\(profile\.headers\)/,
-        'headers: requestHeaders(profile.headers, profile.sendAttribution)'
-      );
-      if (out !== src) {
+      // 逐步计数：四处改动要么全中要么全不写盘。
+      // 原实现只要 out !== src 就写——任一处锚点失配都会落一个半补丁文件：
+      // 典型是第 3 处（函数签名）命中而第 4 处（gating 逻辑）失配，结果 schema 接受
+      // sendAttribution=false 却没有实际生效代码，UI 开关静默失效（用户以为没归因了）。
+      let schema = 0;
+      if (/sendAttribution: z\.boolean\(\)\.optional\(\),/.test(out)) {
+        out = out.replace(
+          /sendAttribution: z\.boolean\(\)\.optional\(\),/,
+          'sendAttribution: z.boolean().default(true),'
+        );
+        schema++;
+      } else if (/headers: z\.dict\(z\.string\(\)\),/.test(out)) {
+        out = out.replace(
+          /headers: z\.dict\(z\.string\(\)\),/,
+          'headers: z.dict(z.string()),\n\tsendAttribution: z.boolean().default(true),'
+        );
+        schema++;
+      }
+      let sig = 0;
+      if (/function requestHeaders\(headers\) \{/.test(out)) {
+        out = out.replace(
+          /function requestHeaders\(headers\) \{/,
+          'function requestHeaders(headers, sendAttribution = true) {'
+        );
+        sig++;
+      }
+      // 依赖上一步的产物：签名改了才谈得上插 gating
+      let gate = 0;
+      if (sig > 0) {
+        const gateRe = /function requestHeaders\(headers, sendAttribution = true\) \{\n(\s*)const attribution = attributionHeaders\(\);/;
+        if (gateRe.test(out)) {
+          out = out.replace(gateRe, (m, indent) => m.replace(
+            'const attribution = attributionHeaders();',
+            `if (sendAttribution === false) return { ...(headers ?? {}) };\n${indent}const attribution = attributionHeaders();`
+          ));
+          gate++;
+        }
+      }
+      let call = 0;
+      if (/headers: requestHeaders\(profile\.headers\)/.test(out)) {
+        out = out.replace(
+          /headers: requestHeaders\(profile\.headers\)/,
+          'headers: requestHeaders(profile.headers, profile.sendAttribution)'
+        );
+        call++;
+      }
+      const complete = schema > 0 && sig > 0 && gate > 0 && call > 0;
+      if (!complete) {
+        log('llm-pi-ai sendAttribution pattern not found, skip' +
+          ` (schema=${schema} sig=${sig} gate=${gate} call=${call}; 未写盘)`);
+      } else if (!syntaxOk(out)) {
+        // 与 attachment-local 同款：写盘前语法自检，失败不落盘（防止毒化 dsh 启动）
+        log('WARN llm-pi-ai sendAttribution: syntax check FAILED, skip');
+      } else {
         writeFileSync(pi, out);
         log('llm-pi-ai sendAttribution support patched: ' + pi);
-      } else {
-        log('llm-pi-ai sendAttribution pattern not found, skip');
       }
     } else {
       log('llm-pi-ai sendAttribution already patched');

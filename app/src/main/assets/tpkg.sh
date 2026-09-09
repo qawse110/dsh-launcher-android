@@ -37,17 +37,43 @@ fix_shebangs() { # $1 = 本包 .list 文件
   done < "$1"
 }
 
+# 校验 status 文件：任一 stanza 出现两条 Package: 字段即判损坏
+# （tpkg 旧版 awk 规则顺序缺陷会制造这种损坏，dpkg-query 直接拒读：
+#   "duplicate value for 'Package' field"，apt/dpkg/tpkg 全链路随之失效）
+status_ok() {
+  awk '/^$/ { seen = 0; next } /^Package:/ { if (seen) exit 1; seen = 1 }' "$1" 2>/dev/null
+}
+
 # 把 stanza 合并进 status：先删除同名旧条目（含尾空行），再追加新条目
 merge_status() { # $1=pkg $2=stanza-file
+  # 自愈入口：当前 status 已损坏时先尝试从备份恢复（备份也坏则继续尽力而为）
+  if [ -f "$STATUS" ] && ! status_ok "$STATUS"; then
+    msg "  ⚠ dpkg status 已损坏（重复 Package 字段），尝试从备份恢复…"
+    if [ -f "$STATUS.dsh-bak" ] && status_ok "$STATUS.dsh-bak"; then
+      cp "$STATUS.dsh-bak" "$STATUS"
+      msg "  ✓ 已从备份恢复 status"
+    else
+      msg "  ⚠ 备份不可用，继续合并（已留存新备份）"
+    fi
+  fi
   cp "$STATUS" "$STATUS.dsh-bak" 2>/dev/null || die "status 备份失败"
+  # 规则顺序关键：$0 == p 必须在 !skip { print } 之前并带 next——
+  # 否则旧条目的 Package: 行会先被 print 再置 skip，留下孤儿头粘到下一条目上，
+  # 制造 "duplicate value for 'Package' field"（见上方 status_ok 注释）
   awk -v p="Package: $1" '
     BEGIN { skip = 0 }
     /^$/  { if (skip) { skip = 0; next } }
+    $0 == p { skip = 1; next }
     !skip { print }
-    $0 == p { skip = 1 }
   ' "$STATUS" > "$STATUS.tmp" || die "status 解析失败"
+  # 末尾保证空行分隔（dpkg 容忍多余空行；缺了则新条目会粘进上一条目）
+  if [ "$(tail -c 2 "$STATUS.tmp" | od -An -tx1 | tr -d ' \n')" != "0a0a" ]; then
+    printf '\n' >> "$STATUS.tmp"
+  fi
+  # 合并产物自检：写盘前确认可解析，坏产物宁可中止也不落盘
   cat "$2" >> "$STATUS.tmp"
   printf '\n' >> "$STATUS.tmp"
+  status_ok "$STATUS.tmp" || { rm -f "$STATUS.tmp"; die "合并产物校验失败（status 未改动）"; }
   mv "$STATUS.tmp" "$STATUS"
 }
 

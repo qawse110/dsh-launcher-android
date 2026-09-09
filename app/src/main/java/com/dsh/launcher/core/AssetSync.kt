@@ -44,10 +44,6 @@ object AssetSync {
         return marker == "apk:$apkVersion#$fp"
     }
 
-    fun markSynced(ctx: Context, key: String, apkVersion: Long) {
-        MarkerStore.put(ctx, key, "apk:$apkVersion")
-    }
-
     /** 携带目标内容指纹写入 marker（isSynced 校验用）。 */
     fun markSyncedWithFingerprint(ctx: Context, key: String, target: File, apkVersion: Long) {
         MarkerStore.put(ctx, key, "apk:$apkVersion#${fingerprintOf(target)}")

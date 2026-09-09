@@ -224,6 +224,9 @@ class MainActivity : AppCompatActivity() {
     private fun refreshRunState(silent: Boolean = false) {
         thread {
             val running = DshFlow.isWebUp()
+            // 缓存后台探测结果：refreshRollbackCard（主线程 3s 轮询）直接复用，
+            // 不再在主线程发 HTTP 探测（800ms 超时足以造成可感卡顿）
+            lastWebUpCache = running
             handler.post {
                 if (flowing || isFinishing || isDestroyed) return@post
                 val next = when {
@@ -235,6 +238,9 @@ class MainActivity : AppCompatActivity() {
             }
         }
     }
+
+    /** 后台轮询得到的 web 存活状态（回滚卡片显示用，最多滞后一个轮询周期）。 */
+    @Volatile private var lastWebUpCache = false
 
     private fun applyPhase(next: Phase, title: String? = null, sub: String? = null, silent: Boolean = false) {
         phase = next
@@ -585,7 +591,7 @@ class MainActivity : AppCompatActivity() {
             append("\n自动确认：")
             append(
                 when {
-                    bootsLeft > 0 -> "稳定启动 $boots/$bootDotTotal${" ".repeat(0)}"
+                    bootsLeft > 0 -> "稳定启动 $boots/$bootDotTotal"
                     observeLeftMs > 0L -> "启动次数已满，观察期剩 " + formatDuration(observeLeftMs)
                     else -> "条件已满足，下次启动后确认"
                 }
@@ -599,7 +605,8 @@ class MainActivity : AppCompatActivity() {
             setPadding(0, dp(6), 0, dp(4))
         })
         // 崩溃循环进度：仅当 web 未运行且已有拉起失败累计时显示
-        if (!DshFlow.isWebUp() && streak > 0 && streakLeft > 0) {
+        // （用后台轮询缓存：主线程不做 HTTP 探测，见 refreshRunState）
+        if (!lastWebUpCache && streak > 0 && streakLeft > 0) {
             rollbackCardBody.addView(TextView(ctx).apply {
                 text = "⚠ web 拉起失败 $streak/${Supervisor.CRASH_LOOP_ROLLBACK_STREAK_PUBLIC}，" +
                     "再失败 $streakLeft 次将自动回滚到 v$prev"
@@ -640,15 +647,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun guardBusy(action: String): Boolean =
         if (flowing) { toast("请等待当前操作完成"); false } else true
-
-    private fun setBusy(b: Boolean) {
-        flowing = b
-        runOnUiThread {
-            progress.visibility = if (b) View.VISIBLE else View.GONE
-            primaryBtn.isEnabled = !b
-            primaryBtn.alpha = if (b) 0.5f else 1f
-        }
-    }
 
     private fun onPrimaryClicked() {
         when (phase) {
@@ -767,14 +765,19 @@ class MainActivity : AppCompatActivity() {
 
     private fun openTerminal() {
         thread {
+            // 回调来自后台线程：appendMiniLog 会触碰 TextView，必须切回主线程
+            // （ConsoleActivity 同路径已正确包裹，此处对齐）；销毁后不再触达视图
+            fun log(msg: String) = runOnUiThread {
+                if (!isFinishing && !isDestroyed) appendMiniLog(msg)
+            }
             if (!TermuxRuntime.isReady(this)) {
                 try {
-                    TermuxRuntime.ensureExtracted(this) { msg -> appendMiniLog(msg) }
+                    TermuxRuntime.ensureExtracted(this) { msg -> log(msg) }
                 } catch (t: Throwable) {
-                    appendMiniLog("✗ Termux 准备失败：${t.message}（回退系统 sh）")
+                    log("✗ Termux 准备失败：${t.message}（回退系统 sh）")
                 }
             }
-            TermuxRuntime.ensureHarnessTools(this) { msg -> appendMiniLog(msg) }
+            TermuxRuntime.ensureHarnessTools(this) { msg -> log(msg) }
             runOnUiThread { startActivity(Intent(this, TerminalActivity::class.java)) }
         }
     }

@@ -654,10 +654,13 @@ class PluginManagerActivity : AppCompatActivity() {
         }
     }
 
+    /** 追加日志。synchronized：Proc 的输出泵线程与操作线程可能并发调用。 */
     private fun appendLog(m: String) {
-        logSb.append("${System.currentTimeMillis() % 100000}\t$m\n")
-        if (logSb.length > 20000) logSb.delete(0, logSb.length / 2)
-        runOnUiThread { logView.text = logSb.toString() }
+        synchronized(logSb) {
+            logSb.append("${System.currentTimeMillis() % 100000}\t$m\n")
+            if (logSb.length > 20000) logSb.delete(0, logSb.length / 2)
+        }
+        runOnUiThread { logView.text = synchronized(logSb) { logSb.toString() } }
     }
 
     /** 后台线程安全版列表刷新。 */
@@ -685,25 +688,24 @@ class PluginManagerActivity : AppCompatActivity() {
         return j.optString("name").isNotBlank()
     }
 
-    /** APK 内是否带有该插件的可用源：extra-plugins 直拷源，或 prebuilt.tgz 内 third_party 子树。 */
+    /** APK 内是否带有该插件的可用源：extra-plugins 直拷源，或 prebuilt.tgz 内 third_party 子树。
+     *  委托 [Proc]（30s 超时 + 输出泵线程）：此前裸 ProcessBuilder 无超时且不关流，
+     *  tgz 半损坏导致 tar 卡死时健康扫描线程被永久挂起，骨架卡永远停在「检测中」。 */
     private fun bundledSourceAvailable(id: String): Boolean {
         if (File(filesDir, "extra-plugins/$id/package.json").isFile) return true
         val tgz = File(filesDir, "prebuilt.tgz")
         if (!tgz.isFile) return false
-        return runCatching {
-            // v4.5 唯一 shell：内置 Termux bash
-            val bash = TermuxRuntime.bashPath(this)
-            if (!bash.isFile) return false
-            val pb = ProcessBuilder(
-                bash.absolutePath, "-c",
-                "tar -tzf '${tgz.absolutePath}' './third_party/$id/package.json' 2>/dev/null | head -n 1"
+        var firstLine: String? = null
+        val code = Proc.run(
+            ProcSpec(
+                ctx = this,
+                command = "tar -tzf '${tgz.absolutePath}' './third_party/$id/package.json' 2>/dev/null | head -n 1",
+                timeoutSec = 30L,
+                killNodeOrphansOnTimeout = false,
+                onLine = { line -> if (firstLine == null) firstLine = line },
             )
-            pb.redirectErrorStream(true)
-            val p = pb.start()
-            val line = p.inputStream.bufferedReader().readLine()
-            p.waitFor()
-            !line.isNullOrBlank()
-        }.getOrDefault(false)
+        )
+        return code == 0 && !firstLine.isNullOrBlank()
     }
 
     /** 从内置源恢复单个插件目录：extra-plugins 直拷；否则 prebuilt.tgz 解包子树。 */
@@ -1085,37 +1087,28 @@ class PluginManagerActivity : AppCompatActivity() {
         return env
     }
 
+    /**
+     * 执行命令并回显输出（统一委托 [Proc]，架构方案 P1-1 单执行器）。
+     * 超时 10 分钟：此前无超时，一次卡死的 tar/npm 会把 busy 永久占死，
+     * 页面所有操作再也点不动只能杀应用。
+     * 与 dsh web 共存的命令（插件装配/修复）超时后不清理 node 进程
+     * （见 [ProcSpec.killNodeOrphansOnTimeout]），避免误杀正在运行的 web。
+     */
     private fun runProcess(cmd: String, env: Map<String, String>, label: String): Int {
         appendLog("   $ $cmd")
-        return try {
-            // v4.5 唯一 shell：内置 Termux bash
-            val bash = TermuxRuntime.bashPath(this)
-            if (!bash.isFile) {
-                appendLog("   ✗ 内置 Termux 未就绪，命令未执行")
-                return -1
-            }
-            val pb = ProcessBuilder(bash.absolutePath, "-c", cmd)
-            pb.redirectErrorStream(true)
-            // 可写工作目录：插件健康检查/重置命令的相对路径操作不受 cwd=/ 影响
-            pb.directory(File(filesDir, "tmp").apply { mkdirs() })
-            val e = pb.environment()
-            env.forEach { (k, v) -> e[k] = v }
-            val p = pb.start()
-            val sb = StringBuilder()
-            p.inputStream.bufferedReader().useLines { lines ->
-                lines.forEach { line ->
-                    sb.append(line).append('\n')
-                    if (sb.length > 4000) { appendLog(sb.toString()); sb.setLength(0) }
-                }
-            }
-            val code = p.waitFor()
-            if (sb.isNotEmpty()) appendLog(sb.toString())
-            appendLog("   exit=$code ($label)")
-            code
-        } catch (t: Throwable) {
-            appendLog("   $label 执行异常: ${t.message}")
-            -1
-        }
+        val code = Proc.run(
+            ProcSpec(
+                ctx = this,
+                command = cmd,
+                envOverrides = env,
+                workdir = File(filesDir, "tmp").apply { mkdirs() },
+                timeoutSec = 600L,
+                killNodeOrphansOnTimeout = false,
+                onLine = { line -> if (line.isNotBlank()) appendLog(line) },
+            )
+        )
+        appendLog("   exit=$code ($label)")
+        return code
     }
 
     /** 重启 dsh：杀 node 后快速启动（秒级）。 */

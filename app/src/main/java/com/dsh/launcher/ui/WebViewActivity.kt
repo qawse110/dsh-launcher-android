@@ -121,7 +121,10 @@ class WebViewActivity : AppCompatActivity() {
         webView.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
-            allowFileAccess = true
+            // WebUI 全部经 http://127.0.0.1 提供（含附件图片），无 file:// 消费方；
+            // 关闭文件访问收敛攻击面（页面本就受同源模型约束，行为不变）
+            allowFileAccess = false
+            allowContentAccess = false
             mediaPlaybackRequiresUserGesture = false
             cacheMode = WebSettings.LOAD_DEFAULT
         }
@@ -159,6 +162,25 @@ class WebViewActivity : AppCompatActivity() {
         }
 
         webView.loadUrl(TARGET_URL)
+    }
+
+    override fun onPause() {
+        // 不可见时停掉 JS 定时器/网络加载：dsh WebUI 的 HMR 心跳与轮询在后台
+        // 继续跑纯属耗电（返回前台自动恢复）
+        webView.onPause()
+        super.onPause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        webView.onResume()
+    }
+
+    override fun onDestroy() {
+        // 标准 WebView 收尾：先从视图树摘除再 destroy，否则窗口仍持有它导致泄漏
+        (webView.parent as? android.view.ViewGroup)?.removeView(webView)
+        webView.destroy()
+        super.onDestroy()
     }
 
     override fun onBackPressed() {

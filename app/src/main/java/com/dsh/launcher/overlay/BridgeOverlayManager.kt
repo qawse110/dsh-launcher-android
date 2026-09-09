@@ -97,6 +97,10 @@ class BridgeOverlayManager(
     /** 内置默认图集缓存（含其解码高度）。 */
     private var defaultSized: SizedAtlas = SizedAtlas(null, 120)
 
+    /** 图集加载全部失败时的退避：同一目标（pet@高度）失败后 30s 内不重试。 */
+    private var atlasFailKey: String? = null
+    private var atlasFailAt = 0L
+
     // 气泡独立悬浮窗（可点击，跟随宠物窗，贴边翻转朝向；其余区域触摸自然透传）
     private var petBubble: TextView? = null
     private var petBubbleAdded = false
@@ -260,6 +264,9 @@ class BridgeOverlayManager(
     private companion object {
         /** 屏幕状态记忆化窗口：远小于轮询间隔变化的时间尺度。 */
         const val SCREEN_VISIBLE_TTL_MS = 500L
+
+        /** 图集加载失败后的重试退避窗口（同目标）。 */
+        const val ATLAS_RETRY_BACKOFF_MS = 30_000L
     }
 
     fun update(status: String, text: String, event: String? = null) {
@@ -405,25 +412,58 @@ class BridgeOverlayManager(
             }
         }
         if (petSized.atlas == null || petLoadedId != wantedId || petSized.heightDp != wantedHeight) {
-            val pets = CodexPetStore.scanPets(context)
-            val pet = pets.firstOrNull { it.id == wantedId }
-                ?: pets.firstOrNull()
-                ?: CodexPetStore.defaultPet()
-            petName = pet.displayName
-            petReplies = pet.replies
-            val loaded = SizedAtlas(CodexPetStore.openAtlas(context, pet, wantedHeight), wantedHeight)
-            petSized = if (loaded.valid) loaded else {
-                // 用户包加载失败时回退内置默认（petLoadedId 保持默认，后续轮询可自愈）；
-                // 默认图集缓存，避免每轮重新解码
-                if (!defaultSized.valid || defaultSized.heightDp != wantedHeight) {
-                    defaultSized = SizedAtlas(
-                        CodexPetStore.openAtlas(context, CodexPetStore.defaultPet(), wantedHeight),
-                        wantedHeight
-                    )
+            // 失败/未命中退避：本轮想加载的目标（pet@高度）在 30s 内已尝试过且未得到
+            // 该目标 → 跳过重试。两种历史问题一并修掉：
+            //  ① 图集损坏（用户包解不动/默认包也解不动）时每轮轮询（1s）都在主线程
+            //     重跑目录扫描 + 位图解码——耗电 + 周期性卡顿；
+            // ② pet 目录被删/扫描未命中时，回退宠物与 wantedId 永不相等 → 每轮重扫。
+            // 换桌宠/换大小 → loadKey 变化立即重试；拿到想要的桌宠后清除退避。
+            val loadKey = "$wantedId@$wantedHeight"
+            val recentlyAttempted = atlasFailKey == loadKey &&
+                SystemClock.uptimeMillis() - atlasFailAt < ATLAS_RETRY_BACKOFF_MS
+            if (!recentlyAttempted) {
+                val pets = CodexPetStore.scanPets(context)
+                val pet = pets.firstOrNull { it.id == wantedId }
+                    ?: pets.firstOrNull()
+                    ?: CodexPetStore.defaultPet()
+                val loaded = SizedAtlas(CodexPetStore.openAtlas(context, pet, wantedHeight), wantedHeight)
+                if (loaded.valid) {
+                    petSized = loaded
+                    petLoadedId = pet.id
+                    petName = pet.displayName
+                    petReplies = pet.replies
+                    if (pet.id == wantedId) {
+                        atlasFailKey = null // 想要的桌宠已就位：清退避
+                    } else {
+                        // 扫描未命中，回退到别的宠物：退避期内不再重扫（目录可能被删/慢）
+                        atlasFailKey = loadKey
+                        atlasFailAt = SystemClock.uptimeMillis()
+                    }
+                } else {
+                    // 用户包解不动：回退内置默认（如可用）。petLoadedId 记默认的 id，
+                    // 后续轮询发现与 wantedId 不符会重试用户包（自愈），
+                    // 但受退避约束不会每秒空转一次扫描 + 解码。
+                    if (!defaultSized.valid || defaultSized.heightDp != wantedHeight) {
+                        defaultSized = SizedAtlas(
+                            CodexPetStore.openAtlas(context, CodexPetStore.defaultPet(), wantedHeight),
+                            wantedHeight
+                        )
+                    }
+                    if (defaultSized.valid) {
+                        petSized = defaultSized
+                        petLoadedId = CodexPetStore.DEFAULT_PET_ID
+                        // 台词/名字跟随实际展示的默认桌宠，用户能立刻看出回退发生了
+                        // （原实现保留失败包的名字，看起来像自己的桌宠还在实际不是）
+                        petName = CodexPetStore.defaultPet().displayName
+                        petReplies = CodexPetStore.defaultPet().replies
+                    } else {
+                        petSized = SizedAtlas(null, wantedHeight)
+                        petLoadedId = null
+                    }
+                    atlasFailKey = loadKey
+                    atlasFailAt = SystemClock.uptimeMillis()
                 }
-                defaultSized
             }
-            petLoadedId = if (petSized.valid) pet.id else null
         }
         val atlas = petSized.atlas ?: return
         windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager

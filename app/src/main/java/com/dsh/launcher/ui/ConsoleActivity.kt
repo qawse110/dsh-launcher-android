@@ -3,12 +3,6 @@ package com.dsh.launcher.ui
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.Service
-import android.content.Intent
-import android.os.IBinder
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -176,7 +170,7 @@ class ConsoleActivity : AppCompatActivity() {
             thread {
                 val up = runCatching { DshFlow.isWebUp() }.getOrDefault(false)
                 runOnUiThread {
-                    appendLine("dsh web：" + if (up) "运行中（http://127.0.0.1:3080）" else "未运行")
+                    appendLine("dsh web：" + if (up) "运行中（http://127.0.0.1:${DshFlow.WEB_PORT}）" else "未运行")
                     setState(if (up) "运行中" else "已停止")
                 }
             }

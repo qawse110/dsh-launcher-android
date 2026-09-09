@@ -89,7 +89,10 @@ class StatusBridgeService : Service() {
         mgr?.remove()
         mgr?.release()
         StatusBridgeAlerts.release() // 释放提示音句柄（M6）
+        // 先落 destroyed 心跳再关执行器：shutdown 允许已排队任务跑完、拒绝新任务，
+        // 顺序反了会让最后一次心跳抛 RejectedExecutionException
         writeHeartbeat("service", "destroyed", "destroyed", force = true)
+        heartbeatIo.shutdown()
         super.onDestroy()
     }
 
@@ -109,15 +112,18 @@ class StatusBridgeService : Service() {
 
     private fun pollLoop() {
         while (running.get()) {
-            // 自适应策略：屏幕/任务态/空闲保活窗喂给治理器，按档位取间隔；
-            // 任务后台运行时持 PARTIAL 锁（空闲灭屏在保活窗内也持，见 PowerGovernor）
-            PowerGovernor.refreshScreenState(this)
-            PowerGovernor.setIdleKeepAliveMinutes(
-                prefs().getInt("idle_keepalive_min", PowerGovernor.DEFAULT_IDLE_KEEPALIVE_MIN)
-            )
-            PowerGovernor.setTaskStatus(lastStatus)
-            syncWakeLock(PowerGovernor.wantWakeLock())
+            // 单轮任何异常（prefs/PowerGovernor/网络/序列化）绝不杀死轮询线程：
+            // 线程一死服务变僵尸（悬浮窗不刷新、心跳停写），只能等 watchdog 60s
+            // 超时重启。与 KeepAliveAccessibilityService.startPolling 的全包裹对齐。
             try {
+                // 自适应策略：屏幕/任务态/空闲保活窗喂给治理器，按档位取间隔；
+                // 任务后台运行时持 PARTIAL 锁（空闲灭屏在保活窗内也持，见 PowerGovernor）
+                PowerGovernor.refreshScreenState(this)
+                PowerGovernor.setIdleKeepAliveMinutes(
+                    prefs().getInt("idle_keepalive_min", PowerGovernor.DEFAULT_IDLE_KEEPALIVE_MIN)
+                )
+                PowerGovernor.setTaskStatus(lastStatus)
+                syncWakeLock(PowerGovernor.wantWakeLock())
                 val json = fetchStatus()
                 if (json != null) {
                     val status = json.optString("status", "idle")
@@ -144,7 +150,7 @@ class StatusBridgeService : Service() {
                     DshWatchdog.maybeRevive(this)
                 }
             } catch (t: Throwable) {
-                // ignore transient polling errors
+                AppLog.e("StatusBridge", "poll loop error: " + (t.message ?: t.toString()))
             }
             try { Thread.sleep(PowerGovernor.intervalMs()) } catch (e: InterruptedException) { break }
         }

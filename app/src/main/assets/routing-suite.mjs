@@ -25,6 +25,11 @@ import { gunzipSync } from 'node:zlib';
    || dirname(fileURLToPath(import.meta.url));
  const HOME = FILES_DIR;
 const DSH_PROFILE = process.env.DSH_PROFILE || 'web';
+// P0 修复：dshCli()/dshPlugin() 引用这两个常量却从未声明（头注释宣称的输入
+// 没有落实），首次走到装配/构建分支即 ReferenceError —— 三份 tar 白下载、
+// injector 不装配、preset 不拷贝，每次尝试都必然失败。
+const DSH_PREFIX = process.env.DSH_PREFIX || join(HOME, 'dsh-prefix');
+const NODE_BIN = process.env.NODE_BIN || join(HOME, 'node/bin/node');
 const ROUTING_DIR = process.env.DSH_ROUTING_DIR || join(HOME, 'routing-suite');
 const PLUGINS_DIR = process.env.DSH_PLUGINS_DIR || join(HOME, 'plugins');
 const TOOLS = join(HOME, '.tools');
@@ -221,7 +226,16 @@ async function installSuite() {
     : sourceInjector;
   if (injector === sourceInjector && !existsSync(join(injector, 'lib/index.js')) && existsSync(join(injector, 'scripts/build.sh'))) {
     log('injector lib missing, trying build...');
-    run('/system/bin/sh', ['-c', 'cd ' + injector + ' && bash scripts/build.sh'], { env: envBase() });
+    // P0 修复：原写法 /system/bin/sh -c "cd <path> && bash scripts/build.sh" 两处都错——
+    //  ① Android 的 /system/bin/sh 找不到 bash（不在系统 PATH），恒定 exit 127；
+    //  ② 路径字符串直接拼进 -c 的参数（空格/引号即转义事故）。
+    // 改为以内建 Termux bash 直接解释脚本，用 cwd 承载工作目录，彻底不拼字符串。
+    const bash = join(TERMUX, 'bin/bash');
+    if (existsSync(bash)) {
+      run(bash, ['scripts/build.sh'], { env: envBase(), cwd: injector, timeoutMs: 10 * 60_000 });
+    } else {
+      log('built-in termux bash not found at ' + bash + ', skip build');
+    }
   }
   if (existsSync(join(injector, 'package.json'))) {
     if (!dshPlugin(['add', injector])) { log('injector add FAILED'); process.exitCode = 1; }
