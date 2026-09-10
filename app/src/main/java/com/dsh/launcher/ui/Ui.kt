@@ -14,11 +14,6 @@ import com.google.android.material.card.MaterialCardView
 import com.google.android.material.chip.Chip
 import com.google.android.material.chip.ChipGroup
 import com.google.android.material.color.MaterialColors
-import com.dsh.launcher.core.*
-import com.dsh.launcher.overlay.*
-import com.dsh.launcher.service.*
-import com.dsh.launcher.tts.*
-import com.dsh.launcher.ui.*
 import com.dsh.launcher.R
 
 /**

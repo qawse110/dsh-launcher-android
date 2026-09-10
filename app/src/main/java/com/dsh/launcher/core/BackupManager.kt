@@ -10,12 +10,6 @@ import java.util.Locale
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
-import com.dsh.launcher.core.*
-import com.dsh.launcher.overlay.*
-import com.dsh.launcher.service.*
-import com.dsh.launcher.tts.*
-import com.dsh.launcher.ui.*
-import com.dsh.launcher.R
 
 /**
  * dsh 数据与启动器配置的备份 / 恢复。

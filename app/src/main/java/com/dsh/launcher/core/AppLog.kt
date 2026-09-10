@@ -6,12 +6,6 @@ import java.io.FileWriter
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import com.dsh.launcher.core.*
-import com.dsh.launcher.overlay.*
-import com.dsh.launcher.service.*
-import com.dsh.launcher.tts.*
-import com.dsh.launcher.ui.*
-import com.dsh.launcher.R
 
 /**
  * 简化文件日志工具：追加写入应用可访问的日志文件。

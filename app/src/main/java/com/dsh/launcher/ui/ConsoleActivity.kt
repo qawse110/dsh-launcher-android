@@ -17,11 +17,7 @@ import com.google.android.material.color.DynamicColors
 import java.io.File
 import kotlin.concurrent.thread
 import com.dsh.launcher.core.*
-import com.dsh.launcher.overlay.*
 import com.dsh.launcher.service.*
-import com.dsh.launcher.tts.*
-import com.dsh.launcher.ui.*
-import com.dsh.launcher.R
 
 /**
  * 内置命令控制台（基于 Java ProcessBuilder，不依赖受限的 PTY 原生库）。
@@ -159,12 +155,13 @@ class ConsoleActivity : AppCompatActivity() {
         }
         chip("▶ 启动 dsh") { runDshFlow(startOnly = true) }
         chip("↻ 重启服务") {
-            appendLine(">> 重启 dsh 服务…")
-            thread {
-                DshFlow.killAllNode(this) { l -> runOnUiThread { appendLine(l) } }
-                Thread.sleep(1200)
-                runOnUiThread { runDshFlow(startOnly = true) }
-            }
+            // 重启语义统一走 DshFlow.restart（killAllNode 已保证进程退出，
+            // 等待时长单点定义——此前此处硬编码 1200ms，与插件页的 1500ms 不一致）
+            DshFlow.restart(
+                this,
+                onLog = { l -> appendLine(l) },
+                onState = { s -> setState(s) },
+            )
         }
         chip("■ 停止 dsh") { stopDsh() }
         chip("● 服务状态") {

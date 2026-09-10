@@ -1,11 +1,5 @@
 package com.dsh.launcher.overlay
 
-import com.dsh.launcher.core.*
-import com.dsh.launcher.overlay.*
-import com.dsh.launcher.service.*
-import com.dsh.launcher.tts.*
-import com.dsh.launcher.ui.*
-import com.dsh.launcher.R
 
 /**
  * dsh 状态悬浮窗的内容格式化。

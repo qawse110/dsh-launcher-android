@@ -29,6 +29,12 @@ jobs:
       - name: Asset scripts gate（脚本语法 + 载荷完整性）
         run: node tools/check-asset-scripts.cjs
 
+      # 引导期资产供给门禁（review-r12）：比对 Kotlin 启动命令引用的 files 级脚本
+      # 与 Kotlin 实际拷贝的资产清单。打包前卡关——这类断链的后果是
+      # 「装完打不开」，只能靠用户反馈发现。
+      - name: Boot assets gate（引导脚本供给一致性）
+        run: node tools/check-boot-assets.cjs
+
       # ABI 门禁：打包前核对内置 node 归档的 ELF 架构与文件名声明一致。
       # 这是本轮最要紧的一道——错 ABI 的包装到真机是「引擎启动即崩」
       # 而非「功能缺失」，且 debug/release 都受影响（参考坑 18/30）。

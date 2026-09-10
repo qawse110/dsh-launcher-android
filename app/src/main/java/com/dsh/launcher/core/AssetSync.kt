@@ -3,12 +3,6 @@ package com.dsh.launcher.core
 import android.content.Context
 import android.os.Build
 import java.io.File
-import com.dsh.launcher.core.*
-import com.dsh.launcher.overlay.*
-import com.dsh.launcher.service.*
-import com.dsh.launcher.tts.*
-import com.dsh.launcher.ui.*
-import com.dsh.launcher.R
 
 /**
  * APK 内置资产同步统一工具。
@@ -31,6 +25,42 @@ object AssetSync {
     } catch (t: Throwable) {
         AppLog.e("AssetSync", "getPackageInfo failed: " + (t.message ?: t.toString()))
         0L
+    }
+
+    /**
+     * **APK 是否被替换过**的判据（review-r12）。
+     *
+     * ## 为什么不能用 versionCode
+     *
+     * 本仓 `versionCode` 是**硬编码常量**（`app/build.gradle.kts` 的 `300`，注释写明
+     * 「300 > 历史所有包…保证任何情况下可直接覆盖安装」），正常迭代**从不递增**。
+     * 旧实现以 `versionCode` 为「APK 已升级」的判据：
+     * ```
+     * val last = prefs.getLong("last_apk_version", 0L)
+     * if (current == last) return          // current 恒为 300，last 首次即为 300
+     * ```
+     * → 首次安装之后该函数**永久早退**，「APK 升级后自动同步内置资产」成了死代码。
+     * 真机实证：`files/install-dsh.mjs` 比 APK 内的小 92 字节，设备上跑的是旧脚本。
+     *
+     * ## 判据选择
+     *
+     * 「APK 被替换」= 已安装 APK 文件本身变了，故直接取该文件的
+     * **路径 + 长度 + mtime**。覆盖安装必然重写该文件，三者之一几乎必然变化；
+     * 且这是 `stat` 级开销，不读 APK 内容。
+     *
+     * 注意：**每个资产的最终判据仍由 [isSynced] 的内容指纹负责**（见其 KDoc）——
+     * 本函数只是「要不要跑同步」的廉价闸门，即使它误判为「没变」，
+     * 资产级指纹也会在真正拷贝判定时补上；反之误判为「变了」只是多跑一次幂等同步。
+     */
+    fun apkInstallStamp(context: Context, versionCode: Long): String = try {
+        val src = context.packageManager
+            .getApplicationInfo(context.packageName, 0).sourceDir
+        val f = File(src)
+        "apk:$versionCode:${f.length()}:${f.lastModified()}"
+    } catch (t: Throwable) {
+        // 取不到 APK 元信息：返回带时间戳的一次性值 → 本次视为「已变更」，倾向同步
+        AppLog.e("AssetSync", "apkInstallStamp failed: " + (t.message ?: t.toString()))
+        "apk:$versionCode:unknown:${System.currentTimeMillis()}"
     }
 
     /** marker（MarkerStore 键）值为 "apk:<version>#<fingerprint>"，且目标文件/目录存在时视为已同步。 */

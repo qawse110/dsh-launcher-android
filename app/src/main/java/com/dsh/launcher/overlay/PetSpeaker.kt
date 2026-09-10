@@ -175,11 +175,25 @@ internal class PetSpeaker(
      * 把游标回退到尚未播出的正文起点（S4）。
      * FLUSH 会清空队列：若不回退，被清掉的句子既没播过、游标又已越过它们，
      * 这段内容就永久丢失（正文读到一半被台词打断后不再续播）。
+     *
+     * ## 为什么按「较小值」而不是精确值（review-r12 复核结论）
+     *
+     * [unspoken] 记录的是**本消息已入队的全部句子**，但它**不会在句子播完后出队**
+     * （系统 TTS 无逐句完成回调，Edge 侧也只有整体 pendingCount）。因此 [unspoken]
+     * 是「入队过的」而非「尚未播出的」——两者只在没有 FLUSH 打断时相等。
+     *
+     * 于是 `dropped` 只能是**近似**。两个方向的代价不对称：
+     * - **多回退**（把已播过的句子再读一遍）→ 用户听到重复，烦人但信息无损；
+     * - **少回退**（漏掉确实被清掉的句子）→ 游标越过未播内容，**这段永远不再朗读**。
+     *
+     * 因此这里取 `min(pendingFromEngine, unspoken.size)`，且在系统引擎路径上
+     * 宁可偏大（见 [speak] 传参），把误差落在**安全的那一侧**：宁可重复，绝不丢内容。
+     * 这是刻意的近似，不是待修的 bug——[computeRewind] 用单测锁定该不变量。
      */
     private fun rewindCursor(pendingFromEngine: Int) {
         // Edge 引擎的队列里可能混有固定台词，取「引擎排队数」与「本地未播正文数」的较小值，
         // 只按确实属于正文、且确实被清掉的那些句子回退
-        val dropped = minOf(pendingFromEngine, unspoken.size)
+        val dropped = computeRewind(pendingFromEngine, unspoken.size)
         if (dropped <= 0) return
         repeat(dropped) {
             val s = unspoken.removeLast()
@@ -280,5 +294,28 @@ internal class PetSpeaker(
         tts?.shutdown()
         tts = null
         ttsReady = false
+    }
+
+    /**
+     * 供单测断言的**纯函数**回退量计算（review-r12）。
+     *
+     * 放在 companion 而非实例上：它不读任何实例状态（两个入参即全部输入），
+     * 若挂在实例上，单测会被迫构造 [PetSpeaker]（需要 android Context）——
+     * 那正是它此前毫无测试覆盖的原因。
+     *
+     * 抽出理由：这是「被 FLUSH 打断后该重读多少句」的核心判定，是「内容永久丢失」
+     * 与「重复朗读」两种后果的分界点，值得单独锁定。
+     *
+     * 不变量（`PetSpeakerRewindTest` 锁定）：
+     * 1. 结果 ∈ [0, min(引擎排队数, 本地未播数)]——绝不超过任一侧的真实数量；
+     * 2. 任一侧为 0 或负数时结果为 0（不产生无中生有的回退）；
+     * 3. **取 min 是刻意的安全侧近似**：多回退 ⇒ 重复朗读（信息无损），
+     *    少回退 ⇒ 未播内容被永久跳过。详见 [rewindCursor] 的方向性说明。
+     */
+    internal companion object {
+        internal fun computeRewind(pendingFromEngine: Int, unspokenCount: Int): Int {
+            if (pendingFromEngine <= 0 || unspokenCount <= 0) return 0
+            return minOf(pendingFromEngine, unspokenCount)
+        }
     }
 }

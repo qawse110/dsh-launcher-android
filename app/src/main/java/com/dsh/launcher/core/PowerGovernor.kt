@@ -2,12 +2,6 @@ package com.dsh.launcher.core
 
 import android.content.Context
 import android.os.PowerManager
-import com.dsh.launcher.core.*
-import com.dsh.launcher.overlay.*
-import com.dsh.launcher.service.*
-import com.dsh.launcher.tts.*
-import com.dsh.launcher.ui.*
-import com.dsh.launcher.R
 
 /**
  * 后台功耗/存活自适应治理器（双通道共用，主进程单例）。

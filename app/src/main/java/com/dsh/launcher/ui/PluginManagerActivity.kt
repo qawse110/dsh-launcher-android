@@ -18,10 +18,6 @@ import org.json.JSONObject
 import java.io.File
 import kotlin.concurrent.thread
 import com.dsh.launcher.core.*
-import com.dsh.launcher.overlay.*
-import com.dsh.launcher.service.*
-import com.dsh.launcher.tts.*
-import com.dsh.launcher.ui.*
 import com.dsh.launcher.R
 
 /**
@@ -1113,25 +1109,19 @@ class PluginManagerActivity : AppCompatActivity() {
         return code
     }
 
-    /** 重启 dsh：杀 node 后快速启动（秒级）。 */
+    /** 重启 dsh：杀 node 后快速启动（秒级）。语义与等待时长统一在 [DshFlow.restart]。 */
     private fun restartFlow() {
         if (!guardBusy()) return
         setBusy(true)
         appendLog(">> 重启 dsh 服务（快速启动，不做安装）…")
-        thread {
-            DshFlow.killAllNode(this) { appendLog(it) }
-            Thread.sleep(1500)
-            runOnUiThread {
-                DshFlow.launch(
-                    this, DshFlow.Mode.START_ONLY,
-                    onLog = { appendLog(it) },
-                    onDone = { ok ->
-                        setBusy(false)
-                        refreshServiceState()
-                        appendLog(if (ok) "✓ dsh 已重启（http://127.0.0.1:${DshFlow.WEB_PORT}）" else "✗ 重启失败，详见上方日志")
-                    }
-                )
-            }
-        }
+        DshFlow.restart(
+            this,
+            onLog = { appendLog(it) },
+            onDone = { ok ->
+                setBusy(false)
+                refreshServiceState()
+                appendLog(if (ok) "✓ dsh 已重启（http://127.0.0.1:${DshFlow.WEB_PORT}）" else "✗ 重启失败，详见上方日志")
+            },
+        )
     }
 }

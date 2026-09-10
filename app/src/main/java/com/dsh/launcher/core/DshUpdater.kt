@@ -3,12 +3,6 @@ package com.dsh.launcher.core
 import android.content.Context
 import org.json.JSONObject
 import java.io.File
-import com.dsh.launcher.core.*
-import com.dsh.launcher.overlay.*
-import com.dsh.launcher.service.*
-import com.dsh.launcher.tts.*
-import com.dsh.launcher.ui.*
-import com.dsh.launcher.R
 
 /**
  * dsh 版本读取 + 安装回滚保护状态机。

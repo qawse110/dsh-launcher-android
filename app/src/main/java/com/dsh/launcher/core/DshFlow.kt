@@ -4,12 +4,10 @@ import android.content.Context
 import android.content.Intent
 import java.io.File
 import kotlin.concurrent.thread
-import com.dsh.launcher.core.*
-import com.dsh.launcher.overlay.*
-import com.dsh.launcher.service.*
-import com.dsh.launcher.tts.*
-import com.dsh.launcher.ui.*
-import com.dsh.launcher.R
+// 显式单名导入（review-r12 收窄）：本文件只需要 service 层的这两个类型。
+// 原先是 5 个包的全通配符导入，掩盖了真实依赖，也让 core 层看起来依赖 ui 层。
+import com.dsh.launcher.service.BuildKeepAliveService
+import com.dsh.launcher.service.StatusBridgeService
 
 /**
  * dsh 启动流程引擎（无 UI 依赖）。
@@ -41,6 +39,13 @@ object DshFlow {
 
     const val WEB_PORT = 3080
 
+    /**
+     * 重启时杀进程后的等待时长（ms）。语义是**给内核释放监听套接字的保险余量**，
+     * 不是「等 node 退出」——[NodeProcs.killAll] 返回时进程已全部退出。
+     * 三处调用方曾各自硬编码 1200 / 1500 / 0，现统一到此（见 [restart]）。
+     */
+    const val RESTART_SETTLE_MS = 1500L
+
     /** dsh 本体钉死版本：普通安装始终装这个精确版本（仅回滚流程经 dsh_install_tag 覆盖）。 */
     const val PINNED_DSH_TAG = "0.1.1-rc.1"
 
@@ -51,6 +56,34 @@ object DshFlow {
     /** web 启动脚本模板（assets 内，@TOKENS@ 由 [TermuxEnv] 渲染）。 */
     /** web 启动脚本模板资产名。 */
     internal const val WEB_LAUNCHER_TPL = "web-launcher.sh.tpl"
+
+    /** stub 脚本名（安装与快速启动两条路径共用）。 */
+    internal const val STUB_SCRIPT = "stub-dsh.mjs"
+
+    /** node 的 ESM loader 注册脚本：web 启动命令经 `--import` 直接引用它。 */
+    internal const val FS_REGISTER_SCRIPT = "fs-register.mjs"
+
+    /**
+     * 引导期脚本的唯一清单——**必须覆盖 web 启动命令引用到的每个 files 级脚本**。
+     *
+     * 真机回归（2026-09-10，review-r12）：`abae4ff` 把安装路径的三件套拷贝循环换成
+     * 「只同步 patched/」的函数时**没有把这三个文件移交出去**——安装路径此后不再供给
+     * `fs-register.mjs`，而 [startDshWeb] 的 node 命令仍硬引用它，于是首次安装
+     * （或 watchdog 崩溃回滚的 forceFullInstall 重装）会以 `ERR_MODULE_NOT_FOUND`
+     * 硬失败（node 对缺失的 `--import` 是 exit=1，不是降级）。
+     * 当时全仓仅 [quickStartWeb] 与 `MainActivity.syncAssetsOnApkUpdate` 会写这三个
+     * 文件，而后者因 versionCode 钉死已永久不执行。
+     *
+     * **结构性约束**：新增任何被启动命令引用的引导脚本，必须同时加进本清单——
+     * `tools/check-boot-assets.cjs` 会从 [startDshWeb] 的命令串反解 `--import` 目标
+     * 并断言它在 [BOOT_SCRIPTS] 内、且对应 asset 真实存在。清单与命令不再能各自漂移。
+     */
+    internal val BOOT_SCRIPTS = listOf(
+        FS_REGISTER_SCRIPT,
+        "fs-loader.mjs",
+        "fs-promises-compat.mjs",
+        STUB_SCRIPT,
+    )
 
     /**
      * 模板资产读取失败时的兜底内联模板。
@@ -135,6 +168,59 @@ object DshFlow {
                 FileLog.exportToShared(ctx, FLOW_LOG)
                 busy.set(false)
                 onDone?.invoke(ok)
+            }
+        }
+    }
+
+    /**
+     * 重启 dsh web 的唯一入口（review-r12 统一）。
+     *
+     * ## 为什么必须集中
+     *
+     * 「杀 node → 等一会 → 快速启动」这套动作此前在**三处各写一份、常量还不一样**：
+     *
+     * | 位置 | 等待 |
+     * |---|---|
+     * | `ConsoleActivity` 的「重启服务」 | `Thread.sleep(1200)` |
+     * | `PluginManagerActivity.restartFlow` | `Thread.sleep(1500)` |
+     * | `MainActivity.confirmRollback` | 无等待 |
+     *
+     * 而 [killAllNode] 返回时 node **已经全部退出**（SIGTERM → 限时等待 → SIGKILL 升级，
+     * 见 [NodeProcs.killAll]），所以那三个 sleep 都不是同步手段，只是来源不明的魔数。
+     * 后果是同一个用户动作在不同页面有不同成功率（端口处于 TIME_WAIT 时 1200ms 更易撞
+     * `address already in use`），且行为无法单点调整。
+     *
+     * 这里收敛为一个函数：等待时长由 [RESTART_SETTLE_MS] 单点定义，语义是**纯保险**
+     * （给内核 TCP 栈释放监听套接字留余量），而非「等 node 退出」。
+     *
+     * @param onLog 日志回调（任意线程）
+     * @param onDone 启动流程结束后回调（任意线程）
+     */
+    fun restart(
+        context: Context,
+        onLog: (String) -> Unit,
+        onState: ((String) -> Unit)? = null,
+        onDone: ((Boolean) -> Unit)? = null,
+    ) {
+        val ctx = context.applicationContext
+        thread {
+            onLog(">> 重启 dsh 服务（快速启动，不做安装）…")
+            killAllNode(ctx, onLog)
+            // 保险等待：killAllNode 已保证进程退出，这里只是给内核释放监听端口留余量
+            runCatching { Thread.sleep(RESTART_SETTLE_MS) }
+            // 主线程投递用 Handler(Looper.getMainLooper())（API 1 起可用）。
+            // **不要用 Context.getMainExecutor()**——那是 API 28+，而本仓 minSdk = 24，
+            // 在 24~27 上会 NoSuchMethodError（本仓是为对齐 Termux SELinux 域而压低
+            // targetSdk 的，minSdk 24 是真实支持下限）。
+            // 旧的两处调用点用的是 Activity.runOnUiThread；此处刻意不依赖 Activity
+            // （DshFlow 无 UI 依赖），且 launch() 内部会立刻再起自己的后台线程。
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                launch(
+                    ctx, Mode.START_ONLY,
+                    onLog = onLog,
+                    onState = onState,
+                    onDone = onDone,
+                )
             }
         }
     }
@@ -315,17 +401,21 @@ object DshFlow {
             fl("OK 3/4 dsh + builtin plugins installed")
 
             fl(">> 3.5/4 Android 兼容修复…")
-            val stubScript = File(ctx.filesDir, "stub-dsh.mjs")
-            try {
-                ctx.assets.open("stub-dsh.mjs").use { input ->
-                    stubScript.outputStream().use { output -> input.copyTo(output) }
-                }
-            } catch (t: Throwable) {
-                fl("FAIL 3.5/4 assets copy stub-dsh.mjs: ${t.message}")
+            // 引导期脚本 + 补丁载荷：与快速启动路径共用同一入口（唯一供给点，见 BOOT_SCRIPTS）。
+            // 原先此处的三件套拷贝循环在 abae4ff 被误删，是 review-r12 的 P0 回归。
+            if (!syncBootAssets(ctx, ::fl)) {
+                fl("  WARN 引导期资产未全部同步，dsh 启动可能失败（见上方 WARN）")
             }
-            syncCompatAssets(ctx, ::fl)
-            // stub 标记含 dsh 版本：回滚重装后版本变化会自动重新打补丁
-            runAndroidStubOnce(ctx, nodeDir, dshPrefix, stubScript, ::fl)
+            val stubScript = File(ctx.filesDir, STUB_SCRIPT)
+            if (stubScript.isFile) {
+                // stub 标记含 dsh 版本：回滚重装后版本变化会自动重新打补丁
+                runAndroidStubOnce(ctx, nodeDir, dshPrefix, stubScript, ::fl)
+            } else {
+                // 与 quickStartWeb 对齐：文件不在就别 spawn node（旧实现会 exec 一个不存在的
+                // 路径，白等一次进程启动并留下 exit=1 的噪音日志）。补丁缺失是真实故障，
+                // 但**不该**在这里 return false——dsh 本体已装好，仍应继续尝试启动 web。
+                fl("WARN $STUB_SCRIPT 缺失，跳过 Android 兼容修复（部分补丁不会生效）")
+            }
 
             // 仅安装/更新模式：到此结束，不启动 web（不置 running，watchdog 不会拉起）
             if (mode == Mode.INSTALL_ONLY) {
@@ -375,36 +465,43 @@ object DshFlow {
             .onFailure { AppLog.e("DshFlow", "bridge start failed: ${it.message}") }
     }
 
-    /** 快速启动：同步兼容脚本（fs-register/fs-loader/fs-promises/stub）→ 执行 stub → 启动 web。 */
+    /** 快速启动：同步引导期脚本与载荷 → 执行 stub → 启动 web。 */
     private fun quickStartWeb(ctx: Context, nodeDir: File, dshPrefix: File, fl: (String) -> Unit): Boolean {
-        for (name in listOf("fs-register.mjs", "fs-loader.mjs", "fs-promises-compat.mjs", "stub-dsh.mjs")) {
-            val target = File(ctx.filesDir, name)
-            try {
-                ctx.assets.open(name).use { input ->
-                    target.outputStream().use { output -> input.copyTo(output) }
-                }
-            } catch (t: Throwable) {
-                fl("WARN copy $name: ${t.message}")
-            }
-        }
-        val stubScript = File(ctx.filesDir, "stub-dsh.mjs")
-        if (stubScript.exists()) {
+        syncBootAssets(ctx, fl)
+        val stubScript = File(ctx.filesDir, STUB_SCRIPT)
+        if (stubScript.isFile) {
             runAndroidStubOnce(ctx, nodeDir, dshPrefix, stubScript, fl)
         } else {
-            fl("WARN 未找到 stub-dsh.mjs，继续尝试启动 web")
+            fl("WARN 未找到 $STUB_SCRIPT，继续尝试启动 web")
         }
         fl(">> 启动 dsh web…")
         return startDshWeb(ctx, nodeDir, dshPrefix, fl)
     }
 
     /**
-     * 同步「引导期补丁资产」到 files（安装路径与快速启动路径共用）：
+     * 同步「引导期脚本 + 补丁载荷」到 files——**安装路径与快速启动路径共用的唯一入口**。
+     *
+     * 两部分都必须同步，缺任一部分都会让 stub 或 node 引导链失效：
+     * - [BOOT_SCRIPTS]：web 启动命令在 files 根直接引用的脚本（见 [FS_REGISTER_SCRIPT]）；
      * - `patched/` 整目录：stub 的补丁载荷（koffi/node-pty/sharp 替身、sharp shim）。
      *   review-r5 起载荷从 stub 内嵌 base64 抽为真实文件（对齐参考实现
      *   dsh-mobile-apk 的 assets/patched + applyAssetPatch 机制）：可 diff、可评审，
      *   并纳入 CI 语法门禁。必须整目录同步——缺失载荷会让 stub 静默跳过对应补丁。
+     *
+     * @return 是否全部同步成功（单个失败不中断，调用方按需告警）
      */
-    private fun syncCompatAssets(ctx: Context, fl: (String) -> Unit) {
+    internal fun syncBootAssets(ctx: Context, fl: (String) -> Unit): Boolean {
+        var ok = true
+        for (name in BOOT_SCRIPTS) {
+            try {
+                ctx.assets.open(name).use { input ->
+                    File(ctx.filesDir, name).outputStream().use { output -> input.copyTo(output) }
+                }
+            } catch (t: Throwable) {
+                fl("  WARN assets copy $name: ${t.message}")
+                ok = false
+            }
+        }
         val patchDir = File(ctx.filesDir, "patched")
         try {
             if (AssetSync.copyAssetDir(ctx, "patched", patchDir, clearFirst = true)) {
@@ -413,10 +510,13 @@ object DshFlow {
                 if (count == 0) fl("  WARN patched 目录为空，stub 将跳过依赖载荷的补丁")
             } else {
                 fl("  WARN assets 无 patched 目录（stub 载荷缺失，相关补丁会跳过）")
+                ok = false
             }
         } catch (t: Throwable) {
             fl("  WARN 同步 patched 载荷失败：${t.message}")
+            ok = false
         }
+        return ok
     }
 
     /**
@@ -512,13 +612,24 @@ object DshFlow {
             }
             onLog(">> 端口 $WEB_PORT 被残留进程占用但 web 无响应，清理后重新启动…")
             killAllNode(ctx, onLog)
-            Thread.sleep(1500)
+            // 与 [restart] 共用同一等待常量：同为「杀净后等内核释放监听套接字」
+            Thread.sleep(RESTART_SETTLE_MS)
         }
         // 生成启动脚本（模板 assets/web-launcher.sh.tpl + TermuxEnv 渲染），由内置 Termux bash 后台执行
         File(ctx.filesDir, "tmp").mkdirs()
         val launcher = webLauncherFile(ctx)
         launcher.parentFile?.mkdirs()
-        val nodeCmd = "${nodeDir.absolutePath}/bin/node --expose-internals --import ${ctx.filesDir.absolutePath}/fs-register.mjs ${cli.absolutePath} web"
+        // 命令串里的 loader 注册脚本名取自 [FS_REGISTER_SCRIPT]（而非字面量）：
+        // 供给清单 [BOOT_SCRIPTS] 与本引用从此不可能各自漂移（review-r12 的 P0 根因）。
+        val register = File(ctx.filesDir, FS_REGISTER_SCRIPT)
+        if (!register.isFile) {
+            // fail-loudly：node 对缺失的 --import 是 exit=1 硬失败，日志却只显示
+            // ERR_MODULE_NOT_FOUND（看起来像 node 环境坏了）。这里直接点明根因。
+            onLog("✗ 缺少 $FS_REGISTER_SCRIPT（${register.absolutePath}）——node 的 --import 会直接失败。")
+            onLog("  该文件由引导期资产同步写入（见 DshFlow.BOOT_SCRIPTS）；请重新执行安装/更新。")
+            return false
+        }
+        val nodeCmd = "${nodeDir.absolutePath}/bin/node --expose-internals --import ${register.absolutePath} ${cli.absolutePath} web"
         val tpl = runCatching { ctx.assets.open(WEB_LAUNCHER_TPL).use { it.readBytes().toString(Charsets.UTF_8) } }
             .getOrElse {
                 onLog("WARN: 启动脚本模板缺失，回退内置模板")

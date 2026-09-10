@@ -34,6 +34,7 @@
 | 命令 | 作用 | 本地 | CI |
 |---|---|---|---|
 | `node tools/check-asset-scripts.cjs` | assets 脚本语法 + 补丁载荷完整性 | ✅ | ✅ |
+| `node tools/check-boot-assets.cjs` | **引导期资产供给一致性**（`BOOT_SCRIPTS` ↔ `--import` 引用 ↔ assets） | ✅ | ✅ |
 | `node tools/check-asset-abi.cjs` | 内置 node 归档 ELF 架构 vs 文件名声明 | ✅（LFS 未拉时 SKIP） | ✅ |
 | `node tools/bracecheck-edited.cjs` | Kotlin 括号平衡 + 注释闭合 + 嵌套扫描 | ✅ | ✅ |
 | `node tools/check-plugin-contract.cjs` | 插件↔壳侧事件契约 + 运行时驱动 + 插件单测 | ✅（dsh 未装时部分 SKIP） | ✅ |
@@ -94,6 +95,23 @@ export OPENSSL_CONF=/dev/null
   用字符串拼接：`!!js (process.env.X ?? '') + '/bin/y'`。
   **改任何 patch 后立即用 `dsh --patch <file> --dump-config` 验证**（只解析不启动，
   零风险，且是唯一权威判定）。详见 gotchas §17。
+- **坑 18**（★致命）：**删掉「供给点」没有门禁守着**——`abae4ff` 把安装路径的
+  三件套拷贝循环换成只同步 `patched/` 的函数，`fs-register.mjs` 从此无供给点，
+  而 `startDshWeb` 的命令仍硬引用它 → 首次安装 `ERR_MODULE_NOT_FOUND` 硬失败
+  （**不是降级**；node 对缺失的 `--import` 是 exit=1）。
+  四道门禁全绿（assets 齐全 + 语法正确）。现由 `BOOT_SCRIPTS` 单源清单
+  + `tools/check-boot-assets.cjs`（从命令串反解 `--import` 目标）守着。
+  **重构删除任何「清单/拷贝/注册」逻辑时，必须问：它的消费者还拿得到东西吗？** 详见 gotchas §18。
+- **坑 19**（★致命）：**用从不递增的量当变更判据 = 死代码**。
+  `syncAssetsOnApkUpdate` 以 `versionCode` 判断「APK 是否升级」，
+  而本仓 `versionCode` 是硬编码常量 300 → 首次安装后该函数**永不执行**
+  （真机实证：设备上 `install-dsh.mjs` 比 APK 内旧 92 字节）。
+  判据改用 `AssetSync.apkInstallStamp()`（APK 路径+长度+mtime），
+  且**标记必须在工作成功之后才写**。详见 gotchas §19。
+- **坑 20**：**破坏性门禁验证必须在仓库外做**。本轮我曾在仓库内把 LFS 资产改成
+  垃圾内容，`cp` 到 `/tmp` 备份因目录不可写而静默失败 → 无备份即覆盖；
+  恢复需 `git cat-file blob HEAD:<path>`（设备上 `git-lfs` 无法执行，
+  `git checkout` 会 smudge 失败）。**不要给子代理下达宽泛的"可运行工具"授权**。详见 gotchas §20。
 
 ## 4. 详档路由表
 
@@ -177,3 +195,16 @@ export OPENSSL_CONF=/dev/null
     `dsh --patch <file> --dump-config`（只解析、不启动引擎，零风险）。
     这是判定 patch 能否被接受的**唯一权威**方式——`!!js` 反引号那类陷阱
     所有静态检查都看不见，而 dsh 的 patch 解析**失败即抛**（= 启动失败）。见坑 16。
+21. **引导期资产只允许一个供给点**：`files/` 根下的引导脚本（`fs-register.mjs` /
+    `fs-loader.mjs` / `fs-promises-compat.mjs` / `stub-dsh.mjs`）**只经
+    `DshFlow.syncBootAssets()` 供给**，清单是 `DshFlow.BOOT_SCRIPTS`。
+    新增任何「被启动命令引用的脚本」必须同时加进该清单，
+    且 `startDshWeb` 的命令串**不得手写字面量文件名**（用常量拼接）。
+    改完跑 `check-boot-assets.cjs`。见坑 18。
+22. **变更判据不得用从不递增的量**：`versionCode`（硬编码 300）、手写 marker、
+    固定字符串都不是「资产已更新」的信号。判据用**内容指纹**
+    （`AssetSync.fingerprintOf`）或 `apkInstallStamp()`；且**标记必须在工作成功之后写**，
+    否则一次失败即永久失去重试。见坑 19。
+23. **破坏性验证只在仓库外副本做**：绝不在仓库内覆盖/删除受版本控制的文件做测试；
+    脚本里的 `cp`/`mv` 必须检查退出码。**给子代理的授权要写明「只读」或「仅副本内」**，
+    事后对账 `git status`。见坑 20。

@@ -774,3 +774,28 @@ js-yaml 的 schema 字段是 `explicit`（不是 `tags`），且 CJS `require` �
 - `tools/check-plugin-contract.cjs`（§H ⑦ **新增裸反引号检查**，反向验证可拦下）
 - `docs/AGENTS/gotchas.md`（**新增 §17**：`!!js` 反引号陷阱 + 用 `--patch --dump-config`
   作权威验证入口）
+
+### review-r12（全项目复审：3 个 P0 + 3 个 P1）
+- `app/src/main/java/com/dsh/launcher/core/DshFlow.kt`（**修 P0-1**：新增 `BOOT_SCRIPTS`
+  单源清单 + `syncBootAssets()` 唯一供给点，恢复被 `abae4ff` 误删的 `fs-register.mjs`
+  供给；`--import` 改为常量拼接 + 缺失时 fail-loudly；新增 `STUB_SCRIPT`/
+  `FS_REGISTER_SCRIPT`/`RESTART_SETTLE_MS` 常量与 `restart()` 统一重启入口）
+- `app/src/main/java/com/dsh/launcher/ui/MainActivity.kt`（**修 P0-2**：`syncAssetsOnApkUpdate`
+  判据由常量 `versionCode` 改为 `AssetSync.apkInstallStamp()`；标记改为工作成功之后才写；
+  引导资产改走 `syncBootAssets()` 单一供给点；回滚路径补「为何不走 restart」的说明）
+- `app/src/main/java/com/dsh/launcher/core/AssetSync.kt`（新增 `apkInstallStamp()`：
+  APK 路径+长度+mtime，替代从不递增的 versionCode 作变更判据）
+- `app/src/main/java/com/dsh/launcher/ui/ConsoleActivity.kt`、
+  `app/src/main/java/com/dsh/launcher/ui/PluginManagerActivity.kt`
+  （**修 P1-①**：重启语义统一走 `DshFlow.restart()`，消除 1200/1500/0 三处魔数漂移）
+- `app/src/main/java/com/dsh/launcher/overlay/PetSpeaker.kt`（**P1-③**：回退量抽为
+  companion 纯函数 `computeRewind` + 方向性说明：误差必须落在「重复朗读」侧而非
+  「永久跳过」侧）
+- `app/src/test/java/com/dsh/launcher/overlay/PetSpeakerRewindTest.kt`（**新增**，8 用例）
+- **25 个文件**（**P1-②**）：移除 113 行「core/ 通配符导入 ui/overlay/service/tts」倒挂依赖
+  （`core/DshFlow.kt` 的 `service` 依赖改为 2 个显式单名导入）
+- `tools/check-boot-assets.cjs`（**新增门禁**：从 `startDshWeb` 命令串反解 `--import`
+  目标 ↔ `BOOT_SCRIPTS` ↔ assets 三者一致性；反向验证 5/5 可拦下）
+- `.github/workflows/ci.yml`、`build-apk.yml`（接入新门禁）
+- `AGENTS.md`（新增坑 18/19/20 + 门禁 1 行 + 维护约定 21/22/23）
+- `docs/AGENTS/gotchas.md`（**新增 §18 供给点断裂、§19 死判据、§20 破坏性验证事故**）

@@ -8,10 +8,6 @@ import android.content.Context
 import android.content.Intent
 import android.os.IBinder
 import com.dsh.launcher.core.*
-import com.dsh.launcher.overlay.*
-import com.dsh.launcher.service.*
-import com.dsh.launcher.tts.*
-import com.dsh.launcher.ui.*
 import com.dsh.launcher.R
 
 /** dsh 安装/构建期间的前台保活服务，防止长时间 build 被系统回收。 */

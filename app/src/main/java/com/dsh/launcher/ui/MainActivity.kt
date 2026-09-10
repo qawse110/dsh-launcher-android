@@ -25,10 +25,7 @@ import com.google.android.material.color.DynamicColors
 import java.io.File
 import kotlin.concurrent.thread
 import com.dsh.launcher.core.*
-import com.dsh.launcher.overlay.*
 import com.dsh.launcher.service.*
-import com.dsh.launcher.tts.*
-import com.dsh.launcher.ui.*
 import com.dsh.launcher.R
 
 /**
@@ -546,6 +543,10 @@ class MainActivity : AppCompatActivity() {
                 // killAllNode 会阻塞等待 node 真正退出（SIGTERM → 限时 → SIGKILL 升级，
                 // 最多约 8s）。这里在 AlertDialog 点击回调里 = 主线程，直接调用会 ANR。
                 // 放到后台线程，杀净后再回主线程起流程（beginFlow 是 UI 操作）。
+                //
+                // 刻意**不**走 DshFlow.restart：那是「START_ONLY 快速启动」，
+                // 而回滚必须走 INSTALL_AND_START + forceFullInstall（重装旧版本）。
+                // 也不额外 sleep——紧接着的安装本身是分钟级，TCP 套接字早已释放。
                 thread {
                     DshFlow.killAllNode(this@MainActivity) { }
                     runOnUiThread {
@@ -650,6 +651,15 @@ class MainActivity : AppCompatActivity() {
     private companion object {
         /** 与 DshUpdater.AUTO_CONFIRM_BOOTS 一致，仅用于文案展示。 */
         const val bootDotTotal = 3
+
+        /**
+         * 已同步 APK 的 stamp 键（值 = [AssetSync.apkInstallStamp] 的字符串）。
+         *
+         * 键名沿用历史 `last_apk_version` 以免引入第二套迁移：旧版本存的是纯数字
+         * versionCode，`getString` 遇 Long 会返回 null → 视为「未同步过」，
+         * 本次补一次同步，随后写回 stamp 字符串（review-r12 的 P0-2 修复）。
+         */
+        const val KEY_APK_STAMP = "last_apk_version"
     }
 
     private fun guardBusy(action: String): Boolean =
@@ -797,40 +807,59 @@ class MainActivity : AppCompatActivity() {
      * APK 升级后自动把 assets 里的内置插件源（prebuilt.tgz 等）同步到 files，
      * 避免“更新了应用但运行时仍是旧插件”。装配本身仍需用户执行
      * 「插件管理 → 重新装配内置插件」（或控制台一键安装）。
+     *
+     * 判据是 [AssetSync.apkInstallStamp]（APK 文件路径+长度+mtime）而**不是 versionCode**
+     * ——本仓 versionCode 是硬编码常量、从不递增，旧写法导致本函数首次安装后永久早退
+     * （review-r12 的 P0-2）。prefs 键沿用 `last_apk_version`，但存的是 stamp 字符串；
+     * 读到旧的纯数字值即视为「未同步过」→ 本次补一次同步（天然迁移、无需清理代码）。
      */
     private fun syncAssetsOnApkUpdate() {
         val current = AssetSync.apkVersion(this)
         if (current == 0L) return
+        val stamp = AssetSync.apkInstallStamp(this, current)
         val prefs = getSharedPreferences(AppState.Prefs.UI, MODE_PRIVATE)
-        val last = prefs.getLong("last_apk_version", 0L)
-        if (current == last) return
-        prefs.edit().putLong("last_apk_version", current).apply()
+        if (prefs.getString(KEY_APK_STAMP, null) == stamp) return
         appendMiniLog("检测到应用更新（v$current），后台同步内置插件源…")
         thread {
+            // 标记在**全部工作成功之后**才写入（review-r12）：旧实现先写标记再干活，
+            // 中途失败/进程被杀就永久失去重试机会（DshFlow 的同名逻辑正是先做后写）。
+            var ok = true
             try {
-                for (name in listOf(
-                    "install-dsh.mjs", "routing-suite.mjs",
-                    "fs-register.mjs", "fs-loader.mjs", "fs-promises-compat.mjs", "stub-dsh.mjs"
-                )) {
-                    AssetSync.copyAsset(this, name, File(filesDir, name))
+                // 本 Activity 专属的运维脚本：引导期脚本（含 fs-register.mjs）与 patched/
+                // 载荷统一走 DshFlow.syncBootAssets 的唯一供给点，此处不再另立清单
+                // （review-r12 的 P0 根因正是「两处清单各自维护、一处被误删」）。
+                for (name in listOf("install-dsh.mjs", "routing-suite.mjs")) {
+                    if (!AssetSync.copyAsset(this, name, File(filesDir, name))) ok = false
                 }
+                if (!DshFlow.syncBootAssets(this) { line -> AppLog.i("Main", line) }) ok = false
                 val prebuilt = File(filesDir, "prebuilt.tgz")
                 if (AssetSync.copyAsset(this, "prebuilt.tgz", prebuilt)) {
                     AssetSync.markSyncedWithFingerprint(this, "prebuilt", prebuilt, current)
+                } else {
+                    ok = false
                 }
                 val extraPlugins = File(filesDir, "extra-plugins")
                 if (AssetSync.copyAssetDir(this, "extra-plugins", extraPlugins, clearFirst = true)) {
                     AssetSync.markSyncedWithFingerprint(this, "extra-plugins", extraPlugins, current)
+                } else {
+                    ok = false
                 }
                 val dshInstalled = File(filesDir, "plugins").exists() && File(filesDir, "dsh-prefix").exists()
-                if (dshInstalled) {
-                    prefs.edit().putBoolean("rewire_hint", true).apply()
-                    runOnUiThread {
-                        appendMiniLog("✓ 内置插件源已同步。建议在「插件管理」执行“重新装配内置插件”。")
-                        showUpdateHint()
-                    }
+                if (ok) {
+                    prefs.edit().putString(KEY_APK_STAMP, stamp).apply()
                 } else {
-                    runOnUiThread { appendMiniLog("✓ 内置插件源已同步（新装环境，装配由首次安装负责）。") }
+                    AppLog.e("Main", "apk asset sync incomplete; stamp not recorded, will retry next launch")
+                }
+                runOnUiThread {
+                    when {
+                        !ok -> appendMiniLog("! 内置插件源同步不完整，下次启动会重试（详见日志）")
+                        dshInstalled -> {
+                            prefs.edit().putBoolean("rewire_hint", true).apply()
+                            appendMiniLog("✓ 内置插件源已同步。建议在「插件管理」执行“重新装配内置插件”。")
+                            showUpdateHint()
+                        }
+                        else -> appendMiniLog("✓ 内置插件源已同步（新装环境，装配由首次安装负责）。")
+                    }
                 }
             } catch (t: Throwable) {
                 AppLog.e("Main", "apk asset sync failed: " + (t.message ?: t.toString()))

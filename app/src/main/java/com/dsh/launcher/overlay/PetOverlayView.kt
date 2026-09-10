@@ -7,12 +7,6 @@ import android.graphics.Rect
 import android.os.Handler
 import android.os.Looper
 import android.view.View
-import com.dsh.launcher.core.*
-import com.dsh.launcher.overlay.*
-import com.dsh.launcher.service.*
-import com.dsh.launcher.tts.*
-import com.dsh.launcher.ui.*
-import com.dsh.launcher.R
 
 /**
  * Codex 桌宠动画视图：从 8x9（或 8x11）精灵表按行播放帧。

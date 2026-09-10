@@ -23,11 +23,9 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import kotlin.random.Random
 import com.dsh.launcher.core.*
-import com.dsh.launcher.overlay.*
 import com.dsh.launcher.service.*
 import com.dsh.launcher.tts.*
 import com.dsh.launcher.ui.*
-import com.dsh.launcher.R
 
 /**
  * 通用 dsh 状态悬浮窗管理器。

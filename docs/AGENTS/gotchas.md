@@ -680,3 +680,170 @@ bashPath: !!js (process.env.PREFIX ?? '') + '/bin/bash'   # ✓
 **推广**：凡是要往 `cordis.patch.yml` / profile 配置里写「平台条件或环境变量表达式」，
 一律先用 `dsh --patch <file> --dump-config` 验证能被 dsh 接受——
 这是**唯一权威**的判定方式，且完全无风险（只解析、不启动引擎）。
+
+---
+
+## 18. ★ 重构时删掉的「供给点」没有任何门禁守着 → 装完打不开（review-r12 实测）
+
+**形态**：一次看起来只是「整理」的重构，删掉了一段资产拷贝循环，
+但**被删掉的清单没有移交给新的唯一入口**。静态语法全绿、assets 文件齐全，
+缺的只是「Kotlin 侧不再把某个文件拷到运行时目录」。
+
+### 事故链（逐环都是真实代码）
+
+commit `abae4ff`（「补丁载荷外置 + 内容比对幂等」）把安装路径上的拷贝循环：
+
+```kotlin
+// 旧：安装路径显式拷三件套
+for (name in listOf("fs-register.mjs", "fs-loader.mjs", "fs-promises-compat.mjs")) {
+    ctx.assets.open(name).use { input -> File(ctx.filesDir, name).outputStream().use { input.copyTo(it) } }
+}
+```
+
+替换成了新抽出的 `syncCompatAssets(...)` ——而那个函数**只同步 `patched/` 目录**。
+于是 `fs-register.mjs` 在整个安装路径上**再无供给点**，可是：
+
+```kotlin
+// DshFlow.startDshWeb —— 仍然硬引用它
+val nodeCmd = "... node --expose-internals --import ${ctx.filesDir.absolutePath}/fs-register.mjs .../bin.js web"
+```
+
+当时全仓仅两处会写这个文件：`quickStartWeb`（只有「已装」才走）与
+`MainActivity.syncAssetsOnApkUpdate`（**本身因 versionCode 钉死而永久早退**，见坑 19）。
+
+### 后果为什么是「硬失败」而不是「降级」
+
+真机实测：
+
+```
+$ node --expose-internals --import .../__NO_SUCH_FILE__.mjs -e 'console.log("REACHED")'
+Error [ERR_MODULE_NOT_FOUND]: Cannot find module '.../__NO_SUCH_FILE__.mjs'
+exit=1          ← 没有 REACHED；node 对缺失的 --import 是直接退出
+```
+
+而报错信息 `ERR_MODULE_NOT_FOUND` **指向 node 环境**，
+与真正的原因（「壳侧少拷一个文件」）隔了三层，极易误判为 node 装坏了。
+
+### 为什么四道门禁全都看不见
+
+| 门禁 | 为什么是绿的 |
+|---|---|
+| `check-asset-scripts` | assets 侧三个文件**都在**，语法都合法 |
+| `check-asset-abi` | 与 node 归档无关 |
+| `bracecheck-edited` | Kotlin 语法完全正确、括号平衡 |
+| `check-plugin-contract` | 与插件契约无关 |
+
+缺口在于：**没有任何东西比对「Kotlin 命令里引用的 files 级资产」与「Kotlin 实际拷贝的清单」**。
+
+### 修复（结构性，不是补一行）
+
+1. **单源化**：新增 `DshFlow.BOOT_SCRIPTS` 作为引导脚本唯一清单，
+   `syncBootAssets()` 作为**唯一供给点**，安装路径与快速启动路径都调用它；
+2. **消灭字面量漂移**：`startDshWeb` 的 `--import` 改为从 `FS_REGISTER_SCRIPT`
+   常量构造（不再是手写文件名），并在缺失时 **fail-loudly** 直接点明根因；
+3. **新增门禁** `tools/check-boot-assets.cjs`：从 `startDshWeb` 的命令串**反解**
+   `--import` 目标，断言它在 `BOOT_SCRIPTS` 内、对应 asset 存在、且同步函数
+   同时覆盖脚本与 `patched/` 载荷、调用点 ≥2 个。
+
+### 反向验证（门禁必须"见过它失败"）
+
+在仓库**外**的隔离副本里注入真实故障（见坑 20 的教训——不要在仓库内做破坏性测试）：
+
+| 注入 | 门禁反应 |
+|---|---|
+| 从 `BOOT_SCRIPTS` 删掉 `FS_REGISTER_SCRIPT` | ✅ 精确报出「--import 引用 fs-register.mjs，但它不在清单里」 |
+| `--import` 改回字面量文件名拼接 | ✅ 报「应与清单共用常量，否则可各自漂移」 |
+| 移除 `copyAssetDir(…, "patched", …)` 调用 | ✅ 报「补丁载荷不会被同步」 |
+| 删除 `assets/fs-register.mjs` | ✅ 报「清单声明了但 asset 不存在」 |
+| 只保留 1 个调用点 | ✅ 报「安装与快速启动都必须调用」 |
+
+**教训**：重构删除任何「清单 / 拷贝 / 注册」逻辑时，必须问一句
+**「这段逻辑的唯一消费者是谁？它还拿得到东西吗？」**——
+并给这个不变量配一道**会从命令串反解**的门禁，而不是靠人记得同步两份清单。
+
+---
+
+## 19. ★ 用「从不递增的量」当变更判据 → 整段功能是死代码（review-r12 实测）
+
+`MainActivity.syncAssetsOnApkUpdate` 的 KDoc 写着「APK 升级后自动同步内置插件源」，
+实现是：
+
+```kotlin
+val last = prefs.getLong("last_apk_version", 0L)
+if (current == last) return                       // 早退
+prefs.edit().putLong("last_apk_version", current).apply()   // 先写标记
+```
+
+而本仓 `versionCode` 是 `app/build.gradle.kts` 里的**硬编码常量 300**
+（注释：「300 > 历史所有包…保证任何情况下可直接覆盖安装」），**正常迭代从不递增**。
+
+### 真机实证
+
+```
+app/build.gradle.kts:  versionCode = 300
+dsh_ui.xml:            last_apk_version = 300     ← 首次安装后即为 300
+=> current == last 恒真 => 该函数此后永不执行
+```
+
+旁证（同一时刻的设备状态）：
+
+```
+38157 bytes  app/src/main/assets/install-dsh.mjs    ← APK 内
+38065 bytes  files/install-dsh.mjs                  ← 设备上跑的是 9 月 6 日的旧版
+```
+
+### 两个叠加缺陷
+
+1. **判据失效**：`versionCode` 不递增 → 「APK 变了」永远检测不到。
+   这正是参考实现记录过的「stale marker」同型缺陷，只是这次连版本号都不变。
+2. **标记先写后干活**：`putLong` 在工作**之前**，中途失败/进程被杀即永久失去重试。
+   同仓 `DshFlow` 的同名逻辑是**先做后写**（可用作对照范式）。
+
+### 修复
+
+- 判据换成 `AssetSync.apkInstallStamp()`：`APK 文件路径 + 长度 + mtime`。
+  覆盖安装必然重写 APK 文件，且是 `stat` 级开销；取不到时返回带时间戳的值
+  （**倾向同步**，而不是倾向跳过）。
+- 标记改为**全部工作成功之后**才写；失败则保留旧值以便下次重试。
+- prefs 键名沿用 `last_apk_version` 以免引入第二套迁移：旧值是纯数字，
+  `getString` 读到 Long 返回 null → 视为「未同步过」→ 自动补一次（天然迁移）。
+
+**教训**：任何「只在 X 变化时才做 Y」的判据，先确认 **X 真的会变**。
+「硬编码常量 / 从不递增的版本号 / 手工维护的 marker」都不能当变更信号；
+**内容指纹**（本仓 `AssetSync.fingerprintOf`）才是可靠判据。
+
+---
+
+## 20. 破坏性门禁验证必须在**仓库外**做（review-r12 自身事故）
+
+本轮我为了反向验证 ABI 门禁「能不能抓错架构」，**直接在仓库内**把
+`app/src/main/assets/node/termux-node-aarch64.tar.gz` 改成垃圾内容，并用
+`cp` 备份到 `/tmp` —— 但 Android 上 `/tmp` **不可写**，`cp` 失败且我没有检查退出码。
+备份没建成，原文件已被覆盖。同时一个被中断的子代理也在仓库内做同类测试，
+删掉了 LFS 指针文件、留下一个 2.5KB 的垃圾归档。
+
+**损伤**：`git status` 出现 ` D termux-node-aarch64.tar.gz` 与未跟踪的垃圾文件；
+而该文件是 LFS 指针，`git checkout` 恢复会因设备上 `git-lfs` 无法执行而失败：
+
+```
+$ git checkout -- app/src/main/assets/node/termux-node-aarch64.tar.gz
+fatal: cannot exec 'git-lfs filter-process': Permission denied
+error: ... smudge filter lfs failed
+```
+
+**正确恢复方式**（绕过 smudge filter，直接取 blob 内容）：
+
+```sh
+git cat-file blob HEAD:<path> > <path>     # 指针文件 133 字节，内容即 version/oid/size 三行
+```
+
+**教训（三条，都要落到操作习惯上）**：
+
+1. **破坏性测试一律在仓库外的隔离副本里做**（`cp -r` 到临时目录），
+   或至少在 `git stash` / 干净分支之外做。本轮后半段我改用
+   `_gateverify/` 隔离副本，才安全地跑完 5 项反向验证。
+2. **`cp` / `mv` 的退出码必须检查**——静默失败 + 后续覆盖 = 无备份。
+   Android 上 `/tmp` 不可写是常态，`$TMPDIR` 指向 `files/tmp` 才可靠。
+3. **不要给子代理下达「可以运行工具做破坏性测试」的宽泛授权**——
+   本轮一个子代理据此删了仓库内的 LFS 资产。授权要写清「只读」
+   或「仅在副本内」，且事后必须 `git status` 对账。

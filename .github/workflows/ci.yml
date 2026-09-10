@@ -27,6 +27,13 @@ jobs:
       - name: Asset scripts gate（脚本语法 + 载荷完整性）
         run: node tools/check-asset-scripts.cjs
 
+      # 引导期资产供给门禁（review-r12）：比对「Kotlin 启动命令引用到的 files 级脚本」
+      # 与「Kotlin 实际拷贝的资产清单」。上一轮四道门禁全都看不见 abae4ff 引入的 P0
+      # ——安装路径不再供给 fs-register.mjs，而启动命令仍硬引用它，首次安装即以
+      # ERR_MODULE_NOT_FOUND 硬失败（assets 侧文件齐全，所以资产脚本门禁是绿的）。
+      - name: Boot assets gate（引导脚本供给一致性）
+        run: node tools/check-boot-assets.cjs
+
       # ABI 门禁（本轮新增）：读内置 node 归档里 bin/node 的 ELF e_machine，
       # 与文件名声明的 ABI 双向核对。参考项目坑 18/30 是两次真机重大事故
       # （错 ABI 运行时装到真机 → 引擎启动即崩 EM_X86_64 ≠ EM_AARCH64）。
