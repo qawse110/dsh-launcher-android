@@ -74,8 +74,13 @@ class TermuxEnvTest {
             val i = it.indexOf('=')
             it.substring(0, i) to it.substring(i + 1)
         }
-        val base = TermuxEnv.childShellEnv(ctx, tmpDir = TermuxRuntime.home(ctx))
-        // 终端环境 = childShellEnv 基底（TMPDIR=home）+ PWD；逐键核对无漂移
+        // 基底 = terminalSessionEnv 同参数的 childShellEnv（TMPDIR=home + .tools/bin extraPath）
+        val base = TermuxEnv.childShellEnv(
+            ctx,
+            tmpDir = TermuxRuntime.home(ctx),
+            extraPath = listOf(File(ctx.filesDir, ".tools/bin").absolutePath),
+        )
+        // 终端环境 = childShellEnv 基底 + PWD；逐键核对无漂移
         assertEquals(base["PATH"], term["PATH"])
         assertEquals(base["HOME"], term["HOME"])
         assertEquals(base["PREFIX"], term["PREFIX"])
