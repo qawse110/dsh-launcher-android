@@ -18,8 +18,6 @@ import android.provider.Settings
 import android.view.WindowManager
 import org.json.JSONObject
 import java.io.File
-import java.net.HttpURLConnection
-import java.net.URL
 import java.util.concurrent.atomic.AtomicBoolean
 import com.dsh.launcher.core.*
 import com.dsh.launcher.overlay.*
@@ -124,26 +122,19 @@ class StatusBridgeService : Service() {
                 )
                 PowerGovernor.setTaskStatus(lastStatus)
                 syncWakeLock(PowerGovernor.wantWakeLock())
-                val json = fetchStatus()
-                if (json != null) {
-                    val status = json.optString("status", "idle")
-                    val text = json.optString("lastText", "")
-                    val event = if (json.has("lastEvent")) json.optString("lastEvent", null) else null
-                    // 插件 0.1.2 起上报当前工具名（tool/call → tool/result 配对）；
-                    // 旧版插件无此字段 → 保持 null，statusLabel 回退为「调用工具」
-                    val toolName = if (json.has("toolName")) json.optString("toolName", null) else null
-                    val updatedAt = json.optLong("updatedAt", 0L)
+                val st = fetchStatus()
+                if (st != null) {
                     val prev = lastStatus
-                    lastStatus = status
+                    lastStatus = st.status
                     mainHandler.post {
-                        updateOverlay(status, text, event, toolName)
-                        updateForeground(status, text)
-                        writeHeartbeat(status, text)
+                        updateOverlay(st.status, st.text, st.event, st.toolName)
+                        updateForeground(st.status, st.text)
+                        writeHeartbeat(st.status, st.text)
                     }
-                    if (prev == "running" && status == "finished") {
-                        if (updatedAt > lastFinishedAt) {
-                            lastFinishedAt = updatedAt
-                            mainHandler.post { StatusBridgeAlerts.onAiFinished(this, text) }
+                    if (prev == "running" && st.status == "finished") {
+                        if (st.updatedAt > lastFinishedAt) {
+                            lastFinishedAt = st.updatedAt
+                            mainHandler.post { StatusBridgeAlerts.onAiFinished(this, st.text) }
                         }
                     }
                 } else {
@@ -159,19 +150,12 @@ class StatusBridgeService : Service() {
         }
     }
 
-    private fun fetchStatus(): JSONObject? = try {
-        // 本机回环一律 Proxy.NO_PROXY（对齐参考实现坑 33），否则系统代理会劫持探针
-        val conn = URL("http://127.0.0.1:3190/status")
-            .openConnection(java.net.Proxy.NO_PROXY) as HttpURLConnection
-        conn.connectTimeout = 800
-        conn.readTimeout = 800
-        conn.requestMethod = "GET"
-        val text = conn.inputStream.bufferedReader().use { it.readText() }
-        conn.disconnect()
-        if (text.isBlank()) null else JSONObject(text)
-    } catch (e: Exception) {
-        null
-    }
+    /**
+     * 读取并解析插件 `/status`（委托 [LocalHttp] + [BridgeStatus]）。
+     * 不可达或响应非法一律返回 null —— 探测契约是「失败即 null」，不抛给轮询线程。
+     */
+    private fun fetchStatus(): BridgeStatus? =
+        LocalHttp.getJson(STATUS_URL)?.let { BridgeStatus.parse(it) }
 
     // ---------------- 配置读取 ----------------
 
@@ -326,6 +310,12 @@ class StatusBridgeService : Service() {
         /** 唤醒锁单次持有超时：轮询循环每轮（≤30s）续期，超时兜底防误判后永久持锁。 */
         private const val WAKELOCK_RENEW_MS = 10 * 60_000L
         const val WATCHDOG_ACTION = "com.dsh.launcher.action.BRIDGE_WATCHDOG"
+
+        /**
+         * `dsh-status-bridge` 插件的状态端点（端口与插件侧 `DSH_STATUS_BRIDGE_PORT`
+         * 默认值一致）。无障碍通道 [KeepAliveAccessibilityService] 消费同一 URL。
+         */
+        const val STATUS_URL = "http://127.0.0.1:3190/status"
 
         fun start(context: Context) {
             val intent = Intent(context, StatusBridgeService::class.java)

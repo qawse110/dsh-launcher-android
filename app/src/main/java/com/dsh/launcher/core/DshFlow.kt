@@ -3,8 +3,6 @@ package com.dsh.launcher.core
 import android.content.Context
 import android.content.Intent
 import java.io.File
-import java.net.HttpURLConnection
-import java.net.URL
 import kotlin.concurrent.thread
 import com.dsh.launcher.core.*
 import com.dsh.launcher.overlay.*
@@ -683,35 +681,8 @@ object DshFlow {
         true
     }
 
-    /**
-     * 本地 HTTP 探测唯一入口：一律 [Proxy.NO_PROXY]。
-     * 用户在系统/Wi-Fi 设置里配了代理时，默认 ProxySelector 会把 127.0.0.1 请求
-     * 也交给代理 → 探针全挂 → 看门狗误判 dsh 死亡（杀进程/误拉起）。
-     * 本机回环地址永不该走代理（对齐参考实现 dsh-mobile-apk 坑 33）。
-     */
-    fun localConnection(url: String): HttpURLConnection =
-        (URL(url).openConnection(java.net.Proxy.NO_PROXY) as HttpURLConnection).apply {
-            useCaches = false
-        }
-
-    fun httpResponds(port: Int): Boolean {
-        val conn = try {
-            localConnection("http://127.0.0.1:$port/")
-        } catch (e: Exception) {
-            return false
-        }
-        return try {
-            conn.connectTimeout = 800
-            conn.readTimeout = 800
-            conn.requestMethod = "GET"
-            conn.responseCode in 200..399
-        } catch (e: Exception) {
-            false
-        } finally {
-            // disconnect 必须放 finally：responseCode 抛异常时连接也要释放
-            runCatching { conn.disconnect() }
-        }
-    }
+    /** dsh web 端口是否响应（委托 [LocalHttp]；本机回环一律不走代理）。 */
+    fun httpResponds(port: Int): Boolean = LocalHttp.responds(port)
 
     private fun appendLogTail(file: File, maxLines: Int, onLog: (String) -> Unit) {
         try {

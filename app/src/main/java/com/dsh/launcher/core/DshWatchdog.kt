@@ -13,27 +13,13 @@ object DshWatchdog {
 
     private const val TAG_WATCHDOG = "DshWatchdog"
 
-    /** dsh web 端口是否可访问。 */
-    fun isUp(): Boolean {
-        val conn = try {
-            // 本机回环一律 Proxy.NO_PROXY：系统代理会把 127.0.0.1 请求劫持给代理，
-            // 探针全挂 → watchdog 误判死亡（对齐参考实现坑 33）
-            java.net.URL("http://127.0.0.1:${DshFlow.WEB_PORT}/")
-                .openConnection(java.net.Proxy.NO_PROXY) as java.net.HttpURLConnection
-        } catch (e: Exception) {
-            return false
-        }
-        return try {
-            conn.connectTimeout = 800
-            conn.readTimeout = 800
-            conn.requestMethod = "GET"
-            conn.responseCode in 200..399
-        } catch (e: Exception) {
-            false
-        } finally {
-            runCatching { conn.disconnect() }
-        }
-    }
+    /**
+     * dsh web 端口是否可访问。
+     *
+     * 委托 [LocalHttp]：本机回环一律 `Proxy.NO_PROXY`，否则系统代理会劫持
+     * 探针导致误判死亡（对齐参考实现坑 33）。
+     */
+    fun isUp(): Boolean = LocalHttp.responds(DshFlow.WEB_PORT)
 
     /**
      * 端口不通且冷却到期时经 [Supervisor] 拉起 dsh web。

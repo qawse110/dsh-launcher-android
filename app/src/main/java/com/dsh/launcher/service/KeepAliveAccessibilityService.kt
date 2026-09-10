@@ -8,11 +8,6 @@ import android.os.Looper
 import android.provider.Settings
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
-import org.json.JSONObject
-import java.io.BufferedReader
-import java.io.InputStreamReader
-import java.net.HttpURLConnection
-import java.net.URL
 import kotlin.concurrent.thread
 import com.dsh.launcher.core.*
 import com.dsh.launcher.overlay.*
@@ -207,45 +202,17 @@ class KeepAliveAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun fetchStatus(): StatusData? {
-        return try {
-            // 本机回环一律 Proxy.NO_PROXY（对齐参考实现坑 33），且 disconnect 收进 finally
-            val conn = URL(STATUS_URL).openConnection(java.net.Proxy.NO_PROXY) as HttpURLConnection
-            conn.connectTimeout = 800
-            conn.readTimeout = 800
-            conn.requestMethod = "GET"
-            conn.useCaches = false
-            try {
-                if (conn.responseCode != 200) return null
-                val text = BufferedReader(InputStreamReader(conn.inputStream)).use { it.readText() }
-                val obj = JSONObject(text)
-                StatusData(
-                    status = obj.optString("status", "idle"),
-                    text = obj.optString("lastText", ""),
-                    event = if (obj.has("lastEvent")) obj.optString("lastEvent", null) else null,
-                    updatedAt = obj.optLong("updatedAt", 0L),
-                    // 插件 0.1.2 起上报工具名；旧插件无此字段 → null，回退「调用工具」
-                    toolName = if (obj.has("toolName")) obj.optString("toolName", null) else null
-                )
-            } finally {
-                conn.disconnect()
-            }
-        } catch (e: Exception) {
-            null
-        }
-    }
-
-    private data class StatusData(
-        val status: String,
-        val text: String,
-        val event: String?,
-        val updatedAt: Long,
-        val toolName: String? = null
-    )
+    /**
+     * 读取插件 `/status`（委托 [LocalHttp] + [BridgeStatus]）。
+     *
+     * 此前与 [StatusBridgeService] 各写一份解析：字段名、默认值、超时、断开位置
+     * 全部手工同步，插件加字段时两处都要改（`toolName` 就是这么加进来的）。
+     * 现统一走共享模型 —— 新增字段只改 `BridgeStatus` 一处。
+     */
+    private fun fetchStatus(): BridgeStatus? =
+        LocalHttp.getJson(StatusBridgeService.STATUS_URL)?.let { BridgeStatus.parse(it) }
 
     companion object {
-        private const val STATUS_URL = "http://127.0.0.1:3190/status"
-
         /** 僵尸窗清扫周期：a11y ts 过期（轮询线程死亡/被冻结）时撤掉本通道窗口。 */
         private const val STALE_SWEEP_MS = 3_000L
 
