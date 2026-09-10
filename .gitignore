@@ -16,3 +16,7 @@ local.properties
 __pycache__/
 *.pyc
 dist/
+
+# 门禁/排查用的临时产物（tools/ 下的隐藏 scratch 与下载的 CI 日志）
+tools/.*
+tools/*.log
