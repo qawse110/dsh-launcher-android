@@ -42,12 +42,13 @@ class PluginManagerActivity : AppCompatActivity() {
 
     companion object {
         // 内置插件（随 APK 分发；首次 flow 已通过 dsh plugin add 装配）
-        // 与 install-dsh.mjs 的 BUILTIN_PLUGINS 保持一致（8 个）
+        // 与 install-dsh.mjs 的 BUILTIN_PLUGINS 保持一致（9 个）
         val BUNDLED = setOf(
             "dsh-mobile-nav", "dsh-super-injector",
             "dsh-net-proxy", "dsh-provider-headers", "dsh-vision",
             "dsh-status-bridge",
             "dsh-android-links", "dsh-llm-codebuddy",
+            "dsh-shell-termux",
         )
         val BUNDLED_DESC = mapOf(
             "dsh-mobile-nav" to "移动端 UI 适配（窄屏抽屉/全宽会话）",
@@ -58,6 +59,7 @@ class PluginManagerActivity : AppCompatActivity() {
             "dsh-status-bridge" to "状态桥接（悬浮窗/通知显示 dsh 运行情况）",
             "dsh-android-links" to "Android 存储桥接（共享存储软链入 dsh home，目录选择器可浏览 /storage）",
             "dsh-llm-codebuddy" to "CodeBuddy Provider（中国区/国际版共存模式）",
+            "dsh-shell-termux" to "Termux 原生 bash 执行器（显式环境注入；替代在 Android 会 fail-closed 的桌面沙箱执行器）",
         )
         const val PRESET_DIR = "router-preset"
         const val PRESET_DESC = "思维模式路由预设（router-spec / router-standard，agent-presets）"

@@ -430,6 +430,86 @@ turn/end kind 覆盖 schema / **运行时驱动状态机** / 插件单测。
 `app/src/main/assets/extra-plugins/dsh-status-bridge/test/status-bridge.test.mjs`，
 17 个用例，`node:test` + `assert/strict` 零依赖。覆盖三个缺陷 + 工具配对 + 健壮性。
 
+## 三点十三、bash 执行世界专项（review-r9，借鉴 dsh-shell-termux）
+
+参考项目单独维护了一个插件 `dsh-shell-termux`（其 [GitHub 仓库](https://github.com/kelai141/dsh-shell-termux)，
+258 行 TS）。本轮**读其设计文档 + 实读两侧源码 + 在本机实证**，挖出本项目一个
+**比前两轮更严重的缺陷**。
+
+### ★ 桌面沙箱执行器在 Android 上 fail-closed，默认档位下 bash 工具不可用
+
+**机制**（全部源码实证，详见 `docs/AGENTS/gotchas.md` §14）：
+
+| 环节 | 事实 |
+|---|---|
+| dsh-base 默认执行器 | `@deepseek-ai/dsh-bash-sandbox` |
+| 非 danger-full-access 时的行为 | `this.ctx.sandbox.confine(["bash","-c",cmd], policy)` |
+| sandbox provider 平台链条 | `PLATFORM_CHAINS = { linux, darwin, win32 }` —— **无 android** |
+| `chainVerdict()` | `PLATFORM_CHAINS[platform] ?? []` → 空 → `"unavailable"` |
+| `selectRunner()` | `unavailable` → **抛 `SandboxUnavailableError`** |
+| dsh-base 会话默认档位 | `DSH_PERMISSION_MODE ?? 'workspace-write'` |
+
+即：**默认档位下 Android 的 bash 工具会被沙箱 fail-closed 拒绝**。
+
+**为何一直没暴露**：本机全部历史会话档位**恰好都是 `danger-full-access`**
+（实测 10/10），该模式下 `run()` 直接 `return super.run(spec)`、**不走 confine**。
+一旦用户切回默认档位，bash 工具即不可用。
+
+### 参考项目的解法与本项目落地
+
+参考项目该插件的**整个存在理由**正是这个实证，其设计文档原文：
+
+> **结论：安卓上 bash 工具实际执行会被沙箱拒绝**（M0 只验证了服务启动，未验证工具执行）
+> 即：**"碰巧能启动" ≠ "工具可用"**。
+
+解法 = `bash-sandbox` 条目 `disabled` + 插入自建 `ctx.shell` provider，
+并**诚实声明**沙箱语义（`enforcement: 'partial'`；真实边界是 SELinux 应用域 + 审批流，
+不做假沙箱）。
+
+本项目落地（`app/src/main/assets/extra-plugins/dsh-shell-termux/`）：
+
+- `lib/index.js` — `TermuxBashExecutor extends LocalBashExecutor`（复用上游全部预算与
+  生命周期语义），只加两处增量：① `resolve()` 显式注入 Termux 环境；
+  ② `sandboxMode` 返回 `undefined`（上游契约允许：不支持沙箱时返回 undefined），
+  不谎报某个档位已被路径级执行。
+- `cordis.patch.yml` — 条件化 disable/insert，**双平台都限定 `process.platform`**
+  （桌面保留真实沙箱，不因本项目而丢约束）。
+- `test/shell-termux.test.mjs` — 21 用例。
+
+### 显式环境注入的独立价值（实测）
+
+即使绕开沙箱问题，环境注入本身也修掉一个真实缺口：dsh 默认执行器 spawn 的是
+**裸 `"bash"`**，靠继承进程环境解析；而子进程环境 = `scrubbedParentEnv()` ⊕ spawn env，
+**完全依赖 web 进程的 PATH/LD_LIBRARY_PATH 恰好正确**：
+
+```
+$ git --version
+CANNOT LINK EXECUTABLE "git": library "libpcre2-8.so" not found   # 无注入
+git version 2.55.0                                                # 注入后
+```
+
+端到端验证（真实 cordis ctx 装载本插件）：**删除进程的 `PATH`/`PREFIX`/`LD_LIBRARY_PATH`
+后 `git --version` 仍正常** —— 注入是自包含的。
+
+### 与参考实现的取舍（不盲抄）
+
+| 参考做法 | 本项目决定 |
+|---|---|
+| 注入 `TERMUX_VERSION`（固定 `0.118.3`） | **不注入**：工作区与官方 Termux app 无交互、无消费方；伪造版本可能误导 pkg 兼容分支 |
+| 注入 `DSH_WRITE_MODE`/`DSH_WORKSPACE`/`DSH_SHARED_DIRS` 并禁 request.env 覆盖 | **不注入**：本机 dsh 的写面闸门由 `dsh-sandbox-policy` 按会话档位事件裁决；实测 `grep -rl DSH_WRITE_MODE` 全树零命中 → 注入即死键 |
+| TypeScript + tsc 构建 | 纯 JS（工作区 assets 无构建链），直接 import 上游 ESM 类 |
+| `probe()` 报 bash 版本 | 保留结构化 probe，但不 spawn 取版本（避免装载期额外进程） |
+
+### 装配契约门禁（§H）
+
+本插件以 `ctx.shell` **唯一 provider** 身份替换默认执行器，装配写错的后果比原缺陷更糟：
+① 未 disable `bash-sandbox` → 争抢单例；② disable 但 insert 未生效 → **无 provider，
+bash 整体不可用**。故门禁核对：disable/insert 成对、均限定平台、三坐标齐备、
+`inject` 声明、继承上游执行器。
+
+**反向验证 3/4 → 修好 → 4/4**：初版用裸短语 `extends LocalBashExecutor` 做锚点，
+**注释里提到该短语即算命中** → 「真实继承被改掉」时漏检；改锚定类声明后正确拦下。
+
 ## 四、后续重构排期建议（未落地）
 
 1. **P2**：`BridgeOverlayManager.kt`（1287 行）按「窗口管理/状态机/交互」三块拆分——参考项目 OverlayService(712)/OverlayPanel(837)/OverlayController 分层值得照抄。
@@ -536,3 +616,16 @@ turn/end kind 覆盖 schema / **运行时驱动状态机** / 插件单测。
 - `.github/workflows/ci.yml`（接入插件契约门禁）
 
 
+### review-r9（bash 执行世界专项：借鉴 dsh-shell-termux）
+- `app/src/main/assets/extra-plugins/dsh-shell-termux/`（**新增内置插件**）
+  - `lib/index.js`（`TermuxBashExecutor extends LocalBashExecutor`：显式环境注入 +
+    `sandboxMode=undefined` 诚实声明 + `checkBashExecutable` X_OK fail-loudly +
+    `probeWorld` 结构化探测）
+  - `cordis.patch.yml`（条件化 `bash-sandbox: disabled` + insert 本插件，双平台限定）
+  - `package.json`（peerDeps 范围声明，不硬编码版本）
+  - `test/shell-termux.test.mjs`（**新增**，21 用例）
+- `app/src/main/assets/install-dsh.mjs`（BUILTIN_PLUGINS / BUILTIN_NAMES / BUILTIN_IDS 三处登记）
+- `app/src/main/java/com/dsh/launcher/ui/PluginManagerActivity.kt`（BUNDLED + BUNDLED_DESC 登记）
+- `tools/check-plugin-contract.cjs`（**新增 §H 装配契约检查**：disable/insert 成对、
+  平台限定、三坐标齐备、inject 声明、继承锚定类声明）
+- `docs/AGENTS/gotchas.md`（新增 §14）、`docs/comparison-with-mobile-apk.md`（本节）

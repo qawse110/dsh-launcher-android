@@ -78,6 +78,12 @@ export OPENSSL_CONF=/dev/null
   （实测三缺陷：高频 chunk 冲刷语义事件、aborted 误报「任务完成」、chunk 类型死分支）。
   改任一方契约面后必跑 `check-plugin-contract.cjs`；
   **定义了却不使用的契约等于没有契约**（白名单/映射表须断言使用点存在）。
+- **坑 14**（★最严重）：**Android 上桌面沙箱执行器 fail-closed**——
+  `dsh-sandbox-local` 的 `PLATFORM_CHAINS` **无 android** → 空链条 →
+  `SandboxUnavailableError`；而 dsh-base 会话默认档位是 `workspace-write`
+  → **默认档位下 bash 工具不可用**。本机因历史会话恰好都是 `danger-full-access`
+  而侥幸可用（该模式不走 confine）。解法见内置插件 `dsh-shell-termux`
+  （disable `bash-sandbox` + 自建 `ctx.shell` provider）。详见 gotchas §14。
 
 ## 4. 详档路由表
 
@@ -106,6 +112,7 @@ export OPENSSL_CONF=/dev/null
 | `core/BackupManager.kt` | 备份/恢复（zip + manifest，KEEP_MAX=5） |
 | `assets/stub-dsh.mjs` | dsh 启动期补丁 stub（载荷见 `assets/patched/`） |
 | `assets/install-dsh.mjs` | 官方 npm 安装 dsh + 内置插件装配 |
+| `assets/extra-plugins/dsh-shell-termux/` | **Android 原生 bash 执行器**（替换会在 Android fail-closed 的桌面沙箱执行器；见坑 14） |
 | `tools/*.cjs` | 门禁与一次性迁移/验证工具 |
 
 ## 6. 维护约定（硬约束）
@@ -138,3 +145,11 @@ export OPENSSL_CONF=/dev/null
 14. **跨项目借鉴须复核字段名**：参考项目的注释可能与其实现在细节上不一致
     （如它读 `turn/end.outcome`，而本机 schema 只有 `reason`）。借鉴前对着
     **本机 dsh 的 `types.d.ts`** 核一遍字段名与联合类型取值。
+15. **执行世界坐标靠显式注入**：不要让子进程依赖「进程环境恰好正确」——
+    dsh 默认执行器 spawn 裸 `"bash"`，子进程环境 = `scrubbedParentEnv()` ⊕ spawn env，
+    缺 `LD_LIBRARY_PATH` 时 Termux 二进制直接 `CANNOT LINK`（实测）。
+    改 `dsh-shell-termux` 的 `buildTermuxEnv` 时**必须保留继承段兜底**
+    （否则注入的 PATH 会覆盖父 PATH、丢掉引擎自带 `node/bin`）。见坑 14。
+16. **改 `ctx.shell` 装配面须跑装配门禁**：`dsh-shell-termux` 以唯一 provider 身份
+    替换默认执行器，写错的后果是「bash 整体不可用」（比原缺陷更糟）。
+    任何 disable/insert/坐标/继承改动后跑 `check-plugin-contract.cjs` 的 §H。

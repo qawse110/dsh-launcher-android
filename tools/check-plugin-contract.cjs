@@ -334,12 +334,66 @@ function checkPluginTests() {
   }
 }
 
+// ── H. dsh-shell-termux：装配契约（替换 shell provider，错配会让 bash 完全不可用） ──
+/**
+ * 本插件的装配比普通插件危险得多：它以 `ctx.shell` 的**唯一 provider** 身份
+ * 替换 dsh 默认执行器。装配写错有两种致命后果：
+ *   - 没 disable `bash-sandbox` → 两个 provider 抢同一单例服务 → 装载冲突；
+ *   - disable 了但插入项因 `disabled` 条件/配置缺失而未生效 → **没有任何 provider**，
+ *     bash 工具整体不可用（比原缺陷更糟）。
+ * 故这里做静态核对：patch 必须同时含 disable 行与 insert 行，且 insert 带必需的
+ * 坐标配置；插件必须 `inject: ['subprocess']`（继承上游执行器的服务依赖）。
+ */
+function checkShellTermuxContract() {
+  const dir = join(ROOT, 'app/src/main/assets/extra-plugins/dsh-shell-termux')
+  const patch = join(dir, 'cordis.patch.yml')
+  const js = join(dir, 'lib/index.js')
+  if (!existsSync(patch) || !existsSync(js)) {
+    fail('dsh-shell-termux 缺少 cordis.patch.yml 或 lib/index.js')
+    return
+  }
+  const yml = readFileSync(patch, 'utf8')
+  const src = readFileSync(js, 'utf8')
+
+  // ① 必须禁用桌面沙箱执行器（否则与其争抢 ctx.shell 单例）
+  if (!/- id: bash-sandbox[\s\S]*?disabled:/.test(yml)) {
+    fail('cordis.patch.yml 未禁用 bash-sandbox → 与 Termux 执行器争抢 ctx.shell 单例服务')
+  }
+  // ② 必须插入本插件
+  if (!/name: '@dsh-external\/dsh-shell-termux'/.test(yml)) {
+    fail('cordis.patch.yml 未插入 @dsh-external/dsh-shell-termux')
+  }
+  // ③ 两者都必须限定 android（桌面平台保留真实沙箱）
+  const disabledLines = [...yml.matchAll(/disabled:\s*(.+)/g)].map((m) => m[1].trim())
+  if (disabledLines.length < 2 || !disabledLines.every((l) => /process\.platform/.test(l))) {
+    fail('patch 的 disabled 条件必须都基于 process.platform（避免桌面平台也替换掉可用沙箱）')
+  }
+  // ④ 插入项必须带三个绝对坐标（缺失会让 assertAbsolutePaths 抛错 → 无 provider）
+  for (const key of ['bashPath', 'prefix', 'home']) {
+    if (!new RegExp(`^\\s*${key}:`, 'm').test(yml)) {
+      fail(`cordis.patch.yml 的 shell-termux 配置缺 ${key} → assertAbsolutePaths 会抛错，导致 ctx.shell 无 provider`)
+    }
+  }
+  // ⑤ 插件必须声明 subprocess 注入（继承执行器的服务依赖）
+  if (!/export const inject = \['subprocess'\]/.test(src)) {
+    fail("插件未声明 inject = ['subprocess'] → 上游执行器拿不到 subprocess 服务")
+  }
+  // ⑥ 必须继承上游执行器而非自行实现 shell 服务。
+  //    锚定到**类声明**而非裸短语：注释里提到 `extends LocalBashExecutor` 也算命中，
+  //    会让本项在真实继承被改掉后依然通过（反向验证实测漏检过一次）。
+  if (!/export class \w+ extends LocalBashExecutor\b/.test(src)) {
+    fail('插件未继承 LocalBashExecutor —— 自行实现会丢掉超时/输出上限/进程组终止等已有语义')
+  }
+  note('shell-termux 装配契约：disable bash-sandbox + insert 本插件 + 三坐标齐备 + inject/继承 均正确')
+}
+
 checkSyntax()
 checkEventContract()
 checkChunkTypes()
 checkTurnEndKinds()
 checkRuntime()
 checkPluginTests()
+checkShellTermuxContract()
 
 console.log('')
 for (const n of notes) console.log('  · ' + n)

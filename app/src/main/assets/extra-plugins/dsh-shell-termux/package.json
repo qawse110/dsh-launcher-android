@@ -1,0 +1,25 @@
+{
+  "name": "@dsh-external/dsh-shell-termux",
+  "version": "0.1.0",
+  "description": "Android/Termux native provider for the bash capability seam: explicit per-spawn Termux environment injection, honest app-domain sandbox declaration (partial enforcement), executable-not-just-present bash probe — replaces the desktop sandbox executor whose platform chain has no android entry and therefore fails closed.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-bash-local": ">=0.1.0-rc.6 <0.2",
+    "@deepseek-ai/cordis": ">=4.0.0 <5"
+  },
+  "license": "MIT"
+}

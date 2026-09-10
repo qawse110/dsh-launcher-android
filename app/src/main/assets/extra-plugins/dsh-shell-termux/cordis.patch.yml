@@ -1,0 +1,41 @@
+# dsh-shell-termux bundle 层：Android 原生 bash 执行器。
+#
+# ## 为什么必须 disable bash-sandbox
+#
+# `ctx.shell` 是 cordis 单例服务（一个 provider）。dsh-base 默认装配
+# `@deepseek-ai/dsh-bash-sandbox`，它在 workspace-write / read-only 下把命令交给
+# `ctx.sandbox.confine()` 包装；而 `@deepseek-ai/dsh-sandbox-local` 的平台链条
+#   PLATFORM_CHAINS = { linux:[bwrap,landlock], darwin:[seatbelt], win32:[windows-acl] }
+# **没有 android** → chainVerdict() 返回 "unavailable" → selectRunner() 抛
+# SandboxUnavailableError（fail-closed 拒绝执行）。而 dsh-base 的会话默认档位是
+# workspace-write，即「默认档位下 Android 的 bash 工具不可用」。
+# 详见 lib/index.js 顶部注释与 docs/AGENTS/gotchas.md §14。
+#
+# ## 为什么只有 android 才替换
+#
+# 桌面（linux/darwin/win32）的沙箱链条是可用的，替换会丢掉真实的路径级约束。
+# 故用 !!js 表达平台条件：非 android 时本条不生效，bash-sandbox 保持启用。
+#
+# ## 配置坐标来自引擎进程环境
+#
+# PREFIX / HOME 由壳侧 TermuxEnv.webProcessExports 注入到 dsh web 进程
+# （见 core/TermuxEnv.kt），因此这里可直接引用，无需硬编码设备路径。
+# bashPath 取 $PREFIX/bin/bash。
+
+# 安卓：禁用桌面沙箱执行器（其链条在 android 无可用 runner，会 fail-closed）
+- id: bash-sandbox
+  disabled: !!js process.platform === 'android'
+
+# 安卓：插入 Termux 原生执行器，独占提供 ctx.shell
+- insert:
+    - id: shell-termux
+      name: '@dsh-external/dsh-shell-termux'
+      disabled: !!js process.platform !== 'android'
+      config:
+        bashPath: !!js `${process.env.PREFIX ?? ''}/bin/bash`
+        prefix: !!js process.env.PREFIX ?? ''
+        home: !!js process.env.HOME ?? ''
+        cwd: !!js process.env.HOME ?? ''
+        # 预算与 dsh-base 的 bash-sandbox 保持一致（120s / 600s 上限）
+        timeoutMs: 120000
+        maxTimeoutMs: 600000

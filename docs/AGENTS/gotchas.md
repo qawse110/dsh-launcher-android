@@ -462,3 +462,107 @@ if (SystemClock.uptimeMillis() - lastSpokeAt < 4000L) return   // 被挡掉的�
 参考项目每个插件都有 `test/*.test.mjs`（`node:test` + `assert/strict`，零依赖），
 本项目此前**一个插件单测都没有**。已为 `dsh-status-bridge` 补 17 个用例，
 覆盖上述三个缺陷 + 工具配对 + 健壮性（未知事件/畸形事件/lastText 有界）。
+
+---
+
+## 14. ★ Android 上桌面沙箱执行器 fail-closed：默认档位下 bash 工具不可用（review-r9）
+
+**本轮最严重发现**——由「读参考项目 dsh-shell-termux」引出，实读源码 + 本机 schema 实证。
+
+### 机制（全部源码实证）
+
+dsh-base 默认装配的 bash 执行器是 `@deepseek-ai/dsh-bash-sandbox`：
+
+```js
+// dsh-bash-sandbox：非 danger-full-access 时把命令交给沙箱包装
+if (mode === "danger-full-access") return { ...await super.run(spec), sandbox:{mode,denied:false} };
+const confined = this.confine(spec.command, {...policy, mode});     // ← 这里
+// confine() 实现：
+confine(command, policy) { return this.ctx.sandbox.confine(["bash","-c",command], policy); }
+```
+
+而 sandbox provider（`dsh-sandbox-local`）的平台链条是：
+
+```js
+const PLATFORM_CHAINS = { linux:["bwrap","landlock"], darwin:["seatbelt"], win32:["windows-acl"] };
+// chainVerdict(): const chain = PLATFORM_CHAINS[platform] ?? []   ← android 落到 []
+//                 if (first === undefined) return "unavailable"
+// selectRunner(): if (this.selectedRunner === "unavailable") throw new SandboxUnavailableError(mode)
+```
+
+本机 `process.platform === 'android'` → **链条为空** → `chainVerdict()` 返回 `"unavailable"`
+→ `selectRunner()` 抛 `SandboxUnavailableError`。
+
+而 dsh-base 的**会话默认档位是 `workspace-write`**
+（`mode: !!js process.env.DSH_PERMISSION_MODE ?? 'workspace-write'`）——
+即：**默认档位下 Android 的 bash 工具会被沙箱 fail-closed 拒绝执行**。
+
+### 为什么一直没暴露
+
+本机所有历史会话档位**恰好都是 `danger-full-access`**（实测 10 个会话全部如此）。
+该模式下 `run()` 直接 `return super.run(spec)`，**不走 confine** → 侥幸可用。
+
+**触发条件**：用户把档位切回默认的 workspace-write、或新会话未显式升档 → bash 工具即不可用。
+这与坑 12 的「靠巧合工作」是同一形态，但后果更重（工具整体不可用）。
+
+### 参考项目的解法（本轮借鉴对象）
+
+参考项目 `kelai141/dsh-shell-termux` 的**整个存在理由**就是这个实证。
+其设计文档原文：
+
+> | `PLATFORM_CHAINS = { linux:[bwrap,landlock], darwin:[seatbelt], win32:[windows-acl] }`——**无 android** | dsh-sandbox-local 源码 |
+> | "A platform with no chain fails closed at `confine()`" | 同上 |
+> | **结论：安卓上 bash 工具实际执行会被沙箱拒绝**（M0 只验证了服务启动，未验证工具执行） | 推理 |
+>
+> 即：**"碰巧能启动" ≠ "工具可用"**。
+
+解法 = **`bash-sandbox` 条目 `disabled` + 插入自己的 `ctx.shell` provider**，
+并**诚实声明**沙箱语义（`enforcement: 'partial'`，真实边界是 SELinux 应用域 + 审批流）。
+
+### 本项目落地
+
+新增内置插件 `app/src/main/assets/extra-plugins/dsh-shell-termux/`：
+
+- `lib/index.js`：`TermuxBashExecutor extends LocalBashExecutor`（复用全部预算/生命周期语义），
+  只做两件增量——① `resolve()` 显式注入 Termux 环境；② `sandboxMode` 返回 `undefined`
+  诚实声明「不做路径级沙箱」。
+- `cordis.patch.yml`：`- id: bash-sandbox / disabled: !!js process.platform === 'android'`
+  + insert 本插件（同样限定 android，桌面保留真实沙箱）。
+- `test/shell-termux.test.mjs`：21 个用例（含我自己引入过的 PATH 继承回归）。
+
+### 显式环境注入的独立价值（实测）
+
+即使绕开沙箱问题，环境注入本身也修掉一个真实缺口——
+dsh 默认执行器 spawn 的是**裸 `"bash"`**，靠继承进程环境解析；而子进程环境
+= `scrubbedParentEnv()` ⊕ spawn env，即**完全依赖 web 进程的 PATH/LD_LIBRARY_PATH 恰好正确**：
+
+```
+# 无显式 Termux 环境时：
+$ git --version
+CANNOT LINK EXECUTABLE "git": library "libpcre2-8.so" not found
+# 注入后：
+$ git --version
+git version 2.55.0
+```
+
+端到端验证（真实 ctx 装载）：**删除进程的 `PATH`/`PREFIX`/`LD_LIBRARY_PATH` 后
+`git --version` 仍正常**——证明注入是自包含的，不再依赖环境碰巧正确。
+
+### 顺带修为
+
+`bash` 可执行性检查：工作区原先只判 `File.isFile`；实测「文件存在但权限 644」时
+判真、执行 `Permission denied` 后以含混错误挂掉。插件改用 `accessSync(X_OK)`
+并给出修复指引（对齐参考实现的 `assertBash`）。
+
+### 装配契约门禁
+
+本插件以 `ctx.shell` **唯一 provider** 身份替换默认执行器，装配写错有两种致命后果：
+① 没 disable `bash-sandbox` → 争抢单例服务；② disable 了但 insert 未生效 →
+**无任何 provider**，bash 整体不可用（比原缺陷更糟）。故
+`tools/check-plugin-contract.cjs` 新增 §H：核对 disable/insert 成对出现、均限定
+`process.platform`、三坐标齐备、`inject` 声明、继承上游执行器。
+
+**反向验证 3/4 → 修好 → 4/4**：初版用裸短语 `extends LocalBashExecutor` 做锚点，
+**注释里提到该短语即算命中**，故「真实继承被改掉」时漏检；改为锚定类声明
+`export class \w+ extends LocalBashExecutor\b` 后正确拦下。
+（又一次印证：**门禁必须见过真实坏输入**，而不是只看构造样例。）
