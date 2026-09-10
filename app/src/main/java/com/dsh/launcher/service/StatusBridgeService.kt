@@ -129,11 +129,14 @@ class StatusBridgeService : Service() {
                     val status = json.optString("status", "idle")
                     val text = json.optString("lastText", "")
                     val event = if (json.has("lastEvent")) json.optString("lastEvent", null) else null
+                    // 插件 0.1.2 起上报当前工具名（tool/call → tool/result 配对）；
+                    // 旧版插件无此字段 → 保持 null，statusLabel 回退为「调用工具」
+                    val toolName = if (json.has("toolName")) json.optString("toolName", null) else null
                     val updatedAt = json.optLong("updatedAt", 0L)
                     val prev = lastStatus
                     lastStatus = status
                     mainHandler.post {
-                        updateOverlay(status, text, event)
+                        updateOverlay(status, text, event, toolName)
                         updateForeground(status, text)
                         writeHeartbeat(status, text)
                     }
@@ -223,12 +226,12 @@ class StatusBridgeService : Service() {
 
     // ---------------- 悬浮窗 ----------------
 
-    private fun updateOverlay(status: String, text: String, event: String?) {
+    private fun updateOverlay(status: String, text: String, event: String?, toolName: String? = null) {
         if (!overlayEnabled() || !Settings.canDrawOverlays(this)) {
             overlayManager?.remove()
             return
         }
-        overlayManager?.update(status, text, event)
+        overlayManager?.update(status, text, event, toolName)
     }
 
     // ---------------- 通知 ----------------

@@ -36,6 +36,7 @@
 | `node tools/check-asset-scripts.cjs` | assets 脚本语法 + 补丁载荷完整性 | ✅ | ✅ |
 | `node tools/check-asset-abi.cjs` | 内置 node 归档 ELF 架构 vs 文件名声明 | ✅（LFS 未拉时 SKIP） | ✅ |
 | `node tools/bracecheck-edited.cjs` | Kotlin 括号平衡 + 注释闭合 + 嵌套扫描 | ✅ | ✅ |
+| `node tools/check-plugin-contract.cjs` | 插件↔壳侧事件契约 + 运行时驱动 + 插件单测 | ✅（dsh 未装时部分 SKIP） | ✅ |
 | `./gradlew :app:assembleDebug` | 编译门禁 | ❌ 无 SDK | ✅ |
 | `./gradlew :app:testDebugUnitTest` | 单测门禁 | ❌ 无 SDK | ✅ |
 
@@ -73,6 +74,10 @@ export OPENSSL_CONF=/dev/null
   且 `Set` 比对令牌集合对「重复」天然失明，**关心出现次数必须用计数**。
 - **坑 12**：「跑得通」不等于「写对了」——现有 3 个缺陷全是「靠巧合工作」形态，
   **没有一个能被 CI 捕获**，只能靠读设备实况与代码假设对账发现。
+- **坑 13**：插件与壳侧的「事件名 ↔ 文案」是**跨边界契约**，无机械校验必漂移
+  （实测三缺陷：高频 chunk 冲刷语义事件、aborted 误报「任务完成」、chunk 类型死分支）。
+  改任一方契约面后必跑 `check-plugin-contract.cjs`；
+  **定义了却不使用的契约等于没有契约**（白名单/映射表须断言使用点存在）。
 
 ## 4. 详档路由表
 
@@ -126,3 +131,10 @@ export OPENSSL_CONF=/dev/null
 12. **环境类改动须读设备实况**：路径存在性、时间戳语义、符号链接指向等前提，
     必须用 `readlink`/`stat`/`strings` 在真机核对后再改——坑 12 的 3 个缺陷
     无一能被 CI 捕获。
+13. **插件契约面**：改 `extra-plugins/*/lib` 的事件名/状态值，或改壳侧
+    `StatusOverlay.statusLabel` / `PetSpeaker` / `PetOverlayView` 的对应分支，
+    **必须同步另一方**并跑 `check-plugin-contract.cjs`。插件须导出 `__testing` 面
+    （门禁靠它做运行时驱动），新增状态机分支须补 `test/*.test.mjs`。见坑 13。
+14. **跨项目借鉴须复核字段名**：参考项目的注释可能与其实现在细节上不一致
+    （如它读 `turn/end.outcome`，而本机 schema 只有 `reason`）。借鉴前对着
+    **本机 dsh 的 `types.d.ts`** 核一遍字段名与联合类型取值。

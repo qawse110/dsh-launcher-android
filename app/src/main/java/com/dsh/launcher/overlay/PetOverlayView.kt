@@ -62,6 +62,10 @@ class PetOverlayView(context: Context, private val atlas: CodexPetAtlas) : View(
             status == "failed" || event == "error" || event?.contains("fail", true) == true ->
                 ROW_FAILED
             status == "finished" -> ROW_JUMPING
+            // aborted / blocked 是插件 turn/end 的另两个终态（不再并成 finished）：
+            // 都落到 else 会显示 ROW_IDLE，与「空闲」混淆；这里复用 WAITING 表示
+            // 「已停下、等人」，与真正空闲区分开。
+            status == "aborted" || status == "blocked" -> ROW_WAITING
             status == "running" -> when (event) {
                 "tool/call" -> ROW_RUNNING
                 "assistant/message" -> ROW_WAITING

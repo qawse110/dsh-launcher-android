@@ -377,6 +377,59 @@ shebang 从未被内核读取。改成 `./dsh-web.sh` 就会立刻失败。
 而不是等用户报障。这 3 个缺陷**没有一个是 CI 能抓到的**——正说明静态门禁与真机核对
 各有职责边界，二者不可互替。
 
+## 三点十二、内置插件专项对比与优化（review-r8）
+
+### 两项目插件形态对照
+
+| 维度 | 本项目 `extra-plugins/` | 参考项目 `plugins/` + `vendor/` |
+|---|---|---|
+| 数量 | 3（status-bridge / android-links / llm-codebuddy） | 5 plugins + 3 vendor |
+| 源码形态 | 纯 JS（`lib/*.js` 直接入库） | TypeScript 源码 + `tsc` 构建 |
+| 客户端面 | 仅 codebuddy 有 `dsh.client` | 多数有 `src/client/*.tsx` |
+| **插件单测** | **0 个**（本轮前） | **每个插件都有** `test/*.test.mjs` |
+| 事件桥方向 | HTTP `/status` + 壳侧轮询 | ndjson 文件 + 壳侧 `FileObserver` |
+
+**结论**：形态差异属工程取舍，不改架构；但**「插件单测」这一项参考项目明显更成熟**，
+已本轮补齐。事件桥方向（HTTP 轮询 vs ndjson tail）不采纳——本项目的
+`PowerGovernor` 已实现按屏幕/任务态自适应 1s~30s 轮询，改造成本与收益不成正比。
+
+### 挖出的三个插件缺陷（详见 `docs/AGENTS/gotchas.md` §13）
+
+1. **`lastEvent` 无条件透传** → 高频 `assistant/chunk` 冲刷语义事件，壳侧文案降级为
+   「dsh 运行中」。修复：`SEMANTIC_EVENTS` 白名单。
+2. **`turn/end` 非 error 一律 finished** → 用户取消任务也弹「任务完成」通知 + TTS。
+   修复：`TURN_END_STATUS` 显式映射，**只有 completed → finished**（schema 有六种 kind）。
+3. **`chunk.type === 'block'` 死分支**（真实取值 `block-end`）→ 块式输出文本漏累积。
+
+另发现**壳侧**缺陷：`PetSpeaker` 把 `lastSpokenKey` 写在 4s 节流检查**之前**，
+被节流的事件永久消费掉键 → **每轮 4 秒内结束的对话都丢失「任务完成」台词**。
+
+### 参考项目自身也有缺陷（不可盲抄）
+
+其 `turn/end` 处理读 `d?.outcome === 'success'`，而**本机 schema 里没有 `outcome`
+字段**（只有 `reason: { kind }`）→ `ok` 恒为 false。其注释写明的「被打断不弹」
+意图正确，但实现读错了字段名。**跨项目借鉴必须对本机 schema 复核字段名。**
+
+### 新增门禁 `tools/check-plugin-contract.cjs`（7 项）
+
+语法 / 事件白名单↔壳侧分支 / 状态集合↔终态文案 / chunk 类型真实性 /
+turn/end kind 覆盖 schema / **运行时驱动状态机** / 插件单测。
+
+**反向验证**：静态 7/7、运行时 3/3、单测 3/3 全部拦下，恢复后通过。
+其中「运行时驱动」是**被我自己犯的错逼出来的**——把 turn/end 重构成映射表时误删
+`const kind` 声明，`A~E` 静态检查**全部通过**，真机执行却抛
+`ReferenceError: kind is not defined`（且被 apply 的 try/catch 吞掉，表现只是
+状态永远停在 running）。**静态检查看不见作用域错误，必须真跑一遍。**
+
+**元教训**：初版门禁只校验「契约元素**存在**且覆盖 schema」，于是把
+`SEMANTIC_EVENTS.has(type)` 改回无条件透传、映射表换成 if/else 兜底——**门禁全绿、
+两个真实缺陷双双漏检**。**定义了却不使用的契约等于没有契约**，须断言使用点存在。
+
+### 新增插件单测（对齐参考项目约定）
+
+`app/src/main/assets/extra-plugins/dsh-status-bridge/test/status-bridge.test.mjs`，
+17 个用例，`node:test` + `assert/strict` 零依赖。覆盖三个缺陷 + 工具配对 + 健壮性。
+
 ## 四、后续重构排期建议（未落地）
 
 1. **P2**：`BridgeOverlayManager.kt`（1287 行）按「窗口管理/状态机/交互」三块拆分——参考项目 OverlayService(712)/OverlayPanel(837)/OverlayController 分层值得照抄。
@@ -463,4 +516,23 @@ shebang 从未被内核读取。改成 `./dsh-web.sh` 就会立刻失败。
   Set 判据、shebang 断言、前缀等长断言、渲染端到端无杂散行）
 - `app/src/test/java/com/dsh/launcher/core/PrefixPatcherTest.kt`（**归档 mtime 陈旧但
   ctime 新**回归 + shouldProcess 边界）
+
+### review-r8（内置插件对比与优化）
+- `app/src/main/assets/extra-plugins/dsh-status-bridge/lib/index.js`（**SEMANTIC_EVENTS
+  语义白名单**、**TURN_END_STATUS 显式映射**、工具活动字段 toolName/toolArgs/lastTool、
+  chunk 死分支 `block`→`block-end`、`__testing` 导出面；版本 0.1.1→0.1.2）
+- `app/src/main/assets/extra-plugins/dsh-status-bridge/test/status-bridge.test.mjs`（**新增**，
+  17 个 `node:test` 用例——本项目首个插件单测，对齐参考项目约定）
+- `app/src/main/java/com/dsh/launcher/overlay/StatusOverlay.kt`（`toolName` 参数、
+  `aborted`/`blocked` 终态文案、`tool/result` 文案）
+- `app/src/main/java/com/dsh/launcher/overlay/PetSpeaker.kt`（**键记录下沉到各分支**，
+  修复被节流事件永久消费键导致台词丢失）
+- `app/src/main/java/com/dsh/launcher/overlay/PetOverlayView.kt`（aborted/blocked → ROW_WAITING）
+- `app/src/main/java/com/dsh/launcher/overlay/BridgeOverlayManager.kt`（`lastToolName` 字段贯通）
+- `app/src/main/java/com/dsh/launcher/service/StatusBridgeService.kt`（解析 `toolName` 并透传）
+- `app/src/main/java/com/dsh/launcher/service/KeepAliveAccessibilityService.kt`（同上，a11y 通道）
+- `tools/check-plugin-contract.cjs`（**新增**，7 项契约门禁：语法/事件白名单/状态集合/
+  chunk 类型/turn-end 覆盖/运行时驱动/插件单测）
+- `.github/workflows/ci.yml`（接入插件契约门禁）
+
 

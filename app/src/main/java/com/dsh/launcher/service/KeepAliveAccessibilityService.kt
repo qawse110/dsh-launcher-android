@@ -138,7 +138,7 @@ class KeepAliveAccessibilityService : AccessibilityService() {
                         data.updatedAt > lastFinishedAt
                     if (finished) lastFinishedAt = data.updatedAt
                     mainHandler.post {
-                        overlayManager?.update(data.status, data.text, data.event)
+                        overlayManager?.update(data.status, data.text, data.event, data.toolName)
                         if (finished) StatusBridgeAlerts.onAiFinished(this, data.text)
                     }
                     try {
@@ -223,7 +223,9 @@ class KeepAliveAccessibilityService : AccessibilityService() {
                     status = obj.optString("status", "idle"),
                     text = obj.optString("lastText", ""),
                     event = if (obj.has("lastEvent")) obj.optString("lastEvent", null) else null,
-                    updatedAt = obj.optLong("updatedAt", 0L)
+                    updatedAt = obj.optLong("updatedAt", 0L),
+                    // 插件 0.1.2 起上报工具名；旧插件无此字段 → null，回退「调用工具」
+                    toolName = if (obj.has("toolName")) obj.optString("toolName", null) else null
                 )
             } finally {
                 conn.disconnect()
@@ -237,7 +239,8 @@ class KeepAliveAccessibilityService : AccessibilityService() {
         val status: String,
         val text: String,
         val event: String?,
-        val updatedAt: Long
+        val updatedAt: Long,
+        val toolName: String? = null
     )
 
     companion object {

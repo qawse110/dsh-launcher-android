@@ -362,3 +362,103 @@ bash 报 `Is a directory`（exit=126）。**脚本没有 `set -e`，失败后继
 本轮的三个缺陷全部由「读设备实况 + 与代码假设对账」发现，**没有一个是 CI 能抓到的**
 ——这正说明静态门禁与真机核对的职责边界。
 
+
+---
+
+## 13. 插件 ↔ 壳侧的事件契约没人守：三个真实缺陷（review-r8）
+
+内置插件 `dsh-status-bridge` 把 dsh 的 session 事件转成壳侧悬浮窗/桌宠的输入。
+「事件名 ↔ 文案/行为」是**跨边界契约**，但此前**没有任何机械校验**。
+逐条读插件 + 读 dsh 权威 schema + 仿真壳侧逻辑后，挖出三个真实缺陷：
+
+### 13.1 `lastEvent` 无条件透传 → 高频 chunk 冲刷掉语义事件
+
+插件原实现 `state.lastEvent = event.type`，而 `assistant/chunk` 是 **token 级高频**
+事件（每个流式片段一次）。壳侧以 1s 轮询取 `/status`，于是流式阶段 lastEvent
+恒为 `assistant/chunk`——而壳侧三个消费方（`StatusOverlay.statusLabel` /
+`PetSpeaker.speakForStatus` / `PetOverlayView.actionRowFor`）**都没有该分支**，
+全部落到退化 else：一轮对话中占比最大的流式阶段，文案从「思考中」退化为「dsh 运行中」。
+
+**修复**：引入 `SEMANTIC_EVENTS` 白名单，只有语义事件才改写 `lastEvent`；
+高频 chunk 仅累积 `lastText`（流式朗读照旧）。
+
+> **归因纠错（重要）**：我最初把「PetSpeaker 的『正在调用工具』台词被吞」也归因于
+> 这里，**仿真证明是错的**——真实根因在**壳侧**（见 13.4）。
+
+### 13.2 `turn/end` 的 aborted/blocked 被当成 finished → 误报「任务完成」
+
+权威 schema（本机 `dsh-session` 的 `TurnEndReasonMap`）里 `reason.kind` 有**六种**：
+`completed | aborted | blocked | error | interrupted | max-tokens`。
+插件原实现只判 `error`，其余**一律** `finished`。壳侧 `StatusBridgeService` 在
+`prev == "running" && status == "finished"` 时弹「任务完成」通知 + TTS
+「任务完成，太棒了！」——于是**用户主动取消任务（aborted）也会收到完成祝贺**。
+
+**修复**：改用**显式映射表** `TURN_END_STATUS`，**只有 `completed` → finished**；
+`aborted`/`blocked` → 同名独立终态；`interrupted`/`max-tokens` → `aborted`（未完成）。
+壳侧 `statusLabel` 补「已取消」「已阻塞」文案。
+
+> **参考项目自身也有此缺陷，不可盲抄**：其注释写明「assistant/message.interrupted
+> （被打断不弹）」，但其代码读的是 `turn/end.outcome` —— **schema 里根本没有
+> `outcome` 字段**（只有 `reason`），故 `ok: d?.outcome === 'success'` 恒为 false。
+> 教训：跨项目借鉴时，**必须对着本机 schema 复核字段名**，不能只读注释。
+
+### 13.3 `chunk.type === 'block'` 是死分支（真实取值 `block-end`）
+
+真实 `StreamChunk` 联合类型（本机 `dsh-llm` types）为：
+`block-start | text-delta | reasoning-delta | tool-call-delta | block-end | usage | finish`。
+插件判定的 `'block'` 不在其中 → 该分支永不命中，块式输出的文本整段漏累积。
+
+### 13.4 壳侧 `PetSpeaker`：键记录写在节流检查之前 → 台词被永久消费
+
+```kotlin
+val key = "$status|${event ?: ""}"
+if (key == lastSpokenKey) return
+lastSpokenKey = key                    // ← 在节流检查**之前**
+if (SystemClock.uptimeMillis() - lastSpokeAt < 4000L) return   // 被挡掉的事件已消费掉键
+```
+
+被 4s 节流挡掉的语义事件会**永久消费掉自己的键**，此后每轮轮询都被去重直接
+`return`，台词再也不播。仿真实测（复刻壳侧轮询逻辑）：
+
+| 场景 | 修复前 | 修复后 |
+|---|---|---|
+| 快轮次（turn/start@0 → 完成@2s） | 只播「收到新任务」，「任务完成」**永久丢失** | 节流窗一过即补播 |
+| 慢工具（tool/call 持续 >4s） | 永不播「调用工具」 | 正常播报 |
+| 工具执行中（isSpeakingActive） | 记键后 return → 播完也不补 | 不记键，播完后补播 |
+
+**该缺陷对每一轮 4 秒内结束的对话都生效**，属高频路径。
+**修复**：键记录下沉到各分支内（未播报 = 未处理）。
+
+### 13.5 新增门禁：`tools/check-plugin-contract.cjs`（7 项检查）
+
+| # | 检查 | 抓什么 |
+|---|---|---|
+| A | 插件脚本 `node --check` | 语法（assets 门禁只管 assets/，不管 extra-plugins/） |
+| B | 语义事件白名单 ↔ 壳侧 statusLabel 分支 | 契约漂移（两边事件名对不上） |
+| C | 插件产出 status ↔ 壳侧终态文案 | 新增终态漏文案（显示成「dsh 空闲」） |
+| D | `chunk.type` 必须存在于真实 StreamChunk 联合 | 死分支 |
+| E | `TURN_END_STATUS` 必须覆盖 schema 全部 kind | schema 新增终态漏配 → 误报完成 |
+| F | **运行时驱动**状态机（全 kind + 未知事件） | 静态看不见的作用域/引用错误 |
+| G | 插件自带 `node:test` 单测 | 状态机语义写错 |
+
+**F 项为何必须有**（我亲身踩到）：把 turn/end 重构成映射表时，编辑操作意外删掉了
+`const kind = ...` 声明，留下 `TURN_END_STATUS[kind]` 引用未定义变量。
+**静态检查（A~E）全部通过**，但真机执行 `turn/end` 直接抛
+`ReferenceError: kind is not defined`——而该异常会被 `apply()` 的 try/catch 吞掉，
+表现只是「状态永远停在 running」。**只有真跑一遍才能发现。**
+
+**反向验证（门禁必须见过它失败）**：
+- 静态缺陷 7/7 拦下（含我真实犯过的两个：白名单定义未使用、映射表定义未使用）；
+- 运行时缺陷 3/3 拦下（含上面那个 ReferenceError）；
+- 单测缺陷 3/3 拦下；三者恢复原状后均通过。
+
+**元教训**：初版门禁只校验「契约元素**存在**且覆盖 schema」，于是把
+`SEMANTIC_EVENTS.has(type)` 改回无条件透传、把映射表换成 if/else 兜底——
+**门禁全绿、两个真实缺陷双双漏检**。**定义了却不使用的契约等于没有契约**，
+必须断言使用点（`SEMANTIC_EVENTS.has(`、`TURN_END_STATUS[`）真实存在。
+
+### 13.6 顺带：新增 `test/` 单测（对齐参考项目约定）
+
+参考项目每个插件都有 `test/*.test.mjs`（`node:test` + `assert/strict`，零依赖），
+本项目此前**一个插件单测都没有**。已为 `dsh-status-bridge` 补 17 个用例，
+覆盖上述三个缺陷 + 工具配对 + 健壮性（未知事件/畸形事件/lastText 有界）。

@@ -151,6 +151,8 @@ class BridgeOverlayManager(
     private var lastStatus: String? = null
     private var lastText: String? = null
     private var lastEvent: String? = null
+    /** 当前工具名（插件 tool/call 上报）；随 update() 更新，供窗口标题细化展示。 */
+    private var lastToolName: String? = null
 
     private var dragStartX = 0
     private var dragStartY = 0
@@ -269,10 +271,11 @@ class BridgeOverlayManager(
         const val ATLAS_RETRY_BACKOFF_MS = 30_000L
     }
 
-    fun update(status: String, text: String, event: String? = null) {
+    fun update(status: String, text: String, event: String? = null, toolName: String? = null) {
         lastStatus = status
         lastText = text
         lastEvent = event
+        lastToolName = toolName
         if (!overlayEnabled()) {
             remove()
             return
@@ -387,7 +390,8 @@ class BridgeOverlayManager(
             text,
             bp.showStatus(),
             bp.showLastText(),
-            full
+            full,
+            lastToolName
         )
         tv.isSingleLine = !full
         tv.maxLines = if (full) 3 else 1
@@ -610,7 +614,7 @@ class BridgeOverlayManager(
 
     private fun buildPetBubbleText(status: String, text: String, event: String?, name: String): String {
         val namePart = if (bp.showPetName()) name else ""
-        val label = if (bp.showStatus()) statusLabel(status, event) else ""
+        val label = if (bp.showStatus()) statusLabel(status, event, lastToolName) else ""
         val snippet = if (bp.showLastText() && text.isNotBlank()) text.take(40) else ""
         return listOf(namePart, label, snippet).filter { it.isNotBlank() }.joinToString(" · ")
     }

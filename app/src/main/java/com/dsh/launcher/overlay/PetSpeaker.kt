@@ -59,9 +59,19 @@ internal class PetSpeaker(
     fun speakForStatus(status: String, event: String?) {
         val key = "$status|${event ?: ""}"
         if (key == lastSpokenKey) return
-        lastSpokenKey = key
+        // 注意：lastSpokenKey 只能在**真正播报之后**记录（原先写在节流检查之前）。
+        // 写在前面时，被 4s 节流挡掉的事件会**永久消费掉自己的键**——此后同一事件
+        // 每轮轮询都被去重直接 return，台词再也不会播出。
+        //
+        // 真机实证（2026-09-10，仿真复刻壳侧轮询逻辑）：
+        //   快轮次（turn/start@0 → 完成@2s，落在节流窗内）修复前只播「收到新任务」，
+        //   「任务完成」永久丢失；修复后节流窗一过即补播。
+        //   慢工具（tool/call 持续 >4s）修复前永不播「调用工具」，修复后可正常播。
+        //   → 该缺陷对**每一轮 4 秒内结束的对话**都生效，属高频路径。
+        // 修复 = 键记录下沉到各自分支内（未播报 = 未处理，下次轮询仍可补播）。
         if (status == "failed") {
             // 错误最高优先级：不等节流，只打断当前这一句，保留尚未播出的排队内容
+            lastSpokenKey = key
             lastSpokeAt = SystemClock.uptimeMillis()
             speak("出错了，快打开 Web 看看吧", EdgeTts.Mode.INTERRUPT)
             return
@@ -69,16 +79,21 @@ internal class PetSpeaker(
         if (SystemClock.uptimeMillis() - lastSpokeAt < 4000L) return
         when {
             status == "finished" -> {
+                lastSpokenKey = key
                 lastSpokeAt = SystemClock.uptimeMillis()
                 speak("任务完成，太棒了！", EdgeTts.Mode.APPEND) // 与正文同级：排队接续
             }
             status == "running" && event == "turn/start" -> {
+                lastSpokenKey = key
                 lastSpokeAt = SystemClock.uptimeMillis()
                 speak("收到新任务，开始干活！", EdgeTts.Mode.FLUSH) // 遗留队列作废
             }
             status == "running" && event == "tool/call" -> {
-                // 最低优先级：有内容在播/排队就不读（key 已记录，本轮事件内不重试）
+                // 最低优先级：有内容在播/排队就不读。
+                // 同样**不**在这里记键——未播报就不算处理过，下次轮询若仍在播则继续让路，
+                // 播完后的下一次轮询即可补播（旧写法记键后再 return 会永久丢失）。
                 if (isSpeakingActive()) return
+                lastSpokenKey = key
                 lastSpokeAt = SystemClock.uptimeMillis()
                 speak("正在调用工具，稍等一下", EdgeTts.Mode.APPEND)
             }

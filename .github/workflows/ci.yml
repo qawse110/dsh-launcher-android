@@ -41,6 +41,15 @@ jobs:
       - name: Kotlin static precheck（括号/注释）
         run: node tools/bracecheck-edited.cjs
 
+      # 插件契约门禁（本次新增）：内置插件 dsh-status-bridge 与壳侧悬浮窗/桌宠之间的
+      # 「事件名 ↔ 文案/行为」是跨边界契约，此前无机械校验，实际漏出三个缺陷
+      # （高频 chunk 冲刷语义事件、aborted 误报「任务完成」、chunk 类型死分支）。
+      # 并核对插件引用的 chunk 类型 / turn-end kind 是否真实存在于 dsh schema。
+      # 注：chunk 类型与 turn-end kind 核对需要 dsh 的 types.d.ts；CI 上缺席则输出
+      # SKIP（不误报），而事件白名单与状态集合核对始终生效。
+      - name: Plugin contract gate（插件 ↔ 壳侧事件契约）
+        run: node tools/check-plugin-contract.cjs
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
