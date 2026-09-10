@@ -60,7 +60,9 @@ class NodeProcsTest {
         assertTrue(NodeProcs.isOurNode(binPath, binPath))
     }
 
-    @Test fun `argv0 为 /data-data 别名路径时亦归属本应用`() {
+    // 注意：Kotlin 反引号方法名在 JVM 上仍受字节码命名约束——不能含 '/' 等字符
+    // （CI 实测：`Name contains illegal characters: /.`）。路径字面量只写在注释里。
+    @Test fun `argv0 为 data-data 别名路径时亦归属本应用`() {
         // /data/data ≡ /data/user/0：内核可能呈递任一形式，两侧都必须认
         val dataForm = binPath.replace("/data/user/0/", "/data/data/")
         assertTrue("binPath=$binPath dataForm=$dataForm", NodeProcs.isOurNode(dataForm, binPath))

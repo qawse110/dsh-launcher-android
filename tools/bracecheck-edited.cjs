@@ -137,6 +137,29 @@ function scan(src) {
 
 let fail = 0;
 let checked = 0;
+
+/**
+ * 反引号方法名中的非法字符。
+ *
+ * Kotlin 允许反引号包裹任意标识符，但 JVM 字节码方法名仍受约束——含 `/` 等字符时
+ * 编译期报 `Name contains illegal characters: /.`。本项目 CI 实测踩到：
+ * `fun \`argv0 为 /data-data 别名路径时亦归属本应用\`()`。路径字面量只能写在注释/字符串里。
+ *
+ * 该检查放在本地即可跑，避免为一个字符等一轮 CI。
+ */
+const ILLEGAL_IN_BACKTICK = /[/\\.;:\[\]<>]/;
+
+function findIllegalBacktickNames(src) {
+  const out = [];
+  const re = /fun\s+`([^`]*)`/g;
+  let m;
+  while ((m = re.exec(src))) {
+    const illegal = [...m[1]].filter((c) => ILLEGAL_IN_BACKTICK.test(c));
+    if (illegal.length > 0) out.push({ name: m[1], chars: illegal.join("") });
+  }
+  return out;
+}
+
 for (const f of files) {
   let src;
   try {
@@ -166,6 +189,12 @@ for (const f of files) {
     problems.push(
       `块注释嵌套（深度 ${r.maxDepth}，首个起始行 ${first}）${more}——` +
         `KDoc 正文里误写注释起始符会吞掉后续代码，请改用不触发嵌套的写法`,
+    );
+  }
+  for (const b of findIllegalBacktickNames(src)) {
+    problems.push(
+      `反引号方法名含 JVM 非法字符 ${JSON.stringify(b.chars)}：\`${b.name}\`——` +
+        `Kotlin 允许反引号方法名，但字节码命名禁止这些字符，编译期报 Name contains illegal characters`,
     );
   }
   if (problems.length === 0) {
