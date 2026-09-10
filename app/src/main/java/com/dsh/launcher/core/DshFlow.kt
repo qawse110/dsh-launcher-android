@@ -368,7 +368,7 @@ object DshFlow {
 
     /**
      * 同步「引导期补丁资产」到 files（安装路径与快速启动路径共用）：
-     * - `patched/**`：stub 的补丁载荷（koffi/node-pty/sharp 替身、sharp shim）。
+     * - `patched/` 整目录：stub 的补丁载荷（koffi/node-pty/sharp 替身、sharp shim）。
      *   review-r5 起载荷从 stub 内嵌 base64 抽为真实文件（对齐参考实现
      *   dsh-mobile-apk 的 assets/patched + applyAssetPatch 机制）：可 diff、可评审，
      *   并纳入 CI 语法门禁。必须整目录同步——缺失载荷会让 stub 静默跳过对应补丁。
