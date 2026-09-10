@@ -1,4 +1,4 @@
-#!/data/user/0/com.dsh.launcher/t/usr/bin/bash
+#!/data/user/0/com.dsh.nextapp1/t/usr/bin/bash
 # dsh web 启动脚本 —— 由 DshLauncher 渲染 assets/web-launcher.sh.tpl 生成，勿手改
 # 可用占位符：@EXPORTS@ @HOME@ @NODE_CMD@ @LOG_FILE@
 @EXPORTS@

@@ -40,7 +40,7 @@ import { writeFileSync, existsSync, readdirSync, readFileSync, mkdirSync, unlink
 import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-const HOME = process.env.HOME || '/data/user/0/com.dsh.launcher/files';
+const HOME = process.env.HOME || '/data/user/0/com.dsh.nextapp1/files';
 const NODE = process.env.NODE_DIR || join(HOME, 'node');
 const DSH_PREFIX = process.env.DSH_PREFIX || join(HOME, 'dsh-prefix');
 const PROFILE = process.env.DSH_PROFILE || 'web';

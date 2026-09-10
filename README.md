@@ -6,7 +6,7 @@
 
 **不需要 Termux、不需要外部 Node**；联网仅用于 npm 首次安装与后续更新。
 
-- 包名 `com.dsh.launcher` · 当前版本 **v4.10.2**（versionCode 33）
+- 包名 `com.dsh.nextapp1` · 当前版本 **v4.10.2**（versionCode 33）
 - 架构：AGP 9.0 / Kotlin / Gradle 8.x · minSdk 24 / targetSdk 28 / compileSdk 35
 
 ## 目录
@@ -103,9 +103,9 @@ files/.dsh/profiles/web ──cordis 装配──▶ dsh web @ 127.0.0.1:3080 �
 ```sh
 adb install -r app/build/outputs/apk/release/app-release.apk
 # 触发一键引导（幂等：重复执行会跳过已完成的步骤）
-adb shell am start -n com.dsh.launcher/.ConsoleActivity --ez dsh true
+adb shell am start -n com.dsh.nextapp1/.ConsoleActivity --ez dsh true
 # 等待控制台输出 “OK 4/4 dsh web started (http://127.0.0.1:3080)”
-adb shell am start -n com.dsh.launcher/.MainActivity   # 或直接点应用图标
+adb shell am start -n com.dsh.nextapp1/.MainActivity   # 或直接点应用图标
 ```
 
 - 主界面按钮「打开 Web 界面」进入内嵌 WebView；填写 API Key（设置 → 添加 API Key）后即可对话。

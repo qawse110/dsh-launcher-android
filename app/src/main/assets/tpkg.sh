@@ -12,7 +12,7 @@
 set -u
 
 OLD_PREFIX="/data/data/com.termux"
-PREFIX="${PREFIX:-/data/user/0/com.dsh.launcher/files/termux/usr}"
+PREFIX="${PREFIX:-/data/user/0/com.dsh.nextapp1/files/termux/usr}"
 ROOT="$(dirname "$PREFIX")"
 CACHE="$PREFIX/var/cache/apt/archives"
 INFO="$PREFIX/var/lib/dpkg/info"

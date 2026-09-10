@@ -24,7 +24,7 @@ import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { gunzipSync } from 'node:zlib';
 
-const HOME = process.env.HOME || '/data/user/0/com.dsh.launcher/files';
+const HOME = process.env.HOME || '/data/user/0/com.dsh.nextapp1/files';
 // 显式文件根：不依赖调用方是否导出 HOME（契约加固，P1）——所有状态路径由此派生
 const FILES_DIR = dirname(process.env.DSH_PREFIX || join(HOME, 'dsh-prefix'));
 const NODE_BIN = process.env.NODE_BIN || join(FILES_DIR, 'node/bin/node');

@@ -3,13 +3,13 @@ plugins {
 }
 
 android {
-    namespace = "com.dsh.launcher"
+    namespace = "com.dsh.nextapp1"
     // compileSdk=35：与现有本地 SDK 环境匹配（android-36 platform 需另行下载）；
     // 代码未使用 API 36 特性，androidx 依赖（appcompat/material/core-ktx）均支持 35。
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.dsh.launcher"
+        applicationId = "com.dsh.nextapp1"
         minSdk = 24
         targetSdk = 28
         // 300 > 历史所有包（曾临时用过 commit 计数到 248）：保证任何情况下可直接覆盖安装
