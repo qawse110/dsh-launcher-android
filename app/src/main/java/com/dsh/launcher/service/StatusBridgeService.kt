@@ -157,7 +157,9 @@ class StatusBridgeService : Service() {
     }
 
     private fun fetchStatus(): JSONObject? = try {
-        val conn = URL("http://127.0.0.1:3190/status").openConnection() as HttpURLConnection
+        // 本机回环一律 Proxy.NO_PROXY（对齐参考实现坑 33），否则系统代理会劫持探针
+        val conn = URL("http://127.0.0.1:3190/status")
+            .openConnection(java.net.Proxy.NO_PROXY) as HttpURLConnection
         conn.connectTimeout = 800
         conn.readTimeout = 800
         conn.requestMethod = "GET"

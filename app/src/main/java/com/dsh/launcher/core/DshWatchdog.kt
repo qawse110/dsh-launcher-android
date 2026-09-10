@@ -16,8 +16,10 @@ object DshWatchdog {
     /** dsh web 端口是否可访问。 */
     fun isUp(): Boolean {
         val conn = try {
-            java.net.URL("http://127.0.0.1:${DshFlow.WEB_PORT}/").openConnection()
-                as java.net.HttpURLConnection
+            // 本机回环一律 Proxy.NO_PROXY：系统代理会把 127.0.0.1 请求劫持给代理，
+            // 探针全挂 → watchdog 误判死亡（对齐参考实现坑 33）
+            java.net.URL("http://127.0.0.1:${DshFlow.WEB_PORT}/")
+                .openConnection(java.net.Proxy.NO_PROXY) as java.net.HttpURLConnection
         } catch (e: Exception) {
             return false
         }

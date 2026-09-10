@@ -209,7 +209,8 @@ class KeepAliveAccessibilityService : AccessibilityService() {
 
     private fun fetchStatus(): StatusData? {
         return try {
-            val conn = URL(STATUS_URL).openConnection() as HttpURLConnection
+            // 本机回环一律 Proxy.NO_PROXY（对齐参考实现坑 33），且 disconnect 收进 finally
+            val conn = URL(STATUS_URL).openConnection(java.net.Proxy.NO_PROXY) as HttpURLConnection
             conn.connectTimeout = 800
             conn.readTimeout = 800
             conn.requestMethod = "GET"

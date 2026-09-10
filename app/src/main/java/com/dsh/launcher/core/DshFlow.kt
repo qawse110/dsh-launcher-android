@@ -458,7 +458,7 @@ object DshFlow {
         // 唯一解释器：内置 Termux bash
         exec(ctx, "${TermuxRuntime.bashPath(ctx).absolutePath} ${launcher.absolutePath}") { onLog(it) }
         onLog(">> dsh web 已后台启动，等待 web 就绪（http://127.0.0.1:$WEB_PORT）…")
-        return waitForWebReady(ctx, 90_000, onLog)
+        return waitForWebReady(ctx, 90_000, onLog, graceOnTimeout = true)
     }
 
     /**
@@ -532,9 +532,22 @@ object DshFlow {
         true
     }
 
-    /** 轮询等待 dsh web 的 HTTP 真正可访问，超时后打印 web 日志尾部。
-     *  前 6 秒每 150ms 探测一次（node 冷启动通常 1~3s，尽快感知就绪），之后放宽到 500ms。 */
-    private fun waitForWebReady(ctx: Context, timeoutMs: Long, onLog: (String) -> Unit): Boolean {
+    /**
+     * 轮询等待 dsh web 的 HTTP 真正可访问，超时后打印 web 日志尾部。
+     *  前 6 秒每 150ms 探测一次（node 冷启动通常 1~3s，尽快感知就绪），之后放宽到 500ms。
+     *
+     * @param graceOnTimeout 超时后若 node 进程仍存活，是否进入慢启动宽限（再等 120s）。
+     *   真正的「启动 dsh web」路径传 true——冷启动慢设备可能超过 90s 才就绪，此前的
+     *   硬超时直接判失败会触发 maybeAutoRollback 全量重装（慢设备「明明能启动却被
+     *   回滚」的根因）；「残留进程探测」路径必须传 false——残留 node 是活进程，
+     *   宽限只会白等 120 秒才走到清理分支。
+     */
+    private fun waitForWebReady(
+        ctx: Context,
+        timeoutMs: Long,
+        onLog: (String) -> Unit,
+        graceOnTimeout: Boolean = false,
+    ): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMs
         var lastLog = 0L
         while (System.currentTimeMillis() < deadline) {
@@ -547,14 +560,55 @@ object DshFlow {
             val elapsed = timeoutMs - (deadline - now)
             Thread.sleep(if (elapsed < 6_000) 150 else 500)
         }
-        onLog("✗ dsh web 未在 ${timeoutMs / 1000} 秒内就绪，日志尾部：")
+        // 超时但进程还活着：不再判死（启动期容错），进入慢启动宽限
+        if (graceOnTimeout && nodeProcessAlive()) {
+            onLog(">> dsh web 未在 ${timeoutMs / 1000}s 内就绪，但 node 进程仍在运行——冷启动较慢，继续等待")
+            val graceStart = System.currentTimeMillis()
+            val graceDeadline = graceStart + 120_000L
+            while (System.currentTimeMillis() < graceDeadline) {
+                if (httpResponds(WEB_PORT)) {
+                    val waitedTotal = (timeoutMs + (System.currentTimeMillis() - graceStart)) / 1000
+                    onLog("OK dsh web 已就绪（共等待 ${waitedTotal}s，属慢启动）")
+                    return true
+                }
+                if (!nodeProcessAlive()) break
+                Thread.sleep(1_000)
+            }
+        }
+        onLog("✗ dsh web 未就绪（进程已退出或超时），日志尾部：")
         appendLogTail(File(FileLog.dir(ctx), WEB_LOG), 25, onLog)
         return false
     }
 
+    /** node 进程是否存活（ps 扫描；供启动等待做「进程死亡→提前失败」判定）。 */
+    private fun nodeProcessAlive(): Boolean = try {
+        val pb = ProcessBuilder("/system/bin/sh", "-c", "ps -A | grep '[n]ode'")
+        pb.redirectErrorStream(true)
+        val p = pb.start()
+        val alive = p.inputStream.bufferedReader().useLines { lines ->
+            lines.any { it.isNotBlank() }
+        }
+        p.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)
+        alive
+    } catch (_: Throwable) {
+        // 探测本身失败时保守认为存活（不因工具缺失误判失败）
+        true
+    }
+
+    /**
+     * 本地 HTTP 探测唯一入口：一律 [Proxy.NO_PROXY]。
+     * 用户在系统/Wi-Fi 设置里配了代理时，默认 ProxySelector 会把 127.0.0.1 请求
+     * 也交给代理 → 探针全挂 → 看门狗误判 dsh 死亡（杀进程/误拉起）。
+     * 本机回环地址永不该走代理（对齐参考实现 dsh-mobile-apk 坑 33）。
+     */
+    fun localConnection(url: String): HttpURLConnection =
+        (URL(url).openConnection(java.net.Proxy.NO_PROXY) as HttpURLConnection).apply {
+            useCaches = false
+        }
+
     fun httpResponds(port: Int): Boolean {
         val conn = try {
-            URL("http://127.0.0.1:$port/").openConnection() as HttpURLConnection
+            localConnection("http://127.0.0.1:$port/")
         } catch (e: Exception) {
             return false
         }
@@ -577,11 +631,24 @@ object DshFlow {
                 onLog("   （无日志文件：${file.path}）")
                 return
             }
-            val lines = file.readText().trim().lines()
-            val tail = if (lines.size > maxLines) lines.takeLast(maxLines) else lines
+            // 只读尾部：web.log 可能长到几十 MB，全量 readText 在低内存设备会 OOM
+            val tail = readTailLines(file, maxLines)
             for (line in tail) onLog("   | $line")
         } catch (t: Throwable) {
             onLog("   （读取日志失败：${t.message}）")
+        }
+    }
+
+    /** 读文件尾部 N 行（RandomAccessFile 定位到 len-256KB 起，避免整文件载入内存）。 */
+    private fun readTailLines(file: File, maxLines: Int): List<String> {
+        if (file.length() <= 256 * 1024) return file.readText().trim().lines()
+        java.io.RandomAccessFile(file, "r").use { raf ->
+            raf.seek(file.length() - 256 * 1024)
+            val buf = ByteArray(256 * 1024)
+            val n = raf.read(buf)
+            // 丢弃首个不完整行（从中间开始读的）
+            val text = String(buf, 0, n.coerceAtLeast(0), Charsets.UTF_8)
+            return text.trim().lines().drop(1).takeLast(maxLines)
         }
     }
 
@@ -601,7 +668,25 @@ object DshFlow {
                     AppLog.i("DshFlow", line)
                 }
             }
-            p.waitFor()
+            // SIGTERM 后必须限时收尾：node 收到 TERM 需要时间退出；不退则 SIGKILL 升级。
+            // 此前 waitFor() 无限阻塞——僵死 node 会让「更新后重启」链路永久挂起。
+            if (!p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                p.destroy()
+                if (!p.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) p.destroyForcibly()
+                // TERM 后仍存活的 node 升级为 KILL（残留进程会占用 3080 导致重启失败）
+                runCatching {
+                    val kb = ProcessBuilder(
+                        "/system/bin/sh", "-c",
+                        "ps -A | grep '[n]ode' | awk '{print \$2}' | while read pid; do kill -9 \"\$pid\" 2>/dev/null; done"
+                    )
+                    kb.redirectErrorStream(true)
+                    val kp = kb.start()
+                    kp.inputStream.use { }
+                    if (!kp.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)) kp.destroyForcibly()
+                }
+                AppLog.i("DshFlow", "node processes killed (SIGKILL escalation)")
+                return
+            }
             AppLog.i("DshFlow", "node processes killed")
         }
     }

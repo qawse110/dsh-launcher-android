@@ -40,6 +40,58 @@ class WebViewActivity : AppCompatActivity() {
     private var pendingPrompt: String? = null
     private var promptInjected = false
 
+    // —— WebView 渲染进程冻结看门狗（借鉴 dsh-mobile-apk issue #36 修复）——
+    // 部分国产 ROM（荣耀 MagicUI 6.1/Android 12 等）渲染进程 JS 主线程会冻结：
+    // 页面停在「Loading plugins…」且无诊断层，页面内定时器也跑不动。
+    // 主线程周期 evaluateJavascript("1") 心跳：回调不再返回 = 渲染进程失活 →
+    // Toast 提示 + 自动 reload 一次（单次自愈，避免 reload 循环）。
+    private val freezeHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var jsAckAt = 0L
+    private var pageLoadedAt = 0L
+    private var pingOutstanding = false
+    private var freezeReloaded = false
+    private val freezeRunnable = object : Runnable {
+        override fun run() {
+            if (!this@WebViewActivity::webView.isInitialized || isFinishing ||
+                webView.visibility != View.VISIBLE
+            ) return
+            val now = System.currentTimeMillis()
+            if (pageLoadedAt > 0 && now - pageLoadedAt > 45_000 && now - jsAckAt > 20_000) {
+                if (!freezeReloaded) {
+                    freezeReloaded = true
+                    try { webView.reload() } catch (_: Throwable) {}
+                }
+                jsAckAt = now
+                pingOutstanding = false
+            } else if (!pingOutstanding) {
+                pingOutstanding = true
+                try {
+                    webView.evaluateJavascript("1") { _ ->
+                        jsAckAt = System.currentTimeMillis()
+                        pingOutstanding = false
+                    }
+                } catch (_: Throwable) {
+                    pingOutstanding = false
+                }
+            }
+            freezeHandler.postDelayed(this, 10_000)
+        }
+    }
+
+    private fun startFreezeWatchdog() {
+        if (isFinishing || !this@WebViewActivity::webView.isInitialized) return
+        val now = System.currentTimeMillis()
+        pageLoadedAt = now
+        jsAckAt = now
+        pingOutstanding = false
+        freezeHandler.removeCallbacks(freezeRunnable)
+        freezeHandler.postDelayed(freezeRunnable, 10_000)
+    }
+
+    private fun stopFreezeWatchdog() {
+        freezeHandler.removeCallbacks(freezeRunnable)
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         DynamicColors.applyToActivityIfAvailable(this)
@@ -94,6 +146,8 @@ class WebViewActivity : AppCompatActivity() {
             setPadding(0, dp(8), 0, dp(20))
         })
         errorView.addView(Ui.button(this, "重试", {
+            autoRetryCount = 0
+            autoRetryHandler.removeCallbacks(autoRetryRunnable)
             errorView.visibility = View.GONE
             webView.visibility = View.VISIBLE
             webView.reload()
@@ -131,6 +185,8 @@ class WebViewActivity : AppCompatActivity() {
 
         webView.webViewClient = object : WebViewClient() {
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                autoRetryCount = 0
+                autoRetryHandler.removeCallbacks(autoRetryRunnable)
                 errorView.visibility = View.GONE
                 webView.visibility = View.VISIBLE
                 progressBar.visibility = View.VISIBLE
@@ -140,6 +196,7 @@ class WebViewActivity : AppCompatActivity() {
                 progressBar.visibility = View.GONE
                 maybeInjectPrompt()
                 injectComposerLayoutFix()
+                startFreezeWatchdog()
             }
 
             override fun onReceivedError(
@@ -151,6 +208,7 @@ class WebViewActivity : AppCompatActivity() {
                 if (request?.isForMainFrame == true) {
                     webView.visibility = View.GONE
                     errorView.visibility = View.VISIBLE
+                    scheduleAutoRetry()
                 }
             }
         }
@@ -164,23 +222,50 @@ class WebViewActivity : AppCompatActivity() {
         webView.loadUrl(TARGET_URL)
     }
 
-    override fun onPause() {
-        // 不可见时停掉 JS 定时器/网络加载：dsh WebUI 的 HMR 心跳与轮询在后台
-        // 继续跑纯属耗电（返回前台自动恢复）
-        webView.onPause()
-        super.onPause()
-    }
-
     override fun onResume() {
         super.onResume()
         webView.onResume()
     }
 
+    override fun onPause() {
+        freezeHandler.removeCallbacks(freezeRunnable)
+        autoRetryHandler.removeCallbacks(autoRetryRunnable)
+        super.onPause()
+        webView.onPause()
+    }
+
     override fun onDestroy() {
+        stopFreezeWatchdog()
+        autoRetryHandler.removeCallbacks(autoRetryRunnable)
         // 标准 WebView 收尾：先从视图树摘除再 destroy，否则窗口仍持有它导致泄漏
         (webView.parent as? android.view.ViewGroup)?.removeView(webView)
         webView.destroy()
         super.onDestroy()
+    }
+
+    // —— 主帧加载失败自动重试（借鉴参考实现 30s 间隔重试 + 最多 2 次退避）——
+    // dsh web 可能仍在启动（首次引导未完成/看门狗正在拉起）：停留在错误页不代表
+    // 引擎死了。主帧 error 时按 10s/20s/30s 间隔自动重载，成功（onPageStarted）
+    // 即取消；用户手动点「重试」同样归零。
+    private val autoRetryHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var autoRetryCount = 0
+    private val autoRetryRunnable = object : Runnable {
+        override fun run() {
+            if (isFinishing || isDestroyed) return
+            if (autoRetryCount >= 3) return
+            autoRetryCount++
+            errorView.visibility = View.GONE
+            webView.visibility = View.VISIBLE
+            progressBar.visibility = View.VISIBLE
+            try { webView.reload() } catch (_: Throwable) {}
+        }
+    }
+
+    private fun scheduleAutoRetry() {
+        if (isFinishing) return
+        if (autoRetryCount >= 3) return
+        autoRetryHandler.removeCallbacks(autoRetryRunnable)
+        autoRetryHandler.postDelayed(autoRetryRunnable, 10_000L * (autoRetryCount + 1))
     }
 
     override fun onBackPressed() {
