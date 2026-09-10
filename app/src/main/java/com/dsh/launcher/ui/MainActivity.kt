@@ -655,11 +655,25 @@ class MainActivity : AppCompatActivity() {
         /**
          * 已同步 APK 的 stamp 键（值 = [AssetSync.apkInstallStamp] 的字符串）。
          *
-         * 键名沿用历史 `last_apk_version` 以免引入第二套迁移：旧版本存的是纯数字
-         * versionCode，`getString` 遇 Long 会返回 null → 视为「未同步过」，
-         * 本次补一次同步，随后写回 stamp 字符串（review-r12 的 P0-2 修复）。
+         * ## 为什么必须换新键名（review-r12 自查纠正）
+         *
+         * 初版为了「省一次迁移」沿用了历史键 `last_apk_version`，并断言
+         * 「旧值是 Long，`getString` 会返回 null 从而自然降级」。**这个断言是错的**：
+         * `SharedPreferencesImpl.getString` 的实现是 `(String) mMap.get(key)`
+         * ——对装箱对象做**直接强转**，遇到 Long 抛
+         * `ClassCastException: java.lang.Long cannot be cast to java.lang.String`，
+         * 而不是返回默认值。真机实证（本机 shared_prefs/dsh_ui.xml）：
+         * ```
+         * <long name="last_apk_version" value="300" />   ← 旧版本 putLong 写入的真实类型
+         * ```
+         * 而本函数在 `MainActivity.onCreate` 主线程调用且**无 try/catch**
+         * → 每个从上一版升级的用户**一打开就崩**（比原缺陷更严重）。
+         *
+         * 修法：**换用新键名**，让新旧值的类型彻底不相遇——旧 `last_apk_version`
+         * 原样留着（无害的死数据），新键首次读到 null 即视为未同步 → 补一次同步。
+         * 这比「读取时捕获 CCE」更彻底：不再有任何类型假设，也不依赖异常路径。
          */
-        const val KEY_APK_STAMP = "last_apk_version"
+        const val KEY_APK_STAMP = "apk_install_stamp"
     }
 
     private fun guardBusy(action: String): Boolean =
@@ -810,15 +824,22 @@ class MainActivity : AppCompatActivity() {
      *
      * 判据是 [AssetSync.apkInstallStamp]（APK 文件路径+长度+mtime）而**不是 versionCode**
      * ——本仓 versionCode 是硬编码常量、从不递增，旧写法导致本函数首次安装后永久早退
-     * （review-r12 的 P0-2）。prefs 键沿用 `last_apk_version`，但存的是 stamp 字符串；
-     * 读到旧的纯数字值即视为「未同步过」→ 本次补一次同步（天然迁移、无需清理代码）。
+     * （review-r12 的 P0-2）。stamp 存在独立新键 [KEY_APK_STAMP] 里（见其 KDoc：
+     * 不能沿用 `last_apk_version`，那键上存的是 Long，`getString` 会抛 CCE）。
+     *
+     * **本函数在 onCreate 主线程调用，任何未捕获异常 = 应用启动即崩**，故：
+     * ① 读 prefs 走 `runCatching`（即便该键将来存了别的类型也不崩）；
+     * ② stamp 计算失败时本次跳过同步，而不是崩溃。
      */
     private fun syncAssetsOnApkUpdate() {
         val current = AssetSync.apkVersion(this)
         if (current == 0L) return
-        val stamp = AssetSync.apkInstallStamp(this, current)
+        val stamp = runCatching { AssetSync.apkInstallStamp(this, current) }.getOrNull() ?: return
         val prefs = getSharedPreferences(AppState.Prefs.UI, MODE_PRIVATE)
-        if (prefs.getString(KEY_APK_STAMP, null) == stamp) return
+        // 类型安全的读：不假设该键上一定是 String（历史/将来都可能变）。
+        // 语义 = 「与本次 stamp 相同才跳过」，取不到就同步一次（幂等，无副作用）。
+        val lastStamp = runCatching { prefs.getString(KEY_APK_STAMP, null) }.getOrNull()
+        if (lastStamp == stamp) return
         appendMiniLog("检测到应用更新（v$current），后台同步内置插件源…")
         thread {
             // 标记在**全部工作成功之后**才写入（review-r12）：旧实现先写标记再干活，

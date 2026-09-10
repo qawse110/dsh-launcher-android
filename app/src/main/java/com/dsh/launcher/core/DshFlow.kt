@@ -177,21 +177,29 @@ object DshFlow {
      *
      * ## 为什么必须集中
      *
-     * 「杀 node → 等一会 → 快速启动」这套动作此前在**三处各写一份、常量还不一样**：
+     * 「杀 node → 等一会 → 快速启动」这套动作此前在不同页面各写一份、常量还不一样：
      *
-     * | 位置 | 等待 |
-     * |---|---|
-     * | `ConsoleActivity` 的「重启服务」 | `Thread.sleep(1200)` |
-     * | `PluginManagerActivity.restartFlow` | `Thread.sleep(1500)` |
-     * | `MainActivity.confirmRollback` | 无等待 |
+     * | 位置 | 等待 | 本轮处置 |
+     * |---|---|---|
+     * | `ConsoleActivity` 的「重启服务」 | `Thread.sleep(1200)` | ✅ 已收敛到本函数 |
+     * | `PluginManagerActivity.restartFlow` | `Thread.sleep(1500)` | ✅ 已收敛到本函数 |
+     * | `MainActivity.confirmRollback` | 无等待 | ❌ **刻意不收**（见下） |
      *
-     * 而 [killAllNode] 返回时 node **已经全部退出**（SIGTERM → 限时等待 → SIGKILL 升级，
-     * 见 [NodeProcs.killAll]），所以那三个 sleep 都不是同步手段，只是来源不明的魔数。
+     * [killAllNode] 返回时 node **已经全部退出**（SIGTERM → 限时等待 → SIGKILL 升级，
+     * 见 [NodeProcs.killAll]），所以那些 sleep 都不是同步手段，只是来源不明的魔数。
      * 后果是同一个用户动作在不同页面有不同成功率（端口处于 TIME_WAIT 时 1200ms 更易撞
      * `address already in use`），且行为无法单点调整。
      *
-     * 这里收敛为一个函数：等待时长由 [RESTART_SETTLE_MS] 单点定义，语义是**纯保险**
+     * **`MainActivity.confirmRollback` 不在收敛范围内，且不应被"顺手统一"**：
+     * 它的语义是「回滚重装旧版本」= `INSTALL_AND_START` + `forceFullInstall = true`，
+     * 而本函数是 `START_ONLY` 快速启动。强行合并会把回滚变成"启动当前（坏）版本"，
+     * 是真实回归。它也不需要等待——紧随其后的安装本身是分钟级，套接字早已释放。
+     *
+     * 本函数语义：等待时长由 [RESTART_SETTLE_MS] 单点定义，是**纯保险**
      * （给内核 TCP 栈释放监听套接字留余量），而非「等 node 退出」。
+     *
+     * 并发保护：进入即检查 [isBusy]——**必须在杀进程之前**，否则会把正在安装的
+     * node 杀掉、随后 launch() 又拒绝启动（详见函数内注释）。
      *
      * @param onLog 日志回调（任意线程）
      * @param onDone 启动流程结束后回调（任意线程）
@@ -203,6 +211,16 @@ object DshFlow {
         onDone: ((Boolean) -> Unit)? = null,
     ) {
         val ctx = context.applicationContext
+        // **必须在杀进程之前拦下**（review-r12 自查纠正）：`busy` 只在 launch() 内部检查，
+        // 而 launch() 是在 killAllNode + 等待之后才被调用的。若此刻正有安装/启动流程在跑
+        // （用户先点「启动 dsh」再点「重启服务」，或 watchdog 触发重装期间），
+        // 旧写法会**先把正在安装的 node 杀掉**，随后 launch() 才礼貌拒绝（"已有流程在执行中"）
+        // ——用户得到的是「引擎被杀 + 重启被拒」的双输局面。
+        if (busy.get()) {
+            onLog(">> 已有启动/安装流程在执行中，忽略本次重启请求")
+            onDone?.invoke(false)
+            return
+        }
         thread {
             onLog(">> 重启 dsh 服务（快速启动，不做安装）…")
             killAllNode(ctx, onLog)

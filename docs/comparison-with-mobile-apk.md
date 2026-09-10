@@ -787,7 +787,10 @@ js-yaml 的 schema 字段是 `explicit`（不是 `tags`），且 CJS `require` �
   APK 路径+长度+mtime，替代从不递增的 versionCode 作变更判据）
 - `app/src/main/java/com/dsh/launcher/ui/ConsoleActivity.kt`、
   `app/src/main/java/com/dsh/launcher/ui/PluginManagerActivity.kt`
-  （**修 P1-①**：重启语义统一走 `DshFlow.restart()`，消除 1200/1500/0 三处魔数漂移）
+  （**修 P1-①**：重启语义统一走 `DshFlow.restart()`，消除 1200/1500 两处魔数漂移；
+  `MainActivity.confirmRollback` 的「无等待」**刻意不收敛**——它是回滚重装
+  （`INSTALL_AND_START` + `forceFullInstall`），而 `restart()` 是 `START_ONLY`，
+  强行合并会把回滚退化成「启动当前坏版本」，已在 KDoc 内写明理由）
 - `app/src/main/java/com/dsh/launcher/overlay/PetSpeaker.kt`（**P1-③**：回退量抽为
   companion 纯函数 `computeRewind` + 方向性说明：误差必须落在「重复朗读」侧而非
   「永久跳过」侧）

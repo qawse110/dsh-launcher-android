@@ -805,8 +805,50 @@ dsh_ui.xml:            last_apk_version = 300     ← 首次安装后即为 300
   覆盖安装必然重写 APK 文件，且是 `stat` 级开销；取不到时返回带时间戳的值
   （**倾向同步**，而不是倾向跳过）。
 - 标记改为**全部工作成功之后**才写；失败则保留旧值以便下次重试。
-- prefs 键名沿用 `last_apk_version` 以免引入第二套迁移：旧值是纯数字，
-  `getString` 读到 Long 返回 null → 视为「未同步过」→ 自动补一次（天然迁移）。
+- prefs 键**换成新键 `apk_install_stamp`**——初版为「省一次迁移」沿用了
+  `last_apk_version` 并断言「旧值是 Long，`getString` 会返回 null 自然降级」。
+  **该断言是错的，而且后果是应用启动即崩**，详见下方「自查纠正」。
+
+### 自查纠正：`getString` 遇 Long **抛 CCE，不返回 null**（本轮最大自身缺陷）
+
+初版写法与错误断言：
+
+```kotlin
+if (prefs.getString("last_apk_version", null) == stamp) return
+// 错误注释：「旧值是 Long，getString 会返回 null → 视为未同步过（天然迁移）」
+```
+
+`SharedPreferencesImpl.getString` 的实现是 **`(String) mMap.get(key)`**——
+对装箱对象**直接强转**。键上存的是 `Long` 时抛
+`ClassCastException: java.lang.Long cannot be cast to java.lang.String`，
+**不会**返回 default。
+
+真机实证（本机 `shared_prefs/dsh_ui.xml`，旧版本 `putLong` 写入的真实类型）：
+
+```xml
+<long name="last_apk_version" value="300" />
+```
+
+而该函数在 `MainActivity.onCreate` **主线程**调用且**无 try/catch**
+→ 每个从上一版升级的用户**一打开应用就崩**。这是本轮我自己引入的、
+比原缺陷更严重的缺陷，由一次**对抗性复核**（专门要求"找编译错误与逻辑 bug"）
+发现，而不是由我自己或任何门禁发现。
+
+**修法（两层）**：
+1. **换新键名** `apk_install_stamp`，让新旧值的类型彻底不相遇（旧键作为无害死数据留着）；
+2. 读取处仍走 `runCatching { prefs.getString(...) }.getOrNull()`——
+   因为这是 `onCreate` 主线程路径，任何未捕获异常都等于启动崩溃，
+   值不得建立在对 prefs 值类型的假设上。
+
+**教训（可推广）**：
+- **`SharedPreferences` 的取值方法不按"优雅降级"设计**：`getString`/`getInt`/`getLong`
+  在类型不符时都是 `ClassCastException`，不存在"取不到就给默认值"。
+  **换存储类型时必须换键名**，或显式 `all[key] as? T`。
+- **`onCreate` 主线程路径上的每一行都要按"崩了就白屏"评估**；
+  `runCatching` 在这里不是防御性过度设计，而是必需。
+- **自己写的 KDoc 断言也是"代码"**：我在两处 KDoc 与文档里把未经验证的
+  Android API 语义当成事实写下来（"返回 null"），它随代码一起被审查通过。
+  **凡"我确信 API 行为如此"的断言，若本机无法实测，就标注为假设并加防御**。
 
 **教训**：任何「只在 X 变化时才做 Y」的判据，先确认 **X 真的会变**。
 「硬编码常量 / 从不递增的版本号 / 手工维护的 marker」都不能当变更信号；
@@ -847,3 +889,42 @@ git cat-file blob HEAD:<path> > <path>     # 指针文件 133 字节，内容即
 3. **不要给子代理下达「可以运行工具做破坏性测试」的宽泛授权**——
    本轮一个子代理据此删了仓库内的 LFS 资产。授权要写清「只读」
    或「仅在副本内」，且事后必须 `git status` 对账。
+
+---
+
+## 21. 门禁与文档都拦不住「API 语义记错」——只能靠对抗性复核（review-r12）
+
+同一次改动里我犯了两类**同源**错误，都逃过了全部 5 道门禁与我自己三轮自查：
+
+| 案例 | 我的错误断言 | 真实语义 | 后果 |
+|---|---|---|---|
+| `ctx.getMainExecutor()` | 「可以用」 | API **28+**，本仓 minSdk=24 | 24~27 上 `NoSuchMethodError` |
+| `prefs.getString(k, null)` 遇 Long | 「返回 null，天然降级」 | `(String)` **强转** → `ClassCastException` | `onCreate` 主线程崩 → **升级即白屏** |
+
+两者共同点：**都是"我记得 Android 是这样"的 API 语义假设**，
+而且**没有任何静态检查能覆盖**——
+- `bracecheck` 只看括号与注释闭合；
+- 编译门禁（CI 的 `assembleDebug`）对两者**都不会报错**：
+  `getMainExecutor` 在 compileSdk 35 下存在（lint 才提示 NewApi，而本仓 lint 只 disable 了
+  `ExpiredTargetSdkVersion`）；`getString` 的类型问题编译期完全看不见；
+- 单测也抓不到：前者只在 API<28 设备上炸，后者只对**升级用户**炸。
+
+**唯一发现它的是：专门派一个对抗性复核子代理，明确要求"找编译错误与逻辑 bug"，
+并要求它对每个断言给出证据**。它找到了 CCE 那个（更严重的），
+而 `getMainExecutor` 是我在写复核提示词时自己发现的。
+
+### 结论：把它变成流程
+
+1. **改动涉及 Android API 时，逐条核对 API level**：
+   `minSdk` 是 24（不是"反正现在的设备都够新"）。凡出现
+   `getMainExecutor` / `java.time` / `Optional` / `Stream` / `Context.getSystemService(Class)`
+   等易记错的 API，先查 level 再写。编译通过**不代表**低版本能跑。
+2. **`SharedPreferences` 换存储类型 = 换键名**。不存在"取不到就降级"；
+   且 `commit/apply` 把旧值持久化到磁盘，**升级用户会带着旧类型的值回来**。
+3. **`onCreate` 主线程路径一律包 `runCatching`**（或保证不可能抛）。
+4. **KDoc 里的 API 断言也是代码**：写「此 API 会返回 X」时，若本机无法实测，
+   就在注释里标明是假设，并让代码对两种情况都成立——不要用一个未经证实的
+   语义去"解释"一个省事的写法。
+5. **每轮结构性改动结束前，派一次对抗性复核**（不是"再看一遍"，
+   而是明确要求证伪）。本轮 3 个 P0 + 3 个 P1 里，最严重的一个
+   （升级即崩）正来自这一步。

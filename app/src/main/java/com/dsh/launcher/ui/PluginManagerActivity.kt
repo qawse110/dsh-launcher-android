@@ -1113,7 +1113,7 @@ class PluginManagerActivity : AppCompatActivity() {
     private fun restartFlow() {
         if (!guardBusy()) return
         setBusy(true)
-        appendLog(">> 重启 dsh 服务（快速启动，不做安装）…")
+        // 横幅由 DshFlow.restart 统一打印，此处不再重复（ConsoleActivity 同处理）
         DshFlow.restart(
             this,
             onLog = { appendLog(it) },

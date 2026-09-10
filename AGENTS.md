@@ -112,6 +112,13 @@ export OPENSSL_CONF=/dev/null
   垃圾内容，`cp` 到 `/tmp` 备份因目录不可写而静默失败 → 无备份即覆盖；
   恢复需 `git cat-file blob HEAD:<path>`（设备上 `git-lfs` 无法执行，
   `git checkout` 会 smudge 失败）。**不要给子代理下达宽泛的"可运行工具"授权**。详见 gotchas §20。
+- **坑 21**（★致命，只能靠对抗性复核发现）：**API 语义记错，编译门禁与单测都拦不住**。
+  本轮同一改动里犯了两例：① `ctx.getMainExecutor()` 是 **API 28+**，而 minSdk=24
+  → 24~27 上 `NoSuchMethodError`；② `prefs.getString(k, null)` 在键上存的是 `Long` 时
+  **抛 `ClassCastException` 而不返回 null**（实现是 `(String) mMap.get(key)` 强转），
+  而该调用在 `onCreate` 主线程且无 try/catch → **升级用户一打开就崩**。
+  两条铁律：**`SharedPreferences` 换存储类型必须换键名**（`apply` 已把旧类型持久化，
+  升级用户会带着它回来）；**`onCreate` 主线程路径一律 `runCatching`**。详见 gotchas §21。
 
 ## 4. 详档路由表
 
@@ -208,3 +215,12 @@ export OPENSSL_CONF=/dev/null
 23. **破坏性验证只在仓库外副本做**：绝不在仓库内覆盖/删除受版本控制的文件做测试；
     脚本里的 `cp`/`mv` 必须检查退出码。**给子代理的授权要写明「只读」或「仅副本内」**，
     事后对账 `git status`。见坑 20。
+24. **Android API 语义不得凭记忆**：本仓 `minSdk = 24`（不能假设"设备都够新"）。
+    出现 `getMainExecutor` / `java.time` / `Optional` / `Stream` /
+    `getSystemService(Class)` / `Context.startForegroundService` 等**易记错 level 的 API**
+    时先查 API level 再写——**编译通过不代表低版本能跑**（`compileSdk=35` 下
+    `getMainExecutor` 正常编译，24~27 上 `NoSuchMethodError`）。
+    **`SharedPreferences` 换存储类型必须换键名**：`getString/getInt/getLong` 在类型不符时
+    抛 `ClassCastException`，**不存在"取不到就给默认值"**；且 `apply()` 已把旧类型持久化，
+    **升级用户会带着旧类型的值回来**。`onCreate` 主线程路径一律 `runCatching`。
+    见坑 21。
