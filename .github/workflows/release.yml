@@ -80,7 +80,21 @@ jobs:
           - 插件管理：健康检查、一键重置修复、在线安装
           - 自适应后台功耗策略（PowerGovernor）
 
-          安装前请先卸载旧版（签名密钥于 v4.3.4 首次引入）。"
+          ### 本版修复（review-r12 / r12b 全项目复审）
+          - **P0** 修复首次安装后 WebUI 打不开：引导期脚本 \`fs-register.mjs\` 失去供给点，
+            node 以 \`ERR_MODULE_NOT_FOUND\` 硬失败（非降级）。现由单源清单
+            \`BOOT_SCRIPTS\` + 新增门禁 \`check-boot-assets.cjs\` 守护。
+          - **P0** 修复 APK 升级后内置资产永不重同步：判据原为 \`versionCode\`，
+            而本仓该值恒为 300 → 首次安装后该逻辑成为死代码。改用 APK 安装指纹。
+          - **P0** 崩溃循环回滚路径与重启路径语义统一，避免重复拉起。
+          - **P1** 重启语义统一为 \`DshFlow.restart()\`（含 busy 前置判定，避免杀进程后才拒绝）。
+          - **P1** 清理 25 个文件里 113 处通配导入，修正 core 层对 ui/overlay/tts 的反向依赖。
+          - **P1** 桌宠回退量抽为纯函数 \`computeRewind\`，补 8 例单测。
+          - 修复本版开发中自身引入的 prefs 换类型不换键名问题（升级即崩 ClassCastException）。
+
+          ### 安装说明
+          签名密钥自 v4.3.4 起未变更，与 v4.10.2-fix3 **签名一致，可直接覆盖安装**，
+          无需卸载（卸载会清除应用数据）。"
 
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" "$APK" --clobber
