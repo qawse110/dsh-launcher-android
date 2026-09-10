@@ -111,27 +111,85 @@ PATH/LD_LIBRARY_PATH/HOME/PREFIX/TERMUX_VERSION/SHELL + 栅栏键）与 `dsh-and
 `TermuxEnvTest` 扩展：SHELL 键断言（childShellEnv/webProcessExports）+
 `terminalSessionEnv 与 childShellEnv 单源一致` 回归测试（逐键比对）。
 
+## 三点六、脚本层专项重构（review-r5，参考 assets/patched + applyAssetPatch 机制）
+
+参考项目脚本层核心：补丁不是内嵌代码，而是**真实文件** `assets/patched/*.js`，
+由 `EngineManager.applyAssetPatch` 覆盖到快照对应位置；幂等靠**内容指纹**
+（其注释明确记录「marker 字符串不变 → 载荷更新后补丁被静默跳过」的 v1→v2 事故），
+另有 hash-adaptive 重写（index.html 引用引擎 content-hash bundle 名）。
+
+### 已落地
+1. **补丁载荷外置**：`stub-dsh.mjs` 内嵌的 4 个 base64 载荷（koffi ESM/CJS、
+   node-pty、sharp shim 12.7KB）抽为 `app/src/main/assets/patched/` 真实文件，
+   由 `DshFlow.syncCompatAssets` 整目录同步到 `files/patched/`。
+   stub 48KB → 37KB，去掉约 19KB 不可读 blob。
+   **安全性证明**：迁移后用 `tools/verify-payload-extraction.cjs` 与迁移前
+   base64 解码结果逐字节比对，4 个载荷全部 IDENTICAL（零行为变化）。
+2. **内容比对幂等**：新增 `overlayPatch()`——覆盖式补丁按载荷与目标逐字节比对
+   决定是否重写，不再依赖版本 marker；ripgrep 补丁同样改为整文件内容比对。
+   `stub-applied` marker 加入**补丁集内容指纹**（stub + patched 全量 CRC32）：
+   此前只看 APK/dsh 版本号，本地重建未 bump 版本或载荷更新时新补丁会被静默跳过。
+3. **不落半补丁**：`dsh-fs-local chmod` 改为逐条锚点计数 + 写盘前 `node --check`：
+   任一条全部失配即不写盘并告警（此前零替换也会落盘并写 marker → 后续永不重试）。
+4. **死代码清理**：`SHARP_STUB` / `SHARP_STUB_ESM`（v4 改纯 JS shim 后无消费者）。
+5. **CI 资产脚本门禁（新）**：`tools/check-asset-scripts.cjs` 对全部 assets 脚本
+   （stub/install/routing/fs 兼容层）+ `patched/` 载荷做 `node --check`，
+   并校验 stub 引用的载荷存在；接入 `ci.yml`（最快环节置顶）与 `build-apk.yml`
+   （打包前卡关）。已实测验证门禁能拦住被写坏的载荷
+   ——这正是载荷外置的直接收益：base64 时代这些内容对静态检查完全不可见。
+
+### 评估后不采纳 / 后续排期
+- **index.html 作为补丁载荷 + hash-adaptive**：工作区对应物是 stub 内联注入的一小段
+  `AbortSignal.timeout` shim（非大 blob，且已按需注入），外置收益不足。
+- **install-dsh.mjs**：已具备内容指纹（`contentFingerprint`）、子进程硬超时、
+  OOM 判定、显式文件根契约，成熟度与参考项目相当，本轮无需改动。
+
 ## 四、后续重构排期建议（未落地）
 
 1. **P2**：`BridgeOverlayManager.kt`（1287 行）按「窗口管理/状态机/交互」三块拆分——参考项目 OverlayService(712)/OverlayPanel(837)/OverlayController 分层值得照抄。
 2. **P2**：`PluginManagerActivity.kt`（1135 行）UI 与逻辑分离（Repository 模式），JSON 解析散落 4 处 `readText()` 收敛到单点。
-3. **P3**：引入 `UndoGate` 式快照回撤（备份 zip 机制已具备，差「自动触发+恢复+验证」闭环）。
-4. **P3**：补 `SnapshotExtractor` 式 symlink 目标白名单——`NodeRuntime.createSymlink` 目前失败静默降级为空文件，可加「目标必须在 dir 内」校验（本资产自控风险低，仅为纵深防御）。
+3. **P2**：**急救 CLI（参考 undo-emergency.mjs）**——与引擎平级、dsh 完全起不来时仍可执行的
+   脚本级恢复通道（list/restore/safe-mode/boot-state）。工作区已有 BackupManager 的 zip
+   备份/恢复，缺的是「不经 dsh、不经 Android UI 也能跑」的那一层。
+4. **P3**：引入 `UndoGate` 式快照回撤（备份 zip 机制已具备，差「自动触发+恢复+验证」闭环）。
+5. **P3**：补 `SnapshotExtractor` 式 symlink 目标白名单——`NodeRuntime.createSymlink` 目前失败静默降级为空文件，可加「目标必须在 dir 内」校验（本资产自控风险低，仅为纵深防御）。
 
 ## 五、验证说明
 
-设备端无 JDK/Android SDK，无法执行 `gradlew` 编译与单测；已做静态验证：
-- 全部改动文件括号/圆括号平衡检查通过（`tools/bracecheck-edited.cjs`）
-- `Proxy.NO_PROXY` 4 处调用点核对一致
-- `waitForWebReady` 两处调用点语义核对（残留探测不进宽限）
-- 改动均限定在既有类型/方法签名内，无新依赖，无 Manifest 变更
-- 下次桌面/CI 环境 `./gradlew assembleDebug` 应作为合并门禁
+设备端无 JDK/Android SDK，无法本地执行 `gradlew` 编译与单测；验证通过三级门禁完成：
+- **本地静态**：括号平衡（`tools/bracecheck-edited.cjs`）、KDoc 提前终止扫描、
+  载荷字节级一致性比对（`tools/verify-payload-extraction.cjs`）
+- **资产脚本门禁**：`tools/check-asset-scripts.cjs`（本地 + CI 双跑，含故意写坏载荷的
+  反向验证）
+- **CI 端**：`ci.yml` 编译门禁 + 单测门禁（65 测试）在 GitHub Actions 上真实执行；
+  `build-apk.yml` 产出 debug APK
+
+> 注：本文件记录的三轮改动（P0/P1 防御性修补 → 环境链路单源化 → 脚本层载荷外置）
+> 全部经 CI 验证。过程中 CI 抓到本模型引入的 3 个缺陷：`progressBar` 局部变量作用域、
+> 单源一致性测试基准漏参、KDoc 内 `patched/**` 提前终止注释块——均由门禁拦截后修复，
+> 佐证「编译/单测/资产门禁」在设备端无 JDK 场景下的不可替代性。
 
 ## 六、改动文件清单
 
+### review-r3（防御性修补）
 - `app/src/main/java/com/dsh/launcher/core/DshFlow.kt`（P0-1/P0-2/P1-1/P1-2）
 - `app/src/main/java/com/dsh/launcher/core/DshWatchdog.kt`（P0-1）
 - `app/src/main/java/com/dsh/launcher/service/StatusBridgeService.kt`（P0-1/P2-1）
 - `app/src/main/java/com/dsh/launcher/service/KeepAliveAccessibilityService.kt`（P0-1）
 - `app/src/main/java/com/dsh/launcher/ui/WebViewActivity.kt`（P1-3/P1-4）
-- `tools/bracecheck-edited.cjs`（验证脚本）
+
+### review-r4（环境链路单源化）
+- `app/src/main/java/com/dsh/launcher/core/TermuxEnv.kt`（SHELL 键、terminalSessionEnv 单源化）
+- `app/src/main/java/com/dsh/launcher/core/NodeRuntime.kt`（nodeEnvPrefix 退役）
+- `app/src/main/java/com/dsh/launcher/core/BootstrapInstaller.kt`（短前缀 fail-loudly）
+- `app/src/main/java/com/dsh/launcher/ui/ConsoleActivity.kt`（改走统一环境）
+- `app/src/test/java/com/dsh/launcher/core/TermuxEnvTest.kt`（单源一致性回归）
+
+### review-r5（脚本层）
+- `app/src/main/assets/stub-dsh.mjs`（载荷外置 + 内容比对幂等 + 锚点计数）
+- `app/src/main/assets/patched/{koffi-stub.mjs,koffi-stub.cjs,node-pty-stub.cjs,sharp-shim.cjs}`（新）
+- `app/src/main/java/com/dsh/launcher/core/DshFlow.kt`（syncCompatAssets、补丁集指纹）
+- `.github/workflows/ci.yml`、`.github/workflows/build-apk.yml`（资产脚本门禁）
+- `tools/check-asset-scripts.cjs`、`tools/migrate-stub-payloads.cjs`、
+  `tools/verify-payload-extraction.cjs`、`tools/bracecheck-edited.cjs`
+
