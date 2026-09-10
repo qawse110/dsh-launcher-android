@@ -27,6 +27,20 @@ jobs:
       - name: Asset scripts gate（脚本语法 + 载荷完整性）
         run: node tools/check-asset-scripts.cjs
 
+      # ABI 门禁（本轮新增）：读内置 node 归档里 bin/node 的 ELF e_machine，
+      # 与文件名声明的 ABI 双向核对。参考项目坑 18/30 是两次真机重大事故
+      # （错 ABI 运行时装到真机 → 引擎启动即崩 EM_X86_64 ≠ EM_AARCH64）。
+      # 依赖上面的 lfs: true —— 未拉取 LFS 时本门禁输出 SKIP 而非误报失败。
+      - name: ABI gate（内置 node ELF 架构核对）
+        run: node tools/check-asset-abi.cjs
+
+      # Kotlin 静态预检（本轮新增）：括号平衡 + 块注释闭合 + 嵌套扫描。
+      # Kotlin 块注释**可嵌套**——KDoc 正文里误写注释起始符会打开嵌套注释并
+      # 吞掉后续代码（本项目 commit 5cf987d 与 d617620 两次真实编译失败的机理）。
+      # 放在 gradle 之前：一次 node 扫描几百毫秒，能在拉 SDK/JDK 前就拦下这类笔误。
+      - name: Kotlin static precheck（括号/注释）
+        run: node tools/bracecheck-edited.cjs
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:

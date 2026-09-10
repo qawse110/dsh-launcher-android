@@ -51,10 +51,18 @@ object DshFlow {
     const val WEB_LOG = "web.log"
 
     /** web 启动脚本模板（assets 内，@TOKENS@ 由 [TermuxEnv] 渲染）。 */
-    private const val WEB_LAUNCHER_TPL = "web-launcher.sh.tpl"
+    /** web 启动脚本模板资产名。 */
+    internal const val WEB_LAUNCHER_TPL = "web-launcher.sh.tpl"
 
-    /** 模板资产读取失败时的兜底内联模板（内容与 tpl 保持一致）。 */
-    private val DEFAULT_WEB_LAUNCHER_TPL = """
+    /**
+     * 模板资产读取失败时的兜底内联模板。
+     *
+     * **单源约定**：本常量与 `assets/web-launcher.sh.tpl` 是同一契约的两份拷贝——
+     * 必须含完全相同的占位符集合（`@EXPORTS@`/`@HOME@`/`@NODE_CMD@`/`@LOG_FILE@`），
+     * 否则资产缺失退回兜底时会静默渲染出缺配脚本（如漏 export → 引擎起不来）。
+     * 由 `LauncherTemplateTest` 逐令牌比对锁定。
+     */
+    internal val DEFAULT_WEB_LAUNCHER_TPL = """
         #!/data/user/0/com.dsh.launcher/t/usr/bin/bash
         @EXPORTS@
         cd "@HOME@" || exit 1
@@ -607,7 +615,7 @@ object DshFlow {
             Thread.sleep(if (elapsed < 6_000) 150 else 500)
         }
         // 超时但进程还活着：不再判死（启动期容错），进入慢启动宽限
-        if (graceOnTimeout && nodeProcessAlive()) {
+        if (graceOnTimeout && nodeProcessAlive(ctx)) {
             onLog(">> dsh web 未在 ${timeoutMs / 1000}s 内就绪，但 node 进程仍在运行——冷启动较慢，继续等待")
             val graceStart = System.currentTimeMillis()
             val graceDeadline = graceStart + 120_000L
@@ -617,7 +625,7 @@ object DshFlow {
                     onLog("OK dsh web 已就绪（共等待 ${waitedTotal}s，属慢启动）")
                     return true
                 }
-                if (!nodeProcessAlive()) break
+                if (!nodeProcessAlive(ctx)) break
                 Thread.sleep(1_000)
             }
         }
@@ -626,18 +634,17 @@ object DshFlow {
         return false
     }
 
-    /** node 进程是否存活（ps 扫描；供启动等待做「进程死亡→提前失败」判定）。 */
-    private fun nodeProcessAlive(): Boolean = try {
-        val pb = ProcessBuilder("/system/bin/sh", "-c", "ps -A | grep '[n]ode'")
-        pb.redirectErrorStream(true)
-        val p = pb.start()
-        val alive = p.inputStream.bufferedReader().useLines { lines ->
-            lines.any { it.isNotBlank() }
-        }
-        p.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)
-        alive
+    /**
+     * 本应用 node 进程是否存活（供启动等待做「进程死亡→提前失败」判定）。
+     *
+     * P0 修复：原实现 `ps -A | grep '[n]ode'` 判定的是「输出是否有任何行」——
+     * 任何含 "node" 字样的无关行都会让判定恒真，于是「进程已死」的提前失败分支
+     * 永不触发，只能干等到超时。现委托 [NodeProcs] 按 argv0 精确归属判定。
+     */
+    private fun nodeProcessAlive(ctx: Context): Boolean = try {
+        NodeProcs.anyAlive(ctx)
     } catch (_: Throwable) {
-        // 探测本身失败时保守认为存活（不因工具缺失误判失败）
+        // 探测本身失败时保守认为存活（不因异常误判失败）
         true
     }
 
@@ -698,44 +705,23 @@ object DshFlow {
         }
     }
 
-    /** 杀掉全部 node 进程（web 与 flow 子进程一并结束），供更新后重启。 */
-    fun killAllNode(ctx: Context, onLine: (String) -> Unit = {}) {
-        runCatching {
-            // 用 [n]ode 避免 grep 匹配到自身；不用 xargs -r，兼容 Android toybox
-            val pb = ProcessBuilder(
-                "/system/bin/sh", "-c",
-                "ps -A | grep '[n]ode' | awk '{print \$2}' | while read pid; do kill \"\$pid\" 2>/dev/null; done"
-            )
-            pb.redirectErrorStream(true)
-            val p = pb.start()
-            p.inputStream.bufferedReader().useLines { lines ->
-                lines.forEach { line ->
-                    onLine(line)
-                    AppLog.i("DshFlow", line)
-                }
-            }
-            // SIGTERM 后必须限时收尾：node 收到 TERM 需要时间退出；不退则 SIGKILL 升级。
-            // 此前 waitFor() 无限阻塞——僵死 node 会让「更新后重启」链路永久挂起。
-            if (!p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) {
-                p.destroy()
-                if (!p.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) p.destroyForcibly()
-                // TERM 后仍存活的 node 升级为 KILL（残留进程会占用 3080 导致重启失败）
-                runCatching {
-                    val kb = ProcessBuilder(
-                        "/system/bin/sh", "-c",
-                        "ps -A | grep '[n]ode' | awk '{print \$2}' | while read pid; do kill -9 \"\$pid\" 2>/dev/null; done"
-                    )
-                    kb.redirectErrorStream(true)
-                    val kp = kb.start()
-                    kp.inputStream.use { }
-                    if (!kp.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)) kp.destroyForcibly()
-                }
-                AppLog.i("DshFlow", "node processes killed (SIGKILL escalation)")
-                return
-            }
-            AppLog.i("DshFlow", "node processes killed")
-        }
-    }
+    /**
+     * 杀掉全部本应用 node 进程（web 与 flow 子进程一并结束），供更新后重启。
+     *
+     * P0 修复（真机实证）：此前实现走
+     * `ps -A | grep '[n]ode' | awk '{print $2}'` —— 该列序假设来自桌面 procps，
+     * 而 Android toybox 的 `ps -A` 列序是 `PID TTY TIME CMD`，`$2` 命中 **TTY 列**，
+     * 解析结果恒为 `?`，kill 静默失败且退出码 0（终止链路全线失效：
+     * 残留 node 占住 3080 → 重启反复失败；安装超时后 npm/pnpm 孙进程被孤儿化）。
+     * 现委托 [NodeProcs]：读 `/proc/<pid>/cmdline` 按可执行文件绝对路径判定归属，
+     * 不依赖任何外部工具与输出列序。
+     *
+     * @return 是否全部已退出（此前无返回值，调用方无法判断清理是否真的成功）
+     */
+    fun killAllNode(ctx: Context, onLine: (String) -> Unit = {}): Boolean =
+        runCatching { NodeProcs.killAll(ctx, onLine) }
+            .onFailure { AppLog.e("DshFlow", "killAllNode failed: ${it.message}") }
+            .getOrDefault(false)
 
     /**
      * 同步执行命令（阻塞直到结束），返回退出码；输出通过 onLine 实时回调。

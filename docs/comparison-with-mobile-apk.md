@@ -144,6 +144,133 @@ PATH/LD_LIBRARY_PATH/HOME/PREFIX/TERMUX_VERSION/SHELL + 栅栏键）与 `dsh-and
 - **install-dsh.mjs**：已具备内容指纹（`contentFingerprint`）、子进程硬超时、
   OOM 判定、显式文件根契约，成熟度与参考项目相当，本轮无需改动。
 
+## 三点七、进程终止链路专项重构（review-r6，真机实证 P0）
+
+本轮与前三轮不同：**不是「借鉴参考项目的做法」，而是参考项目的坑位索引让我们去
+验证自己的工作区，从而挖出一个正在生效、且完全静默的 P0 缺陷。**
+
+### P0 实证：`killAllNode` 的 PID 解析在 Android toybox 上恒失效
+
+原实现：
+
+```sh
+ps -A | grep '[n]ode' | awk '{print $2}' | while read pid; do kill "$pid" 2>/dev/null; done
+```
+
+`awk '{print $2}'` 的列序假设来自桌面 procps（`PID USER …`），而 Android 自带
+toybox 的 `ps -A` 列序是 **`PID TTY TIME CMD`** → `$2` 命中的是 **TTY 列**。
+真机实测（本项目设备）：
+
+```
+$ ps -A | grep '[n]ode'
+  6310 ?        00:01:52 /data/user/0/com.dsh.launcher/files/node/bin/node
+$ ps -A | grep '[n]ode' | awk '{print $2}'
+  ?                                     ← 恒为 "?"
+$ ps -A | grep '[n]ode' | awk '{print $2}' | while read pid; do kill "$pid" 2>/dev/null; done
+                                        ← 静默失败，退出码 0
+```
+
+**为何长期未被发现**：三层静默叠加——`awk` 正常输出 `?`、`kill "?"` 失败但被
+`2>/dev/null` 吞掉、管道整体退出码仍为 0。日志只留下一行无害的
+「node processes killed」。
+
+**影响面**（6 个调用点全部失效）：残留 node 占住 3080 → 「重启 dsh」反复失败；
+`Proc` 安装类命令超时后 npm/pnpm 孙进程被孤儿化，继续写 node_modules 与下一轮安装并发。
+
+### 落地修复
+
+1. **新增 `core/NodeProcs.kt`（唯一进程入口）**：读 `/proc/<pid>/cmdline`（NUL 分隔
+   argv），按 **argv0 绝对路径**判定归属。不依赖 `ps` 输出格式、不依赖任何外部工具。
+   - 归属判定只认「与 binPath 完全一致」或其 `/data/data` ≡ `/data/user/0` 别名形式。
+     刻意拒绝宽松后缀匹配（`endsWith("/node/bin/node")` 会把
+     `/data/user/0/com.other.app/files/node/bin/node` 也算成自己人——误杀无关进程）。
+   - 发信号前**复核身份**（PID 可能被回收给无关进程），复核失败视为已达成目的。
+   - `killAll` 阻塞等待真实退出（SIGTERM → 5s → 存活者 SIGKILL → 3s），
+     **返回是否全部退出**——原实现无返回值，调用方无法判断清理是否真的成功。
+2. **`nodeProcessAlive` 同源化**：原判定是「`ps | grep node` 输出是否有任何行」，
+   任何含 `node` 字样的无关行都让判定恒真 → 「进程已死→提前失败」分支永不触发，
+   只能干等到超时。现走 `NodeProcs.anyAlive`。
+3. **`MainActivity.stopDshAll` 去掉 `pkill -f`**：模式串出现在执行它的 `sh -c`
+   **自身 cmdline** 里，真机实测 `pgrep -f 'bin.js'` 会一并吐出执行命令的 bash PID
+   （自杀隐患）；且参考坑 31 记录部分 ROM 上 `pkill -f` 完全不生效，原代码还用
+   `; true` 吞掉失败。现统一走 `DshFlow.killAllNode`。
+4. **连带修掉一个由本次修复引入的 ANR 风险**：`killAllNode` 现在**真的会阻塞**
+   （最多约 8s），而 `MainActivity.confirmRollback` 的调用点在 AlertDialog 点击回调里
+   = 主线程。已移到后台线程，杀净后回主线程 `beginFlow`。
+
+### 反向验证（门禁必须见过它失败）
+
+`NodeProcsTest` 覆盖：cmdline NUL 切分（含无末尾 NUL、空 cmdline、文件不存在）、
+归属判定（精确路径 / `/data/data` 别名 / 裸 `node` / 其它应用同后缀路径 / 空 argv0）、
+别名双向互转、无 node 时 `killAll` 幂等成功。
+
+## 三点八、ABI 门禁（review-r6，对齐参考坑 18/30）
+
+参考项目两次真机重大事故均由**错 ABI 运行时**造成：debug 包内是 x86_64 快照，
+装到 arm64 真机覆盖后引擎崩——`EM_X86_64 (62) instead of EM_AARCH64 (183)`；
+以及「双 ABI 循环打包后 assets 停在最后一个 ABI」。
+
+**本项目对应风险**：内置 node 经 **Git LFS** 分发，文件名写死
+`termux-node-aarch64.tar.gz`，但**文件名不是事实**，且工作区此前**无任何 ABI 校验**。
+
+新增 `tools/check-asset-abi.cjs`：读归档内 `bin/node` 的 ELF 头 `e_machine`，
+与文件名声明的 ABI 双向核对。接入 `ci.yml` 与 `build-apk.yml`。
+
+- **未拉取 LFS 时输出 SKIP 而非失败**（133 字节指针文件被识别），避免假警报；
+  CI 两 workflow 均已带 `lfs: true`。
+- **双向反向验证**：构造 x86_64 内容 + aarch64 文件名的 tar → 门禁 `exit=1` 并给出
+  「实际 0x3e (x86_64) ≠ 文件名声明 aarch64 (0xb7)，参考坑 18/30」；换成 aarch64 内容
+  → PASS。gzip 与明文 tar 两条路径都实测通过。
+- 设备侧交叉证据：真机 node `e_machine=0xb7 (aarch64)`，设备 ABI `arm64-v8a`。
+
+## 三点九、symlink 白名单与模板双源（review-r6）
+
+### symlink 目标白名单（新增 `core/SymlinkPolicy.kt`，对齐参考坑 45）
+
+参考坑 45 的教训是**双向**的：既要拒绝越界目标，也不能误伤合法的绝对链接
+（其严格版校验只放行 `dest`，导致暂存解压时**静默丢弃** 9 个指向自身运行时的 applet）。
+
+`SymlinkPolicy.classify`：相对目标以链接所在目录为基准规范化后必须仍在**解压根**内；
+绝对目标必须落在**本应用数据目录**内。
+
+**关键细节**：`appRoot` 取 `context.dataDir` 而非 `filesDir`——短前缀链接
+`<dataDir>/t -> <filesDir>/termux/usr` 与官方镜像 `<dataDir>/data/data/...` 都建在
+应用数据根上；只放行 `filesDir` 会误拒指向自身运行时的合法链接，正是坑 45 的形态。
+
+`isWithin` 按**路径段**比较而非字符串前缀（`/ab` 不在 `/a` 之内，但 `startsWith` 会误判为真，
+与参考坑 1「realpath 前缀混用」同族）。纯函数设计，`SymlinkPolicyTest` 穷举边界。
+
+被拒条目**计数并落日志**——静默丢弃会让「归档损坏/被篡改」完全无感。
+
+### 启动脚本模板双源一致性（新增 `LauncherTemplateTest`）
+
+`DshFlow` 渲染 web 启动脚本时对模板做四次 `replace("@TOKEN@", …)`，资产缺失则退回
+`DEFAULT_WEB_LAUNCHER_TPL`。**两份模板是同一契约的两个源**：任一方缺令牌，渲染
+**不报错**，而是把 `@TOKEN@` 原样留在脚本里（如漏 `@EXPORTS@` → 引擎缺环境变量起不来）。
+测试锁定两源占位符集合一致 + 与渲染逻辑消费的四个令牌一一对应 + 兜底模板的必要结构
+（shebang / `cd @HOME@` / `nohup` / 日志重定向）。
+
+## 三点十、Kotlin 静态预检升级（review-r6）
+
+`tools/bracecheck-edited.cjs` 从「硬编码文件列表 + 非嵌套注释模型」升级为全量递归扫描，
+并**修正了一个关于本项目历史 bug 的错误认知**：
+
+- 此前把两次编译失败（`5cf987d`、`d617620`，`patched/**`）归因为「终止符提前结束注释」。
+  实测提取修复前的文件字节后确认真因是：**Kotlin 块注释可嵌套**——KDoc 正文里的
+  `/**` 序列**打开了一层嵌套注释**，本该结束 KDoc 的终止符只关掉内层，外层继续
+  **吞掉后续代码**直到下一个终止符，于是报 `Missing '}'` / `Unclosed comment`。
+- 门禁按 Kotlin 语义按嵌套深度扫描，报告未闭合与深度 >1 的位置。
+  **反向验证**：对修复前的历史文件精准报出 `braces=1`（正是 CI 报的缺失 `}`）与
+  「深度 2，首个起始行 369」。
+- 误报治理：初版启发式（「注释结束后同行仍有内容」）会把合法的
+  `{ /* 日志走 flow */ }` 判为违规（实测 2 处误报），已弃用该启发式改为嵌套深度判据；
+  嵌套起始行只报**首个**（其后各行都是被吞进注释的正常 KDoc）。
+- **本工具自身的注释也踩了这个坑两次**（编写时实测），可见隐蔽性——已写入约定。
+
+> 元教训：**「文档记录的根因」也可能是错的**。本轮通过提取历史版本字节做对照实验，
+> 纠正了前一轮自己写下的错误归因。经验证的门禁必须能对**真实的已知坏输入**报错，
+> 而不是只对构造样例报错。
+
 ## 四、后续重构排期建议（未落地）
 
 1. **P2**：`BridgeOverlayManager.kt`（1287 行）按「窗口管理/状态机/交互」三块拆分——参考项目 OverlayService(712)/OverlayPanel(837)/OverlayController 分层值得照抄。
@@ -152,22 +279,31 @@ PATH/LD_LIBRARY_PATH/HOME/PREFIX/TERMUX_VERSION/SHELL + 栅栏键）与 `dsh-and
    脚本级恢复通道（list/restore/safe-mode/boot-state）。工作区已有 BackupManager 的 zip
    备份/恢复，缺的是「不经 dsh、不经 Android UI 也能跑」的那一层。
 4. **P3**：引入 `UndoGate` 式快照回撤（备份 zip 机制已具备，差「自动触发+恢复+验证」闭环）。
-5. **P3**：补 `SnapshotExtractor` 式 symlink 目标白名单——`NodeRuntime.createSymlink` 目前失败静默降级为空文件，可加「目标必须在 dir 内」校验（本资产自控风险低，仅为纵深防御）。
+5. ~~**P3**：补 symlink 目标白名单~~ → **review-r6 已落地**（`core/SymlinkPolicy.kt` + 接入解压 + 测试）。
+6. **P3**：`BackupManager.restore` 的 `isSafeRel` 已挡路径穿越，但可加「恢复前校验归档内
+   符号链接目标」与「恢复失败可回退」——当前 restore 是合并覆盖、无事务（参考项目
+   SnapshotTransaction 的关注点，npm 模式下对应物是备份 zip 的回滚）。
 
 ## 五、验证说明
 
 设备端无 JDK/Android SDK，无法本地执行 `gradlew` 编译与单测；验证通过三级门禁完成：
-- **本地静态**：括号平衡（`tools/bracecheck-edited.cjs`）、KDoc 提前终止扫描、
-  载荷字节级一致性比对（`tools/verify-payload-extraction.cjs`）
+- **本地静态**：`tools/bracecheck-edited.cjs`（全量 .kt 括号平衡 + Kotlin 嵌套注释扫描）、
+  `tools/check-asset-abi.cjs`（ELF 架构）、载荷字节级一致性比对
+  （`tools/verify-payload-extraction.cjs`）
 - **资产脚本门禁**：`tools/check-asset-scripts.cjs`（本地 + CI 双跑，含故意写坏载荷的
   反向验证）
-- **CI 端**：`ci.yml` 编译门禁 + 单测门禁（65 测试）在 GitHub Actions 上真实执行；
+- **CI 端**：`ci.yml` 编译门禁 + 单测门禁在 GitHub Actions 上真实执行；
   `build-apk.yml` 产出 debug APK
 
-> 注：本文件记录的三轮改动（P0/P1 防御性修补 → 环境链路单源化 → 脚本层载荷外置）
-> 全部经 CI 验证。过程中 CI 抓到本模型引入的 3 个缺陷：`progressBar` 局部变量作用域、
-> 单源一致性测试基准漏参、KDoc 内 `patched/**` 提前终止注释块——均由门禁拦截后修复，
-> 佐证「编译/单测/资产门禁」在设备端无 JDK 场景下的不可替代性。
+**本轮新增门禁**：ABI 门禁、Kotlin 静态预检接入 CI（均在 gradle 之前，最先卡关）。
+
+> 注：本文件记录的四轮改动（P0/P1 防御性修补 → 环境链路单源化 → 脚本层载荷外置 →
+> 进程终止链路/ABI/符号链接）全部经 CI 验证。过程中门禁抓到本模型引入的多个缺陷：
+> `progressBar` 局部变量作用域、单源一致性测试基准漏参、KDoc 内 `patched/**` 触发嵌套注释、
+> 本轮 `NodeProcs` 初版宽松后缀匹配（会被自己的单测抓出，会让
+> `/data/user/0/com.other.app/files/node/bin/node` 误判为自己人）、
+> `killAllNode` 变阻塞后在主线程回调里的 ANR 风险——均由门禁/自测拦截后修复，
+> 佐证「编译/单测/静态门禁」在设备端无 JDK 场景下的不可替代性。
 
 ## 六、改动文件清单
 
@@ -192,4 +328,19 @@ PATH/LD_LIBRARY_PATH/HOME/PREFIX/TERMUX_VERSION/SHELL + 栅栏键）与 `dsh-and
 - `.github/workflows/ci.yml`、`.github/workflows/build-apk.yml`（资产脚本门禁）
 - `tools/check-asset-scripts.cjs`、`tools/migrate-stub-payloads.cjs`、
   `tools/verify-payload-extraction.cjs`、`tools/bracecheck-edited.cjs`
+
+### review-r6（进程终止链路 / ABI / 符号链接 / 静态预检）
+- `app/src/main/java/com/dsh/launcher/core/NodeProcs.kt`（**新增**，进程枚举与终止唯一入口）
+- `app/src/main/java/com/dsh/launcher/core/SymlinkPolicy.kt`（**新增**，解压期链接目标白名单）
+- `app/src/main/java/com/dsh/launcher/core/DshFlow.kt`（killAllNode 委托 NodeProcs 并返回 Boolean、
+  nodeProcessAlive 同源化、killAllNode 调用点注释）
+- `app/src/main/java/com/dsh/launcher/core/NodeRuntime.kt`（接入 SymlinkPolicy、appRoot=dataDir、
+  链接创建失败落日志）
+- `app/src/main/java/com/dsh/launcher/ui/MainActivity.kt`（stopDshAll 去 pkill -f、
+  confirmRollback 移出主线程避免 ANR）
+- `app/src/test/java/com/dsh/launcher/core/{NodeProcsTest,SymlinkPolicyTest,LauncherTemplateTest}.kt`（**新增**）
+- `tools/check-asset-abi.cjs`（**新增**，ELF 架构门禁）、`tools/bracecheck-edited.cjs`（重写：
+  全量递归 + Kotlin 嵌套注释语义）
+- `.github/workflows/ci.yml`（ABI 门禁 + Kotlin 静态预检）、`.github/workflows/build-apk.yml`（ABI 门禁）
+- `AGENTS.md`（**新增**，开发地图索引主文件）、`docs/AGENTS/gotchas.md`（**新增**，9 条坑登记）
 

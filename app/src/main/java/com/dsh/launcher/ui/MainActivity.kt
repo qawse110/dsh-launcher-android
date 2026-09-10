@@ -543,8 +543,15 @@ class MainActivity : AppCompatActivity() {
                 // 自动回滚已触发过时它返回 false 且不置 tag，随后安装会用默认钉死版本
                 // 把临时版本原样装回（「假回滚」）。手动回滚必须强制生效。
                 DshUpdater.forceRollbackTag(this, prev)
-                DshFlow.killAllNode(this) { }
-                beginFlow(DshFlow.Mode.INSTALL_AND_START, forceFullInstall = true)
+                // killAllNode 会阻塞等待 node 真正退出（SIGTERM → 限时 → SIGKILL 升级，
+                // 最多约 8s）。这里在 AlertDialog 点击回调里 = 主线程，直接调用会 ANR。
+                // 放到后台线程，杀净后再回主线程起流程（beginFlow 是 UI 操作）。
+                thread {
+                    DshFlow.killAllNode(this@MainActivity) { }
+                    runOnUiThread {
+                        beginFlow(DshFlow.Mode.INSTALL_AND_START, forceFullInstall = true)
+                    }
+                }
             }
             .setNegativeButton("取消", null)
             .show()
@@ -901,16 +908,15 @@ class MainActivity : AppCompatActivity() {
     private fun stopDshAll() {
         appendMiniLog("▶ 正在停止 dsh 相关进程…")
         thread {
-            try {
-                val pb = ProcessBuilder(
-                    "/system/bin/sh", "-c",
-                    "pkill -f 'dsh/lib/bin.js web'; pkill -f 'bin.js web'; pkill -f 'src/bin.ts'; true"
-                )
-                pb.redirectErrorStream(true)
-                pb.start().waitFor()
-            } catch (t: Throwable) {
-                android.util.Log.w("DshMain", "kill failed: ${t.message}")
-            }
+            // P0 修复：原实现走 `pkill -f 'dsh/lib/bin.js web'`，两处隐患：
+            // ① 模式串出现在执行它的 `sh -c` 自身 cmdline 里，pkill 会连父 shell 一起
+            //    匹配（真机实测：`pgrep -f 'bin.js'` 同时吐出了执行命令的 bash PID）；
+            // ② 部分 ROM 上 `pkill -f` 疑似完全不生效（参考实现坑 31 vivo 实锤），
+            //    且失败被 `; true` 静默吞掉。
+            // 现统一走 [DshFlow.killAllNode] → NodeProcs：按 /proc/<pid>/cmdline 的
+            // argv0 精确归属判定，无模式匹配歧义、无误杀。
+            val ok = DshFlow.killAllNode(this@MainActivity) { line -> android.util.Log.i("DshMain", line) }
+            if (!ok) appendMiniLog("! 部分 node 进程未能退出（详见日志）")
             runOnUiThread {
                 BuildKeepAliveService.markStopped(this@MainActivity)
                 runCatching { stopService(Intent(this@MainActivity, BuildKeepAliveService::class.java)) }

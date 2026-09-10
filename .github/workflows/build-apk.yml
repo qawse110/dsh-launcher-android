@@ -29,6 +29,12 @@ jobs:
       - name: Asset scripts gate（脚本语法 + 载荷完整性）
         run: node tools/check-asset-scripts.cjs
 
+      # ABI 门禁：打包前核对内置 node 归档的 ELF 架构与文件名声明一致。
+      # 这是本轮最要紧的一道——错 ABI 的包装到真机是「引擎启动即崩」
+      # 而非「功能缺失」，且 debug/release 都受影响（参考坑 18/30）。
+      - name: ABI gate（内置 node ELF 架构核对）
+        run: node tools/check-asset-abi.cjs
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:

@@ -30,6 +30,7 @@ object NodeRuntime {
         "node/termux-node-aarch64.tar.gz" // 原始打包名
     )
     private const val DIR = "node"
+    private const val TAG_NODE = "NodeRuntime"
 
     @Synchronized
     fun ensureExtracted(context: Context): File {
@@ -43,16 +44,21 @@ object NodeRuntime {
         // 导致后续覆写 EACCES。先递归恢复可写，再清空，保证全新解压。
         cleanupDir(dir)
         var opened = false
+        // 白名单基准取 **dataDir** 而非 filesDir：短前缀链接
+        // `<dataDir>/t -> <filesDir>/termux/usr` 与官方镜像 `<dataDir>/data/data/...`
+        // 都建在应用数据根上。若只放行 filesDir，指向自身运行时的合法绝对链接会被
+        // 误拒——这正是参考实现坑 45 记录的事故形态（9 个 applet 被静默丢弃）。
+        val appRoot = context.dataDir
         try {
             val stream = openAsset(context)  // 已去除 gzip 头
             opened = true
-            stream.use { raw -> extractTar(dir, raw) }
+            stream.use { raw -> extractTar(dir, raw, appRoot) }
             // 兼容“外层 tar 包着真实 node tar”的资产：资产里只有一个 *.tar 时，
             // 把它再解包一次，得到 bin/ lib/ 等真实运行时目录。
             if (!File(dir, "bin/node").isFile) {
                 val nested = dir.listFiles()?.firstOrNull { it.isFile && it.name.endsWith(".tar") }
                 if (nested != null) {
-                    java.io.FileInputStream(nested).use { extractTar(dir, it) }
+                    java.io.FileInputStream(nested).use { extractTar(dir, it, appRoot) }
                     nested.delete()
                 }
             }
@@ -77,8 +83,14 @@ object NodeRuntime {
         return dir
     }
 
-    /** 把 tar 流解压到 dir；处理目录、符号链接与 W^X 可执行位。 */
-    private fun extractTar(dir: File, raw: InputStream) {
+    /**
+     * 把 tar 流解压到 dir；处理目录、符号链接与 W^X 可执行位。
+     *
+     * @param appRoot 本应用数据目录——符号链接的**绝对**目标必须落在其内才放行
+     *   （见 [SymlinkPolicy]；对齐参考实现坑 45 的白名单语义）。
+     */
+    private fun extractTar(dir: File, raw: InputStream, appRoot: File) {
+        var rejected = 0
         TarArchiveInputStream(raw).use { tar ->
             var e: TarArchiveEntry? = tar.nextEntry
             while (e != null) {
@@ -94,8 +106,23 @@ object NodeRuntime {
                 } else if (e.isSymbolicLink) {
                     // Termux 包大量使用符号链接（libcrypto.so -> libcrypto.so.3）。
                     // 必须真实创建符号链接，否则会写成 0 字节空文件导致动态库加载失败。
-                    out.parentFile?.mkdirs()
-                    createSymlink(out, e.linkName)
+                    // 目标白名单：既拒绝逃逸（../../、/data/data/com.termux/...），
+                    // 也放行合法的「指向本应用运行时根」绝对链接（坑 45 的 9 个 applet）。
+                    when (val d = SymlinkPolicy.classify(
+                        linkPath = out.absolutePath,
+                        target = e.linkName ?: "",
+                        extractRoot = dir.absolutePath,
+                        appRoot = appRoot.absolutePath,
+                    )) {
+                        is SymlinkPolicy.Decision.Allow -> {
+                            out.parentFile?.mkdirs()
+                            createSymlink(out, e.linkName!!)
+                        }
+                        is SymlinkPolicy.Decision.Reject -> {
+                            rejected++
+                            AppLog.i(TAG_NODE, "symlink rejected: $name -> ${e.linkName}（${d.reason}）")
+                        }
+                    }
                 } else {
                     out.parentFile?.mkdirs()
                     val fos = java.io.FileOutputStream(out)
@@ -110,6 +137,10 @@ object NodeRuntime {
                 }
                 e = tar.nextEntry
             }
+        }
+        // 拒绝计数上报：这是**外部输入被拦截**的信号，静默会掩盖归档损坏或被篡改
+        if (rejected > 0) {
+            AppLog.i(TAG_NODE, "symlink policy rejected $rejected entries（越界目标，可能是归档损坏）")
         }
     }
 
@@ -155,12 +186,20 @@ object NodeRuntime {
         }
     }
 
-    /** 创建符号链接；若失败（如目标相对且超界）则退化为空文件避免中断，由启动阶段兜底。 */
+    /**
+     * 创建符号链接。
+     *
+     * 调用方须先经 [SymlinkPolicy] 放行（目标越界不得走到这里）。创建本身仍可能失败
+     * （FUSE/ROM 限制），此时退化为空文件以免中断整体解压——但**必须留日志**：
+     * 空文件替换动态库链接会导致后续 `CANNOT LINK ... library not found` 这类
+     * 与根因相距甚远的报错（参考实现坑 22 的同族现象）。
+     */
     private fun createSymlink(link: File, target: String) {
         try {
             if (link.exists()) link.delete()
             java.nio.file.Files.createSymbolicLink(link.toPath(), java.nio.file.Paths.get(target))
         } catch (t: Throwable) {
+            AppLog.i(TAG_NODE, "createSymbolicLink failed (${link.name} -> $target): ${t.message}；退化为空文件")
             runCatching { link.createNewFile() }
         }
     }
