@@ -570,6 +570,68 @@ bash 整体不可用**。故门禁核对：disable/insert 成对、均限定平�
 > 区分「刻意差异」与「漂移」；刻意差异整理后必须变成显式参数+注释，
 > 而不是继续依赖「两份代码各自碰巧一样」。
 
+## 三点十五、无风险验证（review-r11，隔离进程实测）
+
+要求：**不触碰运行中的系统**。全部验证都在独立进程 + 隔离目录里完成，
+实机 profile 与运行中的引擎始终未被修改（收尾已确认 `cordis.patch.yml` 仍为 `[]`）。
+
+### ★ 挖出一个致命自身缺陷：`!!js` 裸反引号 → dsh 启动即崩
+
+用 `dsh --patch <file> --dump-config` 验证 r9 的 `cordis.patch.yml`：
+
+```
+Error: dsh: failed to parse overlay …: YAMLException: cannot resolve a node
+       with !<tag:yaml.org,2002:js> explicit tag (35:24)
+```
+
+错误指向第 35 行（`bashPath`），而第 33 行的 `!!js` 同文件同 schema 却成功——
+差异只有**反引号**。最小对照（js-yaml 4.3.2 + dsh-app-boot 同款 schema）：
+
+| 写法 | 结果 |
+|---|---|
+| `!!js process.platform !== 'android'` | ✓ |
+| `` !!js `${X}/bin/bash` ``（**裸反引号**） | ✗ **解析失败** |
+| `!!js "\`${X}/bin/bash\`"`（引号包裹） | ✓ |
+
+**YAML 规范里 `` ` `` 是保留指示符**，不能作裸标量首字符。而 `dsh-app-boot` 的
+patch 解析**失败即抛**——后果不是「表达式没生效」，而是 **dsh 起不来**。
+**即 r9 若按原样装配会直接启动失败。**
+
+**修复**：改用字符串拼接 `!!js (process.env.PREFIX ?? '') + '/bin/bash'`。
+**门禁**：`check-plugin-contract.cjs` §H ⑦ 拒绝裸反引号（反向验证：改回即拦下）。
+**验收**：`--patch --dump-config` 由 `exit=1` 变为 **`exit=0`，`shell-termux` 出现，
+且 `bash-sandbox` 的 `disabled` 被成功改写为 `process.platform === 'android'`**。
+
+### ★ 把 r9 的 fail-closed 从「推断」升级为「实测」
+
+r9 的核心主张此前只是**读源码推断**（`PLATFORM_CHAINS` 无 android）。本轮三态实测：
+
+| 状态 | provider | `workspace-write` 下执行结果 |
+|---|---|---|
+| ① 现状（默认执行器） | `SandboxBashExecutor` | ✗ **`SandboxUnavailableError`**——根本跑不了 |
+| ② 本机历史会话（`danger-full-access`） | `SandboxBashExecutor` | ✓ 能跑，但 `git` → **`CANNOT LINK libpcre2-8.so`** |
+| ③ 修复后（`dsh-shell-termux`） | `TermuxBashExecutor` | ✓ **`git version 2.55.0`** |
+
+**②是新增证据**：即便绕开 fail-closed，环境缺口仍真实存在——两个缺陷在真机上同时复现，
+且在 ③ 同时消失。③ 还在**清空进程 `PATH`/`PREFIX`/`LD_LIBRARY_PATH` 后仍正常**，
+证明环境注入是自包含的。
+
+### 落地布局验证（CI 覆盖不到的部分）
+
+把插件复制到 `files/plugins/<dir>` 形态（与 `install-dsh.mjs` 的真实落地一致）后
+import 成功、`inject`/类/方法面齐备；`cordis.patch.yml` 的 `!!js` 条件经
+dsh 同款 schema 求值结果正确（`bash-sandbox` 禁用、`shell-termux` 生效、
+`bashPath` 正确展开为 `<PREFIX>/bin/bash`）。
+
+### 顺带澄清（避免误记）
+
+排查中我一度以为 `entryListSchema` 不支持 `!!js`——那是**测试脚手架的假象**：
+js-yaml 的 schema 字段是 `explicit`（不是 `tags`），且 CJS `require` 与 ESM
+`import * as` 拿到的导出结构不同。用正确的复刻方式后，
+`JSON_SCHEMA.extend(JsExpr)` 工作正常（`explicit` 3→4）。
+**教训：验证工具本身出错时，症状与被测对象出错完全一样**——此时要换用
+「被测系统自带的入口」（`dsh --patch --dump-config`）来仲裁。
+
 ## 四、后续重构排期建议（未落地）
 
 1. **P2**：`BridgeOverlayManager.kt`（1287 行）按「窗口管理/状态机/交互」三块拆分——参考项目 OverlayService(712)/OverlayPanel(837)/OverlayController 分层值得照抄。
@@ -706,3 +768,9 @@ bash 整体不可用**。故门禁核对：disable/insert 成对、均限定平�
 - `app/src/test/java/com/dsh/launcher/core/LocalHttpTest.kt`（**新增**，BridgeStatus 解析契约
   + LocalHttp 降级语义，含 Robolectric runner）
 - `docs/AGENTS/gotchas.md`（新增 §15 `org.json` 桩陷阱、§16 结构整理方法）
+### review-r11（无风险验证：隔离进程实测）
+- `app/src/main/assets/extra-plugins/dsh-shell-termux/cordis.patch.yml`（**修致命缺陷**：
+  `!!js` 裸反引号 → 改字符串拼接；补写法警示注释）
+- `tools/check-plugin-contract.cjs`（§H ⑦ **新增裸反引号检查**，反向验证可拦下）
+- `docs/AGENTS/gotchas.md`（**新增 §17**：`!!js` 反引号陷阱 + 用 `--patch --dump-config`
+  作权威验证入口）

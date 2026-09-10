@@ -88,6 +88,12 @@ export OPENSSL_CONF=/dev/null
   = true`）→ `JSONObject` 构造后任何 `optXxx` 抛 NPE。**碰 android 类的单测一律带
   `@RunWith(RobolectricTestRunner::class)`**（本仓 8 个测试类的既有约定）。
   识别信号：NPE 堆栈指向 android 类**内部**而非被测代码。详见 gotchas §15。
+- **坑 16**（★致命）：`cordis.patch.yml` 里 `!!js` 表达式**不得以裸反引号开头**——
+  YAML 里 `` ` `` 是保留指示符，js-yaml 报 `cannot resolve a node with …js`，
+  而 dsh 的 patch 解析**失败即抛** → **dsh 启动即崩**（不是"表达式没生效"）。
+  用字符串拼接：`!!js (process.env.X ?? '') + '/bin/y'`。
+  **改任何 patch 后立即用 `dsh --patch <file> --dump-config` 验证**（只解析不启动，
+  零风险，且是唯一权威判定）。详见 gotchas §17。
 
 ## 4. 详档路由表
 
@@ -167,3 +173,7 @@ export OPENSSL_CONF=/dev/null
 19. **改 `ctx.shell` 装配面须跑装配门禁**：`dsh-shell-termux` 以唯一 provider 身份
     替换默认执行器，写错的后果是「bash 整体不可用」（比原缺陷更糟）。
     任何 disable/insert/坐标/继承改动后跑 `check-plugin-contract.cjs` 的 §H。
+20. **改任何 `cordis.patch.yml` 后用 dsh 自己验证**：
+    `dsh --patch <file> --dump-config`（只解析、不启动引擎，零风险）。
+    这是判定 patch 能否被接受的**唯一权威**方式——`!!js` 反引号那类陷阱
+    所有静态检查都看不见，而 dsh 的 patch 解析**失败即抛**（= 启动失败）。见坑 16。

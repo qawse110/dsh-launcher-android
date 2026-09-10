@@ -27,12 +27,21 @@
   disabled: !!js process.platform === 'android'
 
 # 安卓：插入 Termux 原生执行器，独占提供 ctx.shell
+#
+# ⚠️ `!!js` 表达式**不得以裸反引号开头**：YAML 规范里 `` ` `` 是保留指示符，
+#    作裸标量首字符时 js-yaml 报 `cannot resolve a node with !<tag:yaml.org,2002:js>`。
+#    这台机器的实测（js-yaml 4.3.2 + dsh-app-boot 的 entryListSchema）：
+#      `bashPath: !!js \`\${X}/bin/bash\``   → 解析失败（dsh 启动即崩）
+#      `bashPath: !!js "\`\${X}/bin/bash\`"` → 正常
+#      `bashPath: !!js X + '/bin/bash'`      → 正常（推荐，无需模板串）
+#    故此处一律用**字符串拼接**，避免模板串与引号嵌套两层坑。
+#    门禁 tools/check-plugin-contract.cjs §H 会拒绝裸反引号写法。
 - insert:
     - id: shell-termux
       name: '@dsh-external/dsh-shell-termux'
       disabled: !!js process.platform !== 'android'
       config:
-        bashPath: !!js `${process.env.PREFIX ?? ''}/bin/bash`
+        bashPath: !!js (process.env.PREFIX ?? '') + '/bin/bash'
         prefix: !!js process.env.PREFIX ?? ''
         home: !!js process.env.HOME ?? ''
         cwd: !!js process.env.HOME ?? ''

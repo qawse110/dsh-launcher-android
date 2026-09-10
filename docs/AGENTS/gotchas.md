@@ -618,3 +618,65 @@ review-r10 把三处重复实现收敛到单点（环境构造 / 本地 HTTP / �
 
 **新增的结构不变量要写成测试**：本轮加了「三处环境对共享键取值一致」——
 新增消费方漏键会立刻失败（`LANG` 那种漂移不可能再发生）。
+
+---
+
+## 17. ★ `cordis.patch.yml` 里 `!!js` 用**裸反引号**开头 → dsh 启动即崩（review-r11 实测）
+
+**本轮最严重的自身缺陷**——由「无风险验证」逐层实测挖出。它不是「表达式没生效」，
+而是 **dsh 整个起不来**。
+
+### 症状与定位过程
+
+用 `dsh --patch <file> --dump-config` 验证 `dsh-shell-termux` 的 patch 时：
+
+```
+Error: dsh: failed to parse overlay .../cordis.patch.yml:
+  YAMLException: cannot resolve a node with !<tag:yaml.org,2002:js> explicit tag (35:24)
+```
+
+**注意错误指向第 35 行**（`bashPath`），而第 33 行的 `!!js` 是同文件、同 schema
+却成功了 —— 差异只有一个：**反引号**。
+
+### 根因（最小对照实验，js-yaml 4.3.2 + dsh-app-boot 同款 schema）
+
+| 写法 | 结果 |
+|---|---|
+| `!!js process.platform !== 'android'` | ✓ 正常 |
+| `` !!js `${X}/bin/bash` `` （**裸反引号开头**） | ✗ **`cannot resolve a node with …js`** |
+| `!!js "\`${X}/bin/bash\`"`（引号包裹） | ✓ 正常 |
+| `` bashPath: `${X}/bin/bash` ``（无反引号包裹也无 `!!js`） | ✗ `bad indentation of a mapping entry` |
+
+**YAML 规范里 `` ` `` 是保留指示符**，不能作裸标量的首字符。js-yaml 因此无法
+把它识别为普通字符串，`!!js` 的 scalar 解析随之失败。
+
+**为何后果特别严重**：`dsh-app-boot` 的 `parsePatchList` / `loadOptionalPatches`
+用 `yaml.load(content, { schema: entryListSchema })` 且**解析失败即 `throw`**
+（`failed to parse overlay/config …`）——patch 层在 boot 早期读取，
+**解析失败 = boot 失败 = dsh 起不来**。
+
+### 修复与约定
+
+改用**字符串拼接**，彻底绕开「模板串 + 引号」两层嵌套：
+
+```yaml
+bashPath: !!js (process.env.PREFIX ?? '') + '/bin/bash'   # ✓
+# 不要写： !!js `${process.env.PREFIX ?? ''}/bin/bash`     # ✗ 裸反引号
+```
+
+### 门禁
+
+`tools/check-plugin-contract.cjs` §H ⑦：扫描 `cordis.patch.yml` 中
+`/!!js\s+`/` 形态即失败，并给出可复制的正确写法。
+**反向验证**：把修复版改回裸反引号 → 门禁拦下并精确指向行号；恢复后通过。
+
+### 教训（验证方法论）
+
+这个缺陷**所有静态门禁都抓不到**，也不是代码逻辑问题——它只存在于
+**「YAML 解析器 × YAML 规范 × dsh 的解析入口」三者交叉处**。
+能抓到它只有一个原因：**用 dsh 自己提供的解析入口（`--patch` + `--dump-config`）
+真跑了一遍**，而不是「我读代码觉得应该没问题」。
+
+**推广**：凡是要往 `cordis.patch.yml` / profile 配置里写「平台条件或环境变量表达式」，
+一律先用 `dsh --patch <file> --dump-config` 验证能被 dsh 接受——
+这是**唯一权威**的判定方式，且完全无风险（只解析、不启动引擎）。

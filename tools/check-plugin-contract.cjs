@@ -385,6 +385,28 @@ function checkShellTermuxContract() {
     fail('插件未继承 LocalBashExecutor —— 自行实现会丢掉超时/输出上限/进程组终止等已有语义')
   }
   note('shell-termux 装配契约：disable bash-sandbox + insert 本插件 + 三坐标齐备 + inject/继承 均正确')
+
+  // ⑦ `!!js` 表达式不得以**裸反引号**开头（真机实测：会让 dsh 启动失败）
+  //
+  // YAML 规范里 `` ` `` 是**保留指示符**，作裸标量首字符时 js-yaml 报
+  // `cannot resolve a node with !<tag:yaml.org,2002:js>`。而 dsh 的 patch 解析
+  // （dsh-app-boot 的 parsePatchList / loadOptionalPatches）用的是带 js tag 的
+  // schema 且**解析失败即抛出** —— 后果不是「表达式没生效」，而是 **dsh 启动失败**。
+  //
+  // 本项被真实踩到：初版写的
+  //   bashPath: !!js ` + '`${process.env.PREFIX ?? \'\'}/bin/bash`' + `
+  // 实测（js-yaml 4.3.2 + dsh-app-boot 同款 schema）：
+  //   裸反引号开头 → 解析失败；引号包裹 / 字符串拼接 → 正常。
+  // 约定：一律用字符串拼接，避免模板串 + 引号两层嵌套。
+  yml.split('\n').forEach((line, idx) => {
+    if (/!!js\s+`/.test(line)) {
+      fail(
+        `cordis.patch.yml 第 ${idx + 1} 行：!!js 表达式以裸反引号开头 —— ` +
+          `YAML 里反引号是保留指示符，js-yaml 会拒绝解析，导致 dsh 启动失败。` +
+          `改用字符串拼接，例如：!!js (process.env.X ?? '') + '/bin/y'`,
+      )
+    }
+  })
 }
 
 checkSyntax()
