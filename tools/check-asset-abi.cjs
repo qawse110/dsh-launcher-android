@@ -64,45 +64,75 @@ function isLfsPointer(buf) {
   return buf.length < 1024 && buf.toString('utf8', 0, 40).startsWith('version https://git-lfs.github.com/spec/')
 }
 
-/** 从 tar.gz / tar 归档中抽取 bin/node 的前 20 字节（ELF 头 + e_machine 所在偏移）。 */
-function extractNodeHeader(path) {
-  // 优先用系统 tar（CI ubuntu 与本地 Termux 都有）；失败再退回纯 JS 扫描
+/**
+ * 是否为 ELF 魔数开头。
+ */
+function isElf(buf) {
+  return !!buf && buf.length >= 4 && buf.readUInt32LE(0) === ELF_MAGIC
+}
+
+/** 取归档内 `bin/node` 的前 20 字节；不存在或失败返回 null。 */
+function tryExtractBinNode(path) {
   try {
-    const out = execFileSync('tar', ['-xOf', path, 'bin/node'], {
+    const out = execFileSync("tar", ["-xOf", path, "bin/node"], {
       maxBuffer: 64 * 1024 * 1024,
-      stdio: ['ignore', 'pipe', 'ignore'],
+      stdio: ["ignore", "pipe", "ignore"],
     })
     return out.subarray(0, 20)
   } catch {
-    return extractNodeHeaderByScan(path)
+    return null
+  }
+}
+
+/** 列出归档条目名（gzip 由 tar 自动处理）。失败返回空数组。 */
+function listEntries(path) {
+  try {
+    return execFileSync("tar", ["-tf", path], {
+      maxBuffer: 96 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "ignore"],
+    })
+      .toString("utf8")
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean)
+  } catch {
+    return []
   }
 }
 
 /**
- * 纯 JS 兜底：在（已解压的）tar 流里定位 `bin/node` 条目并取其数据头。
- * 支持未压缩 tar；gzip 流在此路径下无法解析 —— 交由系统 tar 处理即可。
+ * 从归档中抽取 `bin/node` 的前 20 字节（ELF 头 + e_machine 所在偏移）。
+ *
+ * **归档是两层**（真机实测，2026-09-10）：`termux-node-aarch64.tar.gz` 解出的是
+ * 单个内层 `termux-node-aarch64.tar`，真正的 `bin/node` 在**内层**。这与
+ * `NodeRuntime.ensureExtracted` 的处理一致——它解完外层后若发现 `bin/node` 不在场，
+ * 会把唯一的 `*.tar` 再解一次（「外层 tar 包着真实 node tar」的兼容分支）。
+ *
+ * 初版门禁漏了这一层，直接找外层 `bin/node` → CI 上（LFS 已拉取，非指针文件）
+ * 报「归档内未找到 bin/node」。**门禁自己抓出了自己的错误假设**——这正是
+ * 「门禁必须在真实输入上跑过」的价值：仅用自造的扁平 tar 自测会漏掉。
  */
-function extractNodeHeaderByScan(path) {
-  const buf = readFileSync(path)
-  // gzip 头 → 无系统 tar 时无法解析，明确报错而非静默通过
-  if (buf[0] === 0x1f && buf[1] === 0x8b) {
-    throw new Error('gzip 归档需系统 tar 支持（tar -xOf 不可用）')
-  }
-  let off = 0
-  while (off + 512 <= buf.length) {
-    const nameEnd = buf.indexOf(0, off)
-    if (nameEnd < 0 || nameEnd - off > 100) break
-    const name = buf.toString('utf8', off, nameEnd)
-    if (!name) break
-    const sizeStr = buf.toString('utf8', off + 124, off + 136).replace(/\0.*$/, '').trim()
-    const size = parseInt(sizeStr, 8) || 0
-    const dataOff = off + 512
-    if (name.replace(/^\.\//, '') === 'bin/node') {
-      return buf.subarray(dataOff, dataOff + 20)
+function extractNodeHeader(path) {
+  // 形态一：扁平归档，外层直接有 bin/node
+  const direct = tryExtractBinNode(path)
+  if (isElf(direct)) return direct
+
+  // 形态二：外层含内层 tar → tar|tar 管道流式取内层 bin/node，全程不落盘
+  const innerTar = listEntries(path).find((n) => n.endsWith(".tar") && !n.endsWith("/"))
+  if (innerTar) {
+    try {
+      const out = execFileSync(
+        "sh",
+        ["-c", `tar -xOf "$1" "$2" | tar -xOf - bin/node`, "sh", path, innerTar],
+        { maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] },
+      )
+      if (out && out.length >= 4) return out.subarray(0, 20)
+    } catch {
+      /* 落到下方统一返回 */
     }
-    off = dataOff + Math.ceil(size / 512) * 512
   }
-  throw new Error('归档内未找到 bin/node 条目')
+
+  return direct
 }
 
 function checkOne(relPath) {

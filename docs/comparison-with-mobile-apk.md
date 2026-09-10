@@ -223,6 +223,30 @@ $ ps -A | grep '[n]ode' | awk '{print $2}' | while read pid; do kill "$pid" 2>/d
   → PASS。gzip 与明文 tar 两条路径都实测通过。
 - 设备侧交叉证据：真机 node `e_machine=0xb7 (aarch64)`，设备 ABI `arm64-v8a`。
 
+#### 门禁初版在真实输入上失败（本轮最有价值的一次失败）
+
+初版门禁用**自造的扁平 tar**（`bin/node` 直接在顶层）自测，双向全绿；推到 CI 后
+**立刻失败**——因为 CI 拉到了 LFS 真身（37.1MB，本地只有 133 字节指针）：
+
+```
+FAIL app/src/main/assets/node/termux-node-aarch64.tar.gz
+     归档内未找到 bin/node
+```
+
+**真因**：内置 node 归档是**两层**结构——`.tar.gz` 解出的是**单个内层 `.tar`**（112MB），
+真正的 `bin/node` 在内层。`NodeRuntime.ensureExtracted` 早有对应兼容分支
+（解完外层若 `bin/node` 不在场就把唯一的 `*.tar` 再解一次），但门禁初版漏了这一层。
+
+**修复**：门禁先试扁平形态；否则走 `tar -xOf outer inner | tar -xOf - bin/node`
+管道流式取内层（不落盘，避免 112MB 落盘）。已用**真实归档**重新双向验证：
+真身 → `OK e_machine=0xb7 (aarch64)`；同一真身改名为 `x86_64` 声明 → `exit=1` 正确拒绝。
+
+> **元教训（本轮第二次）**：**用构造样例自测只能验证「我以为的布局」**。这是本轮第二次
+> 「验证手段本身带错误假设」——第一次是 `bracecheck` 对历史 bug 的错误归因，
+> 第二次是 ABI 门禁对归档布局的错误假设。两次都是**在真实输入上才暴露**。
+> 结论：门禁除构造样例的正反测试外，必须**至少在一个真实资产上跑过一次**；
+> CI 正是那个「真实输入」的提供者——它在一分钟内就给出了本地长时间发现不了的结论。
+
 ## 三点九、symlink 白名单与模板双源（review-r6）
 
 ### symlink 目标白名单（新增 `core/SymlinkPolicy.kt`，对齐参考坑 45）

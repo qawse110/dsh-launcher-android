@@ -91,6 +91,35 @@ error: "/data/data/.../usr/bin/node" is for EM_X86_64 (62) instead of EM_AARCH64
 **设备侧体现**：真机 node 实测 `e_machine=0xb7 (aarch64)`，设备 ABI `arm64-v8a`——
 一致即正确，这是排查该事故的第一手证据。
 
+### 3.1 内置 node 归档是**两层**结构（门禁初版就栽在这里）
+
+`app/src/main/assets/node/termux-node-aarch64.tar.gz` 解出来的**不是** `bin/`，
+而是**单个内层** `termux-node-aarch64.tar`（112MB），真正的 `bin/node` 在内层。
+
+```
+termux-node-aarch64.tar.gz
+└── termux-node-aarch64.tar      ← 唯一成员
+    ├── bin/{node,npm,npx}
+    └── lib/…
+```
+
+`NodeRuntime.ensureExtracted` 早有对应分支（解完外层若 `bin/node` 不在场，
+就把唯一的 `*.tar` 再解一次）。**但 ABI 门禁初版漏了这一层**——只用自造的
+扁平 tar 自测（`bin/node` 直接在顶层）→ 全绿；推到 CI（LFS 已拉取，拿到 37MB
+真身）立刻失败：`归档内未找到 bin/node`。
+
+**门禁在真实输入上抓出了自己的错误假设**。这是"用构造样例自测"与"在真实资产上跑"
+的差距——构造样例只验证了我以为的布局。
+
+**取内层 `bin/node` 头部的正确姿势**（不落盘，避免 112MB 落盘）：
+
+```sh
+tar -xOf outer.tar.gz inner.tar | tar -xOf - bin/node
+```
+
+**排查同类问题的入口**：`tar -tzf <归档> | head` 先看**顶层**到底是什么，
+不要假设 `bin/` 在顶层。本项目 `prebuilt.tgz`、`termux-bootstrap.zip` 的形态亦各有不同。
+
 ---
 
 ## 4. Kotlin 块注释可嵌套：KDoc 正文里的注释起始符会吞掉代码
