@@ -4,6 +4,11 @@ const files = [
   "app/src/main/java/com/dsh/launcher/core/NodeRuntime.kt",
   "app/src/main/java/com/dsh/launcher/core/BootstrapInstaller.kt",
   "app/src/main/java/com/dsh/launcher/ui/ConsoleActivity.kt",
+  "app/src/main/java/com/dsh/launcher/ui/WebViewActivity.kt",
+  "app/src/main/java/com/dsh/launcher/core/DshFlow.kt",
+  "app/src/main/java/com/dsh/launcher/core/DshWatchdog.kt",
+  "app/src/main/java/com/dsh/launcher/service/StatusBridgeService.kt",
+  "app/src/main/java/com/dsh/launcher/service/KeepAliveAccessibilityService.kt",
   "app/src/test/java/com/dsh/launcher/core/TermuxEnvTest.kt",
 ];
 let fail = 0;

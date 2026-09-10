@@ -35,6 +35,8 @@ class WebViewActivity : AppCompatActivity() {
 
     private lateinit var webView: WebView
     private lateinit var errorView: LinearLayout
+    /** 顶部加载进度条（提为字段：autoRetryRunnable 亦需操作它）。 */
+    private lateinit var progressBar: ProgressBar
 
     /** codex://new?prompt=... 等 deep link 带入的指令，页面就绪后自动填入输入框。 */
     private var pendingPrompt: String? = null
@@ -107,7 +109,7 @@ class WebViewActivity : AppCompatActivity() {
         }
 
         // 加载进度条
-        val progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+        progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
             max = 100
             progressTintList = ColorStateList.valueOf(Ui.BRAND)
             layoutParams = FrameLayout.LayoutParams(
