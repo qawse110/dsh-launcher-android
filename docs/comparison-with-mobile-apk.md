@@ -75,6 +75,42 @@ responseCode 抛异常时泄漏连接（`KeepAliveAccessibilityService` 已是 f
 | WebView DOM 快速通道/无障碍设备控制 | 大特性，超出本轮范围；已在 §四 排期建议 |
 | Online snapshot update（manifest+sha256+原子切换） | 同上，npm 模式下对应物是「版本钉死+回滚」，已覆盖 |
 
+## 三点五、环境链路专项重构（review-r4，参考 dsh-shell-termux / dsh-android-linux-env）
+
+参考项目环境实现核心：`dsh-shell-termux`（TermuxBashExecutor.termuxEnv 自包含环境：
+PATH/LD_LIBRARY_PATH/HOME/PREFIX/TERMUX_VERSION/SHELL + 栅栏键）与 `dsh-android-linux-env`
+（工具链探测/环境配方导出）。对照落地：
+
+### 已落地
+1. **P1 env 单源化收尾**：`NodeRuntime.nodeEnvPrefix` 退役——其在 NodeRuntime 内私拼
+   5 个 env 字面量（HOME 指向 node 目录，与 childShellEnv 的 termux home 不一致），
+   构成第二环境源；消费者（ConsoleActivity node 版本命令）改走 Proc→TermuxEnv 统一注入
+   （LD_LIBRARY_PATH 已含 node/lib，无需前缀）。TermuxEnv 头注释约束同步收紧为
+   「字面量只允许出现在本文件」。
+2. **P1 SHELL 键补齐**（对齐参考 `termuxEnv()`）：`childShellEnv`/`webProcessExports`
+   注入 `SHELL=<bashPath>`——npm/git/configure 脚本会探测 SHELL，缺省时继承宿主
+   `/bin/sh` 造成歧义。
+3. **P1 terminalSessionEnv 单源化**：原与 childShellEnv 双套维护且已实测漂移
+   （终端 PATH 缺 `/bin`、无 OPENSSL_CONF、无 SHELL、硬编码 `termux/usr` 绕过
+   TermuxRuntime.prefix）。改为 childShellEnv 基底 + TMPDIR=home + PWD=home，
+   行为向后兼容（新增键均为增益）。
+4. **P2 短前缀链接 fail-loudly**（对齐参考 assertBash 哲学）：`createPrefixShortcut`
+   失败原仅 Log.w 静默继续——它是全部官方二进制 shebang/exec 的前提，缺失时后续以
+   含混错误挂掉。新增 `isPrefixShortcutValid` 校验，失败即中止安装并给出修复指引；
+   同时将创建时序移到 PrefixPatcher 之前（patch 产出的 shebang 依赖该链接先存在）。
+
+### 评估后不采纳
+- **TERMUX_VERSION 伪造注入**（参考固定 `0.118.3`）：伪造版本号可能误导 pkg/脚本
+  的兼容性分支判断；本项目 bootstrap 与官方 Termux app 无交互，无消费方，不注入。
+- **DSH_WRITE_MODE 等栅栏键**：参考项目的写面档位随其 dsh-sandbox 契约走；本项目
+  dsh 0.1.1-rc.1 无对应消费端，注入为死键。升级引擎版本时可回看。
+- **probe() 工具链探测面板**（linux-env）：PackageKit.requiredCheck 已覆盖等价探测，
+  UI 面板属新特性，列入后续排期。
+
+### 测试
+`TermuxEnvTest` 扩展：SHELL 键断言（childShellEnv/webProcessExports）+
+`terminalSessionEnv 与 childShellEnv 单源一致` 回归测试（逐键比对）。
+
 ## 四、后续重构排期建议（未落地）
 
 1. **P2**：`BridgeOverlayManager.kt`（1287 行）按「窗口管理/状态机/交互」三块拆分——参考项目 OverlayService(712)/OverlayPanel(837)/OverlayController 分层值得照抄。

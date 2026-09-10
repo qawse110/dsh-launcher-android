@@ -187,10 +187,11 @@ object NodeRuntime {
         }
     }
 
-    /** 返回在嵌入式终端中运行 node 的命令前缀（含 LD_LIBRARY_PATH）。 */
-    fun nodeEnvPrefix(context: Context): String {
-        val dir = ensureExtracted(context).absolutePath
-        return "export LD_LIBRARY_PATH=$dir/lib; export HOME=$dir; export TMPDIR=$dir/tmp; " +
-            "OPENSSL_CONF=/dev/null; TERM=xterm-256color "
-    }
+    /**
+     * [nodeEnvPrefix 已退役]（review-r4）。
+     * 此前在本文件私拼 5 个环境变量字面量（LD_LIBRARY_PATH/HOME/TMPDIR/OPENSSL_CONF/TERM），
+     * 与 TermuxEnv.childShellEnv 构成双套环境源——HOME 两处不一致（node 目录 vs termux home），
+     * 命令串内 export 会覆盖 Proc 注入的统一环境。现唯一环境源 = TermuxEnv（经 Proc 注入）：
+     * LD_LIBRARY_PATH 已含 node/lib，node 可直接执行，无需前缀。
+     */
 }

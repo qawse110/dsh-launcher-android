@@ -39,6 +39,8 @@ class TermuxEnvTest {
         assertEquals("$usr/lib", ld[1])
         assertEquals(TermuxRuntime.tmp(ctx).absolutePath, env["TMPDIR"])
         assertEquals("/dev/null", env["OPENSSL_CONF"])
+        // SHELL 指向真实 bash（对齐参考实现 termuxEnv：npm/git 等工具探测 SHELL）
+        assertEquals("$usr/bin/bash", env["SHELL"])
     }
 
     @Test fun `webProcessExports 的 PATH 以 node bin 开头且含 tools 目录`() {
@@ -47,6 +49,8 @@ class TermuxEnvTest {
         assertEquals(File(nodeDir, "bin").absolutePath, path.first())
         assertTrue(path.contains(File(ctx.filesDir, ".tools/bin").absolutePath))
         assertTrue(exports.containsKey("PREFIX"))
+        // SHELL 指向真实 bash
+        assertEquals(File(ctx.filesDir, "termux/usr/bin/bash").absolutePath, exports["SHELL"])
         // 未装 termux-exec 时不应出现 LD_PRELOAD 键
         assertFalse(exports.containsKey("LD_PRELOAD"))
     }
@@ -60,5 +64,25 @@ class TermuxEnvTest {
             File(ctx.filesDir, "termux/usr/lib/libtermux-exec-ld-preload.so").absolutePath,
             env["LD_PRELOAD"]
         )
+    }
+
+    @Test fun `terminalSessionEnv 与 childShellEnv 单源一致（review-r4）`() {
+        val termuxBin = File(ctx.filesDir, "termux/usr/bin").apply { mkdirs() }
+        File(termuxBin, "bash").writeText("#!/bin/sh\nfake")
+        MarkerStore.resetForTest()
+        val term = TermuxEnv.terminalSessionEnv(ctx).associate {
+            val i = it.indexOf('=')
+            it.substring(0, i) to it.substring(i + 1)
+        }
+        val base = TermuxEnv.childShellEnv(ctx, tmpDir = TermuxRuntime.home(ctx))
+        // 终端环境 = childShellEnv 基底（TMPDIR=home）+ PWD；逐键核对无漂移
+        assertEquals(base["PATH"], term["PATH"])
+        assertEquals(base["HOME"], term["HOME"])
+        assertEquals(base["PREFIX"], term["PREFIX"])
+        assertEquals(base["LD_LIBRARY_PATH"], term["LD_LIBRARY_PATH"])
+        assertEquals(base["OPENSSL_CONF"], term["OPENSSL_CONF"])
+        assertEquals(base["SHELL"], term["SHELL"])
+        assertEquals(TermuxRuntime.home(ctx).absolutePath, term["TMPDIR"])
+        assertEquals(TermuxRuntime.home(ctx).absolutePath, term["PWD"])
     }
 }

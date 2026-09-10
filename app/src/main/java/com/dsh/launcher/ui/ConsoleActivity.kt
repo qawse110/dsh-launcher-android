@@ -320,8 +320,10 @@ class ConsoleActivity : AppCompatActivity() {
         thread {
             try {
                 val nodeDir = NodeRuntime.ensureExtracted(this)
-                val cmd = "${NodeRuntime.nodeEnvPrefix(this)} $nodeDir/bin/node --version"
-                appendLine("$ " + cmd.replace(";", " && "))
+                // 环境统一由 TermuxEnv → Proc 注入（LD_LIBRARY_PATH 已含 node/lib），
+                // 不再用 nodeEnvPrefix 前缀私拼（review-r4 单源化）
+                val cmd = "$nodeDir/bin/node --version"
+                appendLine("$ " + cmd)
                 runCommand(cmd)
             } catch (t: Throwable) {
                 appendLine("✗ Node 准备失败：${t.message}")

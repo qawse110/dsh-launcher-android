@@ -69,7 +69,18 @@ internal object BootstrapInstaller {
             }
             progress("解压完成，创建符号链接…")
             applySymlinks(usr, symlinks.toString())
+            // 短前缀链接必须先于 patch 创建：PrefixPatcher 产出的 shebang 指向
+            // /data/user/0/.../t，链接缺席会让 patch 产物全部失效。
             createPrefixShortcut(context)
+            // 短前缀链接是全部官方二进制 shebang/exec 的前提（review-r4 fail-loudly，
+            // 对齐参考实现 assertBash 哲学）：创建失败时继续 = 后续以含混的
+            // 「not found / EACCES」挂掉且难以定位。这里显式校验，失败即中止安装并指明修复方向。
+            if (!isPrefixShortcutValid(context)) {
+                throw IllegalStateException(
+                    "短前缀符号链接 ${context.dataDir}/t 创建失败（官方二进制 shebang 依赖此路径）。" +
+                        "请清除应用数据后重装；若仍失败，检查 ROM 是否禁止应用 dataDir 根创建符号链接。"
+                )
+            }
             createOfficialMirror(context)
             progress("适配 Termux 官方硬编码路径（${PrefixPatcher.OFFICIAL_PREFIX} → ${PrefixPatcher.SHORT_PREFIX}）…")
             PrefixPatcher.patchAll(usr)
@@ -160,6 +171,20 @@ internal object BootstrapInstaller {
         val top = skippedReasons.entries.sortedByDescending { it.value }.take(3)
         for ((reason, n) in top) android.util.Log.w("TermuxRuntime", "symlink skip x$n: $reason")
         android.util.Log.i("TermuxRuntime", "symlinks ok=$ok skipped=$skipped")
+    }
+
+    /**
+     * 短前缀符号链接是否有效：存在、是符号链接、指向真实 prefix。
+     * [ensure] 的 fail-loudly 校验用；也供诊断面板复用。
+     */
+    fun isPrefixShortcutValid(context: Context): Boolean {
+        val link = File(context.dataDir, "t")
+        if (!Files.isSymbolicLink(link.toPath())) return false
+        return try {
+            link.canonicalFile.absolutePath == TermuxRuntime.prefix(context).absolutePath
+        } catch (_: Throwable) {
+            false
+        }
     }
 
     /**
