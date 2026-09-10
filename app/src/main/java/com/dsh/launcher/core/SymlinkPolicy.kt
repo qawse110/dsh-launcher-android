@@ -20,8 +20,8 @@ import java.io.File
  *   （`files/node`）——`../` 逃逸一律拒绝。
  * - **绝对目标**：必须落在**本应用数据目录**内（`/data/user/0/<pkg>` 及其
  *   `/data/data/<pkg>` 别名）。这样既放行指向自身运行时的合法链接
- *   （含短前缀 `/data/user/0/<pkg>/t/usr/...`），也拒绝 Termux 残留
- *   （`/data/data/com.termux/...`）与任何系统路径。
+ *   （含短前缀 `/data/user/0/<pkg>/t/...`——注意 `t` 本身即 `usr` 的别名），
+ *   也拒绝 Termux 残留（`/data/data/com.termux/...`）与任何系统路径。
  *
  * 纯函数设计：不碰文件系统，便于单测覆盖全部边界组合。
  */

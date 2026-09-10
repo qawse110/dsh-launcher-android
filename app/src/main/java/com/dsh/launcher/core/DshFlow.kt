@@ -63,12 +63,37 @@ object DshFlow {
      * 由 `LauncherTemplateTest` 逐令牌比对锁定。
      */
     internal val DEFAULT_WEB_LAUNCHER_TPL = """
-        #!/data/user/0/com.dsh.launcher/t/usr/bin/bash
+        #!/data/user/0/com.dsh.launcher/t/bin/bash
         @EXPORTS@
         cd "@HOME@" || exit 1
         nohup @NODE_CMD@ > "@LOG_FILE@" 2>&1 &
         echo DSH_WEB_PID=${'$'}!
         """.trimIndent()
+
+    /** 启动脚本模板的全部占位符（顺序即替换顺序）。 */
+    internal val WEB_LAUNCHER_TOKENS = listOf("@EXPORTS@", "@HOME@", "@NODE_CMD@", "@LOG_FILE@")
+
+    /**
+     * 渲染 web 启动脚本（纯函数，便于单测）。
+     *
+     * **为什么独立成函数**：模板渲染是纯字符串 `replace`，与模板内容强耦合。
+     * 真机踩坑（2026-09-10）：模板第 3 行注释里写了「可用占位符：@EXPORTS@ …」
+     * 作为说明，渲染时**注释里的占位符被一并展开**，生成了一条真实执行的杂散命令
+     * （` <home> <nodeCmd> <logFile>`，bash 报 `Is a directory`，exit=126）。
+     * 脚本没有 `set -e` 才侥幸继续跑到真正的 nohup，功能表现正常——
+     * 典型的「靠巧合工作」，模板注释一改就可能真炸。
+     */
+    internal fun renderWebLauncher(
+        tpl: String,
+        exports: String,
+        home: String,
+        nodeCmd: String,
+        logFile: String,
+    ): String = tpl
+        .replace("@EXPORTS@", exports)
+        .replace("@HOME@", home)
+        .replace("@NODE_CMD@", nodeCmd)
+        .replace("@LOG_FILE@", logFile)
 
     fun dshCli(ctx: Context): File =
         File(File(ctx.filesDir, "dsh-prefix"), "node_modules/@deepseek-ai/dsh/lib/bin.js")
@@ -501,13 +526,23 @@ object DshFlow {
                 onLog("WARN: 启动脚本模板缺失，回退内置模板")
                 DEFAULT_WEB_LAUNCHER_TPL
             }
-        launcher.writeText(
-            tpl.replace("@EXPORTS@", TermuxEnv.webProcessExports(ctx, nodeDir)
-                .joinToString("") { (k, v) -> "export $k=$v\n" })
-                .replace("@HOME@", ctx.filesDir.absolutePath)
-                .replace("@NODE_CMD@", nodeCmd)
-                .replace("@LOG_FILE@", File(FileLog.dir(ctx), WEB_LOG).absolutePath)
+        val rendered = renderWebLauncher(
+            tpl = tpl,
+            exports = TermuxEnv.webProcessExports(ctx, nodeDir)
+                .joinToString("") { (k, v) -> "export $k=$v\n" },
+            home = ctx.filesDir.absolutePath,
+            nodeCmd = nodeCmd,
+            logFile = File(FileLog.dir(ctx), WEB_LOG).absolutePath,
         )
+        // 渲染后仍残留占位符 = 模板与渲染逻辑漂移（或模板注释里写了占位符字面量）。
+        // 残留 token 会被 bash 当普通词执行（真机实证：模板注释里的占位符被一并展开，
+        // 生成了一条 " <home> <nodeCmd> <logFile>" 的杂散命令，exit=126）。
+        // 脚本没有 set -e 才侥幸继续跑——不能依赖这种巧合，此处显式告警。
+        val leftover = WEB_LAUNCHER_TOKENS.filter { rendered.contains(it) }
+        if (leftover.isNotEmpty()) {
+            onLog("WARN: 启动脚本残留未替换占位符 ${leftover.joinToString(" ")}（模板与渲染逻辑不一致）")
+        }
+        launcher.writeText(rendered)
         launcher.setExecutable(true)
         // 唯一解释器：内置 Termux bash
         exec(ctx, "${TermuxRuntime.bashPath(ctx).absolutePath} ${launcher.absolutePath}") { onLog(it) }

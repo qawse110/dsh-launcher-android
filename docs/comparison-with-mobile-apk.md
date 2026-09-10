@@ -295,6 +295,88 @@ FAIL app/src/main/assets/node/termux-node-aarch64.tar.gz
 > 纠正了前一轮自己写下的错误归因。经验证的门禁必须能对**真实的已知坏输入**报错，
 > 而不是只对构造样例报错。
 
+## 三点十一、运行环境专项核对（review-r7，读设备实况对账代码假设）
+
+本轮方法不同以往：**不读参考项目，直接读本机实况**（`/proc`、`readlink`、`stat`、
+渲染产物、真实执行），逐项与代码里的假设对账。**挖出 3 个真实缺陷，且全部无法被
+CI 抓到**——静态门禁的盲区正是「代码假设 vs 设备事实」的差距。
+
+### 缺陷 1（P1）：增量 patch 基线用 mtime，dpkg 保留归档时间 → 483 文件全部跳过
+
+`PackageKit.ensure` 用「安装窗口开始时刻」作增量基线，比对 `f.lastModified()`。
+但 `dpkg-deb -x` / tar **保留包内归档 mtime**：
+
+| 文件 | mtime | 基线 |
+|---|---|---|
+| `bin/git` | 2026-07-05 | 2026-09-06 |
+| `bin/wget` | 2025-08-31 | 2026-09-06 |
+
+实测 `bin`+`lib` 共 **483 个文件全部被跳过、0 个被处理**，其中 **12 个至今带着官方
+硬编码前缀** `/data/data/com.termux/files/usr`。**已在真机复现可见故障**：
+
+```
+$ git config --get user.name
+fatal: unable to access '/data/data/com.termux/files/usr/etc/gitconfig': Permission denied
+```
+
+`git` 二进制内仍有 11 处官方前缀（`strings` 实测）。两个放大因素：
+① `ready()` 早退使**存量设备永不自愈**；② `patchAll` 逐文件静默 catch，
+日志只呈现 `patched files=0 skipped=483`，极易忽略。
+
+**修复三层**：
+1. `PrefixPatcher.shouldProcess` 判据改为 **ctime OR mtime**。ctime 由内核在落盘那刻
+   写入、归档无法伪造；取「或」而非只用 ctime，是因为 Android 上 `creationTime()`
+   的底层语义（statx birthtime 或回落 `st_ctime`）**无法在本环境实测**——
+   拿未经验证的 API 语义下判断正是本项目已记录两次的失败模式。取「或」使正确性
+   可证明：安装窗口内写入 → ctime 必刷新 → 一定处理；陈旧文件两戳都旧 → 才跳过。
+2. `PackageKit.repairStalePrefixes`：在 `ready()` 早退分支插入**一次性自愈**
+   （marker `prefix-repair` 控代次；失败不写 marker，下次重试）。
+3. 开销实测：全量扫 `usr`（3835 文件 / 144MB）约 1.1s，仅升级后首启一次，
+   且调用方均已在后台线程——注释中明确标注「不可挪到主线程」。
+
+**验证**：复制 `bin/git` 做等长替换（11 处 → 0 处）后执行，`git init` 与 `git config`
+**均不再报 EACCES**；对照未 patch 副本必现 `fatal: unable to access ... Permission denied`。
+
+### 缺陷 2：短前缀 `t` 已是 `usr` 的别名，模板 shebang 却写成 `t/usr/bin/bash`
+
+`readlink` 实测 `<dataDir>/t -> <filesDir>/termux/usr`，故正确路径是 `t/bin/bash`。
+模板多写了一层 `/usr`，直接执行报 `bad interpreter: No such file or directory`（exit=126）。
+
+**为何一直没暴露**：两条调用路径都写成 `bash <script>`（显式传解释器），
+shebang 从未被内核读取。改成 `./dsh-web.sh` 就会立刻失败。
+
+**修复**：shebang 改为 `t/bin/bash`；`LauncherTemplateTest` 新增
+`资产模板 shebang 指向短前缀下的 bash`、`兜底模板 shebang 同样…`、
+`短前缀与官方前缀等长`（等长是二进制等长替换的硬前提）。
+
+### 缺陷 3：模板注释里的占位符字面量被渲染器一并展开
+
+模板曾有一行 `# 可用占位符：@EXPORTS@ @HOME@ @NODE_CMD@ @LOG_FILE@`。
+渲染是纯字符串 `replace`，**不区分注释与代码** → 生成一条真实执行的杂散命令
+（` <home> <nodeCmd> <logFile>`，bash 报 `Is a directory`，exit=126）。
+脚本无 `set -e` 才继续跑到真正的 `nohup`，功能表现完全正常。
+
+**修复**：注释改为自然语言；测试补**计数**判据（每个占位符**恰好出现一次**）。
+
+**为何原测试没抓到**：原测试用 `Set<String>` 比对令牌集合，而**注释里那份与真正那份
+是同一字符串，集合比对会静默折叠重复**——集合相等照样通过。
+**`Set` 对「重复」天然失明，凡关心出现次数必须用计数。**
+
+### 本轮方法论
+
+三个缺陷的共同形态是「**靠巧合工作**」——不是功能坏了，而是当前恰好没坏：
+
+| 缺陷 | 为何当前正常 | 触发条件 |
+|---|---|---|
+| shebang 多一层 | 调用方都显式传 `bash <script>` | 改为 `./dsh-web.sh` |
+| 注释占位符被展开 | 脚本无 `set -e`，杂散命令失败后继续 | 加 `set -e`，或杂散行恰好成功 |
+| 增量 patch 全跳过 | 多数工具不碰硬编码路径 | 任何读 `etc/gitconfig` 的操作（已复现） |
+
+**教训**：「跑得通」不等于「写对了」。排查环境问题应**主动验证那些「假设成立但从未被
+检验」的前提**（路径是否真存在、时间戳语义是否如假设、替换是否区分上下文），
+而不是等用户报障。这 3 个缺陷**没有一个是 CI 能抓到的**——正说明静态门禁与真机核对
+各有职责边界，二者不可互替。
+
 ## 四、后续重构排期建议（未落地）
 
 1. **P2**：`BridgeOverlayManager.kt`（1287 行）按「窗口管理/状态机/交互」三块拆分——参考项目 OverlayService(712)/OverlayPanel(837)/OverlayController 分层值得照抄。
@@ -367,4 +449,18 @@ FAIL app/src/main/assets/node/termux-node-aarch64.tar.gz
   全量递归 + Kotlin 嵌套注释语义）
 - `.github/workflows/ci.yml`（ABI 门禁 + Kotlin 静态预检）、`.github/workflows/build-apk.yml`（ABI 门禁）
 - `AGENTS.md`（**新增**，开发地图索引主文件）、`docs/AGENTS/gotchas.md`（**新增**，9 条坑登记）
+
+### review-r7（运行环境专项核对：读设备实况对账代码假设）
+- `app/src/main/java/com/dsh/launcher/core/PrefixPatcher.kt`（**shouldProcess 判据
+  mtime → ctime OR mtime**，缺陷 1 核心修复；参数改名 minTsMs）
+- `app/src/main/java/com/dsh/launcher/core/PackageKit.kt`（**新增 repairStalePrefixes
+  存量自愈通道** + `prefix-repair` marker；基线注释修正）
+- `app/src/main/assets/web-launcher.sh.tpl`（shebang 去多余 `/usr`；注释不再含占位符字面量）
+- `app/src/main/java/com/dsh/launcher/core/DshFlow.kt`（兜底模板 shebang 同步修正、
+  抽出纯函数 `renderWebLauncher`、新增 `WEB_LAUNCHER_TOKENS`、渲染后残留占位符告警）
+- `app/src/main/java/com/dsh/launcher/core/SymlinkPolicy.kt`（注释纠正 `t` 即 `usr` 别名）
+- `app/src/test/java/com/dsh/launcher/core/LauncherTemplateTest.kt`（**计数判据**替换
+  Set 判据、shebang 断言、前缀等长断言、渲染端到端无杂散行）
+- `app/src/test/java/com/dsh/launcher/core/PrefixPatcherTest.kt`（**归档 mtime 陈旧但
+  ctime 新**回归 + shouldProcess 边界）
 

@@ -227,3 +227,138 @@ prefix，使 shebang 与 exec 路径可解析。
 `not found` / `EACCES` 挂掉且难以定位。
 
 **时序关键**：patch 产出的 shebang 依赖该链接**先存在**，故创建必须前置。
+
+### 9.1 短前缀 `t` **已经是 `usr` 的别名**——路径不能写 `t/usr/…`
+
+`<dataDir>/t -> <filesDir>/termux/usr`（实测 `readlink` 确认）。于是 bash 的正确路径是
+
+```
+/data/user/0/com.dsh.launcher/t/bin/bash        ← 正确
+/data/user/0/com.dsh.launcher/t/usr/bin/bash    ← 多了一层 usr
+```
+
+**真机实证（2026-09-10）**：`assets/web-launcher.sh.tpl` 的 shebang 写成了
+`t/usr/bin/bash`，直接执行该脚本报：
+
+```
+bad interpreter: No such file or directory      # exit=126
+```
+
+**为何一直没暴露**：两条调用路径都写成 `bash <script>`（显式传解释器，
+见 `DshFlow.startDshWeb` 的 `exec(ctx, "${bashPath} ${launcher}")` 与
+`Supervisor.reviveWebIfDue` 的 `ProcessBuilder(bash, script)`），**shebang 从未被内核读取**。
+又一个「靠巧合工作」：改成 `./dsh-web.sh` 或被别的进程以 shebang 调用就立刻失败。
+
+**等价长度也是硬约束**：官方前缀与短前缀必须**同为 31 字符**（`patchAll` 对二进制做
+等长字节替换，长度不等会直接拒绝并静默跳过全部 ELF）。已由 `LauncherTemplateTest`
+的 `短前缀与官方前缀等长` + `资产模板 shebang 指向短前缀下的 bash` 两条测试钉死。
+
+---
+
+## 10. 增量 patch 的基线**不能用 mtime**——dpkg 会保留包内归档时间
+
+**真机 P1（2026-09-10，本轮最严重的环境缺陷）**。
+
+`PackageKit.ensure` 用「安装窗口开始时刻」作增量基线，原实现比对 `f.lastModified()`。
+但 `dpkg-deb -x` / tar 解包会**保留包内的归档 mtime**——实测：
+
+| 文件 | mtime | 基线（安装时刻） |
+|---|---|---|
+| `bin/git` | 2026-07-05 | 2026-09-06 |
+| `bin/wget` | 2025-08-31 | 2026-09-06 |
+| `lib/libuuid.so` | 2026-07-11 | 2026-09-06 |
+
+**全部早于基线**。实测 `bin`+`lib` 共 **483 个文件全部被跳过、0 个被处理**，
+其中 12 个（git / rg / wget / file / git-lfs / scalar / git-cvsserver / git-shell /
+libuuid.so / libexpat.so.1.12.4 / pkgconfig/uuid.pc / expat.pc）至今带着官方硬编码前缀
+`/data/data/com.termux/files/usr`。
+
+**这不是潜在风险，是正在发生的可见故障**：
+
+```
+$ git config --get user.name
+fatal: unable to access '/data/data/com.termux/files/usr/etc/gitconfig': Permission denied
+```
+
+`git` 二进制里还有 11 处官方前缀（`strings bin/git | grep -c` 实测）。
+即「harness 工具装好了但没被适配」——工具能跑，但任何触及 etc/gitconfig、
+share/git-core 等硬编码路径的操作都会以 Permission denied 失败。
+
+**两个叠加的放大因素**：
+
+1. **`ready()` 早退**：`PackageKit.ensure` 在 marker 命中时直接 `return true`，
+   于是**存量设备永远不会重新走到 patch**——缺陷无法自愈。
+2. **patch 失败静默**：`patchAll` 逐文件 `catch (_: Throwable) {}`，
+   「0 个被处理」在日志里只呈现为一行 `patched files=0 skipped=483`，极易忽略。
+
+**修复**（三层）：
+- `PrefixPatcher.shouldProcess` 判据改为 **ctime OR mtime**：`ctime`（inode 状态变更时间）
+  由内核在文件**落盘那刻**写入，归档无法伪造，因此「本次安装写进来」的文件必然
+  被捕获；取「或」而非只用 ctime，是因为 Android 上 `creationTime()` 的底层语义
+  （statx birthtime 或回落 st_ctime）**无法在本开发环境实测**——拿未经验证的 API 语义
+  下判断正是本项目已记录两次的失败模式。取「或」把正确性变成可证明的：
+  安装窗口内写入 → ctime 必刷新 → 一定处理；真正陈旧的文件两个戳都旧 → 才跳过。
+- `PackageKit.repairStalePrefixes`：在 `ready()` 早退分支插入**一次性自愈**
+  （marker `prefix-repair` 控代次），对存量安装做全量内容扫描修复。
+  失败不写 marker，下次启动重试。
+- 开销实测可控：全量扫描 `usr` 树（3835 文件 / 144MB）约 **1.1s**（其中 bin+lib
+  483 文件约 250ms），且只在升级后首次启动跑一次；调用方均已在后台线程
+  （MainActivity / ConsoleActivity 的 `thread { }` 包裹）——**不可挪到主线程**。
+
+**验证**：把 `bin/git` 复制出来做等长替换（11 处 → 0 处）后执行，
+`git init` 与 `git config` **均不再报 EACCES**；对照未 patch 副本必现
+`fatal: unable to access ... Permission denied`。
+
+**约定**：任何「哪些文件是本次操作产生的」判定，**不得依赖 mtime**——
+归档解包、`cp -p`、`rsync -t`、`git checkout` 都会保留源时间戳。
+用 ctime，或在内容层面判定（本项目 patch 幂等，多处理无副作用）。
+
+---
+
+## 11. 模板注释里写占位符字面量会被渲染器一并展开
+
+**真机实证（2026-09-10）**。`assets/web-launcher.sh.tpl` 曾有一行说明性注释：
+
+```
+# 可用占位符：@EXPORTS@ @HOME@ @NODE_CMD@ @LOG_FILE@
+```
+
+`DshFlow` 的渲染是**纯字符串 `replace`**，不区分注释与代码——四个占位符连同
+注释里那一份被全部替换，生成了一条真实执行的杂散命令：
+
+```
+ /data/user/0/com.dsh.launcher/files /data/user/0/com.dsh.launcher/files/node/bin/node \
+   --expose-internals --import …/fs-register.mjs …/bin.js web /…/logs/web.log
+```
+
+bash 报 `Is a directory`（exit=126）。**脚本没有 `set -e`，失败后继续执行到真正的
+`nohup`，功能表现完全正常**——所以长期没有被发现。
+
+**修复**：注释里不写占位符字面量（改用自然语言描述）；并在 `LauncherTemplateTest`
+补上**计数**判据（每个占位符必须**恰好出现一次**）。
+
+**为何原测试没抓到**：原测试用 `Set<String>` 比对令牌集合，
+而**注释里那份与真正那份是同一个字符串，集合比对会静默折叠重复**——集合相等照样通过。
+`Set` 判据对「重复」天然失明，凡是关心出现次数的场景都必须用计数。
+
+**衍生**：`renderedTokens` 在测试中独立写死一份，与 `DshFlow.WEB_LAUNCHER_TOKENS`
+交叉校验，防止有人只改一处。
+
+---
+
+## 12. 本轮三缺陷的共同形态：**靠巧合工作**
+
+三个缺陷都不是「功能坏了」，而是「当前恰好没坏」：
+
+| 缺陷 | 为何当前表现正常 | 触发条件 |
+|---|---|---|
+| `t/usr/bin/bash` shebang 多一层 | 调用方都显式传 `bash <script>`，shebang 从未被读 | 改为 `./dsh-web.sh` 或被别处以 shebang 调用 |
+| 注释里的占位符被展开 | 脚本无 `set -e`，杂散命令失败后继续执行 | 加 `set -e`、或杂散行恰好成功（改变用户路径布局） |
+| 增量 patch 全量跳过 | 大多数工具不触碰硬编码路径 | 任何读 `etc/gitconfig` 等路径的操作（已实测复现） |
+
+**教训**：「跑得通」不等于「写对了」。排查环境类问题时，
+**主动去验证那些「假设成立但从未被检验」的前提**（路径是否真存在、时间戳语义是否如假设、
+字符串替换是否区分上下文），而不是等到用户报障。
+本轮的三个缺陷全部由「读设备实况 + 与代码假设对账」发现，**没有一个是 CI 能抓到的**
+——这正说明静态门禁与真机核对的职责边界。
+

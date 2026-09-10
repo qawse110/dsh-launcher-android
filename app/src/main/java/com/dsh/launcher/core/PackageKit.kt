@@ -16,6 +16,10 @@ internal object PackageKit {
 
     private const val TOOLS_MARKER_VERSION = "4"
 
+    /** 存量安装的前缀补丁自愈代次（见 [repairStalePrefixes]）；升代次可强制重跑。 */
+    private const val PREFIX_REPAIR_MARKER = "prefix-repair"
+    private const val PREFIX_REPAIR_VERSION = "1"
+
     /** Harness 附加工具是否已安装就绪。 */
     fun ready(context: Context): Boolean =
         MarkerStore.get(context, "harness-tools") == TOOLS_MARKER_VERSION
@@ -34,7 +38,17 @@ internal object PackageKit {
             ProfileWriter.writeLinuxProfile(usr)
             ProfileWriter.writeInputRc(usr)
             ProfileWriter.writeTpkgScript(context, usr)
-            if (ready(context)) return true
+            if (ready(context)) {
+                // 存量安装的补丁修复通道（真机 P1，2026-09-10）：
+                // ready 早退意味着「工具已装好」，但**历史上装进来的包可能从未被 patch 过**
+                // （旧基线的 mtime 判据把 483 个文件全跳过，12 个至今带着官方硬编码前缀，
+                // 表现为 `git config` 报 /data/data/com.termux/files/usr/etc/gitconfig
+                // Permission denied）。若直接 return，存量设备永远不会自愈。
+                // 这里做一次**全量内容扫描**（仅本次升级后首启一次，见 repairStalePrefixes
+                // 的开销说明）：只对仍含官方前缀的文件做等长替换，无残留则仅付出一次遍历。
+                repairStalePrefixes(context, usr, progress)
+                return true
+            }
             val bash = TermuxRuntime.bashPath(context).absolutePath
             // 环境基底统一由 Proc → TermuxEnv 提供，此处不再本地拼接（P0-1/P1-1）
             val env = emptyMap<String, String>()
@@ -60,8 +74,11 @@ internal object PackageKit {
                     // 运行时翻译脚本 shebang 的官方前缀（postinst/pip 入口依赖）
                     if (!File(usr, "lib/libtermux-exec-ld-preload.so").isFile) add("termux-exec")
                 }
-                // P2-5 增量 patch 基线：安装窗口开始时间。之后所有新落盘文件
-                // （pkg/tpkg/apt-get -f）mtime 必然 >= 该值，patch 只扫这些文件
+                // P2-5 增量 patch 基线：安装窗口开始时刻。之后落盘的文件由 patch 处理。
+                // **判据是 ctime 而非 mtime**（真机 P1，2026-09-10）：dpkg-deb -x / tar
+                // 解包会保留包内归档 mtime（git 是 7 月、wget 是去年 8 月），全都早于本基线
+                // → 旧实现把 483 个文件全部跳过、0 个处理，12 个文件至今带着官方硬编码前缀。
+                // ctime 由内核在落盘那刻设置，归档无法伪造。见 PrefixPatcher.shouldProcess。
                 val patchBaseline = System.currentTimeMillis()
                 val installRc = if (missing.isNotEmpty()) {
                     runBash(context, bash, "pkg install -o Acquire::Retries=3 -y --no-install-recommends ${missing.joinToString(" ")}", env, progress, timeoutSec = 1200)
@@ -111,6 +128,39 @@ internal object PackageKit {
         } catch (t: Throwable) {
             progress("WARN: ensureHarnessTools 失败: ${t.message}")
             return false
+        }
+    }
+
+    /**
+     * 存量安装的「前缀补丁修复」通道（真机 P1，2026-09-10）。
+     *
+     * 背景：历史版本的增量 patch 用 mtime 作基线，而 dpkg/tar **保留包内归档 mtime**
+     * ——新装文件的 mtime 全早于基线，`bin`+`lib` 共 483 个文件被全部跳过、0 个处理，
+     * 12 个文件至今带着官方硬编码前缀 `/data/data/com.termux/files/usr`。可见故障：
+     * ```
+     * $ git config --get user.name
+     * fatal: unable to access '/data/data/com.termux/files/usr/etc/gitconfig': Permission denied
+     * ```
+     *
+     * 因为 [ensure] 在 `ready()` 时早退，存量设备不会重新走到 patch——本方法提供
+     * **一次性自愈**：[PREFIX_REPAIR_MARKER] 记录已修复的代次，修过即跳过。
+     *
+     * 幂等与开销：只对**仍含官方前缀**的文件做等长替换（内容扫描即判定，已修则零写入）。
+     * 实测全量扫描 `usr` 树 3835 文件 / 144MB 约 1.1s（其中 bin+lib 占 483 文件约 250ms），
+     * 仅升级后首次启动一次，且调用方均已在后台线程（见 MainActivity/ConsoleActivity 的
+     * `thread { }` 包裹）——**不要把它挪到主线程**，1s 级 IO 会造成 ANR。
+     */
+    private fun repairStalePrefixes(context: Context, usr: File, progress: (String) -> Unit) {
+        if (MarkerStore.get(context, PREFIX_REPAIR_MARKER) == PREFIX_REPAIR_VERSION) return
+        try {
+            progress("检查内置 Termux 前缀补丁完整性…")
+            PrefixPatcher.patchAll(usr)              // 基线 0 = 全量内容扫描
+            PrefixPatcher.patchTextOfficialDirs(usr)
+            MarkerStore.put(context, PREFIX_REPAIR_MARKER, PREFIX_REPAIR_VERSION)
+            progress("前缀补丁检查完成")
+        } catch (t: Throwable) {
+            // 不写 marker：下次启动重试（修复失败不该被永久跳过）
+            progress("WARN: 前缀补丁修复失败: ${t.message}")
         }
     }
 

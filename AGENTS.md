@@ -64,6 +64,15 @@ export OPENSSL_CONF=/dev/null
 - **坑 8**：环境变量字面量只允许出现在 `TermuxEnv`（已发生两次真实漂移事故）。
 - **坑 9**：短前缀链接 `/data/user/0/com.dsh.launcher/t`（31 字符，与官方
   `/data/data/com.termux/files/usr` 等长）是官方二进制的硬前提，必须在 patch 前创建。
+  **`t` 本身即 `usr` 的别名**，故 bash 是 `t/bin/bash`；写成 `t/usr/bin/bash` 会
+  `bad interpreter`（exit=126）。
+- **坑 10**：**判定「哪些文件是本次操作产生的」不得依赖 mtime**——dpkg/tar 保留包内
+  归档时间，曾致 483 文件被增量 patch 全部跳过、12 个文件永久带着官方硬编码前缀
+  （`git config` 报 EACCES）。用 ctime，或在内容层面判定。
+- **坑 11**：模板注释里写占位符字面量会被纯字符串渲染一并展开成真实执行的杂散命令；
+  且 `Set` 比对令牌集合对「重复」天然失明，**关心出现次数必须用计数**。
+- **坑 12**：「跑得通」不等于「写对了」——现有 3 个缺陷全是「靠巧合工作」形态，
+  **没有一个能被 CI 捕获**，只能靠读设备实况与代码假设对账发现。
 
 ## 4. 详档路由表
 
@@ -105,3 +114,15 @@ export OPENSSL_CONF=/dev/null
 6. **KDoc**：正文里不写注释起始/终止符号字面量；提目录通配写 `patched/` 而非 `patched/**`。
 7. **大资产**：LFS 文件（node/prebuilt/bootstrap）变更后必须跑 ABI 门禁并确认 workflow
    仍带 `lfs: true`。
+8. **时间戳判据**：判断「文件是否本次操作产生」**禁止用 mtime**（dpkg/tar/`cp -p`/
+   `rsync -t`/`git checkout` 都保留源时间戳）；用 ctime，或在内容层面判定
+   （patch 幂等，多处理无副作用）。见坑 10。
+9. **模板占位符**：注释与文档里**不得出现占位符字面量**（纯字符串替换会一并展开）；
+   渲染类测试用**计数**判据而非 `Set` 比对（`Set` 对重复天然失明）。见坑 11。
+10. **前缀路径**：短前缀 `t` 即 `usr` 的别名，路径写 `t/bin/...`；新增任何硬编码
+   `/data/user/0/com.dsh.launcher/t…` 前先用 `readlink` 确认语义。见坑 9。
+11. **长耗时 IO 不进主线程**：`ensureHarnessTools` 等含全树扫描的函数（实测 ~1s）
+    调用方必须包裹 `thread { }`。
+12. **环境类改动须读设备实况**：路径存在性、时间戳语义、符号链接指向等前提，
+    必须用 `readlink`/`stat`/`strings` 在真机核对后再改——坑 12 的 3 个缺陷
+    无一能被 CI 捕获。
