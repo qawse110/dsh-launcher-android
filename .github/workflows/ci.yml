@@ -20,6 +20,13 @@ jobs:
         with:
           lfs: true
 
+      # 资产脚本门禁（review-r5，最快的一环放最前）：assets 下的 stub/install/routing/
+      # fs 兼容层 + patched/ 补丁载荷全部做 node --check，并校验 stub 引用的载荷存在。
+      # 背景：载荷此前以 base64 内嵌在 stub 里，静态检查完全看不到；抽为真实文件后
+      # 这类「写坏一个上游补丁文件拖死 dsh 启动」的事故才能在 CI 暴露。
+      - name: Asset scripts gate（脚本语法 + 载荷完整性）
+        run: node tools/check-asset-scripts.cjs
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:

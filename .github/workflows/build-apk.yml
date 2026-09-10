@@ -24,6 +24,11 @@ jobs:
         with:
           lfs: true
 
+      # 资产脚本门禁（review-r5）：打包含 stub 与 patched/ 载荷，脚本写坏会拖死
+      # 设备上的 dsh 启动——打包前先卡语法与载荷完整性。
+      - name: Asset scripts gate（脚本语法 + 载荷完整性）
+        run: node tools/check-asset-scripts.cjs
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:

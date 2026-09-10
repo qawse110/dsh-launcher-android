@@ -292,17 +292,7 @@ object DshFlow {
             } catch (t: Throwable) {
                 fl("FAIL 3.5/4 assets copy stub-dsh.mjs: ${t.message}")
             }
-            // SELinux 禁止 app 对 data 文件硬链接；dsh session 首次落盘用 link()。
-            // 通过 Node loader 把 node:fs/promises 的 link 重定向为 rename 兼容实现。
-            for (name in listOf("fs-register.mjs", "fs-loader.mjs", "fs-promises-compat.mjs")) {
-                try {
-                    ctx.assets.open(name).use { input ->
-                        File(ctx.filesDir, name).outputStream().use { output -> input.copyTo(output) }
-                    }
-                } catch (t: Throwable) {
-                    fl("WARN assets copy $name: ${t.message}")
-                }
-            }
+            syncCompatAssets(ctx, ::fl)
             // stub 标记含 dsh 版本：回滚重装后版本变化会自动重新打补丁
             runAndroidStubOnce(ctx, nodeDir, dshPrefix, stubScript, ::fl)
 
@@ -377,12 +367,40 @@ object DshFlow {
     }
 
     /**
+     * 同步「引导期补丁资产」到 files（安装路径与快速启动路径共用）：
+     * - `patched/**`：stub 的补丁载荷（koffi/node-pty/sharp 替身、sharp shim）。
+     *   review-r5 起载荷从 stub 内嵌 base64 抽为真实文件（对齐参考实现
+     *   dsh-mobile-apk 的 assets/patched + applyAssetPatch 机制）：可 diff、可评审，
+     *   并纳入 CI 语法门禁。必须整目录同步——缺失载荷会让 stub 静默跳过对应补丁。
+     */
+    private fun syncCompatAssets(ctx: Context, fl: (String) -> Unit) {
+        val patchDir = File(ctx.filesDir, "patched")
+        try {
+            if (AssetSync.copyAssetDir(ctx, "patched", patchDir, clearFirst = true)) {
+                val count = patchDir.walkTopDown().count { it.isFile }
+                fl("  补丁载荷 assets/patched → files/patched（$count 个文件）")
+                if (count == 0) fl("  WARN patched 目录为空，stub 将跳过依赖载荷的补丁")
+            } else {
+                fl("  WARN assets 无 patched 目录（stub 载荷缺失，相关补丁会跳过）")
+            }
+        } catch (t: Throwable) {
+            fl("  WARN 同步 patched 载荷失败：${t.message}")
+        }
+    }
+
+    /**
      * Android 兼容修复（stub-dsh.mjs）按版本只跑一次：
-     * marker 记录「APK 版本 + dsh 版本」，两者都没变则跳过（省 2~5 秒启动时间）。
+     * marker 记录「APK 版本 + dsh 版本 + stub/载荷内容指纹」，都没变则跳过（省 2~5 秒启动时间）。
+     *
+     * review-r5 增加内容指纹：此前只看两个版本号，本地重建 APK 而 versionCode 未变
+     * （或补丁载荷更新但 dsh 版本未变）时 marker 命中 → 新补丁被静默跳过。
+     * 这与参考实现 dsh-mobile-apk 记录的「stale marker string 导致 v1→v2 资产更新失效」
+     * 属同型缺陷；内容指纹保证「载荷变即重跑」。
      */
     private fun runAndroidStubOnce(ctx: Context, nodeDir: File, dshPrefix: File, stubScript: File, fl: (String) -> Unit) {
         val apkVer = AssetSync.apkVersion(ctx)
-        val expected = "apk:$apkVer|dsh:${DshUpdater.currentVersion(ctx)}"
+        val fp = patchSetFingerprint(ctx, stubScript)
+        val expected = "apk:$apkVer|dsh:${DshUpdater.currentVersion(ctx)}|fp:$fp"
         if (MarkerStore.get(ctx, "stub-applied") == expected) {
             fl(">> Android 兼容修复已应用（$expected），跳过 stub")
             return
@@ -394,7 +412,8 @@ object DshFlow {
                 "NODE_DIR" to nodeDir.absolutePath,
                 "DSH_PREFIX" to dshPrefix.absolutePath,
                 "DSH_PROFILE" to "web",
-                "DSH_APK_VER" to apkVer.toString()
+                "DSH_APK_VER" to apkVer.toString(),
+                "DSH_PATCH_DIR" to File(ctx.filesDir, "patched").absolutePath
             )
         ) { fl(it) }
         if (exit == 0) {
@@ -402,6 +421,33 @@ object DshFlow {
         } else {
             fl("WARN stub-dsh 退出码 $exit（不写 marker，下次重跑）")
         }
+    }
+
+    /**
+     * 补丁集内容指纹：stub 脚本 + patched/ 全部载荷的长度与全量 CRC32 聚合。
+     * 任一处内容变化即指纹变化 → stub 重跑（「载荷变即重贴」，不依赖版本号）。
+     */
+    private fun patchSetFingerprint(ctx: Context, stubScript: File): String {
+        val crc = java.util.zip.CRC32()
+        fun feed(f: File) {
+            try {
+                crc.update(f.name.toByteArray())
+                crc.update(f.length().toString().toByteArray())
+                if (f.length() > 0) {
+                    java.io.FileInputStream(f).use { input ->
+                        val buf = ByteArray(64 * 1024)
+                        var n: Int
+                        while (input.read(buf).also { n = it } != -1) crc.update(buf, 0, n)
+                    }
+                }
+            } catch (_: Throwable) {
+                // 单文件不可读时忽略（内容变化会在下次启动重算）
+            }
+        }
+        feed(stubScript)
+        val patchDir = File(ctx.filesDir, "patched")
+        patchDir.walkTopDown().filter { it.isFile }.sortedBy { it.name }.forEach { feed(it) }
+        return java.lang.Long.toHexString(crc.value)
     }
 
     /** 后台启动 dsh web 并等待 HTTP 就绪。端口已有监听但无响应时清场重启（幂等但不再盲信）。 */

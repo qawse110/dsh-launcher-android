@@ -1,0 +1,3 @@
+const p=new Proxy(function(){},{get:(t,k)=>(k===Symbol.toPrimitive)?()=>0:(k==='then'||k==='catch'||k==='finally')?undefined:p,apply:()=>p,construct:()=>p});const koffi={load:()=>p,decode:()=>0,encode:()=>0,
+sizeof:()=>0,alignof:()=>0,function:()=>p,struct:()=>p,union:()=>p,enum:()=>p,typedef:()=>p,pointer:()=>p,
+register:()=>p,KoffiError:class extends Error{}};module.exports=koffi;module.exports.default=koffi;
