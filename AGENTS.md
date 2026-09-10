@@ -84,6 +84,10 @@ export OPENSSL_CONF=/dev/null
   → **默认档位下 bash 工具不可用**。本机因历史会话恰好都是 `danger-full-access`
   而侥幸可用（该模式不走 confine）。解法见内置插件 `dsh-shell-termux`
   （disable `bash-sandbox` + 自建 `ctx.shell` provider）。详见 gotchas §14。
+- **坑 15**：纯 JVM 单测里 `org.json` 等 android 类**被桩掉**（`isReturnDefaultValues
+  = true`）→ `JSONObject` 构造后任何 `optXxx` 抛 NPE。**碰 android 类的单测一律带
+  `@RunWith(RobolectricTestRunner::class)`**（本仓 8 个测试类的既有约定）。
+  识别信号：NPE 堆栈指向 android 类**内部**而非被测代码。详见 gotchas §15。
 
 ## 4. 详档路由表
 
@@ -108,6 +112,8 @@ export OPENSSL_CONF=/dev/null
 | `core/SymlinkPolicy.kt` | 解压期符号链接目标白名单（纯函数，可单测） |
 | `core/BootstrapInstaller.kt` | Termux bootstrap 解压、短前缀链接、官方镜像 |
 | `core/Proc.kt` | 统一子进程执行器（超时、流式输出、W^X 自动放开） |
+| `core/LocalHttp.kt` | **本机回环 HTTP 唯一入口**（一律 `Proxy.NO_PROXY`；`disconnect` 进 finally） |
+| `core/BridgeStatus.kt` | `/status` 插件契约共享模型（壳侧唯一解析点） |
 | `core/Supervisor.kt` / `DshWatchdog.kt` | 保活期望态、退避拉起、崩溃循环回滚 |
 | `core/BackupManager.kt` | 备份/恢复（zip + manifest，KEEP_MAX=5） |
 | `assets/stub-dsh.mjs` | dsh 启动期补丁 stub（载荷见 `assets/patched/`） |
@@ -118,38 +124,46 @@ export OPENSSL_CONF=/dev/null
 ## 6. 维护约定（硬约束）
 
 1. **进程操作**：只用 `NodeProcs` / `DshFlow.killAllNode`；禁止 `ps|grep|awk`、`pkill -f`。
-2. **环境变量**：字面量只允许出现在 `TermuxEnv`；新增键须同步 `TermuxEnvTest` 单源回归。
+2. **环境变量**：字面量只允许出现在 `TermuxEnv`；三个环境函数共用内部 `build()`，
+   新增键须落在**共享键**段（而非某个函数内），并同步 `TermuxEnvTest` 的
+   「三处环境对共享键取值一致」回归。见坑 8。
 3. **子进程**：一律走 `Proc.run`（自带超时与流消费）；直用 `ProcessBuilder` 需说明理由。
-4. **补丁载荷**：`assets/patched/` 是真实文件（非 base64 内嵌），改动后跑资产脚本门禁；
+4. **本机回环 HTTP**：一律走 `LocalHttp`（`NO_PROXY` + `disconnect` 进 finally），
+   禁止再写裸 `openConnection`；插件 `/status` 一律经 `BridgeStatus.parse` 解析。
+5. **单测碰 android 类须带 Robolectric**：`org.json` / `android.util.*` 在纯 JVM 下被桩掉
+   会抛 NPE。见坑 15。
+6. **结构整理先对账再动手**：合并重复实现前把各方输出**逐字节对照**，区分「刻意差异」
+   （整理后须成为显式参数 + 注释）与「漂移」（按缺陷修）。见 gotchas §16。
+7. **补丁载荷**：`assets/patched/` 是真实文件（非 base64 内嵌），改动后跑资产脚本门禁；
    幂等靠**内容指纹**而非版本 marker（参考项目 v1→v2 静默跳过事故）。
-5. **模板/兜底双源**：任何「资产 + 内联兜底」对必须在测试中锁定占位符集合一致。
-6. **KDoc**：正文里不写注释起始/终止符号字面量；提目录通配写 `patched/` 而非 `patched/**`。
-7. **大资产**：LFS 文件（node/prebuilt/bootstrap）变更后必须跑 ABI 门禁并确认 workflow
+8. **模板/兜底双源**：任何「资产 + 内联兜底」对必须在测试中锁定占位符集合一致。
+9. **KDoc**：正文里不写注释起始/终止符号字面量；提目录通配写 `patched/` 而非 `patched/**`。
+10. **大资产**：LFS 文件（node/prebuilt/bootstrap）变更后必须跑 ABI 门禁并确认 workflow
    仍带 `lfs: true`。
-8. **时间戳判据**：判断「文件是否本次操作产生」**禁止用 mtime**（dpkg/tar/`cp -p`/
+11. **时间戳判据**：判断「文件是否本次操作产生」**禁止用 mtime**（dpkg/tar/`cp -p`/
    `rsync -t`/`git checkout` 都保留源时间戳）；用 ctime，或在内容层面判定
    （patch 幂等，多处理无副作用）。见坑 10。
-9. **模板占位符**：注释与文档里**不得出现占位符字面量**（纯字符串替换会一并展开）；
+12. **模板占位符**：注释与文档里**不得出现占位符字面量**（纯字符串替换会一并展开）；
    渲染类测试用**计数**判据而非 `Set` 比对（`Set` 对重复天然失明）。见坑 11。
-10. **前缀路径**：短前缀 `t` 即 `usr` 的别名，路径写 `t/bin/...`；新增任何硬编码
+13. **前缀路径**：短前缀 `t` 即 `usr` 的别名，路径写 `t/bin/...`；新增任何硬编码
    `/data/user/0/com.dsh.launcher/t…` 前先用 `readlink` 确认语义。见坑 9。
-11. **长耗时 IO 不进主线程**：`ensureHarnessTools` 等含全树扫描的函数（实测 ~1s）
+14. **长耗时 IO 不进主线程**：`ensureHarnessTools` 等含全树扫描的函数（实测 ~1s）
     调用方必须包裹 `thread { }`。
-12. **环境类改动须读设备实况**：路径存在性、时间戳语义、符号链接指向等前提，
+15. **环境类改动须读设备实况**：路径存在性、时间戳语义、符号链接指向等前提，
     必须用 `readlink`/`stat`/`strings` 在真机核对后再改——坑 12 的 3 个缺陷
     无一能被 CI 捕获。
-13. **插件契约面**：改 `extra-plugins/*/lib` 的事件名/状态值，或改壳侧
+16. **插件契约面**：改 `extra-plugins/*/lib` 的事件名/状态值，或改壳侧
     `StatusOverlay.statusLabel` / `PetSpeaker` / `PetOverlayView` 的对应分支，
     **必须同步另一方**并跑 `check-plugin-contract.cjs`。插件须导出 `__testing` 面
     （门禁靠它做运行时驱动），新增状态机分支须补 `test/*.test.mjs`。见坑 13。
-14. **跨项目借鉴须复核字段名**：参考项目的注释可能与其实现在细节上不一致
+17. **跨项目借鉴须复核字段名**：参考项目的注释可能与其实现在细节上不一致
     （如它读 `turn/end.outcome`，而本机 schema 只有 `reason`）。借鉴前对着
     **本机 dsh 的 `types.d.ts`** 核一遍字段名与联合类型取值。
-15. **执行世界坐标靠显式注入**：不要让子进程依赖「进程环境恰好正确」——
+18. **执行世界坐标靠显式注入**：不要让子进程依赖「进程环境恰好正确」——
     dsh 默认执行器 spawn 裸 `"bash"`，子进程环境 = `scrubbedParentEnv()` ⊕ spawn env，
     缺 `LD_LIBRARY_PATH` 时 Termux 二进制直接 `CANNOT LINK`（实测）。
     改 `dsh-shell-termux` 的 `buildTermuxEnv` 时**必须保留继承段兜底**
     （否则注入的 PATH 会覆盖父 PATH、丢掉引擎自带 `node/bin`）。见坑 14。
-16. **改 `ctx.shell` 装配面须跑装配门禁**：`dsh-shell-termux` 以唯一 provider 身份
+19. **改 `ctx.shell` 装配面须跑装配门禁**：`dsh-shell-termux` 以唯一 provider 身份
     替换默认执行器，写错的后果是「bash 整体不可用」（比原缺陷更糟）。
     任何 disable/insert/坐标/继承改动后跑 `check-plugin-contract.cjs` 的 §H。

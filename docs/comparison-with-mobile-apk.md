@@ -510,6 +510,66 @@ bash 整体不可用**。故门禁核对：disable/insert 成对、均限定平�
 **反向验证 3/4 → 修好 → 4/4**：初版用裸短语 `extends LocalBashExecutor` 做锚点，
 **注释里提到该短语即算命中** → 「真实继承被改掉」时漏检；改锚定类声明后正确拦下。
 
+## 三点十四、结构整理（review-r10，行为零变化）
+
+目标不是「换个写法」，而是**消除已经产生真实漂移的重复**。三处重复各自收敛到单点：
+
+### 1. `TermuxEnv`：三个环境构造器 → 一个内部构造器
+
+`childShellEnv` / `webProcessExports` / `terminalSessionEnv` 此前各写一份「几乎相同」
+的环境，共享 7 个键却各自维护，**已实测漂移**：
+
+| 键 | 子 shell | web 进程 | 终端 PTY |
+|---|---|---|---|
+| PREFIX / LD_LIBRARY_PATH / OPENSSL_CONF / TERM / SHELL / LD_PRELOAD | 共享 | 共享 | 共享 |
+| `LANG` | `C.UTF-8` | **遗漏** | `C.UTF-8` |
+
+**真机实测**：web 进程 `/proc/<pid>/environ` **无 `LANG`**——影响工具的中文/UTF-8
+输出判定。这属真实缺失，不是风格差异。
+
+收敛后：共享键只写一次；差异（`HOME`/`TMPDIR`/PATH 顺序/`nodeDir`）全部走**显式参数
++ 注释说明为何不同**。顺带修掉一个同源错配——web 的 `LD_LIBRARY_PATH` 此前硬编码推导
+`filesDir/node/lib`，而 PATH 用调用方传入的 `nodeDir`；现在同一个 `nodeDir` 派生，
+不可能再出现「PATH 指向 A 的 node、LD 指向 B 的 lib」。
+
+**行为保持验证**：三种场景的 PATH 输出与旧实现**逐字节一致**（脚本对照，非目测）。
+公开面审计后从 5 个降到 3 个（`nodeLibDir`/`ldLibraryPath` 转 private，
+`nodeBinDir` 无消费者直接删）。
+
+### 2. `LocalHttp`：4 处重复探测 → 单一入口
+
+`DshFlow.httpResponds` / `DshWatchdog.isUp` / `StatusBridgeService.fetchStatus` /
+`KeepAliveAccessibilityService.fetchStatus` 此前各自实现「建连→设超时→GET→判码→断开」，
+连超时值与 `disconnect` 位置都已出现细微差异。收敛为 `responds`/`getText`/`getJson`，
+两条硬约束写进类型文档（必须 `NO_PROXY`、`disconnect` 必进 `finally`）。
+`DshFlow.localConnection` 随之成为死代码并删除（连带 2 个 unused import）。
+
+### 3. `BridgeStatus`：2 处手写 JSON 解析 → 共享模型
+
+插件 `/status` 是跨进程契约，此前壳侧两处各自解析，字段名与默认值散落在四处字面量
+（插件加 `toolName` 时两处都要手改）。收敛为 `BridgeStatus.parse`，
+并修正一个真实陷阱：`JSONObject.optString(key, null)` 在**键存在但值为 JSON null** 时
+返回**字面量 `"null"`**——下游会把 `"null"` 当真实事件名。
+
+### 测试把新不变量钉死
+
+- 「三处环境对共享键取值一致」→ 新增消费方漏键立刻失败（`LANG` 那种漂移不可能再发生）
+- 「web 的 LD 与 PATH 同源」「export 顺序稳定」「各 PATH 顺序符合设计」
+- `BridgeStatus` 解析契约（JSON null / 空串 / 未知状态 / 类型不匹配）
+- `LocalHttp` 失败降级语义
+
+### 本轮 CI 抓到的自身缺陷
+
+1. **静态预检抓到我的 `/` 反引号方法名**（review-r8 加的那条规则）——门禁对作者同样生效。
+2. **`BridgeStatusTest` 缺 Robolectric runner**：`isReturnDefaultValues = true` 下
+   `org.json` 被桩掉，7 个用例全 NPE。本仓既有 8 个测试类都带 runner，本测试是
+   **首个直接用 `org.json` 的测试**而漏了该约定（`BackupManagerTest` 是反证：它经
+   `create()` 走到 `JSONObject` 且通过）。已记入 gotchas §15。
+
+> 方法沉淀（gotchas §16）：整理前**先对账不改码**——把重复方的输出逐字节对照，
+> 区分「刻意差异」与「漂移」；刻意差异整理后必须变成显式参数+注释，
+> 而不是继续依赖「两份代码各自碰巧一样」。
+
 ## 四、后续重构排期建议（未落地）
 
 1. **P2**：`BridgeOverlayManager.kt`（1287 行）按「窗口管理/状态机/交互」三块拆分——参考项目 OverlayService(712)/OverlayPanel(837)/OverlayController 分层值得照抄。
@@ -629,3 +689,20 @@ bash 整体不可用**。故门禁核对：disable/insert 成对、均限定平�
 - `tools/check-plugin-contract.cjs`（**新增 §H 装配契约检查**：disable/insert 成对、
   平台限定、三坐标齐备、inject 声明、继承锚定类声明）
 - `docs/AGENTS/gotchas.md`（新增 §14）、`docs/comparison-with-mobile-apk.md`（本节）
+### review-r10（结构整理：消除已漂移的重复）
+- `app/src/main/java/com/dsh/launcher/core/TermuxEnv.kt`（**三个构造器收敛为一个内部
+  `build()`**；共享键单点产出；差异显式参数化；公开面 5 → 3）
+- `app/src/main/java/com/dsh/launcher/core/LocalHttp.kt`（**新增**，4 处重复探测的单一入口）
+- `app/src/main/java/com/dsh/launcher/core/BridgeStatus.kt`（**新增**，`/status` 契约共享模型
+  + `optNullableString` 修正 JSON-null 陷阱）
+- `app/src/main/java/com/dsh/launcher/core/DshFlow.kt`（`httpResponds` 委托；删死代码
+  `localConnection` 与 2 个 unused import）
+- `app/src/main/java/com/dsh/launcher/core/DshWatchdog.kt`（`isUp` 委托，减 20 行）
+- `app/src/main/java/com/dsh/launcher/service/StatusBridgeService.kt`（`fetchStatus` 委托；
+  `STATUS_URL` 提为共享常量；配置读取改用共享模型）
+- `app/src/main/java/com/dsh/launcher/service/KeepAliveAccessibilityService.kt`（同上；
+  删除本地 `StatusData` 内部类与 4 个 unused import）
+- `app/src/test/java/com/dsh/launcher/core/TermuxEnvTest.kt`（+5 用例：共享键三处一致等）
+- `app/src/test/java/com/dsh/launcher/core/LocalHttpTest.kt`（**新增**，BridgeStatus 解析契约
+  + LocalHttp 降级语义，含 Robolectric runner）
+- `docs/AGENTS/gotchas.md`（新增 §15 `org.json` 桩陷阱、§16 结构整理方法）

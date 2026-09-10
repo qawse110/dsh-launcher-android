@@ -566,3 +566,55 @@ git version 2.55.0
 **注释里提到该短语即算命中**，故「真实继承被改掉」时漏检；改为锚定类声明
 `export class \w+ extends LocalBashExecutor\b` 后正确拦下。
 （又一次印证：**门禁必须见过真实坏输入**，而不是只看构造样例。）
+
+---
+
+## 15. 纯 JVM 单测里 `org.json` 被桩掉 → NPE（review-r10 CI 实测）
+
+`app/build.gradle.kts` 设了 `unitTests.isReturnDefaultValues = true`——未 shadow 的
+android 类方法返回默认值。`org.json.JSONObject` 因此在**纯 JVM 测试**下：
+
+```kotlin
+val o = JSONObject("""{"a":1}""")   // 桩实现：内部 map 未初始化
+o.optString("a", "x")               // → NullPointerException
+```
+
+CI 实测：7 个用例全部 NPE 在同一行（`JSONObject(...)`）。
+
+**约定**：**凡碰 android 类的单测一律带 Robolectric runner**：
+
+```kotlin
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [33])
+```
+
+Robolectric 的 android-all 提供真实实现，解析语义才等于线上语义。本仓 8 个测试类
+都遵守此约定；例外只有纯函数逻辑（`SymlinkPolicyTest`、不碰 android 类）。
+`BackupManagerTest` 是反证：它经 `BackupManager.create()` 走到 `JSONObject` 且通过。
+
+**识别信号**：单测报 `NullPointerException` 且堆栈指向 android 类（`org.json.*`、
+`android.util.*`）的**内部**，而不是被测代码——先查 runner 注解，不要先怀疑逻辑。
+
+---
+
+## 16. 结构整理经验：先量「行为是否真的相同」，再动手
+
+review-r10 把三处重复实现收敛到单点（环境构造 / 本地 HTTP / 状态解析）。
+可复用的做法：
+
+1. **先对账，不改码**：把重复方的**输出逐字节对照**（本轮把三套 PATH 用脚本
+   打印出来逐项比对），确认哪些差异是刻意的、哪些是漂移。
+2. **刻意差异必须显式化**：`webProcessExports` 的 PATH 顺序与 `childShellEnv` 不同
+   （web 需 `node/bin` 优先，否则 `node`/`npm` 可能解析到别处）——整理后这类差异
+   变成构造器的显式参数 + 注释，而不是「两份代码各自碰巧一样」。
+3. **漂移当缺陷修**：对账中发现 `webProcessExports` **缺 `LANG`**
+   （真机 `/proc/<pid>/environ` 实测无 LANG，而 childShellEnv 设了 `C.UTF-8`），
+   属真实缺失而非风格差异。
+4. **顺手修同源错配**：web 的 `LD_LIBRARY_PATH` 硬编码推导 `filesDir/node/lib`，
+   而 PATH 用调用方传入的 `nodeDir`——两个来源。统一为同一个 `nodeDir` 派生后，
+   不可能再出现「PATH 指向 A 的 node、LD 指向 B 的 lib」。
+5. **审计公开面**：整理后确认 `nodeLibDir`/`ldLibraryPath` 已无外部消费者 →
+   转 private；`nodeBinDir` 无消费者 → 直接删。公开 API 收敛为「三个消费方函数」。
+
+**新增的结构不变量要写成测试**：本轮加了「三处环境对共享键取值一致」——
+新增消费方漏键会立刻失败（`LANG` 那种漂移不可能再发生）。
