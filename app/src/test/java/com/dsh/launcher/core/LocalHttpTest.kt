@@ -2,10 +2,12 @@ package com.dsh.launcher.core
 
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
 
 /**
  * [BridgeStatus]：插件 `/status` 契约的解析测试。
@@ -13,7 +15,15 @@ import org.junit.Test
  * 该 JSON 是**插件 ↔ 壳侧跨进程契约**，此前壳侧两处各自手写解析（字段名与默认值
  * 散落在四处字面量）。集中后本测试锁定兼容性约定，插件加字段/壳侧改默认值时
  * 会在此暴露。
+ *
+ * **必须带 Robolectric runner**：`app/build.gradle.kts` 设了
+ * `unitTests.isReturnDefaultValues = true`，纯 JVM 测试下 `org.json.JSONObject`
+ * 是被桩掉的 android 类（方法返回默认值）→ 随后任何 `optXxx` 都抛
+ * `NullPointerException`。CI 实测：7 个用例全挂在 `JSONObject(...)` 那一行。
+ * Robolectric 提供 android-all 的真实实现，解析语义才等于线上语义。
  */
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [33])
 class BridgeStatusTest {
 
     @Test fun `完整响应按字段解析`() {
@@ -72,19 +82,17 @@ class BridgeStatusTest {
      */
     /**
      * 类型不匹配时**必须降级而非抛异常**——探测契约要求失败即 null/默认值，
-     * 异常会打死轮询线程（这是本测试唯一要锁定的不变量）。
+     * 异常会打死轮询线程（这是本测试真正要锁定的不变量：解析本身不炸）。
      *
-     * 刻意**不**断言转换后的具体取值：Android `org.json` 的 `optString` 会把
-     * 非字符串经 `JSON.toString` 转写，`optLong` 对非数值的行为也依赖实现细节，
-     * 二者都无法在本开发环境实测（设备无 JDK/jar）。把未经验证的语义写进断言
-     * 只会在 CI 上换来一次无意义的红灯。
+     * 刻意**不**断言 `status` 经 `optString` 转写后的具体取值（org.json 会把非字符串
+     * 经 `JSON.toString` 转写，属实现细节）；改为断言**未提供的字段仍走默认值**——
+     * 这一点不受其它字段类型错误影响，是真正有意义的契约。
      */
-    @Test fun `type 不匹配时不抛异常且返回可用对象`() {
+    @Test fun `type 不匹配时不抛异常且未提供字段走默认值`() {
         val st = BridgeStatus.parse(JSONObject("""{"status":123,"updatedAt":"abc"}"""))
-        // 不抛异常 + 对象可用（字段可读）即达成契约
-        assertNotNull(st)
-        assertNotNull(st.status)
-        assertNotNull(st.text)
+        assertEquals("未提供的 lastText 取默认空串", "", st.text)
+        assertNull("未提供的 lastEvent 为 null", st.event)
+        assertNull("未提供的 toolName 为 null", st.toolName)
     }
 
     @Test fun `IDLE 常量与空响应解析结果一致`() {
