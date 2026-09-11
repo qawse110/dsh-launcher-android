@@ -5,7 +5,6 @@ import { Config, PiAiAdapter } from "@deepseek-ai/dsh-llm-pi-ai";
 import { installSettingsSection, settingsNamespace } from "@deepseek-ai/dsh-settings";
 import { createProvider } from "@earendil-works/pi-ai";
 import * as openAICompletionsApi from "@earendil-works/pi-ai/api/openai-completions";
-import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import {
   CODEBUDDY_REGIONS,
   parseCodeBuddySession,
@@ -259,12 +258,75 @@ async function fetchCodeBuddyModels(region, credential, signal) {
   return extra.length > 0 ? [...models, ...extra] : models;
 }
 
-function codeBuddyProvider(region, models, auth) {
+/**
+ * CodeBuddy 的 API-Key auth：行为对齐 pi-ai 的 envApiKeyAuth（helpers.js）。
+ *
+ * 【为什么不用 pi-ai 内置的 DeepSeek auth helper】（上游 167e8fc 同款修复）
+ * 旧实现是 `builtins.get("deepseek")?.auth`，有三个问题：
+ *   1. 新版 pi-ai 的 auth resolver 要求接收 signal 参数，而旧版 DSH 适配器
+ *      调用时不传 —— 跨版本升级会直接报错；
+ *   2. 硬依赖 pi-ai 内置 provider 目录里存在 "deepseek"，一旦上游调整目录，
+ *      插件会在加载期抛 "auth helper is unavailable" 而整体挂掉；
+ *   3. DeepSeek helper 的 env 兜底读的是 DEEPSEEK_API_KEY 等变量，跟
+ *      CodeBuddy 的凭据体系对不上。
+ *
+ * 【resolve 的三段式语义】（与 envApiKeyAuth 完全一致，只是 envVars 换成
+ * CodeBuddy 自己的）：
+ *   1. pi-ai credential store 里存了 api_key → 直接用；
+ *   2. 没存 → 按 envVars 逐个读环境变量兜底（CodeBuddy API Key 模式的
+ *      正常入口：CODEBUDDY_API_KEY / CODEBUDDY_INTL_API_KEY）；
+ *   3. 都没有 → undefined（pi-ai 会报 "Provider is not configured"）。
+ *
+ * 令牌登录模式不经这条链：DSH 适配器（本插件）的 resolveApiKey 直接从
+ * DSH credentials 服务里取登录会话 accessToken 并注入请求头，pi-ai 的
+ * credential store 里不会、也不需要存 CodeBuddy 凭据。因此 token 模式下
+ * 若有代码路径只调 pi-ai 的 getAuth（如部分 catalog 预取），会落到第 3 段
+ * —— 这与上游 envApiKeyAuth 的行为一致，属预期。
+ *
+ * 注意 pi-ai 调用 resolve 的实参形如 { ctx, credential }（见
+ * resolveProviderAuth → resolveApiKey），env 兜底必须走 ctx.env 而非
+ * process.env：authContext 可能被 overrides.env 覆盖。
+ */
+function codeBuddyApiKeyAuth(displayName, envVars) {
+  return {
+    name: `${displayName} API Key`,
+    login: async (interaction) => {
+      const signal = interaction?.signal;
+      signal?.throwIfAborted?.();
+      const key = await interaction.prompt({ type: "secret", message: `Enter ${displayName} API Key` });
+      signal?.throwIfAborted?.();
+      return { type: "api_key", key };
+    },
+    resolve: async ({ ctx, credential, signal } = {}) => {
+      signal?.throwIfAborted?.();
+      if (credential?.key) {
+        return {
+          auth: { apiKey: credential.key },
+          ...(credential.env ? { env: credential.env } : {}),
+          source: "stored credential",
+        };
+      }
+      for (const envVar of envVars) {
+        const value = ctx?.env ? await ctx.env(envVar) : process.env[envVar];
+        if (value) return { auth: { apiKey: value }, source: envVar };
+      }
+      return undefined;
+    },
+  };
+}
+
+function codeBuddyProvider(region, models, apiKeyAuth) {
   return createProvider({
     id: region.provider,
     name: region.displayName,
     baseUrl: region.baseUrl,
-    auth,
+    // 【必须包成 { apiKey } 】pi-ai 的 resolveProviderAuth 以 provider.auth.apiKey
+    // 为入口：`overrides.apiKey !== undefined && provider.auth.apiKey` 才走请求级
+    // 覆盖分支，ambient 兜底同样读 provider.auth.apiKey.resolve。若把 ApiKeyAuth
+    // 裸传给 auth，则 auth.apiKey === undefined → getAuth 恒为 undefined →
+    // 每次请求都抛 "Provider is not configured"（2026-09-11 实修：上一轮改造
+    // 裸传导致的回归；上游 167e8fc 的写法正是包了一层的 auth: { apiKey: … }）。
+    auth: { apiKey: apiKeyAuth },
     models,
     api: codeBuddyApi,
   });
@@ -277,6 +339,10 @@ function resolvedProfile(provider, source, piProvider, configuredMaxTokens = new
     headers: runtimeHeaders(source.headers),
     provider,
     displayName: source.displayName ?? piProvider.name ?? provider,
+    // dsh-llm-pi-ai 在目录解析时会为每个精确模型读取这个 map。本插件没有
+    // 逐模型的校验失败项，但仍须提供空 map 以满足共享适配器 API
+    // （上游 29ff497 修复；旧版本 pi-ai 不读该字段，补上对旧版无副作用）。
+    modelErrors: new Map(),
     ...(apiKeyEnv === undefined ? {} : { apiKeyEnv }),
     streamIdleTimeoutMs: source.streamIdleTimeoutMs ?? STREAM_IDLE_TIMEOUT_MS,
     retryPolicy: resolveRetryPolicy(source.retryPolicy ?? CODEBUDDY_RETRY_POLICY, `${name}: provider "${provider}" retryPolicy`),
@@ -336,6 +402,7 @@ function codeBuddySource(config, source, provider) {
 
 export const __testing = Object.freeze({
   authenticationHeaders,
+  codeBuddyApiKeyAuth,
   codeBuddyRequestOptions,
   codeBuddySource,
   modelsFromConfig,
@@ -350,9 +417,8 @@ export const __testing = Object.freeze({
 export function apply(ctx, config) {
   installCodeBuddyWeb(ctx);
   let current = () => config;
-  const builtins = new Map(builtinProviders().map((provider) => [provider.id, provider]));
-  const apiKeyAuth = builtins.get("deepseek")?.auth;
-  if (!apiKeyAuth) throw new Error(`${name}: pi-ai DeepSeek auth helper is unavailable`);
+  // auth 已下沉到 regionProfile：每个区域一份（env 兜底读自己的 apiKeyEnv，
+  // 见 codeBuddyApiKeyAuth 注释），不再共用、也不依赖 pi-ai 内置 provider 目录。
 
   const states = new Map();
   for (const region of Object.values(CODEBUDDY_REGIONS)) {
@@ -386,7 +452,7 @@ export function apply(ctx, config) {
     const result = resolvedProfile(region.provider, {
       ...sourceWithAuth,
       displayName: region.displayName,
-    }, codeBuddyProvider(region, models, apiKeyAuth), configured);
+    }, codeBuddyProvider(region, models, codeBuddyApiKeyAuth(region.displayName, [region.apiKeyEnv])), configured);
     state.memoRaw = current();
     state.memoGeneration = state.generation;
     state.memoized = result;
