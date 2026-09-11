@@ -18,7 +18,7 @@ import java.net.URL
  * |---|---|---|
  * | `GET /`（无凭据，即使 loopback） | 200 | **401** |
  * | `GET /api`（无凭据） | 放行 | **401** |
- * | `GET /assets/*`（静态资产） | 200 | 200（栅栏不拦静态） |
+ * | `GET /assets/...`（静态资产） | 200 | 200（栅栏不拦静态） |
  * | `GET /?token=<启动令牌>` | — | **303** + 下发 `dsh-auth-<authority>` cookie |
  * | `GET /`（带该 cookie） | — | 200 |
  *
@@ -33,7 +33,7 @@ import java.net.URL
  * 1. [isFenced]：判定当前 dsh 版本是否启用栅栏（探测 `/` 返回 401/403）。
  * 2. [launchTokenUrl]：从 web 日志解析带启动令牌的 URL。
  * 3. [ensureSession]：用启动令牌换 cookie 并持久化，供后续请求复用。
- * 4. [authenticatedUrl]：给 WebView 用的入口 URL。
+ * 4. [entryUrl]：给 WebView 用的入口 URL。
  *
  * 兼容性：0.1.1（无栅栏）下 [isFenced] 恒 false，全部逻辑退化为「直接开根路径」，
  * 行为与升级前完全一致。
@@ -119,7 +119,7 @@ internal object WebAuth {
      *
      * 注意：换取的 cookie 绑定 `host:port`（authority），端口变化即失效。
      */
-    fun ensureSession(ctx: Context, port: Int, tokenUrl: String): String? {
+    fun ensureSession(ctx: Context, tokenUrl: String): String? {
         var conn: HttpURLConnection? = null
         return try {
             conn = URL(tokenUrl).openConnection() as HttpURLConnection
@@ -182,7 +182,7 @@ internal object WebAuth {
         // 栅栏启用且 cookie 无效 → 用日志里的启动令牌重新换 cookie
         val tokenUrl = launchTokenUrl(ctx, logFile)
         if (tokenUrl != null) {
-            val cookie = ensureSession(ctx, port, tokenUrl)
+            val cookie = ensureSession(ctx, tokenUrl)
             if (cookie != null && !isFenced(port, cookie)) return base
             // 换取后仍被拒（cookie 无效/authority 不匹配）→ 直接用带令牌 URL 兜底，
             // 让 dsh 自己完成 303 与 cookie 下发（WebView 会保存 cookie）。

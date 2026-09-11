@@ -147,3 +147,46 @@ v5 首版把 **helper 体内的 `await link(from, target)` 也当成待改写调
 第二次运行即把 helper 改成自递归（`rewritten=1` 且文件 sha 变化暴露）。
 修复：用花括号配平定位 `publishCopied` 函数体区间，扫描时排除该区间。
 **教训：凡「扫描+改写」型补丁，必须显式排除自己插入的代码。**
+
+### 7.5 浏览器信任栅栏（★壳侧必须适配，非补丁问题）
+
+**真机现象**：装 0.1.5-rc.2 后启动报 `✗ dsh web 未在 90 秒内就绪`，
+日志尾部停在 `[net-proxy] 同源设置路由`（看似"起不来"）。
+
+**根因**：0.1.5 新增 **authority 绑定的浏览器会话鉴权**
+（`@deepseek-ai/dsh-client-connection` 的 `BrowserAuth`），且**无条件启用**——
+配置项只有 `cookieMaxAgeDays` / `trustedHosts`，**没有任何开关可关闭栅栏**：
+
+| 请求 | 0.1.1 | 0.1.5 |
+|---|---|---|
+| `GET /` 无凭据（**含 loopback**） | 200 | **401** |
+| `GET /api` 无凭据 | 放行 | **401** |
+| `GET /assets/*` | 200 | 200（静态资产不拦） |
+| `GET /?token=<启动令牌>` | — | **303** + 下发 `dsh-auth-<authority>` cookie |
+| `GET /` 带该 cookie | — | 200 |
+
+启动令牌**每进程随机**（`randomBytes(32)`），只打印在 web 日志里；
+换取的 cookie 用**持久密钥**签名、30 天有效、audience 绑定 `host:port`
+→ cookie 一旦拿到，进程重启后仍可复用（端口不变时）。
+
+**为什么「90 秒未就绪」是误报**：实测 3093 端口 **30 秒内即返回 401**，
+即服务**早已就绪、只是缺凭据**；而就绪探针只接受 `200..399` → 永远判未就绪。
+
+**三处壳侧修复**：
+
+1. `DshFlow.httpResponds` / `DshWatchdog.isUp`：401/403 也算「端口活着」。
+   401/403 只可能由**已监听的 HTTP 服务**返回，语义上等价于就绪。
+   ★ watchdog 那处尤其关键——否则每轮误判 web 挂了 → 反复 revive，
+   连续失败还会被 `Supervisor` 误判为崩溃循环而**自动回滚重装上一版本**。
+2. 新增 `WebAuth`：解析日志里的启动令牌 URL → 换 cookie → 持久化。
+   只读日志尾部 64KB（web.log 持续追加不轮转，全量读会卡顿）；
+   取**最后一次**出现的令牌（进程重启后旧令牌立即失效）。
+3. `WebViewActivity.loadWebUi()`：先确保会话，再**注入 WebView 自己的 cookie jar**
+   （WebView 与 `HttpURLConnection` **不共享 cookie**，只存 pref 不注入是无效的），
+   然后开根路径；全失败退回带令牌 URL，且不阻断启动。
+
+**兼容性**：0.1.1（无栅栏）下 `isFenced` 恒 false，逻辑退化为「直接开根路径」，
+与升级前行为完全一致。
+
+**验证**：对真实服务复刻完整决策链 —— 无 cookie→401 → 令牌交换→303+cookie →
+带 cookie→200 → 判定可直接开根路径 ✅；单测 `WebAuthTest` 6 例。
