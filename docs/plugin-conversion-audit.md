@@ -190,3 +190,56 @@ v5 首版把 **helper 体内的 `await link(from, target)` 也当成待改写调
 
 **验证**：对真实服务复刻完整决策链 —— 无 cookie→401 → 令牌交换→303+cookie →
 带 cookie→200 → 判定可直接开根路径 ✅；单测 `WebAuthTest` 6 例。
+
+### 7.6 内置插件 API 漂移：`dsh-settings` 导出面收窄（★插件加载失败）
+
+**真机现象**：`✗ dsh web 未在 90 秒内就绪`，日志尾部是**插件加载失败**
+（不是壳侧问题）：
+
+```
+plugins/dsh-llm-codebuddy/lib/index.js:5
+import { installSettingsSection, settingsNamespace } from "@deepseek-ai/dsh-settings";
+SyntaxError: The requested module '@deepseek-ai/dsh-settings'
+             does not provide an export named 'installSettingsSection'
+```
+
+Cordis 判定整棵插件树 apply 失败 → web 完全起不来。
+
+**根因**：0.1.5 收窄了 `@deepseek-ai/dsh-settings` 的导出面（实测两版对照）：
+
+| 版本 | 导出符号 |
+|---|---|
+| 0.1.1 | 7 个，含 `installSettingsSection` / `settingsNamespace` / `deepEqualJson` |
+| 0.1.5 | **4 个**：`SettingsConflictError` / `SettingsProvider` / `default` / `redactSecrets` |
+
+能力下沉为服务方法（逐行比对上游实现，**语义等价**）：
+
+| 旧 (0.1.1) | 新 (0.1.5) |
+|---|---|
+| 模块级 `installSettingsSection(ctx, ns, schema, entry, hooks)`<br>内部即 `ctx.inject(["settings"], sctx => sctx.settings.register(...))` | `ctx.settings.installSection(ctx, ns, schema, entry, hooks)`<br>（官方插件 `dsh-agent-default-model` 即用此形式） |
+
+**★ 关键手法**：**具名导入在 ESM 链接期就抛错**，`try/catch` 兜不住，运行时
+探测也没机会执行——必须改成**命名空间导入**（`import * as dshSettings`），
+把符号存在性判定推迟到运行时。这是本类问题的通用解法。
+
+**改动**（`src/` 与 `lib/` 同步，`lib/` 由 `build.mjs` 生成）：
+
+1. 具名导入 → `import * as dshSettings`（缺符号不再炸链接期）；
+2. `settingsNamespace("llm-codebuddy")` → 常量字面量（该函数同样不再导出；
+   其校验规则 `/^[a-z][a-z0-9-]*$/` 极简，且新版 `register()` 内部会自行校验并抛错）；
+3. 新增 `installCodeBuddySettings` 兼容层：优先走 0.1.5 服务方法，仅旧版回退
+   模块级函数；**两代皆缺时显式抛错**，而非静默不注册。
+
+**同类漂移审计**（避免只修崩溃点、漏掉别处）：内置插件中只有 codebuddy 导入
+dsh API，逐个核对了 5 个包的符号——仅 `dsh-settings` 缺失，`dsh-credentials` /
+`dsh-launch-environment` / `dsh-llm` / `dsh-llm-pi-ai` 全部完好。
+
+**验证**：
+- 兼容层三场景隔离测试：0.1.1 走模块级 ✓ / 0.1.5 走 `inject`+`installSection` ✓ /
+  两代皆缺时显式抛错 ✓；
+- 真机 scratch 装配：`dsh plugin add` 后 `--dump-config` 确认插件在树中；
+  启动 web **20 秒内就绪**、零插件加载错误（修复前必崩）。
+
+**沉淀（下次 dsh 升级必查）**：插件对 `@deepseek-ai/*` 的**每一个具名导入**
+都要核对该包在新版的导出面——**导入符号消失 = 插件加载即失败 = web 起不来**，
+且报错点在插件文件而非壳侧，容易被误判成"web 启动问题"。
