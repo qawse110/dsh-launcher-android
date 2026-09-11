@@ -62,11 +62,13 @@
 
 ## 五、升级守护清单（后续 dsh 版本需复查的点）
 
-1. attachment-local v4 与 fs-local chmod 的锚点是否漂移（补丁自带 node --check 防毒化）；
+1. attachment-local v5 与 fs-local chmod 的锚点是否漂移（补丁自带 node --check 防毒化）；
 2. llm-pi-ai 是否提供官方归因抑制缝隙（有则删补丁 #6）；
 3. 前端 dist 是否重新引入 `AbortSignal.timeout` 消费者（按需注入自动兜底，无需动作）;
 4. `writableRoots()` 是否退回丢失 `os.tmpdir()`（若有变化恢复补丁 #10 并去掉 marker 头写入）；
-5. browse 是否改变符号链接语义（若不再 stat 跟随，`dsh-android-links` 需同步调整）。
+5. browse 是否改变符号链接语义（若不再 stat 跟随，`dsh-android-links` 需同步调整）；
+6. **koffi ABI 断言所在包是否再次搬家**（见 §七：0.1.5 已从 sandbox-windows-acl 搬到
+   win32-process，补丁现按包名清单遍历两包；若上游再新增宿主包，需加入 `ABI_PKGS`）。
 
 ## 六、验证记录（2026-08-25，真机 v4.9 环境 @ dsh 0.1.1-rc.2）
 
@@ -77,3 +79,71 @@
   证实 client 插件无法先于 app bundle 执行；
 - 设备 WebView 为 Chromium 94，当前 rc.2 页面在**无 shim** 时亦正常（无消费者），
   与「按需注入」结论一致。
+
+## 七、dsh 0.1.5-rc.2 适配记录（2026-09-11，next 分支）
+
+钉死版本 `0.1.1-rc.1` → `0.1.5-rc.2`（跨 4 个小版本）。在真机隔离 scratch 环境
+（`$HOME/tmp/dsh-adapt/`，**不在仓库内**）用真实启动命令复现，定位到**两处
+「不报错但失效」的补丁锚点漂移**——两者都不会被编译/单测门禁捕获：
+
+### 7.1 koffi ABI 断言搬家（★boot 硬阻断）
+
+| 项 | 0.1.1-rc.1 | 0.1.5-rc.2 |
+|---|---|---|
+| 断言所在包 | `dsh-sandbox-windows-acl` | **`dsh-win32-process`（新包）** |
+| 旧包现状 | 含断言 | 断言已移除（同名实现保留） |
+| 旧补丁表现 | 正常禁用 | `asserts disabled: 0` —— **看起来无害** |
+
+失败模式：koffi 被 stub 后 `struct().size` 恒为 0，断言在 **import 期**抛错 →
+Cordis 报 `loader entries failed to apply` → **整棵插件树失败，web 完全起不来**
+（实测日志：`failed to import loader entry subprocess ... STARTUPINFOW layout mismatch`）。
+**不是降级，是硬失败。**
+
+修复：`ABI_PKGS` 包名清单遍历新旧两包，且「扫到包却 0 命中」时显式 WARN。
+
+### 7.2 attachment-local 发布链路重构（★图片/附件必挂）
+
+上游把单一 `await link(temporary, target)` 拆成两个调用点：
+
+| 版本 | link 调用点 |
+|---|---|
+| 0.1.1-rc.2 | `publishStagedObject` 内 1 处：`link(temporary, target)` |
+| 0.1.5-rc.2 | `publishImmutableAlias`：`link(source, target)`；`publishStagedObject`：`link(staged.path, target)` |
+
+旧 v4 补丁锚定 `'await link(temporary, target);'` 字面量 → 上游重构后**该串不存在**，
+补丁只打一行 `WARN link anchors unusable (call=false,def=true)` 后放弃。
+
+必要性证据（真机实测，非推断）：
+
+```
+app-private(ext4) link FAIL EACCES
+sdcard(FUSE)      link FAIL EACCES
+```
+
+**应用私有存储上 `link(2)` 同样 EACCES**（SELinux `untrusted_app_27` 域），
+故这不是「sdcard 才需要」的防御性补丁，而是所有附件/图片发布的必经路径。
+
+修复（v5）：改为**扫描式**改写——正则枚举全部 `await link(from, target)` 调用点，
+按作用域推导 sha256 实参（`source`→`sha256`、`staged.path`→`staged.sha256`）。
+**幂等判据同时修正**：不再只看 marker 字符串，而是
+「marker 存在 **且** 已无裸 link 调用点」——旧判据在换版后会把「marker 在、
+调用点未改写」这一失效状态误判为已完成而**永久短路**。
+
+### 7.3 验证记录（真机，隔离环境）
+
+| 项 | 结果 |
+|---|---|
+| 新版结构改写 | 2 处调用点全部改写，sha256 实参各自正确 |
+| 旧版结构（向后兼容） | 1 处调用点正确改写 |
+| 幂等 | 连续 3 次运行文件 sha256 恒定 |
+| copy 回退端到端 | `link` EACCES → copy → digest 校验通过，内容一致 |
+| **web 完整启动** | 真实启动命令 boot web profile → `dsh web: http://127.0.0.1:<port>/?token=…` |
+| **UI 可服务** | 带 token 请求 → HTTP 200，29KB HTML 外壳 + 前端 bundle（555KB/740KB 均 200） |
+| CI 门禁 | 编译 + 12 个测试类全绿（run 34613507254） |
+
+### 7.4 开发期自身踩的坑（记录以免重犯）
+
+v5 首版把 **helper 体内的 `await link(from, target)` 也当成待改写调用点**，
+第二次运行即把 helper 改成自递归（`rewritten=1` 且文件 sha 变化暴露）。
+修复：用花括号配平定位 `publishCopied` 函数体区间，扫描时排除该区间。
+**教训：凡「扫描+改写」型补丁，必须显式排除自己插入的代码。**
