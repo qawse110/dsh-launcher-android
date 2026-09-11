@@ -140,14 +140,12 @@ function text(...values) {
   return values.find((value) => typeof value === "string" && value.length > 0);
 }
 
-function modelsFromConfig(data, region) {
+/** 按给定 id 列表从在线目录里解析模型规格（reasoning/context/maxTokens 全按在线目录）。 */
+function modelsFromIds(data, ids, region) {
   const fallbackModelsList = fallbackModels(region);
-  const agents = Array.isArray(data?.agents) ? data.agents : data?.agent?.agents;
-  const cli = Array.isArray(agents) ? agents.find((agent) => agent?.name === "cli") : undefined;
-  const allowed = Array.isArray(cli?.models) ? cli.models : [];
   const source = Array.isArray(data?.models) ? data.models : [];
   const byId = new Map(source.map((model) => [model?.id, model]));
-  return allowed.flatMap((id) => {
+  return ids.flatMap((id) => {
     const raw = byId.get(id);
     if (!raw) return [];
     const fallback = fallbackModelsList.find((model) => model.id === id);
@@ -166,9 +164,72 @@ function modelsFromConfig(data, region) {
   });
 }
 
+function modelsFromConfig(data, region) {
+  const agents = Array.isArray(data?.agents) ? data.agents : data?.agent?.agents;
+  const cli = Array.isArray(agents) ? agents.find((agent) => agent?.name === "cli") : undefined;
+  const allowed = Array.isArray(cli?.models) ? cli.models : [];
+  return modelsFromIds(data, allowed, region);
+}
+
 function authenticationHeaders(credential) {
   const value = assertUsableApiKey(credential.value, name, credential.ref ?? "CODEBUDDY_API_KEY");
   return credential.kind === "bearer" ? { authorization: `Bearer ${value}` } : { "x-api-key": value };
+}
+
+// 交叉补充模型：某些模型端点可用、也确实列在【国内版】目录里，但没进【国际版】
+// 的 cli.models 白名单（实测：hy4-preview / hy4-preview-x / deepseek-v4.1-flash /
+// hy3 在国际版端点上都返回 200，其中 deepseek-v4.1-flash 与 hy3 免费）。
+// 这些模型不能靠手工写进配置解决——手写会丢掉 reasoning 规格（思考等级），
+// 所以这里改为：拉国际版目录时顺便拉一次国内版目录，把缺失条目按国内版规格补上。
+//
+// 只补「白名单里明确列出的 id」：这些是经核实端点确实可用的，避免把国内版
+// 独有且国际版不支持的模型（如 deepseek-v4-pro，实测 11102 不存在）误加进来。
+// 注意：这个列表要跟着【国内版实时目录】走，不能照抄历史快照。
+// 实测（2026-09-11）：旧快照里的 hy4-preview-x 已从国内版目录移除（服务端下线），
+// 取而代之的是 hy4-preview-f（国际版端点实测 200、credit 0）；hy3-x 在国际版
+// 端点不可用（400），故不列入。缺失的 id 会自动跳过，不会报错。
+const CROSS_REGION_MODEL_IDS = Object.freeze([
+  "hy4-preview",
+  "hy4-preview-f",
+  "deepseek-v4.1-flash",
+  "hy3",
+]);
+
+/**
+ * 用国内版目录补齐国际版缺失的模型。
+ *
+ * 返回补出来的模型规格（已在 region 语境下重建，含 reasoning 信息）；
+ * 国内版目录拉取失败时静默返回 []，不影响国际版主流程。
+ */
+async function fetchCrossRegionModels(region, credential, present, signal) {
+  const missing = CROSS_REGION_MODEL_IDS.filter((id) => !present.has(id));
+  if (missing.length === 0) return [];
+  const source = CODEBUDDY_REGIONS["codebuddy-cn"];
+  if (!source || source.provider === region.provider) return [];
+  let body;
+  try {
+    const response = await fetch(source.configUrl, {
+      headers: {
+        accept: "application/json",
+        ...authenticationHeaders(credential),
+        "user-agent": USER_AGENT,
+        "x-product": "SaaS",
+      },
+      signal,
+    });
+    if (!response.ok) return [];
+    body = await response.json();
+    if (body?.code !== 0) return [];
+  } catch {
+    // 国内版域名在纯国际网络下可能不通：补不了就只显示国际版自有模型。
+    return [];
+  }
+  const raw = Array.isArray(body?.data?.models) ? body.data.models : [];
+  const byId = new Map(raw.map((entry) => [entry?.id, entry]));
+  // 直接复用解析逻辑：只解析缺失的那几个 id，reasoning / contextWindow /
+  // maxTokens 全部按国内版在线规格，与国内版 UI 里看到的思考等级完全一致。
+  const picked = missing.filter((id) => byId.has(id));
+  return picked.length === 0 ? [] : modelsFromIds(body.data, picked, region);
 }
 
 async function fetchCodeBuddyModels(region, credential, signal) {
@@ -192,7 +253,10 @@ async function fetchCodeBuddyModels(region, credential, signal) {
   if (body?.code !== 0) throw new LlmError(`CodeBuddy 模型配置接口错误：${body?.msg ?? body?.code}`, "DISCOVERY_FAILED");
   const models = modelsFromConfig(body.data, region);
   if (models.length === 0) throw new LlmError("CodeBuddy 没有返回 CLI 可用模型", "DISCOVERY_FAILED");
-  return models;
+  // 国际版：补上国内版有、但国际版 cli 白名单里没有的模型。
+  const present = new Set(models.map((model) => model.id));
+  const extra = await fetchCrossRegionModels(region, credential, present, signal);
+  return extra.length > 0 ? [...models, ...extra] : models;
 }
 
 function codeBuddyProvider(region, models, auth) {
@@ -221,10 +285,22 @@ function resolvedProfile(provider, source, piProvider, configuredMaxTokens = new
   };
 }
 
+// 目录合成：在线目录（base）+ 配置声明（entries）。
+//
+// 语义要点：
+//   - 配置里声明的 id 若在线目录也有 → 用配置规格覆盖该条（并把在线目录的
+//     reasoning 信息作为兜底基线，避免覆盖时丢掉思考等级）。
+//   - 配置里声明的 id 在线目录没有（如国际版的 hy4-preview / deepseek-v4.1-flash，
+//     端点可用但不在 cli.models 白名单里）→ 追加到列表末尾。
+//   - 空 entries 时原样返回在线目录。
+//
+// 历史坑（已修）：旧实现是 entries 非空就只返回 entries，等于"配置即全量"，
+// 会把在线目录里的模型全部丢掉；且追加模型的 reasoning 基线为 undefined，
+// 导致思考等级直接没了（reasoning: false）。
 function selectCodeBuddyModels(region, base, entries) {
   if (!Array.isArray(entries) || entries.length === 0) return base;
   const byId = new Map(base.map((model) => [model.id, model]));
-  return entries.map((entry) => {
+  const declared = entries.map((entry) => {
     const model = byId.get(entry.id);
     const reasoning = configuredReasoning(entry, model);
     return codeBuddyModel({
@@ -237,6 +313,9 @@ function selectCodeBuddyModels(region, base, entries) {
       ...reasoning,
     });
   });
+  // 在线目录里未被配置声明的模型追加在后（保持服务端顺序）。
+  const declaredIds = new Set(declared.map((model) => model.id));
+  return [...declared, ...base.filter((model) => !declaredIds.has(model.id))];
 }
 
 // 共存模式：本插件只负责 CodeBuddy 两个 Provider（中国区 + 国际版），
@@ -260,6 +339,8 @@ export const __testing = Object.freeze({
   codeBuddyRequestOptions,
   codeBuddySource,
   modelsFromConfig,
+  modelsFromIds,
+  crossRegionModelIds: CROSS_REGION_MODEL_IDS,
   ownsProvider,
   runtimeHeaders,
   selectCodeBuddyModels,

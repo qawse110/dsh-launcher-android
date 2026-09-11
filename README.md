@@ -85,7 +85,7 @@ files/.dsh/profiles/web ──cordis 装配──▶ dsh web @ 127.0.0.1:3080 �
 | `dsh-oh-we-need` | 推理风格 Skill（不再注入系统提示词） |
 | `dsh-status-bridge` | dsh 运行状态桥接到悬浮窗/通知（本地 HTTP :3190） |
 | `dsh-android-links` | 在 dsh HOME 创建 `sdcard → /storage/emulated/0` 符号链接，让工作区目录浏览器直达 SD 卡（**零 dsh 文件改动**，替代旧源码补丁） |
-| `dsh-llm-codebuddy` | CodeBuddy 中国区/国际版 LLM Provider（**共存模式**：独立命名空间 `llm-codebuddy`，只新增 Provider，不禁用 `llm-pi-ai`，现有自定义 Provider 不受影响；支持 WorkBuddy API Key 与网页令牌登录，DSH 依赖走 peerDependencies 复用宿主实例） |
+| `dsh-llm-codebuddy` | CodeBuddy 中国区/国际版 LLM Provider（**共存模式**：独立命名空间 `llm-codebuddy`，只新增 Provider，不禁用 `llm-pi-ai`，现有自定义 Provider 不受影响；支持 WorkBuddy API Key 与网页令牌登录，DSH 依赖走 peerDependencies 复用宿主实例）。设置页「CodeBuddy 用量」含三个视图：中国区额度、国际版额度、**积分消耗明细**（官方逐条消耗接口，按日分片拉取规避 3000 条上限，按模型/日/客户端聚合）+ **会话用量本地统计**（扫描会话日志按模型与会话聚合 token）。国际版目录会自动补齐国内版有、国际版白名单缺失的模型（`hy4-preview` / `hy4-preview-f` / `deepseek-v4.1-flash` / `hy3`），并继承其思考等级 |
 
 ## 构建
 
