@@ -87,6 +87,44 @@ object AssetSync {
     }
 
     /**
+     * 把内置插件源（`extraSrc` = files/extra-plugins/<dir>）刷新到**已装配的插件副本**
+     * （`pluginsDir` = files/plugins/<dir>）。
+     *
+     * **为什么需要这一步**：profile 里登记的是 `link:.../files/plugins/<dir>`，
+     * dsh 直接从该目录加载插件代码，因此**换掉目录内容即生效**，无需重跑 `dsh plugin add`。
+     * 但旧升级路径只同步了 files/extra-plugins（源），没刷新 files/plugins（装配副本），
+     * 而「快速启动」又会跳过插件装配 → 结果正是「装了含插件修复的新 APK，运行时仍是旧代码、
+     * 报同样的错」。语义与 install-dsh.mjs 的 syncExtraPlugin 一致（整目录替换），
+     * 差别是不碰 profile 登记（登记已存在，且那步需要起 CLI）。
+     *
+     * @param onlyExisting 只刷新「目标已存在」的插件，避免把从未装配过的插件硬塞进
+     *   plugins/（装配与否仍由 dsh plugin add 决定）。
+     * @return 实际刷新的插件个数。
+     */
+    fun refreshBundledPluginCopies(extraSrc: File, pluginsDir: File, onlyExisting: Boolean = true): Int {
+        if (!extraSrc.isDirectory) return 0
+        val dirs = extraSrc.listFiles()?.filter { it.isDirectory } ?: return 0
+        var n = 0
+        for (src in dirs) {
+            if (!File(src, "package.json").isFile) continue
+            val dst = File(pluginsDir, src.name)
+            val dstHasPkg = File(dst, "package.json").isFile
+            if (onlyExisting && !dstHasPkg) continue
+            try {
+                // 内容一致则跳过，避免每次启动无谓重写大量文件
+                if (dstHasPkg && fingerprintOf(dst) == fingerprintOf(src)) continue
+                dst.deleteRecursively()
+                dst.parentFile?.mkdirs()
+                src.copyRecursively(dst, overwrite = true)
+                n++
+            } catch (t: Throwable) {
+                AppLog.e("AssetSync", "refresh plugin copy ${src.name} failed: ${t.message}")
+            }
+        }
+        return n
+    }
+
+    /**
      * 公开的单文件指纹（长度 + 头 64KB CRC32），供「脚本内容变了就该重跑」类判据使用
      * （如 stub-dsh.mjs 补丁载荷的幂等 marker）。文件不存在返回 "absent"。
      */

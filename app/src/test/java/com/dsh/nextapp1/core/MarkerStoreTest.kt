@@ -134,4 +134,41 @@ class MarkerStoreTest {
         assertFalse("安装戳不应为空否则判据 fail-closed 成永久跳过", stamp.isEmpty())
         assertTrue(stamp.contains("|"))
     }
+
+    @Test fun `refreshBundledPluginCopies 刷新装配副本且不误建未装配插件`() {
+        val src = File(ctx.cacheDir, "rbp-src")
+        val dst = File(ctx.cacheDir, "rbp-dst")
+        src.deleteRecursively(); dst.deleteRecursively()
+
+        // 源有两个插件；目标只有 A 已装配
+        File(src, "plugA/lib/index.js").apply { parentFile!!.mkdirs() }.writeText("NEW-A")
+        File(src, "plugA/package.json").writeText("{\"name\":\"plugA\"}")
+        File(src, "plugB/lib/index.js").apply { parentFile!!.mkdirs() }.writeText("NEW-B")
+        File(src, "plugB/package.json").writeText("{\"name\":\"plugB\"}")
+        File(dst, "plugA/lib/index.js").apply { parentFile!!.mkdirs() }.writeText("OLD-A")
+        File(dst, "plugA/package.json").writeText("{\"name\":\"plugA\"}")
+
+        val n = AssetSync.refreshBundledPluginCopies(src, dst, onlyExisting = true)
+        assertEquals("只应刷新已装配的 plugA", 1, n)
+        assertEquals("NEW-A", File(dst, "plugA/lib/index.js").readText())
+        assertFalse("plugB 从未装配过，不应被硬塞进 plugins/", File(dst, "plugB").exists())
+
+        // 幂等：内容一致时不再重复刷新
+        assertEquals(0, AssetSync.refreshBundledPluginCopies(src, dst, onlyExisting = true))
+
+        // onlyExisting=false 时允许补齐未装配的
+        assertEquals(1, AssetSync.refreshBundledPluginCopies(src, dst, onlyExisting = false))
+        assertTrue(File(dst, "plugB/lib/index.js").isFile)
+
+        src.deleteRecursively(); dst.deleteRecursively()
+    }
+
+    @Test fun `refreshBundledPluginCopies 源缺失时安全返回 0`() {
+        assertEquals(
+            0,
+            AssetSync.refreshBundledPluginCopies(
+                File(ctx.cacheDir, "rbp-none"), File(ctx.cacheDir, "rbp-dst2"), true
+            )
+        )
+    }
 }

@@ -933,6 +933,16 @@ class MainActivity : AppCompatActivity() {
                 } else {
                     ok = false
                 }
+                // ★ 同步了「源」还不够：运行时加载的是 files/plugins 下的**装配副本**，
+                //   profile 登记的是 link: 到该目录 → 必须把副本也刷一遍。否则装了含插件
+                //   修复的新 APK，快速启动仍加载旧代码、报完全相同的错（真机事故）。
+                //   只刷新已装配过的插件（装配与否仍由 dsh plugin add 决定）。
+                if (ok) {
+                    val refreshed = AssetSync.refreshBundledPluginCopies(
+                        extraPlugins, File(filesDir, "plugins"), onlyExisting = true
+                    )
+                    if (refreshed > 0) appendMiniLog("✓ 已刷新 $refreshed 个内置插件的装配副本")
+                }
                 // ★ 安装戳标记必须在**同步成功之后**才写：提前写会让一次失败
                 //   （弱网/空间不足）把自己永久标记成"已同步"，之后再不重试。
                 if (ok) prefs.edit().putString("last_apk_stamp", stamp).apply()
