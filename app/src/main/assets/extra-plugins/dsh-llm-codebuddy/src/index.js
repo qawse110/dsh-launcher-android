@@ -2,7 +2,11 @@ import { credentialRef } from "@deepseek-ai/dsh-credentials";
 import { launchEnvironmentOf } from "@deepseek-ai/dsh-launch-environment";
 import { LlmError, assertUsableApiKey, resolveRetryPolicy } from "@deepseek-ai/dsh-llm";
 import { Config, PiAiAdapter } from "@deepseek-ai/dsh-llm-pi-ai";
-import { installSettingsSection, settingsNamespace } from "@deepseek-ai/dsh-settings";
+// 命名空间导入（**不能用具名导入**）：dsh 0.1.5 起 @deepseek-ai/dsh-settings 不再
+// 导出 installSettingsSection / settingsNamespace，具名导入会在 ESM 链接期直接抛
+// "does not provide an export named ..."，使整个插件加载失败并拖垮插件树（web 起不来）。
+// 命名空间导入只要求模块可解析，符号缺失留到运行时按能力探测（见 installSection）。
+import * as dshSettings from "@deepseek-ai/dsh-settings";
 import { createProvider } from "@earendil-works/pi-ai";
 import * as openAICompletionsApi from "@earendil-works/pi-ai/api/openai-completions";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
@@ -21,7 +25,11 @@ export { Config };
 export const name = "llm-codebuddy";
 export const inject = ["llm"];
 
-const NS = settingsNamespace("llm-codebuddy");
+// settings 命名空间字面量。旧版用 settingsNamespace() 校验后返回原值，新版该函数
+// 不再导出（改名 parseSettingsNamespace 且同样未导出）；其校验规则很简单
+// （/^[a-z][a-z0-9-]*$/，见新版 dsh-settings 的 parseSettingsNamespace），
+// 且新版 ctx.settings.register() 内部会自行校验并抛错，故此处只保留常量。
+const NS = "llm-codebuddy";
 const USER_AGENT = "CLI/unknown CodeBuddy/2.137.1";
 const STREAM_IDLE_TIMEOUT_MS = 300_000;
 const NO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
@@ -539,7 +547,7 @@ export function apply(ctx, config) {
   // 共存模式：CodeBuddy 配置存于独立命名空间 llm-codebuddy（不复用 llm-pi-ai，
   // 避免与内置适配器竞争同一命名空间）。目录条目恒定注册，使两个 Provider 始终
   // 可从 WebUI「添加提供方」下拉框选取；适配器路由只覆盖用户实际添加过的 Provider。
-  installSettingsSection(ctx, NS, Config, config ?? { providers: {} }, {
+  installCodeBuddySettings(ctx, Config, config ?? { providers: {} }, {
     setSource(source) {
       current = source;
     },
@@ -548,5 +556,44 @@ export function apply(ctx, config) {
       syncRegistration();
       directory.replace(directoryEntries());
     },
+  });
+}
+
+/**
+ * 注册 llm-codebuddy 设置命名空间，兼容 dsh 0.1.1 / 0.1.5 两代 settings API。
+ *
+ * 为什么需要兼容层：0.1.5 移除了模块级 `installSettingsSection`，而**具名导入在
+ * ESM 链接期就会抛错**（"does not provide an export named ..."），会让插件加载失败
+ * 并拖垮整棵插件树（真机现象：dsh web 起不来）。故改用命名空间导入 + 运行时探测，
+ * 缺失时按能力回退，避免把版本号写死。
+ *
+ * 两代语义等价（已逐行比对上游实现）：
+ *   0.1.1 `installSettingsSection(ctx, ns, schema, entry, hooks)`
+ *         内部即 `ctx.inject(["settings"], sctx => sctx.settings.register(...))`
+ *   0.1.5 `ctx.settings.installSection(ctx, ns, schema, entry, hooks)`
+ *         官方插件 dsh-agent-default-model 即用此形式，函数体与旧版逐行一致。
+ *
+ * @param ctx - 插件上下文。
+ * @param schema - 该命名空间的 schemastery schema。
+ * @param entry - 组合基线值（用户文档之下的一层）。
+ * @param hooks - setSource / onChange 回调，语义同上游 installSection。
+ */
+function installCodeBuddySettings(ctx, schema, entry, hooks) {
+  const legacy = dshSettings.installSettingsSection;
+  if (typeof legacy === "function") {
+    // 0.1.1 路径：模块级函数自身会 ctx.inject(["settings"], …)，无需外层 inject
+    legacy(ctx, NS, schema, entry, hooks);
+    return;
+  }
+  // 0.1.5 路径：能力在 settings 服务上，需先声明对 settings 服务的依赖
+  ctx.inject(["settings"], (settingsCtx) => {
+    const settings = settingsCtx.settings;
+    if (settings === undefined || typeof settings.installSection !== "function") {
+      throw new Error(
+        "llm-codebuddy: 当前 dsh 的 settings 服务不提供 installSection，" +
+          "无法注册设置命名空间（0.1.1 与 0.1.5 两种 API 均不可用）"
+      );
+    }
+    settings.installSection(ctx, NS, schema, entry, hooks);
   });
 }
