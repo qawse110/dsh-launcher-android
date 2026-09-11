@@ -243,3 +243,52 @@ dsh API，逐个核对了 5 个包的符号——仅 `dsh-settings` 缺失，`ds
 **沉淀（下次 dsh 升级必查）**：插件对 `@deepseek-ai/*` 的**每一个具名导入**
 都要核对该包在新版的导出面——**导入符号消失 = 插件加载即失败 = web 起不来**，
 且报错点在插件文件而非壳侧，容易被误判成"web 启动问题"。
+
+### 7.7 装了新 APK 却仍跑旧插件：同步判据用「从不递增的量」（★五处连锁）
+
+**真机现象**：装好含 §7.6 插件修复的**新 APK**，启动仍报**完全相同**的
+`does not provide an export named 'installSettingsSection'`。
+→ APK 里的插件已是修好的，设备 `files/` 下跑的仍是旧文件：**资产同步没生效**。
+
+**根因**：本仓 `versionCode` 是**硬编码常量 300**（每次出包都相同），而以下判据
+都拿它当「APK 换过了」的信号 → 首次安装后**永不成立 = 死代码**：
+
+| # | 位置 | 旧判据 | 后果 |
+|---|---|---|---|
+| 1 | `AssetSync.isSynced` | marker=`apk:<versionCode>#<目标指纹>`，且指纹是**目标目录自身**的 | 自己和自己比永远相等 → 新 APK 的资产永远到不了 `files/` |
+| 2 | `MainActivity.syncAssetsOnApkUpdate` | `last_apk_version == current` → `return` | 升级后同步函数**从不执行** |
+| 3 | `DshFlow.runAndroidStubOnce` | marker=`apk:<ver>\|dsh:<ver>` | 「补丁脚本改了但版本号没动」被判成已应用 → **补丁永久跳过**（v5 前缀补丁正是这样打不上的） |
+| 4 | `PluginManagerActivity.rewireBuiltins` | 未调 `syncExtraPluginsSource()` | 用户最常点的「重新装配」只重装**设备上的旧源**，白点 |
+| 5 | 升级路径整体 | 只同步「源」`files/extra-plugins`，未刷「装配副本」`files/plugins/<id>` | profile 登记的是 `link:` 到副本目录，运行时加载副本 → 仍是旧代码 |
+
+第 1、3 条是同一病根的两面：**用不会变的量当变更判据**（既有坑 19 的同型）。
+
+**修复**：
+
+1. 新增 `AssetSync.apkInstallStamp()` = `<sourceDir>|<长度>|<mtime>`：重装必变；
+   取不到时返回空串 → 判据 **fail-open 到「做事」**，不 fail-closed 到「跳过」。
+2. `isSynced`/`markSynced*` 改以安装戳为主判据，保留目标指纹作次判据
+   （前者认「APK 换过」，后者认「目标被改坏/只拷一半」）。
+3. `MainActivity` 升级门改用安装戳，并**换键名** `last_apk_stamp`
+   （旧键是 Long 型 versionCode；同键换语义会让升级用户带着旧值误判）。
+4. `runAndroidStubOnce` marker 加入 `stub-dsh.mjs` 的内容指纹。
+5. 新增 `AssetSync.refreshBundledPluginCopies()`，升级后把源刷新到**装配副本**
+   （语义同 install-dsh.mjs 的 `syncExtraPlugin`，但不碰 profile 登记）；
+   `rewireBuiltins` 补上源同步。
+
+**★ 同时修正「标记写入时机」**：原 `syncAssetsOnApkUpdate` 在**做事之前**就写
+`last_apk_version`，一次失败即永久标记为已同步。改为**全部拷贝成功后**才写
+（与本项目既有约定一致：标记必须在工作成功之后写）。
+
+**自愈性**：新戳形态含路径与 `|`，旧 marker `apk:300#...` 的前缀判据必然不匹配
+→ 存量设备升级后**强制重新同步一次**，无需手动清数据。
+
+**验证**：CI 全绿（含 8 个 `AssetSync` 用例，覆盖「旧格式 marker 必须判未同步」
+「安装戳变则判未同步」「刷新副本不误建未装配插件」「幂等」）；APK 内确认
+`apkInstallStamp` / `last_apk_stamp` / `fileFingerprint` / `refreshBundledPluginCopies`
+四者均在 dex 中（旧包全为 0）。
+
+**沉淀**：出包流程里任何「是否已同步/已应用」的判据，都要先问一句
+**「这个量会随每次出包变化吗？」**。versionCode、手写 marker、固定字符串都不会，
+用它们等于把判断写成常量 → 静默失效，且编译与单测**全绿**。正确做法是内容指纹
+或安装戳（APK 路径+长度+mtime），且**标记必须在工作成功之后写**。
