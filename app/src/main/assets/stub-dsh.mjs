@@ -12,12 +12,19 @@
  * 现存修复：
  *   1) koffi / node-pty / sharp：Android 无预编译产物，用 Proxy stub / 纯 JS
  *      shim 顶替（模块 import 期，插件通道无法介入）；
- *   2) @deepseek-ai/dsh-attachment-local 视觉链路 v4：SELinux 禁 link(2)、FUSE
- *      上 fsync 失败的运行时行为修复（fs 兼容层不覆盖 CJS 盲区，只能改源）；
+ *   2) @deepseek-ai/dsh-attachment-local 视觉链路 v5：SELinux 禁 link(2)（实测应用
+ *      私有存储上同为 EACCES，非仅 sdcard）、FUSE 上 fsync 失败的运行时行为修复
+ *      （fs 兼容层不覆盖 CJS 盲区，只能改源）。v5 起 link 调用点改为**扫描式**改写，
+ *      不再锚定单一字面量——上游 0.1.5 把发布链路重构成 publishStagedObject /
+ *      publishImmutableAlias 两点，v4 的单锚点因此静默失效（无报错、补丁不生效）；
  *   3) @deepseek-ai/dsh-llm-pi-ai sendAttribution：dsh-provider-headers 内置
  *      插件的「关闭归因 UA」依赖该 schema 字段，上游明确注释
  *      “omission cannot suppress attribution”，在官方提供抑制缝隙前保留；
- *   4) sandbox-windows-acl 的 koffi 布局断言禁用（防御性，koffi 已被顶替）；
+ *   4) koffi ABI 布局断言禁用（**非防御性，是 boot 硬阻断**）：koffi 被 stub 后
+ *      struct().size 恒为 0，而上游在 import 期断言 STARTUPINFOW=104 /
+ *      PROCESS_INFORMATION=24 → 抛错使 Cordis 判定整棵插件树 apply 失败，web 起不来。
+ *      0.1.5 把断言从 dsh-sandbox-windows-acl **搬到了新包** dsh-win32-process，
+ *      故改为按包名清单遍历两包（只扫旧包会 0 命中而 boot 必崩）；
  *   5) WebView/旧 Chrome AbortSignal.timeout polyfill——仅当前端产物确实引用
  *      该 API 时才注入（rc.2 前端与全部内置插件 client 均无引用，自动跳过，
  *      不再无条件改写 dist/index.html；引导期早于 app bundle，插件无法替代）；
@@ -179,16 +186,58 @@ try {
 
 
 
-  /* v4 视觉链路配套（dsh-launcher-android-att-vision-v4），在 v3 基础上加两道保险：
+  /* 视觉链路配套（当前 dsh-launcher-android-att-vision-v5），在 v3/v4 基础上加三道保险：
      1) syncDirectory 改用「函数签名 + 花括号配平」定位完整函数体，不再依赖后继注释锚点，
         对任何上游结构（干净 / v2 残缺 / v3 已改）都能精确切出整个函数；
-     2) 写入前先用 node --check 校验临时文件语法，校验失败则放弃写盘（防止再毒化）。
-     v4 同时自愈 v2 遗留的孤儿 finally / 孤儿 publishCopied 调用。 */
+     2) 写入前先用 node --check 校验临时文件语法，校验失败则放弃写盘（防止再毒化）；
+     3) link 调用点**扫描式**改写（v5 新增）——上游 0.1.5 把单点 link 拆成
+        publishStagedObject / publishImmutableAlias 两点，v4 的单锚点静默失效。
+     同时自愈 v2 遗留的孤儿 finally / 孤儿 publishCopied 调用。
+
+     幂等判据（v5 修正）：**不能只看 marker 字符串**。旧实现只要文件里出现
+     'att-vision-v4' 就整体短路，而上游换版时 marker 可能与「调用点未改写」
+     共存（正是 0.1.5 的真实现场）→ 补丁永久失效。v5 改为
+     「marker 存在 且 已无裸 link 发布调用点」才算已完成。 */
   try {
     const attLocal = findPkg('@deepseek-ai/dsh-attachment-local', 'lib/index.js');
+    /* 匹配 `await link(<from>, <target>);`：from/target 均为简单标识符或成员访问，
+       不含嵌套括号，避免误伤非发布用途的 link 调用。 */
+    const LINK_CALL_SRC = 'await link\\(([A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)*), ([A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)*)\\);';
+    /**
+     * 定位已安装 helper `publishCopied` 的函数体区间 [start, end)。
+     * **必须排除该区间**：helper 体内本身含一句 `await link(from, target);`，
+     * 若把它也当成待改写调用点，第二次运行就会把 helper 改成自递归
+     * （v5 开发期真实踩到：二次运行 rewritten=1 且 sha 变化）。
+     * 用花括号配平求函数体，与 syncDirectory 的定位手法一致。
+     */
+    const helperSpan = (text) => {
+      const sig = 'async function publishCopied(';
+      const i = text.indexOf(sig);
+      if (i === -1) return null;
+      let depth = 0, seen = false;
+      for (let k = i; k < text.length; k++) {
+        const c = text[k];
+        if (c === '{') { depth++; seen = true; }
+        else if (c === '}') { depth--; if (seen && depth === 0) return { start: i, end: k + 1 }; }
+      }
+      return { start: i, end: text.length };
+    };
+    /** 收集 helper 体之外的裸 link 发布调用点。 */
+    const collectSites = (text) => {
+      const span = helperSpan(text);
+      const re = new RegExp(LINK_CALL_SRC, 'g');
+      const out = [];
+      let mm;
+      while ((mm = re.exec(text)) !== null) {
+        if (span && mm.index >= span.start && mm.index < span.end) continue; /* helper 自身，跳过 */
+        out.push({ from: mm[1], target: mm[2], text: mm[0] });
+      }
+      return out;
+    };
+    const hasMarker = (t) => t.includes('dsh-launcher-android-att-vision-v5');
     if (!attLocal) {
       log('attachment-local: not found, skip vision patch');
-    } else if (readFileSync(attLocal, 'utf8').includes('dsh-launcher-android-att-vision-v4')) {
+    } else if (hasMarker(readFileSync(attLocal, 'utf8')) && collectSites(readFileSync(attLocal, 'utf8')).length === 0) {
       log('attachment-local vision patch already applied');
     } else {
       let src = readFileSync(attLocal, 'utf8');
@@ -260,90 +309,116 @@ try {
         src = src.replace(orphanCloseRe, '');
       }
 
-      /* link 发布回退：SELinux 拒绝应用 uid 的 link(2)、sdcard FUSE 不支持硬链接。
-         helper 与调用点成对落地，标记写在 helper 头部（保证与文件共存亡）。
-         兼容 v2 毒化残留：调用点已被改写为 publishCopied 但定义从未插入时，
-         先还原调用点，再按标准流程安装。 */
-      if (!src.includes('async function publishCopied(temporary, target, sha256)')) {
-        const v2Call = 'await publishCopied(temporary, target, sha256);';
+      /* link 发布回退：SELinux 拒绝应用 uid 的 link(2)（真机实测：应用私有存储
+         上同为 EACCES，不只是 sdcard FUSE），必须回退 copy。
+
+         v5 改为**扫描式**改写，不再锚定单一调用点字面量：
+         上游 0.1.5 把发布链路重构成 publishStagedObject(root,target,staged) 与
+         publishImmutableAlias(root,source,target,sha256) 两个 link 调用点，
+         旧的单锚点 'await link(temporary, target);' 直接消失 → v4 静默失效
+         （只打一行 WARN，图片/附件链路在真机上必挂）。扫描式改写对上游后续
+         再拆分/重命名同样有效，且每个调用点各自用其作用域内的实参。
+
+         helper 语义按调用点实参推导：link(from, target) 之后上游会 unlink(from)
+         （staged/source 是暂存名），故 helper 负责「copy 成功后由调用方 unlink」；
+         EEXIST 去重与 digest 校验语义与上游一致。 */
+      {
         const defAnchor = '/**\n* Publish one already verified normalized image';
         const di = src.indexOf(defAnchor);
-        if (src.includes(v2Call)) {
-          src = src.replace(v2Call, 'await link(temporary, target);');
-          log('vision patch v3: restored v2-orphaned publishCopied call');
+        /* 用外层 collectSites（已排除 helper 自身函数体，避免自递归） */
+        let sites = collectSites(src);
+        /* 兼容 v2/v3 毒化残留：调用点已被改写但 helper 定义缺失时，先还原为 link 调用 */
+        if (!src.includes('async function publishCopied(') && src.includes('await publishCopied(temporary, target, sha256);')) {
+          src = src.replace('await publishCopied(temporary, target, sha256);', 'await link(temporary, target);');
+          log('vision patch v5: restored v2-orphaned publishCopied call');
+          sites = collectSites();
         }
-        const ci = src.indexOf('await link(temporary, target);');
-        if (di === -1 || ci === -1 || ci < di) {
-          /* 锚点缺失或顺序异常（上游结构变化）：宁可跳过也不误插 */
-          log('WARN vision patch v3: link anchors unusable (call=' + (ci !== -1) + ',def=' + (di !== -1) + ')');
+        /* 关键：helper 已存在（v4 遗留）时**仍须改写裸调用点**——上游换版后
+           helper 在位、调用点却是裸 link，正是 0.1.5 的真实失效现场。
+           v4 helper 形参为 (temporary, target, sha256)，与 v5 位置语义一致，
+           故同一调用形式对两者都成立。 */
+        const hasHelper = src.includes('async function publishCopied(');
+        if (di === -1 && !hasHelper) {
+          log('WARN vision patch v5: helper def anchor miss (def=false), leave as-is');
+        } else if (sites.length === 0) {
+          log('vision patch v5: no bare link call site, nothing to rewrite');
         } else {
-          const helper = [
-            '/** dsh-launcher-android-att-vision-v4: link 优先；SELinux/FUSE 环境回退 copy，',
-            '* 复制中途失败清理半写 target 防止内容寻址路径被毒化。 */',
-            'async function publishCopied(temporary, target, sha256) {',
-            '\ttry {',
-            '\t\tawait link(temporary, target);',
-            '\t\treturn;',
-            '\t} catch (linkError) {',
-            '\t\tconst code = linkError instanceof Error && "code" in linkError ? linkError.code : void 0;',
-            '\t\tif (code === "EEXIST") {',
-            '\t\t\tif (digest$1(new Uint8Array(await readFile(target))) !== sha256) throw new AttachmentError("Stored attachment failed integrity verification.", "ATTACHMENT_CORRUPT");',
-            '\t\t\treturn;',
-            '\t\t}',
-            '\t\tif (!(code === "EACCES" || code === "EPERM" || code === "ENOSYS" || code === "EXDEV")) throw linkError;',
-            '\t\ttry { await copyFile(temporary, target); } catch (copyError) {',
-            '\t\t\tawait unlink(target).catch(() => {});',
-            '\t\t\tthrow copyError;',
-            '\t\t}',
-            '\t\tif (digest$1(new Uint8Array(await readFile(target))) !== sha256) {',
-            '\t\t\tawait unlink(target).catch(() => {});',
-            '\t\t\tthrow new AttachmentError("Stored attachment failed integrity verification.", "ATTACHMENT_CORRUPT");',
-            '\t\t}',
-            '\t}',
-            '}'
-          ].join('\n');
-          /* 上游未导入 copyFile，回退分支需要；锚定 fs/promises 导入语句精确追加 */
-          if (!src.includes('copyFile')) {
-            const impA = '} from "node:fs/promises";';
-            if (src.includes(impA)) src = src.replace(impA, ', copyFile' + impA);
-            else log('WARN vision patch v4: fs/promises import anchor miss');
+          /* 先改写全部调用点、后插入 helper：helper 内部同样含 await link 字面量，
+             先插后换会把 helper 自身也改写掉（自递归）。用字符串替换避免索引错位。 */
+          let rewritten = 0;
+          for (const s of sites) {
+            /* sha256 实参按调用点作用域推导：
+               publishImmutableAlias(root, source, target, sha256) → from=source，用 sha256；
+               publishStagedObject(root, target, staged)          → from=staged.path，用 staged.sha256。 */
+            const sha = s.from.startsWith('staged.') ? 'staged.sha256' : 'sha256';
+            const repl = 'await publishCopied(' + s.from + ', ' + s.target + ', ' + sha + ');';
+            if (src.includes(s.text)) { src = src.replace(s.text, repl); rewritten++; }
           }
-          /* 先改写调用点、后插入 helper（用字符串替换，不用索引切片，避免索引错位）：
-             helper 内部同样含 await link 字面量，先插后换会把 helper 自身改写成递归调用。 */
-          const patched = src.replace('await link(temporary, target);', 'await publishCopied(temporary, target, sha256);');
-          if (patched === src) {
-            log('WARN vision patch v4: link call rewrite miss');
+          if (rewritten === 0) {
+            log('WARN vision patch v5: link call rewrite miss');
           } else {
-            src = patched;
-            src = src.replace(defAnchor, helper + '\n' + defAnchor);
-            log('vision patch v4: publishCopied installed');
+            /* copyFile 回退分支需要；仅当尚未导入时追加 */
+            if (!src.includes('copyFile')) {
+              const impA = '} from "node:fs/promises";';
+              if (src.includes(impA)) src = src.replace(impA, ', copyFile' + impA);
+              else log('WARN vision patch v5: fs/promises import anchor miss');
+            }
+            if (!hasHelper) {
+              const helper = [
+                '/** dsh-launcher-android-att-vision-v5: link 优先；SELinux/FUSE 环境回退 copy，',
+                '* 复制中途失败清理半写 target 防止内容寻址路径被毒化。 */',
+                'async function publishCopied(from, target, sha256) {',
+                '\ttry {',
+                '\t\tawait link(from, target);',
+                '\t\treturn;',
+                '\t} catch (linkError) {',
+                '\t\tconst code = linkError instanceof Error && "code" in linkError ? linkError.code : void 0;',
+                '\t\tif (code === "EEXIST") {',
+                '\t\t\tif (digest$1(new Uint8Array(await readFile(target))) !== sha256) throw new AttachmentError("Stored attachment failed integrity verification.", "ATTACHMENT_CORRUPT");',
+                '\t\t\treturn;',
+                '\t\t}',
+                '\t\tif (!(code === "EACCES" || code === "EPERM" || code === "ENOSYS" || code === "EXDEV")) throw linkError;',
+                '\t\ttry { await copyFile(from, target); } catch (copyError) {',
+                '\t\t\tawait unlink(target).catch(() => {});',
+                '\t\t\tthrow copyError;',
+                '\t\t}',
+                '\t\tif (digest$1(new Uint8Array(await readFile(target))) !== sha256) {',
+                '\t\t\tawait unlink(target).catch(() => {});',
+                '\t\t\tthrow new AttachmentError("Stored attachment failed integrity verification.", "ATTACHMENT_CORRUPT");',
+                '\t\t}',
+                '\t}',
+                '}'
+              ].join('\n');
+              if (di === -1) src = helper + '\n' + src;
+              else src = src.replace(defAnchor, helper + '\n' + defAnchor);
+            }
+            log('vision patch v5: publishCopied installed=' + (!hasHelper) + ', link call sites rewritten=' + rewritten);
           }
         }
       }
 
       /* 写入前语法自检：写临时文件 + node --check，失败则放弃写盘（防止再毒化）。
          ESM 文件 node --check 会校验语法；若 spawnSync 不可用则降级为括号配平检查。 */
-      const tmpPath = attLocal + '.v4check.mjs';
+      const tmpPath = attLocal + '.v5check.mjs';
       let syntaxOk = false;
       try {
         writeFileSync(tmpPath, src);
         const r = spawnSync(process.execPath, ['--check', tmpPath], { timeout: 15000, encoding: 'utf8' });
         if (r.status === 0) syntaxOk = true;
-        else log('WARN attachment-local v4 syntax check FAILED: ' + (r.stderr || '').slice(0, 300));
+        else log('WARN attachment-local v5 syntax check FAILED: ' + (r.stderr || '').slice(0, 300));
       } catch (e) {
-        log('WARN attachment-local v4 syntax check unavailable: ' + e.message);
+        log('WARN attachment-local v5 syntax check unavailable: ' + e.message);
       } finally {
         try { unlinkSync(tmpPath); } catch {}
       }
       if (syntaxOk) {
-        /* 若 helper 已存在但标记是旧版本（v2/v3 遗留），升级标记保证幂等短路生效 */
-        if (src.includes('att-vision-v3') || src.includes('att-vision-v2') || src.includes('att-vision-v1')) {
-          src = src.replace(/att-vision-v[123]/g, 'att-vision-v4');
-        }
+        /* 旧版本标记（v1~v4 遗留）统一升级到 v5，保证幂等短路用的是当前判据。
+           注意：仅升级 marker 字符串，调用点改写是否完成由外层判据另行校验。 */
+        src = src.replace(/att-vision-v[1-4]/g, 'att-vision-v5');
         writeFileSync(attLocal, src);
-        log('attachment-local vision patch v4 applied: ' + attLocal);
+        log('attachment-local vision patch v5 applied: ' + attLocal);
       } else {
-        log('WARN attachment-local vision patch v4: syntax check failed, file NOT modified: ' + attLocal);
+        log('WARN attachment-local vision patch v5: syntax check failed, file NOT modified: ' + attLocal);
       }
     }
   } catch (e) { log('WARN attachment-local vision: ' + e.message); }
@@ -399,27 +474,49 @@ try {
 } catch (e) { log('WARN llm-pi-ai sendAttribution: ' + e.message); }
 
 try {
-  const w = findPkg('@deepseek-ai/dsh-sandbox-windows-acl', 'lib') || findPkg('@deepseek-ai/dsh-sandbox-windows-acl', 'lib/index.js');
-  if (w) {
+  /* koffi ABI 断言禁用：koffi 已被 stub 顶替（见上文 koffi ESM/CJS stub），
+     其 struct().size 恒为 0，而上游在 import 期就断言 STARTUPINFOW=104 /
+     PROCESS_INFORMATION=24 → **抛错发生在模块加载期**，Cordis 会把整棵插件树
+     判为 failed to apply，web 直接起不来（不是降级，是硬失败）。
+
+     0.1.5 把断言从 dsh-sandbox-windows-acl **搬到了新包** dsh-win32-process，
+     旧包只剩同名的无断言实现。只扫旧包会命中 0 处（日志 'asserts disabled: 0'
+     看起来无害），实际 boot 必崩——故改为**按包名清单遍历**，新旧两包都扫，
+     并对「包在但一处未命中」发出显式 WARN（避免再次静默漂移）。 */
+  const ABI_PKGS = ['@deepseek-ai/dsh-sandbox-windows-acl', '@deepseek-ai/dsh-win32-process'];
+  const foundPkgs = [];
+  let totalPatched = 0;
+  for (const name of ABI_PKGS) {
+    const w = findPkg(name, 'lib') || findPkg(name, 'lib/index.js');
+    if (!w) continue;
     const dir = existsSync(w) && w.endsWith('.js') ? dirname(w) : w;
-    if (existsSync(dir)) {
-      let patched = 0;
-      for (const f of readdirSync(dir)) {
-        if (!f.endsWith('.js')) continue;
-        const p = join(dir, f);
-        const src = readFileSync(p, 'utf8');
-        if (!src.includes('layout mismatch')) continue;
-        let out = src;
-        out = out.replace(/if \(STARTUPINFOW\.size !== 104\) throw new Error\(`STARTUPINFOW layout mismatch[^;]*\);/, '/* dsh-launcher: koffi stubbed, STARTUPINFOW assert disabled */');
-        out = out.replace(/if \(PROCESS_INFORMATION\.size !== 24\) throw new Error\(`PROCESS_INFORMATION layout mismatch[^;]*\);/, '/* dsh-launcher: koffi stubbed, PROCESS_INFORMATION assert disabled */');
-        if (out !== src) { writeFileSync(p, out); patched++; }
-      }
-      log('sandbox-windows-acl asserts disabled: ' + patched);
+    if (!existsSync(dir)) continue;
+    foundPkgs.push(name);
+    let patched = 0;
+    let sawAssert = false;
+    for (const f of readdirSync(dir)) {
+      if (!f.endsWith('.js')) continue;
+      const p = join(dir, f);
+      const src = readFileSync(p, 'utf8');
+      if (!src.includes('layout mismatch')) continue;
+      sawAssert = true;
+      let out = src;
+      out = out.replace(/if \(STARTUPINFOW\.size !== 104\) throw new Error\(`STARTUPINFOW layout mismatch[^;]*\);/, '/* dsh-launcher: koffi stubbed, STARTUPINFOW assert disabled */');
+      out = out.replace(/if \(PROCESS_INFORMATION\.size !== 24\) throw new Error\(`PROCESS_INFORMATION layout mismatch[^;]*\);/, '/* dsh-launcher: koffi stubbed, PROCESS_INFORMATION assert disabled */');
+      if (out !== src) { writeFileSync(p, out); patched++; }
     }
-  } else {
-    log('sandbox-windows-acl: not found, skip');
+    if (sawAssert && patched === 0) log(`WARN koffi-abi: ${name} has layout assertions but none matched the disable patterns`);
+    totalPatched += patched;
   }
-} catch (e) { log('WARN sandbox-windows-acl: ' + e.message); }
+  if (foundPkgs.length === 0) {
+    log('WARN koffi-abi: none of the ABI-assert packages found (koffi stub may leave boot broken)');
+  } else {
+    log('koffi ABI asserts disabled: ' + totalPatched + ' (pkgs: ' + foundPkgs.join(', ') + ')');
+    /* 关键护栏：若扫到包却一处未禁用，说明断言文本又漂移了——此时 boot 必崩，
+       大声报出来（这是 0.1.5 适配期真实踩到的静默失效点）。 */
+    if (totalPatched === 0) log('WARN koffi-abi: no assertion disabled across ' + foundPkgs.join(', ') + ' — dsh boot may fail at plugin load');
+  }
+} catch (e) { log('WARN koffi-abi: ' + e.message); }
 
 try {
   // WebView / Chrome ≤102 无 AbortSignal.timeout。

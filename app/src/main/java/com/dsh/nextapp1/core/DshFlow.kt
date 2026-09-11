@@ -44,7 +44,7 @@ object DshFlow {
     const val WEB_PORT = 3080
 
     /** dsh 本体钉死版本：普通安装始终装这个精确版本（DSH_TAG 可被 UI/回滚显式覆盖）。 */
-    const val PINNED_DSH_TAG = "0.1.1-rc.1"
+    const val PINNED_DSH_TAG = "0.1.5-rc.2"
 
     /** 统一日志文件名（files/logs/ 下，见 [FileLog]）。 */
     const val FLOW_LOG = "flow.log"
@@ -236,13 +236,13 @@ object DshFlow {
         var attempt = 0
         while (attempt < 2) {
             attempt++
-            // dsh 本体版本钉死为 0.1.1-rc.1（仅 UI 显式选择 tag 时才覆盖）
+            // dsh 本体版本钉死为 0.1.5-rc.2（仅 UI 显式选择 tag 时才覆盖）
             val tag = ctx.getSharedPreferences(AppState.Prefs.CONSOLE, Context.MODE_PRIVATE)
-                .getString("dsh_install_tag", "0.1.1-rc.1") ?: "0.1.1-rc.1"
+                .getString("dsh_install_tag", "0.1.5-rc.2") ?: "0.1.5-rc.2"
             // 回滚重装（tag=精确旧版本）显式跳过基线记录：此时要回到的就是基线本身，
             // 记录会把它覆盖成回滚目标——此前行为正确只是靠 afterInstall 的 cur==prev
             // 分支兜底，这里把语义显式化。
-            // 注意：钉死的默认版本 0.1.1-rc.1 也是精确版本，但它不是回滚 attempt。
+            // 注意：钉死的默认版本 0.1.5-rc.2 也是精确版本，但它不是回滚 attempt。
             val isRollbackAttempt = tag != "latest" && tag != "next" && tag != PINNED_DSH_TAG
             if (isRollbackAttempt) {
                 fl("  回滚重装 attempt：保持原基线，不重新记录")
