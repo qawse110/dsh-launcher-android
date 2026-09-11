@@ -2,10 +2,25 @@
 //
 // 那个页面本身是 SPA 空壳（HTML 里只有 <div id="root">），所有数字都由登录后
 // 的 XHR 拉取，所以抓 HTML 没有意义 —— 这里直接打它背后的接口：
-//   POST /billing/meter/get-user-resource          —— 全部资源包明细
-//   POST /billing/meter/get-user-resource-summary  —— 轻量汇总
-//   POST /billing/meter/get-user-daily-usage       —— 每日用量明细
+//   POST /billing/meter/get-user-resource          —— 全部资源包明细（现役）
+//   POST /billing/meter/get-user-resource-summary  —— 轻量汇总（现役）
+//   POST /billing/meter/get-enterprise-user-usage  —— 企业版额度（需 X-Enterprise-Id）
 // 三个接口都接受登录会话里的 accessToken（issuer 与账单域名同一 realm）。
+//
+// 【关于 get-user-daily-usage / get-user-request-usage】
+// 2026-09 实测（从 usercenter 前端产物 download.codebuddy.cn/web/usercenter/**
+// /assets/index-*.js 里扒到真实调用点）：
+//   POST /billing/meter/get-user-request-usage —— 积分消耗明细（网页「使用明细」表格的数据源）
+//     请求体 { startTime: "YYYY-MM-DD HH:mm:ss", endTime: "...", pageNum, pageSize }
+//     返回 { total, data: [{ requestId, credit, model, client, requestTime,
+//                            input, inputTrunc, agentPurpose }] }
+//     这是唯一能落到「单次请求 × 模型 × 客户端 × 积分」的官方数据源。
+//   POST /billing/meter/get-user-daily-usage —— 日粒度聚合（前端同样存在此调用点）。
+//     2026-09 实测：与 request-usage 完全同款的参数（startTime/endTime/pageNum/
+//     pageSize，含/不含 timezone）均返回 10001 invalid params，穷举 140+ 组合无一
+//     成功；结构体已探明为 {startTime,endTime,timezone: string, pageNum, pageSize,
+//     version: int}。故本模块【不依赖】它，改由 request-usage 在本侧按日聚合
+//     （byDay），效果等价且数据源可靠。保留说明以免后人重复踩坑。
 //
 // 只读。刻意不实现 claim-gift / claim-compensation 等写操作：那是动账户资产。
 
@@ -110,6 +125,125 @@ function normalizeAccounts(data) {
       resourceId: entry.ResourceId ?? "",
     };
   });
+}
+
+// ---- 积分消耗明细（get-user-request-usage）----
+// 网页「使用明细」表格的同源接口：逐条请求 × 模型 × 客户端 × 积分。
+// 服务端 total 有上限（实测 3000 条封顶），pageSize 同样受限，因此按页翻到底。
+
+const REQUEST_USAGE_PAGE_SIZE = 1000;
+const REQUEST_USAGE_MAX_PAGES = 10; // 兜底：绝不无限翻页
+
+/** 时间格式 "YYYY-MM-DD HH:mm:ss"（服务端按此格式解析，实测通过）。 */
+function formatUsageTime(date) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+/** 把明细聚合成 按模型 / 按日 / 按客户端 三张表。 */
+function aggregateRequestUsage(rows) {
+  const byModel = new Map();
+  const byDay = new Map();
+  const byClient = new Map();
+  const bump = (map, key, row) => {
+    const entry = map.get(key) ?? { key, credit: 0, requests: 0, models: new Set() };
+    entry.credit += Number(row.credit ?? 0);
+    entry.requests += 1;
+    if (row.model) entry.models.add(row.model);
+    map.set(key, entry);
+  };
+  for (const row of rows) {
+    bump(byModel, row.model ?? "?", row);
+    // requestTime 形如 "2026-09-10 07:47:00" → 取日期段
+    const day = typeof row.requestTime === "string" ? row.requestTime.slice(0, 10) : "?";
+    bump(byDay, day, row);
+    bump(byClient, row.client || "(未知客户端)", row);
+  }
+  const finish = (map, label) =>
+    [...map.values()]
+      .map((entry) => ({
+        [label]: entry.key,
+        credit: Math.round(entry.credit * 100) / 100,
+        requests: entry.requests,
+        models: [...entry.models],
+      }))
+      .sort((a, b) => b.credit - a.credit || b.requests - a.requests);
+  return {
+    byModel: finish(byModel, "model"),
+    byDay: finish(byDay, "day").sort((a, b) => String(b.day).localeCompare(String(a.day))),
+    byClient: finish(byClient, "client"),
+  };
+}
+
+/**
+ * 拉取积分消耗明细（分页到底）并聚合。
+ * 返回 { total, fetched, rows, byModel, byDay, byClient, servedAt }。
+ * rows 是可控上限内的原始明细（用于 UI 展示最近若干条；含用户输入文本，故只取摘要）。
+ */
+export async function fetchCodeBuddyRequestUsage(region, session, { days = 30, signal } = {}) {
+  const headers = {
+    authorization: `Bearer ${session.auth.accessToken}`,
+    ...(session.account?.userId ? { "X-User-Id": session.account.userId } : {}),
+    ...(session.account?.enterpriseId
+      ? { "X-Enterprise-Id": session.account.enterpriseId, "X-Tenant-Id": session.account.enterpriseId }
+      : {}),
+    ...(session.auth.domain ? { "X-Domain": session.auth.domain } : {}),
+  };
+  const base = region.billingBaseUrl;
+  const end = new Date();
+  const start = new Date(end.getTime() - days * 24 * 3600 * 1000);
+  const range = { startTime: formatUsageTime(start), endTime: formatUsageTime(end) };
+  const rows = [];
+  const seen = new Set(); // requestId 去重：分片/翻页之间可能有重叠
+  let reportedTotal = 0;
+  let windows = 0;
+  let capped = false; // 是否有某个分片触及服务端上限（说明该片仍可能不全）
+
+  // 【关键】服务端 total 硬封顶 3000 条：整月/跨月查询一律只返回 3000，
+  // 实测 9 月逐日合计 3900+ 条 > 3000，宽区间必然丢数据。
+  // 因此按【自然日】分片拉取：每日条数远低于上限，拼起来才是完整集合。
+  for (let offset = days; offset >= 0; offset -= 1) {
+    const dayStart = new Date(end.getTime() - offset * 24 * 3600 * 1000);
+    dayStart.setHours(0, 0, 0, 0);
+    const dayEnd = new Date(dayStart.getTime() + 24 * 3600 * 1000 - 1000);
+    const window = { startTime: formatUsageTime(dayStart), endTime: formatUsageTime(dayEnd) };
+    windows += 1;
+    for (let page = 1; page <= REQUEST_USAGE_MAX_PAGES; page += 1) {
+      const data = await postJson(
+        `${base}/billing/meter/get-user-request-usage`,
+        { ...window, pageNum: page, pageSize: REQUEST_USAGE_PAGE_SIZE },
+        headers,
+        signal,
+      );
+      const pageRows = Array.isArray(data?.data) ? data.data : [];
+      const sliceTotal = Number(data?.total ?? 0) || 0;
+      reportedTotal = Math.max(reportedTotal, sliceTotal);
+      for (const row of pageRows) {
+        // 同一天的分页之间理论上不重复，但跨天边界可能重叠，按 requestId 去重。
+        const id = row?.requestId;
+        if (id) {
+          if (seen.has(id)) continue;
+          seen.add(id);
+        }
+        rows.push(row);
+      }
+      if (pageRows.length < REQUEST_USAGE_PAGE_SIZE) break;
+      if (page === REQUEST_USAGE_MAX_PAGES) capped = true;
+    }
+  }
+  return {
+    ...range,
+    // total 是"单个分片的最大值"，不是全区间真实总数（服务端封顶），
+    // 真实条数看 fetched。
+    reportedTotal,
+    fetched: rows.length,
+    windows,
+    capped,
+    // 明细原文（含用户输入）不出网到 UI 之外的任何地方；UI 只展示前若干条摘要。
+    rows: rows.slice(0, 200),
+    ...aggregateRequestUsage(rows),
+    servedAt: new Date().toISOString(),
+  };
 }
 
 /**

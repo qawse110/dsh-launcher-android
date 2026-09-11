@@ -1,6 +1,6 @@
 {
   "name": "dsh-llm-codebuddy",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "CodeBuddy 中国区/国际版 LLM Provider（共存模式，不接管 llm-pi-ai）",
   "author": "Axiaohungry",
   "keywords": [

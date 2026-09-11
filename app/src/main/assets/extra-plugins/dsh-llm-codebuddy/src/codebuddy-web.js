@@ -9,7 +9,8 @@ import {
   sessionNeedsRefresh,
   waitForCodeBuddyLogin,
 } from "./codebuddy-auth.js";
-import { fetchCodeBuddyUsage, probeCodeBuddyHy4 } from "./codebuddy-usage.js";
+import { fetchCodeBuddyRequestUsage, fetchCodeBuddyUsage, probeCodeBuddyHy4 } from "./codebuddy-usage.js";
+import { collectSessionUsageAsync, defaultSessionsRoot } from "./codebuddy-sessions.js";
 
 const ROUTE_BY_PROVIDER = {
   "codebuddy-cn": "/dsh-llm-codebuddy/auth",
@@ -163,6 +164,26 @@ export function installCodeBuddyWeb(ctx) {
           });
         }
       };
+      // 积分消耗明细：网页「使用明细」同源接口，逐条请求 × 模型 × 客户端 × 积分，
+      // 在本侧聚合成 按模型/按日/按客户端。与资源包额度互补：额度是"还剩多少"，
+      // 这里是"花在哪了"。
+      const usageRequests = async (_req, res) => {
+        try {
+          const state = await currentState();
+          if (!state.authenticated) {
+            return json(res, 401, { ok: false, message: "尚未保存 CodeBuddy 登录令牌" });
+          }
+          const session = await resolveUsageSession(region);
+          const detail = await fetchCodeBuddyRequestUsage(region, session);
+          json(res, 200, { ok: true, provider: region.provider, ...detail });
+        } catch (error) {
+          json(res, 200, {
+            ok: false,
+            provider: region.provider,
+            message: error instanceof Error ? error.message : "积分消耗明细查询失败",
+          });
+        }
+      };
       // hy4-preview 免费档的「用量/限流窗口」探测：与用量查询同会话、同鉴权，
       // 在用量页加载或点「刷新」时调用（探测会发一次最小请求，见 codebuddy-usage.js）。
       const usageHy4 = async (_req, res) => {
@@ -182,6 +203,20 @@ export function installCodeBuddyWeb(ctx) {
           });
         }
       };
+      // 本地会话用量统计（模型/会话聚合）。数据源是 DSH 会话日志，与登录态无关，
+      // 因此不需要鉴权检查；所有区域共用同一份数据，路由挂在两个前缀下等价。
+      const usageSessions = async (_req, res) => {
+        try {
+          // webCtx 是注入代理，未注入的属性不可访问；会话根目录走默认解析
+          //（host 进程与 DSH 主进程同一 DSH_HOME env）。
+          json(res, 200, { ok: true, ...(await collectSessionUsageAsync(defaultSessionsRoot())) });
+        } catch (error) {
+          json(res, 200, {
+            ok: false,
+            message: error instanceof Error ? error.message : "会话用量统计失败",
+          });
+        }
+      };
       registrations.push(
         webCtx.webServer.register({ kind: "exact", path: `${route}/status`, handler: status }),
         webCtx.webServer.register({ kind: "exact", path: `${route}/api-key`, handler: apiKey }),
@@ -190,6 +225,8 @@ export function installCodeBuddyWeb(ctx) {
         webCtx.webServer.register({ kind: "exact", path: `${route}/login-status`, handler: loginStatus }),
         webCtx.webServer.register({ kind: "exact", path: `${route}/usage`, handler: usage }),
         webCtx.webServer.register({ kind: "exact", path: `${route}/usage/hy4`, handler: usageHy4 }),
+        webCtx.webServer.register({ kind: "exact", path: `${route}/usage/requests`, handler: usageRequests }),
+        webCtx.webServer.register({ kind: "exact", path: `${route}/usage/sessions`, handler: usageSessions }),
       );
     }
 

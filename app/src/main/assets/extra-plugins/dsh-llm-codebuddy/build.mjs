@@ -19,7 +19,7 @@ const root = dirname(fileURLToPath(import.meta.url));
 const src = join(root, "src");
 const lib = join(root, "lib");
 
-const HOST_FILES = ["index.js", "codebuddy-auth.js", "codebuddy-usage.js", "codebuddy-web.js"];
+const HOST_FILES = ["index.js", "codebuddy-auth.js", "codebuddy-usage.js", "codebuddy-sessions.js", "codebuddy-web.js"];
 
 function fail(message) {
   console.error(`ERROR: ${message}`);
@@ -56,3 +56,9 @@ if (/export const inject/.test(client)) fail("client 源码不应包含 ESM expo
 client = `${client}\n// inject = ["slots"]（build.mjs：供 super-injector 骨架校验扫描；实际契约见上方模块导出的 inject 字段）\n`;
 writeFileSync(join(lib, "client.js"), client, "utf8");
 console.log("client 构建完成（→ lib/client.js）");
+
+// ---- worker：直接复制（已是可执行 ESM） ----
+const workerSrc = join(src, "codebuddy-sessions-worker.mjs");
+if (!existsSync(workerSrc)) fail(`缺少 worker 源码 ${workerSrc}`);
+writeFileSync(join(lib, "codebuddy-sessions-worker.mjs"), readFileSync(workerSrc, "utf8"), "utf8");
+console.log("worker 构建完成（→ lib/codebuddy-sessions-worker.mjs）");
