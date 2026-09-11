@@ -25,7 +25,10 @@ object DshWatchdog {
             conn.connectTimeout = 800
             conn.readTimeout = 800
             conn.requestMethod = "GET"
-            conn.responseCode in 200..399
+            // dsh 0.1.5 起根路径无浏览器会话时返回 401（browser-trust fence）。
+            // 必须算「活着」——否则 watchdog 每轮都判 web 挂了 → 反复 revive，
+            // 连续失败还会被 Supervisor 误判成崩溃循环而**自动回滚重装上一版本**。
+            conn.responseCode in 200..399 || conn.responseCode == 401 || conn.responseCode == 403
         } catch (e: Exception) {
             false
         } finally {

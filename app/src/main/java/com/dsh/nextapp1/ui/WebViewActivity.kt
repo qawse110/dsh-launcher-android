@@ -8,6 +8,7 @@ import android.os.Bundle
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.webkit.CookieManager
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -18,6 +19,7 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
+import java.io.File
 import androidx.appcompat.app.AppCompatActivity
 import com.google.android.material.color.DynamicColors
 import com.dsh.nextapp1.core.*
@@ -158,7 +160,9 @@ class WebViewActivity : AppCompatActivity() {
             }
         }
 
-        webView.loadUrl(TARGET_URL)
+        // dsh 0.1.5 起根路径受 browser-trust fence 保护（无凭据 401），
+        // 必须带浏览器会话（cookie）或启动令牌才能进 UI——见 WebAuth。
+        loadWebUi()
     }
 
     override fun onBackPressed() {
@@ -313,6 +317,37 @@ class WebViewActivity : AppCompatActivity() {
     }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+    /**
+     * 加载 WebUI 入口。
+     *
+     * 0.1.1（无栅栏）→ 直接根路径，行为与升级前一致。
+     * 0.1.5（browser-trust fence）→ 先确保拿到浏览器会话 cookie，**注入 WebView 自己的
+     * cookie jar**（WebView 与 HttpURLConnection 不共享 cookie，只存 pref 不注入是没用的），
+     * 再开根路径；cookie 拿不到时退回「带启动令牌的 URL」，让 dsh 自己完成 303 下发。
+     *
+     * 网络探测有超时，故整体放后台线程，回主线程再 loadUrl。
+     */
+    private fun loadWebUi() {
+        val logFile = File(FileLog.dir(this), DshFlow.WEB_LOG)
+        Thread {
+            val url = runCatching { WebAuth.entryUrl(this, DshFlow.WEB_PORT, logFile) }
+                .getOrDefault(TARGET_URL)
+            val cookie = runCatching { WebAuth.loadCookie(this) }.getOrNull()
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                if (cookie.isNullOrBlank()) {
+                    webView.loadUrl(url)
+                } else {
+                    // 注入后需 flush 才保证随首个请求发出（API 21+ 的异步回调版本）
+                    CookieManager.getInstance().setCookie(url, cookie) {
+                        runCatching { CookieManager.getInstance().flush() }
+                        if (!isFinishing && !isDestroyed) webView.loadUrl(url)
+                    }
+                }
+            }
+        }.start()
+    }
 
     companion object {
         private const val TARGET_URL = "http://127.0.0.1:" + com.dsh.nextapp1.core.DshFlow.WEB_PORT

@@ -559,7 +559,11 @@ object DshFlow {
             conn.connectTimeout = 800
             conn.readTimeout = 800
             conn.requestMethod = "GET"
-            conn.responseCode in 200..399
+            // dsh 0.1.5 起根路径在无浏览器会话时返回 401（browser-trust fence），
+            // 那是「服务已就绪、只是没带凭据」而非「没起来」——必须一并算就绪，
+            // 否则等待循环永远超时（真机实测：web 30s 内已监听，探针却判 90s 未就绪）。
+            // 401/403 只可能由**已监听的 HTTP 服务**返回，故语义上等价于「端口活着」。
+            conn.responseCode in 200..399 || conn.responseCode == 401 || conn.responseCode == 403
         } catch (e: Exception) {
             false
         } finally {
