@@ -899,36 +899,57 @@ class MainActivity : AppCompatActivity() {
     private fun syncAssetsOnApkUpdate() {
         val current = AssetSync.apkVersion(this)
         if (current == 0L) return
+        // ★ 判据必须是「安装戳」而非 versionCode：versionCode 硬编码为常量 300，
+        //   用它比较会让本函数在首次安装后**永不执行**（真机事故根因——装了含插件
+        //   修复的新 APK，files/extra-plugins 仍是旧内容，插件加载失败 web 起不来）。
+        //   安装戳含 APK 路径/长度/mtime，重装必然变化。
+        val stamp = AssetSync.apkInstallStamp(this)
+        if (stamp.isEmpty()) return
         val prefs = getSharedPreferences(AppState.Prefs.UI, MODE_PRIVATE)
-        val last = prefs.getLong("last_apk_version", 0L)
-        if (current == last) return
-        prefs.edit().putLong("last_apk_version", current).apply()
-        appendMiniLog("检测到应用更新（v$current），后台同步内置插件源…")
+        // 换键名：旧键 last_apk_version 里存的是 versionCode，与新判据语义不同。
+        // SharedPreferences 同键换存储语义会让升级用户带着旧值回来误判（旧值 300
+        // 恰好也是 Long，不换键名会静默把新判据判成"已同步"），故必须换键。
+        val last = prefs.getString("last_apk_stamp", null)
+        if (stamp == last) return
+        appendMiniLog("检测到应用已更新（v$current），后台同步内置插件源…")
         thread {
+            var ok = true
             try {
                 for (name in listOf(
                     "install-dsh.mjs", "routing-suite.mjs",
                     "fs-register.mjs", "fs-loader.mjs", "fs-promises-compat.mjs", "stub-dsh.mjs"
                 )) {
-                    AssetSync.copyAsset(this, name, File(filesDir, name))
+                    if (!AssetSync.copyAsset(this, name, File(filesDir, name))) ok = false
                 }
                 val prebuilt = File(filesDir, "prebuilt.tgz")
                 if (AssetSync.copyAsset(this, "prebuilt.tgz", prebuilt)) {
-                    AssetSync.markSyncedWithFingerprint(this, "prebuilt", prebuilt, current)
+                    AssetSync.markSyncedWithFingerprint(this, "prebuilt", prebuilt, stamp)
+                } else {
+                    ok = false
                 }
                 val extraPlugins = File(filesDir, "extra-plugins")
                 if (AssetSync.copyAssetDir(this, "extra-plugins", extraPlugins, clearFirst = true)) {
-                    AssetSync.markSyncedWithFingerprint(this, "extra-plugins", extraPlugins, current)
+                    AssetSync.markSyncedWithFingerprint(this, "extra-plugins", extraPlugins, stamp)
+                } else {
+                    ok = false
                 }
+                // ★ 安装戳标记必须在**同步成功之后**才写：提前写会让一次失败
+                //   （弱网/空间不足）把自己永久标记成"已同步"，之后再不重试。
+                if (ok) prefs.edit().putString("last_apk_stamp", stamp).apply()
+                else AppLog.i("Main", "apk asset sync incomplete, will retry next launch")
                 val dshInstalled = File(filesDir, "plugins").exists() && File(filesDir, "dsh-prefix").exists()
                 if (dshInstalled) {
                     prefs.edit().putBoolean("rewire_hint", true).apply()
                     runOnUiThread {
-                        appendMiniLog("✓ 内置插件源已同步。建议在「插件管理」执行“重新装配内置插件”。")
+                        appendMiniLog(if (ok) "✓ 内置插件源已同步。建议在「插件管理」执行“重新装配内置插件”。"
+                                     else "⚠ 内置插件源同步未完成，下次启动会重试。")
                         showUpdateHint()
                     }
                 } else {
-                    runOnUiThread { appendMiniLog("✓ 内置插件源已同步（新装环境，装配由首次安装负责）。") }
+                    runOnUiThread {
+                        appendMiniLog(if (ok) "✓ 内置插件源已同步（新装环境，装配由首次安装负责）。"
+                                     else "⚠ 内置插件源同步未完成，下次启动会重试。")
+                    }
                 }
             } catch (t: Throwable) {
                 AppLog.e("Main", "apk asset sync failed: " + (t.message ?: t.toString()))

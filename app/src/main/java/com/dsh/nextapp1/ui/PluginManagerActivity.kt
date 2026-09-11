@@ -919,6 +919,10 @@ class PluginManagerActivity : AppCompatActivity() {
                 Thread {
                     try {
                         ensureHarnessTools()
+                        // 必须先同步 extra-plugins 源再装配：否则「重新装配」只是把
+                        // 设备上**旧**的源再装一遍，APK 里的插件修复到不了位。
+                        // （此前只有「修复单个」与「一键重置」同步，本入口漏了。）
+                        syncExtraPluginsSource()
                         val code = rewireCore("重新装配")
                         if (code == 0) appendLog("   ✓ 重新装配完成")
                         refreshListSafe()
@@ -971,12 +975,12 @@ class PluginManagerActivity : AppCompatActivity() {
 
     /** 同步 assets 的 extra-plugins 源到 files（clearFirst 自愈坏拷贝）。 */
     private fun syncExtraPluginsSource() {
-        val apkVer = AssetSync.apkVersion(this)
+        val stamp = AssetSync.apkInstallStamp(this)
         val dest = File(filesDir, "extra-plugins")
-        if (AssetSync.isSynced(this, "extra-plugins", dest, apkVer)) return
+        if (AssetSync.isSynced(this, "extra-plugins", dest, stamp)) return
         try {
             if (AssetSync.copyAssetDir(this, "extra-plugins", dest, clearFirst = true)) {
-                AssetSync.markSyncedWithFingerprint(this, "extra-plugins", dest, apkVer)
+                AssetSync.markSyncedWithFingerprint(this, "extra-plugins", dest, stamp)
                 appendLog("   extra-plugins 源已同步（${dest.walkTopDown().count { it.isFile }} 个文件）")
             }
         } catch (t: Throwable) {
@@ -987,16 +991,18 @@ class PluginManagerActivity : AppCompatActivity() {
     /** --plugins-only 核心（供「重新装配」与「一键重置」复用）。 */
     private fun rewireCore(label: String): Int {
         val apkVer = AssetSync.apkVersion(this)
+        // 资产判据用安装戳（versionCode 是硬编码常量，无法识别 APK 换代）
+        val apkStamp = AssetSync.apkInstallStamp(this)
         val installScript = File(filesDir, "install-dsh.mjs")
         if (!AssetSync.copyAsset(this, "install-dsh.mjs", installScript) && !installScript.exists()) {
             appendLog("   ✗ $label 失败：install-dsh.mjs 缺失")
             return -1
         }
         val prebuilt = File(filesDir, "prebuilt.tgz")
-        if (AssetSync.isSynced(this, "prebuilt", prebuilt, apkVer)) {
+        if (AssetSync.isSynced(this, "prebuilt", prebuilt, apkStamp)) {
             appendLog("   内置插件源已是最新，跳过复制")
         } else if (AssetSync.copyAsset(this, "prebuilt.tgz", prebuilt)) {
-            AssetSync.markSyncedWithFingerprint(this, "prebuilt", prebuilt, apkVer)
+            AssetSync.markSyncedWithFingerprint(this, "prebuilt", prebuilt, apkStamp)
             appendLog("   内置插件源 ${prebuilt.length() / 1024 / 1024}MB")
         } else {
             appendLog("   WARN 无法复制 prebuilt.tgz，继续使用已有源")

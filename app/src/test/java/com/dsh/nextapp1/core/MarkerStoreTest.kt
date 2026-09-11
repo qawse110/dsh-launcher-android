@@ -5,6 +5,7 @@ import androidx.test.core.app.ApplicationProvider
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -61,33 +62,46 @@ class MarkerStoreTest {
         assertTrue(File(ctx.filesDir, ".termux-ok").exists()) // 原文件保留不动
     }
 
-    @Test fun `AssetSync 键值接口与 apk 版本判定`() {
+    // ---- AssetSync：判据为「安装戳」字符串 ----
+    // 注意：判据**不能**用 versionCode——本仓 versionCode 硬编码为常量 300，
+    // 用它当"APK 换过了"的信号会让同步永久短路（真机事故根因）。
+
+    private val stampA = "/data/app/base.apk|12345|1700000000000"
+    private val stampB = "/data/app/base.apk|23456|1700000009999" // 重装后长度/mtime 变化
+
+    @Test fun `AssetSync 键值接口与安装戳判定`() {
         val target = File(ctx.cacheDir, "asset.bin").apply { writeText("x") }
-        AssetSync.markSyncedWithFingerprint(ctx, "prebuilt", target, 29L)
-        assertTrue(AssetSync.isSynced(ctx, "prebuilt", target, 29L))
-        assertFalse(AssetSync.isSynced(ctx, "prebuilt", target, 30L))
-        assertFalse(AssetSync.isSynced(ctx, "prebuilt", File(ctx.cacheDir, "missing"), 29L))
+        AssetSync.markSyncedWithFingerprint(ctx, "prebuilt", target, stampA)
+        assertTrue(AssetSync.isSynced(ctx, "prebuilt", target, stampA))
+        // 安装戳变了（重装了 APK）→ 必须重新同步
+        assertFalse(AssetSync.isSynced(ctx, "prebuilt", target, stampB))
+        assertFalse(AssetSync.isSynced(ctx, "prebuilt", File(ctx.cacheDir, "missing"), stampA))
+        // 空戳（取不到 APK 信息）视为未同步，fail-open 到"做事"而非"跳过"
+        assertFalse(AssetSync.isSynced(ctx, "prebuilt", target, ""))
     }
 
-    @Test fun `AssetSync 内容指纹：versionCode 相同但内容变化时判定未同步`() {
+    @Test fun `AssetSync 内容指纹：安装戳相同但内容变化时判定未同步`() {
         val target = File(ctx.cacheDir, "asset-fp.bin").apply { writeText("v1") }
-        AssetSync.markSyncedWithFingerprint(ctx, "prebuilt", target, 29L)
-        assertTrue(AssetSync.isSynced(ctx, "prebuilt", target, 29L))
-        // 同 versionCode，内容变化（本地 debug 重建场景）→ 必须重新拷贝
+        AssetSync.markSyncedWithFingerprint(ctx, "prebuilt", target, stampA)
+        assertTrue(AssetSync.isSynced(ctx, "prebuilt", target, stampA))
+        // 同安装戳，内容变化（本地 debug 重建场景）→ 必须重新拷贝
         target.writeText("v2 with different content and length")
-        assertFalse(AssetSync.isSynced(ctx, "prebuilt", target, 29L))
+        assertFalse(AssetSync.isSynced(ctx, "prebuilt", target, stampA))
         // 重新标记后恢复同步态
-        AssetSync.markSyncedWithFingerprint(ctx, "prebuilt", target, 29L)
-        assertTrue(AssetSync.isSynced(ctx, "prebuilt", target, 29L))
+        AssetSync.markSyncedWithFingerprint(ctx, "prebuilt", target, stampA)
+        assertTrue(AssetSync.isSynced(ctx, "prebuilt", target, stampA))
     }
 
-    @Test fun `AssetSync 旧格式 marker（无指纹）视为未同步并可通过重新标记升级`() {
+    @Test fun `AssetSync 旧格式 marker（versionCode 判据，无指纹）视为未同步`() {
         val target = File(ctx.cacheDir, "asset-legacy.bin").apply { writeText("x") }
-        // 模拟旧版本写入的 marker
+        // 模拟旧版本写入的 marker：apk:<versionCode>（无 # 指纹）
         MarkerStore.put(ctx, "extra-plugins", "apk:29")
-        assertFalse(AssetSync.isSynced(ctx, "extra-plugins", target, 29L))
-        AssetSync.markSyncedWithFingerprint(ctx, "extra-plugins", target, 29L)
-        assertTrue(AssetSync.isSynced(ctx, "extra-plugins", target, 29L))
+        assertFalse(AssetSync.isSynced(ctx, "extra-plugins", target, stampA))
+        // 也模拟旧格式带指纹的：apk:29#<fp> —— 前缀与安装戳不同，同样视为未同步
+        MarkerStore.put(ctx, "extra-plugins", "apk:29#deadbeef")
+        assertFalse(AssetSync.isSynced(ctx, "extra-plugins", target, stampA))
+        AssetSync.markSyncedWithFingerprint(ctx, "extra-plugins", target, stampA)
+        assertTrue(AssetSync.isSynced(ctx, "extra-plugins", target, stampA))
     }
 
     @Test fun `AssetSync 目录指纹：目录内容变化时判定未同步`() {
@@ -96,11 +110,28 @@ class MarkerStoreTest {
         dir.mkdirs()
         File(dir, "a.txt").writeText("aaa")
         File(dir, "sub/b.txt").apply { parentFile!!.mkdirs() }.writeText("bbb")
-        AssetSync.markSyncedWithFingerprint(ctx, "extra-plugins", dir, 29L)
-        assertTrue(AssetSync.isSynced(ctx, "extra-plugins", dir, 29L))
+        AssetSync.markSyncedWithFingerprint(ctx, "extra-plugins", dir, stampA)
+        assertTrue(AssetSync.isSynced(ctx, "extra-plugins", dir, stampA))
         // 增加一个文件 → 指纹变化
         File(dir, "sub/c.txt").writeText("ccc")
-        assertFalse(AssetSync.isSynced(ctx, "extra-plugins", dir, 29L))
+        assertFalse(AssetSync.isSynced(ctx, "extra-plugins", dir, stampA))
         dir.deleteRecursively()
+    }
+
+    @Test fun `AssetSync fileFingerprint：内容变则指纹变，缺失为 absent`() {
+        val f = File(ctx.cacheDir, "stub-probe.mjs").apply { writeText("v5 patch") }
+        val fp1 = AssetSync.fileFingerprint(f)
+        assertTrue(fp1.isNotEmpty() && fp1 != "absent")
+        f.writeText("v6 patch with different content")
+        assertNotEquals(fp1, AssetSync.fileFingerprint(f))
+        assertEquals("absent", AssetSync.fileFingerprint(File(ctx.cacheDir, "nope.mjs")))
+    }
+
+    @Test fun `apkInstallStamp 反映 APK 文件本身且非空`() {
+        // Robolectric 下 applicationInfo.sourceDir 指向测试用的 apk/目录；
+        // 这里只断言「能取到一个非空、且包含来源路径的戳」，避免依赖具体打包形态。
+        val stamp = AssetSync.apkInstallStamp(ctx)
+        assertFalse("安装戳不应为空否则判据 fail-closed 成永久跳过", stamp.isEmpty())
+        assertTrue(stamp.contains("|"))
     }
 }

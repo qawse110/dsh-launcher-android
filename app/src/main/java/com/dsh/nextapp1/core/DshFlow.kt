@@ -139,6 +139,9 @@ object DshFlow {
 
         val nodeDir = NodeRuntime.ensureExtracted(ctx)
         val apkVer = AssetSync.apkVersion(ctx)
+        // 资产变更判据用「安装戳」而非 versionCode：本仓 versionCode 硬编码为常量，
+        // 以它为判据会使「APK 升级后重新同步资产」永不触发（真机事故根因）。
+        val apkStamp = AssetSync.apkInstallStamp(ctx)
         fl("OK 1/4 node=$nodeDir")
         val dshPrefix = File(ctx.filesDir, "dsh-prefix")
 
@@ -204,21 +207,21 @@ object DshFlow {
             return false
         }
         val prebuilt = File(ctx.filesDir, "prebuilt.tgz")
-        if (AssetSync.isSynced(ctx, "prebuilt", prebuilt, apkVer)) {
+        if (AssetSync.isSynced(ctx, "prebuilt", prebuilt, apkStamp)) {
             fl("  内置插件源已是最新，跳过复制")
         } else if (AssetSync.copyAsset(ctx, "prebuilt.tgz", prebuilt)) {
-            AssetSync.markSyncedWithFingerprint(ctx, "prebuilt", prebuilt, apkVer)
+            AssetSync.markSyncedWithFingerprint(ctx, "prebuilt", prebuilt, apkStamp)
             fl("  内置插件源 ${prebuilt.length() / 1024 / 1024}MB")
         } else {
             fl("  WARN assets 无 prebuilt.tgz，继续使用已有插件源")
         }
         val extraPluginsDir = File(ctx.filesDir, "extra-plugins")
-        if (AssetSync.isSynced(ctx, "extra-plugins", extraPluginsDir, apkVer)) {
+        if (AssetSync.isSynced(ctx, "extra-plugins", extraPluginsDir, apkStamp)) {
             fl("  额外桥接插件源已是最新，跳过复制")
         } else {
             try {
                 if (AssetSync.copyAssetDir(ctx, "extra-plugins", extraPluginsDir, clearFirst = true)) {
-                    AssetSync.markSyncedWithFingerprint(ctx, "extra-plugins", extraPluginsDir, apkVer)
+                    AssetSync.markSyncedWithFingerprint(ctx, "extra-plugins", extraPluginsDir, apkStamp)
                     val count = extraPluginsDir.walkTopDown().count { it.isFile }
                     fl("  额外桥接插件源 $count 个文件")
                     if (count == 0) fl("  WARN extra-plugins 复制后 0 个文件（assets 可能为空）")
@@ -374,12 +377,18 @@ object DshFlow {
     }
 
     /**
-     * Android 兼容修复（stub-dsh.mjs）按版本只跑一次：
-     * marker 记录「APK 版本 + dsh 版本」，两者都没变则跳过（省 2~5 秒启动时间）。
+     * Android 兼容修复（stub-dsh.mjs）按「APK 安装戳 + dsh 版本 + 脚本内容指纹」跑一次：
+     * 三者都没变则跳过（省 2~5 秒启动时间）。
+     *
+     * **为什么必须带脚本内容指纹**：stub-dsh.mjs 是补丁载荷，它的改动**不体现在
+     * versionCode 上**（硬编码常量），也不体现在 dsh 版本上。旧判据只有
+     * `apk:<versionCode>|dsh:<ver>`，于是「换了补丁逻辑但版本号没动」时会被判成
+     * 「已应用」而**永久跳过补丁**（真机事故：0.1.5 适配的 v5 前缀补丁打不上）。
      */
     private fun runAndroidStubOnce(ctx: Context, nodeDir: File, dshPrefix: File, stubScript: File, fl: (String) -> Unit) {
-        val apkVer = AssetSync.apkVersion(ctx)
-        val expected = "apk:$apkVer|dsh:${DshUpdater.currentVersion(ctx)}"
+        val apkStamp = AssetSync.apkInstallStamp(ctx)
+        val stubFp = AssetSync.fileFingerprint(stubScript)
+        val expected = "apk:$apkStamp|dsh:${DshUpdater.currentVersion(ctx)}|fp:$stubFp"
         if (MarkerStore.get(ctx, "stub-applied") == expected) {
             fl(">> Android 兼容修复已应用（$expected），跳过 stub")
             return
@@ -391,10 +400,11 @@ object DshFlow {
                 "NODE_DIR" to nodeDir.absolutePath,
                 "DSH_PREFIX" to dshPrefix.absolutePath,
                 "DSH_PROFILE" to "web",
-                "DSH_APK_VER" to apkVer.toString()
+                "DSH_APK_VER" to AssetSync.apkVersion(ctx).toString()
             )
         ) { fl(it) }
         if (exit == 0) {
+            // 标记必须在工作成功之后写：失败即不写，下次自然重跑
             MarkerStore.put(ctx, "stub-applied", expected)
         } else {
             fl("WARN stub-dsh 退出码 $exit（不写 marker，下次重跑）")

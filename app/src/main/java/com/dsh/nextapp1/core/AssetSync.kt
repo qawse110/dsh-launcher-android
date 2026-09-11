@@ -33,25 +33,65 @@ object AssetSync {
         0L
     }
 
-    /** marker（MarkerStore 键）值为 "apk:<version>#<fingerprint>"，且目标文件/目录存在时视为已同步。 */
-    fun isSynced(ctx: Context, key: String, target: File, apkVersion: Long): Boolean {
-        if (apkVersion <= 0L || !target.exists()) return false
-        val marker = MarkerStore.get(ctx, key) ?: return false
-        if (!marker.startsWith("apk:$apkVersion#")) return false
-        // 内容指纹：versionCode 相同（本地 debug 重建）但资产变了 → 签名不匹配 → 重新拷贝。
-        // 兼容旧格式 marker（无 #）：视为未同步，本次拷贝后升级为新格式。
-        val fp = fingerprintOf(target)
-        return marker == "apk:$apkVersion#$fp"
+    /**
+     * APK 安装戳：`<sourceDir>|<长度>|<mtime>`。
+     *
+     * **为什么不能用 versionCode 当「APK 是否变了」的判据**：本仓 versionCode 是硬编码
+     * 常量（`versionCode = 300`），每次出包都相同 → 任何以它为判据的「升级检测」在
+     * 首次安装后**永不成立**，是死代码（旧版 `syncAssetsOnApkUpdate` 的 `current == last`
+     * 即因此直接 return，装了新 APK 也不同步资产 —— 真机实证：新 APK 里的插件修复
+     * 到不了 devices 上的 files/）。
+     *
+     * 重装/覆盖安装会替换 APK 文件本身，其**长度或 mtime 必然变化**，故取二者与路径
+     * 组成戳即可真实反映「本次安装的包换过了」。取不到时返回空串，调用方应视为
+     * 「未知」并**按需要重新同步**（fail-open 到「做事」，而不是 fail-closed 到「跳过」）。
+     */
+    fun apkInstallStamp(context: Context): String = try {
+        val src = File(context.applicationInfo.sourceDir)
+        if (!src.isFile) "" else "${src.absolutePath}|${src.length()}|${src.lastModified()}"
+    } catch (t: Throwable) {
+        AppLog.e("AssetSync", "apkInstallStamp failed: " + (t.message ?: t.toString()))
+        ""
     }
 
-    fun markSynced(ctx: Context, key: String, apkVersion: Long) {
-        MarkerStore.put(ctx, key, "apk:$apkVersion")
+    /**
+     * marker 值为 `apk:<安装戳>#<目标内容指纹>`，且目标存在时视为已同步。
+     *
+     * **判据必须是「安装戳」而非 versionCode**：旧实现用 `apk:<versionCode>` 当签名，
+     * 而本仓 versionCode 硬编码为 300，每次出包都相同 → 装了新 APK 后签名**依旧匹配**，
+     * 于是「已同步」被永久短路，新 APK 里的资产（含内置插件修复）永远到不了 files/
+     * （真机实证：修好的 codebuddy 插件在设备上仍是旧文件）。详见 [apkInstallStamp]。
+     *
+     * 双重判据缺一不可：
+     *  - 安装戳：识别「APK 换过了」（versionCode 做不到）；
+     *  - 目标指纹：识别「目标被改坏/只拷了一半」以及 marker 落盘后目标被外部改动。
+     * 注意目标指纹是**目标自身**的，只能发现目标侧变化；APK 侧的更新靠安装戳发现。
+     */
+    fun isSynced(ctx: Context, key: String, target: File, apkStamp: String): Boolean {
+        if (apkStamp.isEmpty() || !target.exists()) return false
+        val marker = MarkerStore.get(ctx, key) ?: return false
+        if (!marker.startsWith("apk:$apkStamp#")) return false
+        // 兼容旧格式 marker（无 #）与旧判据（apk:<versionCode>）：视为未同步，
+        // 本次拷贝后升级为新格式。
+        val fp = fingerprintOf(target)
+        return marker == "apk:$apkStamp#$fp"
+    }
+
+    fun markSynced(ctx: Context, key: String, apkStamp: String) {
+        MarkerStore.put(ctx, key, "apk:$apkStamp")
     }
 
     /** 携带目标内容指纹写入 marker（isSynced 校验用）。 */
-    fun markSyncedWithFingerprint(ctx: Context, key: String, target: File, apkVersion: Long) {
-        MarkerStore.put(ctx, key, "apk:$apkVersion#${fingerprintOf(target)}")
+    fun markSyncedWithFingerprint(ctx: Context, key: String, target: File, apkStamp: String) {
+        MarkerStore.put(ctx, key, "apk:$apkStamp#${fingerprintOf(target)}")
     }
+
+    /**
+     * 公开的单文件指纹（长度 + 头 64KB CRC32），供「脚本内容变了就该重跑」类判据使用
+     * （如 stub-dsh.mjs 补丁载荷的幂等 marker）。文件不存在返回 "absent"。
+     */
+    fun fileFingerprint(file: File): String =
+        if (!file.isFile) "absent" else fingerprintOf(file)
 
     /**
      * 轻量内容指纹：文件 = 长度 + 头 64KB CRC32；目录 = 递归各文件（长度+CRC）的聚合 CRC。
