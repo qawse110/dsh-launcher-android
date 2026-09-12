@@ -1,12 +1,21 @@
 import { credentialRef } from "@deepseek-ai/dsh-credentials";
 import {
   CODEBUDDY_REGIONS,
+  activeCodeBuddySession,
+  backfillCodeBuddySessionLabels,
+  codeBuddySessionAccounts,
+  codeBuddySessionNeedsLabel,
   createCodeBuddyLogin,
+  createCodeBuddySessionStore,
+  enrichAccountWithProfile,
   parseCodeBuddySession,
+  parseCodeBuddySessions,
   refreshCodeBuddySession,
   serializeCodeBuddySession,
+  serializeCodeBuddySessions,
   sessionCacheDeadline,
   sessionNeedsRefresh,
+  upsertCodeBuddySession,
   waitForCodeBuddyLogin,
 } from "./codebuddy-auth.js";
 import { fetchCodeBuddyRequestUsage, fetchCodeBuddyUsage, probeCodeBuddyHy4 } from "./codebuddy-usage.js";
@@ -64,22 +73,86 @@ async function setMode(settings, mode, region) {
  */
 function createUsageSessionResolver(webCtx) {
   const cache = new Map();
-  return async function resolveUsageSession(region) {
-    const cached = cache.get(region.provider);
+  // accountId 可选：多账号用量查询可指定账号（缺省 = 当前 active）。
+  // 解析/刷新走统一的 store 读写（兼容旧单账号 ref），缓存按「区域:账号」分键。
+  return async function resolveUsageSession(region, accountId) {
+    const key = `${region.provider}:${accountId ?? "active"}`;
+    const cached = cache.get(key);
     if (cached && cached.expiresAt > Date.now()) return cached;
-    const ref = credentialRef(region.sessionRef);
-    const stored = await webCtx.credentials.resolve(ref);
-    const value = stored?.value;
-    if (!value) throw new Error("尚未保存 CodeBuddy 登录令牌");
-    let session = parseCodeBuddySession(value);
-    if (sessionNeedsRefresh(session)) {
-      session = await refreshCodeBuddySession(session, undefined, region.authBaseUrl);
-      await webCtx.credentials.set(ref, serializeCodeBuddySession(session));
-    }
-    const result = { ...session, expiresAt: sessionCacheDeadline(session) };
-    cache.set(region.provider, result);
+    const { session, expiresAt } = await resolveSession(webCtx.credentials, region, accountId);
+    const result = { ...session, expiresAt };
+    cache.set(key, result);
     return result;
   };
+}
+
+/** 读取 POST JSON body（登录/切换/删除端点用；坏体返回 {}）。 */
+function requestBody(req) {
+  return new Promise((resolve) => {
+    let data = "";
+    req.on("data", (chunk) => {
+      data += chunk;
+      if (data.length > 1_000_000) data = ""; // 超限即弃，防滥发
+    });
+    req.on("end", () => {
+      try {
+        resolve(data ? JSON.parse(data) : {});
+      } catch {
+        resolve({});
+      }
+    });
+    req.on("error", () => resolve({}));
+  });
+}
+
+// ---- 多账号会话 store（每个区域一份）----
+// 读侧兼容：本区域多账号 store → 旧单账号 ref（自动包成单条 store）。
+
+async function readSessionStore(credentials, region) {
+  for (const ref of [region.sessionsRef, region.sessionRef]) {
+    try {
+      const stored = await credentials?.resolve(credentialRef(ref));
+      if (stored?.value) {
+        const parsed = JSON.parse(stored.value);
+        if (Array.isArray(parsed?.sessions)) return parseCodeBuddySessions(stored.value);
+        if (parsed?.auth) {
+          const legacy = parseCodeBuddySession(stored.value);
+          return createCodeBuddySessionStore([legacy], undefined);
+        }
+      }
+    } catch {
+      /* 单个 ref 坏掉继续试下一个 */
+    }
+  }
+  return createCodeBuddySessionStore();
+}
+
+async function writeSessionStore(credentials, region, store) {
+  const active = activeCodeBuddySession(store);
+  if (!active) {
+    await credentials?.unset(credentialRef(region.sessionsRef));
+    await credentials?.unset(credentialRef(region.sessionRef));
+    return;
+  }
+  await credentials?.set(credentialRef(region.sessionsRef), serializeCodeBuddySessions(store));
+  // 旧单账号 ref 继续维护为「指向 active」的兼容指针：
+  // 旧版插件/CLI/用量路由读它仍能拿到当前账号。
+  await credentials?.set(credentialRef(region.sessionRef), serializeCodeBuddySession(active));
+}
+
+/** 按 accountId 解析会话（无 id → active），必要时刷新并回写 store。 */
+async function resolveSession(credentials, region, accountId) {
+  const store = await readSessionStore(credentials, region);
+  const requestedId = typeof accountId === "string" && accountId ? accountId : store.activeId;
+  let session = store.sessions.find((entry) => entry.id === requestedId) ?? activeCodeBuddySession(store);
+  if (!session) throw new Error("没有找到该 CodeBuddy 登录账号");
+  if (sessionNeedsRefresh(session)) {
+    session = await refreshCodeBuddySession(session, undefined, region.authBaseUrl);
+    const nextStore = upsertCodeBuddySession({ ...store, activeId: session.id }, session);
+    await writeSessionStore(credentials, region, nextStore);
+    session = { ...session, ...activeCodeBuddySession(nextStore) };
+  }
+  return { session, expiresAt: sessionCacheDeadline(session) };
 }
 
 export function installCodeBuddyWeb(ctx) {
@@ -91,11 +164,43 @@ export function installCodeBuddyWeb(ctx) {
     for (const region of Object.values(CODEBUDDY_REGIONS)) {
       const route = ROUTE_BY_PROVIDER[region.provider];
       const sessionRef = credentialRef(region.sessionRef);
-      const currentState = async () => ({
-        ok: true,
-        mode: authenticationMode(webCtx.settings.get(NS), region.provider),
-        authenticated: (await webCtx.credentials.describe(sessionRef)).configured,
-      });
+      // 昵称回填是「尽力而为」的后台动作，绝不阻塞 status：
+      //   - 中国区没有 /v2/plugin/accounts 端点，探测会白等到超时（实测会把
+      //     status 拖到 HTTP 000 无响应）；
+      //   - 一旦某区域被判定为不支持（超时/404），记下来不再重试。
+      // 因此 status 只做「读 + 立即返回」，回填在后台跑，下次刷新就能看到新昵称。
+      let profileEndpointUnsupported = false;
+      let backfillRunning = false;
+      const runBackfill = (store) => {
+        if (profileEndpointUnsupported || backfillRunning) return;
+        if (!(store?.sessions ?? []).some((entry) => codeBuddySessionNeedsLabel(entry))) return;
+        backfillRunning = true;
+        backfillCodeBuddySessionLabels(store, async (entry) => {
+          const auth = entry?.auth;
+          if (!auth?.accessToken) return undefined;
+          const enriched = await enrichAccountWithProfile(auth, entry.account, undefined, region.authBaseUrl);
+          if (enriched === entry.account) profileEndpointUnsupported = true; // 端点不可用：停止后续尝试
+          return enriched !== entry.account ? enriched : undefined;
+        })
+          .then(async (next) => {
+            if (next !== store) await writeSessionStore(webCtx.credentials, region, next);
+          })
+          .catch(() => {})
+          .finally(() => { backfillRunning = false; });
+      };
+      const currentState = async () => {
+        const store = await readSessionStore(webCtx.credentials, region);
+        runBackfill(store); // 后台，不 await
+        const active = activeCodeBuddySession(store);
+        return {
+          ok: true,
+          mode: authenticationMode(webCtx.settings.get(NS), region.provider),
+          authenticated: (await webCtx.credentials.describe(sessionRef)).configured,
+          // 多账号：列表 + 当前激活账号（旧版客户端会忽略这两个新字段，互不影响）
+          activeAccountId: active?.id ?? null,
+          accounts: codeBuddySessionAccounts(store),
+        };
+      };
       const status = async (_req, res) => {
         json(res, 200, await currentState());
       };
@@ -105,13 +210,23 @@ export function installCodeBuddyWeb(ctx) {
         await setMode(webCtx.settings, "api-key", region);
         json(res, 200, await currentState());
       };
+      // 切换令牌账号：body.accountId 指定目标账号（缺省 = 保持当前 active），
+      // 把它设为 store.activeId 并同步旧单账号兼容指针。
       const token = async (req, res) => {
         if (req.method !== "POST") return json(res, 405, { ok: false, message: "Method not allowed" });
         if (!localPost(req)) return json(res, 403, { ok: false, message: "只允许从本机 DSH 页面切换认证方式" });
-        const state = await currentState();
-        if (!state.authenticated) return json(res, 409, { ok: false, message: "尚未保存 CodeBuddy 登录令牌" });
-        await setMode(webCtx.settings, "token", region);
-        json(res, 200, await currentState());
+        try {
+          const body = await requestBody(req);
+          const store = await readSessionStore(webCtx.credentials, region);
+          const accountId = typeof body.accountId === "string" && body.accountId ? body.accountId : store.activeId;
+          const active = store.sessions.find((entry) => entry.id === accountId);
+          if (!active) return json(res, 409, { ok: false, message: "没有找到该 CodeBuddy 登录账号" });
+          await writeSessionStore(webCtx.credentials, region, { ...store, activeId: active.id });
+          await setMode(webCtx.settings, "token", region);
+          json(res, 200, await currentState());
+        } catch (error) {
+          json(res, 500, { ok: false, message: error instanceof Error ? error.message : "切换令牌账号失败" });
+        }
       };
       const login = async (req, res) => {
         if (req.method !== "POST") return json(res, 405, { ok: false, message: "Method not allowed" });
@@ -126,7 +241,9 @@ export function installCodeBuddyWeb(ctx) {
             loginPromises.set(region.provider, entry);
             entry.promise = (async () => {
               const session = await waitForCodeBuddyLogin(entry.state, undefined, region.authBaseUrl);
-              await webCtx.credentials.set(sessionRef, serializeCodeBuddySession(session));
+              // upsert：同一账号重复登录只更新令牌，不同账号则追加并自动激活。
+              const store = await readSessionStore(webCtx.credentials, region);
+              await writeSessionStore(webCtx.credentials, region, upsertCodeBuddySession(store, session));
               await setMode(webCtx.settings, "token", region);
             })().then(
               () => { entry.settled = true; },
@@ -147,13 +264,32 @@ export function installCodeBuddyWeb(ctx) {
         if (entry.settled && entry.error) return json(res, 200, { ...state, pending: false, error: entry.error });
         json(res, 200, { ...state, pending: !entry.settled });
       };
-      const usage = async (_req, res) => {
+      // 删除令牌账号：body.accountId（缺省 = 当前 active）。删的是 active 时
+      // 顺位切到列表里下一个账号；列表清空则同时清掉两代 ref。
+      const remove = async (req, res) => {
+        if (req.method !== "POST") return json(res, 405, { ok: false, message: "Method not allowed" });
+        if (!localPost(req)) return json(res, 403, { ok: false, message: "只允许从本机 DSH 页面管理登录账号" });
+        try {
+          const body = await requestBody(req);
+          const store = await readSessionStore(webCtx.credentials, region);
+          const accountId = typeof body.accountId === "string" && body.accountId ? body.accountId : store.activeId;
+          const sessions = store.sessions.filter((entry) => entry.id !== accountId);
+          if (sessions.length === store.sessions.length) return json(res, 404, { ok: false, message: "没有找到该 CodeBuddy 登录账号" });
+          const activeId = accountId === store.activeId ? sessions[0]?.id : store.activeId;
+          await writeSessionStore(webCtx.credentials, region, { version: 1, activeId, sessions });
+          json(res, 200, await currentState());
+        } catch (error) {
+          json(res, 500, { ok: false, message: error instanceof Error ? error.message : "删除令牌账号失败" });
+        }
+      };
+      const usage = async (req, res) => {
         try {
           const state = await currentState();
           if (!state.authenticated) {
             return json(res, 401, { ok: false, message: "尚未保存 CodeBuddy 登录令牌" });
           }
-          const session = await resolveUsageSession(region);
+          const body = await requestBody(req);
+          const session = await resolveUsageSession(region, body.accountId);
           const usage$ = await fetchCodeBuddyUsage(region, session);
           json(res, 200, { ok: true, provider: region.provider, ...usage$ });
         } catch (error) {
@@ -167,13 +303,14 @@ export function installCodeBuddyWeb(ctx) {
       // 积分消耗明细：网页「使用明细」同源接口，逐条请求 × 模型 × 客户端 × 积分，
       // 在本侧聚合成 按模型/按日/按客户端。与资源包额度互补：额度是"还剩多少"，
       // 这里是"花在哪了"。
-      const usageRequests = async (_req, res) => {
+      const usageRequests = async (req, res) => {
         try {
           const state = await currentState();
           if (!state.authenticated) {
             return json(res, 401, { ok: false, message: "尚未保存 CodeBuddy 登录令牌" });
           }
-          const session = await resolveUsageSession(region);
+          const body = await requestBody(req);
+          const session = await resolveUsageSession(region, body.accountId);
           const detail = await fetchCodeBuddyRequestUsage(region, session);
           json(res, 200, { ok: true, provider: region.provider, ...detail });
         } catch (error) {
@@ -186,13 +323,14 @@ export function installCodeBuddyWeb(ctx) {
       };
       // hy4-preview 免费档的「用量/限流窗口」探测：与用量查询同会话、同鉴权，
       // 在用量页加载或点「刷新」时调用（探测会发一次最小请求，见 codebuddy-usage.js）。
-      const usageHy4 = async (_req, res) => {
+      const usageHy4 = async (req, res) => {
         try {
           const state = await currentState();
           if (!state.authenticated) {
             return json(res, 401, { ok: false, message: "尚未保存 CodeBuddy 登录令牌" });
           }
-          const session = await resolveUsageSession(region);
+          const body = await requestBody(req);
+          const session = await resolveUsageSession(region, body.accountId);
           const status = await probeCodeBuddyHy4(region, session);
           json(res, 200, { ok: true, provider: region.provider, ...status });
         } catch (error) {
@@ -223,6 +361,7 @@ export function installCodeBuddyWeb(ctx) {
         webCtx.webServer.register({ kind: "exact", path: `${route}/token`, handler: token }),
         webCtx.webServer.register({ kind: "exact", path: `${route}/login`, handler: login }),
         webCtx.webServer.register({ kind: "exact", path: `${route}/login-status`, handler: loginStatus }),
+        webCtx.webServer.register({ kind: "exact", path: `${route}/remove`, handler: remove }),
         webCtx.webServer.register({ kind: "exact", path: `${route}/usage`, handler: usage }),
         webCtx.webServer.register({ kind: "exact", path: `${route}/usage/hy4`, handler: usageHy4 }),
         webCtx.webServer.register({ kind: "exact", path: `${route}/usage/requests`, handler: usageRequests }),

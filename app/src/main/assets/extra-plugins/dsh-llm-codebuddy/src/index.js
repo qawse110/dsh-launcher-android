@@ -9,14 +9,19 @@ import { Config, PiAiAdapter } from "@deepseek-ai/dsh-llm-pi-ai";
 import * as dshSettings from "@deepseek-ai/dsh-settings";
 import { createProvider } from "@earendil-works/pi-ai";
 import * as openAICompletionsApi from "@earendil-works/pi-ai/api/openai-completions";
-import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import {
   CODEBUDDY_REGIONS,
+  activeCodeBuddySession,
+  codeBuddySessionId,
+  createCodeBuddySessionStore,
   parseCodeBuddySession,
+  parseCodeBuddySessions,
   refreshCodeBuddySession,
   serializeCodeBuddySession,
+  serializeCodeBuddySessions,
   sessionCacheDeadline,
   sessionNeedsRefresh,
+  upsertCodeBuddySession,
 } from "./codebuddy-auth.js";
 import { installCodeBuddyWeb } from "./codebuddy-web.js";
 
@@ -29,8 +34,10 @@ export const inject = ["llm"];
 // 不再导出（改名 parseSettingsNamespace 且同样未导出）；其校验规则很简单
 // （/^[a-z][a-z0-9-]*$/，见新版 dsh-settings 的 parseSettingsNamespace），
 // 且新版 ctx.settings.register() 内部会自行校验并抛错，故此处只保留常量。
+// ★ 与'多账号会话池/新版 UA'同步时的冲突解法：NS 用常量（远程修复，避免引用
+//   已被 0.1.5 删除的 settingsNamespace），USER_AGENT 取本地新版（新特性）。
 const NS = "llm-codebuddy";
-const USER_AGENT = "CLI/unknown CodeBuddy/2.137.1";
+const USER_AGENT = "workbuddy-ai/5.5.2 workbuddy-ai/5.5.2 CLI/2.137.1";
 const STREAM_IDLE_TIMEOUT_MS = 300_000;
 const NO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 const EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"];
@@ -86,10 +93,29 @@ function fallbackModels(region) {
   );
 }
 
-function codeBuddyModel({ id, name: modelName, contextWindow, maxTokens, images, region, reasoning = true, thinkingLevelMap = { off: null }, defaultReasoningEffort, thinkingFormat }) {
+/** 解析目录 credits 字段为数值倍率。"x0.79 credits" / "x0.00" → 0.79/0；无效 → null。 */
+export function parseCreditRate(value) {
+  if (value === null || value === undefined) return null;
+  const match = String(value).match(/x?([0-9]+(?:\.[0-9]+)?)/i);
+  if (!match) return null;
+  const rate = Number.parseFloat(match[1]);
+  return Number.isFinite(rate) ? rate : null;
+}
+
+/** 倍率 → 选择框描述文本（model.description，DSH ModelSelect 渲染在模型名下方）。 */
+export function creditDescription(rate) {
+  if (rate === null || rate === undefined || !Number.isFinite(rate)) return undefined;
+  if (rate === 0) return "免费";
+  return `积分倍率 ×${rate}`;
+}
+
+function codeBuddyModel({ id, name: modelName, contextWindow, maxTokens, images, region, reasoning = true, thinkingLevelMap = { off: null }, defaultReasoningEffort, thinkingFormat, creditRate }) {
+  const description = creditDescription(creditRate);
   return {
     id,
     name: modelName,
+    // 倍率说明随目录透传（dsh-llm 允许可选 string），模型选择框会渲染在名称下方。
+    ...(description !== undefined ? { description } : {}),
     api: "openai-completions",
     provider: region.provider,
     baseUrl: region.baseUrl,
@@ -167,6 +193,8 @@ function modelsFromIds(data, ids, region) {
       maxTokens,
       images: raw.supportsImages === true || fallback?.input.includes("image") === true,
       region,
+      // 倍率来自目录 credits（"x0.79 credits"）；跨区域补齐的模型同样带自己的倍率。
+      creditRate: parseCreditRate(raw.credits),
       ...remoteReasoning(raw, fallback),
     })];
   });
@@ -182,62 +210,6 @@ function modelsFromConfig(data, region) {
 function authenticationHeaders(credential) {
   const value = assertUsableApiKey(credential.value, name, credential.ref ?? "CODEBUDDY_API_KEY");
   return credential.kind === "bearer" ? { authorization: `Bearer ${value}` } : { "x-api-key": value };
-}
-
-// 交叉补充模型：某些模型端点可用、也确实列在【国内版】目录里，但没进【国际版】
-// 的 cli.models 白名单（实测：hy4-preview / hy4-preview-x / deepseek-v4.1-flash /
-// hy3 在国际版端点上都返回 200，其中 deepseek-v4.1-flash 与 hy3 免费）。
-// 这些模型不能靠手工写进配置解决——手写会丢掉 reasoning 规格（思考等级），
-// 所以这里改为：拉国际版目录时顺便拉一次国内版目录，把缺失条目按国内版规格补上。
-//
-// 只补「白名单里明确列出的 id」：这些是经核实端点确实可用的，避免把国内版
-// 独有且国际版不支持的模型（如 deepseek-v4-pro，实测 11102 不存在）误加进来。
-// 注意：这个列表要跟着【国内版实时目录】走，不能照抄历史快照。
-// 实测（2026-09-11）：旧快照里的 hy4-preview-x 已从国内版目录移除（服务端下线），
-// 取而代之的是 hy4-preview-f（国际版端点实测 200、credit 0）；hy3-x 在国际版
-// 端点不可用（400），故不列入。缺失的 id 会自动跳过，不会报错。
-const CROSS_REGION_MODEL_IDS = Object.freeze([
-  "hy4-preview",
-  "hy4-preview-f",
-  "deepseek-v4.1-flash",
-  "hy3",
-]);
-
-/**
- * 用国内版目录补齐国际版缺失的模型。
- *
- * 返回补出来的模型规格（已在 region 语境下重建，含 reasoning 信息）；
- * 国内版目录拉取失败时静默返回 []，不影响国际版主流程。
- */
-async function fetchCrossRegionModels(region, credential, present, signal) {
-  const missing = CROSS_REGION_MODEL_IDS.filter((id) => !present.has(id));
-  if (missing.length === 0) return [];
-  const source = CODEBUDDY_REGIONS["codebuddy-cn"];
-  if (!source || source.provider === region.provider) return [];
-  let body;
-  try {
-    const response = await fetch(source.configUrl, {
-      headers: {
-        accept: "application/json",
-        ...authenticationHeaders(credential),
-        "user-agent": USER_AGENT,
-        "x-product": "SaaS",
-      },
-      signal,
-    });
-    if (!response.ok) return [];
-    body = await response.json();
-    if (body?.code !== 0) return [];
-  } catch {
-    // 国内版域名在纯国际网络下可能不通：补不了就只显示国际版自有模型。
-    return [];
-  }
-  const raw = Array.isArray(body?.data?.models) ? body.data.models : [];
-  const byId = new Map(raw.map((entry) => [entry?.id, entry]));
-  // 直接复用解析逻辑：只解析缺失的那几个 id，reasoning / contextWindow /
-  // maxTokens 全部按国内版在线规格，与国内版 UI 里看到的思考等级完全一致。
-  const picked = missing.filter((id) => byId.has(id));
-  return picked.length === 0 ? [] : modelsFromIds(body.data, picked, region);
 }
 
 async function fetchCodeBuddyModels(region, credential, signal) {
@@ -259,20 +231,82 @@ async function fetchCodeBuddyModels(region, credential, signal) {
   if (!response.ok) throw new LlmError(`CodeBuddy 模型配置接口返回 ${response.status}`, "DISCOVERY_FAILED");
   const body = await response.json();
   if (body?.code !== 0) throw new LlmError(`CodeBuddy 模型配置接口错误：${body?.msg ?? body?.code}`, "DISCOVERY_FAILED");
-  const models = modelsFromConfig(body.data, region);
-  if (models.length === 0) throw new LlmError("CodeBuddy 没有返回 CLI 可用模型", "DISCOVERY_FAILED");
-  // 国际版：补上国内版有、但国际版 cli 白名单里没有的模型。
-  const present = new Set(models.map((model) => model.id));
-  const extra = await fetchCrossRegionModels(region, credential, present, signal);
-  return extra.length > 0 ? [...models, ...extra] : models;
+  // 【历史说明】2026-09-11 曾在此做"跨区域补齐"：把国内版有、国际版 cli 白名单
+  // 缺失的模型（hy4-preview-f / deepseek-v4.1-flash / hy3）按国内版规格合并进来。
+  // 2026-09-12 起服务端已把这三个模型放进国际版 cli.models 白名单（抓包证实，
+  // 且目录里原生标 x0.00 免费），补齐逻辑不再需要，已整体移除。
+  return modelsFromConfig(body.data, region);
 }
 
-function codeBuddyProvider(region, models, auth) {
+/**
+ * CodeBuddy 的 API-Key auth：行为对齐 pi-ai 的 envApiKeyAuth（helpers.js）。
+ *
+ * 【为什么不用 pi-ai 内置的 DeepSeek auth helper】（上游 167e8fc 同款修复）
+ * 旧实现是 `builtins.get("deepseek")?.auth`，有三个问题：
+ *   1. 新版 pi-ai 的 auth resolver 要求接收 signal 参数，而旧版 DSH 适配器
+ *      调用时不传 —— 跨版本升级会直接报错；
+ *   2. 硬依赖 pi-ai 内置 provider 目录里存在 "deepseek"，一旦上游调整目录，
+ *      插件会在加载期抛 "auth helper is unavailable" 而整体挂掉；
+ *   3. DeepSeek helper 的 env 兜底读的是 DEEPSEEK_API_KEY 等变量，跟
+ *      CodeBuddy 的凭据体系对不上。
+ *
+ * 【resolve 的三段式语义】（与 envApiKeyAuth 完全一致，只是 envVars 换成
+ * CodeBuddy 自己的）：
+ *   1. pi-ai credential store 里存了 api_key → 直接用；
+ *   2. 没存 → 按 envVars 逐个读环境变量兜底（CodeBuddy API Key 模式的
+ *      正常入口：CODEBUDDY_API_KEY / CODEBUDDY_INTL_API_KEY）；
+ *   3. 都没有 → undefined（pi-ai 会报 "Provider is not configured"）。
+ *
+ * 令牌登录模式不经这条链：DSH 适配器（本插件）的 resolveApiKey 直接从
+ * DSH credentials 服务里取登录会话 accessToken 并注入请求头，pi-ai 的
+ * credential store 里不会、也不需要存 CodeBuddy 凭据。因此 token 模式下
+ * 若有代码路径只调 pi-ai 的 getAuth（如部分 catalog 预取），会落到第 3 段
+ * —— 这与上游 envApiKeyAuth 的行为一致，属预期。
+ *
+ * 注意 pi-ai 调用 resolve 的实参形如 { ctx, credential }（见
+ * resolveProviderAuth → resolveApiKey），env 兜底必须走 ctx.env 而非
+ * process.env：authContext 可能被 overrides.env 覆盖。
+ */
+function codeBuddyApiKeyAuth(displayName, envVars) {
+  return {
+    name: `${displayName} API Key`,
+    login: async (interaction) => {
+      const signal = interaction?.signal;
+      signal?.throwIfAborted?.();
+      const key = await interaction.prompt({ type: "secret", message: `Enter ${displayName} API Key` });
+      signal?.throwIfAborted?.();
+      return { type: "api_key", key };
+    },
+    resolve: async ({ ctx, credential, signal } = {}) => {
+      signal?.throwIfAborted?.();
+      if (credential?.key) {
+        return {
+          auth: { apiKey: credential.key },
+          ...(credential.env ? { env: credential.env } : {}),
+          source: "stored credential",
+        };
+      }
+      for (const envVar of envVars) {
+        const value = ctx?.env ? await ctx.env(envVar) : process.env[envVar];
+        if (value) return { auth: { apiKey: value }, source: envVar };
+      }
+      return undefined;
+    },
+  };
+}
+
+function codeBuddyProvider(region, models, apiKeyAuth) {
   return createProvider({
     id: region.provider,
     name: region.displayName,
     baseUrl: region.baseUrl,
-    auth,
+    // 【必须包成 { apiKey } 】pi-ai 的 resolveProviderAuth 以 provider.auth.apiKey
+    // 为入口：`overrides.apiKey !== undefined && provider.auth.apiKey` 才走请求级
+    // 覆盖分支，ambient 兜底同样读 provider.auth.apiKey.resolve。若把 ApiKeyAuth
+    // 裸传给 auth，则 auth.apiKey === undefined → getAuth 恒为 undefined →
+    // 每次请求都抛 "Provider is not configured"（2026-09-11 实修：上一轮改造
+    // 裸传导致的回归；上游 167e8fc 的写法正是包了一层的 auth: { apiKey: … }）。
+    auth: { apiKey: apiKeyAuth },
     models,
     api: codeBuddyApi,
   });
@@ -285,6 +319,10 @@ function resolvedProfile(provider, source, piProvider, configuredMaxTokens = new
     headers: runtimeHeaders(source.headers),
     provider,
     displayName: source.displayName ?? piProvider.name ?? provider,
+    // dsh-llm-pi-ai 在目录解析时会为每个精确模型读取这个 map。本插件没有
+    // 逐模型的校验失败项，但仍须提供空 map 以满足共享适配器 API
+    // （上游 29ff497 修复；旧版本 pi-ai 不读该字段，补上对旧版无副作用）。
+    modelErrors: new Map(),
     ...(apiKeyEnv === undefined ? {} : { apiKeyEnv }),
     streamIdleTimeoutMs: source.streamIdleTimeoutMs ?? STREAM_IDLE_TIMEOUT_MS,
     retryPolicy: resolveRetryPolicy(source.retryPolicy ?? CODEBUDDY_RETRY_POLICY, `${name}: provider "${provider}" retryPolicy`),
@@ -318,6 +356,8 @@ function selectCodeBuddyModels(region, base, entries) {
       maxTokens: entry.maxTokens ?? model?.maxTokens ?? 32768,
       images: entry.input?.includes("image") ?? model?.input.includes("image") ?? false,
       region,
+      // 配置可显式覆盖倍率（creditRate 数值）；否则保留在线目录的。
+      creditRate: parseCreditRate(entry.creditRate) ?? model?.creditRate ?? parseCreditRate(entry.credits),
       ...reasoning,
     });
   });
@@ -344,11 +384,13 @@ function codeBuddySource(config, source, provider) {
 
 export const __testing = Object.freeze({
   authenticationHeaders,
+  codeBuddyApiKeyAuth,
   codeBuddyRequestOptions,
   codeBuddySource,
+  creditDescription,
+  parseCreditRate,
   modelsFromConfig,
   modelsFromIds,
-  crossRegionModelIds: CROSS_REGION_MODEL_IDS,
   ownsProvider,
   runtimeHeaders,
   selectCodeBuddyModels,
@@ -358,9 +400,8 @@ export const __testing = Object.freeze({
 export function apply(ctx, config) {
   installCodeBuddyWeb(ctx);
   let current = () => config;
-  const builtins = new Map(builtinProviders().map((provider) => [provider.id, provider]));
-  const apiKeyAuth = builtins.get("deepseek")?.auth;
-  if (!apiKeyAuth) throw new Error(`${name}: pi-ai DeepSeek auth helper is unavailable`);
+  // auth 已下沉到 regionProfile：每个区域一份（env 兜底读自己的 apiKeyEnv，
+  // 见 codeBuddyApiKeyAuth 注释），不再共用、也不依赖 pi-ai 内置 provider 目录。
 
   const states = new Map();
   for (const region of Object.values(CODEBUDDY_REGIONS)) {
@@ -372,6 +413,8 @@ export function apply(ctx, config) {
       memoGeneration: -1,
       memoized: undefined,
       loginSession: undefined,
+      loginSessions: new Map(),
+      activeAccountId: undefined,
       loginSessionPromise: undefined,
     });
   }
@@ -394,7 +437,7 @@ export function apply(ctx, config) {
     const result = resolvedProfile(region.provider, {
       ...sourceWithAuth,
       displayName: region.displayName,
-    }, codeBuddyProvider(region, models, apiKeyAuth), configured);
+    }, codeBuddyProvider(region, models, codeBuddyApiKeyAuth(region.displayName, [region.apiKeyEnv])), configured);
     state.memoRaw = current();
     state.memoGeneration = state.generation;
     state.memoized = result;
@@ -410,26 +453,56 @@ export function apply(ctx, config) {
     return result;
   };
 
-  const resolveLoginSession = async (state) => {
-    if (state.loginSession?.expiresAt > Date.now()) return state.loginSession;
+  const resolveLoginSession = async (state, accountId) => {
+    const cacheKey = accountId ?? "active";
+    const cached = state.loginSessions?.get(cacheKey);
+    if (cached?.expiresAt > Date.now()) return cached;
     state.loginSessionPromise ??= (async () => {
       const { region } = state;
       const credentials = ctx.get("credentials");
-      const ref = credentialRef(region.sessionRef);
-      const stored = await credentials?.resolve(ref);
-      const value = stored?.value ?? launchEnvironmentOf(ctx).get(ref)?.value;
-      if (!value) throw new Error("未找到 CodeBuddy 登录凭据");
-      let session = parseCodeBuddySession(value);
+      const env = launchEnvironmentOf(ctx);
+      const sessionsRef = credentialRef(region.sessionsRef);
+      // 读侧兼容三代格式：本区域多账号 store → 本区域旧单账号 → 旧的单账号 ref
+      //（旧 ref 只在中国区历史上存在过；国际版一直用自己的 ref）。
+      let store;
+      const sessionsStored = await credentials?.resolve(sessionsRef);
+      const sessionsValue = sessionsStored?.value ?? env.get(sessionsRef)?.value;
+      if (sessionsValue) {
+        store = parseCodeBuddySessions(sessionsValue);
+      } else {
+        const sessionRef = credentialRef(region.sessionRef);
+        const legacyStored = await credentials?.resolve(sessionRef);
+        const legacyValue = legacyStored?.value ?? env.get(sessionRef)?.value;
+        if (!legacyValue) throw new Error("未找到 CodeBuddy 登录凭据");
+        const legacy = parseCodeBuddySession(legacyValue);
+        store = createCodeBuddySessionStore([legacy], codeBuddySessionId(legacy));
+      }
+      // accountId 指定且存在 → 用它（web 用量路由按账号查询用）；
+      // 否则用 store.activeId。多账号的会话缓存按账号各存一份。
+      const active = (typeof accountId === "string" && accountId ? store.sessions.find((entry) => entry.id === accountId) : undefined)
+        ?? activeCodeBuddySession(store);
+      if (!active) throw new Error("未找到 CodeBuddy 登录账号");
+      let session = active;
       if (sessionNeedsRefresh(session)) {
         session = await refreshCodeBuddySession(session, undefined, region.authBaseUrl);
-        await credentials?.set(ref, serializeCodeBuddySession(session));
+        // 刷新结果回写 store（保持列表与 active 指针），并同步旧单账号 ref
+        // 作为兼容指针——旧版本插件/CLI 读它也能拿到 active 账号。
+        const nextStore = upsertCodeBuddySession({ ...store, activeId: active.id }, session);
+        await credentials?.set(sessionsRef, serializeCodeBuddySessions(nextStore));
+        await credentials?.set(credentialRef(region.sessionRef), serializeCodeBuddySession(session));
+        state.activeAccountId = nextStore.activeId;
+      } else {
+        state.activeAccountId = active.id;
       }
-      return { ...session, expiresAt: sessionCacheDeadline(session) };
+      return { ...session, sessionId: active.id, expiresAt: sessionCacheDeadline(session) };
     })().finally(() => {
       state.loginSessionPromise = undefined;
     });
-    state.loginSession = await state.loginSessionPromise;
-    return state.loginSession;
+    const resolved = await state.loginSessionPromise;
+    state.loginSessions ??= new Map();
+    state.loginSessions.set(cacheKey, resolved);
+    if (cacheKey === "active") state.loginSession = resolved;
+    return resolved;
   };
 
   const resolveCredential = async (provider, profile) => {
@@ -449,7 +522,7 @@ export function apply(ctx, config) {
         profile.headers["X-Tenant-Id"] = session.account.enterpriseId;
       }
       if (session.auth.domain) profile.headers["X-Domain"] = session.auth.domain;
-      return { value: assertUsableApiKey(session.auth.accessToken, name, "CodeBuddy login session"), kind: "bearer" };
+      return { value: assertUsableApiKey(session.auth.accessToken, name, "CodeBuddy login session"), kind: "bearer", sessionId: session.sessionId };
     }
     if (!ref) return { value: undefined, kind: "none" };
     const stored = await ctx.get("credentials")?.resolve(ref);
@@ -468,11 +541,16 @@ export function apply(ctx, config) {
   const resolveModel = adapter.resolveModel.bind(adapter);
   adapter.resolveModel = async (provider, model, signal) => {
     const resolved = await resolveModel(provider, model, signal);
-    if (!Object.hasOwn(CODEBUDDY_REGIONS, provider) || !resolved.reasoning) return resolved;
-    const configured = profiles().get(provider)?.piProvider.getModels().find((entry) => entry.id === model);
-    const effort = configured?.defaultReasoningEffort;
-    if (!effort || !resolved.reasoning.efforts.some((entry) => entry.id === effort)) return resolved;
-    return { ...resolved, reasoning: { ...resolved.reasoning, defaultEffort: effort } };
+    if (!Object.hasOwn(CODEBUDDY_REGIONS, provider)) return resolved;
+    const source = profiles().get(provider)?.piProvider.getModels().find((entry) => entry.id === model);
+    // 倍率描述同样要在这里补（精确模型信息也会被 dsh-llm-pi-ai 丢弃，见 listModels 处说明）。
+    const withDescription = source?.description && !resolved.description
+      ? { ...resolved, description: source.description }
+      : resolved;
+    if (!withDescription.reasoning) return withDescription;
+    const effort = source?.defaultReasoningEffort;
+    if (!effort || !withDescription.reasoning.efforts.some((entry) => entry.id === effort)) return withDescription;
+    return { ...withDescription, reasoning: { ...withDescription.reasoning, defaultEffort: effort } };
   };
   const listModels = adapter.listModels.bind(adapter);
   adapter.listModels = async (provider) => {
@@ -494,7 +572,19 @@ export function apply(ctx, config) {
         await state.refreshPromise;
       }
     }
-    return listModels(provider);
+    const entries = await listModels(provider);
+    if (!Object.hasOwn(CODEBUDDY_REGIONS, provider)) return entries;
+    // 【为什么要在这一层补 description】dsh-llm-pi-ai 的 listModels 只映射
+    // provider/id/name/inputModalities 四个字段，会把我们挂在模型上的
+    // description（积分倍率文案）丢掉；而 dsh-llm 的目录校验与前端
+    // ModelSelect 都支持并渲染 model.description（输入框下方的模型选择框
+    // 就在模型名下方显示这行小字）。所以在这里按 id 合并回去。
+    const byId = new Map((profiles().get(provider)?.piProvider.getModels() ?? []).map((model) => [model.id, model]));
+    return entries.map((entry) => {
+      const source = byId.get(entry.id);
+      if (!source?.description || entry.description) return entry;
+      return { ...entry, description: source.description };
+    });
   };
 
   const directoryEntries = () => [
