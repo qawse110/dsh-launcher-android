@@ -50,19 +50,6 @@ android {
     // 内置终端需要原生 libtermux.so
     packaging {
         jniLibs.useLegacyPackaging = false
-        // ★ 排除 AGP 的 baseline-profile dexopt 资产（真机事故根因，见 docs §7.11）
-        //
-        //   release 构建时 AGP 会把 assets/dexopt/baseline.prof(.m) 写进包里，
-        //   且**插在 assets 列表最前**——而 AssetManager 对 assets 做字典序二分查找，
-        //   该逆序（dexopt > codex-pets）使部分资产查不到：
-        //     FileNotFoundException("prebuilt.tgz") / ("termux-bootstrap.zip")
-        //   → Termux 无法解压 → 一切依赖 bash 的安装步骤全废（真机 13:27 日志）。
-        //   debug 构建不生成 dexopt 资产，故 debug 包从未复现此错。
-        //
-        //   本模块并未使用 baseline profile 功能（无 baseline-prof*.txt、无
-        //   profileinstaller 显式依赖），该资产是 AGP 9 release 构建的附带产物，
-        //   排除后无副作用；顺带少 2 个条目。
-        assets.excludes += "assets/dexopt/**"
     }
 
     // targetSdk=28 用于对齐 termux 的 SELinux 域(untrusted_app_27)实验，
