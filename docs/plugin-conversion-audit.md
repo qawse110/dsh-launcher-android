@@ -492,3 +492,63 @@ dsh-provider-headers : dsh-client-runtime/client  ❌ 已删除 → 唯一需修
    两个包同包名同 versionCode 但签名不同，安装器仍会拒绝。
 3. `signing/release.keystore` 是**签名稳定性的唯一凭据**，丢失即永久失去对已发布版本的
    升级能力（用户只能卸载重装）。切勿清理或重新生成。
+
+### 7.12 release 包资产读取失败：dexopt 破坏 AssetManager 索引 → 运行时兜底
+
+**真机现象**（release 包首启）：
+
+```
+WARN 1.5/4 termux prepare failed: termux-bootstrap.zip
+WARN assets 无 prebuilt.tgz，继续使用已有插件源
+✗ 内置 Termux 不可用（v4.5 起仅支持 Termux 环境），命令未执行
+FAIL 3/4 install exit=-1 / CLI missing
+```
+
+**证据链**（决定性的时序 + 规律）：
+
+- `准备目录…` 与失败**同一毫秒** → 失败点在 `assets.open(资产名)`，
+  异常 message 恰为资产名（`FileNotFoundException` 的 AssetManager 形态）；
+- **大单文件全失败、小文件全成功**：`prebuilt.tgz`(29MB)/`termux-bootstrap.zip`(31MB) 失败，
+  `install-dsh.mjs`(38KB)/`extra-plugins/*` 成功；
+- 第一块倒下的骨牌是 Termux：解不了压 → `Proc.resolveShell` 返回 null →
+  一切经 bash 的安装步骤（install-dsh.mjs）全部废掉。
+
+**排查中证伪的假设（各有实测反证）**：
+
+| 假设 | 反证 |
+|---|---|
+| 压缩资产 1MB 上限 | 已安装且正常的包同样 DEFLATED 同尺寸 |
+| ZIP64 扩展 | 两包均无 ZIP64 |
+| assets 未按字典序（dexopt 插在最前） | 旧正式版同样有该逆序 → 排序非决定性 |
+| 资产损坏 | CRC/gzip/zip 完整性校验全过 |
+| APK 结构差异 | 压缩方式/大小/清单逐项与旧正式版等价 |
+
+（注：assets 排序异常真实存在——release 独有的 `assets/dexopt/*` 插在最前，
+但旧正式版同样存在却不致故障，故只算伴生现象，不能定为根因。）
+
+**修复演进**：
+
+1. ❌ `packaging.assets.excludes`（2138dc2）→ AGP 9 的 Packaging DSL **没有 assets 入口**，
+   CI 编译失败（`Unresolved reference 'assets'`），已撤销（d754da3 移除坏行）。
+2. ✅ **运行时兜底**（1e008c9）：`AssetSync.openAsset(context, name)` 两级读取——
+   ① `assets.open()`（快路径，现有行为不变）；
+   ② 失败 → 用 commons-compress `ZipFile` 直接打开**应用自身 APK**
+   （`applicationInfo.sourceDir`，应用进程可读），按 zip 条目名取内容。
+   完全绕开 AssetManager 的索引/排序，对任意资产通用、零新增依赖
+   （commons-compress 已是依赖，BootstrapInstaller 本就在用它）。
+
+**接入点**（真机失败的两处）：`BootstrapInstaller`（termux-bootstrap.zip）、
+`AssetSync.copyAsset`/`copyDirRecursive`（prebuilt.tgz 等）。
+其余 `assets.open` 调用点走快路径或本就成功，保持原状以缩小改动面。
+
+**验证**：CI 全绿；release 包内确认 `openAsset` 与兜底日志串都在 dex 中、
+签名仍为 release keystore（`4ae87902…`）。
+
+**沉淀**：
+1. **与平台行为对抗时，优先绕过而非改平台**——AGP 的 DSL 不支持，就在运行时
+   换一条不依赖该行为的路径（这里是从 APK 直读）。
+2. 「大文件失败、小文件成功」+「异常 message = 资产名」+「同一毫秒失败」
+   三条合起来几乎唯一地指向 AssetManager 索引问题；逐个假设用实测反证
+   是收敛到正确方向的关键。
+3. release 与 debug 的差异（dexopt 资产、签名、minify）都可能成为「debug 好好的、
+   release 一上就坏」的来源——**验证必须用与交付相同的构建类型**。
