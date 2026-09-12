@@ -601,6 +601,23 @@ window.__ModuleLoader__.load({
 		}
 
 		/* 拖动位置（会话内存内保留）+ 边界夹紧 */
+		/**
+		 * 面板最小尺寸——**必须随视口收缩**，否则手机上必然溢出。
+		 *
+		 * 原实现硬编码 400×320：实测本机视口仅 361 CSS px（1264 物理 / 3.5 密度），
+		 * 400 已超屏宽，浮层右侧被裁到看不见按钮；且 clampSize 里
+		 * `Math.max(PANEL_MIN_W, ...)` 会把最小值顶回 400，
+		 * 导致「拖不窄 / 放不下」。改为按视口留 16px 边距取下限，
+		 * 并保留 240/200 的绝对地板值。
+		 */
+		function panelMinW() {
+			const vw = (typeof window !== "undefined" && window.innerWidth) || 1024;
+			return Math.max(240, Math.min(400, Math.round(vw - 16)));
+		}
+		function panelMinH() {
+			const vh = (typeof window !== "undefined" && window.innerHeight) || 768;
+			return Math.max(200, Math.min(320, Math.round(vh - 16)));
+		}
 		const PANEL_MIN_W = 400;
 		const PANEL_MIN_H = 320;
 		function clampPos(x, y, panel) {
@@ -612,11 +629,16 @@ window.__ModuleLoader__.load({
 		}
 		/** 尺寸夹紧：不小于最小值，也不超出视口（浏览器缩小后仍完整可见）。 */
 		function clampSize(w, h) {
-			const maxW = Math.max(PANEL_MIN_W, window.innerWidth - 16);
-			const maxH = Math.max(PANEL_MIN_H, window.innerHeight - 16);
+			const maxW = Math.max(panelMinW(), window.innerWidth - 16);
+			const maxH = Math.max(panelMinH(), window.innerHeight - 16);
 			const out = {};
-			if (w !== null && w !== undefined) out.w = Math.min(Math.max(PANEL_MIN_W, Math.round(w)), maxW);
-			if (h !== null && h !== undefined) out.h = Math.min(Math.max(PANEL_MIN_H, Math.round(h)), maxH);
+			// ★ 用视口感知的 panelMinW/H，而非硬编码常量：手机上 minW 会降到 ~345，
+			//   否则 maxW(=视口-16) < PANEL_MIN_W(=400) 时出现「最小值反而更大」的矛盾，
+			//   浮层永远放不进屏幕。
+			const minW = panelMinW();
+			const minH = panelMinH();
+			if (w !== null && w !== undefined) out.w = Math.min(Math.max(minW, Math.round(w)), maxW);
+			if (h !== null && h !== undefined) out.h = Math.min(Math.max(minH, Math.round(h)), maxH);
 			return out;
 		}
 		/** 把当前尺寸/位置落到 DOM 与 store（不开渲染，供拖动帧内使用）。 */
@@ -2672,6 +2694,27 @@ window.__ModuleLoader__.load({
 					"@media (max-width:1480px){.dpo-controls{gap:10px}.dpo-slider-track{flex-basis:104px;min-width:88px}.dpo-model{max-width:132px}}",
 					"@media (max-width:1240px){.dpo-controls{gap:9px}.dpo-slider-track{flex-basis:88px;min-width:76px}.dpo-model{max-width:112px}}",
 					"@media (max-width:1080px){.dpo-controls{gap:8px}.dpo-slider-track{flex-basis:72px;min-width:60px}}",
+					/* ================= 移动端适配（v55） =================
+					 * 原样式最低断点只到 1080px，而手机视口实测仅 361 CSS px
+					 * （1264 物理 / 3.5 密度）——所有桌面规则照单全收，表现为：
+					 *   浮层 460px 宽被裁掉右半、滑块拖不动、按钮挤成一团、底部被导航栏盖住。
+					 * 这里补三档窄屏断点 + 安全区 + 触控人体工学。
+					 */
+					"@media (max-width:768px){.dpo-overlay{width:calc(100vw - 20px);min-width:0;max-width:520px}.dpo-pop{width:calc(100vw - 24px);max-width:340px}.dpo-controls{flex-wrap:wrap;gap:6px}.dpo-model{max-width:100%}}",
+					"@media (max-width:560px){.dpo-overlay{width:calc(100vw - 16px);max-height:min(88vh,660px);font-size:13px}.dpo-overlay-head{padding:9px 12px}.dpo-overlay-body{padding:10px 12px}.dpo-overlay-actions{padding:9px 12px;flex-wrap:wrap}.dpo-overlay-foot .dpo-btn{flex:1 1 46%;min-height:38px}.dpo-trace{display:none}.dpo-pane{max-height:36vh}}",
+					/* 触控目标 ≥44px（HIG/规范下限），否则手指点不准 */
+					"@media (max-width:560px){.dpo-btn{min-height:40px;padding:9px 14px;font-size:13.5px}.dpo-x{width:34px;height:34px}.dpo-help{width:34px;height:34px}.dpo-slider-thumb{width:20px;height:20px}.dpo-slider-track{height:26px;min-width:54px}}",
+					"@media (max-width:420px){.dpo-overlay{width:calc(100vw - 12px);border-radius:10px}.dpo-pop{width:calc(100vw - 16px);max-width:300px}.dpo-overlay-foot .dpo-btn{flex:1 1 100%}.dpo-overlay-src{display:none}.dpo-tok-chip{font-size:10px;padding:1px 6px}}",
+					/* 全面屏安全区：避开刘海/挖孔与底部手势条，防止按钮被系统栏吃掉。
+					 * ★ 必须显式 box-sizing:border-box —— .dpo-overlay 自身未声明，
+					 *   宿主页若不是 border-box，下面的 padding 会叠加到 width 上，
+					 *   使 calc(100vw - 12px) 反而溢出（窄屏横向滚动）。 */
+					"@supports (padding:max(0px)){.dpo-overlay{box-sizing:border-box;padding-left:env(safe-area-inset-left);padding-right:env(safe-area-inset-right)}.dpo-overlay-foot{padding-bottom:max(8px,env(safe-area-inset-bottom))}.dpo-overlay-head{padding-top:max(9px,env(safe-area-inset-top))}.dpo-pop{box-sizing:border-box;margin-bottom:max(6px,env(safe-area-inset-bottom))}}",
+					/* 窄屏下弹出层贴底更顺手，并允许内部纵向滚动（不锁死） */
+					"@media (max-width:560px){.dpo-pop{max-height:min(70vh,520px);overflow-y:auto;-webkit-overflow-scrolling:touch}.dpo-pop-item{min-height:42px}}",
+					/* 拖动滑块时禁止页面滚动/缩放干扰（Pointer Events 需显式声明） */
+					".dpo-slider-track{touch-action:none}",
+					".dpo-overlay-head,.dpo-size-grip{touch-action:none}",
 					/* 常驻操作栏 + token 徽标（v54） */
 					".dpo-overlay-foot{flex:0 0 auto;position:relative;z-index:3;border-top:1px solid color-mix(in srgb,var(--dpo-line) 70%,transparent);background:linear-gradient(0deg,var(--dpo-hi),transparent)}",
 					".dpo-foot-inner{display:flex;flex-direction:column}",
