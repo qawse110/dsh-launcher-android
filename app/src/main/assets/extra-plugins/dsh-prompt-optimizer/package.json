@@ -1,0 +1,63 @@
+{
+    "name":  "@dsh-external/dsh-prompt-optimizer",
+    "version":  "0.1.1-beta.1",
+    "description":  "DSH Web 输入框接管：发送前用独立 AI 把提示词优化成可直接发给工作 AI 的命令（传话者语义、三档强度、需审查/自动输出、可拖动改尺寸迷你窗、按会话隔离的档位与权限）",
+    "type":  "module",
+    "main":  "./lib/index.js",
+    "files":  [
+                  "lib",
+                  "cordis.patch.yml",
+                  "README.md",
+                  "ACCEPTANCE.md",
+                  "LICENSE",
+                  "CHANGELOG.md",
+                  "README.en.md"
+              ],
+    "keywords":  [
+                     "dsh",
+                     "dsh-plugin",
+                     "prompt",
+                     "prompt-optimizer",
+                     "llm",
+                     "web"
+                 ],
+    "license":  "BSD-3-Clause",
+    "peerDependencies":  {
+                             "@deepseek-ai/dsh-llm":  "*",
+                             "@deepseek-ai/dsh-client-ui-slots":  "*",
+                             "cordis":  "*"
+                         },
+    "peerDependenciesMeta":  {
+                                 "@deepseek-ai/dsh-llm":  {
+                                                              "optional":  true
+                                                          },
+                                 "@deepseek-ai/dsh-client-ui-slots":  {
+                                                                          "optional":  true
+                                                                      },
+                                 "cordis":  {
+                                                "optional":  true
+                                            }
+                             },
+    "exports":  {
+                    ".":  {
+                              "default":  "./lib/index.js"
+                          },
+                    "./client":  {
+                                     "default":  "./lib/client.js"
+                                 },
+                    "./cordis.patch.yml":  "./cordis.patch.yml",
+                    "./package.json":  "./package.json"
+                },
+    "dsh":  {
+                "bundle":  {
+                               "patch":  "./cordis.patch.yml"
+                           },
+                "client":  {
+                               "inject":  [
+                                              "@deepseek-ai/dsh-client-runtime",
+                                              "@deepseek-ai/dsh-client-ui-slots"
+                                          ],
+                               "platform":  "web"
+                           }
+            }
+}

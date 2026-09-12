@@ -1,0 +1,14 @@
+# dsh-prompt-optimizer bundle 层：插入插件行。
+#
+# 这个文件让本包成为一个"标准 DSH 插件包"：当包名被列进 profile 的
+# dsh.profile.bundles 时，DSH 会读取本补丁层并把下面这条 entry 插进根条目表 ——
+# 于是插件的 host 半边被加载，client-modules 又能扫描到它声明的 dsh.client，
+# 把 ./client 半边发给浏览器。
+#
+# 为什么必须由包自己插入自己：本插件只声明 dsh.client、没有别的 bundle 依赖，
+# 而 dsh.profile.bundles 里的包必须在自己的 dsh.bundle.patch 层里声明自己的 entry
+# （与 @dsh-external/dsh-super-injector、@dsh-external/dsh-graded-mode 同一写法）。
+- insert:
+    - id: prompt-optimizer
+      name: '@dsh-external/dsh-prompt-optimizer'
+      config: {}

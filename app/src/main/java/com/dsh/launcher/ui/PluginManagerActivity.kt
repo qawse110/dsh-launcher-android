@@ -45,6 +45,7 @@ class PluginManagerActivity : AppCompatActivity() {
             "dsh-status-bridge",
             "dsh-android-links", "dsh-llm-codebuddy",
             "dsh-shell-termux",
+            "dsh-prompt-optimizer",
         )
         val BUNDLED_DESC = mapOf(
             "dsh-mobile-nav" to "移动端 UI 适配（窄屏抽屉/全宽会话）",
@@ -56,9 +57,14 @@ class PluginManagerActivity : AppCompatActivity() {
             "dsh-android-links" to "Android 存储桥接（共享存储软链入 dsh home，目录选择器可浏览 /storage）",
             "dsh-llm-codebuddy" to "CodeBuddy Provider（中国区/国际版共存模式）",
             "dsh-shell-termux" to "Termux 原生 bash 执行器（显式环境注入；替代在 Android 会 fail-closed 的桌面沙箱执行器）",
+            "dsh-prompt-optimizer" to "提示词优化（发送前用独立 AI 把输入改写成命令，可调档位/强度）",
         )
-        const val PRESET_DIR = "router-preset"
-        const val PRESET_DESC = "思维模式路由预设（router-spec / router-standard，agent-presets）"
+        /**
+         * 路由预设已于 v4.10.3 从内置资产下线（连同 prebuilt.tgz 内的
+         * third_party/router-preset 一起移除），故不再有 PRESET 卡片。
+         * 需要时走「在线扩展」里的路由套件安装（ROUTING_REPO），
+         * 或由 install-dsh.mjs 的 removePresets() 清理老设备残留。
+         */
         const val ROUTING_REPO = "yjh051108/dsh-routing-suite"
         private val BASE_BUNDLES = setOf(
             "@deepseek-ai/dsh-base",
@@ -100,7 +106,6 @@ class PluginManagerActivity : AppCompatActivity() {
     private fun pluginsDir() = File(filesDir, "plugins")
     private fun profileWebDir() = File(filesDir, ".dsh/profiles/web")
     private fun profilePkg() = File(profileWebDir(), "package.json")
-    private fun presetsRoot() = File(filesDir, ".dsh/.agent-presets")
 
     private val pollRunnable = object : Runnable {
         override fun run() {
@@ -114,7 +119,7 @@ class PluginManagerActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         Ui.applyDynamicColors(this)
         setContentView(buildUi())
-        appendLog("插件管理就绪（内置 ${BUNDLED.size} 个 + $PRESET_DIR 预设）")
+        appendLog("插件管理就绪（内置 ${BUNDLED.size} 个）")
         refreshList()
         handler.post(pollRunnable)
     }
@@ -301,7 +306,6 @@ class PluginManagerActivity : AppCompatActivity() {
 
         thread(name = "plugin-health-scan") {
             val bundled = BUNDLED.sorted().map { id -> Triple(id, healthOf(id), readVersion(id)) }
-            val presetOk = listOf("router-spec", "router-standard").any { File(presetsRoot(), it).exists() }
             val extras = readBundles()
                 .filter { name -> name !in BASE_BUNDLES && BUNDLED.none { d -> name == d || name == "@dsh-external/$d" } }
                 .mapNotNull { name -> readInstalledPlugin(name) }
@@ -311,11 +315,10 @@ class PluginManagerActivity : AppCompatActivity() {
                 !h.healthy -> issues.add(id to "副本损坏")
                 !h.wired -> issues.add(id to "未装配")
             }
-            if (!presetOk) issues.add(PRESET_DIR to "未安装")
 
             runOnUiThread {
                 if (isFinishing || isDestroyed || gen != listGeneration) return@runOnUiThread
-                renderList(bundled, presetOk, extras, issues)
+                renderList(bundled, extras, issues)
             }
         }
     }
@@ -323,7 +326,6 @@ class PluginManagerActivity : AppCompatActivity() {
     /** 数据就绪后的完整渲染（主线程，纯视图构建无 IO）。 */
     private fun renderList(
         bundled: List<Triple<String, BundledHealth, String>>,
-        presetOk: Boolean,
         extras: List<PluginInfo>,
         issues: List<Pair<String, String>>
     ) {
@@ -351,13 +353,6 @@ class PluginManagerActivity : AppCompatActivity() {
             }
             listBox.addView(makeCard(id, BUNDLED_DESC[id] ?: "", ver, status, actions))
         }
-
-        listBox.addView(sectionHeader("路由预设", null))
-        listBox.addView(makeCard(
-            PRESET_DIR, PRESET_DESC, "preset",
-            if (presetOk) "已安装（agent-presets）" else "待装配",
-            if (presetOk) emptyList() else listOf("重新装配" to { rewireBuiltins() })
-        ))
 
         listBox.addView(sectionHeader("在线扩展", "${extras.size} 个"))
         for (info in extras) {
