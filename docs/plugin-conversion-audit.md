@@ -457,3 +457,38 @@ dsh-provider-headers : dsh-client-runtime/client  ❌ 已删除 → 唯一需修
 2. **供给链**：`BUILTIN_PLUGINS` 的**两条来源并集**都要审（§7.9）；
 3. **整包/模块表**：host 端与 **client 端分别**审 `require`/`import` 的**包是否还存在**
    —— 包被删且能力迁移时，Node 侧与浏览器侧表现完全不同，且**报错位置互不覆盖**。
+
+### 7.11 打包：必须走 release.yml（build-apk.yml 的 debug 签名每次都变）
+
+**发现**：核对历次交付的 APK 签名时发现，**同一个 workflow 的每次运行产生不同签名**：
+
+| APK | 签名块 | 公钥 sha256（前 32 位） |
+|---|---|---|
+| 第一次 debug | `7109871a, 42726577` | `b2af23de8dfdb39326dffec4669087a9` |
+| 第二次 debug | 同上 | `2a79373d59910234278f587f1d3da116` |
+| 第三次 debug | 同上 | `16f7c8c9fa3048fe7aab268945c0b263` |
+
+**根因**：`build-apk.yml` **没有任何 keystore 处理步骤**（`assembleDebug` 用 CI 每次
+自动生成的临时 debug keystore）→ 每次运行的签名身份都不同 →
+**这些包之间无法覆盖安装**，用户必须先卸载（丢失 dsh 全部数据与已装插件）。
+
+`release.yml` 则不同：它先把 `DSH_KEYSTORE_B64` 密钥解码或使用**已入库的
+`signing/release.keystore`**（`git add -f` 强制入库，正是为保证签名稳定），
+再 `assembleRelease` → 签名身份跨运行恒定。
+
+**实测对照**（本次 release 与上一个正式版）：
+
+| APK | 签名块 | 公钥 sha256 |
+|---|---|---|
+| 正式版 v4.10.2-fix6 | `7109871a, 504b4453, 42726577` | `4ae87902636d13d372d81ff83e14d89d` |
+| 本次 next release | 同上 | `4ae87902636d13d372d81ff83e14d89d` |
+
+→ **完全一致，可直接覆盖安装**（无需卸载、不丢数据）。
+
+**沉淀**：
+1. 交付给用户的包必须走 **release.yml**；`build-apk.yml` 只适合内部验证编译能否通过
+   （它的 debug 签名每次都变，交付即"必须卸载重装"）。
+2. 判断「能否覆盖安装」的依据是**签名公钥**，不是版本号或包名——
+   两个包同包名同 versionCode 但签名不同，安装器仍会拒绝。
+3. `signing/release.keystore` 是**签名稳定性的唯一凭据**，丢失即永久失去对已发布版本的
+   升级能力（用户只能卸载重装）。切勿清理或重新生成。
