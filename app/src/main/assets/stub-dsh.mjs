@@ -53,6 +53,11 @@ const DSH_PREFIX = process.env.DSH_PREFIX || join(HOME, 'dsh-prefix');
 const PROFILE = process.env.DSH_PROFILE || 'web';
 const NODE_MODULES = join(DSH_PREFIX, 'node_modules');
 const PNPM_DIR = join(NODE_MODULES, '.pnpm');
+// 内置插件（prebuilt.tgz 解出的 dsh-vision 等，以及 extra-plugins 同步来的
+// dsh-status-bridge 等）安装在 files/plugins/ 下，**不在** dsh-prefix/node_modules 里。
+// 历史实现只扫 node_modules，导致这些插件的源码问题完全不在修补范围内——
+// 真机事故：codebuddy 修好后 dsh-vision 又炸，同类错误换了个插件。
+const PLUGINS_DIR = process.env.DSH_PLUGINS_DIR || join(HOME, 'plugins');
 const pkgCache = new Map();
 let pnpmEntries = null;
 const OUT = join(HOME, 'install_log.txt');
@@ -121,6 +126,40 @@ function findNestedPkg(pkgName, rel) {
   }
   walk(NODE_MODULES, 0);
   return found[0] || null;
+}
+
+/**
+ * 枚举 files/plugins/<dir> 下每个内置插件的入口文件。
+ *
+ * 为什么需要：内置插件（dsh-vision 等来自 prebuilt.tgz 解包，dsh-status-bridge 等
+ * 来自 extra-plugins 同步）都装在 files/plugins/ 下，而 [findPkg] 只扫
+ * dsh-prefix/node_modules —— 这些插件的源码补丁长期不在覆盖范围内，
+ * 真机表现为「同类错误换一个插件继续炸」（codebuddy 修好后 dsh-vision 又炸）。
+ *
+ * @returns [{ name, file }]，name 为插件目录名，file 为主要入口（package.json 的
+ *   exports/main 首选项，退化到 lib/index.js）。
+ */
+function eachPluginEntry() {
+  const out = [];
+  let dirs;
+  try { dirs = readdirSync(PLUGINS_DIR, { withFileTypes: true }); } catch { return out; }
+  for (const d of dirs) {
+    if (!d.isDirectory() || d.name === 'node_modules' || d.name.startsWith('.')) continue;
+    const root = join(PLUGINS_DIR, d.name);
+    let entry = null;
+    try {
+      const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+      const cand = pkg?.exports?.['.']?.default
+        ?? (typeof pkg?.exports === 'string' ? pkg.exports : undefined)
+        ?? pkg?.main
+        ?? 'lib/index.js';
+      entry = join(root, typeof cand === 'string' ? cand : 'lib/index.js');
+    } catch {
+      entry = join(root, 'lib/index.js');
+    }
+    if (existsSync(entry)) out.push({ name: d.name, file: entry });
+  }
+  return out;
 }
 
 const KSTUB = 'Y29uc3QgcD1uZXcgUHJveHkoZnVuY3Rpb24oKXt9LHtnZXQ6KHQsayk9PihrPT09U3ltYm9sLnRvUHJpbWl0aXZlKT8oKT0+MDooaz09PSd0aGVuJ3x8az09PSdjYXRjaCd8fGs9PT0nZmluYWxseScpP3VuZGVmaW5lZDpwLGFwcGx5OigpPT5wLGNvbnN0cnVjdDooKT0+cH0pO2NvbnN0IGtvZmZpPXtsb2FkOigpPT5wLGRlY29kZTooKT0+MCxlbmNvZGU6KCk9PjAsCnNpemVvZjooKT0+MCxhbGlnbm9mOigpPT4wLGZ1bmN0aW9uOigpPT5wLHN0cnVjdDooKT0+cCx1bmlvbjooKT0+cCxlbnVtOigpPT5wLHR5cGVkZWY6KCk9PnAscG9pbnRlcjooKT0+cCwKcmVnaXN0ZXI6KCk9PnAsS29mZmlFcnJvcjpjbGFzcyBleHRlbmRzIEVycm9ye319O2V4cG9ydCBkZWZhdWx0IGtvZmZpOw==';
@@ -684,5 +723,68 @@ try {
 
 // v4.8.1 资产清理：移除 patch-koffi.yml 占位写入——全仓库无任何消费方，
 // koffi 已由上方 Proxy stub 直接顶替，无需禁用行文件。
+
+/* ---------------------------------------------------------------------------
+ * 内置插件源码兼容：@deepseek-ai/dsh-settings 在 0.1.5 收窄了导出面
+ *
+ * 0.1.1 导出 7 个符号，0.1.5 只剩 4 个（SettingsConflictError / SettingsProvider /
+ * default / redactSecrets），以下两个被删除：
+ *   - settingsNamespace(v)      —— 仅按 /^[a-z][a-z0-9-]*$/ 校验后原值返回
+ *   - installSettingsSection(…) —— 能力下沉为 ctx.settings.installSection(…)
+ *
+ * **为什么必须在启动期就地改源码**：具名导入在 ESM **链接期**就抛
+ * 「does not provide an export named …」，try/catch 兜不住，运行时探测也没机会执行；
+ * 而这些插件装在 files/plugins/（dsh-vision 来自 prebuilt.tgz 解包），
+ * 无法靠改 APK 内 assets 源修复——prebuilt.tgz 是 30MB 的 LFS 二进制。
+ * 属「本机专有缺陷 + 唯一可行修复点」，与 koffi/node-pty stub 同性质。
+ * ------------------------------------------------------------------------- */
+try {
+  const MARKER = 'dsh-launcher-plugin-compat-v1';
+  const MISSING = [
+    ['settingsNamespace', `function settingsNamespace(value) {\n\tif (!/^[a-z][a-z0-9-]*$/.test(value)) throw new TypeError('settings namespace "' + value + '" must match /^[a-z][a-z0-9-]*$/');\n\treturn value;\n}`],
+    ['installSettingsSection', `function installSettingsSection(ctx, ns, schema, entry, hooks) {\n\tctx.inject(['settings'], (sctx) => {\n\t\tconst settings = sctx.settings;\n\t\tif (settings === undefined || typeof settings.installSection !== 'function') throw new Error('installSettingsSection: settings service lacks installSection');\n\t\tsettings.installSection(ctx, ns, schema, entry, hooks);\n\t});\n}`],
+  ];
+  let patchedFiles = 0, alreadyDone = 0;
+  const entries = eachPluginEntry();
+  for (const { name, file: entry } of entries) {
+    let src;
+    try { src = readFileSync(entry, 'utf8'); } catch { continue; }
+    if (src.includes(MARKER)) { alreadyDone++; continue; }
+    // 只处理「从 dsh-settings 具名导入了已删除符号」的文件
+    const importRe = /import\s*\{([^}]*)\}\s*from\s*['"]@deepseek-ai\/dsh-settings['"];?/g;
+    let changed = false;
+    const out = src.replace(importRe, (whole, namesRaw) => {
+      const names = namesRaw.split(',').map((s) => s.trim()).filter(Boolean);
+      const used = names.filter((n) => MISSING.some(([sym]) => sym === n));
+      if (used.length === 0) return whole;   // 引用的符号都还在 → 别碰
+      changed = true;
+      const helpers = used.map((n) => MISSING.find(([sym]) => sym === n)[1]).join('\n');
+      const keep = names.filter((n) => !MISSING.some(([sym]) => sym === n));
+      const rest = keep.length ? `import { ${keep.join(', ')} } from '@deepseek-ai/dsh-settings';\n` : '';
+      return `${rest}${helpers}`;
+    });
+    if (!changed) continue;
+    // 语法自检通过才写盘（否则会把插件改成「加载即崩」，比原缺陷更糟）
+    const tmp = entry + '.compat-check.mjs';
+    let ok = false;
+    try {
+      writeFileSync(tmp, out);
+      const r = spawnSync(process.execPath, ['--check', tmp], { timeout: 15000, encoding: 'utf8' });
+      ok = r.status === 0;
+      if (!ok) log(`WARN plugin-compat: syntax check FAILED for ${name}: ${(r.stderr || '').slice(0, 200)}`);
+    } catch (e) {
+      log(`WARN plugin-compat: syntax check unavailable for ${name}: ${e.message}`);
+    } finally {
+      try { unlinkSync(tmp); } catch {}
+    }
+    if (!ok) continue;
+    try {
+      writeFileSync(entry, `// ${MARKER}\n` + out);
+      patchedFiles++;
+      log(`plugin-compat patched: ${name}`);
+    } catch (e) { log(`WARN plugin-compat write ${name}: ${e.message}`); }
+  }
+  log(`plugin-compat: scanned=${entries.length} patched=${patchedFiles} already=${alreadyDone}`);
+} catch (e) { log('WARN plugin-compat: ' + e.message); }
 
 log('=== android fixup done ===');
