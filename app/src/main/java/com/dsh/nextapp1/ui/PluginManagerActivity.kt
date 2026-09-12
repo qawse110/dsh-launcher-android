@@ -349,6 +349,13 @@ class PluginManagerActivity : AppCompatActivity() {
                     status = "待装配"
                     actions.add("装配" to { wireBundled(id) })
                 }
+                // ★ 「结构完好但内容落后」单列：旧逻辑落到 else 显示"已装配"，
+                //   而运行时加载的正是这份旧副本 → 装了新 APK 仍跑旧代码却毫无提示
+                //   （真机事故：只在启动时以「web 未就绪」炸出来，极难定位）。
+                h.staleVsSource -> {
+                    status = "已装配 · 副本落后于内置源"
+                    if (h.srcOk) actions.add("修复" to { repairSingle(id) })
+                }
                 else -> status = "已装配"
             }
             listBox.addView(makeCard(id, BUNDLED_DESC[id] ?: "", ver, status, actions))
@@ -667,14 +674,46 @@ class PluginManagerActivity : AppCompatActivity() {
 
     // ── 健康检查 ──────────────────────────────────────────
 
-    private data class BundledHealth(val dirExists: Boolean, val healthy: Boolean, val wired: Boolean, val srcOk: Boolean)
+    private data class BundledHealth(
+        val dirExists: Boolean,
+        val healthy: Boolean,
+        val wired: Boolean,
+        val srcOk: Boolean,
+        /** 装配副本落后于内置源（装了新 APK 但副本未刷新）。 */
+        val staleVsSource: Boolean = false,
+    )
 
     /** 只许在后台线程调用（srcOk 的 tar 探测是重活，结果按 apkVer:id 缓存）。 */
     private fun healthOf(id: String): BundledHealth {
         val dir = File(pluginsDir(), id)
         val key = AssetSync.apkVersion(this).toString() + ":" + id
         val srcOk = srcAvailCache[key] ?: bundledSourceAvailable(id).also { srcAvailCache[key] = it }
-        return BundledHealth(dir.isDirectory, bundleHealthy(dir), isWired(id), srcOk)
+        return BundledHealth(
+            dir.isDirectory,
+            bundleHealthy(dir),
+            isWired(id),
+            srcOk,
+            staleVsSource = isStaleVsSource(id, dir),
+        )
+    }
+
+    /**
+     * 装配副本是否**落后于**内置源。
+     *
+     * 为什么要有这个判定：原 [bundleHealthy] 只校验 package.json 有 name，
+     * 因此「旧版本但结构完好」的插件会被判成**健康**——真机事故正是如此：
+     * 装了含修复的新 APK，`files/plugins/<id>` 仍是旧代码，健康检查显示正常、
+     * 用户毫无提示，只在启动时以「web 未就绪」炸出来。
+     * 这里用与资产同步同一套内容指纹直接比对，暴露「源已更新、副本未刷新」。
+     *
+     * 源不存在（该插件不由 extra-plugins 供给，如来自 prebuilt.tgz）时返回 false，
+     * 不做无根据的告警。
+     */
+    private fun isStaleVsSource(id: String, dir: File): Boolean {
+        if (!File(dir, "package.json").isFile) return false
+        val src = File(filesDir, "extra-plugins/$id")
+        if (!File(src, "package.json").isFile) return false
+        return runCatching { !AssetSync.dirContentEquals(src, dir) }.getOrDefault(false)
     }
 
     /** 目录健康：package.json 存在、可解析、name 非空（空壳损坏判定）。 */

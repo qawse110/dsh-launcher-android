@@ -132,6 +132,18 @@ object AssetSync {
         if (!file.isFile) "absent" else fingerprintOf(file)
 
     /**
+     * 两个目录内容是否一致（同套指纹）。
+     *
+     * 用于识别「旧版本但结构完好」的插件副本：只校验 package.json 可解析会把它判成
+     * 健康，而运行时加载的正是该副本 → 装了新 APK 却仍跑旧代码且毫无提示（真机事故）。
+     * 任一目录不存在时返回 false（视为不一致），由调用方决定是否告警。
+     */
+    fun dirContentEquals(a: File, b: File): Boolean {
+        if (!a.isDirectory || !b.isDirectory) return false
+        return fingerprintOf(a) == fingerprintOf(b)
+    }
+
+    /**
      * 轻量内容指纹：文件 = 长度 + 头 64KB CRC32；目录 = 递归各文件（长度+CRC）的聚合 CRC。
      * 预算：prebuilt.tgz ~30MB 只读头 64KB；extra-plugins 目录数百个小文件全读但都是文本，
      * 总量 MB 级，冷缓存下 ~百毫秒，仅资产拷贝判定路径调用（非每帧）。

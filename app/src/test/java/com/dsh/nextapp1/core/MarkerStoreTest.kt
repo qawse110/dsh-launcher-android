@@ -171,4 +171,20 @@ class MarkerStoreTest {
             )
         )
     }
+
+    @Test fun `dirContentEquals 识别副本落后于内置源`() {
+        val src = File(ctx.cacheDir, "dce-src")
+        val dst = File(ctx.cacheDir, "dce-dst")
+        src.deleteRecursively(); dst.deleteRecursively()
+        File(src, "a.js").apply { parentFile!!.mkdirs() }.writeText("NEW")
+        File(dst, "a.js").apply { parentFile!!.mkdirs() }.writeText("OLD")
+        // 内容不同 → 判定落后（这正是「装了新 APK 但副本是旧的」形态）
+        assertFalse(AssetSync.dirContentEquals(src, dst))
+        // 同步后一致
+        dst.deleteRecursively(); src.copyRecursively(dst)
+        assertTrue(AssetSync.dirContentEquals(src, dst))
+        // 目录缺失一律视为不一致（不做无根据的判定）
+        assertFalse(AssetSync.dirContentEquals(src, File(ctx.cacheDir, "dce-none")))
+        src.deleteRecursively(); dst.deleteRecursively()
+    }
 }
