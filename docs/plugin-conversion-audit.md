@@ -292,3 +292,45 @@ dsh API，逐个核对了 5 个包的符号——仅 `dsh-settings` 缺失，`ds
 **「这个量会随每次出包变化吗？」**。versionCode、手写 marker、固定字符串都不会，
 用它们等于把判断写成常量 → 静默失效，且编译与单测**全绿**。正确做法是内容指纹
 或安装戳（APK 路径+长度+mtime），且**标记必须在工作成功之后写**。
+
+### 7.8 修复的最后一环：时序竞争 + 让故障可见
+
+§7.7 修好了「判据失效导致不刷新」，但还有两件事不做就仍会失败：
+
+**A. 时序竞争（会让 7.7 白修）**
+
+`MainActivity.onCreate` 里两个后台线程并发：
+
+```
+syncAssetsOnApkUpdate()  → thread{A}：拷 30MB prebuilt + 刷新插件副本（数秒）
+autoRoute()              → thread{B}：判 isInstalled → START_ONLY 快速启动
+```
+
+B 通常远快于 A（A 要拷 30MB），而**快速启动跳过插件装配**，直接加载
+`files/plugins/<id>` 下的副本 → B 先跑完时，dsh 用的仍是**尚未刷新**的旧插件，
+同样的错误再次出现。这不是理论风险：两者本就是并发发起的。
+
+修复：加 `assetsSyncGate`（`CountDownLatch(1)`）作显式闸门——
+
+- `syncAssetsOnApkUpdate` 的 3 条早返回分支与同步线程的 `finally` **都必 countDown**
+  （失败也放行，最坏退化为「带旧资产启动」，绝不把「启动卡死」变成新失败模式）；
+- `autoRoute` 的线程先 `await` 闸门，限时 30s 兜底。
+
+语义：**先让资产落地，再决定启动什么**。
+
+**B. 故障是静默的 → 让它可见**
+
+`bundleHealthy` 只校验 `package.json` 能解析且 `name` 非空，因此「旧版本但结构完好」
+的插件被判成**健康**，插件管理页面显示「已装配」，用户毫无提示，只在启动时以
+「dsh web 未就绪」炸出来、真正错误埋在日志尾部（本事故三次复发均因此极难定位）。
+
+修复：`AssetSync.dirContentEquals()` 比对 `files/plugins/<id>` 与
+`files/extra-plugins/<id>`；`BundledHealth` 增加 `staleVsSource`，
+渲染分支单列 **「已装配 · 副本落后于内置源」** 并提供「修复」动作。
+源不存在时（插件来自 prebuilt.tgz 等）不告警，避免无根据的误报。
+
+**沉淀**：
+1. 任何「刷新资产 → 立刻启动」的流程，都必须用**显式闸门**而非时序运气；
+   闸门必须在失败路径也放行（fail-open 到"带旧数据继续"，而非"卡死"）。
+2. 健康检查若只校验「结构完整」，就识别不出「内容过期」——**结构完好 + 内容陈旧**
+   是最隐蔽的故障形态，必须比对内容而非结构。
