@@ -34,7 +34,11 @@ internal object BootstrapInstaller {
         // assets 流不可 seek，先复制到 cache 再用 ZipFile 解压
         val cache = File(context.cacheDir, ASSET)
         try {
-            context.assets.open(ASSET).use { ins ->
+            // ★ 用 openAsset（带 APK 直读兜底）而非 context.assets.open：
+            //   release 包的 assets/dexopt 破坏 AssetManager 的字典序索引后，
+            //   本资产用 assets.open() 会抛 FileNotFoundException(资产名)，
+            //   直接导致 Termux 无法解压 → 一切依赖 bash 的安装步骤全废。
+            AssetSync.openAsset(context, ASSET).use { ins ->
                 cache.outputStream().use { ous -> ins.copyTo(ous) }
             }
             progress("已就绪压缩包 ${cache.length() / 1024 / 1024}MB，开始解压…")

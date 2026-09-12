@@ -3,6 +3,8 @@ package com.dsh.nextapp1.core
 import android.content.Context
 import android.os.Build
 import java.io.File
+import java.io.InputStream
+import org.apache.commons.compress.archivers.zip.ZipFile
 import com.dsh.nextapp1.core.*
 import com.dsh.nextapp1.overlay.*
 import com.dsh.nextapp1.service.*
@@ -53,6 +55,52 @@ object AssetSync {
         AppLog.e("AssetSync", "apkInstallStamp failed: " + (t.message ?: t.toString()))
         ""
     }
+
+    /**
+     * 打开 assets 条目，**带 APK 直读兜底**。
+     *
+     * 为什么需要兜底：release 构建时 AGP 会把 baseline-profile 的
+     * `assets/dexopt/baseline.prof(.m)` 插在 APK 的 assets 列表**最前**，
+     * 而 AssetManager 对 assets 做字典序二分查找——该逆序使部分条目
+     * （实测为 prebuilt.tgz / termux-bootstrap.zip）用 [Context.assets.open] 读不到，
+     * 抛 `FileNotFoundException(资产名)`；小文件反而正常，极具迷惑性。
+     *
+     * 兜底路径：直接用 commons-compress 的 [ZipFile] 打开**应用自身 APK**
+     * （`applicationInfo.sourceDir`，应用进程可读），按 zip 条目名取出内容。
+     * 这条路不经过 AssetManager 的索引，对任意资产通用，也不依赖排序。
+     *
+     * @return 可用的输入流（调用方负责 close）；两级都失败则抛出原始异常。
+     */
+    fun openAsset(context: Context, assetName: String): InputStream {
+        var primary: Throwable? = null
+        try {
+            return context.assets.open(assetName)
+        } catch (t: Throwable) {
+            primary = t
+        }
+        try {
+            val apk = File(context.applicationInfo.sourceDir)
+            if (!apk.isFile) throw primary
+            ZipFile(apk).use { zip ->
+                val entry = zip.getEntry("assets/$assetName")
+                    ?: zip.getEntry(assetName)
+                    ?: throw primary
+                // 一次性读出（此处资产均 ≤ ~35MB，流式接口由调用方 close 的约束
+                // 会让 ZipFile 提前关闭底层 fd，故先物化到内存）
+                return zip.getInputStream(entry).use { it.readBytes() }.inputStream()
+            }
+        } catch (t: Throwable) {
+            AppLog.e(
+                "AssetSync",
+                "openAsset fallback failed for $assetName: ${t.message}（primary=${primary.message}）"
+            )
+            throw primary
+        }
+    }
+
+    /** [openAsset] 的字节变体，供「读小文件为文本」的调用点复用。 */
+    fun readAssetBytes(context: Context, assetName: String): ByteArray =
+        openAsset(context, assetName).use { it.readBytes() }
 
     /**
      * marker 值为 `apk:<安装戳>#<目标内容指纹>`，且目标存在时视为已同步。
@@ -176,7 +224,7 @@ object AssetSync {
     }
 
     fun copyAsset(context: Context, assetName: String, dest: File): Boolean = try {
-        context.assets.open(assetName).use { input ->
+        openAsset(context, assetName).use { input ->
             dest.parentFile?.mkdirs()
             dest.outputStream().use { output -> input.copyTo(output) }
         }
@@ -221,7 +269,7 @@ object AssetSync {
             } else {
                 try {
                     childDest.parentFile?.mkdirs()
-                    context.assets.open(childAsset).use { input ->
+                    openAsset(context, childAsset).use { input ->
                         childDest.outputStream().use { output -> input.copyTo(output) }
                     }
                     1
