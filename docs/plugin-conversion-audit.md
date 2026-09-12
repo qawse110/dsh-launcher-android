@@ -334,3 +334,59 @@ B 通常远快于 A（A 要拷 30MB），而**快速启动跳过插件装配**�
    闸门必须在失败路径也放行（fail-open 到"带旧数据继续"，而非"卡死"）。
 2. 健康检查若只校验「结构完整」，就识别不出「内容过期」——**结构完好 + 内容陈旧**
    是最隐蔽的故障形态，必须比对内容而非结构。
+
+### 7.9 审计盲区补全：内置插件有**两个**来源（dsh-vision 漏网）
+
+§7.6 我写了「同类漂移审计」，但**只审了 `assets/extra-plugins/`（3 个插件）**，
+漏掉了另一条供给链 —— 真机于是「修好一个、炸下一个」：
+
+| 来源 | 插件 | 审计 |
+|---|---|---|
+| `assets/extra-plugins/` | dsh-status-bridge / dsh-android-links / dsh-llm-codebuddy | ✅ 7.6 已审 |
+| **`prebuilt.tgz` 内 `third_party/`** | dsh-mobile-nav / dsh-net-proxy / dsh-provider-headers / dsh-super-injector / **dsh-vision** / router-preset | ❌ **漏审** |
+
+真机新现象（codebuddy 修好后）：报错换成
+`plugins/dsh-vision/lib/index.js:20 import { settingsNamespace } from '@deepseek-ai/dsh-settings'`。
+
+**补全审计**（提取 prebuilt.tgz 全部 14186 个文件）后，对 6 个包逐个核对符号：
+
+```
+OK       @deepseek-ai/dsh-credentials        all present
+OK       @deepseek-ai/dsh-launch-environment all present
+OK       @deepseek-ai/dsh-llm                all present（含 BlockAssembler 等）
+OK       @deepseek-ai/dsh-llm-pi-ai          all present
+OK       @deepseek-ai/dsh-tools              all present
+MISSING  @deepseek-ai/dsh-settings           settingsNamespace, installSettingsSection
+```
+
+**为什么修在启动期而非改源**：
+
+1. 具名导入在 ESM **链接期**抛错 → `try/catch` 兜不住、运行时探测无机会执行；
+2. `dsh-vision` 来自 `prebuilt.tgz`（30MB **LFS 二进制**），改 assets 源不可行；
+3. `stub-dsh.mjs` 已有同类先例（koffi / node-pty / sharp 都是就地顶替）。
+
+**改动**（`stub-dsh.mjs`）：
+
+- 新增 `PLUGINS_DIR`（`DSH_PLUGINS_DIR` 可覆盖，默认 `HOME/plugins`）——
+  历史实现只扫 `dsh-prefix/node_modules`，**内置插件目录完全不在覆盖范围**，
+  这正是「同类错误换个插件继续炸」的结构性原因；
+- `eachPluginEntry()` 枚举 `files/plugins/<dir>` 入口；
+- 通用垫片：把「从 dsh-settings 具名导入**已删除**符号」的语句换成等价内联实现
+  （`settingsNamespace` 纯校验；`installSettingsSection` 转调 0.1.5 的
+  `ctx.settings.installSection`），**只动确实引用了缺失符号的文件**；
+- 写盘前 `node --check` 自检，失败即放弃（避免把插件改成"加载即崩"，比原缺陷更糟）；
+- marker `dsh-launcher-plugin-compat-v1` 幂等，重复运行不改文件。
+
+**验证（真机 scratch，仓库外）**：
+
+- 真实 `dsh-vision` 源：改写正确、调用点完好、**干净插件未被误改**、二次运行幂等；
+- **对照实验**（决定性）：未修补版启动 → `exit=1` 且报错与真机日志**逐字一致**
+  （`dsh-vision` + `settingsNamespace`）；修补版 → **30s 就绪、零错误**；
+- 两条垫片路径同验：`dsh-vision`（单符号）+ 修复前的旧 `codebuddy`
+  （`installSettingsSection` + `settingsNamespace` 双符号），同时装载启动成功。
+
+**沉淀（本次最重要的教训）**：
+**审计必须覆盖「所有供给链」，而不是「我改过的那一条」。** 内置资产在本仓有两条
+独立来源（`extra-plugins/` 与 `prebuilt.tgz`），只审其一必然漏网；且漏网后表现为
+「修好一个、炸下一个」，极易被误判成"修复无效"。查「哪些插件会被加载」的正确依据是
+`BUILTIN_PLUGINS` 清单 + 两条来源的**并集**，不是某个目录的列表。
