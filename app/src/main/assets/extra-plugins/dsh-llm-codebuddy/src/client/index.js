@@ -53,15 +53,33 @@ window.__ModuleLoader__.load({
       message.style.color = token && !status.authenticated ? "var(--dsw-text-danger, #c62828)" : "var(--dsw-text-success, #2e7d32)";
     }
 
-    async function request(route, path) {
-      const response = await fetch(`${route}/${path}`, { method: "POST" });
-      const body = await response.json();
-      if (!response.ok || !body.ok) {
-        const error = new Error(body.message || `请求失败（${response.status}）`);
+    async function request(route, path, body) {
+      const options = { method: "POST", cache: "no-store" };
+      if (body !== undefined) {
+        options.headers = { "content-type": "application/json" };
+        options.body = JSON.stringify(body);
+      }
+      const response = await fetch(`${route}/${path}`, options);
+      const body2 = await response.json();
+      if (!response.ok || !body2.ok) {
+        const error = new Error(body2.message || `请求失败（${response.status}）`);
         error.status = response.status;
         throw error;
       }
-      return body;
+      return body2;
+    }
+
+    // 账号显示名：后端给的 label 优先，account 里再兜底一层。
+    function accountText(account) {
+      return account?.accountName || account?.label
+        || account?.account?.displayName || account?.account?.email
+        || account?.account?.uin || account?.account?.userId
+        || `账号 ${(account?.id ?? "").slice(-8)}`;
+    }
+
+    function accountLabel(account) {
+      const id = account?.account?.userId ? `（user: ${account.account.userId}）` : `（${account?.id ?? "?"}）`;
+      return `${accountText(account)}${id}`;
     }
 
     function mount(input, provider) {
@@ -83,16 +101,57 @@ window.__ModuleLoader__.load({
       message.setAttribute("aria-live", "polite");
       Object.assign(message.style, { fontSize: "12px", minHeight: "18px" });
       controls.append(keyButton, tokenButton, message);
-      field.append(controls);
-      let current = { mode: "api-key", authenticated: false };
+      // ---- 多账号行：令牌模式下展示（下拉选择 + 添加账号 + 删除账号）----
+      const accountRow = document.createElement("div");
+      accountRow.setAttribute("data-codebuddy-account-row", provider);
+      Object.assign(accountRow.style, { display: "none", alignItems: "center", gap: "8px", flexWrap: "wrap", width: "100%" });
+      const accountLabelEl = document.createElement("span");
+      accountLabelEl.textContent = "令牌账号";
+      Object.assign(accountLabelEl.style, { fontSize: "12px", color: "var(--dsw-text-tertiary, #98a2b3)", flexShrink: "0" });
+      const accountSelect = document.createElement("select");
+      accountSelect.setAttribute("aria-label", "CodeBuddy 令牌账号");
+      Object.assign(accountSelect.style, {
+        minHeight: "36px", padding: "0 8px", maxWidth: "220px", borderRadius: "8px",
+        border: "1px solid var(--dsw-border-subtle, #d0d5dd)", background: "var(--dsw-surface-subtle, transparent)",
+        color: "inherit", fontSize: "12px",
+      });
+      const addAccountButton = button("添加账号");
+      const removeAccountButton = button("删除账号");
+      removeAccountButton.style.borderColor = "var(--dsw-border-danger, rgba(198,40,40,0.5))";
+      removeAccountButton.style.color = "var(--dsw-text-danger, #c62828)";
+      accountRow.append(accountLabelEl, accountSelect, addAccountButton, removeAccountButton);
+      field.append(controls, accountRow);
+      let current = { mode: "api-key", authenticated: false, accounts: [], activeAccountId: null };
       const render = (status) => {
         current = { ...current, ...status };
         applyMode(input, keyButton, tokenButton, message, current);
+        const accounts = Array.isArray(current.accounts) ? current.accounts : [];
+        const activeAccountId = current.activeAccountId ?? accounts[0]?.id;
+        const token = current.mode === "token";
+        // 只在令牌模式且已登录时展示账号行；只有 1 个账号也不隐藏——
+        // 这样「添加账号」入口始终可达，且能确认当前用的是哪个号。
+        accountRow.style.display = token && current.authenticated ? "flex" : "none";
+        addAccountButton.textContent = accounts.length ? "添加账号" : "登录 CodeBuddy";
+        accountSelect.replaceChildren(...accounts.map((account) => {
+          const option = document.createElement("option");
+          option.value = account.id;
+          option.textContent = accountText(account);
+          option.title = accountLabel(account);
+          return option;
+        }));
+        if (activeAccountId) accountSelect.value = activeAccountId;
+        removeAccountButton.hidden = accounts.length === 0;
+        const activeAccount = accounts.find((account) => account.id === activeAccountId);
+        const base = token ? (current.authenticated ? "令牌已登录" : "令牌缺失，请重新登录") : "";
+        message.textContent = base + (token && current.authenticated && activeAccount ? `：${accountText(activeAccount)}` : "");
       };
 
       const setBusy = (busy) => {
         keyButton.disabled = busy;
         tokenButton.disabled = busy;
+        addAccountButton.disabled = busy;
+        removeAccountButton.disabled = busy;
+        accountSelect.disabled = busy;
         keyButton.style.cursor = busy ? "progress" : "pointer";
         tokenButton.style.cursor = busy ? "progress" : "pointer";
       };
@@ -161,6 +220,81 @@ window.__ModuleLoader__.load({
               if (s.authenticated && !s.pending) {
                 render(s);
                 return finish(true, "令牌已登录");
+              }
+            } catch { /* 瞬时网络抖动，继续轮询 */ }
+            if (Date.now() > deadline) finish(false, "等待登录超时，请重试");
+          }, 2000);
+        } catch (error) {
+          finish(false, error instanceof Error ? error.message : "登录失败");
+        }
+      });
+      // 切换令牌账号：POST /token { accountId }（服务端改 store.activeId）
+      accountSelect.addEventListener("change", async () => {
+        setBusy(true);
+        message.textContent = "正在切换令牌账号…";
+        try {
+          render(await request(route, "token", { accountId: accountSelect.value }));
+        } catch (error) {
+          message.textContent = error instanceof Error ? error.message : "切换失败";
+          message.style.color = "var(--dsw-text-danger, #c62828)";
+        } finally {
+          setBusy(false);
+        }
+      });
+      // 删除当前选中的账号（二次确认；删 active 时服务端自动顺位切换）
+      removeAccountButton.addEventListener("click", async () => {
+        const target = accountSelect.value || current.activeAccountId;
+        if (!target || !window.confirm("确定删除这个 CodeBuddy 登录账号吗？令牌将从 DSH 凭据中移除。")) return;
+        setBusy(true);
+        message.textContent = "正在删除账号…";
+        try {
+          render(await request(route, "remove", { accountId: target }));
+        } catch (error) {
+          message.textContent = error instanceof Error ? error.message : "删除失败";
+          message.style.color = "var(--dsw-text-danger, #c62828)";
+        } finally {
+          setBusy(false);
+        }
+      });
+      // 添加账号：走同一登录流程（服务端 upsert，不同账号自动追加并激活）
+      addAccountButton.addEventListener("click", async () => {
+        setBusy(true);
+        addAccountButton.textContent = "等待登录…";
+        message.textContent = "正在创建登录会话…";
+        message.style.color = "";
+        let pollTimer;
+        const success = "var(--dsw-text-success, #2e7d32)";
+        const danger = "var(--dsw-text-danger, #c62828)";
+        const finish = (ok, text) => {
+          clearInterval(pollTimer);
+          message.textContent = text;
+          message.style.color = ok ? success : danger;
+          addAccountButton.textContent = current.accounts?.length ? "添加账号" : "登录 CodeBuddy";
+          setBusy(false);
+        };
+        try {
+          const started = await request(route, "login");
+          const authUrl = started.authUrl;
+          let win = null;
+          try { win = window.open(authUrl, "_blank", "noopener"); } catch { /* 弹窗被拦截时走链接兜底 */ }
+          if (win) message.textContent = "已打开登录页，请在浏览器中完成 CodeBuddy 登录…";
+          else {
+            message.replaceChildren();
+            const link = document.createElement("a");
+            link.href = authUrl;
+            link.target = "_blank";
+            link.rel = "noopener";
+            link.textContent = "点此打开 CodeBuddy 登录页";
+            message.append(link, document.createTextNode("（或复制链接：" + authUrl + "）"));
+          }
+          const deadline = Date.now() + 10 * 60_000;
+          pollTimer = setInterval(async () => {
+            try {
+              const s = await fetch(`${route}/login-status`, { cache: "no-store" }).then((r) => r.json());
+              if (s.error) return finish(false, s.error);
+              if (s.authenticated && !s.pending) {
+                render(s);
+                return finish(true, `已登录：${accountText((s.accounts ?? []).find((a) => a.id === s.activeAccountId))}`);
               }
             } catch { /* 瞬时网络抖动，继续轮询 */ }
             if (Date.now() > deadline) finish(false, "等待登录超时，请重试");
