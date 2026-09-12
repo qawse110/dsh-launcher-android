@@ -162,6 +162,26 @@ function eachPluginEntry() {
   return out;
 }
 
+/**
+ * 枚举内置插件的 **client 端**文件（files/plugins/<dir>/lib/client.js）。
+ *
+ * 为什么单独处理：client 端由浏览器侧 `window.__ModuleLoader__.load({ factory: (require) => … })`
+ * 加载，其 `require(spec)` 走 client-modules 的**模块表**（种子词 → 已加载 → 已注册工厂），
+ * 与 Node 侧解析完全无关 —— 所以 host 端插件树能加载，UI 仍可能报
+ * 「Failed to load plugins」。两边必须分别审计。
+ */
+function eachPluginClientFile() {
+  const out = [];
+  let dirs;
+  try { dirs = readdirSync(PLUGINS_DIR, { withFileTypes: true }); } catch { return out; }
+  for (const d of dirs) {
+    if (!d.isDirectory() || d.name === 'node_modules' || d.name.startsWith('.')) continue;
+    const f = join(PLUGINS_DIR, d.name, 'lib', 'client.js');
+    if (existsSync(f)) out.push({ name: d.name, file: f });
+  }
+  return out;
+}
+
 const KSTUB = 'Y29uc3QgcD1uZXcgUHJveHkoZnVuY3Rpb24oKXt9LHtnZXQ6KHQsayk9PihrPT09U3ltYm9sLnRvUHJpbWl0aXZlKT8oKT0+MDooaz09PSd0aGVuJ3x8az09PSdjYXRjaCd8fGs9PT0nZmluYWxseScpP3VuZGVmaW5lZDpwLGFwcGx5OigpPT5wLGNvbnN0cnVjdDooKT0+cH0pO2NvbnN0IGtvZmZpPXtsb2FkOigpPT5wLGRlY29kZTooKT0+MCxlbmNvZGU6KCk9PjAsCnNpemVvZjooKT0+MCxhbGlnbm9mOigpPT4wLGZ1bmN0aW9uOigpPT5wLHN0cnVjdDooKT0+cCx1bmlvbjooKT0+cCxlbnVtOigpPT5wLHR5cGVkZWY6KCk9PnAscG9pbnRlcjooKT0+cCwKcmVnaXN0ZXI6KCk9PnAsS29mZmlFcnJvcjpjbGFzcyBleHRlbmRzIEVycm9ye319O2V4cG9ydCBkZWZhdWx0IGtvZmZpOw==';
 const KCJS = 'Y29uc3QgcD1uZXcgUHJveHkoZnVuY3Rpb24oKXt9LHtnZXQ6KHQsayk9PihrPT09U3ltYm9sLnRvUHJpbWl0aXZlKT8oKT0+MDooaz09PSd0aGVuJ3x8az09PSdjYXRjaCd8fGs9PT0nZmluYWxseScpP3VuZGVmaW5lZDpwLGFwcGx5OigpPT5wLGNvbnN0cnVjdDooKT0+cH0pO2NvbnN0IGtvZmZpPXtsb2FkOigpPT5wLGRlY29kZTooKT0+MCxlbmNvZGU6KCk9PjAsCnNpemVvZjooKT0+MCxhbGlnbm9mOigpPT4wLGZ1bmN0aW9uOigpPT5wLHN0cnVjdDooKT0+cCx1bmlvbjooKT0+cCxlbnVtOigpPT5wLHR5cGVkZWY6KCk9PnAscG9pbnRlcjooKT0+cCwKcmVnaXN0ZXI6KCk9PnAsS29mZmlFcnJvcjpjbGFzcyBleHRlbmRzIEVycm9ye319O21vZHVsZS5leHBvcnRzPWtvZmZpO21vZHVsZS5leHBvcnRzLmRlZmF1bHQ9a29mZmk7';
 const PSTUB = 'Y29uc3R7RXZlbnRFbWl0dGVyfT1yZXF1aXJlKCdldmVudHMnKTtjbGFzcyBGIGV4dGVuZHMgRXZlbnRFbWl0dGVye2NvbnN0cnVjdG9yKCl7c3VwZXIoKTt0aGlzLnBpZD0wO3RoaXMuZXhpdENvZGU9MH13cml0ZSgpe31raWxsKCl7fXJlc2l6ZSgpe31jbGVhcigpe31jbG9zZSgpe31vbkV4aXQoYyl7aWYoYyljKHtleGl0Q29kZTowLHNpZ25hbDp1bmRlZmluZWR9KX19bW9kdWxlLmV4cG9ydHM9e3NwYXduKCl7Y29uc3QgeD1uZXcgRigpO3Byb2Nlc3MubmV4dFRpY2soKCk9PnguZW1pdCgnZXhpdCcse2V4aXRDb2RlOjAsc2lnbmFsOnVuZGVmaW5lZH0pKTtyZXR1cm4geH0sZm9yaygpe3JldHVybiBuZXcgRigpfSxvcGVuKCl7cmV0dXJue21hc3RlcjpuZXcgRigpLHNsYXZlOm5ldyBGKCl9fX07';
@@ -786,5 +806,68 @@ try {
   }
   log(`plugin-compat: scanned=${entries.length} patched=${patchedFiles} already=${alreadyDone}`);
 } catch (e) { log('WARN plugin-compat: ' + e.message); }
+
+/* ---------------------------------------------------------------------------
+ * 内置插件 **client 端** 的模块表兼容：dsh 0.1.5 删除了 @deepseek-ai/dsh-client-runtime
+ *
+ * 现象（真机）：host 端插件树加载正常、web UI 已起，但页面顶部报
+ *   Failed to load plugins
+ *   failed to import loader entry …(dsh-provider-headers): client-modules:
+ *   require("@deepseek-ai/dsh-client-runtime/client") missed the module table
+ *
+ * 根因：0.1.5 把 `createSnapshotStore` 从 `dsh-client-runtime/client`
+ * **迁移到新包 `@deepseek-ai/dsh-client-store`**，并删除旧包。
+ * 证据（逐项实测）：
+ *   · 0.1.5 前端种子表（staticModules）只有 5 个 @deepseek-ai 词：
+ *     cordis / dsh-client-store / dsh-client-ui-dockkit /
+ *     dsh-client-ui-primitives / dsh-client-ui-slots —— **无 client-runtime**；
+ *   · 0.1.5 安装树中不存在 dsh-client-runtime 包；
+ *   · 新旧 createSnapshotStore **实现逐行相同**（仅缩进不同），故改指新包语义等价。
+ *
+ * 与 host 端不同：client 端是浏览器侧 `require(spec)` 查模块表，Node 侧解析无关，
+ * 所以必须单独改写 client.js。改写的是 `require` 的**说明符字符串**，不动逻辑。
+ * ------------------------------------------------------------------------- */
+try {
+  const CMARKER = 'dsh-launcher-client-compat-v1';
+  // 已删除 → 替代（0.1.5 模块表中存在的等价模块）
+  const REQUIRE_MAP = [
+    ['@deepseek-ai/dsh-client-runtime/client', '@deepseek-ai/dsh-client-store'],
+  ];
+  let patched = 0, already = 0;
+  const clients = eachPluginClientFile();
+  for (const { name, file } of clients) {
+    let src;
+    try { src = readFileSync(file, 'utf8'); } catch { continue; }
+    if (src.includes(CMARKER)) { already++; continue; }
+    let changed = false;
+    let out = src;
+    for (const [from, to] of REQUIRE_MAP) {
+      if (!out.includes(`"${from}"`) && !out.includes(`'${from}'`)) continue;
+      out = out.split(`"${from}"`).join(`"${to}"`).split(`'${from}'`).join(`'${to}'`);
+      changed = true;
+    }
+    if (!changed) continue;
+    // 语法自检（client.js 是 ESM 包装的工厂函数体，node --check 可校验）
+    const tmp = file + '.client-check.mjs';
+    let ok = false;
+    try {
+      writeFileSync(tmp, out);
+      const r = spawnSync(process.execPath, ['--check', tmp], { timeout: 15000, encoding: 'utf8' });
+      ok = r.status === 0;
+      if (!ok) log(`WARN client-compat: syntax check FAILED for ${name}: ${(r.stderr || '').slice(0, 200)}`);
+    } catch (e) {
+      log(`WARN client-compat: syntax check unavailable for ${name}: ${e.message}`);
+    } finally {
+      try { unlinkSync(tmp); } catch {}
+    }
+    if (!ok) continue;
+    try {
+      writeFileSync(file, `// ${CMARKER}\n` + out);
+      patched++;
+      log(`client-compat patched: ${name}`);
+    } catch (e) { log(`WARN client-compat write ${name}: ${e.message}`); }
+  }
+  log(`client-compat: scanned=${clients.length} patched=${patched} already=${already}`);
+} catch (e) { log('WARN client-compat: ' + e.message); }
 
 log('=== android fixup done ===');
