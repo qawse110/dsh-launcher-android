@@ -76,6 +76,19 @@ class MainActivity : AppCompatActivity() {
     /** 冷启动自动路由只做一次；从 WebUI 返回主界面不重复弹。 */
     private var autoRouteDone = false
 
+    /**
+     * APK 升级资产同步的放行闸门。
+     *
+     * **为什么需要显式闸门而不是靠时序**：`syncAssetsOnApkUpdate()` 在后台线程拷贝
+     * 资产（含 30MB prebuilt + 刷新插件副本，可能数秒），而 `autoRoute()` 紧接着在
+     * 另一线程判断「已安装 → START_ONLY 快速启动」。快速启动**跳过插件装配**，
+     * 直接加载 `files/plugins/<id>` 下的副本——若它先跑完，dsh 用的就是**尚未刷新**的
+     * 旧插件，于是「装了含修复的新 APK 仍报同样的错」再次复现。
+     * 故启动路径必须等闸门放行；闸门在同步线程的 finally 里必定 countDown
+     * （失败也放行），最坏退化为「带旧资产启动」而非「卡死」。
+     */
+    private val assetsSyncGate = java.util.concurrent.CountDownLatch(1)
+
     private var updateCheckCount = 0
 
     private val pollRunnable = object : Runnable {
@@ -148,6 +161,10 @@ class MainActivity : AppCompatActivity() {
         }
         autoRouteDone = true
         thread {
+            // ★ 等资产同步闸门：升级后必须先把插件副本刷新到位，再决定启动，
+            //   否则快速启动（跳过装配）会加载旧插件、复现「装了新版仍报同样的错」。
+            //   限时等待（30s）兜底：同步异常卡住也不能让启动无限期挂起。
+            runCatching { assetsSyncGate.await(30, java.util.concurrent.TimeUnit.SECONDS) }
             val installed = DshFlow.isInstalled(this)
             val up = installed && DshFlow.isWebUp()
             handler.post {
@@ -898,19 +915,19 @@ class MainActivity : AppCompatActivity() {
      */
     private fun syncAssetsOnApkUpdate() {
         val current = AssetSync.apkVersion(this)
-        if (current == 0L) return
+        if (current == 0L) { assetsSyncGate.countDown(); return }
         // ★ 判据必须是「安装戳」而非 versionCode：versionCode 硬编码为常量 300，
         //   用它比较会让本函数在首次安装后**永不执行**（真机事故根因——装了含插件
         //   修复的新 APK，files/extra-plugins 仍是旧内容，插件加载失败 web 起不来）。
         //   安装戳含 APK 路径/长度/mtime，重装必然变化。
         val stamp = AssetSync.apkInstallStamp(this)
-        if (stamp.isEmpty()) return
+        if (stamp.isEmpty()) { assetsSyncGate.countDown(); return }
         val prefs = getSharedPreferences(AppState.Prefs.UI, MODE_PRIVATE)
         // 换键名：旧键 last_apk_version 里存的是 versionCode，与新判据语义不同。
         // SharedPreferences 同键换存储语义会让升级用户带着旧值回来误判（旧值 300
         // 恰好也是 Long，不换键名会静默把新判据判成"已同步"），故必须换键。
         val last = prefs.getString("last_apk_stamp", null)
-        if (stamp == last) return
+        if (stamp == last) { assetsSyncGate.countDown(); return }
         appendMiniLog("检测到应用已更新（v$current），后台同步内置插件源…")
         thread {
             var ok = true
@@ -963,6 +980,10 @@ class MainActivity : AppCompatActivity() {
                 }
             } catch (t: Throwable) {
                 AppLog.e("Main", "apk asset sync failed: " + (t.message ?: t.toString()))
+            } finally {
+                // ★ 无论成败都必须放行：否则 autoRoute 会永远等下去。
+                //   宁可带着旧资产启动，也不能把「启动卡死」变成新的失败模式。
+                assetsSyncGate.countDown()
             }
         }
     }
