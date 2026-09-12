@@ -390,3 +390,70 @@ MISSING  @deepseek-ai/dsh-settings           settingsNamespace, installSettingsS
 独立来源（`extra-plugins/` 与 `prebuilt.tgz`），只审其一必然漏网；且漏网后表现为
 「修好一个、炸下一个」，极易被误判成"修复无效"。查「哪些插件会被加载」的正确依据是
 `BUILTIN_PLUGINS` 清单 + 两条来源的**并集**，不是某个目录的列表。
+
+### 7.10 client 端模块表：0.1.5 **删除**了 dsh-client-runtime（第三类漂移）
+
+**真机现象**（host 端已通、web UI 已起之后，页面顶部报）：
+
+```
+Failed to load plugins
+failed to import loader entry …(dsh-provider-headers): client-modules:
+require("@deepseek-ai/dsh-client-runtime/client") missed the module table
+```
+
+**这是第三类漂移**，与前两类都不同：
+
+| # | 类别 | 表现 | 章节 |
+|---|---|---|---|
+| 1 | 符号缺失（包还在） | 具名导入链接期抛错 | §7.6 |
+| 2 | 供给链漏审 | 同类错误换插件继续炸 | §7.9 |
+| 3 | **整包被删除、能力迁移** | host 正常，**只在浏览器端炸** | 本节 |
+
+**根因**（逐项实测，证据链闭合）：
+
+- 0.1.5 把 `createSnapshotStore` 从 `dsh-client-runtime/client` **迁移到新包
+  `@deepseek-ai/dsh-client-store`**，并删除旧包；
+- 0.1.5 前端**种子表**（`staticModules`）只有 5 个 `@deepseek-ai` 词：
+  `cordis` / `dsh-client-store` / `dsh-client-ui-dockkit` /
+  `dsh-client-ui-primitives` / `dsh-client-ui-slots` —— **实测 client-runtime 出现 0 次**；
+- 0.1.5 安装树中不存在 `dsh-client-runtime`；`dsh-web-app` 的 client 依赖也不含它；
+- 新旧 `createSnapshotStore` **实现逐行相同**（仅缩进不同）→ 改指新包语义等价。
+
+**★ 为什么 host 端正常而 UI 炸**：client 端走浏览器侧
+`require(spec)` → `client-modules` 的**模块表**（种子词 → 已加载 → 已注册工厂），
+与 Node 侧解析**完全无关**。所以「host 插件树加载成功」**不代表**「UI 能加载插件」，
+**两边必须分别审计**。
+
+**改动**（`stub-dsh.mjs`）：
+
+- 新增 `eachPluginClientFile()`：枚举 `files/plugins/<dir>/lib/client.js`；
+- `client-compat` 块：把 `require` 的**说明符字符串**从已删除包改为等价新包
+  （`REQUIRE_MAP`，只动说明符、不动逻辑）；写盘前 `node --check` 自检；
+  marker `dsh-launcher-client-compat-v1` 幂等。
+
+**审计**（全部内置插件 client 端 `require` 清点，避免"修一个炸一个"）：
+
+```
+dsh-mobile-nav       : dsh-client-ui-primitives   ✅ 0.1.5 种子表存在
+dsh-net-proxy        : dsh-client-ui-primitives   ✅
+dsh-vision           : dsh-client-ui-primitives   ✅
+dsh-provider-headers : dsh-client-runtime/client  ❌ 已删除 → 唯一需修
+```
+
+另确认 `client.js` 是唯一 client 入口：`dsh-super-injector/lib/index.js` 虽含
+`__ModuleLoader__` 字样，但那只是**构建期生成的 banner 字符串**，不是 client 入口。
+
+**验证（真机 scratch，仓库外）**：
+
+- 真实 `client.js`：`require` 正确改写、语法通过、对照插件未被误改、二次运行幂等；
+- 端到端模拟模块表解析：修复前 `require` **未命中**（复现真机报错文案），
+  修复后**命中种子表**；并确认新包第 178 行确实
+  `export { createSnapshotStore, defineStore, notifySubscribers, shallowEqual }`；
+- 用 **APK 内**的 stub 实测真实 `client.js` → 改写为 `dsh-client-store` 且语法通过。
+
+**沉淀（三类漂移的检查清单，下次 dsh 升级按此逐条过）**：
+
+1. **符号**：插件每个具名导入的符号在新版是否仍导出（§7.6）；
+2. **供给链**：`BUILTIN_PLUGINS` 的**两条来源并集**都要审（§7.9）；
+3. **整包/模块表**：host 端与 **client 端分别**审 `require`/`import` 的**包是否还存在**
+   —— 包被删且能力迁移时，Node 侧与浏览器侧表现完全不同，且**报错位置互不覆盖**。
