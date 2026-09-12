@@ -63,6 +63,7 @@ const BUILTIN_PLUGINS = [
   'dsh-status-bridge',
   'dsh-android-links',
   'dsh-llm-codebuddy',
+  'dsh-prompt-optimizer',
 ];
 const BUILTIN_NAMES = new Set([
   '@dsh-external/dsh-mobile-nav',
@@ -73,6 +74,7 @@ const BUILTIN_NAMES = new Set([
   '@dsh-external/dsh-status-bridge',
   '@dsh-external/dsh-android-links',
   'dsh-llm-codebuddy',
+  '@dsh-external/dsh-prompt-optimizer',
 ]);
 const BUILTIN_IDS = new Set([
   'dsh-mobile-nav',
@@ -83,6 +85,7 @@ const BUILTIN_IDS = new Set([
   'dsh-status-bridge',
   'dsh-android-links',
   'llm-codebuddy',
+  'prompt-optimizer',
 ]);
 function log(m) {
   const l = `${new Date().toISOString()} [install] ${m}`;
@@ -620,50 +623,35 @@ function addLocalPlugin(dir) {
   return dshPlugin(['add', p]);
 }
 
-/** 路由预设不是 pnpm bundle，需整体拷贝/展平到 .agent-presets（特殊适配）。 */
-function copyPresets() {
-  const srcRoot = join(PLUGINS_DIR, 'router-preset');
-  if (!existsSync(srcRoot)) {
-    log('router-preset not bundled, skip preset copy');
-    return;
-  }
+/**
+ * 路由预设已从内置资产中移除（v4.10.3 起）——本函数不再安装任何预设，
+ * 只负责**清理历史安装残留**，避免老设备升级后 `.agent-presets` 里仍留着
+ * 已下线的 router-preset / router-spec / router-standard / router-pro。
+ *
+ * 背景：原 `copyPresets()` 会把 `prebuilt.tgz` 内 `third_party/router-preset`
+ * 展平到 `$HOME/.dsh/.agent-presets`。删除该预设时若只从包里拿掉文件，
+ * 存量设备上**已安装的副本不会被清掉**（agent-presets 是独立目录，不随包更新），
+ * 于是「删了但还在」。故这里保留一个清理钩子。
+ *
+ * 如需重新装回，走「插件管理 → 路由预设」的在线安装路径
+ * （routing-suite.mjs，从 yjh051108/dsh-routing-suite 拉取），
+ * 不再依赖 APK 内置资产。
+ */
+function removePresets() {
   const destRoot = join(FILES_DIR, '.dsh/.agent-presets');
-  mkdirSync(destRoot, { recursive: true });
+  if (!existsSync(destRoot)) return;
   try {
-    const sourceNames = new Set();
-    if (existsSync(join(srcRoot, 'agent.cordis.yml'))) {
-      const dest = join(destRoot, 'router-preset');
-      rmSync(dest, { recursive: true, force: true });
-      cpSync(srcRoot, dest, { recursive: true, force: true });
-      log('preset installed: router-preset');
-    } else {
-      let copied = 0;
-      for (const child of readdirSync(srcRoot, { withFileTypes: true })) {
-        if (!child.isDirectory()) continue;
-        sourceNames.add(child.name);
-        const childSrc = join(srcRoot, child.name);
-        if (!existsSync(join(childSrc, 'agent.cordis.yml'))) continue;
-        const dest = join(destRoot, child.name);
-        rmSync(dest, { recursive: true, force: true });
-        cpSync(childSrc, dest, { recursive: true, force: true });
-        copied++;
-      }
-      const legacy = join(destRoot, 'router-preset');
-      if (existsSync(legacy) && !existsSync(join(legacy, 'agent.cordis.yml'))) {
-        rmSync(legacy, { recursive: true, force: true });
-      }
-      log('preset install: router-preset (' + copied + ' subpresets)');
+    let removed = 0;
+    for (const stale of ['router-preset', 'router-spec', 'router-standard', 'router-pro']) {
+      const p = join(destRoot, stale);
+      if (!existsSync(p)) continue;
+      rmSync(p, { recursive: true, force: true });
+      removed++;
+      log('removed retired preset: ' + stale);
     }
-    // 上游当前不再发布 router-pro；
-    // 清理历史安装残留，避免 agent-presets 里出现已移除的预设。
-    for (const stale of ['router-pro']) {
-      if (!sourceNames.has(stale)) {
-        rmSync(join(destRoot, stale), { recursive: true, force: true });
-        log('removed stale preset: ' + stale + ' (upstream reverted to v0.2.0)');
-      }
-    }
+    if (removed > 0) log(`retired presets cleaned: ${removed}`);
   } catch (e) {
-    log('WARN preset copy failed: ' + e.message);
+    log('WARN preset cleanup failed: ' + e.message);
   }
 }
 
@@ -673,7 +661,7 @@ function installBuiltins() {
     if (addLocalPlugin(d)) ok++; else fail++;
   }
   log(`builtin plugins assembled: ${ok} ok, ${fail} failed / ${BUILTIN_PLUGINS.length} total`);
-  copyPresets();
+  removePresets();
   cleanBuiltinPatch();
 }
 
