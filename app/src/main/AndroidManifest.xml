@@ -75,6 +75,12 @@
             android:exported="false"
             android:configChanges="orientation|screenSize|keyboardHidden"
             android:windowSoftInputMode="adjustResize" />
+        <!-- 备份与恢复（对齐 classic 分支的同名功能） -->
+        <activity
+            android:name=".ui.BackupActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:windowSoftInputMode="adjustResize" />
 
         <service
             android:name=".service.BuildKeepAliveService"

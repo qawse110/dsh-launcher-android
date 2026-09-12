@@ -552,6 +552,9 @@ class MainActivity : AppCompatActivity() {
             ), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(8) })
             addView(addPairRow(
                 getString(R.string.btn_stop_all) to { stopDshAll() },
+                "💾 备份与恢复" to { startActivity(Intent(this@MainActivity, BackupActivity::class.java)) }
+            ), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(8) })
+            addView(addPairRow(
                 "📖 操作指南" to { toggleHelp() }
             ), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         })
