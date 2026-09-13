@@ -445,6 +445,15 @@ object DshFlow {
             Thread.sleep(1500)
         }
         // 生成启动脚本（模板 assets/web-launcher.sh.tpl + TermuxEnv 渲染），由内置 Termux bash 后台执行
+        // ★ 起进程前再确认一次端口空闲（TOCTOU 收口）：
+        //   上面的检查与这里的 exec 之间有窗口（渲染脚本、写文件），而 dsh 0.1.5
+        //   的 bind 发生在插件树加载之后，端口可能在启动过程中才被别的进程占上。
+        //   此处复查一次，把「检查→启动」的窗口压到最小；仍被占用则清场后再起。
+        if (isPortListening(WEB_PORT)) {
+            onLog(">> 起进程前复查：端口 $WEB_PORT 仍被占用，再清场一次…")
+            killAllNode(ctx, onLog)
+            Thread.sleep(1500)
+        }
         File(ctx.filesDir, "tmp").mkdirs()
         val launcher = webLauncherFile(ctx)
         launcher.parentFile?.mkdirs()
@@ -544,8 +553,16 @@ object DshFlow {
     private fun waitForWebReady(ctx: Context, timeoutMs: Long, onLog: (String) -> Unit): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMs
         var lastLog = 0L
+        val webLog = File(FileLog.dir(ctx), WEB_LOG)
         while (System.currentTimeMillis() < deadline) {
             if (httpResponds(WEB_PORT)) return true
+            // 快速失败：进程已因致命错误退出时，继续等满超时只会白等 90 秒，
+            // 且用户看到的是「未就绪」而非真正的错误原因（真机 EADDRINUSE 即如此）。
+            if (webLogIsFatal(webLog)) {
+                onLog("✗ dsh web 启动即失败（端口冲突或插件加载错误），日志尾部：")
+                appendLogTail(webLog, 25, onLog)
+                return false
+            }
             val now = System.currentTimeMillis()
             if (now - lastLog >= 5000) {
                 lastLog = now
@@ -555,8 +572,27 @@ object DshFlow {
             Thread.sleep(if (elapsed < 6_000) 150 else 500)
         }
         onLog("✗ dsh web 未在 ${timeoutMs / 1000} 秒内就绪，日志尾部：")
-        appendLogTail(File(FileLog.dir(ctx), WEB_LOG), 25, onLog)
+        appendLogTail(webLog, 25, onLog)
         return false
+    }
+
+    /**
+     * web 日志是否已出现「致命、不可能自愈」的失败标记。
+     *
+     * 目前识别两类：
+     * - `EADDRINUSE`：端口被占（多为 watchdog 与启动流程双拉，见 Supervisor.reviveWebIfDue）；
+     * - `Node.js v`：node 打印版本号后退出＝进程已终结（正常运行时不会出现）。
+     *
+     * 只看日志**尾部**，避免历史残留的旧错误导致永久误判。
+     */
+    private fun webLogIsFatal(log: File): Boolean = try {
+        if (!log.isFile) false
+        else {
+            val tail = log.readText().takeLast(8_000)
+            tail.contains("EADDRINUSE") || tail.contains("Node.js v")
+        }
+    } catch (t: Throwable) {
+        false
     }
 
     fun httpResponds(port: Int): Boolean {

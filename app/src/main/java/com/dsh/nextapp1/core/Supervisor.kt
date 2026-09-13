@@ -44,11 +44,33 @@ object Supervisor {
     @Synchronized
     fun reviveWebIfDue(ctx: Context): Boolean {
         if (!desiredRunning(ctx)) return false
+        // ★ 安装/启动流程进行中一律不抢跑（真机故障根因）。
+        //
+        //   dsh 0.1.5 的 web 启动顺序是：先加载整棵插件树（实测 index 103 个条目，
+        //   数十秒），**最后**才 listen 3080。于是从「流程开始」到「端口 bind」
+        //   之间有一个长达数十秒的窗口，此间 isUp() 恒为 false。
+        //   watchdog 每轮探测都判「web 挂了」→ reviveWebIfDue 再拉一个 node →
+        //   两个进程先后 bind 3080 → 后到者 EADDRINUSE 崩溃 →
+        //   主流程 waitForWebReady 白等 90 秒报「未就绪」。
+        //
+        //   流程自身已有完整的启动与等待逻辑，watchdog 无需在此期间插手；
+        //   真正的崩溃循环由 maybeRollbackOnCrashLoop（已含同样的 isBusy 守卫）处理。
+        if (DshFlow.isBusy()) {
+            AppLog.i(TAG, "revive: 安装/启动流程进行中，跳过本次拉起（防端口双绑）")
+            return false
+        }
         val now = System.currentTimeMillis()
         val last = prefs(ctx).getLong(KEY_LAST_REVIVE, 0L)
         val cooldown = currentCooldown(ctx)
         if (now - last < cooldown) return false
         prefs(ctx).edit().putLong(KEY_LAST_REVIVE, now).apply() // 先占位，防并发双拉
+
+        // 端口已监听但 HTTP 无响应＝有残留进程占着：此时再拉只会 EADDRINUSE。
+        // 交给 DshFlow 的启动路径（它会在启动前 killAllNode 清场）处理，这里不掺和。
+        if (DshFlow.isPortListening(DshFlow.WEB_PORT) && !DshFlow.httpResponds(DshFlow.WEB_PORT)) {
+            AppLog.i(TAG, "revive: 端口 ${DshFlow.WEB_PORT} 被残留进程占用，跳过本次拉起（等流程清场）")
+            return false
+        }
 
         val script = DshFlow.webLauncherFile(ctx)
         if (!script.exists() || !script.canRead()) {
