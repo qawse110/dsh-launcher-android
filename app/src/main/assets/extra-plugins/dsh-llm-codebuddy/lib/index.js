@@ -63,18 +63,44 @@ const codeBuddyApi = {
 };
 
 // 内置兜底目录（在线目录不可用时使用）。两个区域共用同一份规格；真实目录以 /v3/config 返回为准。
+//
+// 【必须与在线目录对齐】2026-09-13 实修：fallback 里缺 glm-5.3-flash 等现役模型，
+// 导致热重载/启动后第一次请求（在线目录尚未拉回）直接报
+// `provider "codebuddy-cn" has no configured model "glm-5.3-flash"`。
+// 这里的清单 = 2026-09-13 两区在线目录的并集常用项（规格取自 /v3/config）。
 const MODEL_SPECS = [
+  // 中国区（cli.models 实测 15 个）
+  ["hy4-preview", "Hy4 preview", 1000000, 64000, true],
   ["hy3", "Hy3", 192000, 64000, true],
+  ["hy3-x", "Hy3", 192000, 64000, true],
+  ["deepseek-v4.1-flash", "Deepseek-V4.1-Flash", 1000000, 128000, true],
+  ["glm-5.3", "GLM-5.3", 1000000, 48000, false],
+  ["glm-5.3-flash", "GLM-5.3-Flash", 1000000, 32000, true],
   ["glm-5.2", "GLM-5.2", 1000000, 48000, false],
   ["glm-5.1", "GLM-5.1", 200000, 48000, false],
   ["glm-5v-turbo", "GLM-5v-Turbo", 200000, 64000, true],
-  ["minimax-m3-pay", "MiniMax-M3", 512000, 128000, true],
+  ["minimax-m3", "MiniMax-M3", 512000, 128000, true],
   ["minimax-m2.7", "MiniMax-M2.7", 200000, 48000, true],
-  ["kimi-k3-2", "Kimi-K3", 1000000, 32000, true],
+  ["kimi-k3-1", "Kimi-K3", 1000000, 32000, true],
   ["kimi-k2.7", "Kimi-K2.7-Code", 256000, 32000, true],
   ["kimi-k2.6", "Kimi-K2.6", 256000, 32000, true],
-  ["deepseek-v4-pro", "DeepSeek V4 Pro", 1000000, 50000, true],
-  ["deepseek-v4-flash", "DeepSeek V4 Flash", 1000000, 50000, true],
+  ["deepseek-v4-pro", "Deepseek-V4-Pro", 1000000, 50000, true],
+  // 国际版独有（cli.models 实测 20 个中的增量）
+  ["default-model", "Auto", 1000000, 32000, true],
+  ["fast-model", "Fast", 1000000, 32000, true],
+  ["balanced-model", "Balanced", 1000000, 32000, true],
+  ["primary-model", "Primary", 1000000, 32000, true],
+  ["deep-model", "Deep", 1000000, 32000, true],
+  ["hy4-preview-f", "Hy4 preview", 1000000, 64000, true],
+  ["gpt-6-astra", "GPT-6-Astra", 1000000, 32000, true],
+  ["gpt-5.6-sol", "GPT-5.6-Sol", 1000000, 32000, true],
+  ["gpt-5.6-terra", "GPT-5.6-Terra", 1000000, 32000, true],
+  ["gpt-5.6-luna", "GPT-5.6-Luna", 1000000, 32000, true],
+  ["gpt-5.5", "GPT-5.5", 1000000, 32000, true],
+  ["gpt-5.4", "GPT-5.4", 1000000, 32000, true],
+  ["gpt-5.3-codex", "GPT-5.3-Codex", 1000000, 32000, true],
+  ["gemini-3.5-flash", "Gemini-3.5-Flash", 1000000, 32000, true],
+  ["kimi-k3", "Kimi-K3", 1000000, 32000, true],
 ];
 
 function fallbackModels(region) {
@@ -380,6 +406,7 @@ export const __testing = Object.freeze({
   creditDescription,
   parseCreditRate,
   modelsFromConfig,
+  codeBuddyApi,
   modelsFromIds,
   ownsProvider,
   runtimeHeaders,

@@ -18,8 +18,15 @@ import {
   upsertCodeBuddySession,
   waitForCodeBuddyLogin,
 } from "./codebuddy-auth.js";
-import { fetchCodeBuddyRequestUsage, fetchCodeBuddyUsage, probeCodeBuddyHy4 } from "./codebuddy-usage.js";
+import { fetchCodeBuddyRequestUsage, fetchCodeBuddyUsage, probeCodeBuddyHy4, probeModelRateLimit } from "./codebuddy-usage.js";
 import { collectSessionUsageAsync, defaultSessionsRoot } from "./codebuddy-sessions.js";
+
+// 限流状态探测的默认模型集：hy4 系列与 DeepSeek V4.1 Flash（免费/低价高关注度模型）。
+const RATE_LIMIT_PROBE_MODELS = Object.freeze([
+  "hy4-preview",
+  "hy4-preview-f",
+  "deepseek-v4.1-flash",
+]);
 
 const ROUTE_BY_PROVIDER = {
   "codebuddy-cn": "/dsh-llm-codebuddy/auth",
@@ -341,6 +348,49 @@ export function installCodeBuddyWeb(ctx) {
           });
         }
       };
+      // 多模型限流状态探测：body.models 指定要探测的模型列表（缺省 = hy4 系列
+      // + DeepSeek V4.1 Flash）。逐个发一次最小请求（max_tokens:1，429 时服务端
+      // 直接拒绝不计费），返回每个模型的 可用/限流/重置时间。
+      const usageRateLimits = async (req, res) => {
+        try {
+          const state = await currentState();
+          if (!state.authenticated) {
+            return json(res, 401, { ok: false, message: "尚未保存 CodeBuddy 登录令牌" });
+          }
+          const body = await requestBody(req);
+          const session = await resolveUsageSession(region, body.accountId);
+          const requested = Array.isArray(body.models) ? body.models.filter((m) => typeof m === "string" && m) : [];
+          const targets = requested.length > 0 ? requested : RATE_LIMIT_PROBE_MODELS;
+          const results = [];
+          for (const modelId of targets) {
+            try {
+              const status = await probeModelRateLimit(region, session, modelId);
+              results.push({ ok: true, ...status });
+            } catch (error) {
+              results.push({
+                ok: false,
+                model: modelId,
+                available: false,
+                limited: false,
+                message: error instanceof Error ? error.message : "探测失败",
+              });
+            }
+          }
+          json(res, 200, {
+            ok: true,
+            provider: region.provider,
+            accountId: body.accountId ?? null,
+            results,
+            servedAt: new Date().toISOString(),
+          });
+        } catch (error) {
+          json(res, 200, {
+            ok: false,
+            provider: region.provider,
+            message: error instanceof Error ? error.message : "限流状态探测失败",
+          });
+        }
+      };
       // 本地会话用量统计（模型/会话聚合）。数据源是 DSH 会话日志，与登录态无关，
       // 因此不需要鉴权检查；所有区域共用同一份数据，路由挂在两个前缀下等价。
       const usageSessions = async (_req, res) => {
@@ -364,6 +414,7 @@ export function installCodeBuddyWeb(ctx) {
         webCtx.webServer.register({ kind: "exact", path: `${route}/remove`, handler: remove }),
         webCtx.webServer.register({ kind: "exact", path: `${route}/usage`, handler: usage }),
         webCtx.webServer.register({ kind: "exact", path: `${route}/usage/hy4`, handler: usageHy4 }),
+        webCtx.webServer.register({ kind: "exact", path: `${route}/usage/rate-limits`, handler: usageRateLimits }),
         webCtx.webServer.register({ kind: "exact", path: `${route}/usage/requests`, handler: usageRequests }),
         webCtx.webServer.register({ kind: "exact", path: `${route}/usage/sessions`, handler: usageSessions }),
       );
