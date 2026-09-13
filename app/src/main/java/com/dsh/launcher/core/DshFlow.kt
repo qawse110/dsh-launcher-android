@@ -766,8 +766,16 @@ object DshFlow {
     ): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMs
         var lastLog = 0L
+        val webLog = File(FileLog.dir(ctx), WEB_LOG)
         while (System.currentTimeMillis() < deadline) {
             if (httpResponds(WEB_PORT)) return true
+            // 快速失败：进程已因致命错误退出时，继续等满超时只会白等，
+            // 且用户看到的是「未就绪」而非真正的错误原因（真机 EADDRINUSE 即如此）。
+            if (webLogIsFatal(webLog)) {
+                onLog("✗ dsh web 启动即失败（端口冲突或插件加载错误），日志尾部：")
+                appendLogTail(webLog, 25, onLog)
+                return false
+            }
             val now = System.currentTimeMillis()
             if (now - lastLog >= 5000) {
                 lastLog = now
@@ -811,6 +819,25 @@ object DshFlow {
     }
 
     /** dsh web 端口是否响应（委托 [LocalHttp]；本机回环一律不走代理）。 */
+    /**
+     * web 日志是否已出现「致命、不可能自愈」的失败标记。
+     *
+     * 目前识别两类：
+     * - `EADDRINUSE`：端口被占（多为 watchdog 与启动流程双拉，见 Supervisor.reviveWebIfDue）；
+     * - `Node.js v`：node 打印版本号后退出＝进程已终结（正常运行时不会出现）。
+     *
+     * 只看日志**尾部**，避免历史残留的旧错误导致永久误判。
+     */
+    private fun webLogIsFatal(log: File): Boolean = try {
+        if (!log.isFile) false
+        else {
+            val tail = log.readText().takeLast(8_000)
+            tail.contains("EADDRINUSE") || tail.contains("Node.js v")
+        }
+    } catch (t: Throwable) {
+        false
+    }
+
     fun httpResponds(port: Int): Boolean = LocalHttp.responds(port)
 
     private fun appendLogTail(file: File, maxLines: Int, onLog: (String) -> Unit) {
