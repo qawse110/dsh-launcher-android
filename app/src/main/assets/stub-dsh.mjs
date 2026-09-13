@@ -731,4 +731,54 @@ try {
 // v4.8.1 资产清理：移除 patch-koffi.yml 占位写入——全仓库无任何消费方，
 // koffi 已由上方 Proxy stub 直接顶替，无需禁用行文件。
 
+/* ---------------------------------------------------------------------------
+ * Android flock 降级（v4.10.3）
+ *
+ * 现象：dsh 0.1.5 起，每轮对话都报「本轮运行失败 flock is not supported on android-arm64」。
+ *
+ * 根因链（已逐环复现）：
+ *   dsh 0.1.5 新增依赖 @deepseek-ai/node-addon-system（native addon），
+ *   其 lib/flock.js 开头就判断平台：
+ *       if (platform !== 'linux' && platform !== 'darwin') throw ERR_FLOCK_UNSUPPORTED_PLATFORM
+ *   而 Android 上 **process.platform === 'android'**（不是 'linux'）→ 直接抛错。
+ *   该 addon 官方只发布 darwin-arm64/x64、linux-x64/arm64 四个平台包，
+ *   **没有 android**，所以即便绕过判断也加载不到二进制。
+ *   dsh-session-persistence-jsonl 用 tryLockExclusive 获取「会话写租约」，
+ *   抛错冒泡成「本轮运行失败」——对话每轮都触发，等于不可用。
+ *   （本分支钉死 dsh 0.1.1，无该依赖，故当前不受影响；此为防御性补齐，
+ *     保证将来升级或回滚到 0.1.5 时不炸。）
+ *
+ * 为什么可以安全降级为「立即成功」：
+ *   flock 的用途是**跨进程**互斥（同进程内另有 write claim 保证唯一写者）。
+ *   Android 上 dsh web 是**单进程** node，不存在第二个进程争用同一会话文件，
+ *   故跨进程锁在此场景是多余的。官方对 browser worker 就是同一做法，原话：
+ *     "The browser worker stubs the native flock entry to immediate success:
+ *      it is single-process, so the in-process write claim already excludes every writer."
+ * ------------------------------------------------------------------------- */
+try {
+  const MARKER_FLOCK = 'dsh-launcher-android-flock-stub';
+  const flockFile = findPkg('@deepseek-ai/node-addon-system', 'lib/flock.js');
+  if (!flockFile) {
+    log('node-addon-system/flock: not found, skip android stub');
+  } else {
+    let src = readFileSync(flockFile, 'utf8');
+    if (src.includes(MARKER_FLOCK)) {
+      log('flock android stub already applied');
+    } else {
+      const anchor2 = 'export async function tryLockExclusive(fd) {';
+      if (!src.includes(anchor2)) {
+        log('WARN flock android stub: anchor not found (upstream changed?), skip');
+      } else {
+        const patchedFn =
+          anchor2 + '\n' +
+          '    // ' + MARKER_FLOCK + ': Android 单进程无需跨进程 flock\n' +
+          '    if (process.platform === \'android\') return;\n';
+        src = src.replace(anchor2, patchedFn);
+        writeFileSync(flockFile, `// ${MARKER_FLOCK}\n` + src);
+        log('flock android stub applied: ' + flockFile);
+      }
+    }
+  }
+} catch (e) { log('WARN flock android stub: ' + e.message); }
+
 log('=== android fixup done ===');
