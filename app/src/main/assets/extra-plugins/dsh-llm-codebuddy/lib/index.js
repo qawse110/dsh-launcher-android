@@ -2,11 +2,7 @@ import { credentialRef } from "@deepseek-ai/dsh-credentials";
 import { launchEnvironmentOf } from "@deepseek-ai/dsh-launch-environment";
 import { LlmError, assertUsableApiKey, resolveRetryPolicy } from "@deepseek-ai/dsh-llm";
 import { Config, PiAiAdapter } from "@deepseek-ai/dsh-llm-pi-ai";
-// 命名空间导入（**不能用具名导入**）：dsh 0.1.5 起 @deepseek-ai/dsh-settings 不再
-// 导出 installSettingsSection / settingsNamespace，具名导入会在 ESM 链接期直接抛
-// "does not provide an export named ..."，使整个插件加载失败并拖垮插件树（web 起不来）。
-// 命名空间导入只要求模块可解析，符号缺失留到运行时按能力探测（见 installSection）。
-import * as dshSettings from "@deepseek-ai/dsh-settings";
+import { installSettingsSection, settingsNamespace } from "@deepseek-ai/dsh-settings";
 import { createProvider } from "@earendil-works/pi-ai";
 import * as openAICompletionsApi from "@earendil-works/pi-ai/api/openai-completions";
 import {
@@ -30,13 +26,7 @@ export { Config };
 export const name = "llm-codebuddy";
 export const inject = ["llm"];
 
-// settings 命名空间字面量。旧版用 settingsNamespace() 校验后返回原值，新版该函数
-// 不再导出（改名 parseSettingsNamespace 且同样未导出）；其校验规则很简单
-// （/^[a-z][a-z0-9-]*$/，见新版 dsh-settings 的 parseSettingsNamespace），
-// 且新版 ctx.settings.register() 内部会自行校验并抛错，故此处只保留常量。
-// ★ 与'多账号会话池/新版 UA'同步时的冲突解法：NS 用常量（远程修复，避免引用
-//   已被 0.1.5 删除的 settingsNamespace），USER_AGENT 取本地新版（新特性）。
-const NS = "llm-codebuddy";
+const NS = settingsNamespace("llm-codebuddy");
 const USER_AGENT = "workbuddy-ai/5.5.2 workbuddy-ai/5.5.2 CLI/2.137.1";
 const STREAM_IDLE_TIMEOUT_MS = 300_000;
 const NO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
@@ -73,18 +63,44 @@ const codeBuddyApi = {
 };
 
 // 内置兜底目录（在线目录不可用时使用）。两个区域共用同一份规格；真实目录以 /v3/config 返回为准。
+//
+// 【必须与在线目录对齐】2026-09-13 实修：fallback 里缺 glm-5.3-flash 等现役模型，
+// 导致热重载/启动后第一次请求（在线目录尚未拉回）直接报
+// `provider "codebuddy-cn" has no configured model "glm-5.3-flash"`。
+// 这里的清单 = 2026-09-13 两区在线目录的并集常用项（规格取自 /v3/config）。
 const MODEL_SPECS = [
+  // 中国区（cli.models 实测 15 个）
+  ["hy4-preview", "Hy4 preview", 1000000, 64000, true],
   ["hy3", "Hy3", 192000, 64000, true],
+  ["hy3-x", "Hy3", 192000, 64000, true],
+  ["deepseek-v4.1-flash", "Deepseek-V4.1-Flash", 1000000, 128000, true],
+  ["glm-5.3", "GLM-5.3", 1000000, 48000, false],
+  ["glm-5.3-flash", "GLM-5.3-Flash", 1000000, 32000, true],
   ["glm-5.2", "GLM-5.2", 1000000, 48000, false],
   ["glm-5.1", "GLM-5.1", 200000, 48000, false],
   ["glm-5v-turbo", "GLM-5v-Turbo", 200000, 64000, true],
-  ["minimax-m3-pay", "MiniMax-M3", 512000, 128000, true],
+  ["minimax-m3", "MiniMax-M3", 512000, 128000, true],
   ["minimax-m2.7", "MiniMax-M2.7", 200000, 48000, true],
-  ["kimi-k3-2", "Kimi-K3", 1000000, 32000, true],
+  ["kimi-k3-1", "Kimi-K3", 1000000, 32000, true],
   ["kimi-k2.7", "Kimi-K2.7-Code", 256000, 32000, true],
   ["kimi-k2.6", "Kimi-K2.6", 256000, 32000, true],
-  ["deepseek-v4-pro", "DeepSeek V4 Pro", 1000000, 50000, true],
-  ["deepseek-v4-flash", "DeepSeek V4 Flash", 1000000, 50000, true],
+  ["deepseek-v4-pro", "Deepseek-V4-Pro", 1000000, 50000, true],
+  // 国际版独有（cli.models 实测 20 个中的增量）
+  ["default-model", "Auto", 1000000, 32000, true],
+  ["fast-model", "Fast", 1000000, 32000, true],
+  ["balanced-model", "Balanced", 1000000, 32000, true],
+  ["primary-model", "Primary", 1000000, 32000, true],
+  ["deep-model", "Deep", 1000000, 32000, true],
+  ["hy4-preview-f", "Hy4 preview", 1000000, 64000, true],
+  ["gpt-6-astra", "GPT-6-Astra", 1000000, 32000, true],
+  ["gpt-5.6-sol", "GPT-5.6-Sol", 1000000, 32000, true],
+  ["gpt-5.6-terra", "GPT-5.6-Terra", 1000000, 32000, true],
+  ["gpt-5.6-luna", "GPT-5.6-Luna", 1000000, 32000, true],
+  ["gpt-5.5", "GPT-5.5", 1000000, 32000, true],
+  ["gpt-5.4", "GPT-5.4", 1000000, 32000, true],
+  ["gpt-5.3-codex", "GPT-5.3-Codex", 1000000, 32000, true],
+  ["gemini-3.5-flash", "Gemini-3.5-Flash", 1000000, 32000, true],
+  ["kimi-k3", "Kimi-K3", 1000000, 32000, true],
 ];
 
 function fallbackModels(region) {
@@ -390,6 +406,7 @@ export const __testing = Object.freeze({
   creditDescription,
   parseCreditRate,
   modelsFromConfig,
+  codeBuddyApi,
   modelsFromIds,
   ownsProvider,
   runtimeHeaders,
@@ -637,7 +654,7 @@ export function apply(ctx, config) {
   // 共存模式：CodeBuddy 配置存于独立命名空间 llm-codebuddy（不复用 llm-pi-ai，
   // 避免与内置适配器竞争同一命名空间）。目录条目恒定注册，使两个 Provider 始终
   // 可从 WebUI「添加提供方」下拉框选取；适配器路由只覆盖用户实际添加过的 Provider。
-  installCodeBuddySettings(ctx, Config, config ?? { providers: {} }, {
+  installSettingsSection(ctx, NS, Config, config ?? { providers: {} }, {
     setSource(source) {
       current = source;
     },
@@ -646,44 +663,5 @@ export function apply(ctx, config) {
       syncRegistration();
       directory.replace(directoryEntries());
     },
-  });
-}
-
-/**
- * 注册 llm-codebuddy 设置命名空间，兼容 dsh 0.1.1 / 0.1.5 两代 settings API。
- *
- * 为什么需要兼容层：0.1.5 移除了模块级 `installSettingsSection`，而**具名导入在
- * ESM 链接期就会抛错**（"does not provide an export named ..."），会让插件加载失败
- * 并拖垮整棵插件树（真机现象：dsh web 起不来）。故改用命名空间导入 + 运行时探测，
- * 缺失时按能力回退，避免把版本号写死。
- *
- * 两代语义等价（已逐行比对上游实现）：
- *   0.1.1 `installSettingsSection(ctx, ns, schema, entry, hooks)`
- *         内部即 `ctx.inject(["settings"], sctx => sctx.settings.register(...))`
- *   0.1.5 `ctx.settings.installSection(ctx, ns, schema, entry, hooks)`
- *         官方插件 dsh-agent-default-model 即用此形式，函数体与旧版逐行一致。
- *
- * @param ctx - 插件上下文。
- * @param schema - 该命名空间的 schemastery schema。
- * @param entry - 组合基线值（用户文档之下的一层）。
- * @param hooks - setSource / onChange 回调，语义同上游 installSection。
- */
-function installCodeBuddySettings(ctx, schema, entry, hooks) {
-  const legacy = dshSettings.installSettingsSection;
-  if (typeof legacy === "function") {
-    // 0.1.1 路径：模块级函数自身会 ctx.inject(["settings"], …)，无需外层 inject
-    legacy(ctx, NS, schema, entry, hooks);
-    return;
-  }
-  // 0.1.5 路径：能力在 settings 服务上，需先声明对 settings 服务的依赖
-  ctx.inject(["settings"], (settingsCtx) => {
-    const settings = settingsCtx.settings;
-    if (settings === undefined || typeof settings.installSection !== "function") {
-      throw new Error(
-        "llm-codebuddy: 当前 dsh 的 settings 服务不提供 installSection，" +
-          "无法注册设置命名空间（0.1.1 与 0.1.5 两种 API 均不可用）"
-      );
-    }
-    settings.installSection(ctx, NS, schema, entry, hooks);
   });
 }

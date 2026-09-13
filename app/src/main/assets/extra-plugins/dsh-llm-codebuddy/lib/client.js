@@ -416,6 +416,80 @@ window.__ModuleLoader__.load({
       return `${seconds} 秒`;
     }
 
+    // 多模型限流状态块：hy4 系列 + DeepSeek V4.1 Flash（逐行显示 可用/限流/倒计时）。
+    // 数据源：POST /usage/rate-limits（一次请求探测全部目标模型）。
+    function RateLimitsBlock(props) {
+      const { data, loading, error, now, secondary, danger, success } = props;
+      const results = Array.isArray(data?.results) ? data.results : [];
+      return React.createElement(
+        "div",
+        { style: { display: "flex", flexDirection: "column", gap: 8 } },
+        React.createElement(
+          "div",
+          { style: { fontSize: 12, fontWeight: 600, color: secondary } },
+          "限流状态（hy4 / DeepSeek V4.1 Flash）"
+        ),
+        loading && results.length === 0
+          ? React.createElement("div", { style: { fontSize: 12, color: secondary } }, "正在探测模型限流窗口…")
+          : error && results.length === 0
+            ? React.createElement(
+                "div",
+                { style: { fontSize: 12, color: secondary } },
+                `状态未知（${error}），请点「刷新」重试`
+              )
+            : React.createElement(
+                "div",
+                { style: { display: "flex", flexDirection: "column", gap: 6 } },
+                results.map((r) =>
+                  React.createElement(
+                    "div",
+                    {
+                      key: r.model,
+                      style: {
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 10,
+                        flexWrap: "wrap",
+                        padding: "8px 12px",
+                        borderRadius: 8,
+                        background: "var(--dsw-alias-bg-layer-1, var(--dsh-bg-secondary, rgba(128,128,128,0.08)))",
+                        border: `1px solid ${r.ok && r.limited ? danger : "var(--dsw-alias-border-l1, var(--dsh-border, rgba(128,128,128,0.35)))"}`,
+                      },
+                    },
+                    React.createElement(
+                      "span",
+                      { style: { fontSize: 12, fontWeight: 600, minWidth: 150 } },
+                      r.model
+                    ),
+                    !r.ok
+                      ? React.createElement("span", { style: { fontSize: 12, color: secondary } }, `探测失败：${r.message ?? ""}`)
+                      : React.createElement(
+                          "span",
+                          { style: { fontSize: 13, fontWeight: 600, color: r.available ? success : danger } },
+                          r.available ? "可用" : r.limited ? "限流中" : `异常（HTTP ${r.httpStatus}）`
+                        ),
+                    r.ok && r.limited && r.resetAt
+                      ? React.createElement(
+                          "span",
+                          { style: { fontSize: 12, color: secondary, fontVariantNumeric: "tabular-nums" } },
+                          `重置于 ${new Date(r.resetAt).toLocaleString()}（剩余 ${formatCountdown(r.resetAt, now)}）`
+                        )
+                      : r.ok && r.limited
+                        ? React.createElement("span", { style: { fontSize: 12, color: secondary } }, "（服务端未给出重置时间）")
+                        : r.ok && !r.available
+                          ? React.createElement("span", { style: { fontSize: 12, color: secondary } }, `探测返回 ${r.httpStatus}：${r.message ?? ""}`)
+                          : null
+                  )
+                ),
+                React.createElement(
+                  "div",
+                  { style: { fontSize: 11, color: secondary } },
+                  data?.servedAt ? `探测于 ${new Date(data.servedAt).toLocaleString()} · 每个模型一条 max_tokens:1 的最小请求（限流时不计费）` : ""
+                )
+              )
+      );
+    }
+
     // hy4-preview 用量/限流状态块：独立于额度查询渲染（额度接口挂了也要能看出限流）。
     function Hy4StatusBlock(props) {
       const { hy4, hy4Loading, hy4Error, now, secondary, danger, success } = props;
@@ -749,6 +823,9 @@ window.__ModuleLoader__.load({
       const [error, setError] = React.useState("");
       const [loading, setLoading] = React.useState(false);
       const [hy4, setHy4] = React.useState(null);
+      const [rateLimits, setRateLimits] = React.useState(null);
+      const [rateLimitsLoading, setRateLimitsLoading] = React.useState(false);
+      const [rateLimitsError, setRateLimitsError] = React.useState("");
       const [hy4Loading, setHy4Loading] = React.useState(false);
       const [hy4Error, setHy4Error] = React.useState("");
       const [sessionUsage, setSessionUsage] = React.useState(null);
@@ -763,6 +840,7 @@ window.__ModuleLoader__.load({
       requestsProviderRef.current = requestsProvider;
       const [now, setNow] = React.useState(Date.now());
       const hy4InflightRef = React.useRef(new Map());
+      const rateLimitsInflightRef = React.useRef(new Map());
       const sessionInflightRef = React.useRef(undefined);
       const requestInflightRef = React.useRef(undefined);
       const providerRef = React.useRef(provider);
@@ -816,6 +894,40 @@ window.__ModuleLoader__.load({
             hy4InflightRef.current.delete(which);
           });
         hy4InflightRef.current.set(which, promise);
+        return promise;
+      }, []);
+
+      // 多模型限流状态（hy4 系列 + DeepSeek V4.1 Flash）：一次请求探测全部。
+      const loadRateLimits = React.useCallback((which) => {
+        if (rateLimitsInflightRef.current.get(which)) return rateLimitsInflightRef.current.get(which);
+        setRateLimitsLoading(true);
+        setRateLimitsError("");
+        const route = ROUTES[which];
+        const promise = fetch(`${route}/usage/rate-limits`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({}),
+          cache: "no-store",
+        })
+          .then((response) => response.json())
+          .then((body) => {
+            if (!body || body.ok === false) {
+              setRateLimits(null);
+              setRateLimitsError(body?.message || "限流状态探测失败");
+            } else {
+              setRateLimits(body);
+              setRateLimitsError("");
+            }
+          })
+          .catch((e) => {
+            setRateLimits(null);
+            setRateLimitsError(`限流状态加载失败：${e instanceof Error ? e.message : String(e)}`);
+          })
+          .finally(() => {
+            setRateLimitsLoading(false);
+            rateLimitsInflightRef.current.delete(which);
+          });
+        rateLimitsInflightRef.current.set(which, promise);
         return promise;
       }, []);
 
@@ -888,8 +1000,9 @@ window.__ModuleLoader__.load({
         setHy4Error("");
         load(provider);
         loadHy4(provider);
+        loadRateLimits(provider);
         loadSessions();
-      }, [provider, requestsProvider, isRequestsView, load, loadHy4, loadSessions, loadRequests]);
+      }, [provider, requestsProvider, isRequestsView, load, loadHy4, loadRateLimits, loadSessions, loadRequests]);
 
       // 限流中且带重置时间时，每秒刷新一次倒计时。
       React.useEffect(() => {
@@ -1030,7 +1143,7 @@ window.__ModuleLoader__.load({
                           )
                     )
                   ),
-              React.createElement(Hy4StatusBlock, { hy4, hy4Loading, hy4Error, now, secondary, danger, success }),
+              React.createElement(RateLimitsBlock, { data: rateLimits, loading: rateLimitsLoading, error: rateLimitsError, now, secondary, danger, success }),
               React.createElement(SessionUsageBlock, {
                 data: sessionUsage,
                 loading: sessionLoading,

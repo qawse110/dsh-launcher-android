@@ -302,7 +302,7 @@ const HY4_MODEL_ID = "hy4-preview";
  * 探测本身不扣额度（x0.00），但会占一丁点窗口配额，所以在用量页加载或点
  * 「刷新」时才调用（不放在常驻轮询里）。
  */
-export async function probeCodeBuddyHy4(region, session, signal) {
+export async function probeModelRateLimit(region, session, modelId, signal) {
   const headers = {
     authorization: `Bearer ${session.auth.accessToken}`,
     ...(session.account?.userId ? { "X-User-Id": session.account.userId } : {}),
@@ -324,7 +324,7 @@ export async function probeCodeBuddyHy4(region, session, signal) {
         method: "POST",
         headers: { ...REQUEST_HEADERS, ...headers },
         body: JSON.stringify({
-          model: HY4_MODEL_ID,
+          model: modelId,
           // 国际版要求首条消息是 system prompt（否则 400/11128），中国区对两种都兼容；
           // 统一带 system 首条，保证两个区域都能探测。
           messages: [
@@ -340,7 +340,7 @@ export async function probeCodeBuddyHy4(region, session, signal) {
     } catch (error) {
       lastError = error;
       if (signal?.aborted || controller.signal.aborted) {
-        throw new Error("hy4-preview 用量探测已取消");
+        throw new Error(`模型 ${modelId} 限流探测已取消`);
       }
     } finally {
       clearTimeout(timer);
@@ -353,7 +353,7 @@ export async function probeCodeBuddyHy4(region, session, signal) {
     // 200 = 可用；不消费流内容，直接释放连接。
     response.body?.cancel().catch(() => {});
     return {
-      model: HY4_MODEL_ID,
+      model: modelId,
       available: true,
       limited: false,
       resetAt: null,
@@ -365,7 +365,7 @@ export async function probeCodeBuddyHy4(region, session, signal) {
   const payload = await response.json().catch(() => undefined);
   const code = payload?.code ?? response.status;
   const msg = payload?.msg ?? payload?.message ?? "";
-  const limited = response.status === 429 || code === 6000;
+  const limited = response.status === 429 || code === 6004;
   // 重置时间优先取 body.msg 里的 "2026-09-02 17:55:20"；body 缺失（纯 429）时
   // 兜底解析 Retry-After 头（秒数或 HTTP-date），拿不到就只报「限流中」。
   const resetMatch = typeof msg === "string" ? msg.match(/(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})/) : null;
@@ -388,7 +388,7 @@ export async function probeCodeBuddyHy4(region, session, signal) {
     }
   }
   return {
-    model: HY4_MODEL_ID,
+    model: modelId,
     available: false,
     limited,
     resetAt,
@@ -407,4 +407,9 @@ function parseResetTime(raw) {
   const [, year, month, day, hour, minute, second] = match.map(Number);
   const date = new Date(Date.UTC(year, month - 1, day, hour - 8, minute, second));
   return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+/** 旧接口名兼容：hy4-preview 专用探测 = 通用限流探测的特例。 */
+export async function probeCodeBuddyHy4(region, session, signal) {
+  return probeModelRateLimit(region, session, HY4_MODEL_ID, signal);
 }
