@@ -14,6 +14,7 @@ import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import com.google.android.material.color.DynamicColors
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import kotlin.concurrent.thread
@@ -25,13 +26,18 @@ import com.dsh.nextapp1.ui.*
 import com.dsh.nextapp1.R
 
 /**
- * 插件管理页 —— 整页重构后的信息架构：
+ * 插件管理页 —— 整页重构后的信息架构（**清单驱动**）：
+ *
+ * 插件集合的唯一真源是 assets/plugin-manifest.json（DshFlow 拷到 files/plugin-manifest.json）：
+ *   builtin  → 随 APK 装配，源目录 files/extra-plugins/<dir>
+ *   optional → 随 APK 分发但默认不装配，源目录 files/optional-plugins/<dir>，按需装配
+ * 本页不再硬编码任何插件表。
  *
  * ┌ 头部：标题 + dsh 服务实时状态 pill + 手动刷新
  * ├ 操作进度条（任何装配/重置/重启期间可见）
- * ├ 概览卡：内置 N · 扩展 M · 异常 K；主操作（一键重置修复[异常时] / 重新装配 / 重启服务）
- * ├ 内置插件：逐个健康卡（目录存在 / package.json 可解析 / 已装配），异常可单修
- * ├ 路由预设：router-spec / router-standard 安装状态
+ * ├ 概览卡：内置 N · 可选 M · 在线扩展 K · 异常 J；主操作（一键重置修复[异常时] / 重新装配 / 重启服务）
+ * ├ 内置插件：清单 builtin，逐个健康卡（目录存在 / package.json 可解析 / 已装配 / 副本是否落后于源）
+ * ├ 可选插件：清单 optional（源目录存在才显示该分区），已装配的可卸载、未装配的可装配
  * ├ 在线扩展：已装配扩展卡片 + 仓库安装入口（输入框内联在本区）
  * ├ 引导卡：插件源未就绪时提供「自动安装并启动」（复用 DshFlow 全量引擎）
  * └ 日志：可折叠控制台，操作输出实时回显
@@ -41,33 +47,24 @@ import com.dsh.nextapp1.R
 class PluginManagerActivity : AppCompatActivity() {
 
     companion object {
-        // 内置插件（随 APK 分发；首次 flow 已通过 dsh plugin add 装配）
-        // 与 install-dsh.mjs 的 BUILTIN_PLUGINS 保持一致（9 个）
-        val BUNDLED = setOf(
-            "dsh-mobile-nav", "dsh-super-injector",
-            "dsh-net-proxy", "dsh-provider-headers", "dsh-vision",
-            "dsh-status-bridge",
-            "dsh-android-links", "dsh-llm-codebuddy",
-            "dsh-prompt-optimizer",
-        )
-        val BUNDLED_DESC = mapOf(
-            "dsh-mobile-nav" to "移动端 UI 适配（窄屏抽屉/全宽会话）",
-            "dsh-super-injector" to "超级模组注入器（dev_* 运行时工具全家桶）",
-            "dsh-net-proxy" to "网络代理（web_search/web_fetch 走代理）",
-            "dsh-provider-headers" to "自定义 provider 请求头（设置页配置）",
-            "dsh-vision" to "视觉（view_image 工具 + VLM 后端）",
-            "dsh-status-bridge" to "状态桥接（悬浮窗/通知显示 dsh 运行情况）",
-            "dsh-android-links" to "Android 存储桥接（共享存储软链入 dsh home，目录选择器可浏览 /storage）",
-            "dsh-llm-codebuddy" to "CodeBuddy Provider（中国区/国际版共存模式）",
-            "dsh-prompt-optimizer" to "提示词优化（发送前用独立 AI 把输入改写成命令，可调档位/强度）",
-        )
         /**
-         * 路由预设已于 v4.10.3 从内置资产下线（连同 prebuilt.tgz 内的
-         * third_party/router-preset 一起移除），故不再有 PRESET 卡片。
-         * 需要时走「在线扩展」里的路由套件安装（ROUTING_REPO），
+         * 插件装配清单文件名 —— **单一真源**（app/src/main/assets/plugin-manifest.json，
+         * DshFlow 会把它拷到 files/plugin-manifest.json）。
+         *
+         * builtin = 随 APK 装配的插件；optional = 随 APK 分发但**默认不装配**的插件。
+         * 本页的展示、装配源、健康检查全部从该清单派生，Kotlin 侧不再维护并行的硬编码表
+         * （install-dsh.mjs 读同一份清单，装配面与展示面不可能再漂移）。
+         */
+        const val MANIFEST_NAME = "plugin-manifest.json"
+
+        /**
+         * 路由预设已于 v4.10.3 从内置资产下线（其源码曾随旧的内置插件压缩包分发），
+         * 故不再有 PRESET 卡片。需要时走「在线扩展」里的路由套件安装（ROUTING_REPO），
          * 或由 install-dsh.mjs 的 removePresets() 清理老设备残留。
          */
         const val ROUTING_REPO = "yjh051108/dsh-routing-suite"
+
+        /** dsh 自身的 bundle（非第三方插件）：用于把「在线扩展」里的 dsh 本体排除掉。 */
         private val BASE_BUNDLES = setOf(
             "@deepseek-ai/dsh-base",
             "@deepseek-ai/dsh-web-app",
@@ -98,7 +95,7 @@ class PluginManagerActivity : AppCompatActivity() {
     @Volatile
     private var listGeneration = 0
 
-    /** 内置源可用性缓存（key=apkVer:id）。tar -tzf 要解压 30MB tgz，重活只许在后台跑且须缓存。 */
+    /** 插件源可用性缓存（key=apkVer:源目录:dir），避免刷新时重复做目录 IO。 */
     private val srcAvailCache = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
 
     private val nodeDir: File get() = NodeRuntime.ensureExtracted(this)
@@ -106,6 +103,9 @@ class PluginManagerActivity : AppCompatActivity() {
     private fun dshPrefix() = File(filesDir, "dsh-prefix")
     private fun dshCliFile() = File(dshPrefix(), "node_modules/@deepseek-ai/dsh/lib/bin.js")
     private fun pluginsDir() = File(filesDir, "plugins")
+
+    /** 可选插件源（随 APK 分发、默认不装配）：files/optional-plugins，由 DshFlow 从 assets 同步。 */
+    private fun optionalPluginsDir() = File(filesDir, "optional-plugins")
     private fun profileWebDir() = File(filesDir, ".dsh/profiles/web")
     private fun profilePkg() = File(profileWebDir(), "package.json")
 
@@ -121,7 +121,7 @@ class PluginManagerActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         Ui.applyDynamicColors(this)
         setContentView(buildUi())
-        appendLog("插件管理就绪（内置 ${BUNDLED.size} 个）")
+        appendLog("插件管理就绪（清单驱动：$MANIFEST_NAME）")
         refreshList()
         handler.post(pollRunnable)
     }
@@ -172,7 +172,7 @@ class PluginManagerActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ))
         root.addView(TextView(this).apply {
-            text = "内置插件随 app 自动装配；在线安装走官方 dsh plugin --profile web add"
+            text = "内置插件随 app 自动装配，可选插件按需装配；在线安装走官方 dsh plugin --profile web add"
             textSize = 12f
             setTextColor(Ui.TEXT_SECONDARY)
             setPadding(0, dp(2), 0, 0)
@@ -190,7 +190,7 @@ class PluginManagerActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.MATCH_PARENT, dp(6)
         ).apply { topMargin = dp(8) })
 
-        // ---- 动态列表（概览/内置/预设/在线扩展/引导卡全部在此重建）----
+        // ---- 动态列表（概览/内置/可选/在线扩展/引导卡全部在此重建）----
         listBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val listScroll = ScrollView(this).apply { addView(listBox) }
         root.addView(listScroll, LinearLayout.LayoutParams(
@@ -297,71 +297,126 @@ class PluginManagerActivity : AppCompatActivity() {
             return
         }
 
-        // 骨架先上屏；重活（30MB prebuilt.tgz 的 tar 探测等）全部移到后台——
+        // 骨架先上屏；重活（清单解析、目录内容指纹比对等）全部移到后台——
         // 此前在主线程同步扫描曾把主线程卡过 ANR 阈值，被 ColorOS 直接杀进程（表现为闪退）
         listBox.addView(buildOverviewSkeleton())
         listBox.addView(sectionHeader("内置插件", null))
-        listBox.addView(makeCard("健康检测中…", "目录 · package.json · 装配状态 · 内置源可用性", "", "…", emptyList()))
+        listBox.addView(makeCard("健康检测中…", "清单 · 目录 · package.json · 装配状态 · 源可用性", "", "…", emptyList()))
         listBox.addView(sectionHeader("在线扩展", null))
         listBox.addView(buildInstallCard())
 
         thread(name = "plugin-health-scan") {
-            val bundled = BUNDLED.sorted().map { id -> Triple(id, healthOf(id), readVersion(id)) }
+            val manifest = loadManifest()
+            // 可选插件源目录不存在时（旧 APK / 资产未同步）整区不显示，也不参与健康扫描
+            val optionalEntries = if (optionalPluginsDir().isDirectory) manifest.optional else emptyList()
+            val bundled = manifest.builtin.map { e -> Triple(e, healthOf(e), readVersion(e.dir)) }
+            val optionals = optionalEntries.map { e -> Triple(e, healthOf(e), readVersion(e.dir)) }
+            // 「在线扩展」= profile 里登记、但没在上方两个分区渲染出来的 bundle。
+            // 用「实际渲染的条目」而非整份清单来排除：optional 源目录缺失时该分区整体不显示，
+            // 此时已装配的 optional 会落到「在线扩展」里（仍可见、可卸载），绝不重复两份。
+            val knownNames = (bundled.map { it.first } + optionals.map { it.first })
+                .flatMap { listOf(it.dir, it.name, it.id) }
+                .toSet()
             val extras = readBundles()
-                .filter { name -> name !in BASE_BUNDLES && BUNDLED.none { d -> name == d || name == "@dsh-external/$d" } }
+                .filter { name -> name !in BASE_BUNDLES && name !in knownNames }
                 .mapNotNull { name -> readInstalledPlugin(name) }
             val issues = mutableListOf<Pair<String, String>>()
-            for ((id, h, _) in bundled) when {
-                !h.dirExists -> issues.add(id to "目录缺失")
-                !h.healthy -> issues.add(id to "副本损坏")
-                !h.wired -> issues.add(id to "未装配")
+            if (manifest.error != null) issues.add("清单" to manifest.error)
+            for ((e, h, _) in bundled) when {
+                !h.dirExists -> issues.add(e.dir to "目录缺失")
+                !h.healthy -> issues.add(e.dir to "副本损坏")
+                !h.wired -> issues.add(e.dir to "未装配")
+            }
+            for ((e, h, _) in optionals) when {
+                // optional「未装配」是正常态，不算异常；只有已有副本损坏、或登记了却没副本才提示
+                h.dirExists && !h.healthy -> issues.add(e.dir to "可选副本损坏")
+                h.wired && !h.dirExists -> issues.add(e.dir to "可选已登记但副本缺失")
             }
 
             runOnUiThread {
                 if (isFinishing || isDestroyed || gen != listGeneration) return@runOnUiThread
-                renderList(bundled, extras, issues)
+                renderList(manifest, bundled, optionals, extras, issues)
             }
         }
     }
 
     /** 数据就绪后的完整渲染（主线程，纯视图构建无 IO）。 */
     private fun renderList(
-        bundled: List<Triple<String, BundledHealth, String>>,
+        manifest: PluginManifest,
+        bundled: List<Triple<PluginEntry, BundledHealth, String>>,
+        optionals: List<Triple<PluginEntry, BundledHealth, String>>,
         extras: List<PluginInfo>,
         issues: List<Pair<String, String>>
     ) {
         listBox.removeAllViews()
-        listBox.addView(buildOverviewCard(bundled.size, extras.size, issues))
+        listBox.addView(buildOverviewCard(bundled.size, optionals.size, extras.size, issues))
 
         listBox.addView(sectionHeader("内置插件", "${bundled.size} 个"))
-        for ((id, h, ver) in bundled) {
+        // 清单不可用时不静默空列表：显式告警卡（原因已由 loadManifest 写入日志）
+        if (manifest.error != null) listBox.addView(buildManifestWarnCard(manifest.error))
+        for ((e, h, ver) in bundled) {
             val status: String
             val actions = mutableListOf<Pair<String, () -> Unit>>()
             when {
                 !h.dirExists -> {
                     status = if (h.srcOk) "缺失 · 可修复" else "未内置（构建产物缺失）"
-                    if (h.srcOk) actions.add("恢复" to { repairSingle(id) })
+                    if (h.srcOk) actions.add("恢复" to { repairSingle(e) })
                 }
                 !h.healthy -> {
                     status = if (h.srcOk) "已损坏 · 可修复" else "已损坏（无内置源）"
-                    if (h.srcOk) actions.add("修复" to { repairSingle(id) })
+                    if (h.srcOk) actions.add("修复" to { repairSingle(e) })
                 }
                 !h.wired -> {
                     status = "待装配"
-                    actions.add("装配" to { wireBundled(id) })
+                    actions.add("装配" to { wireBundled(e) })
                 }
                 // ★ 「结构完好但内容落后」单列：旧逻辑落到 else 显示"已装配"，
                 //   而运行时加载的正是这份旧副本 → 装了新 APK 仍跑旧代码却毫无提示
                 //   （真机事故：只在启动时以「web 未就绪」炸出来，极难定位）。
                 h.staleVsSource -> {
                     status = "已装配 · 副本落后于内置源"
-                    if (h.srcOk) actions.add("修复" to { repairSingle(id) })
+                    if (h.srcOk) actions.add("修复" to { repairSingle(e) })
                 }
                 else -> status = "已装配"
             }
-            listBox.addView(makeCard(id, BUNDLED_DESC[id] ?: "", ver, status, actions))
+            listBox.addView(makeCard(e.title.ifBlank { e.dir }, e.desc, ver, status, actions))
         }
 
+        // ── 可选插件：随 APK 分发、默认不装配；源目录存在才显示该分区 ──
+        if (optionals.isNotEmpty()) {
+            listBox.addView(sectionHeader("可选插件", "${optionals.size} 个"))
+            for ((e, h, ver) in optionals) {
+                val status: String
+                val actions = mutableListOf<Pair<String, () -> Unit>>()
+                when {
+                    !h.dirExists && !h.wired -> {
+                        status = if (h.srcOk) "未装配" else "未装配（源缺失）"
+                        if (h.srcOk) actions.add("装配" to { wireOptional(e) })
+                    }
+                    !h.dirExists -> {
+                        status = if (h.srcOk) "已登记 · 副本缺失" else "已登记 · 副本缺失（无源）"
+                        if (h.srcOk) actions.add("恢复" to { repairSingle(e) })
+                    }
+                    !h.healthy -> {
+                        status = if (h.srcOk) "副本损坏 · 可修复" else "副本损坏（无源）"
+                        if (h.srcOk) actions.add("修复" to { repairSingle(e) })
+                    }
+                    !h.wired -> {
+                        status = "副本已就绪 · 待装配"
+                        actions.add("装配" to { wireBundled(e) })
+                    }
+                    h.staleVsSource -> {
+                        status = "已装配 · 副本落后于源"
+                        if (h.srcOk) actions.add("修复" to { repairSingle(e) })
+                    }
+                    else -> {
+                        status = "已装配"
+                        actions.add("卸载" to { uninstall(e.name) })
+                    }
+                }
+                listBox.addView(makeCard(e.title.ifBlank { e.dir }, e.desc, ver, status, actions))
+            }
+        }
 
         listBox.addView(sectionHeader("在线扩展", "${extras.size} 个"))
         for (info in extras) {
@@ -381,7 +436,7 @@ class PluginManagerActivity : AppCompatActivity() {
             setTextColor(Ui.TEXT_SECONDARY)
         })
         col.addView(TextView(this).apply {
-            text = "目录 · package.json · 装配状态 · 内置源可用性"
+            text = "清单 · 目录 · package.json · 装配状态 · 源可用性"
             textSize = 11.5f
             setTextColor(Ui.TEXT_MUTED)
             setPadding(0, dp(4), 0, 0)
@@ -407,7 +462,7 @@ class PluginManagerActivity : AppCompatActivity() {
         }
 
     /** 概览卡：数量总览 + 异常明细 + 主操作行。 */
-    private fun buildOverviewCard(bundledCount: Int, extraCount: Int, issues: List<Pair<String, String>>): View {
+    private fun buildOverviewCard(builtinCount: Int, optionalCount: Int, extraCount: Int, issues: List<Pair<String, String>>): View {
         val card = Ui.card(this, radiusDp = 16, background = Ui.SURFACE_CONTAINER_HIGH, elevationDp = 1f)
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
@@ -435,7 +490,8 @@ class PluginManagerActivity : AppCompatActivity() {
                 })
             })
         }
-        countBlock(bundledCount, "内置", Ui.TEXT_PRIMARY)
+        countBlock(builtinCount, "内置", Ui.TEXT_PRIMARY)
+        countBlock(optionalCount, "可选", Ui.TEXT_PRIMARY)
         countBlock(extraCount, "在线扩展", Ui.TEXT_PRIMARY)
         countBlock(issues.size, "异常", if (issues.isEmpty()) Ui.SUCCESS else Ui.DANGER)
         col.addView(countsRow, LinearLayout.LayoutParams(
@@ -678,35 +734,34 @@ class PluginManagerActivity : AppCompatActivity() {
         val staleVsSource: Boolean = false,
     )
 
-    /** 只许在后台线程调用（srcOk 的 tar 探测是重活，结果按 apkVer:id 缓存）。 */
-    private fun healthOf(id: String): BundledHealth {
-        val dir = File(pluginsDir(), id)
-        val key = AssetSync.apkVersion(this).toString() + ":" + id
-        val srcOk = srcAvailCache[key] ?: bundledSourceAvailable(id).also { srcAvailCache[key] = it }
+    /** 只许在后台线程调用（目录内容指纹比对是重活，结果按 apkVer:源目录:dir 缓存）。 */
+    private fun healthOf(e: PluginEntry): BundledHealth {
+        val dir = File(pluginsDir(), e.dir)
+        val key = AssetSync.apkVersion(this).toString() + ":" + e.sourceDir.name + ":" + e.dir
+        val srcOk = srcAvailCache[key] ?: bundledSourceAvailable(e).also { srcAvailCache[key] = it }
         return BundledHealth(
             dir.isDirectory,
             bundleHealthy(dir),
-            isWired(id),
+            isWired(e),
             srcOk,
-            staleVsSource = isStaleVsSource(id, dir),
+            staleVsSource = isStaleVsSource(e, dir),
         )
     }
 
     /**
-     * 装配副本是否**落后于**内置源。
+     * 装配副本是否**落后于**源（内置取 extra-plugins，可选取 optional-plugins）。
      *
      * 为什么要有这个判定：原 [bundleHealthy] 只校验 package.json 有 name，
      * 因此「旧版本但结构完好」的插件会被判成**健康**——真机事故正是如此：
-     * 装了含修复的新 APK，`files/plugins/<id>` 仍是旧代码，健康检查显示正常、
+     * 装了含修复的新 APK，`files/plugins/<dir>` 仍是旧代码，健康检查显示正常、
      * 用户毫无提示，只在启动时以「web 未就绪」炸出来。
      * 这里用与资产同步同一套内容指纹直接比对，暴露「源已更新、副本未刷新」。
      *
-     * 源不存在（该插件不由 extra-plugins 供给，如来自 prebuilt.tgz）时返回 false，
-     * 不做无根据的告警。
+     * 源不存在（清单条目对应的源目录缺失）时返回 false，不做无根据的告警。
      */
-    private fun isStaleVsSource(id: String, dir: File): Boolean {
+    private fun isStaleVsSource(e: PluginEntry, dir: File): Boolean {
         if (!File(dir, "package.json").isFile) return false
-        val src = File(filesDir, "extra-plugins/$id")
+        val src = File(e.sourceDir, e.dir)
         if (!File(src, "package.json").isFile) return false
         return runCatching { !AssetSync.dirContentEquals(src, dir) }.getOrDefault(false)
     }
@@ -719,53 +774,156 @@ class PluginManagerActivity : AppCompatActivity() {
         return j.optString("name").isNotBlank()
     }
 
-    /** APK 内是否带有该插件的可用源：extra-plugins 直拷源，或 prebuilt.tgz 内 third_party 子树。 */
-    private fun bundledSourceAvailable(id: String): Boolean {
-        if (File(filesDir, "extra-plugins/$id/package.json").isFile) return true
-        val tgz = File(filesDir, "prebuilt.tgz")
-        if (!tgz.isFile) return false
+    /**
+     * APK 内是否带有该插件的可用源。
+     *
+     * 供给链只有一条：清单条目按归属取源目录 —— builtin → files/extra-plugins/<dir>，
+     * optional → files/optional-plugins/<dir>（均由 AssetSync 从 APK assets 整目录拷出）。
+     * 旧的压缩包 tar 探测分支已随资产删除一并下线。
+     */
+    private fun bundledSourceAvailable(e: PluginEntry): Boolean =
+        File(File(e.sourceDir, e.dir), "package.json").isFile
+
+    /** 从内置源恢复单个插件目录：按清单取源目录整目录直拷（旧 tgz 通道已下线）。 */
+    private fun repairFromSource(e: PluginEntry): Boolean {
+        val src = File(e.sourceDir, e.dir)
+        if (!File(src, "package.json").isFile) return false
+        val dst = File(pluginsDir(), e.dir)
+        dst.deleteRecursively()
         return runCatching {
-            // v4.5 唯一 shell：内置 Termux bash
-            val bash = TermuxRuntime.bashPath(this)
-            if (!bash.isFile) return false
-            val pb = ProcessBuilder(
-                bash.absolutePath, "-c",
-                "tar -tzf '${tgz.absolutePath}' './third_party/$id/package.json' 2>/dev/null | head -n 1"
-            )
-            pb.redirectErrorStream(true)
-            val p = pb.start()
-            val line = p.inputStream.bufferedReader().readLine()
-            p.waitFor()
-            !line.isNullOrBlank()
+            src.copyRecursively(dst, overwrite = true)
+            bundleHealthy(dst)
         }.getOrDefault(false)
     }
 
-    /** 从内置源恢复单个插件目录：extra-plugins 直拷；否则 prebuilt.tgz 解包子树。 */
-    private fun repairFromSource(id: String): Boolean {
-        val dst = File(pluginsDir(), id)
-        dst.deleteRecursively()
-        val extraSrc = File(filesDir, "extra-plugins/$id")
-        if (File(extraSrc, "package.json").isFile) {
-            return runCatching {
-                extraSrc.copyRecursively(dst, overwrite = true)
-                bundleHealthy(dst)
-            }.getOrDefault(false)
+    // ── 插件清单（单一真源）────────────────────────────────
+
+    /** 清单条目：dir=目录名，name=package.json 的 name，id=cordis.patch.yml 的 insert id。 */
+    private data class PluginEntry(
+        val dir: String,
+        val name: String,
+        val id: String,
+        val title: String,
+        val desc: String,
+        /** 该条目对应的源目录：builtin → files/extra-plugins，optional → files/optional-plugins。 */
+        val sourceDir: File,
+    )
+
+    /**
+     * 清单解析结果。[error] 非空表示清单不可用（缺失/解析失败/builtin 为空）：
+     * 此时列表必须**显式**显示告警卡并写日志，绝不静默显示空列表。
+     */
+    private data class PluginManifest(
+        val builtin: List<PluginEntry> = emptyList(),
+        val optional: List<PluginEntry> = emptyList(),
+        val error: String? = null,
+    )
+
+    /**
+     * 读取装配清单 —— 单一真源 assets/plugin-manifest.json。
+     *
+     * 读取顺序：files/plugin-manifest.json（DshFlow 启动/安装时已从 APK 拷出）
+     * → APK assets 直读（AssetSync.openAsset 带 zip 兜底，绕开 release 包 assets 索引异常）。
+     * 解析失败不静默：返回 [PluginManifest.error] 并写日志，由 UI 渲染告警卡。
+     */
+    private fun loadManifest(): PluginManifest {
+        val text = readManifestText()
+        if (text == null) {
+            val msg = "$MANIFEST_NAME 不可读（files/ 与 APK assets 均取不到）"
+            appendLog("WARN 插件清单缺失：$msg")
+            return PluginManifest(error = msg)
         }
-        val tgz = File(filesDir, "prebuilt.tgz")
-        if (!tgz.isFile) return false
-        val tmp = File(filesDir, "tmp/repair-$id")
-        tmp.deleteRecursively()
-        tmp.mkdirs()
-        val cmd = "tar -xzf '${tgz.absolutePath}' -C '${tmp.absolutePath}' './third_party/$id'"
-        if (runProcess(cmd, baseEnv(), "解包 $id") != 0) return false
-        val src = File(tmp, "third_party/$id")
-        val ok = File(src, "package.json").isFile &&
-            runCatching {
-                src.copyRecursively(dst, overwrite = true)
-                bundleHealthy(dst)
-            }.getOrDefault(false)
-        tmp.deleteRecursively()
-        return ok
+        return try {
+            val j = JSONObject(text)
+            val builtin = parseManifestList(j.optJSONArray("builtin"), File(filesDir, "extra-plugins"))
+            val optional = parseManifestList(j.optJSONArray("optional"), optionalPluginsDir())
+            if (builtin.isEmpty()) {
+                val msg = "$MANIFEST_NAME 的 builtin 列表为空"
+                appendLog("WARN 插件清单异常：$msg")
+                PluginManifest(builtin, optional, msg)
+            } else {
+                PluginManifest(builtin, optional, null)
+            }
+        } catch (t: Throwable) {
+            val msg = "$MANIFEST_NAME 解析失败：${t.message}"
+            appendLog("WARN 插件清单解析失败：$msg")
+            PluginManifest(error = msg)
+        }
+    }
+
+    private fun readManifestText(): String? {
+        val f = File(filesDir, MANIFEST_NAME)
+        try {
+            if (f.isFile && f.length() > 0L) return f.readText()
+        } catch (t: Throwable) {
+            appendLog("WARN 读取 ${f.absolutePath} 失败：${t.message}")
+        }
+        return try {
+            AssetSync.openAsset(this, MANIFEST_NAME).use { String(it.readBytes(), Charsets.UTF_8) }
+        } catch (t: Throwable) {
+            appendLog("WARN 读取 assets/$MANIFEST_NAME 失败：${t.message}")
+            null
+        }
+    }
+
+    /** 解析清单数组；条目缺 dir 时跳过并记日志（不静默丢弃）。 */
+    private fun parseManifestList(arr: JSONArray?, sourceDir: File): List<PluginEntry> {
+        if (arr == null) return emptyList()
+        val out = ArrayList<PluginEntry>(arr.length())
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val dir = o.optString("dir").trim()
+            if (dir.isEmpty()) {
+                appendLog("WARN 清单第 $i 项缺少 dir，已跳过")
+                continue
+            }
+            out.add(
+                PluginEntry(
+                    dir = dir,
+                    name = o.optString("name").trim().ifEmpty { dir },
+                    id = o.optString("id").trim().ifEmpty { dir },
+                    title = o.optString("title").trim().ifEmpty { dir },
+                    desc = o.optString("desc").trim(),
+                    sourceDir = sourceDir,
+                )
+            )
+        }
+        return out
+    }
+
+    /**
+     * 兜底：确保 files/plugin-manifest.json 存在（install-dsh.mjs 也从这里读清单）。
+     * 正常路径由 DshFlow 拷贝；此处仅防「清单没到位 → 静默装配 0 个插件」的故障。
+     */
+    private fun ensureManifestFile() {
+        val dest = File(filesDir, MANIFEST_NAME)
+        if (dest.isFile && dest.length() > 0L) return
+        if (AssetSync.copyAsset(this, MANIFEST_NAME, dest)) {
+            appendLog("   清单已从 APK assets 补齐：$MANIFEST_NAME")
+        } else {
+            appendLog("   WARN 无法获取 $MANIFEST_NAME，install-dsh.mjs 将装配 0 个插件")
+        }
+    }
+
+    /** 清单不可用时的显式告警卡（绝不静默显示空列表）。 */
+    private fun buildManifestWarnCard(reason: String): View {
+        val card = Ui.card(this, radiusDp = 14, background = Ui.SURFACE_CONTAINER, stroke = Ui.WARNING, elevationDp = 0f)
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        col.addView(TextView(this).apply {
+            text = "插件清单不可用"
+            textSize = 14f
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            setTextColor(Ui.WARNING)
+        })
+        col.addView(TextView(this).apply {
+            text = "$MANIFEST_NAME 读取/解析失败：$reason\n请点「刷新」重试；若持续失败，用「自动安装并启动」重建 files/ 资产。"
+            textSize = 12f
+            setTextColor(Ui.TEXT_SECONDARY)
+            setLineSpacing(dp(2).toFloat(), 1f)
+            setPadding(0, dp(4), 0, 0)
+        })
+        card.addView(col)
+        return card
     }
 
     // ── 数据读取 ──────────────────────────────────────────
@@ -780,12 +938,13 @@ class PluginManagerActivity : AppCompatActivity() {
         }
     }
 
-    /** 装配判定：官方 dsh plugin add 后会在 profile node_modules 出现对应包。 */
-    private fun isWired(d: String): Boolean {
+    /** 装配判定：官方 dsh plugin add 后会在 profile node_modules / bundles 里出现对应包。 */
+    private fun isWired(e: PluginEntry): Boolean {
         val nm = profileNm()
-        if (File(nm, d).exists()) return true
-        if (File(nm, "@dsh-external/$d").exists()) return true
-        return readBundles().any { it == d || it == "@dsh-external/$d" }
+        val names = listOf(e.name, e.dir, "@dsh-external/${e.name}", "@dsh-external/${e.dir}").distinct()
+        if (names.any { File(nm, it).exists() }) return true
+        val bundles = readBundles()
+        return names.any { n -> bundles.any { it == n } }
     }
 
     private fun profileNm() = File(profileWebDir(), "node_modules")
@@ -830,8 +989,9 @@ class PluginManagerActivity : AppCompatActivity() {
 
     /** 状态 pill 颜色显式映射（「已损坏」不得命中 contains(已) 变绿）。 */
     private fun statusColor(status: String): Int = when {
-        status.contains("已装配") || status.contains("已安装") || status.contains("已连接") -> Ui.SUCCESS
         status.contains("损坏") || status.contains("缺失") -> Ui.DANGER
+        status.contains("落后") -> Ui.WARNING
+        status.contains("已装配") || status.contains("已安装") || status.contains("已连接") -> Ui.SUCCESS
         status.contains("待") || status.contains("需") -> Ui.WARNING
         else -> Ui.TEXT_MUTED
     }
@@ -901,41 +1061,71 @@ class PluginManagerActivity : AppCompatActivity() {
         }.start()
     }
 
-    /** 单个内置插件「装配」：目录健康但未注册进 profile。 */
-    private fun wireBundled(id: String) {
+    /** 单个插件「装配」：files/plugins/<dir> 副本健康但未注册进 profile。 */
+    private fun wireBundled(e: PluginEntry) {
         if (!guardBusy()) return
         setBusy(true)
         Thread {
             try {
-                val path = File(pluginsDir(), id).absolutePath
-                dshPluginSync(listOf("add", path), "装配 $id")
+                val path = File(pluginsDir(), e.dir).absolutePath
+                dshPluginSync(listOf("add", path), "装配 ${e.dir}")
                 refreshListSafe()
             } catch (t: Throwable) {
-                appendLog("装配 $id 异常: ${t.message}")
+                appendLog("装配 ${e.dir} 异常: ${t.message}")
             } finally {
                 setBusy(false)
             }
         }.start()
     }
 
-    /** 单个内置插件「修复/恢复」：清异常副本 → 从内置源恢复 → 注册进 profile。 */
-    private fun repairSingle(id: String) {
+    /**
+     * 可选插件「装配」：先把 optional-plugins 源整目录补到 files/plugins/<dir>，
+     * 再走与内置插件完全相同的 `dsh plugin add <path>` 注册路径。
+     * optional 默认不装配，只有用户显式点「装配」才会进入 profile。
+     */
+    private fun wireOptional(e: PluginEntry) {
+        if (!guardBusy()) return
+        setBusy(true)
+        Thread {
+            try {
+                ensureHarnessTools()
+                appendLog(">> 装配可选插件 ${e.dir} …")
+                if (!File(File(pluginsDir(), e.dir), "package.json").isFile) {
+                    if (!repairFromSource(e)) {
+                        appendLog("   ✗ ${e.dir} 无可选源或复制失败，装配中止")
+                        return@Thread
+                    }
+                    appendLog("   ✓ ${e.dir} 已从 optional-plugins 源复制到 plugins/")
+                }
+                val path = File(pluginsDir(), e.dir).absolutePath
+                dshPluginSync(listOf("add", path), "装配 ${e.dir}")
+                refreshListSafe()
+            } catch (t: Throwable) {
+                appendLog("装配可选插件 ${e.dir} 异常: ${t.message}")
+            } finally {
+                setBusy(false)
+            }
+        }.start()
+    }
+
+    /** 单个插件「修复/恢复」：清异常副本 → 按清单从源目录恢复 → 注册进 profile。 */
+    private fun repairSingle(e: PluginEntry) {
         if (!guardBusy()) return
         setBusy(true)
         Thread {
             try {
                 ensureHarnessTools()
                 syncExtraPluginsSource()
-                appendLog(">> 修复 $id …")
-                if (!repairFromSource(id)) {
-                    appendLog("   ✗ $id 恢复失败（无可用内置源或解包失败）")
+                appendLog(">> 修复 ${e.dir} …")
+                if (!repairFromSource(e)) {
+                    appendLog("   ✗ ${e.dir} 恢复失败（源目录缺失或复制失败）")
                     return@Thread
                 }
-                val path = File(pluginsDir(), id).absolutePath
-                dshPluginSync(listOf("add", path), "装配 $id")
+                val path = File(pluginsDir(), e.dir).absolutePath
+                dshPluginSync(listOf("add", path), "装配 ${e.dir}")
                 refreshListSafe()
             } catch (t: Throwable) {
-                appendLog("修复 $id 异常: ${t.message}")
+                appendLog("修复 ${e.dir} 异常: ${t.message}")
             } finally {
                 setBusy(false)
             }
@@ -947,7 +1137,7 @@ class PluginManagerActivity : AppCompatActivity() {
         if (!guardBusy()) return
         AlertDialog.Builder(this)
             .setTitle("重新装配内置插件")
-            .setMessage("跳过 npm 更新，仅重新装配全部内置插件与路由预设（--plugins-only）。继续？")
+            .setMessage("跳过 npm 更新，仅重新装配全部内置插件（清单 builtin，--plugins-only）。继续？")
             .setPositiveButton("执行") { _, _ ->
                 setBusy(true)
                 Thread {
@@ -983,14 +1173,18 @@ class PluginManagerActivity : AppCompatActivity() {
                     try {
                         ensureHarnessTools()
                         syncExtraPluginsSource()
-                        for (id in BUNDLED.sorted()) {
-                            val h = healthOf(id)
-                            val needsRepair = (!h.dirExists || !h.healthy) && h.srcOk
-                            if (needsRepair) {
-                                appendLog(">> 恢复 $id …")
-                                appendLog(if (repairFromSource(id)) "   ✓ $id 已从内置源恢复" else "   ✗ $id 恢复失败")
+                        val manifest = loadManifest()
+                        // builtin 缺失/损坏都修；optional 只修「已有副本但损坏」的，
+                        // 绝不因为一次重置就把默认不装配的可选插件塞进 profile
+                        val targets = manifest.builtin.map { it to true } + manifest.optional.map { it to false }
+                        for ((e, isBuiltin) in targets) {
+                            val h = healthOf(e)
+                            val repairable = h.srcOk && (isBuiltin || h.dirExists)
+                            if ((!h.dirExists || !h.healthy) && repairable) {
+                                appendLog(">> 恢复 ${e.dir} …")
+                                appendLog(if (repairFromSource(e)) "   ✓ ${e.dir} 已从源目录恢复" else "   ✗ ${e.dir} 恢复失败")
                             } else if (h.dirExists && !h.healthy) {
-                                appendLog("   ⚠ $id 损坏且无内置源可恢复，跳过")
+                                appendLog("   ⚠ ${e.dir} 损坏且无源可恢复，跳过")
                             }
                         }
                         val code = rewireCore("重置装配")
@@ -1025,28 +1219,20 @@ class PluginManagerActivity : AppCompatActivity() {
     /** --plugins-only 核心（供「重新装配」与「一键重置」复用）。 */
     private fun rewireCore(label: String): Int {
         val apkVer = AssetSync.apkVersion(this)
-        // 资产判据用安装戳（versionCode 是硬编码常量，无法识别 APK 换代）
-        val apkStamp = AssetSync.apkInstallStamp(this)
         val installScript = File(filesDir, "install-dsh.mjs")
         if (!AssetSync.copyAsset(this, "install-dsh.mjs", installScript) && !installScript.exists()) {
             appendLog("   ✗ $label 失败：install-dsh.mjs 缺失")
             return -1
         }
-        val prebuilt = File(filesDir, "prebuilt.tgz")
-        if (AssetSync.isSynced(this, "prebuilt", prebuilt, apkStamp)) {
-            appendLog("   内置插件源已是最新，跳过复制")
-        } else if (AssetSync.copyAsset(this, "prebuilt.tgz", prebuilt)) {
-            AssetSync.markSyncedWithFingerprint(this, "prebuilt", prebuilt, apkStamp)
-            appendLog("   内置插件源 ${prebuilt.length() / 1024 / 1024}MB")
-        } else {
-            appendLog("   WARN 无法复制 prebuilt.tgz，继续使用已有源")
-        }
+        // 内置插件源只有一条供给链：assets/extra-plugins → files/extra-plugins →
+        // install-dsh.mjs 的 syncExtraPlugin() 整目录替换到 files/plugins。
+        // 旧的压缩包 tgz 通道已随资产删除一并下线，这里不再复制任何 tgz。
+        ensureManifestFile()
         val node = File(File(nodeDir, "bin"), "node")
         val cmd = "${node.absolutePath} ${installScript.absolutePath} --plugins-only"
         val env = baseEnv().apply {
             put("DSH_PREFIX", dshPrefix().absolutePath)
             put("DSH_PROFILE", "web")
-            put("DSH_PREBUILT", prebuilt.absolutePath)
             put("DSH_PLUGINS_DIR", pluginsDir().absolutePath)
             put("DSH_APK_VER", apkVer.toString())
         }

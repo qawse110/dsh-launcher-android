@@ -1,0 +1,61 @@
+{
+  "$comment": "内置插件装配清单 —— 单一真源。install-dsh.mjs 与 PluginManagerActivity.kt 都从这里读取；两侧不得再各自硬编码。dir = assets/extra-plugins/<dir>，name = package.json 的 name，id = cordis.patch.yml 的 insert id。",
+  "version": 1,
+  "profile": "web",
+  "builtin": [
+    {
+      "dir": "dsh-web-mobile",
+      "name": "dsh-web-mobile",
+      "id": "dsh-web-mobile",
+      "title": "移动端适配",
+      "desc": "竖屏/窄屏 Web 适配（抽屉导航、全宽会话、安全区、触控人体工学）",
+      "upstream": "https://github.com/mexiaosqwq/dsh-web-mobile"
+    },
+    {
+      "dir": "dsh-prompt-optimizer",
+      "name": "@dsh-external/dsh-prompt-optimizer",
+      "id": "prompt-optimizer",
+      "title": "提示词优化",
+      "desc": "发送前用独立 AI 把输入改写成命令，可调档位/强度（含移动端适配补丁）",
+      "upstream": "https://github.com/WestFox-AwA/dsh-prompt-optimizer"
+    },
+    {
+      "dir": "dsh-codearts-auth",
+      "name": "dsh-codearts-auth",
+      "id": "codearts-auth",
+      "title": "CodeArts 多 Provider",
+      "desc": "CodeArts/Buddy/Qoder/Trae/Cline 等 Provider 登录、积分与模型接入",
+      "upstream": "https://gitee.com/iJetLi/deepseek-harness-codearts"
+    }
+  ],
+  "optional": [
+    {
+      "dir": "dsh-status-bridge",
+      "name": "@dsh-external/dsh-status-bridge",
+      "id": "dsh-status-bridge",
+      "title": "状态桥接",
+      "desc": "悬浮窗/通知显示 dsh 运行情况（与启动器 Kotlin 侧强耦合，默认不装配）"
+    },
+    {
+      "dir": "dsh-android-links",
+      "name": "@dsh-external/dsh-android-links",
+      "id": "dsh-android-links",
+      "title": "Android 存储桥接",
+      "desc": "共享存储软链入 dsh home，目录选择器可浏览 /storage"
+    },
+    {
+      "dir": "dsh-llm-codebuddy",
+      "name": "dsh-llm-codebuddy",
+      "id": "llm-codebuddy",
+      "title": "CodeBuddy Provider",
+      "desc": "CodeBuddy Provider（中国区/国际版共存模式）"
+    },
+    {
+      "dir": "dsh-oh-we-need",
+      "name": "@dsh-external/dsh-oh-we-need",
+      "id": "dsh-oh-we-need",
+      "title": "oh-we-need",
+      "desc": "提示词/技能增强包（历史遗留，从未接入装配链）"
+    }
+  ]
+}

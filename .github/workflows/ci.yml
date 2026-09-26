@@ -32,6 +32,12 @@ jobs:
         with:
           packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
 
+      - name: 插件清单一致性门禁
+        # 内置插件清单是单一真源（assets/plugin-manifest.json）；本步校验
+        # 「清单 ↔ 资产目录 ↔ package.json ↔ cordis.patch.yml」四者对齐，
+        # 防止再次出现「六处手工硬编码、两侧静默不一致」的历史问题。
+        run: node tools/check-plugin-manifest.mjs
+
       - name: Assemble debug（编译门禁）
         run: chmod +x gradlew && ./gradlew :app:assembleDebug --no-daemon
 

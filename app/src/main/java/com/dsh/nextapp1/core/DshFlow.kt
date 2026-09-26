@@ -22,7 +22,7 @@ import com.dsh.nextapp1.R
  *
  * 阶段（安装+启动全流程）：
  *   1) 确保内置 node 解压
- *   2) 复制 assets 内 install-dsh.mjs + prebuilt.tgz + extra-plugins（内置插件源）
+ *   2) 复制 assets 内 install-dsh.mjs + plugin-manifest.json + extra-plugins（内置插件源）
  *   3) 官方 npm 安装/更新 @deepseek-ai/dsh，并用 `dsh plugin --profile web add` 装配内置插件
  *   4) 执行 stub-dsh.mjs（Android 兼容修复），后台启动 dsh web 并等待 HTTP 就绪
  *
@@ -43,8 +43,14 @@ object DshFlow {
 
     const val WEB_PORT = 3080
 
-    /** dsh 本体钉死版本：普通安装始终装这个精确版本（DSH_TAG 可被 UI/回滚显式覆盖）。 */
-    const val PINNED_DSH_TAG = "0.1.5-rc.2"
+    /**
+     * dsh 本体钉死版本：普通安装始终装这个精确版本（DSH_TAG 可被 UI/回滚显式覆盖）。
+     *
+     * **单一真源是 assets/dsh-pin.json**——install-dsh.mjs 的默认 tag 也读同一份，
+     * 两侧不再各自硬编码（历史上 0.1.1→0.1.2→0.1.5 每次升级都要手工同步两处，
+     * 漏一处就静默装成另一个版本）。这里的常量是「读不到 pin 文件」时的编译期兜底。
+     */
+    const val PINNED_DSH_TAG = "0.1.7-rc.2"
 
     /** 统一日志文件名（files/logs/ 下，见 [FileLog]）。 */
     const val FLOW_LOG = "flow.log"
@@ -61,6 +67,18 @@ object DshFlow {
         nohup @NODE_CMD@ > "@LOG_FILE@" 2>&1 &
         echo DSH_WEB_PID=${'$'}!
         """.trimIndent()
+
+    /**
+     * 从 assets/dsh-pin.json 读钉死版本；读不到时回退 [PINNED_DSH_TAG]。
+     *
+     * 与 install-dsh.mjs 的 pinnedDshTag() 读**同一份文件**——这是「两侧不再各自
+     * 硬编码版本号」的落地方式。历史上版本号散落在 Kotlin 两处 + JS 一处，
+     * 每次升级都要手工同步，漏一处就静默装成另一个版本。
+     */
+    fun pinnedTag(ctx: Context): String = runCatching {
+        val txt = ctx.assets.open("dsh-pin.json").use { it.readBytes().toString(Charsets.UTF_8) }
+        org.json.JSONObject(txt).optString("tag").takeIf { it.isNotBlank() }
+    }.getOrNull() ?: PINNED_DSH_TAG
 
     fun dshCli(ctx: Context): File =
         File(File(ctx.filesDir, "dsh-prefix"), "node_modules/@deepseek-ai/dsh/lib/bin.js")
@@ -206,15 +224,23 @@ object DshFlow {
             onState?.invoke("出错")
             return false
         }
-        val prebuilt = File(ctx.filesDir, "prebuilt.tgz")
-        if (AssetSync.isSynced(ctx, "prebuilt", prebuilt, apkStamp)) {
-            fl("  内置插件源已是最新，跳过复制")
-        } else if (AssetSync.copyAsset(ctx, "prebuilt.tgz", prebuilt)) {
-            AssetSync.markSyncedWithFingerprint(ctx, "prebuilt", prebuilt, apkStamp)
-            fl("  内置插件源 ${prebuilt.length() / 1024 / 1024}MB")
-        } else {
-            fl("  WARN assets 无 prebuilt.tgz，继续使用已有插件源")
+        // 插件清单（单一真源）：装配面与展示面都从它派生，Kotlin/JS 两侧不再各自硬编码。
+        try {
+            ctx.assets.open("plugin-manifest.json").use { input ->
+                File(ctx.filesDir, "plugin-manifest.json").outputStream().use { output -> input.copyTo(output) }
+            }
+        } catch (t: Throwable) {
+            fl("  WARN assets 无 plugin-manifest.json：${t.message}")
         }
+        // dsh 钉死版本同源文件：install-dsh.mjs 也读它，两侧不再各自硬编码版本号。
+        try {
+            ctx.assets.open("dsh-pin.json").use { input ->
+                File(ctx.filesDir, "dsh-pin.json").outputStream().use { output -> input.copyTo(output) }
+            }
+        } catch (t: Throwable) {
+            fl("  WARN assets 无 dsh-pin.json：${t.message}")
+        }
+        // 内置插件源：重构后**只有这一条供给链**（原 prebuilt.tgz 的 third_party 链已删除）。
         val extraPluginsDir = File(ctx.filesDir, "extra-plugins")
         if (AssetSync.isSynced(ctx, "extra-plugins", extraPluginsDir, apkStamp)) {
             fl("  额外桥接插件源已是最新，跳过复制")
@@ -232,6 +258,22 @@ object DshFlow {
                 fl("  WARN assets 无 extra-plugins：${t.message}")
             }
         }
+        // 可选插件源（随 APK 分发、默认**不装配**）：保留代码供用户在插件管理页按需装配。
+        val optionalPluginsDir = File(ctx.filesDir, "optional-plugins")
+        if (AssetSync.isSynced(ctx, "optional-plugins", optionalPluginsDir, apkStamp)) {
+            fl("  可选插件源已是最新，跳过复制")
+        } else {
+            try {
+                if (AssetSync.copyAssetDir(ctx, "optional-plugins", optionalPluginsDir, clearFirst = true)) {
+                    AssetSync.markSyncedWithFingerprint(ctx, "optional-plugins", optionalPluginsDir, apkStamp)
+                    fl("  可选插件源 ${optionalPluginsDir.walkTopDown().count { it.isFile }} 个文件（默认不装配）")
+                } else {
+                    fl("  WARN assets 无 optional-plugins")
+                }
+            } catch (t: Throwable) {
+                fl("  WARN assets 无 optional-plugins：${t.message}")
+            }
+        }
 
         // —— 3/4~4/4 安装 + 启动（临时更新保护：异常时自动回滚一次，最多两轮）——
         // 第一轮用用户指定 tag（latest / next / 回滚版本）正常安装；
@@ -239,14 +281,18 @@ object DshFlow {
         var attempt = 0
         while (attempt < 2) {
             attempt++
-            // dsh 本体版本钉死为 0.1.5-rc.2（仅 UI 显式选择 tag 时才覆盖）
+            // dsh 本体版本钉死（仅 UI 显式选择 tag 时才覆盖）。默认值来自 assets/dsh-pin.json，
+            // 与 install-dsh.mjs 同源，不再两处硬编码。
+            val pinned = pinnedTag(ctx)
             val tag = ctx.getSharedPreferences(AppState.Prefs.CONSOLE, Context.MODE_PRIVATE)
-                .getString("dsh_install_tag", "0.1.5-rc.2") ?: "0.1.5-rc.2"
-            // 回滚重装（tag=精确旧版本）显式跳过基线记录：此时要回到的就是基线本身，
-            // 记录会把它覆盖成回滚目标——此前行为正确只是靠 afterInstall 的 cur==prev
-            // 分支兜底，这里把语义显式化。
-            // 注意：钉死的默认版本 0.1.5-rc.2 也是精确版本，但它不是回滚 attempt。
-            val isRollbackAttempt = tag != "latest" && tag != "next" && tag != PINNED_DSH_TAG
+                .getString("dsh_install_tag", pinned) ?: pinned
+            // 回滚重装显式跳过基线记录：此时要回到的就是基线本身，记录会把它覆盖成
+            // 回滚目标。
+            //
+            // 判据必须锚定「本次 tag 是否等于回滚基线」，**不能**用「tag 是不是精确版本号」
+            // 笼统判断：钉死版本本身也是精确版本号，而「检查到新版本→更新」路径同样会显式
+            // 置 tag=远端精确版本号——那种情况必须记录基线，否则临时更新保护失效。
+            val isRollbackAttempt = tag == DshUpdater.prevVersion(ctx)
             if (isRollbackAttempt) {
                 fl("  回滚重装 attempt：保持原基线，不重新记录")
             } else {
@@ -256,15 +302,17 @@ object DshFlow {
             }
 
             fl(">> 3/4 官方 npm 安装/更新 dsh + dsh plugin 装配内置插件…")
-            if (tag != "latest" && tag != PINNED_DSH_TAG) fl("  （安装 dist-tag=$tag 预发布/回滚线）")
-            else if (tag == PINNED_DSH_TAG) fl("  （dsh 版本钉死：$tag）")
+            when {
+                tag == pinned -> fl("  （dsh 版本钉死：$tag）")
+                isRollbackAttempt -> fl("  （回滚重装精确版本 $tag）")
+                else -> fl("  （安装指定版本 $tag）")
+            }
             val installEnv = mapOf(
                 "HOME" to ctx.filesDir.absolutePath,
                 "NODE_BIN" to "$nodeDir/bin/node",
                 "NPM_BIN" to "$nodeDir/bin/npm",
                 "DSH_PREFIX" to dshPrefix.absolutePath,
                 "DSH_PROFILE" to "web",
-                "DSH_PREBUILT" to prebuilt.absolutePath,
                 "DSH_PLUGINS_DIR" to pluginsDir.absolutePath,
                 "DSH_EXTRA_PLUGINS_SRC" to extraPluginsDir.absolutePath,
                 "DSH_TAG" to tag,

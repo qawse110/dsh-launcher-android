@@ -9,28 +9,45 @@
  * Cordis 插件运行时实现的功能一律下沉为独立内置插件（见
  * docs/plugin-conversion-audit.md），避免每次 dsh 升级都要重新对表补锚点。
  *
- * 现存修复：
+ * 现存修复：**14 个补丁区域** = 13 个顶层 try 块 + 1 个缩进块（attachment-local 视觉链路，
+ * 历史原因写在 sharp 块之后、未提升缩进）。每个补丁块的注释都标注了「已针对
+ * 0.1.7-rc.2 核实」的锚点状态（命中数 / 未命中原因 / 与版本无关）：
  *   1) koffi / node-pty / sharp：Android 无预编译产物，用 Proxy stub / 纯 JS
- *      shim 顶替（模块 import 期，插件通道无法介入）；
+ *      shim 顶替（模块 import 期，插件通道无法介入）。**与 dsh 版本无关，锚点不适用**；
  *   2) @deepseek-ai/dsh-attachment-local 视觉链路 v5：SELinux 禁 link(2)（实测应用
  *      私有存储上同为 EACCES，非仅 sdcard）、FUSE 上 fsync 失败的运行时行为修复
  *      （fs 兼容层不覆盖 CJS 盲区，只能改源）。v5 起 link 调用点改为**扫描式**改写，
  *      不再锚定单一字面量——上游 0.1.5 把发布链路重构成 publishStagedObject /
- *      publishImmutableAlias 两点，v4 的单锚点因此静默失效（无报错、补丁不生效）；
+ *      publishImmutableAlias 两点，v4 的单锚点因此静默失效（无报错、补丁不生效）。
+ *      0.1.7-rc.2 实测仍为 2 个扫描命中点，**扫描式实现已兼容，无需改动**；
  *   3) @deepseek-ai/dsh-llm-pi-ai sendAttribution：dsh-provider-headers 内置
  *      插件的「关闭归因 UA」依赖该 schema 字段，上游明确注释
- *      “omission cannot suppress attribution”，在官方提供抑制缝隙前保留；
+ *      “omission cannot suppress attribution”，在官方提供抑制缝隙前保留。
+ *      0.1.7-rc.2 的 schema 声明形式已变（见补丁块注释），锚点已按实测修正；
  *   4) koffi ABI 布局断言禁用（**非防御性，是 boot 硬阻断**）：koffi 被 stub 后
  *      struct().size 恒为 0，而上游在 import 期断言 STARTUPINFOW=104 /
  *      PROCESS_INFORMATION=24 → 抛错使 Cordis 判定整棵插件树 apply 失败，web 起不来。
  *      0.1.5 把断言从 dsh-sandbox-windows-acl **搬到了新包** dsh-win32-process，
- *      故改为按包名清单遍历两包（只扫旧包会 0 命中而 boot 必崩）；
+ *      故改为按包名清单遍历两包（只扫旧包会 0 命中而 boot 必崩）。
+ *      0.1.7-rc.2 实测：dsh-win32-process 命中 2 处、旧包 0 处，**清单式实现已兼容**；
  *   5) WebView/旧 Chrome AbortSignal.timeout polyfill——仅当前端产物确实引用
  *      该 API 时才注入（rc.2 前端与全部内置插件 client 均无引用，自动跳过，
  *      不再无条件改写 dist/index.html；引导期早于 app bundle，插件无法替代）；
  *   6) @vscode/ripgrep 解析器 Android 回退（import 期解析，优先 Termux 原生 rg）；
+ *      **与 dsh 版本无关，锚点不适用**；
  *   7) dsh-fs-local chmod 对 FUSE 的 EACCES/EPERM 容错（原子写内部路径，
- *      无插件缝隙）。
+ *      无插件缝隙）。0.1.7-rc.2 三处锚点全部命中，**保持不动**；
+ *   8) **新增** node-addon-require-builtin 纯 JS 顶替（0.1.7 新增的 boot 级硬阻断，
+ *      见对应补丁块注释）。
+ *
+ * 已评估、**无需补丁**（0.1.7 结构性收敛结论，逐条有实测依据）：
+ *   - @deepseek-ai/dsh-atomic-write（0.1.7 新包）：只 import node:fs/promises 的
+ *     lstat/mkdir/readFile/rename/rm/writeFile + node:crypto，**不调用 chmod**；
+ *     权限位经 writeFile({ mode }) 在建 inode 时生效，rename 只换目录项，
+ *     二者在 FUSE/SELinux 上都不需要容错（详见文件末尾「atomic-write 评估」注释）；
+ *   - @deepseek-ai/dsh-settings 收窄导出面：0.1.7-rc.2 导出仍为
+ *     { SettingsConflictError, SettingsForms, SettingsForms as default, redactSecrets }，
+ *     settingsNamespace / installSettingsSection 确实缺失，plugin-compat 补丁仍必要。
  *
  * 已移除（详见审计文档）：
  *   - apiproxy WEB_SETTINGS_NAMESPACES += vision（上游已无该常量，
@@ -195,6 +212,10 @@ const PSTUB = 'Y29uc3R7RXZlbnRFbWl0dGVyfT1yZXF1aXJlKCdldmVudHMnKTtjbGFzcyBGIGV4d
 const SHARP_STUB = 'Y29uc3QgcD1uZXcgUHJveHkoZnVuY3Rpb24oKXt9LHtnZXQ6KHQsayk9PihrPT09U3ltYm9sLnRvUHJpbWl0aXZlKT8oKT0+MDooaz09PSd0aGVuJ3x8az09PSdjYXRjaCd8fGs9PT0nZmluYWxseScpP3VuZGVmaW5lZDpwLGFwcGx5OigpPT5wLGNvbnN0cnVjdDooKT0+cH0pO21vZHVsZS5leHBvcnRzPXA7bW9kdWxlLmV4cG9ydHMuZGVmYXVsdD1wOw==';
 const SHARP_STUB_ESM = 'Y29uc3QgcD1uZXcgUHJveHkoZnVuY3Rpb24oKXt9LHtnZXQ6KHQsayk9PihrPT09U3ltYm9sLnRvUHJpbWl0aXZlKT8oKT0+MDooaz09PSd0aGVuJ3x8az09PSdjYXRjaCd8fGs9PT0nZmluYWxseScpP3VuZGVmaW5lZDpwLGFwcGx5OigpPT5wLGNvbnN0cnVjdDooKT0+cH0pO2V4cG9ydCBkZWZhdWx0IHA7';
 
+/* 已针对 0.1.7-rc.2 核实：**与 dsh 版本无关，无锚点**。
+ * koffi / node-pty 的入口是整体覆写（不依赖上游任何字面量），只要包还在就被顶替；
+ * 0.1.7 安装树中两者仍在（koffi 经 dsh-win32-process、node-pty 经 subprocess 相关包）。
+ * 未命中时打 'not found, skip'，可诊断。 */
 try {
   const ke = findPkg('koffi', 'index.js');
   if (ke) { writeFileSync(ke, Buffer.from(KSTUB, 'base64')); log('koffi ESM stub ok: ' + ke); }
@@ -209,6 +230,10 @@ try {
   else log('node-pty: not found, skip');
 } catch (e) { log('WARN node-pty: ' + e.message); }
 
+/* 已针对 0.1.7-rc.2 核实：**与 dsh 版本无关，无锚点**。
+ * sharp 各入口（dist/index.cjs|mjs、dist/sharp.cjs|mjs、lib/index.js、index.js）
+ * 均为整体覆写；0.1.7 侧 sharp 由 dsh-attachment-local 视觉链路引用。
+ * 全部 target 未命中时打 'sharp: not found, skip'，可诊断。 */
 try {
   /* Android 无 libvips：写入纯 JS 兼容层 _dshshim.cjs（PNG 全解码 + 头部探测），
      各入口改为重定向；替代旧 Proxy 桩（旧桩让所有图片判 INVALID_IMAGE 且
@@ -243,6 +268,99 @@ try {
   if (n === 0) log('sharp: not found, skip');
 } catch (e) { log('WARN sharp shim: ' + e.message); }
 
+try {
+  /* node-addon-require-builtin 纯 JS 顶替（**已针对 0.1.7-rc.2 核实**）
+   *
+   * 为什么必须新增（**boot 级硬阻断，不是降级**）：dsh 0.1.7 把 profile 模块解析
+   * 重构为依赖原生插件 node-addon-require-builtin——
+   *   dsh-app-boot/lib/index.js:1573 internalModules() 用它 requireBuiltin() 拿 5 个
+   *   Node 内部模块（internal/modules/{esm/loader,cjs/loader,helpers,esm/utils,esm/resolve}）；
+   *   调用链 internalModules ← installRuntimeInterception(:1641) ← PluginPackages 构造
+   *   ← runProfile 的 **boot prepare 回调**，**早于任何插件树加载**。
+   * 该插件在**模块加载期**就急切加载原生二进制：
+   *   node-addon-native-custom-loader/lib/index.js:552 createEntryApi 顶层即调 loadEntry(:496)。
+   * Android 没有该包的任何预编译产物：node-addon-require-builtin-android-arm64 在 registry
+   * 上 404，其 optionalDependencies 只列了 darwin/linux/win32 共 7 个平台包。
+   * → require 期同步抛 "No usable native binding found"，失败点在插件树挂载**之前**，
+   *   日志里只有「web 未就绪」，**没有任何插件级报错**（极易误判为网络/端口问题）。
+   *
+   * 顶替原理：启动器本来就以 --expose-internals 启动 dsh
+   *   （DshFlow.startDshWeb: node --expose-internals --import fs-register.mjs <cli> web），
+   * 该开关让 require('internal/modules/…') 直接可用，与原生插件 requireBuiltin 语义等价。
+   * 实测（Node 22.17 / --expose-internals）app-boot 的**完整校验谓词全部通过**：
+   *   resolveSync / getOrCreateModuleJob|getModuleJobForImport / Module._resolveFilename /
+   *   getCjsConditions / getDefaultConditions / defaultResolve，且
+   *   「与直接 require 拿到的是同一个 Node 真实 loader 对象」。
+   * 缺少 --expose-internals 时**显式抛错并说明原因**（不是静默返回空对象）——静默会让
+   * app-boot 的校验抛「unsupported Node module loader」，反而掩盖真实原因。
+   *
+   * 覆写方式与 koffi / node-pty 同性质（整体覆写入口，非锚点插桩）；payload 为 base64
+   * 常量，末尾自带 marker 注释 'dsh-launcher-android-narb-shim-v1'。 */
+  const NARB_B64 =
+    'Ly8gZHNoLWxhdW5jaGVyLWFuZHJvaWQtbmFyYi1zaGltLXYxCid1c2Ugc3RyaWN0JzsKLyoqCiAqIG5vZGUtYWRk' +
+    'b24tcmVxdWlyZS1idWlsdGluIOKAlCBBbmRyb2lkIOe6ryBKUyDpobbmm7/lrp7njrDjgIIKICoKICog5Li65LuA' +
+    '5LmI5b+F6aG75a2Y5Zyo77yaZHNoIDAuMS43IOaKiiBwcm9maWxlIOaooeWdl+ino+aekOmHjeaehOS4uuS+nei1' +
+    'lui/meS4qioq5Y6f55Sf5o+S5Lu2KirigJTigJQKICogZHNoLWFwcC1ib290IOeahCBpbnRlcm5hbE1vZHVsZXMo' +
+    'KSDnlKjlroPmi78gTm9kZSDlhoXpg6jmqKHlnZfvvIhpbnRlcm5hbC9tb2R1bGVzLy4uLu+8ie+8jAogKiDogIzl' +
+    'roPlnKgqKuaooeWdl+WKoOi9veacnyoq77yIY3JlYXRlRW50cnlBcGkg4oaSIGxvYWRFbnRyee+8ieWwseaApeWI' +
+    'h+WKoOi9veWOn+eUn+S6jOi/m+WItuOAggogKgogKiBBbmRyb2lkIOayoeacieivpeWMheeahOS7u+S9lemihOe8' +
+    'luivkeS6p+eJqe+8iG5vZGUtYWRkb24tcmVxdWlyZS1idWlsdGluLWFuZHJvaWQtYXJtNjQg5ZyoCiAqIHJlZ2lz' +
+    'dHJ5IOS4iiA0MDTvvIxvcHRpb25hbERlcGVuZGVuY2llcyDlj6rliJfkuoYgZGFyd2luL2xpbnV4L3dpbjMy77yJ' +
+    '77yM5LqO5pivIHJlcXVpcmUKICog5pyf5ZCM5q2l5oqbICJObyB1c2FibGUgbmF0aXZlIGJpbmRpbmcgZm91bmQi' +
+    '44CCCiAqCiAqIOWksei0peS9jee9ruWcqCAqKmJvb3Qg55qEIHByZXBhcmUg5Zue6LCD6YeM44CB5Lu75L2V5o+S' +
+    '5Lu25qCR5Yqg6L295LmL5YmNKirvvIhkc2gvbGliL3Byb2ZpbGUtYm9vdAogKiDnmoQgcnVuUHJvZmlsZSDihpIg' +
+    'UGx1Z2luUGFja2FnZXMg5p6E6YCgIOKGkiBpbnN0YWxsUnVudGltZUludGVyY2VwdGlvbiDihpIgaW50ZXJuYWxN' +
+    'b2R1bGVz77yJ77yMCiAqIOWboOatpOaXpeW/l+mHjOWPquacieOAjHdlYiDmnKrlsLHnu6rjgI3vvIwqKuayoeac' +
+    'ieS7u+S9leaPkuS7tue6p+aKpemUmSoq4oCU4oCU5p6B5piT6K+v5Yik5Li6572R57ucL+err+WPo+mXrumimOOA' +
+    'ggogKgogKiDpobbmm7/ljp/nkIbvvJrlkK/liqjlmajmnKzmnaXlsLHku6UgLS1leHBvc2UtaW50ZXJuYWxzIOWQ' +
+    'r+WKqCBkc2jvvIjop4EgRHNoRmxvdy5zdGFydERzaFdlYu+8ie+8jAogKiDor6XlvIDlhbPorqkgcmVxdWlyZSgn' +
+    'aW50ZXJuYWwvbW9kdWxlcy8uLi4nKSDnm7TmjqXlj6/nlKjvvIzkuI7ljp/nlJ/mj5Lku7bnmoQgcmVxdWlyZUJ1' +
+    'aWx0aW4KICog6K+t5LmJ562J5Lu344CC5a6e5rWL5pys5py6IE5vZGUgMjYg5LiLIGFwcC1ib290IOeahOWujOaV' +
+    'tOagoemqjOiwk+ivjeWFqOmDqOmAmui/hwogKiDvvIhyZXNvbHZlU3luYyAvIGdldE9yQ3JlYXRlTW9kdWxlSm9i' +
+    'fGdldE1vZHVsZUpvYkZvckltcG9ydCAvIE1vZHVsZS5fcmVzb2x2ZUZpbGVuYW1lIC8KICogICBnZXRDanNDb25k' +
+    'aXRpb25zIC8gZ2V0RGVmYXVsdENvbmRpdGlvbnMgLyBkZWZhdWx0UmVzb2x2Ze+8ieOAggogKgogKiDms6jmhI/v' +
+    'vJotLWV4cG9zZS1pbnRlcm5hbHMg57y65aSx5pe26L+Z6YeM5LyaKirmmL7lvI/mipvplJnlubbor7TmmI7ljp/l' +
+    'm6AqKu+8jOiAjOS4jeaYr+mdmem7mOmZjee6p+KAlOKAlAogKiDpnZnpu5jov5Tlm57nqbrlr7nosaHkvJrorqkg' +
+    'YXBwLWJvb3Qg55qE5qCh6aqM5oqb44CMdW5zdXBwb3J0ZWQgTm9kZSBtb2R1bGUgbG9hZGVy44CN77yMCiAqIOWP' +
+    'jeiAjOaOqeebluecn+WunuWOn+WboOOAggogKi8KY29uc3QgeyBjcmVhdGVSZXF1aXJlIH0gPSByZXF1aXJlKCdu' +
+    'b2RlOm1vZHVsZScpOwpjb25zdCByZXEgPSBjcmVhdGVSZXF1aXJlKF9fZmlsZW5hbWUpOwoKY29uc3QgSU5URVJO' +
+    'QUxfTU9EVUxFUyA9IHsKICAnaW50ZXJuYWwvbW9kdWxlcy9lc20vbG9hZGVyJzogbnVsbCwKICAnaW50ZXJuYWwv' +
+    'bW9kdWxlcy9janMvbG9hZGVyJzogbnVsbCwKICAnaW50ZXJuYWwvbW9kdWxlcy9oZWxwZXJzJzogbnVsbCwKICAn' +
+    'aW50ZXJuYWwvbW9kdWxlcy9lc20vdXRpbHMnOiBudWxsLAogICdpbnRlcm5hbC9tb2R1bGVzL2VzbS9yZXNvbHZl' +
+    'JzogbnVsbCwKfTsKY29uc3QgY2FjaGUgPSBuZXcgTWFwKCk7CgpmdW5jdGlvbiByZXF1aXJlQnVpbHRpbihtb2R1' +
+    'bGVJZCkgewogIGlmIChjYWNoZS5oYXMobW9kdWxlSWQpKSByZXR1cm4gY2FjaGUuZ2V0KG1vZHVsZUlkKTsKICBs' +
+    'ZXQgbW9kOwogIHRyeSB7CiAgICBtb2QgPSByZXEobW9kdWxlSWQpOwogIH0gY2F0Y2ggKGUpIHsKICAgIHRocm93' +
+    'IG5ldyBFcnJvcigKICAgICAgJ25vZGUtYWRkb24tcmVxdWlyZS1idWlsdGluKHNoaW0pOiDml6Dms5XliqDovb3l' +
+    'hoXpg6jmqKHlnZcgIicgKyBtb2R1bGVJZCArICci44CCJyArCiAgICAgICfmnKzpobbmm7/lrp7njrDkvp3otZYg' +
+    'Tm9kZSDku6UgLS1leHBvc2UtaW50ZXJuYWxzIOWQr+WKqO+8iGRzaCDlkK/liqjlkb3ku6Tlt7LluKbor6Xlj4Lm' +
+    'lbDvvInvvJsnICsKICAgICAgJ+iLpeeci+WIsOacrOadoe+8jOivtOaYjuWQr+WKqOWPguaVsOiiq+aUueWKqOOA' +
+    'guWOn+Wni+mUmeivrzogJyArIChlICYmIGUubWVzc2FnZSkKICAgICk7CiAgfQogIGNhY2hlLnNldChtb2R1bGVJ' +
+    'ZCwgbW9kKTsKICByZXR1cm4gbW9kOwp9CgovKiog5LiO5Y6f55Sf5o+S5Lu25ZCM5b2i55qE55m95ZCN5Y2V5Yik' +
+    '5a6a77ya5Y+q5pS+6KGMIGRzaCDlrp7pmYXkvJrnlKjnmoTov5kgNSDkuKrlhoXpg6jmqKHlnZfjgIIgKi8KZnVu' +
+    'Y3Rpb24gaXNBbGxvd2VkSW50ZXJuYWxJZChtb2R1bGVJZCkgewogIHJldHVybiBPYmplY3QucHJvdG90eXBlLmhh' +
+    'c093blByb3BlcnR5LmNhbGwoSU5URVJOQUxfTU9EVUxFUywgbW9kdWxlSWQpOwp9CgovKiog5Y6f55Sf5a6e546w' +
+    '6L+U5ZueIGJpbmRpbmcg5YWD5L+h5oGv77yb5q2k5aSE5qCH5piO5Li6IEpTIOmhtuabv++8jOS+v+S6juiviuaW' +
+    'reaXpeW/l+WMuuWIhuOAgiAqLwpmdW5jdGlvbiBnZXRCaW5kaW5nSW5mbygpIHsKICByZXR1cm4gT2JqZWN0LmZy' +
+    'ZWV6ZSh7CiAgICBtb2RlOiAnanMtc2hpbScsCiAgICBiYWNrZW5kOiAnbmFwaScsCiAgICBhYmk6ICduYXBpLXY5' +
+    'JywKICAgIHBsYXRmb3JtOiBwcm9jZXNzLnBsYXRmb3JtLAogICAgYXJjaDogcHJvY2Vzcy5hcmNoLAogICAgbm9k' +
+    'ZTogcHJvY2Vzcy52ZXJzaW9uLAogIH0pOwp9Cgptb2R1bGUuZXhwb3J0cyA9IHsgcmVxdWlyZUJ1aWx0aW4sIGlz' +
+    'QWxsb3dlZEludGVybmFsSWQsIGdldEJpbmRpbmdJbmZvIH07Cm1vZHVsZS5leHBvcnRzLmRlZmF1bHQgPSBtb2R1' +
+    'bGUuZXhwb3J0czsK';
+  const NARB_MARKER = 'dsh-launcher-android-narb-shim-v1';
+  const narb = findPkg('node-addon-require-builtin', 'lib/index.js');
+  if (!narb) {
+    log('WARN node-addon-require-builtin: not found — 0.1.7 boot 将失败（该包是 app-boot 的硬依赖）');
+  } else {
+    const cur = readFileSync(narb, 'utf8');
+    if (cur.includes(NARB_MARKER)) {
+      log('node-addon-require-builtin JS shim already applied');
+    } else {
+      writeFileSync(narb, Buffer.from(NARB_B64, 'base64'));
+      log('node-addon-require-builtin JS shim applied: ' + narb);
+    }
+  }
+} catch (e) { log('WARN node-addon-require-builtin shim: ' + e.message); }
+
 
 
   /* 视觉链路配套（当前 dsh-launcher-android-att-vision-v5），在 v3/v4 基础上加三道保险：
@@ -256,7 +374,18 @@ try {
      幂等判据（v5 修正）：**不能只看 marker 字符串**。旧实现只要文件里出现
      'att-vision-v4' 就整体短路，而上游换版时 marker 可能与「调用点未改写」
      共存（正是 0.1.5 的真实现场）→ 补丁永久失效。v5 改为
-     「marker 存在 且 已无裸 link 发布调用点」才算已完成。 */
+     「marker 存在 且 已无裸 link 发布调用点」才算已完成。
+
+     **已针对 0.1.7-rc.2 核实**：dsh-attachment-local@0.1.7-rc.2/lib/index.js 中
+       · 正则 /await link\(…\);/ 命中 **2 处**（publishStagedObject / publishImmutableAlias）；
+       · publishStagedObject / publishImmutableAlias / async function syncDirectory(path) {
+         三处签名均存在。
+     → 扫描式实现已兼容，**保持不动**。
+     「collectSites()==0 即已完成」这条自愈判据在命中 2 处时**不会误判**：
+     只有「marker 在位 **且** 裸 link 调用点已全部改写为 publishCopied」才短路；
+     若上游再改结构导致调用点消失，collectSites() 归零会让补丁**重跑**（而非静默跳过），
+     此时块内会打 'no bare link call site, nothing to rewrite' 或
+     'helper def anchor miss' 的显式 WARN——这正是需要的可诊断性。 */
   try {
     const attLocal = findPkg('@deepseek-ai/dsh-attachment-local', 'lib/index.js');
     /* 匹配 `await link(<from>, <target>);`：from/target 均为简单标识符或成员访问，
@@ -487,48 +616,112 @@ try {
  * dsh-vision 现通过 @deepseek-ai/dsh-settings 的 settingsNamespace('vision')
  * 直接注册设置命名空间，无需 api 网关白名单。 */
 
+/* ---------------------------------------------------------------------------
+ * llm-pi-ai sendAttribution 抑制缝隙（**已针对 0.1.7-rc.2 核实**）
+ *
+ * 为什么还需要这个补丁：dsh-provider-headers 内置插件的「发送归因请求头」
+ * 开关把 `providers.<route>.sendAttribution = false` 写进 profile，期望不再注入
+ * `deepseek-harness/…` User-Agent。但上游 @deepseek-ai/dsh-llm 的
+ * attributionHeaders() 签名是 `(identity = APP_IDENTITY)`，注释明写
+ * “omission cannot suppress attribution”；pi-ai 侧 requestHeaders() 又无条件把
+ * 归因头**合并覆盖**在用户 headers 之上（按小写名去重，用户设了同名头也会被顶掉）。
+ * → 该开关在 0.1.7-rc.2 上仍然无效，上游未提供抑制缝隙，只能就地插桩。
+ *
+ * 0.1.7-rc.2 锚点实测（dsh-llm-pi-ai/lib/index.js，113953 字节）：
+ *   · `headers: z.dict(z.string()),`                  → 命中 1 处（profile schema，行 1024）
+ *   · `function requestHeaders(headers) {`            → 命中 1 处（行 1733）
+ *   · `headers: requestHeaders(profile.headers)`      → 命中 1 处（流式请求，行 1883）
+ *   · 归因头注入**共 2 处**：上述流式请求，以及模型探测 discoverModels() 的
+ *     `for (const [name, value] of Object.entries(attributionHeaders())) headers.set(...)`
+ *     （行 2308）。**旧版补丁只覆盖了前者**，探测请求仍带归因头 —— 本次补齐。
+ *   · 旧锚点 `sendAttribution: z.boolean().optional(),` → **0 处**：0.1.5 起就不存在，
+ *     属历史死分支（每轮都白跑一次 replace），本次删除。
+ *   · 结论：上游**未**原生支持抑制，补丁保留（不是「为了适配而硬打」）。
+ *
+ * 做法（6 个锚点，全部命中才写盘；缺任一即显式 WARN 并放弃，避免半套补丁）：
+ *   1) profile schema 声明 sendAttribution（default true，与「未设置即发送」同义）；
+ *   2) requestHeaders 增加第二参数，false 时直接返回用户 headers，不合并归因头；
+ *   3) 流式请求调用点传入 profile.sendAttribution；
+ *   4) 探测链路分流：storedDiscoveryProfile() 透出 sendAttribution，
+ *      discoverModels() 据其决定是否注入归因头。
+ *
+ * 幂等 marker 写在文件头（`// dsh-launcher-android-pi-ai-send-attribution`），
+ * 与 fs-local / plugin-compat 的 marker 写法一致。
+ * ------------------------------------------------------------------------- */
 try {
-  // dsh-provider-headers: sendAttribution=false 时不再强制注入 deepseek-harness User-Agent
+  const MARKER_PI = 'dsh-launcher-android-pi-ai-send-attribution';
   const pi = findPkg('@deepseek-ai/dsh-llm-pi-ai', 'lib/index.js');
-  if (pi) {
+  if (!pi) {
+    log('llm-pi-ai: not found, skip sendAttribution patch');
+  } else {
     let src = readFileSync(pi, 'utf8');
-    const marker = 'sendAttribution: z.boolean().default(true)';
-    if (!src.includes(marker)) {
+    if (src.includes(MARKER_PI)) {
+      log('llm-pi-ai sendAttribution already patched');
+    } else {
       let out = src;
-      out = out.replace(
-        /sendAttribution: z\.boolean\(\)\.optional\(\),/,
-        'sendAttribution: z.boolean().default(true),'
-      );
-      out = out.replace(
+      let hits = 0;
+      /* 逐锚点替换：每个锚点单独报命中/未命中，避免「整体 replace 后 out===src」
+         这种只说「pattern not found」却不知是哪一条漂移的含糊日志。 */
+      const apply = (label, re, to) => {
+        const before = out;
+        out = out.replace(re, to);
+        if (out !== before) { hits++; return true; }
+        log('WARN llm-pi-ai sendAttribution: anchor MISS — ' + label);
+        return false;
+      };
+      // 1) profile schema 声明字段
+      apply('profile schema (headers: z.dict)',
         /headers: z\.dict\(z\.string\(\)\),/,
-        'headers: z.dict(z.string()),\n\tsendAttribution: z.boolean().default(true),'
-      );
-      out = out.replace(
+        'headers: z.dict(z.string()),\n\tsendAttribution: z.boolean().default(true),');
+      // 2) requestHeaders 签名 + 函数体分流
+      apply('requestHeaders signature',
         /function requestHeaders\(headers\) \{/,
-        'function requestHeaders(headers, sendAttribution = true) {'
-      );
-      out = out.replace(
+        'function requestHeaders(headers, sendAttribution = true) {');
+      apply('requestHeaders body guard',
         /function requestHeaders\(headers, sendAttribution = true\) \{\n(\s*)const attribution = attributionHeaders\(\);/,
         (m, indent) => m.replace(
           'const attribution = attributionHeaders();',
           `if (sendAttribution === false) return { ...(headers ?? {}) };\n${indent}const attribution = attributionHeaders();`
-        )
-      );
-      out = out.replace(
+        ));
+      // 3) 流式请求调用点
+      apply('stream requestHeaders call',
         /headers: requestHeaders\(profile\.headers\)/,
-        'headers: requestHeaders(profile.headers, profile.sendAttribution)'
-      );
-      if (out !== src) {
-        writeFileSync(pi, out);
-        log('llm-pi-ai sendAttribution support patched: ' + pi);
+        'headers: requestHeaders(profile.headers, profile.sendAttribution)');
+      // 4) 模型探测链路（0.1.7 新增覆盖）
+      apply('discovery attribution injection',
+        /for \(const \[name, value\] of Object\.entries\(attributionHeaders\(\)\)\) headers\.set\(name, value\);/,
+        'if (stored?.sendAttribution !== false) for (const [name, value] of Object.entries(attributionHeaders())) headers.set(name, value);');
+      apply('discovery profile passthrough',
+        /return \{\n\t\t\theaders: profile\.headers,\n\t\t\tresolveApiKey: \(\) => resolveApiKey\(provider, profile\)\n\t\t\};/,
+        'return {\n\t\t\theaders: profile.headers,\n\t\t\tsendAttribution: profile.sendAttribution,\n\t\t\tresolveApiKey: () => resolveApiKey(provider, profile)\n\t\t};');
+
+      const EXPECTED = 6;
+      if (hits < EXPECTED) {
+        log('WARN llm-pi-ai sendAttribution: only ' + hits + '/' + EXPECTED +
+            ' anchors hit — file NOT modified (上游结构又漂移了，需重新对表)');
       } else {
-        log('llm-pi-ai sendAttribution pattern not found, skip');
+        // 写盘前语法自检（与 attachment-local / plugin-compat 同手法）
+        const tmp = pi + '.pi-check.mjs';
+        let ok = false;
+        try {
+          writeFileSync(tmp, out);
+          const r = spawnSync(process.execPath, ['--check', tmp], { timeout: 15000, encoding: 'utf8' });
+          ok = r.status === 0;
+          if (!ok) log('WARN llm-pi-ai sendAttribution syntax check FAILED: ' + (r.stderr || '').slice(0, 200));
+        } catch (e) {
+          log('WARN llm-pi-ai sendAttribution syntax check unavailable: ' + e.message);
+        } finally {
+          try { unlinkSync(tmp); } catch {}
+        }
+        if (ok) {
+          writeFileSync(pi, '// ' + MARKER_PI + '\n' + out);
+          log('llm-pi-ai sendAttribution patched: ' + hits + '/' + EXPECTED +
+              ' anchors (schema + requestHeaders + stream call + discovery x2)');
+        } else {
+          log('WARN llm-pi-ai sendAttribution: syntax check failed, file NOT modified');
+        }
       }
-    } else {
-      log('llm-pi-ai sendAttribution already patched');
     }
-  } else {
-    log('llm-pi-ai: not found, skip');
   }
 } catch (e) { log('WARN llm-pi-ai sendAttribution: ' + e.message); }
 
@@ -541,43 +734,73 @@ try {
      0.1.5 把断言从 dsh-sandbox-windows-acl **搬到了新包** dsh-win32-process，
      旧包只剩同名的无断言实现。只扫旧包会命中 0 处（日志 'asserts disabled: 0'
      看起来无害），实际 boot 必崩——故改为**按包名清单遍历**，新旧两包都扫，
-     并对「包在但一处未命中」发出显式 WARN（避免再次静默漂移）。 */
+     并对「包在但一处未命中」发出显式 WARN（避免再次静默漂移）。
+
+     **已针对 0.1.7-rc.2 核实**（0.1.7 安装树实测）：
+       · @deepseek-ai/dsh-win32-process/lib/index.js → 'layout mismatch' 命中 **2 处**
+         （行 71 STARTUPINFOW / 行 72 PROCESS_INFORMATION，文本与下方正则一致）；
+       · @deepseek-ai/dsh-sandbox-windows-acl → 命中 **0 处**（该包在 0.1.7 已无断言）。
+     → 按包名清单遍历两包的实现**已兼容 0.1.7，保持不动**；日志会打
+       'koffi ABI asserts disabled: 2 (pkgs: …)'，若归零则显式 WARN（boot 必崩）。 */
   const ABI_PKGS = ['@deepseek-ai/dsh-sandbox-windows-acl', '@deepseek-ai/dsh-win32-process'];
   const foundPkgs = [];
   let totalPatched = 0;
+  let totalAlready = 0;  // 全部包合计「已禁用」的断言条数（幂等判据用）
   for (const name of ABI_PKGS) {
     const w = findPkg(name, 'lib') || findPkg(name, 'lib/index.js');
     if (!w) continue;
     const dir = existsSync(w) && w.endsWith('.js') ? dirname(w) : w;
     if (!existsSync(dir)) continue;
     foundPkgs.push(name);
-    let patched = 0;
-    let sawAssert = false;
+    let patched = 0;       // 本次实际禁用的**断言条数**（非文件数：0.1.7 两处断言同在一个文件）
+    let sawAssert = 0;     // 文件里出现 'layout mismatch' 的处数
+    let alreadyDone = 0;   // 已被本补丁禁用过的断言条数（二次运行 / 重装后重跑）
     for (const f of readdirSync(dir)) {
       if (!f.endsWith('.js')) continue;
       const p = join(dir, f);
       const src = readFileSync(p, 'utf8');
+      /* 已被本补丁处理过：断言文本已被替换成 marker 注释。
+         必须单独计数，否则二次运行会看到 sawAssert=0 而误报「boot 必崩」。 */
+      alreadyDone += (src.match(/dsh-launcher: koffi stubbed,/g) || []).length;
       if (!src.includes('layout mismatch')) continue;
-      sawAssert = true;
       let out = src;
       out = out.replace(/if \(STARTUPINFOW\.size !== 104\) throw new Error\(`STARTUPINFOW layout mismatch[^;]*\);/, '/* dsh-launcher: koffi stubbed, STARTUPINFOW assert disabled */');
       out = out.replace(/if \(PROCESS_INFORMATION\.size !== 24\) throw new Error\(`PROCESS_INFORMATION layout mismatch[^;]*\);/, '/* dsh-launcher: koffi stubbed, PROCESS_INFORMATION assert disabled */');
-      if (out !== src) { writeFileSync(p, out); patched++; }
+      if (out !== src) {
+        /* 断言条数 = 原文出现 'layout mismatch' 的次数（0.1.7 实测同一文件 2 处）。
+           用 match 计数，避免把「文件数」误报成「断言数」。 */
+        const n = (src.match(/layout mismatch/g) || []).length;
+        sawAssert += n;
+        patched += n;
+        writeFileSync(p, out);
+      } else {
+        sawAssert += (src.match(/layout mismatch/g) || []).length;
+      }
     }
-    if (sawAssert && patched === 0) log(`WARN koffi-abi: ${name} has layout assertions but none matched the disable patterns`);
+    if (sawAssert > 0 && patched === 0) log(`WARN koffi-abi: ${name} has ${sawAssert} layout assertion(s) but none matched the disable patterns`);
     totalPatched += patched;
+    totalAlready += alreadyDone;
   }
   if (foundPkgs.length === 0) {
     log('WARN koffi-abi: none of the ABI-assert packages found (koffi stub may leave boot broken)');
+  } else if (totalAlready > 0) {
+    /* 断言已在位（本次禁用 0 条是**正常**的幂等结果，不是漂移）。
+       旧实现只判 totalPatched===0，导致二次运行恒打「boot may fail」假警报。 */
+    log('koffi ABI asserts already disabled: ' + totalAlready + ' (pkgs: ' + foundPkgs.join(', ') + ')');
   } else {
     log('koffi ABI asserts disabled: ' + totalPatched + ' (pkgs: ' + foundPkgs.join(', ') + ')');
-    /* 关键护栏：若扫到包却一处未禁用，说明断言文本又漂移了——此时 boot 必崩，
-       大声报出来（这是 0.1.5 适配期真实踩到的静默失效点）。 */
+    /* 关键护栏：若扫到包、断言文本在、却一条都没禁用，说明文本又漂移了——
+       此时 boot 必崩，大声报出来（这是 0.1.5 适配期真实踩到的静默失效点）。 */
     if (totalPatched === 0) log('WARN koffi-abi: no assertion disabled across ' + foundPkgs.join(', ') + ' — dsh boot may fail at plugin load');
   }
 } catch (e) { log('WARN koffi-abi: ' + e.message); }
 
 try {
+  // 已针对 0.1.7-rc.2 核实：探测路径 @deepseek-ai/dsh-web-frontend/dist/index.html
+  // **仍然命中**——0.1.7 dist 布局为 assets/ + index.html + manifest.webmanifest
+  // （+ favicon-*.svg），assets/ 递归扫描逻辑对 chunk 子目录布局变化不敏感。
+  // 按需注入语义不变：无消费者时打 'index.html shim skipped'（可诊断，非静默）。
+  //
   // WebView / Chrome ≤102 无 AbortSignal.timeout。
   // v4.10 起**按需注入**：仅当 dist 内 app bundle 确实引用了该 API 才写
   // index.html；0.1.1-rc.2 前端与全部内置插件 client 均无引用，自动跳过，
@@ -630,6 +853,14 @@ try {
   // 填写/保存。dsh-llm-codebuddy 内置插件以独立命名空间 llm-codebuddy 与内置
   // llm-pi-ai 共存（互不抢占 settings 注册），必须让客户端把它按 pi-ai 布局渲染。
   // 必须留在引导期脚本里：layoutOf 是编译产物内的闭包函数，client 插件通道改不到。
+  //
+  // 已针对 0.1.7-rc.2 核实：锚点 'if (ns === "llm-pi-ai") return "pi-ai";' 在
+  // @deepseek-ai/dsh-client-ui-settings-models@0.1.7-rc.2/lib/client.js 中**命中 1 处**
+  // → 保持不动。锚点缺失时打 'WARN settings-models layoutOf pattern not found'（可诊断）。
+  //
+  // 消费者说明（0.1.7 改造后）：本补丁服务的是 **dsh-llm-codebuddy**。该插件本次改造后
+  // **不再内置**（代码保留在 assets/optional-plugins/dsh-llm-codebuddy，默认不装配），
+  // 因此当前**无内置消费者**，仅服务于用户手动装配 codebuddy 的场景。补丁保留不删。
   const smClient = findPkg('@deepseek-ai/dsh-client-ui-settings-models', 'lib/client.js');
   if (smClient && existsSync(smClient)) {
     let smSrc = readFileSync(smClient, 'utf8');
@@ -651,6 +882,9 @@ try {
 } catch (e) { log('WARN codebuddy layout patch: ' + e.message); }
 
 try {
+  // 已针对 0.1.7-rc.2 核实：**与 dsh 版本无关，无锚点**。@vscode/ripgrep 的解析器
+  // 是整体覆写（整文件重写，含 rgPath 导出），不依赖上游字面量；0.1.7 仍由
+  // dsh-tool-fs-search 消费。fallback 缺失时打 'not found, skip'（可诊断）。
   // @vscode/ripgrep：Android 没有 @vscode/ripgrep-android-arm64 平台包，
   // 导致 dsh-tool-fs-search 的 glob/grep 报 “ripgrep launch failed”。
   // 这里把解析器改为优先使用 Termux `pkg install -y ripgrep` 安装的原生 rg，
@@ -713,6 +947,13 @@ export const rgPath = resolved;
  * 旧补丁在 rc.2 上零替换仍会向上游文件追加 marker 头，属纯污染。 */
 
 try {
+  // 已针对 0.1.7-rc.2 核实：dsh-fs-local@0.1.7-rc.2/lib/index.js 三处锚点
+  // **全部命中 1 次**：
+  //   'await chmod(stagingDir, 448);' / 'await handle.chmod(384);' /
+  //   'if (mode !== void 0) await handle.chmod(mode);'
+  // → **保持不动**。注意 0.1.7 同时新增了 @deepseek-ai/dsh-atomic-write，
+  //   本补丁**不覆盖**它——该新包已在文件末尾单独评估（结论：无需补丁）。
+  //
   // Android 共享存储（/storage/emulated/0，FUSE）不支持 chmod；dsh-fs-local 原子写
   // 会对临时 staging 目录/文件 chmod 0700/0600，导致 EACCES。这里把 chmod 改为
   // 遇到 EACCES/EPERM 时忽略（权限位在 FUSE 上本来也无法生效）。
@@ -757,6 +998,33 @@ try {
  * 而这些插件装在 files/plugins/（dsh-vision 来自 prebuilt.tgz 解包），
  * 无法靠改 APK 内 assets 源修复——prebuilt.tgz 是 30MB 的 LFS 二进制。
  * 属「本机专有缺陷 + 唯一可行修复点」，与 koffi/node-pty stub 同性质。
+ *
+ * **已针对 0.1.7-rc.2 核实**：
+ *   · @deepseek-ai/dsh-settings@0.1.7-rc.2/lib/index.js 的导出实测为
+ *       export { SettingsConflictError, SettingsForms, SettingsForms as default, redactSecrets }
+ *     → settingsNamespace / installSettingsSection **仍然不存在**，补丁**仍有必要，保持不动**。
+ *   · 内置插件收缩为三个后（dsh-web-mobile / dsh-prompt-optimizer / dsh-codearts-auth），
+ *     逐一实测其对 dsh-settings 的引用：
+ *       - dsh-codearts-auth：lib/ 中 25 处 'settingsNamespace' 命中，但**全部是它自带的**
+ *         settings-compat.js 里的 `settingsNamespaceFor()`（本地函数，且从 **'./settings-compat.js'**
+ *         导入，**不是**从 @deepseek-ai/dsh-settings 具名导入）；其 76 个 lib/*.js 中
+ *         **没有任何文件 import 这两个已删除符号**（唯一的 dsh-settings 提及是
+ *         jet-hub-store.js 里的一句文档注释）。
+ *       - dsh-web-mobile / dsh-prompt-optimizer：**完全不引用** dsh-settings。
+ *     → 0.1.7 三个内置插件当前**均非本补丁的消费者**。
+ *   · 本补丁**真实的消费者**是 dsh-vision（来自 prebuilt.tgz 的 third_party/）与
+ *     手动装配的 dsh-llm-codebuddy，两者都写
+ *       import { settingsNamespace } from '@deepseek-ai/dsh-settings';
+ *     （dsh-vision 另有 installSettingsSection 的文档提及）。
+ *
+ * 关于扫描范围（本次核实项）：eachPluginEntry() 返回的是**每个插件目录的单一入口**
+ * （package.json exports['.'].default ?? main ?? lib/index.js），**不是** lib/*.js 全量。
+ * 就 0.1.7 现状而言这已足够——上述真实消费者都在**入口文件**里具名导入
+ * （dsh-vision 的 import 在 lib/index.js；codebuddy 的在 lib/index.js）。
+ * 但这是**已知的覆盖边界**：若将来某插件把已删除符号挪进 lib/ 子模块，补丁会漏。
+ * 由于本文件是引导期补丁、且对每个插件目录全量递归扫描成本高（插件含 node_modules），
+ * 这里保持入口级扫描，并在日志里以 scanned=<入口数> 显式暴露覆盖规模，
+ * 一旦出现「插件加载报 does not provide an export named」即可据日志定位。
  * ------------------------------------------------------------------------- */
 try {
   const MARKER = 'dsh-launcher-plugin-compat-v1';
@@ -826,6 +1094,18 @@ try {
  *
  * 与 host 端不同：client 端是浏览器侧 `require(spec)` 查模块表，Node 侧解析无关，
  * 所以必须单独改写 client.js。改写的是 `require` 的**说明符字符串**，不动逻辑。
+ *
+ * **已针对 0.1.7-rc.2 核实（对新插件无副作用）**：
+ *   · dsh-web-mobile@3.0.3/lib/client.js 的 external require 只有
+ *     '@deepseek-ai/dsh-client-ui-primitives' 与 'react/jsx-runtime'，**不含 client-runtime**；
+ *   · dsh-codearts-auth 的 client 是 lib/client/jet-hub.js，其 require 只有 'react'；
+ *   · dsh-prompt-optimizer：不引用 client-runtime。
+ *   → REQUIRE_MAP 对这三者**零命中**；代码里 `if (!out.includes(...)) continue` 直接跳过、
+ *     **不写盘、不加 marker**，故**无副作用**（日志 scanned=N patched=0）。
+ *   · 另外注意：eachPluginClientFile() 只探测 **lib/client.js** 这一固定路径，
+ *     而 codearts 的 client 出口是 **lib/client/jet-hub.js**（package.json
+ *     exports['./client']）——当前它本就不需要本补丁，故不影响；
+ *     但这是已知覆盖边界（与 plugin-compat 同性质），日志的 scanned 计数会暴露规模。
  * ------------------------------------------------------------------------- */
 try {
   const CMARKER = 'dsh-launcher-client-compat-v1';
@@ -898,6 +1178,16 @@ try {
  * 做法：在 flock.js 顶部插入 android 短路——tryLockExclusive 立即 resolve。
  * 保留原文件其余内容与导出签名，故 dsh-session-persistence-jsonl 侧
  * 走的是正常 posix lease 分支，无需改动其它包。
+ *
+ * **已针对 0.1.7-rc.2 核实**：
+ *   · 锚点 'export async function tryLockExclusive(fd) {' 在
+ *     @deepseek-ai/node-addon-system@0.1.2/lib/flock.js 中**仍然命中**（版本未变，
+ *     0.1.7 安装树实测）。→ 保持不动。
+ *   · findPkg 定位能力：0.1.7 的 **npm 扁平布局**下
+ *     node_modules/@deepseek-ai/node-addon-system/lib/flock.js 直接命中；
+ *     **pnpm 布局**下走 .pnpm/<name>@<ver>.../node_modules/<pkg>/<rel> 前缀匹配，
+ *     再退到 findNestedPkg 递归（深度 ≤8）。实测 0.1.7 解包树为扁平布局，
+ *     但两种布局的解析分支都在，未命中时打显式 WARN 而非静默。
  * ------------------------------------------------------------------------- */
 try {
   const MARKER_FLOCK = 'dsh-launcher-android-flock-stub';
@@ -926,5 +1216,50 @@ try {
     }
   }
 } catch (e) { log('WARN flock android stub: ' + e.message); }
+
+/* ---------------------------------------------------------------------------
+ * @deepseek-ai/dsh-atomic-write 评估结论（0.1.7 新包）—— **已评估，无需补丁**
+ *
+ * 背景：0.1.7 新增 @deepseek-ai/dsh-atomic-write（writeFileAtomic / withFileLock，
+ * 用 rename 提交、wx 创建临时文件）。它与 dsh-fs-local **并存**，因此必须回答：
+ * 该新包在 Android(SELinux/FUSE) 上是否需要与 fs-local chmod 同类的容错？
+ *
+ * 结论：**不需要**。逐条依据（均取自 @deepseek-ai/dsh-atomic-write@0.1.7-rc.2/lib/index.js，
+ * 9095 字节，全文已逐行核对）：
+ *
+ *   1) **它完全不调用 chmod。** 该文件只 import
+ *        node:fs/promises → { lstat, mkdir, readFile, rename, rm, writeFile }
+ *        node:crypto     → { createHash, randomBytes }
+ *      全文没有 chmod / fchmod / chown / futimes 的任何调用——fs-local 那三处
+ *      chmod 锚点在此**根本不存在**，所以「同类 chmod 容错」没有作用对象。
+ *      权限位的传递方式不同：writeFile(temp, content, { mode, flag: 'wx' })
+ *      在**创建新 inode 时**就把 mode 交给内核（0o600 = 384），rename 只替换目录项、
+ *      **不触碰权限位**。因此不存在「先建后 chmod」的 EACCES 窗口——
+ *      这正是 fs-local 需要打补丁的原因，而 atomic-write 天然规避了它。
+ *
+ *   2) **rename 容错已由上游自带，且只针对 Windows。** 上游有
+ *      renameAtomicTemp()：对 EACCES/EBUSY/EPERM 做 8 次指数退避重试，但入口
+ *      isTransientWindowsRenameError() **首行就是** 'if (process.platform !== "win32") return false'
+ *      —— Android（platform === 'android'）不会进入该重试分支，rename 失败会直接抛出。
+ *      这是**正确的**：rename(2) 在 Linux/ext4 与 FUSE 上都是原子的、同目录内不返回
+ *      EACCES/EPERM/EBUSY（EXDEV 只在跨文件系统时出现，而该包强制临时文件与目标同目录：
+ *      临时名形如 '<filename>.<12位hex>.tmp'，由 randomBytes(6) 生成）。
+ *      给 Android 加同类重试反而会掩盖真实的 EXDEV/权限错误。
+ *
+ *   3) **调用点都落在应用私有存储（ext4），不是 FUSE 共享存储。** 0.1.7 中该包的
+ *      消费者实测为 dsh-app-boot / dsh-config-editor / dsh-credentials-local /
+ *      dsh-llm-deepseek / dsh-plugin-manager / dsh 本体，写入目标分别是
+ *      profile 目录（files/.dsh/…）、credentials、配置文档——全部在 HOME
+ *      （应用私有 ext4）下。fs-local 的 chmod 补丁针对的是**用户可能把工作区
+ *      指向 /storage/emulated/0（FUSE）** 的场景；atomic-write 写的是 dsh 自身状态，
+ *      不落 FUSE。
+ *
+ *   4) withFileLock 用 writeFile(lockPath, pid, { mode: 384, flag: 'wx' }) 建锁，
+ *      EEXIST 视为争用、EPERM 会 lstat 复核（该分支同样注明是 Windows 独占创建语义），
+ *      Android 上是标准 EEXIST 路径。单进程 dsh web 下争用本就极少。
+ *
+ * 因此：**不新增补丁块**。若将来 atomic-write 开始调用 chmod/chown，或
+ * 调用点把目标挪到 /storage/emulated/0，需按 fs-local 的 guard 写法补一个块。
+ * ------------------------------------------------------------------------- */
 
 log('=== android fixup done ===');

@@ -15,7 +15,7 @@ import com.dsh.nextapp1.R
 /**
  * APK 内置资产同步统一工具。
  *
- * 背景：prebuilt.tgz（约 30MB）等资产在「一键安装 / 重新装配」路径上被反复从
+ * 背景：extra-plugins/ 等资产在「一键安装 / 重新装配」路径上被反复从
  * assets 拷贝到 files，设备端 flash IO 较慢，冗余拷贝拖慢安装。
  *
  * 规则：assets 只随 APK 版本变化。把「当前 APK 版本已同步过」写入 marker 文件，
@@ -193,7 +193,7 @@ object AssetSync {
 
     /**
      * 轻量内容指纹：文件 = 长度 + 头 64KB CRC32；目录 = 递归各文件（长度+CRC）的聚合 CRC。
-     * 预算：prebuilt.tgz ~30MB 只读头 64KB；extra-plugins 目录数百个小文件全读但都是文本，
+     * 预算：extra-plugins 目录数百个小文件全读但都是文本，
      * 总量 MB 级，冷缓存下 ~百毫秒，仅资产拷贝判定路径调用（非每帧）。
      */
     private fun fingerprintOf(target: File): String = try {

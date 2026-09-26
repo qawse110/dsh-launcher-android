@@ -1,0 +1,6 @@
+{
+  "$comment": "dsh 本体钉死版本 —— 单一真源。DshFlow.kt（PINNED_DSH_TAG）与 install-dsh.mjs（默认 DSH_TAG）都从这里读取，两侧不得再各自硬编码。tag 为 next dist-tag 对应的精确版本；升级时只改这一处。",
+  "tag": "0.1.7-rc.2",
+  "distTag": "next",
+  "note": "0.1.7-rc.2 = registry.npmjs.org 的 next dist-tag（latest=0.1.5-rc.3）。启动器整套 Android 兼容层已针对该版本逐锚点核实。"
+}

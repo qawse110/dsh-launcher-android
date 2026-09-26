@@ -34,7 +34,7 @@
 | **界面** | 内嵌 WebView（Chromium）+ 任意浏览器访问同一地址 |
 | **语音** | 双 TTS：系统引擎（离线）/ Edge 在线语音（微软神经音色，零依赖实现） |
 | **悬浮窗** | 状态条 + 桌宠动画双样式；普通服务 + 无障碍双通道保活 |
-| **插件化适配** | 能由插件实现的功能一律下沉为独立内置插件（9 个），脚本补丁降至最低 |
+| **插件化适配** | 能由插件实现的功能一律下沉为独立内置插件（内置 3 个 + 可选 4 个），脚本补丁降至最低 |
 | **环境** | apt/dpkg 原生可用；Termux 环境自动准备（幂等） |
 
 ## 架构：最小脚本干预，能力插件化
@@ -51,8 +51,11 @@
 APK assets
   ├─ node/  termux-bootstrap.zip    → 解压、makeUnwritable（W^X）、Termux 环境准备
   ├─ install-dsh.mjs                → npm 安装/更新 @deepseek-ai/dsh + dsh plugin 装配内置插件
+  ├─ plugin-manifest.json           → 内置插件清单【单一真源】：装配面与展示面都从它派生
+  ├─ dsh-pin.json                   → dsh 钉死版本【单一真源】：Kotlin 与 JS 两侧同源
   ├─ stub-dsh.mjs                   → Android 兼容修复（仅剩加载期/引导期必需项，幂等）
   ├─ extra-plugins/…                → 内置插件源（随 APK 同步，装配进 web profile）
+  ├─ optional-plugins/…             → 可选插件源（随 APK 分发，默认不装配，按需启用）
   └─ web-launcher.sh.tpl            → 可重现的 web 启动环境（TermuxEnv 单源渲染）
         │
         ▼
@@ -72,21 +75,52 @@ files/.dsh/profiles/web ──cordis 装配──▶ dsh web @ 127.0.0.1:3080 �
 
 ## 内置插件
 
-经官方 `dsh plugin --profile web add` 装配到 `files/.dsh/profiles/web`（bundle 层），
-随 dsh 升级自动保持，不被启动器补丁破坏：
+清单唯一真源是 [`app/src/main/assets/plugin-manifest.json`](app/src/main/assets/plugin-manifest.json)，
+Kotlin 展示面与 `install-dsh.mjs` 装配面都从它派生；一致性由 `node tools/check-plugin-manifest.mjs` 校验（已接入 CI）。
+经官方 `dsh plugin --profile web add` 以 `link:` 方式装配到 `files/.dsh/profiles/web`：
+
+| 插件 | 来源 | 作用 |
+|---|---|---|
+| `dsh-web-mobile` | <https://github.com/mexiaosqwq/dsh-web-mobile> | 竖屏/窄屏 Web 适配（抽屉导航、全宽会话、安全区、触控人体工学） |
+| `@dsh-external/dsh-prompt-optimizer` | <https://github.com/WestFox-AwA/dsh-prompt-optimizer> | 提示词优化（发送前用独立 AI 改写成命令，含本地移动端适配补丁） |
+| `dsh-codearts-auth` | <https://gitee.com/iJetLi/deepseek-harness-codearts> | CodeArts / Buddy / Qoder / Trae / Cline / Loomy 等多 Provider 登录与模型接入 |
+
+### 可选插件（随 APK 分发，**默认不装配**）
+
+源码保留在 `assets/optional-plugins/`，可在「插件管理 → 可选插件」按需装配；不装配时相关能力静默缺席，不影响 dsh 启动：
 
 | 插件 | 作用 |
 |---|---|
-| `dsh-mobile-nav` | Web 界面移动端导航适配 |
-| `dsh-super-injector` | 运行时插件注入器（开发/热装通道） |
-| `dsh-net-proxy` | 网络代理配置 |
-| `dsh-provider-headers` | LLM 提供方请求头（归因 UA 开关） |
-| `dsh-vision` | 视觉能力（经 settings 服务自注册命名空间） |
-| `dsh-oh-we-need` | 推理风格 Skill（不再注入系统提示词） |
-| `dsh-status-bridge` | dsh 运行状态桥接到悬浮窗/通知（本地 HTTP :3190） |
-| `dsh-android-links` | 在 dsh HOME 创建 `sdcard → /storage/emulated/0` 符号链接，让工作区目录浏览器直达 SD 卡（**零 dsh 文件改动**，替代旧源码补丁） |
-| `dsh-llm-codebuddy` | CodeBuddy 中国区/国际版 LLM Provider（**共存模式**：独立命名空间 `llm-codebuddy`，只新增 Provider，不禁用 `llm-pi-ai`，现有自定义 Provider 不受影响；支持 WorkBuddy API Key 与网页令牌登录，DSH 依赖走 peerDependencies 复用宿主实例）。设置页「CodeBuddy 用量」含三个视图：中国区额度、国际版额度、**积分消耗明细**（官方逐条消耗接口，按日分片拉取规避 3000 条上限，按模型/日/客户端聚合）+ **会话用量本地统计**（扫描会话日志按模型与会话聚合 token）。国际版目录会自动补齐国内版有、国际版白名单缺失的模型（`hy4-preview` / `hy4-preview-f` / `deepseek-v4.1-flash` / `hy3`），并继承其思考等级 |
+| `dsh-status-bridge` | dsh 运行状态桥接到悬浮窗/通知（本地 HTTP :3190）。**与启动器 Kotlin 侧强耦合**：不装配则悬浮窗状态显示/TTS 播报链路失效 |
+| `dsh-android-links` | 在 dsh HOME 创建 `sdcard → /storage/emulated/0` 符号链接，让工作区目录浏览器直达 SD 卡 |
+| `dsh-llm-codebuddy` | CodeBuddy 中国区/国际版 LLM Provider（独立命名空间 `llm-codebuddy`，只新增 Provider） |
+| `@dsh-external/dsh-oh-we-need` | 推理风格 Skill（历史遗留，此前从未接入装配链） |
 
+> 内置集合**只保留上述三个**。原内置的 `dsh-mobile-nav` / `dsh-super-injector` / `dsh-net-proxy` /
+> `dsh-provider-headers` / `dsh-vision` 已随 `prebuilt.tgz` 供给链一并移除；
+> 与启动器功能耦合的 `dsh-status-bridge` / `dsh-android-links` / `dsh-llm-codebuddy` 按「保留代码、默认不装配」处理。
+
+> `dsh-web-mobile` 是原 `dsh-mobile-nav` 的**改名后继**（同一插件的新名），故旧名已一并退役，避免双份注册。
+
+## dsh 版本适配
+
+钉死版本唯一真源是 [`app/src/main/assets/dsh-pin.json`](app/src/main/assets/dsh-pin.json)：
+`DshFlow.PINNED_DSH_TAG` 与 `install-dsh.mjs` 的默认 tag 都读同一份（此前两处各自硬编码，漏同步就静默装错版本）。
+
+当前适配目标：**`0.1.7-rc.2`**（npm `next` dist-tag）。
+`stub-dsh.mjs` 内每个补丁块都标注了「已针对该版本核实的锚点状态」，失效时会打印显式 WARN 而非静默跳过。
+
+0.1.7 相对上一适配版本（0.1.5-rc.2）的关键破坏性变更与处置：
+
+| 变更 | 影响 | 处置 |
+|---|---|---|
+| 新增原生插件依赖 `node-addon-require-builtin`，Android 无预编译产物（registry 404） | **boot 级硬阻断**：失败点在插件树挂载之前，日志只有「web 未就绪」，无插件级报错 | 以纯 JS 顶替实现覆写该包，改用启动器本就传入的 `--expose-internals` 取 Node 内部模块 |
+| `dsh-llm-pi-ai` 的 `sendAttribution` schema 声明形式变化 | 归因 UA 抑制补丁锚点漂移 | 按 0.1.7 实际代码重新锚定 |
+| 新增 `@deepseek-ai/dsh-atomic-write` | 原子写走 rename/wx | 评估后按需补丁 |
+| 包增删 48/6（新增 dsh-lazy-require、dsh-plugin-manager 等） | 依赖面扩大 | 逐锚点复核 |
+
+已核实**未漂移**、继续有效的锚点：koffi ABI 断言（`dsh-win32-process`）、`attachment-local` 两点 link 调用、
+`dsh-fs-local` chmod 三处字面量、`flock` 锚点、`dsh-settings` 已删除符号、`--no-open` 参数、前端静态模块种子表。
 ## 构建
 
 ```sh

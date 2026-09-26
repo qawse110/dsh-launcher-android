@@ -80,7 +80,7 @@ class MainActivity : AppCompatActivity() {
      * APK 升级资产同步的放行闸门。
      *
      * **为什么需要显式闸门而不是靠时序**：`syncAssetsOnApkUpdate()` 在后台线程拷贝
-     * 资产（含 30MB prebuilt + 刷新插件副本，可能数秒），而 `autoRoute()` 紧接着在
+     * 资产（含插件源拷贝 + 刷新插件副本，可能数秒），而 `autoRoute()` 紧接着在
      * 另一线程判断「已安装 → START_ONLY 快速启动」。快速启动**跳过插件装配**，
      * 直接加载 `files/plugins/<id>` 下的副本——若它先跑完，dsh 用的就是**尚未刷新**的
      * 旧插件，于是「装了含修复的新 APK 仍报同样的错」再次复现。
@@ -912,7 +912,7 @@ class MainActivity : AppCompatActivity() {
     // ---------------- APK 升级：同步内置插件源 ----------------
 
     /**
-     * APK 升级后自动把 assets 里的内置插件源（prebuilt.tgz 等）同步到 files，
+     * APK 升级后自动把 assets 里的内置插件源（extra-plugins/ 与装配清单）同步到 files，
      * 避免“更新了应用但运行时仍是旧插件”。装配本身仍需用户执行
      * 「插件管理 → 重新装配内置插件」（或控制台一键安装）。
      */
@@ -937,21 +937,21 @@ class MainActivity : AppCompatActivity() {
             try {
                 for (name in listOf(
                     "install-dsh.mjs", "routing-suite.mjs",
-                    "fs-register.mjs", "fs-loader.mjs", "fs-promises-compat.mjs", "stub-dsh.mjs"
+                    "fs-register.mjs", "fs-loader.mjs", "fs-promises-compat.mjs", "stub-dsh.mjs",
+                    "plugin-manifest.json", "dsh-pin.json"
                 )) {
                     if (!AssetSync.copyAsset(this, name, File(filesDir, name))) ok = false
-                }
-                val prebuilt = File(filesDir, "prebuilt.tgz")
-                if (AssetSync.copyAsset(this, "prebuilt.tgz", prebuilt)) {
-                    AssetSync.markSyncedWithFingerprint(this, "prebuilt", prebuilt, stamp)
-                } else {
-                    ok = false
                 }
                 val extraPlugins = File(filesDir, "extra-plugins")
                 if (AssetSync.copyAssetDir(this, "extra-plugins", extraPlugins, clearFirst = true)) {
                     AssetSync.markSyncedWithFingerprint(this, "extra-plugins", extraPlugins, stamp)
                 } else {
                     ok = false
+                }
+                // 可选插件源（随 APK 分发、默认不装配）：与内置源同等对待地保持最新。
+                val optionalPlugins = File(filesDir, "optional-plugins")
+                if (AssetSync.copyAssetDir(this, "optional-plugins", optionalPlugins, clearFirst = true)) {
+                    AssetSync.markSyncedWithFingerprint(this, "optional-plugins", optionalPlugins, stamp)
                 }
                 // ★ 同步了「源」还不够：运行时加载的是 files/plugins 下的**装配副本**，
                 //   profile 登记的是 link: 到该目录 → 必须把副本也刷一遍。否则装了含插件
@@ -1007,7 +1007,7 @@ class MainActivity : AppCompatActivity() {
             setTextColor(Ui.TEXT_PRIMARY)
         })
         inner.addView(TextView(this).apply {
-            text = "检测到 APK 升级，内置插件源（prebuilt.tgz）已同步到新版本。" +
+            text = "检测到 APK 升级，内置插件源（extra-plugins/）已同步到新版本。" +
                 "内置插件需要重新装配后才会使用新代码。"
             textSize = 12f
             setTextColor(Ui.TEXT_SECONDARY)

@@ -1,0 +1,5 @@
+# dsh-codearts-auth 配置包补丁：在空配置根上追加插件行。
+# 后续配置补丁可通过 id 引用此行。
+- insert:
+    - id: codearts-auth
+      name: 'dsh-codearts-auth'

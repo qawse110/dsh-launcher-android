@@ -15,14 +15,13 @@
  *   node install-dsh.mjs --plugins-only # 跳过 npm 更新，只重新装配内置插件
  *
  * 环境变量：
- *   HOME / NODE_BIN / NPM_BIN / DSH_PREFIX / DSH_PROFILE / DSH_PREBUILT
+ *   HOME / NODE_BIN / NPM_BIN / DSH_PREFIX / DSH_PROFILE
  *   DSH_PLUGINS_DIR / DSH_NODE_MEM / NPM_REGISTRY
  *   DSH_NPM_TIMEOUT_MS / DSH_PLUGIN_TIMEOUT_MS（子进程硬超时，防网络卡死）
  */
 import { existsSync, writeFileSync, mkdirSync, readFileSync, readdirSync, rmSync, cpSync, chmodSync, symlinkSync, readlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { gunzipSync } from 'node:zlib';
 
 const HOME = process.env.HOME || '/data/user/0/com.dsh.nextapp1/files';
 // 显式文件根：不依赖调用方是否导出 HOME（契约加固，P1）——所有状态路径由此派生
@@ -31,7 +30,6 @@ const NODE_BIN = process.env.NODE_BIN || join(FILES_DIR, 'node/bin/node');
 const NPM_BIN = process.env.NPM_BIN || join(FILES_DIR, 'node/bin/npm');
 const DSH_PREFIX = process.env.DSH_PREFIX || join(HOME, 'dsh-prefix');
 const DSH_PROFILE = process.env.DSH_PROFILE || 'web';
-const PREBUILT = process.env.DSH_PREBUILT || '';
 const DSH_APK_VER = process.env.DSH_APK_VER || '';
 const PLUGINS_DIR = process.env.DSH_PLUGINS_DIR || join(FILES_DIR, 'plugins');
 const EXTRA_PLUGINS_SRC = process.env.DSH_EXTRA_PLUGINS_SRC || join(FILES_DIR, 'extra-plugins');
@@ -54,39 +52,35 @@ const NPM_NET_ARGS = [
 ];
 const OUT = join(FILES_DIR, 'install_log.txt');
 const OUT_SHARED = '/sdcard/Download/DshLauncher/install_log.txt';
-const BUILTIN_PLUGINS = [
-  'dsh-mobile-nav',
-  'dsh-super-injector',
-  'dsh-net-proxy',
-  'dsh-provider-headers',
-  'dsh-vision',
-  'dsh-status-bridge',
-  'dsh-android-links',
-  'dsh-llm-codebuddy',
-  'dsh-prompt-optimizer',
-];
-const BUILTIN_NAMES = new Set([
-  '@dsh-external/dsh-mobile-nav',
-  '@dsh-external/dsh-super-injector',
-  'dsh-net-proxy',
-  'dsh-provider-headers',
-  '@dsh-external/dsh-vision',
-  '@dsh-external/dsh-status-bridge',
-  '@dsh-external/dsh-android-links',
-  'dsh-llm-codebuddy',
-  '@dsh-external/dsh-prompt-optimizer',
-]);
-const BUILTIN_IDS = new Set([
-  'dsh-mobile-nav',
-  'dsh-super-injector',
-  'net-proxy',
-  'provider-headers',
-  'dsh-vision',
-  'dsh-status-bridge',
-  'dsh-android-links',
-  'llm-codebuddy',
-  'prompt-optimizer',
-]);
+/**
+ * 内置插件清单 —— **单一真源**，来自 assets/plugin-manifest.json。
+ *
+ * 为什么改成读清单：此前装配清单在本文件里硬编码了三份（目录名/包名/patch id），
+ * Kotlin 侧 PluginManagerActivity 又各自硬编码三份，六份表手工同步、无任何校验——
+ * 改一个插件要动六处，漏一处就静默不一致（真机表现为「插件管理页显示的」与
+ * 「实际装配的」对不上）。现在两侧都从同一份 JSON 派生，装配面与展示面不可能再漂移。
+ *
+ * builtin = 随 APK 装配的插件；optional = 随 APK 分发但**默认不装配**的插件
+ * （源码保留在 assets/optional-plugins/，用户可在插件管理页按需装配）。
+ */
+function loadManifest() {
+  const file = join(EXTRA_PLUGINS_SRC, '..', 'plugin-manifest.json');
+  const fallback = join(FILES_DIR, 'plugin-manifest.json');
+  for (const p of [file, fallback]) {
+    try {
+      const m = JSON.parse(readFileSync(p, 'utf8'));
+      if (Array.isArray(m.builtin) && m.builtin.length) return m;
+    } catch {}
+  }
+  return { builtin: [], optional: [] };
+}
+const MANIFEST = loadManifest();
+/** 装配目录名（assets/extra-plugins 与 files/plugins 下的目录名）。 */
+const BUILTIN_PLUGINS = MANIFEST.builtin.map((p) => p.dir);
+/** package.json 的 name：cleanBuiltinPatch 匹配 profile patch 的 name: 行。 */
+const BUILTIN_NAMES = new Set(MANIFEST.builtin.map((p) => p.name));
+/** cordis.patch.yml 的 insert id：cleanBuiltinPatch 匹配 patch 的 - id: 行。 */
+const BUILTIN_IDS = new Set(MANIFEST.builtin.map((p) => p.id));
 function log(m) {
   const l = `${new Date().toISOString()} [install] ${m}`;
   console.log(l);
@@ -167,6 +161,16 @@ function envBase(extra = {}) {
   return env;
 }
 
+/** dsh 钉死版本：读 assets/dsh-pin.json（与 DshFlow.PINNED_DSH_TAG 同源）。
+ *  读不到时回退编译期常量，保证脚本独立可跑（离线调试/CI）。 */
+const FALLBACK_DSH_TAG = '0.1.7-rc.2';
+function pinnedDshTag() {
+  try {
+    const t = JSON.parse(readFileSync(join(FILES_DIR, 'dsh-pin.json'), 'utf8')).tag;
+    if (typeof t === 'string' && t.trim()) return t.trim();
+  } catch {}
+  return FALLBACK_DSH_TAG;
+}
 function dshCli() {
   return join(DSH_PREFIX, 'node_modules/@deepseek-ai/dsh/lib/bin.js');
 }
@@ -247,8 +251,10 @@ function ensureHostPkg() {
 function ensureDsh() {
   mkdirSync(DSH_PREFIX, { recursive: true });
   ensureHostPkg();
-  // dsh 本体版本钉死为 0.1.5-rc.2（DSH_TAG 环境变量可覆盖）
-  const tag = process.env.DSH_TAG || '0.1.5-rc.2';
+  // dsh 本体版本钉死（DSH_TAG 环境变量可覆盖）。默认值来自 assets/dsh-pin.json ——
+  // 与 DshFlow.PINNED_DSH_TAG 同源，避免两处版本号各自漂移（历史上每次升级都要
+  // 手工同步两处，漏一处就静默装错版本）。
+  const tag = process.env.DSH_TAG || pinnedDshTag();
   const pkgSpec = `@deepseek-ai/dsh@${tag}`;
   const pkgDir = join(DSH_PREFIX, 'node_modules/@deepseek-ai/dsh');
   const beforeVersion = (() => {
@@ -424,107 +430,21 @@ function ensureRipgrepFallback() {
   }
 }
 
-/** 解析 ustar tar（无需外部工具）：文件/目录/符号链接；只提取指定前缀。 */
-function untarWithPrefix(buf, dest, prefix) {
-  let off = 0;
-  let files = 0;
-  const strip = prefix.replace(/\/+$/, '') + '/';
-  while (off + 512 <= buf.length) {
-    const h = buf.subarray(off, off + 512);
-    if (h.every((b) => b === 0)) break;
-    const name0 = h.subarray(0, 100).toString('utf8').replace(/\0[\s\S]*$/, '');
-    if (!name0) break;
-    const prefix0 = h.subarray(345, 500).toString('utf8').replace(/\0[\s\S]*$/, '');
-    const rawName = (prefix0 ? prefix0 + '/' : '') + name0;
-    const name = rawName.replace(/^\.\//, '');
-    if (name.includes('..') || name.startsWith('/') || /^[A-Za-z]:/.test(name)) {
-      off += 512 + Math.ceil(parseInt(h.subarray(124, 136).toString('utf8').replace(/\0[\s\S]*$/, '').trim(), 8) / 512) * 512;
-      continue;
-    }
-    const size = parseInt(h.subarray(124, 136).toString('utf8').replace(/\0[\s\S]*$/, '').trim(), 8) || 0;
-    const type = String.fromCharCode(h[156]);
-    const data = buf.subarray(off + 512, off + 512 + size);
-    // 只处理匹配前缀的条目；third_party 顶层目录本身也跳过
-    const matched = !prefix
-      ? (name !== '.' && name !== '')
-      : (name === strip.slice(0, -1) || name.startsWith(strip));
-    if (matched) {
-      const rel = !prefix
-        ? name
-        : (name.startsWith(strip) ? name.slice(strip.length) : '');
-      if (rel) {
-        const p = join(dest, rel);
-        if (type === '5') {
-          mkdirSync(p, { recursive: true });
-        } else if (type === '2') {
-          const target = h.subarray(157, 257).toString('utf8').replace(/\0[\s\S]*$/, '');
-          mkdirSync(dirname(p), { recursive: true });
-          try { symlinkSync(target, p); } catch {}
-        } else if (type === '0' || type === '\0') {
-          mkdirSync(dirname(p), { recursive: true });
-          writeFileSync(p, data);
-          files++;
-        }
-      }
-    }
-    off += 512 + Math.ceil(size / 512) * 512;
-  }
-  log(`untar: ${files} files (prefix=${strip}) -> ${dest}`);
-  return files;
-}
-
-/** 轻量内容指纹（fnv1a 32bit + 字节数）：本地 debug 重建 versionCode 不变时，
- *  也能感知资产内容变化。文件取长度+头 64KB；目录由调用方聚合。 */
-function contentFingerprint(buf) {
-  let h = 0x811c9dc5;
-  const n = Math.min(buf.length, 64 * 1024);
-  const step = Math.max(1, Math.floor(n / 4096)); // 最多采样 4KB 点
-  for (let i = 0; i < n; i += step) {
-    h ^= buf[i];
-    h = Math.imul(h, 0x01000193) >>> 0;
-  }
-  return h.toString(16) + '-' + buf.length;
-}
-
-function extractPlugins() {
-  if (!PREBUILT || !existsSync(PREBUILT)) {
-    log('DSH_PREBUILT not set or missing, skip bundled plugin extraction');
-    return;
-  }
-  // 提取完成标记由脚本自己维护（不能由 prebuilt 拷贝侧维护）：APK 升级后
-  // prebuilt 可能已覆盖为新包，但 plugins 目录还是旧包，必须在提取成功后
-  // 才写标记；否则会误跳过新包的提取。
-  // 标记格式：apk:<ver>/<指纹>——指纹覆盖同 versionCode 换包的场景（本地 debug 重建）。
-  const extractedMarker = join(FILES_DIR, '.plugins-extracted-ok');
-  const raw = readFileSync(PREBUILT);
-  const buf = (raw[0] === 0x1f && raw[1] === 0x8b) ? gunzipSync(raw) : raw;
-  const prebuiltFp = contentFingerprint(buf);
-  let markerOk = false;
-  if (DSH_APK_VER && existsSync(extractedMarker)) {
-    try { markerOk = readFileSync(extractedMarker, 'utf8').trim() === 'apk:' + DSH_APK_VER + '/' + prebuiltFp; } catch {}
-  }
-  if (markerOk && BUILTIN_PLUGINS.every((d) => existsSync(join(PLUGINS_DIR, d, 'package.json')))) {
-    log('bundled plugins already extracted for apk:' + DSH_APK_VER + '/' + prebuiltFp + ', skip untar');
-    return;
-  }
-  try {
-    mkdirSync(PLUGINS_DIR, { recursive: true });
-    let extractedFiles = untarWithPrefix(buf, PLUGINS_DIR, 'third_party');
-    // 兼容直接打包 plugins.tgz（顶层就是插件目录而非 third_party/）：
-    // 如果上面没解出任何东西且包内没有 third_party 前缀，再整体解到 plugins。
-    const anyBuiltin = BUILTIN_PLUGINS.some((d) => existsSync(join(PLUGINS_DIR, d, 'package.json')));
-    if (!anyBuiltin) {
-      log('no third_party prefix found, try extracting archive to plugins dir directly');
-      extractedFiles += untarWithPrefix(buf, PLUGINS_DIR, '');
-    }
-    const builtinReady = BUILTIN_PLUGINS.some((d) => existsSync(join(PLUGINS_DIR, d, 'package.json')));
-    if (extractedFiles > 0 && builtinReady && DSH_APK_VER) {
-      try { writeFileSync(extractedMarker, 'apk:' + DSH_APK_VER + '/' + prebuiltFp + '\n'); } catch {}
-    }
-  } catch (t) {
-    log('WARN extract plugins failed: ' + t.message);
-  }
-}
+/* ---------------------------------------------------------------------------
+ * 已移除：prebuilt.tgz 解包供给链（untarWithPrefix / contentFingerprint / extractPlugins）
+ *
+ * 历史：内置插件有**两条**供给链——assets/extra-plugins/（AssetManager 直拷）与
+ * prebuilt.tgz 内的 third_party/（自实现 ustar 解包）。两条链各自有同步标记、
+ * 各自有指纹判据，审计必须同时覆盖；真机事故正是「只审了一条」导致 dsh-vision
+ * 的源码问题长期漏网（见 docs/plugin-conversion-audit.md §7.9）。
+ *
+ * 本次重构后，全部内置插件统一放在 assets/extra-plugins/ 下，走同一条
+ * 「AssetManager 直拷 + syncExtraPlugin 整目录替换」通道，prebuilt.tgz 不再需要，
+ * 故整条解包链一并删除。收益：
+ *   1) 单一供给链——不再存在「审了一条漏另一条」的结构性盲区；
+ *   2) 少一个 1.7MB 的 LFS 二进制与一套自实现 tar 解析器；
+ *   3) 插件改动不再需要重新打包 tgz 并推 LFS 对象。
+ * ------------------------------------------------------------------------- */
 
 function dshPlugin(args) {
   if (!dshInstalled()) {
@@ -859,7 +779,6 @@ if (!pluginsOnly) {
   ensureRipgrepFallback();
 }
 
-extractPlugins();
 installBuiltins();
 linkPluginDeps();
 
