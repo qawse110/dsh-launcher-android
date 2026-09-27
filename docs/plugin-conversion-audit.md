@@ -7,7 +7,7 @@
   directory-picker browse 源码、HTML 引导时序），给出「保留 / 移除 / 插件化」三向结论。
 - 结论速览：12 处补丁 → **1 处插件化**（新增 `dsh-android-links`）、
   **2 处死码移除**（apiproxy 白名单、sandbox "/tmp"）、
-  **1 处改按需注入**（AbortSignal shim）、8 处保留并注明不可替代原因。
+  **1 处改为无条件注入**（前端 API shim，带 `if(!X)` 守卫与版本化幂等判据）、8 处保留并注明不可替代原因。
 
 ---
 
@@ -22,7 +22,7 @@
 | 5 | apiproxy `WEB_SETTINGS_NAMESPACES += "vision"` | 正则插桩 | **移除（死码）** | rc.2 原包已无该常量（grep=0），补丁恒命中 "pattern not found, skip"；`dsh-vision` 现经 `@deepseek-ai/dsh-settings` 的 `settingsNamespace('vision')` 直接注册命名空间 |
 | 6 | llm-pi-ai sendAttribution（schema default + requestHeaders 分流） | 正则插桩 | **保留** | rc.2 原包无此字段且源码注释明示 *“omission cannot suppress attribution”*——归因 UA 大小写不敏感地覆盖用户 headers，唯一抑制通道就是该补丁；`dsh-provider-headers` 设置页的「发送归因请求头」开关依赖它。待上游提供官方抑制缝隙后删除 |
 | 7 | sandbox-windows-acl STARTUPINFOW/PROCESS_INFORMATION 断言禁用 | 正则替换 | **保留（防御性）** | 断言存在于 rc.2 原包 `lib/types-*.js`；koffi 已被顶替，一旦上游自动选中 windows-acl 策略即崩，禁用成本≈0 |
-| 8 | index.html AbortSignal.timeout polyfill | dist/index.html 注入 | **改为按需注入** | 全量扫描 rc.2 前端 dist 与全部 @deepseek-ai 包：**无任何浏览器侧消费者**（仅 host 侧 vision/super-injector 使用，Node 原生支持）；现仅在 assets 中检测到真实引用才注入（**递归扫描含子目录 chunk**，布局变化不丢消费者；误报无害——shim 自带 `if(!AbortSignal.timeout)` 守卫），资产目录不可读时保守回退注入。必须留在引导期脚本：polyfill 需先于 `/assets/index-*.js` 与 client-modules 条目执行，client 插件由模块系统在 app bundle 内引导，时序上不可能更早 |
+| 8 | 前端 API polyfill（index.html 注入） | dist/index.html 注入 | **改为无条件注入（带守卫 + 版本化幂等）** | 0.1.7 真机复测**推翻**了此处原有结论：系统 WebView 94 上页面缺 `Promise.withResolvers` / `AbortSignal.any` / `AbortSignal.prototype.throwIfAborted` / `structuredClone` 四类 API 并白屏；消费者位于**插件 client bundle**（`/plugins/**/client.js`）而非 app bundle，故「扫描 app bundle 无消费者即可不注入」的判据不成立（实测恒 0 命中）。现改为无条件注入，整段 `if(!X)` 守卫保证新版 WebView 上逐条 no-op、不覆盖原生实现。幂等判据带版本号（`SHIM_ID`）：升级 payload 只需递增版本，旧 shim 会被就地替换，不再需要手工改 `index.html`。必须留在引导期脚本：polyfill 需先于 `/assets/index-*.js` 与 client-modules 条目执行，client 插件由模块系统在 app bundle 内引导，时序上不可能更早 |
 | 9 | @vscode/ripgrep 解析器 Android 回退 | 重写解析器 | **保留** | 无 android-arm64 平台包；import 期 `require.resolve` 抛错导致 glob/grep 工具瘫痪；优先 Termux 原生 rg 属产品语义。（备选方案：alias 出 `@vscode/ripgrep-android-arm64` 侧门面包——会丢失 Termux rg 优先级，未采纳） |
 | 10 | dsh-sandbox/-local `"/tmp"`→TMPDIR | 字符串全量替换 | **移除（已被上游覆盖）** | rc.2 `writableRoots()` 已原生并入 `os.tmpdir()`（Node 读 TMPDIR，启动器恒导出应用私有 tmp）；sandbox-local 的 `--tmpfs/readWrite` 分支依赖 bubblewrap，Android 上不可达。旧补丁在 rc.2 上零替换仍追加 marker 头，属纯文件污染 |
 | 11 | dsh-fs-local chmod EACCES/EPERM 容错 | 三处调用点包裹 | **保留** | FUSE（/storage/emulated）不支持 chmod，原子写 staging 会 EACCES；三处锚点 rc.2 均存在；内部实现路径无插件缝隙 |
@@ -64,7 +64,7 @@
 
 1. attachment-local v5 与 fs-local chmod 的锚点是否漂移（补丁自带 node --check 防毒化）；
 2. llm-pi-ai 是否提供官方归因抑制缝隙（有则删补丁 #6）；
-3. 前端 dist 是否重新引入 `AbortSignal.timeout` 消费者（按需注入自动兜底，无需动作）;
+3. 前端是否引入新的浏览器 API（polyfill 为无条件注入 + 守卫，新版 WebView 自动 no-op；旧 WebView 需追加 `if(!X)` 并递增 `SHIM_ID`）;
 4. `writableRoots()` 是否退回丢失 `os.tmpdir()`（若有变化恢复补丁 #10 并去掉 marker 头写入）；
 5. browse 是否改变符号链接语义（若不再 stat 跟随，`dsh-android-links` 需同步调整）；
 6. **koffi ABI 断言所在包是否再次搬家**（见 §七：0.1.5 已从 sandbox-windows-acl 搬到
@@ -77,8 +77,10 @@
 - HTML 引导时序：`<head>` 内为 module-loader shim → client-modules/client-runtime 预载
   → `__DSH_BOOT__` → （shim 位点）→ `<script type="module" src="/assets/index-*.js">`，
   证实 client 插件无法先于 app bundle 执行；
-- 设备 WebView 为 Chromium 94，当前 rc.2 页面在**无 shim** 时亦正常（无消费者），
-  与「按需注入」结论一致。
+- 设备 WebView 为 Chromium 94。**0.1.7 真机复测推翻了此处的旧结论**：无 shim 时页面
+  抛 `Promise.withResolvers` / `AbortSignal.any` / `throwIfAborted` / `structuredClone`
+  四类缺失 API 并白屏；消费者在**插件 client bundle** 而非 app bundle，
+  故「扫描 app bundle 无消费者即可不注入」不成立，现为无条件注入 + 逐条守卫。
 
 ## 七、dsh 0.1.5-rc.2 适配记录（2026-09-11，next 分支）
 

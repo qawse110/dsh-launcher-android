@@ -59,6 +59,18 @@ object DshFlow {
     /** web 启动脚本模板（assets 内，@TOKENS@ 由 [TermuxEnv] 渲染）。 */
     private const val WEB_LAUNCHER_TPL = "web-launcher.sh.tpl"
 
+    /** stub 补丁载荷文件名（assets → files 同步；两条启动路径共用）。 */
+    private const val STUB_SCRIPT = "stub-dsh.mjs"
+
+    /**
+     * Node loader 兼容层脚本清单（assets → files 同步的**单一真源**）。
+     * SELinux 禁止 app 对 data 文件硬链接，dsh 会话首次落盘用 link()，
+     * 故需把 node:fs/promises 的 link 重定向为 rename 兼容实现。
+     */
+    private val COMPAT_SCRIPTS = listOf(
+        "fs-register.mjs", "fs-loader.mjs", "fs-promises-compat.mjs",
+    )
+
     /** 模板资产读取失败时的兜底内联模板（内容与 tpl 保持一致）。 */
     private val DEFAULT_WEB_LAUNCHER_TPL = """
         #!/data/user/0/com.dsh.nextapp1/t/usr/bin/bash
@@ -170,35 +182,19 @@ object DshFlow {
                 onState?.invoke("未安装")
                 return false
             }
-            return if (quickStartWeb(ctx, nodeDir, dshPrefix, ::fl)) {
-                fl("OK 启动完成 (http://127.0.0.1:$WEB_PORT)")
-                DshUpdater.noteSuccessfulBoot(ctx, ::fl)
-                onState?.invoke("运行中")
-                BuildKeepAliveService.updateRunning(ctx)
-                ensureBridge(ctx)
-                true
-            } else {
-                fl("FAIL 启动：dsh web 未就绪（见上方日志尾部）")
-                onState?.invoke("启动失败")
-                false
-            }
+            return runQuickStart(
+                ctx, nodeDir, dshPrefix, onState, ::fl,
+                okLabel = "OK 启动完成", failLabel = "FAIL 启动"
+            )
         }
 
         // 安装+启动模式且 dsh 已安装：快速启动，跳过 npm 更新/插件装配/Termux 全量准备
         if (mode == Mode.INSTALL_AND_START && !forceFullInstall && isInstalled(ctx)) {
             fl(">> 快速启动：已安装 dsh v${DshUpdater.currentVersion(ctx)}，跳过 npm/插件装配…")
-            return if (quickStartWeb(ctx, nodeDir, dshPrefix, ::fl)) {
-                fl("OK 快速启动完成 (http://127.0.0.1:$WEB_PORT)")
-                DshUpdater.noteSuccessfulBoot(ctx, ::fl)
-                onState?.invoke("运行中")
-                BuildKeepAliveService.updateRunning(ctx)
-                ensureBridge(ctx)
-                true
-            } else {
-                fl("FAIL 快速启动：dsh web 未就绪（见上方日志尾部）")
-                onState?.invoke("启动失败")
-                false
-            }
+            return runQuickStart(
+                ctx, nodeDir, dshPrefix, onState, ::fl,
+                okLabel = "OK 快速启动完成", failLabel = "FAIL 快速启动"
+            )
         }
 
         fl(">> 1.5/4 准备内置 Termux（bash/coreutils + git/rg/file）…")
@@ -332,25 +328,7 @@ object DshFlow {
             fl("OK 3/4 dsh + builtin plugins installed")
 
             fl(">> 3.5/4 Android 兼容修复…")
-            val stubScript = File(ctx.filesDir, "stub-dsh.mjs")
-            try {
-                ctx.assets.open("stub-dsh.mjs").use { input ->
-                    stubScript.outputStream().use { output -> input.copyTo(output) }
-                }
-            } catch (t: Throwable) {
-                fl("FAIL 3.5/4 assets copy stub-dsh.mjs: ${t.message}")
-            }
-            // SELinux 禁止 app 对 data 文件硬链接；dsh session 首次落盘用 link()。
-            // 通过 Node loader 把 node:fs/promises 的 link 重定向为 rename 兼容实现。
-            for (name in listOf("fs-register.mjs", "fs-loader.mjs", "fs-promises-compat.mjs")) {
-                try {
-                    ctx.assets.open(name).use { input ->
-                        File(ctx.filesDir, name).outputStream().use { output -> input.copyTo(output) }
-                    }
-                } catch (t: Throwable) {
-                    fl("WARN assets copy $name: ${t.message}")
-                }
-            }
+            val stubScript = syncCompatScripts(ctx, ::fl)
             // stub 标记含 dsh 版本：回滚重装后版本变化会自动重新打补丁
             runAndroidStubOnce(ctx, nodeDir, dshPrefix, stubScript, ::fl)
 
@@ -402,26 +380,67 @@ object DshFlow {
             .onFailure { AppLog.e("DshFlow", "bridge start failed: ${it.message}") }
     }
 
-    /** 快速启动：同步兼容脚本（fs-register/fs-loader/fs-promises/stub）→ 执行 stub → 启动 web。 */
+    /**
+     * 快速启动：同步兼容脚本 → 执行 stub → 启动 web。
+     * 脚本同步走 [syncCompatScripts]（与全量安装同一入口）。
+     */
     private fun quickStartWeb(ctx: Context, nodeDir: File, dshPrefix: File, fl: (String) -> Unit): Boolean {
-        for (name in listOf("fs-register.mjs", "fs-loader.mjs", "fs-promises-compat.mjs", "stub-dsh.mjs")) {
-            val target = File(ctx.filesDir, name)
-            try {
-                ctx.assets.open(name).use { input ->
-                    target.outputStream().use { output -> input.copyTo(output) }
-                }
-            } catch (t: Throwable) {
-                fl("WARN copy $name: ${t.message}")
-            }
-        }
-        val stubScript = File(ctx.filesDir, "stub-dsh.mjs")
+        val stubScript = syncCompatScripts(ctx, fl)
         if (stubScript.exists()) {
             runAndroidStubOnce(ctx, nodeDir, dshPrefix, stubScript, fl)
         } else {
-            fl("WARN 未找到 stub-dsh.mjs，继续尝试启动 web")
+            fl("WARN 未找到 $STUB_SCRIPT，继续尝试启动 web")
         }
         fl(">> 启动 dsh web…")
         return startDshWeb(ctx, nodeDir, dshPrefix, fl)
+    }
+
+    /**
+     * 同步 Android 兼容脚本到 files（**唯一入口**）。
+     *
+     * 全量安装与快速启动两条路径共用。此前两处各写一遍文件清单，新增脚本时
+     * 漏改一处就会出现「某个入口缺脚本」的静默故障——同一件事只保留一条实现。
+     *
+     * @return stub 补丁载荷的目标文件（调用方据此决定是否重打补丁）
+     */
+    private fun syncCompatScripts(ctx: Context, onLog: (String) -> Unit): File {
+        for (name in COMPAT_SCRIPTS + STUB_SCRIPT) {
+            try {
+                ctx.assets.open(name).use { input ->
+                    File(ctx.filesDir, name).outputStream().use { output -> input.copyTo(output) }
+                }
+            } catch (t: Throwable) {
+                onLog("WARN assets copy $name: ${t.message}")
+            }
+        }
+        return File(ctx.filesDir, STUB_SCRIPT)
+    }
+
+    /**
+     * 快速启动的**唯一收尾入口**（仅启动 / 安装+启动且已安装 两条触发路径共用）。
+     * 此前两处各写一遍「成功则记录基线+保活+桥接、失败则置状态」，新增联动时
+     * 极易漏改一处；这里收敛为单一实现。
+     */
+    private fun runQuickStart(
+        ctx: Context,
+        nodeDir: File,
+        dshPrefix: File,
+        onState: ((String) -> Unit)?,
+        fl: (String) -> Unit,
+        okLabel: String,
+        failLabel: String,
+    ): Boolean {
+        if (quickStartWeb(ctx, nodeDir, dshPrefix, fl)) {
+            fl("$okLabel (http://127.0.0.1:$WEB_PORT)")
+            DshUpdater.noteSuccessfulBoot(ctx, fl)
+            onState?.invoke("运行中")
+            BuildKeepAliveService.updateRunning(ctx)
+            ensureBridge(ctx)
+            return true
+        }
+        fl("$failLabel：dsh web 未就绪（见上方日志尾部）")
+        onState?.invoke("启动失败")
+        return false
     }
 
     /**

@@ -178,11 +178,11 @@ adb shell am start -n com.dsh.nextapp1/.MainActivity   # 或直接点应用图�
 | `sharp` / `node-pty` 无 Android 预编译产物 | Proxy stub / 纯 JS shim（import 期顶替） |
 | `sendAttribution:false` 不生效（归因 UA 仍被强制注入） | `llm-pi-ai` schema/header 补丁（待上游提供官方抑制缝隙） |
 | `sandbox-windows-acl` 布局断言崩溃 | 正则禁用 STARTUPINFOW/PROCESS_INFORMATION 断言 |
-| WebView 无限 `connection lost` 重连 | `AbortSignal.timeout` polyfill——**按需注入**：仅当 dist 内 bundle 确实引用该 API 才写 `index.html`（rc.2 前端无消费者，自动跳过） |
+| WebView 白屏 / 无限 `connection lost` 重连 | 前端 API polyfill——**无条件注入 + 逐条 `if(!X)` 守卫**（新版 WebView 上逐条 no-op）。覆盖 `Promise.withResolvers` / `AbortSignal.timeout` / `any` / `throwIfAborted` / `structuredClone` / `Array.at` / `findLast` / `findLastIndex` / `toSorted` / `toReversed` / `with` / `Object.hasOwn` / `Object.groupBy` / `Map.groupBy`。曾改为按需注入，但消费者在**插件 client bundle**（`/plugins/**/client.js`）而非 app bundle，扫描恒 0 命中→跳过注入→照旧白屏，故改回；幂等判据带版本号（`SHIM_ID`） |
 
 ## 已知限制
 
-- 系统 WebView 版本较旧（本机 Chromium 94）：上游若引入更新的 Web API，可能需要补充 polyfill（`stub-dsh.mjs` index shim 段）。
+- 系统 WebView 版本较旧（本机 Chromium 94）：本仓已**无条件注入带守卫的前端 polyfill**（见上表）。上游若再引入更新的 Web API，只需在 `stub-dsh.mjs` 的 polyfill 里追加一条 `if(!X)` 并**递增 `SHIM_ID`**，设备端会自动替换旧 shim，无需人工介入。
 - `sharp` 为 stub：依赖图片处理的能力不可用，不影响核心会话功能。
 - 设备内存有限：**不要在设备上执行 `pnpm build` / 类型检查**（会 OOM）；内置插件以源码打包进 APK，装配用官方 `dsh plugin`，不在设备端编译。
 - 重新安装 APK 会终止旧 web 进程，需再次触发一键引导（幂等；已安装时走 npm 增量更新）。
