@@ -1,2 +1,12 @@
 app/src/main/assets/node/termux-node-aarch64.tar.gz filter=lfs diff=lfs merge=lfs -text
 app/src/main/assets/termux-bootstrap.zip filter=lfs diff=lfs merge=lfs -text
+
+# 文本资产强制以 LF 入库。
+# 背景（真机实测）：Windows 上 core.autocrlf=true 会把检出内容变成 CRLF，而
+#   · bash 对行尾 \r 敏感 -> dsh-web.sh / tpkg.sh 报 "$'\r': command not found"，
+#     export 的值也会带上 \r；
+#   · 渲染会把模板内容直接写进设备端 shell 脚本，CRLF 会一路带进去。
+# 故按类型钉死 LF，避免「Linux CI 上正常、Windows 本地打包却坏掉」。
+*.sh   text eol=lf
+*.tpl  text eol=lf
+*.mjs  text eol=lf

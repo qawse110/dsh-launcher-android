@@ -796,50 +796,99 @@ try {
 } catch (e) { log('WARN koffi-abi: ' + e.message); }
 
 try {
-  // 已针对 0.1.7-rc.2 核实：探测路径 @deepseek-ai/dsh-web-frontend/dist/index.html
-  // **仍然命中**——0.1.7 dist 布局为 assets/ + index.html + manifest.webmanifest
-  // （+ favicon-*.svg），assets/ 递归扫描逻辑对 chunk 子目录布局变化不敏感。
-  // 按需注入语义不变：无消费者时打 'index.html shim skipped'（可诊断，非静默）。
+  // WebView / 旧 Chrome 前端 API 补齐（**已针对 0.1.7-rc.2 核实**）。
   //
-  // WebView / Chrome ≤102 无 AbortSignal.timeout。
-  // v4.10 起**按需注入**：仅当 dist 内 app bundle 确实引用了该 API 才写
-  // index.html；0.1.1-rc.2 前端与全部内置插件 client 均无引用，自动跳过，
-  // 不再无条件改写上游产物。必须留在引导期脚本里：polyfill 需要先于
-  // /assets/index-*.js 与模块系统条目执行，client 插件通道时序上做不到。
+  // 真机实测（Android 11 / 系统 WebView 94）dsh 0.1.7 前端一启动即抛：
+  //   Uncaught TypeError: Promise.withResolvers is not a function        （需 Chrome 119+）
+  //   Uncaught (in promise) TypeError: AbortSignal.any is not a function（需 Chrome 116+）
+  //   AbortSignal.timeout                                                （需 Chrome 103+）
+  // → 页面停在引导骨架，UI 完全不可交互。
+  //
+  // v4.10 起曾把注入改成「按需」：只在 dist 内 app bundle 命中字面量时才写 index.html。
+  // **该判据在 0.1.7 上失效**：消费者在**插件 client bundle**（/plugins/**/client.js）里，
+  // 不在 app bundle —— 实测扫描 0 命中并跳过注入，页面照旧崩（真机 console 实拍）。
+  // 故改回无条件注入，但整段由 `if(!X)` 守卫包裹：新版 WebView 上逐条 no-op，
+  // 不覆盖原生实现，代价只有几行 HTML。
+  //
+  // 必须留在引导期脚本里：polyfill 要早于 /assets/index-*.js 与模块系统条目执行，
+  // client 插件通道时序上做不到。
   const idx = findPkg('@deepseek-ai/dsh-web-frontend', 'dist/index.html');
   if (idx && existsSync(idx)) {
     let html = readFileSync(idx, 'utf8');
-    if (html.includes('dsh-timeout-shim')) {
+    if (html.includes('dsh-webview-compat-shim')) {
       log('index.html shim already present');
+    } else if (!html.includes('<head>')) {
+      log('WARN index.html has no <head>, skip shim');
     } else {
-      let consumerFound = false;
-      try {
-        // 递归扫描 assets（含子目录 chunk，布局变化不丢失消费者检测）。
-        // 误报无害：shim 自带 `if(!AbortSignal.timeout)` 守卫，已定义时不生效。
-        const stack = [join(dirname(idx), 'assets')];
-        while (stack.length && !consumerFound) {
-          const dir = stack.pop();
-          let ents;
-          try { ents = readdirSync(dir, { withFileTypes: true }); } catch { continue; }
-          for (const ent of ents) {
-            if (ent.isDirectory()) { stack.push(join(dir, ent.name)); continue; }
-            if (!ent.name.endsWith('.js')) continue;
-            if (readFileSync(join(dir, ent.name), 'utf8').includes('AbortSignal.timeout')) { consumerFound = true; break; }
-          }
-        }
-      } catch (e) {
-        /* 资产目录不可读（布局变化）：宁可保守注入，回到旧行为 */
-        consumerFound = true;
-        log('WARN index shim asset scan failed (' + e.message + '), inject conservatively');
-      }
-      if (!consumerFound) {
-        log('index.html shim skipped: no AbortSignal.timeout consumer in app bundle');
-      } else {
-        const shim = '<script id="dsh-timeout-shim">if(!AbortSignal.timeout)AbortSignal.timeout=(ms)=>{const c=new AbortController();setTimeout(()=>c.abort(new DOMException(\'TimeoutError\',\'TimeoutError\')),ms);return c.signal;};</script>';
-        html = html.replace('<head>', '<head>' + shim);
-        writeFileSync(idx, html);
-        log('index.html AbortSignal.timeout shim injected');
-      }
+      // payload 以 base64 内嵌：内含引号与尖括号，直接内联字符串极易转义出错
+      // （与 koffi / node-pty / narb 的写法一致）；且必须分块——单行过长会被截断写坏。
+      const SHIM_HTML_B64 =
+        'PHNjcmlwdCBpZD0iZHNoLXdlYnZpZXctY29tcGF0LXNoaW0iPihmdW5jdGlvbigpewogIHZhciBn' +
+        'PXR5cGVvZiBnbG9iYWxUaGlzIT09J3VuZGVmaW5lZCc/Z2xvYmFsVGhpczp3aW5kb3c7CiAgaWYo' +
+        'IVByb21pc2Uud2l0aFJlc29sdmVycyl7UHJvbWlzZS53aXRoUmVzb2x2ZXJzPWZ1bmN0aW9uKCl7' +
+        'dmFyIHJlcyxyZWo7dmFyIHA9bmV3IFByb21pc2UoZnVuY3Rpb24oYSxiKXtyZXM9YTtyZWo9Yjt9' +
+        'KTtyZXR1cm57cHJvbWlzZTpwLHJlc29sdmU6cmVzLHJlamVjdDpyZWp9O307fQogIGlmKCFBYm9y' +
+        'dFNpZ25hbC50aW1lb3V0KXtBYm9ydFNpZ25hbC50aW1lb3V0PWZ1bmN0aW9uKG1zKXt2YXIgYz1u' +
+        'ZXcgQWJvcnRDb250cm9sbGVyKCk7c2V0VGltZW91dChmdW5jdGlvbigpe2MuYWJvcnQobmV3IERP' +
+        'TUV4Y2VwdGlvbignVGltZW91dEVycm9yJywnVGltZW91dEVycm9yJykpO30sbXMpO3JldHVybiBj' +
+        'LnNpZ25hbDt9O30KICBpZighQWJvcnRTaWduYWwuYW55KXtBYm9ydFNpZ25hbC5hbnk9ZnVuY3Rp' +
+        'b24oc2lncyl7dmFyIGM9bmV3IEFib3J0Q29udHJvbGxlcigpO2Zvcih2YXIgaT0wO2k8c2lncy5s' +
+        'ZW5ndGg7aSsrKXt2YXIgcz1zaWdzW2ldO2lmKHMuYWJvcnRlZCl7Yy5hYm9ydChzLnJlYXNvbik7' +
+        'YnJlYWs7fShmdW5jdGlvbihzaWcpe3NpZy5hZGRFdmVudExpc3RlbmVyKCdhYm9ydCcsZnVuY3Rp' +
+        'b24oKXtpZighYy5zaWduYWwuYWJvcnRlZCljLmFib3J0KHNpZy5yZWFzb24pO30se29uY2U6dHJ1' +
+        'ZX0pO30pKHMpO31yZXR1cm4gYy5zaWduYWw7fTt9CiAgaWYoIUFib3J0U2lnbmFsLnByb3RvdHlw' +
+        'ZS50aHJvd0lmQWJvcnRlZCl7QWJvcnRTaWduYWwucHJvdG90eXBlLnRocm93SWZBYm9ydGVkPWZ1' +
+        'bmN0aW9uKCl7aWYodGhpcy5hYm9ydGVkKXRocm93IHRoaXMucmVhc29uIT09dW5kZWZpbmVkP3Ro' +
+        'aXMucmVhc29uOm5ldyBET01FeGNlcHRpb24oJ1RoZSBvcGVyYXRpb24gd2FzIGFib3J0ZWQuJywn' +
+        'QWJvcnRFcnJvcicpO307fQogIGlmKCFBcnJheS5wcm90b3R5cGUuYXQpe0FycmF5LnByb3RvdHlw' +
+        'ZS5hdD1mdW5jdGlvbihuKXtuPU1hdGgudHJ1bmMobil8fDA7aWYobjwwKW4rPXRoaXMubGVuZ3Ro' +
+        'O3JldHVybiBuPDB8fG4+PXRoaXMubGVuZ3RoP3VuZGVmaW5lZDp0aGlzW25dO307fQogIGlmKCFT' +
+        'dHJpbmcucHJvdG90eXBlLmF0KXtTdHJpbmcucHJvdG90eXBlLmF0PWZ1bmN0aW9uKG4pe249TWF0' +
+        'aC50cnVuYyhuKXx8MDtpZihuPDApbis9dGhpcy5sZW5ndGg7cmV0dXJuIG48MHx8bj49dGhpcy5s' +
+        'ZW5ndGg/dW5kZWZpbmVkOnRoaXMuY2hhckF0KG4pO307fQogIGlmKCFBcnJheS5wcm90b3R5cGUu' +
+        'ZmluZExhc3Qpe0FycmF5LnByb3RvdHlwZS5maW5kTGFzdD1mdW5jdGlvbihmLHQpe2Zvcih2YXIg' +
+        'aT10aGlzLmxlbmd0aC0xO2k+PTA7aS0tKXtpZihmLmNhbGwodCx0aGlzW2ldLGksdGhpcykpcmV0' +
+        'dXJuIHRoaXNbaV07fXJldHVybiB1bmRlZmluZWQ7fTt9CiAgaWYoIUFycmF5LnByb3RvdHlwZS5m' +
+        'aW5kTGFzdEluZGV4KXtBcnJheS5wcm90b3R5cGUuZmluZExhc3RJbmRleD1mdW5jdGlvbihmLHQp' +
+        'e2Zvcih2YXIgaT10aGlzLmxlbmd0aC0xO2k+PTA7aS0tKXtpZihmLmNhbGwodCx0aGlzW2ldLGks' +
+        'dGhpcykpcmV0dXJuIGk7fXJldHVybiAtMTt9O30KICBpZighT2JqZWN0Lmhhc093bil7T2JqZWN0' +
+        'Lmhhc093bj1mdW5jdGlvbihvLGspe3JldHVybiBPYmplY3QucHJvdG90eXBlLmhhc093blByb3Bl' +
+        'cnR5LmNhbGwobyxrKTt9O30KICBpZighQXJyYXkucHJvdG90eXBlLnRvU29ydGVkKXtBcnJheS5w' +
+        'cm90b3R5cGUudG9Tb3J0ZWQ9ZnVuY3Rpb24oYyl7cmV0dXJuIEFycmF5LnByb3RvdHlwZS5zbGlj' +
+        'ZS5jYWxsKHRoaXMpLnNvcnQoYyk7fTt9CiAgaWYoIUFycmF5LnByb3RvdHlwZS50b1JldmVyc2Vk' +
+        'KXtBcnJheS5wcm90b3R5cGUudG9SZXZlcnNlZD1mdW5jdGlvbigpe3JldHVybiBBcnJheS5wcm90' +
+        'b3R5cGUuc2xpY2UuY2FsbCh0aGlzKS5yZXZlcnNlKCk7fTt9CiAgaWYoIUFycmF5LnByb3RvdHlw' +
+        'ZS53aXRoKXtBcnJheS5wcm90b3R5cGUud2l0aD1mdW5jdGlvbihpLHYpe3ZhciBhPUFycmF5LnBy' +
+        'b3RvdHlwZS5zbGljZS5jYWxsKHRoaXMpO2k9TWF0aC50cnVuYyhpKXx8MDtpZihpPDApaSs9YS5s' +
+        'ZW5ndGg7YVtpXT12O3JldHVybiBhO307fQogIGlmKHR5cGVvZiBnLnN0cnVjdHVyZWRDbG9uZT09' +
+        'PSd1bmRlZmluZWQnKXsKICAgIGcuc3RydWN0dXJlZENsb25lPWZ1bmN0aW9uKHYpewogICAgICBp' +
+        'Zih2PT09bnVsbHx8dHlwZW9mIHYhPT0nb2JqZWN0JylyZXR1cm4gdjsKICAgICAgaWYodHlwZW9m' +
+        'IHY9PT0nZnVuY3Rpb24nfHx0eXBlb2Ygdj09PSdzeW1ib2wnKXRocm93IG5ldyBET01FeGNlcHRp' +
+        'b24oJ2NvdWxkIG5vdCBiZSBjbG9uZWQnLCdEYXRhQ2xvbmVFcnJvcicpOwogICAgICBpZih2IGlu' +
+        'c3RhbmNlb2YgRGF0ZSlyZXR1cm4gbmV3IERhdGUodi5nZXRUaW1lKCkpOwogICAgICBpZih2IGlu' +
+        'c3RhbmNlb2YgUmVnRXhwKXJldHVybiBuZXcgUmVnRXhwKHYuc291cmNlLHYuZmxhZ3MpOwogICAg' +
+        'ICBpZih2IGluc3RhbmNlb2YgTWFwKXt2YXIgbT1uZXcgTWFwKCk7di5mb3JFYWNoKGZ1bmN0aW9u' +
+        'KHgsayl7bS5zZXQoZy5zdHJ1Y3R1cmVkQ2xvbmUoayksZy5zdHJ1Y3R1cmVkQ2xvbmUoeCkpO30p' +
+        'O3JldHVybiBtO30KICAgICAgaWYodiBpbnN0YW5jZW9mIFNldCl7dmFyIHN0PW5ldyBTZXQoKTt2' +
+        'LmZvckVhY2goZnVuY3Rpb24oeCl7c3QuYWRkKGcuc3RydWN0dXJlZENsb25lKHgpKTt9KTtyZXR1' +
+        'cm4gc3Q7fQogICAgICBpZih2IGluc3RhbmNlb2YgQXJyYXlCdWZmZXIpcmV0dXJuIHYuc2xpY2Uo' +
+        'MCk7CiAgICAgIGlmKEFycmF5QnVmZmVyLmlzVmlldyh2KSlyZXR1cm4gbmV3IHYuY29uc3RydWN0' +
+        'b3IoZy5zdHJ1Y3R1cmVkQ2xvbmUodi5idWZmZXIpLHYuYnl0ZU9mZnNldCx2Lmxlbmd0aCk7CiAg' +
+        'ICAgIGlmKEFycmF5LmlzQXJyYXkodikpcmV0dXJuIHYubWFwKGcuc3RydWN0dXJlZENsb25lKTsK' +
+        'ICAgICAgdmFyIG91dD17fTtmb3IodmFyIGsgaW4gdil7aWYoT2JqZWN0LnByb3RvdHlwZS5oYXNP' +
+        'd25Qcm9wZXJ0eS5jYWxsKHYsaykpb3V0W2tdPWcuc3RydWN0dXJlZENsb25lKHZba10pO31yZXR1' +
+        'cm4gb3V0OwogICAgfTsKICB9CiAgaWYoIU9iamVjdC5ncm91cEJ5KXtPYmplY3QuZ3JvdXBCeT1m' +
+        'dW5jdGlvbihpdGVtcyxrZXkpe3ZhciBvPU9iamVjdC5jcmVhdGUobnVsbCk7dmFyIGk9MDtmb3Io' +
+        'dmFyIGl0IG9mIGl0ZW1zKXt2YXIgaz1rZXkoaXQsaSsrKTtpZighT2JqZWN0LnByb3RvdHlwZS5o' +
+        'YXNPd25Qcm9wZXJ0eS5jYWxsKG8saykpb1trXT1bXTtvW2tdLnB1c2goaXQpO31yZXR1cm4gbzt9' +
+        'O30KICBpZighTWFwLmdyb3VwQnkpe01hcC5ncm91cEJ5PWZ1bmN0aW9uKGl0ZW1zLGtleSl7dmFy' +
+        'IG09bmV3IE1hcCgpO3ZhciBpPTA7Zm9yKHZhciBpdCBvZiBpdGVtcyl7dmFyIGs9a2V5KGl0LGkr' +
+        'Kyk7dmFyIGE9bS5nZXQoayk7aWYoYSlhLnB1c2goaXQpO2Vsc2UgbS5zZXQoayxbaXRdKTt9cmV0' +
+        'dXJuIG07fTt9Cn0pKCk7PC9zY3JpcHQ+' ;
+      const shim = Buffer.from(SHIM_HTML_B64, 'base64').toString('utf8');
+      html = html.replace('<head>', '<head>' + shim);
+      writeFileSync(idx, html);
+      log('index.html WebView compat shim injected (withResolvers/any/timeout)');
     }
   } else {
     log('dsh-web-frontend dist not found, skip shim');

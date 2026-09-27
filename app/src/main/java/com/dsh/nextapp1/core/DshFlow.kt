@@ -511,8 +511,12 @@ object DshFlow {
                 onLog("WARN: 启动脚本模板缺失，回退内置模板")
                 DEFAULT_WEB_LAUNCHER_TPL
             }
+        // 渲染前统一归一为 LF：Windows 检出（core.autocrlf=true）会把 .tpl 变成 CRLF，
+        // 而 bash 对行尾 CR 敏感 —— 真机现象是 dsh-web.sh 大量报 "command not found"，
+        // 且 export 的值会带上 CR。这里是无条件兜底防线（.gitattributes 同时按类型钉死 LF）。
+        val tplLf = tpl.replace("\r\n", "\n").replace("\r", "\n")
         launcher.writeText(
-            tpl.replace("@EXPORTS@", TermuxEnv.webProcessExports(ctx, nodeDir)
+            tplLf.replace("@EXPORTS@", TermuxEnv.webProcessExports(ctx, nodeDir)
                 .joinToString("") { (k, v) -> "export $k=$v\n" })
                 .replace("@HOME@", ctx.filesDir.absolutePath)
                 .replace("@NODE_CMD@", nodeCmd)
