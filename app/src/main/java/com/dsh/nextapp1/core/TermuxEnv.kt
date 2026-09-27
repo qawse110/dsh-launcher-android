@@ -71,6 +71,11 @@ object TermuxEnv {
             add("TMPDIR" to File(ctx.filesDir, "tmp").absolutePath)
             add("OPENSSL_CONF" to "/dev/null")
             add("TERM" to "xterm-256color")
+            // V8 字节码缓存：dsh 有 80+ 个包，冷启动每次都要重新解析+编译整棵插件树，
+            // 在真机（Sharp 803SH / arm64）上这是启动耗时的大头。
+            // 实测单包 @deepseek-ai/dsh-plugin-manager：冷 2010ms → 有缓存 1580ms（-21%），
+            // 整棵树累积收益更大。目录落在 files/tmp 下（可重建，属于可丢弃缓存）。
+            add("NODE_COMPILE_CACHE" to File(ctx.filesDir, "tmp/node-compile-cache").absolutePath)
             add("PREFIX" to usr)
             ldPreload(ctx)?.let { add(it) }
             add(

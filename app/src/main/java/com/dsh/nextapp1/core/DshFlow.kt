@@ -62,6 +62,12 @@ object DshFlow {
     /** stub 补丁载荷文件名（assets → files 同步；两条启动路径共用）。 */
     private const val STUB_SCRIPT = "stub-dsh.mjs"
 
+    /** 启动前预热 V8 字节码缓存的脚本（见 assets/warmup-modules.mjs 顶部说明）。 */
+    private const val WARMUP_SCRIPT = "warmup-modules.mjs"
+
+    /** 预热完成 marker：字节码缓存建好后不必每次启动都重跑（幂等）。 */
+    private const val WARMUP_MARKER = "web-modules-warmed"
+
     /**
      * Node loader 兼容层脚本清单（assets → files 同步的**单一真源**）。
      * SELinux 禁止 app 对 data 文件硬链接，dsh 会话首次落盘用 link()，
@@ -395,6 +401,47 @@ object DshFlow {
         return startDshWeb(ctx, nodeDir, dshPrefix, fl)
     }
 
+
+    /**
+     * 预热 V8 字节码缓存（**缓解**手段，幂等）。
+     *
+     * 背景：真机实测插件树加载是启动耗时大头，而 dsh 的启动审计在挂载后立刻快照，
+     * 个别大包会来不及建 fiber 而被判 "failed to import"，导致 pluginManager 服务缺失、
+     * 插件页报「本部署没有可管理的 profile」。预热把整棵树的字节码先写进
+     * NODE_COMPILE_CACHE（见 [TermuxEnv.webProcessExports]），让正式启动更快。
+     *
+     * 幂等：成功后写 marker，之后启动直接跳过；失败**不阻断**启动（只是没预热到），
+     * 也不写 marker，下次启动会重试。
+     */
+    private fun warmupModuleCache(ctx: Context, nodeDir: File, cli: File, onLog: (String) -> Unit) {
+        if (MarkerStore.has(ctx, WARMUP_MARKER)) return
+        val script = File(ctx.filesDir, WARMUP_SCRIPT)
+        try {
+            ctx.assets.open(WARMUP_SCRIPT).use { input ->
+                script.outputStream().use { output -> input.copyTo(output) }
+            }
+        } catch (t: Throwable) {
+            onLog("WARN 预热脚本缺失，跳过（不影响启动）：${t.message}")
+            return
+        }
+        onLog(">> 预热模块字节码缓存（首次启动会慢几秒，之后启动更快）…")
+        val cacheDir = File(ctx.filesDir, "tmp/node-compile-cache").apply { mkdirs() }
+        val env = TermuxEnv.webProcessExports(ctx, nodeDir).toMap() + mapOf(
+            "DSH_CLI" to cli.absolutePath,
+            "DSH_PROFILE" to "web",
+            "NODE_COMPILE_CACHE" to cacheDir.absolutePath,
+        )
+        val exit = runCatching {
+            exec(ctx, "${nodeDir.absolutePath}/bin/node ${script.absolutePath}", env) { onLog(it) }
+        }.getOrDefault(-1)
+        if (exit == 0) {
+            MarkerStore.put(ctx, WARMUP_MARKER, "ok")
+            onLog("   预热完成")
+        } else {
+            onLog("WARN 预热退出码 $exit（不阻断启动，下次再试）")
+        }
+    }
+
     /**
      * 同步 Android 兼容脚本到 files（**唯一入口**）。
      *
@@ -485,6 +532,9 @@ object DshFlow {
             onLog("✗ 未找到官方 dsh CLI（安装可能未完成）")
             return false
         }
+        // 启动前预热 V8 字节码缓存（幂等）：降低整棵插件树的模块加载/编译耗时，
+        // 避免个别大包（如 plugin-manager）在 dsh 的启动审计前还建不出 fiber。
+        warmupModuleCache(ctx, nodeDir, cli, onLog)
         // 预检：会话存储根（files/.dsh/sessions）必须可写。
         // 真机故障：dsh 新建会话时 mkdir 报 EACCES permission denied——应用私有目录
         // 正常不可能 EACCES，多为换机/备份恢复把目录属主改乱。快速失败 + 能修则修。
