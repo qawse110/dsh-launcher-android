@@ -722,13 +722,29 @@ function linkPluginDeps() {
 /**
  * 把 dsh 自身的包桥接进 **profile 目录**的 node_modules。
  *
- * 为什么必须做（真机插桩定性，勿删）：dsh 的 loader 对 profile 条目的模块解析
- * 基准是 **profile 目录**（实测 baseUrl=file:///…/.dsh/profiles/web/），而 profile 的
- * node_modules 只含 `dsh plugin add` 登记的那几个包。dsh 自身声明的条目
- * （如 @deepseek-ai/dsh-plugin-manager、dsh-hmr）因此**从 profile 目录解析不到**
- * （MODULE_NOT_FOUND）→ import 失败 → entry.fiber 永不创建 → 被审计记为
- * "failed to import" → pluginManager 服务缺失 → host-plugin-inventory 不置
- * managementAvailable → 插件页显示「本部署没有可管理的 profile」。
+ * 作用：补上 profile 目录对 dsh 自身包的可见性（此前从该目录解析
+ * @deepseek-ai/dsh-plugin-manager 返回 MODULE_NOT_FOUND）。
+ *
+ * ⚠ **它不是「插件页无可管理 profile」的修复，勿据此误判**。
+ * 该缺陷的三轮假设已全部被真机实验证伪，记录在此以免后来者重走：
+ *
+ *   1) 「条目被 disabled 跳过」——插桩实测 disabled=false、profileContext 在位；
+ *   2) 「导入太慢、启动审计抢在 fiber 之前快照」——预热 14MB 字节码缓存、
+ *      单包导入 -21% 后症状分毫不动；
+ *   3) 「profile 目录解析不到该包」——本函数补上后，从 profile 目录
+ *      **ESM 导入成功**（ESM_OK），症状依旧不变。
+ *
+ * 另外插桩 install-scope 收集发现：被静默丢弃的依赖只有 3 个可选包
+ * （bufferutil / utf-8-validate / @modelcontextprotocol/sdk），
+ * **@deepseek-ai/dsh-plugin-manager 并未被丢弃** —— 即 dsh 的 runtime resolution
+ * 表里本来就有它。故「resolution 表缺包」同样不成立。
+ *
+ * 结论：模块可解析、可导入、在解析表内、条目已启用，**fiber 仍不创建**。
+ * 剩下的方向是条目 id 前缀 `include:` —— 它由 cordis-plugin-include 的 profile
+ * include 层生成，问题发生在**挂载层而非解析层**，需插桩该层才能定性。
+ *
+ * 保留本函数的原因：它修的是一个**真实但独立**的解析缺口（规范化、幂等、无副作用）；
+ * 若只需最小改动面，可单独回滚本函数而不影响其他功能。
  *
  * 与 [linkPluginDeps] 的关键区别：**只补不删**。
  *   · 那个函数服务于启动器自管的 files/plugins，可以清掉未覆盖的旧链接；
