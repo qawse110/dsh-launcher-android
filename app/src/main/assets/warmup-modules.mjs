@@ -2,12 +2,21 @@
 /**
  * warmup-modules.mjs — 预热 V8 字节码缓存（dsh 启动加速的**缓解**手段）。
  *
- * 为什么需要：真机实测 dsh 的插件树加载是启动耗时大头，冷启动时每个模块都要
- * 重新解析+编译；而 dsh 的启动审计在插件树挂载后立刻快照，个别大包（如
- * @deepseek-ai/dsh-plugin-manager，实测单包导入 1.1~2.0s）会来不及建立 fiber，
- * 被判为 "failed to import" —— 后者会让 pluginManager 服务缺失，插件页于是报
- * 「本部署没有可管理的 profile」。本脚本先把整棵树的字节码写进 NODE_COMPILE_CACHE，
- * 让正式启动时模块加载更快（实测单包约 -21%，整棵树累积更多）。
+ * 定位说明（**勿把成因写错**）：本脚本最初是为「插件页报『本部署没有可管理的
+ * profile』」做的启动器侧缓解，当时假设成因是「大包导入慢、启动审计抢在 fiber
+ * 之前快照」。**该假设已被真机插桩实测证伪**：预热 14MB 字节码缓存后症状分毫不动。
+ *
+ * 插桩给出的真实成因（entry.fiber === undefined 的那一条）：
+ *   id=include:plugin-manager  disabled=false  hasProfileContext=true
+ *   baseUrl=file:///…/files/.dsh/profiles/web/
+ * 即条目**已启用**，但它的模块解析基准是 **profile 目录**，而 profile 的
+ * node_modules 里没有 dsh 自身的包（@deepseek-ai/dsh-plugin-manager 从该目录解析
+ * 返回 MODULE_NOT_FOUND）→ 无法 import → fiber 永不创建 → 被记为 failed to import
+ * → pluginManager 服务缺失 → host-plugin-inventory 不置 managementAvailable
+ * → 插件页显示 unavailable。**与导入速度无关**，属 profile 依赖可见性问题。
+ *
+ * 因此本脚本**不是**该缺陷的修复，它只做一件事：把整棵插件树的字节码写进
+ * NODE_COMPILE_CACHE，降低模块加载/编译开销（实测单包约 -21%）。
  *
  * 设计要点（避免硬编码、避免绕过式补丁）：
  *   · 要预热哪些模块**不硬编码**：直接取 `dsh --profile <p> --dump-config` 输出的
