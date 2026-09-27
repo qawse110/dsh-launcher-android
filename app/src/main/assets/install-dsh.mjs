@@ -718,6 +718,95 @@ function linkPluginDeps() {
   }
 }
 
+
+/**
+ * 把 dsh 自身的包桥接进 **profile 目录**的 node_modules。
+ *
+ * 为什么必须做（真机插桩定性，勿删）：dsh 的 loader 对 profile 条目的模块解析
+ * 基准是 **profile 目录**（实测 baseUrl=file:///…/.dsh/profiles/web/），而 profile 的
+ * node_modules 只含 `dsh plugin add` 登记的那几个包。dsh 自身声明的条目
+ * （如 @deepseek-ai/dsh-plugin-manager、dsh-hmr）因此**从 profile 目录解析不到**
+ * （MODULE_NOT_FOUND）→ import 失败 → entry.fiber 永不创建 → 被审计记为
+ * "failed to import" → pluginManager 服务缺失 → host-plugin-inventory 不置
+ * managementAvailable → 插件页显示「本部署没有可管理的 profile」。
+ *
+ * 与 [linkPluginDeps] 的关键区别：**只补不删**。
+ *   · 那个函数服务于启动器自管的 files/plugins，可以清掉未覆盖的旧链接；
+ *   · 本函数写的是 **dsh/pnpm 自管的 profile 目录**，里面既有 dsh 自己生成的链接，
+ *     也有启动器的 link: 插件 —— 任何删除都会破坏 dsh 的装配状态。
+ *     故这里只补缺失项：目标已存在就跳过，绝不覆盖、绝不清理。
+ */
+function linkProfileDeps() {
+  const src = join(DSH_PREFIX, 'node_modules');
+  const dest = join(FILES_DIR, '.dsh/profiles', DSH_PROFILE, 'node_modules');
+  if (!existsSync(src)) {
+    log('WARN profile dep bridge: dsh-prefix node_modules missing, skip');
+    return;
+  }
+  if (!existsSync(join(FILES_DIR, '.dsh/profiles', DSH_PROFILE))) {
+    log('WARN profile dep bridge: profile dir missing, skip');
+    return;
+  }
+  try {
+    mkdirSync(dest, { recursive: true });
+    let linked = 0;
+    let present = 0;
+    let warns = 0;
+    const ensureLink = (name, target) => {
+      const link = join(dest, ...name.split('/'));
+      // 已存在（dsh 自己生成的链接 / 启动器的 link: 插件）→ 一律不动
+      if (existsSync(link) || (() => { try { readlinkSync(link); return true; } catch { return false; } })()) {
+        present++;
+        return;
+      }
+      if (name.includes('/')) mkdirSync(join(dest, name.slice(0, name.indexOf('/'))), { recursive: true });
+      try {
+        symlinkSync(target, link);
+        linked++;
+      } catch (e) {
+        warns++;
+        if (warns <= 3) log('WARN profile dep bridge ' + name + ': ' + e.message);
+      }
+    };
+    // 1) dsh-prefix 顶层直接依赖
+    for (const ent of readdirSync(src, { withFileTypes: true })) {
+      if (ent.name.startsWith('.')) continue;
+      ensureLink(ent.name, join(src, ent.name));
+    }
+    // 2) pnpm 传递依赖：与 linkPluginDeps 同款「扫描 .pnpm 取最高版本」策略
+    const store = join(src, '.pnpm');
+    if (existsSync(store)) {
+      const best = new Map();
+      for (const d of readdirSync(store)) {
+        if (d.startsWith('.')) continue;
+        const nm = join(store, d, 'node_modules');
+        if (!existsSync(nm)) continue;
+        const found = [];
+        try {
+          for (const c of readdirSync(nm)) {
+            if (c.startsWith('.')) continue;
+            if (c.startsWith('@')) {
+              for (const g of readdirSync(join(nm, c))) found.push([c + '/' + g, join(nm, c, g)]);
+            } else {
+              found.push([c, join(nm, c)]);
+            }
+          }
+        } catch {}
+        for (const [name, dir] of found) {
+          let ver = '0.0.0';
+          try { ver = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')).version || ver; } catch {}
+          const cur = best.get(name);
+          if (!cur || cmpVer(ver, cur.ver) > 0) best.set(name, { dir, ver });
+        }
+      }
+      for (const [name, info] of best) ensureLink(name, info.dir);
+    }
+    log(`profile dep bridge: ${linked} linked, ${present} already present, ${warns} warn -> ${dest}`);
+  } catch (e) {
+    log('WARN linkProfileDeps: ' + e.message);
+  }
+}
+
 /** 清理旧版遗留的 profile patch 内置插件 insert，避免与 dsh.profile.bundles 重复装配。 */
 function cleanBuiltinPatch() {
   const patch = join(FILES_DIR, '.dsh/profiles', DSH_PROFILE, 'cordis.patch.yml');
@@ -749,12 +838,18 @@ function cleanBuiltinPatch() {
     }
     flush();
     const cleaned = out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
-    const body = cleaned.split('\n').filter((l) => !l.trim().startsWith('#') && l.trim() !== '').join('');
-    if (!body.includes('[]') && !body.includes('- insert:')) {
-      writeFileSync(patch, (cleaned ? cleaned + '\n' : '') + '[]\n');
-    } else {
-      writeFileSync(patch, cleaned + '\n');
-    }
+    // 语义：把内置插件的 insert 块摘掉后，**只在文件已无任何条目时**补 `[]`，
+    // 否则原样写回。
+    //
+    // 曾经的判据是「正文里不含 `[]` 且不含 `- insert:` 就追加 `[]`」，这会把
+    // **已有其它条目**的 profile patch 拼成「一个数组 + 一个 []」的两个 YAML 文档，
+    // dsh 启动时直接解析失败（真机实测报 YAMLException: end of the stream or a
+    // document separator is expected）。判据改为只看「清理后是否为空」。
+    const hasEntry = cleaned.split('\n').some((l) => {
+      const t = l.trim();
+      return t !== '' && !t.startsWith('#');
+    });
+    writeFileSync(patch, hasEntry ? cleaned + '\n' : '[]\n');
     log('builtin patch entries cleaned (profile patch dedupe)');
   } catch (e) {
     log('WARN cleanBuiltinPatch: ' + e.message);
@@ -780,7 +875,13 @@ if (!pluginsOnly) {
 }
 
 installBuiltins();
+// 桥接启动器自管的 files/plugins（可清理旧链接）
 linkPluginDeps();
+// 桥接 dsh/pnpm 自管的 profile 目录（只补不删）——dsh 的 loader 以 profile 目录为
+// 模块解析基准，缺这一步则 dsh 自身的条目（plugin-manager / hmr 等）解析不到，
+// 表现为插件页「本部署没有可管理的 profile」。必须在 installBuiltins()（即
+// dsh plugin add）之后执行：pnpm 写入 profile node_modules 会晚于我们。
+linkProfileDeps();
 
 try {
   writeFileSync(join(DSH_PREFIX, 'dsh-installed.json'), JSON.stringify({
