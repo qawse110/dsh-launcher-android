@@ -164,7 +164,7 @@ const WIRE_LOG_PATH = join(DSH_HOME, 'po06-wire.jsonl')
  * 本机 0.1.6 侧不受影响：v3 对用户消息的 kind 不设白名单（只要求非空字符串），
  * 而"绝不自我触发"那道闸是**正向白名单**（只认 `kind === 'user'`，见 `wire.js`），不依赖这个名字。
  */
-const PRODUCER_KIND = 'plugin:@dsh-external/dsh-po06'
+const PRODUCER_KIND = 'plugin:dsh-prompt-optimizer-mobile'
 
 /** 追加一条生产接线记录。**尽力而为**：台账写不进去也绝不打断会话。 */
 function appendWireLog(rec) {
@@ -1353,7 +1353,7 @@ async function decideEnableFor(agentId) {
   return { ...decision, probe }
 }
 
-export const name = '@dsh-external/dsh-po06'
+export const name = 'dsh-prompt-optimizer-mobile'
 /** 版本号从**随包发行的 package.json** 读，不写死（写死就会漂——本项目栽过这类跟头）。 */
 const PKG_VERSION = (() => {
   try { return JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json'), 'utf8')).version } catch { return null }
@@ -1776,7 +1776,7 @@ export function apply(ctx, config) {
         if (!live) return
         try {
           const cm = scope.clientModules || scope.get('clientModules')
-          const name = '@dsh-external/dsh-po06'
+          const name = 'dsh-prompt-optimizer-mobile'
           if (!cm?.pkgMeta || !cm?.dirty || typeof cm.flush !== 'function') return
           for (const key of cm.pkgMeta.keys()) {
             if (key === name || String(key).endsWith('\0' + name)) cm.pkgMeta.delete(key)
@@ -1849,8 +1849,16 @@ export function apply(ctx, config) {
     return {
       configPath: ENABLE_CONFIG_PATH,
       configExists: existsSync(ENABLE_CONFIG_PATH),
-      intent: { ok: i.ok, ours: i.ours, reason: i.reason, enabled: i.settings.enabled, rolloutMode: i.rollout.mode },
-      note: '未判定期间一律不启用（保守）；判定按 agent 懒触发',
+      // fork：rollout 在"未配置"时是 **null**（表示没表态，不是用户写的 off），
+      // 故这里必须空安全 —— 原来直接读 i.rollout.mode 会在未配置时抛
+      // TypeError: Cannot read properties of null (reading 'mode')，
+      // 把整个插件打成 "failed to import"（真机实测踩到）。
+      intent: {
+        ok: i.ok, ours: i.ours, reason: i.reason,
+        enabled: i.settings && i.settings.enabled,
+        rolloutMode: (i.rollout && i.rollout.mode) || null,
+      },
+      note: 'dsh-launcher fork：默认启用（未配置 = 启用）；仅显式 enabled:false 才关闭。判定按 agent 懒触发',
     }
   })()
 

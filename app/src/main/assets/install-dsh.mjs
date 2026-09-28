@@ -466,6 +466,30 @@ function profileDeps() {
   } catch { return {}; }
 }
 
+/** profile 的 dsh.profile.bundles —— dsh 据此决定「读哪些包的 cordis.patch.yml」。 */
+function profileBundles() {
+  try {
+    const pkg = JSON.parse(readFileSync(join(FILES_DIR, '.dsh/profiles', DSH_PROFILE, 'package.json'), 'utf8'));
+    const b = pkg && pkg.dsh && pkg.dsh.profile && pkg.dsh.profile.bundles;
+    return Array.isArray(b) ? b : [];
+  } catch { return []; }
+}
+
+/** 从 profile 里摘掉一个依赖登记及其 bundle 项（仅用于「已登记但未装配」的修复路径）。 */
+function removeProfileDep(name) {
+  const file = join(FILES_DIR, '.dsh/profiles', DSH_PROFILE, 'package.json');
+  try {
+    const pkg = JSON.parse(readFileSync(file, 'utf8'));
+    if (pkg.dependencies) delete pkg.dependencies[name];
+    const b = pkg && pkg.dsh && pkg.dsh.profile && pkg.dsh.profile.bundles;
+    if (Array.isArray(b)) {
+      const i = b.indexOf(name);
+      if (i >= 0) b.splice(i, 1);
+    }
+    writeFileSync(file, JSON.stringify(pkg, void 0, 2) + '\n');
+  } catch (e) { log('WARN removeProfileDep: ' + e.message); }
+}
+
 /**
  * 把 APK 内置的 extra-plugins 源同步到 plugins 目录：以「版本@APK版本」为签名，
  * 签名一致则跳过；APK 升级或插件版本变化（哪怕没 bump version）都整目录替换——
@@ -531,13 +555,26 @@ function addLocalPlugin(dir) {
     log(`skip builtin plugin ${dir}: not bundled`);
     return false;
   }
-  // 2) 幂等跳过：profile 已按 link: 登记同一路径 → 无需再跑 dsh plugin add
-  //    （每次安装 9 个插件逐个起 CLI 很慢；profile 重置后登记消失会自动重装）
+  // 2) 幂等跳过：profile 已按 link: 登记同一路径**且已列进 bundles** → 无需再跑
+  //    dsh plugin add（每次安装逐个起 CLI 很慢；profile 重置后登记消失会自动重装）。
+  //
+  // ⚠ 判据**必须同时看 bundles**（真机实测踩到）：dsh 只有把包名列进
+  //    `dsh.profile.bundles` 才会读它的 cordis.patch.yml、把 entry 插进条目表。
+  //    换名/换目录的升级场景里，dependencies 可能已经是新 link、而 bundles 里
+  //    旧的包名已被 prune 掉 —— 只看 dependencies 就会「跳过 add」，
+  //    结果是**登记了却永不装配**（dump-config 里 0 命中，插件静默消失）。
   const link = 'link:' + p;
   const deps = profileDeps();
-  if (Object.values(deps).some((v) => v === link)) {
-    log(`plugin ${dir} already wired, skip add`);
-    return true;
+  const wired = Object.entries(deps).find(([, v]) => v === link);
+  if (wired) {
+    const bundles = profileBundles();
+    if (bundles.includes(wired[0])) {
+      log(`plugin ${dir} already wired, skip add`);
+      return true;
+    }
+    // 有依赖登记但缺 bundle 层：先摘掉旧登记，让下面的 dsh plugin add 重新写全
+    log(`plugin ${dir} wired but missing from bundles, re-adding`);
+    removeProfileDep(wired[0]);
   }
   log(`dsh plugin add ${dir}`);
   return dshPlugin(['add', p]);
@@ -827,7 +864,7 @@ function linkProfileDeps() {
 /**
  * 清理「曾内置、现已退役」的插件（升级路径）。
  *
- * 为什么需要：内置插件换名/换目录后（本轮实例：dsh-prompt-optimizer → dsh-po06），
+ * 为什么需要：内置插件换名/换目录后（本轮实例：dsh-po06 → dsh-prompt-optimizer-mobile 的 fork），
  * profile 的 package.json 里仍留着旧包的 `link:` 登记，files/plugins 下也仍有旧目录。
  * installBuiltins() 只**新增**不移除，于是升级后的设备会**同时装配新旧两个插件** ——
  * 上游对此有明确警告：两个拦截器同时生效（DOUBLE_INTERCEPT），且 slot/entry id 会打架。
@@ -946,10 +983,16 @@ if (!pluginsOnly) {
   ensureRipgrepFallback();
 }
 
-installBuiltins();
 // 退役内置插件清理：只认 extra-plugins 同步 marker 记录过的目录（不误伤手动装的插件）。
-// 必须排在 installBuiltins() 之后：先按新清单登记，再摘掉旧身份，避免升级后双插件并存。
+//
+// ⚠ 必须排在 installBuiltins() **之前**（真机实测踩到）：installBuiltins 走的是
+// `dsh plugin add`，pnpm 会先解析**整个 profile 的依赖树**。若 profile 里还留着
+// 指向已删目录的旧 link:（换名场景必然如此），pnpm 直接报
+//   "[WARN] Installing a dependency from a non-existent directory: …/plugins/dsh-po06"
+// 并让本次安装失败 —— 表现为新插件装不上（builtin plugins assembled: 2 ok, 1 failed）。
+// 先摘掉旧身份、再登记新插件，才是正确的升级顺序。
 pruneRetiredBuiltins();
+installBuiltins();
 // 桥接启动器自管的 files/plugins（可清理旧链接）
 linkPluginDeps();
 // 桥接 dsh/pnpm 自管的 profile 目录（只补不删）——dsh 的 loader 以 profile 目录为

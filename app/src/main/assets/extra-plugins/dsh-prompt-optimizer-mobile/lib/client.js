@@ -19,7 +19,7 @@
 // 与宿主控制 API 的约定（见 lib/control-api.js）：**写操作必须带 `x-po06: 1`**
 // —— 自定义头会触发 CORS 预检，而服务端从不回 CORS 头 ⇒ 跨站写在预检阶段就被浏览器拦掉。
 window.__ModuleLoader__.load({
-  id: '@dsh-external/dsh-po06',
+  id: 'dsh-prompt-optimizer-mobile',
   factory: (require) => {
     var module = { exports: {} }
     var exports = module.exports
@@ -28,7 +28,7 @@ window.__ModuleLoader__.load({
     const React = require('react')
     const h = React.createElement
 
-    const NS = 'dsh-po06'
+    const NS = 'prompt-optimizer'
     const API = '/po06/api'
     const WRITE_HEADERS = { 'content-type': 'application/json', 'x-po06': '1' }
     const INSTANCE_TOKEN = NS + '#' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7)

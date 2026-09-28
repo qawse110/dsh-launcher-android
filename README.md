@@ -82,7 +82,7 @@ Kotlin 展示面与 `install-dsh.mjs` 装配面都从它派生；一致性由 `n
 | 插件 | 来源 | 作用 |
 |---|---|---|
 | `dsh-web-mobile` | <https://github.com/mexiaosqwq/dsh-web-mobile> | 竖屏/窄屏 Web 适配（抽屉导航、全宽会话、安全区、触控人体工学） |
-| `@dsh-external/dsh-prompt-optimizer` | <https://github.com/WestFox-AwA/dsh-prompt-optimizer> | 提示词优化（发送前用独立 AI 改写成命令，含本地移动端适配补丁） |
+| `dsh-prompt-optimizer-mobile` | **本仓库 fork**，基于 <https://github.com/WestFox-AwA/dsh-prompt-optimizer> `v0.7.6`（见 [FORK.md](app/src/main/assets/extra-plugins/dsh-prompt-optimizer-mobile/FORK.md)） | 提示词优化（发送前用独立 AI 改写成命令）。fork 相对上游：**默认启用**（仅显式 `enabled:false` 关闭）、视口感知面板尺寸、窄屏断点、全面屏安全区、触控人体工学 |
 | `dsh-codearts-auth` | <https://gitee.com/iJetLi/deepseek-harness-codearts> | CodeArts / Buddy / Qoder / Trae / Cline / Loomy 等多 Provider 登录与模型接入 |
 
 ### 可选插件（随 APK 分发，**默认不装配**）

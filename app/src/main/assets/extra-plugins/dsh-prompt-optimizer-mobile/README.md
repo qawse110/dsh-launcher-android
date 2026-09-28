@@ -1,6 +1,6 @@
 # dsh-prompt-optimizer 0.6（**0.7.6**）
 
-`@dsh-external/dsh-po06` · **0.7.6** · GitHub Release（**未发 npm**：`private: true`，只发附件）
+`dsh-prompt-optimizer-mobile` · **0.7.6** · GitHub Release（**未发 npm**：`private: true`，只发附件）
 → 下载：<https://github.com/WestFox-AwA/dsh-prompt-optimizer/releases/tag/v0.7.6>（附件含 `tgz` 与 `SHA256SUMS`）
 
 > **0.7.6 的一句话**：**档位终于真的分开了**——补充程度（700 / 1200 / 2000 字）与自主预算
@@ -146,7 +146,7 @@ Set-Content -Path "$env:USERPROFILE\.dsh\po06.json" -Encoding utf8 -Value '{"set
 # 关：把 enabled 改 false（或直接删掉这个文件——读不到就是不启用）
 Set-Content -Path "$env:USERPROFILE\.dsh\po06.json" -Encoding utf8 -Value '{"settingsVersion":1,"enabled":false,"rollout":{"mode":"off"}}'
 # 卸：从 profile 移除并把 profile 整个删掉
-dsh plugin --profile po06beta remove @dsh-external/dsh-po06
+dsh plugin --profile po06beta remove dsh-prompt-optimizer-mobile
 Remove-Item -Recurse -Force "$env:USERPROFILE\.dsh\profiles\po06beta"
 ```
 

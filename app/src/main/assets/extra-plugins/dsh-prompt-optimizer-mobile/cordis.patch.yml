@@ -14,6 +14,6 @@
 #    或在 profile 的 cordis.patch.yml 里手写一条 `insert`。
 #    都做会让同一条 entry 插入两次 → 启动报 `duplicate loader entry id`。
 - insert:
-    - id: dsh-po06
-      name: '@dsh-external/dsh-po06'
+    - id: prompt-optimizer
+      name: 'dsh-prompt-optimizer-mobile'
       config: {}

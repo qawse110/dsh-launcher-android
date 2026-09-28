@@ -1064,16 +1064,16 @@ try {
  *   · @deepseek-ai/dsh-settings@0.1.7-rc.2/lib/index.js 的导出实测为
  *       export { SettingsConflictError, SettingsForms, SettingsForms as default, redactSecrets }
  *     → settingsNamespace / installSettingsSection **仍然不存在**，补丁**仍有必要，保持不动**。
- *   · 内置插件收缩为三个后（dsh-web-mobile / dsh-po06 / dsh-codearts-auth），
+ *   · 内置插件收缩为三个后（dsh-web-mobile / dsh-prompt-optimizer-mobile / dsh-codearts-auth），
  *     逐一实测其对 dsh-settings 的引用：
  *       - dsh-codearts-auth：lib/ 中 25 处 'settingsNamespace' 命中，但**全部是它自带的**
  *         settings-compat.js 里的 `settingsNamespaceFor()`（本地函数，且从 **'./settings-compat.js'**
  *         导入，**不是**从 @deepseek-ai/dsh-settings 具名导入）；其 76 个 lib/*.js 中
  *         **没有任何文件 import 这两个已删除符号**（唯一的 dsh-settings 提及是
  *         jet-hub-store.js 里的一句文档注释）。
- *       - dsh-web-mobile / dsh-po06：**完全不引用** dsh-settings。
- *         （dsh-po06 即原 dsh-prompt-optimizer 的上游最新版：0.7.6 起重命名为 dsh-po06、
- *         代码移入 po06/lib/，本轮实测其 37 个 lib/*.js 对 settingsNamespace 命中 0 处。）
+ *       - dsh-web-mobile / dsh-prompt-optimizer-mobile：**完全不引用** dsh-settings。
+ *         （后者是本仓库对上游 dsh-prompt-optimizer 的 fork，基于 v0.7.6 即上游的
+ *         dsh-po06；实测其 lib/*.js 对 settingsNamespace 命中 0 处。）
  *     → 0.1.7 三个内置插件当前**均非本补丁的消费者**。
  *   · 本补丁**真实的消费者**是 dsh-vision（来自 prebuilt.tgz 的 third_party/）与
  *     手动装配的 dsh-llm-codebuddy，两者都写
@@ -1162,7 +1162,7 @@ try {
  *   · dsh-web-mobile@3.0.3/lib/client.js 的 external require 只有
  *     '@deepseek-ai/dsh-client-ui-primitives' 与 'react/jsx-runtime'，**不含 client-runtime**；
  *   · dsh-codearts-auth 的 client 是 lib/client/jet-hub.js，其 require 只有 'react'；
- *   · dsh-po06：不引用 client-runtime（0 处命中 `dsh-client-runtime`；它唯一的外部
+ *   · dsh-prompt-optimizer-mobile：不引用 client-runtime（0 处命中 `dsh-client-runtime`；它唯一的外部
  *     require 是 '@deepseek-ai/dsh-client-ui-primitives'，不在 REQUIRE_MAP 内）。
  *   → REQUIRE_MAP 对这三者**零命中**；代码里 `if (!out.includes(...)) continue` 直接跳过、
  *     **不写盘、不加 marker**，故**无副作用**（日志 scanned=N patched=0）。

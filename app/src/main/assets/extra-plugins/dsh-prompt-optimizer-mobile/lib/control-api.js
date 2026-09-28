@@ -352,18 +352,23 @@ export function createControlHandler({ home, stateDir, ledgerPath, version = nul
         const intent = parseEnableIntent(readTextSafe(cfgPath))
         const norm = normalizeSettings(raw || {})
         const prompt = resolvePrompt({ home: H })
+        // fork：rollout 在"未配置"时是 **null**（＝没表态，而非用户写的 off），
+        // 且判定默认值已翻转为「未配置即启用」。这里全部空安全 + 文案对齐 fork 语义，
+        // 否则未配置时读 .mode 会抛（真机实测：插件在 /status 上崩）。
+        const rollout = intent.rollout
+        const settingsOff = Boolean(intent.settings) && intent.settings.enabled === false
         return send(200, {
           ok: true, version, home: H,
-          enabled: intent.settings.enabled === true,
-          rollout: intent.rollout.mode,
+          enabled: !settingsOff,
+          rollout: rollout ? rollout.mode : null,
           // 诊断：`rollout` 是**回落来的 off**（配置里没写/写错）还是**用户显式写的 off**——
           // 这两种在界面上必须能分开，否则"什么都没发生"永远无从归因（用户 2026-09-22 要求查清
           // `gate:rollout-off`）。见 rollout.js 的 normalizeRollout/decideEnabled。
-          rolloutDefaulted: intent.rollout.defaulted === true,
-          rolloutNote: intent.rollout.defaulted === true
-            ? (intent.settings.enabled === true
-              ? '配置里没有（或写错了）rollout：已按 "all" 处理（因为你显式写了 enabled:true）'
-              : '配置里没有（或写错了）rollout，且没有显式 enabled:true ⇒ 保守不启用')
+          rolloutDefaulted: Boolean(rollout && rollout.defaulted === true),
+          rolloutNote: rollout && rollout.defaulted === true
+            ? (settingsOff
+              ? 'dsh-launcher fork：设置里显式 enabled:false ⇒ 保持关闭'
+              : 'dsh-launcher fork：配置里没有（或写错了）rollout，且未被显式关闭 ⇒ 按 "all" 处理（默认启用）')
             : null,
           // ⚠ 上面那个 `enabled` 是**配置里的意图**，不是**闸门实际放行的结论**。两者可能不同
           //   （例：配置写了 enabled:true，但 rollout 显式 off / 旧插件仍在装配 ⇒ 闸门不放行）。

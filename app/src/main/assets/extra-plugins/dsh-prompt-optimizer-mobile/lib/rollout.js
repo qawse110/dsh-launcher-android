@@ -73,26 +73,36 @@ export function assertNoDoubleIntercept({ oldPluginActive, newEnabled }) {
  * @returns {{enabled:boolean, code:string, reason:string|null, note?:string|null}}
  */
 export function decideEnabled({ rollout, sessionId, settings, oldPluginActive }) {
+  // ══════════ dsh-launcher fork：默认值由「保守关」翻转为「默认开」 ══════════
+  // 上游取向是保守：配置里必须**显式** enabled:true 才生效。其理由「误报的代价是暂时
+  // 不启用，漏报的代价是一条消息被两个拦截器处理两次」在本部署不成立：内置插件清单里
+  // **只有这一个**提示词插件，不存在与旧版 @dsh-external/dsh-prompt-optimizer 并存的
+  // 现实可能（上游那条链在本部署从未装配）；而用户看到的是「面板在、点了却没反应」，
+  // 只会当成坏了。故：**只有显式 enabled:false 才算关闭**；未配置 = 启用。
+  // 显式关闭的语义与上游一致，只是默认值相反；DOUBLE_INTERCEPT 守卫仍然独立把关。
+  const settingsOff = Boolean(settings) && settings.enabled === false
   let enabled = isEnabledFor(rollout, sessionId)
   let rolloutNote = null
   if (!enabled) {
     const r = normalizeRollout(rollout)
     const explicitOff = r.mode === 'off' && r.defaulted !== true
-    if (r.mode === 'off' && r.defaulted === true && settings && settings.enabled === true) {
-      // 回落而来的 off + 用户显式 enabled:true ⇒ 按 all 处理（并说清楚）
+    if (r.mode === 'off' && r.defaulted === true && !settingsOff) {
+      // 回落而来的 off（配置缺失/不合法）+ 未被显式关闭 ⇒ 按 all 处理（并说清楚）
       enabled = true
-      rolloutNote = 'rollout 缺失或值不认识，已按 "all" 处理（用户显式 enabled:true）'
+      rolloutNote = 'dsh-launcher fork：rollout 缺失或值不认识，且未被显式关闭 ⇒ 按 "all" 处理（默认启用）'
     } else {
       return {
         enabled: false,
         code: r.mode === 'off' ? 'rollout-off' : 'session-not-in-allowlist',
-        reason: explicitOff && !r.reason ? '灰度配置显式设为 off（用户的选择）' : r.reason,
-        note: r.defaulted === true ? 'rollout 字段缺失或不合法；且设置里没有显式 enabled:true ⇒ 保守不启用' : null,
+        reason: settingsOff
+          ? '设置里显式 enabled:false（用户的选择）'
+          : (explicitOff && !r.reason ? '灰度配置显式设为 off（用户的选择）' : r.reason),
+        note: r.defaulted === true ? 'rollout 字段缺失或不合法；且设置里显式 enabled:false ⇒ 保持关闭' : null,
       }
     }
   }
-  if (settings && settings.enabled !== true) {
-    return { enabled: false, code: 'settings-disabled', reason: '设置里未启用 0.6' }
+  if (settingsOff) {
+    return { enabled: false, code: 'settings-disabled', reason: '设置里显式关闭' }
   }
   const guard = assertNoDoubleIntercept({ oldPluginActive, newEnabled: true })
   if (!guard.ok) return { enabled: false, code: guard.code, reason: guard.reason }
