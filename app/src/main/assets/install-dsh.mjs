@@ -823,6 +823,62 @@ function linkProfileDeps() {
   }
 }
 
+
+/**
+ * 清理「曾内置、现已退役」的插件（升级路径）。
+ *
+ * 为什么需要：内置插件换名/换目录后（本轮实例：dsh-prompt-optimizer → dsh-po06），
+ * profile 的 package.json 里仍留着旧包的 `link:` 登记，files/plugins 下也仍有旧目录。
+ * installBuiltins() 只**新增**不移除，于是升级后的设备会**同时装配新旧两个插件** ——
+ * 上游对此有明确警告：两个拦截器同时生效（DOUBLE_INTERCEPT），且 slot/entry id 会打架。
+ *
+ * 判据（**不写死历史包名**，也不会误伤手动装的插件）：
+ *   只有出现在 extra-plugins 同步 marker 里的目录才算「内置供给链的产物」；
+ *   其中已不在当前清单 builtin 目录集里的，即为退役项。
+ * 手动 `dsh plugin add` 的插件不在 marker 里，因此不会被本函数碰到。
+ */
+function pruneRetiredBuiltins() {
+  const profilePkgFile = join(FILES_DIR, '.dsh/profiles', DSH_PROFILE, 'package.json');
+  if (!existsSync(profilePkgFile)) return;
+  const markers = readSyncMarker();
+  const keep = new Set(BUILTIN_PLUGINS);
+  const retiredDirs = Object.keys(markers).filter((d) => !keep.has(d));
+  if (!retiredDirs.length) return;
+  try {
+    const pkg = JSON.parse(readFileSync(profilePkgFile, 'utf8'));
+    const deps = pkg.dependencies || {};
+    const profile = (pkg.dsh && pkg.dsh.profile) || {};
+    const bundles = Array.isArray(profile.bundles) ? profile.bundles : [];
+    const linkPrefix = 'link:' + join(FILES_DIR, 'plugins') + '/';
+    let pruned = 0;
+    for (const dir of retiredDirs) {
+      // 1) 目录本身
+      const dirAbs = join(FILES_DIR, 'plugins', dir);
+      const existed = existsSync(dirAbs);
+      rmSync(dirAbs, { recursive: true, force: true });
+      // 2) profile 里指向该目录的 link: 依赖 + 对应的 bundles 包名
+      for (const [name, spec] of Object.entries(deps)) {
+        if (typeof spec !== 'string' || !spec.startsWith(linkPrefix)) continue;
+        if (spec.slice(linkPrefix.length).replace(/\/+$/, '') !== dir) continue;
+        delete deps[name];
+        const i = bundles.indexOf(name);
+        if (i >= 0) bundles.splice(i, 1);
+        rmSync(join(FILES_DIR, 'plugins/node_modules', ...name.split('/')), { recursive: true, force: true });
+        pruned++;
+      }
+      delete markers[dir];
+      if (existed) log(`retired builtin pruned: ${dir}`);
+    }
+    pkg.dependencies = deps;
+    if (pkg.dsh && pkg.dsh.profile) pkg.dsh.profile.bundles = bundles;
+    writeFileSync(profilePkgFile, JSON.stringify(pkg, void 0, 2) + '\n');
+    writeFileSync(EXTRA_SYNC_MARKER, JSON.stringify(markers));
+    if (pruned) log(`retired builtin deps unregistered: ${pruned}`);
+  } catch (e) {
+    log('WARN pruneRetiredBuiltins: ' + e.message);
+  }
+}
+
 /** 清理旧版遗留的 profile patch 内置插件 insert，避免与 dsh.profile.bundles 重复装配。 */
 function cleanBuiltinPatch() {
   const patch = join(FILES_DIR, '.dsh/profiles', DSH_PROFILE, 'cordis.patch.yml');
@@ -891,6 +947,9 @@ if (!pluginsOnly) {
 }
 
 installBuiltins();
+// 退役内置插件清理：只认 extra-plugins 同步 marker 记录过的目录（不误伤手动装的插件）。
+// 必须排在 installBuiltins() 之后：先按新清单登记，再摘掉旧身份，避免升级后双插件并存。
+pruneRetiredBuiltins();
 // 桥接启动器自管的 files/plugins（可清理旧链接）
 linkPluginDeps();
 // 桥接 dsh/pnpm 自管的 profile 目录（只补不删）——dsh 的 loader 以 profile 目录为

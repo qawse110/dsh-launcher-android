@@ -12,11 +12,12 @@
       "upstream": "https://github.com/mexiaosqwq/dsh-web-mobile"
     },
     {
-      "dir": "dsh-prompt-optimizer",
-      "name": "@dsh-external/dsh-prompt-optimizer",
-      "id": "prompt-optimizer",
+      "dir": "dsh-po06",
+      "name": "@dsh-external/dsh-po06",
+      "id": "dsh-po06",
       "title": "提示词优化",
-      "desc": "发送前用独立 AI 把输入改写成命令，可调档位/强度（含移动端适配补丁）",
+      "desc": "发送前用独立 AI 把输入改写成命令。上游 0.6 起重命名为 dsh-po06，并按设计默认不启用（装配闸门保守取 off），需在插件面板里显式开启",
+      "version": "0.7.6",
       "upstream": "https://github.com/WestFox-AwA/dsh-prompt-optimizer"
     },
     {

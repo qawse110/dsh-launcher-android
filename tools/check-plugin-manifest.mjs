@@ -75,7 +75,19 @@ for (const section of ['builtin', 'optional']) {
     catch (e) { fail(`${where}: package.json 解析失败: ${e.message}`); continue; }
     if (pkg.name !== row.name) fail(`${where}: name 不一致 —— 清单=${row.name}, package.json=${pkg.name}`);
     // 3. id 对齐
-    const patch = join(dirAbs, 'cordis.patch.yml');
+    // cordis.patch.yml 的位置以 package.json 的 exports 为准（dsh 就是这么解析的）：
+    // 上游 0.6+ 把插件代码移入子目录（po06/），补丁层随之声明为
+    // `exports["./cordis.patch.yml"] = "./po06/cordis.patch.yml"`。
+    // 早先这里硬编码根目录，遇到该布局会误报「缺少 cordis.patch.yml」。
+    // 先认 exports，再回退根目录（兼容未声明 exports 的旧版布局）。
+    let patch = join(dirAbs, 'cordis.patch.yml');
+    if (!existsSync(patch)) {
+      const declared = pkg.exports && pkg.exports['./cordis.patch.yml'];
+      const rel = typeof declared === 'string'
+        ? declared
+        : declared && (declared.default || declared.import || declared.require);
+      if (typeof rel === 'string') patch = join(dirAbs, rel);
+    }
     if (!existsSync(patch)) fail(`${where}: 缺少 cordis.patch.yml`);
     else {
       const ids = patchIds(patch);
