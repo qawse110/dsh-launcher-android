@@ -2765,9 +2765,27 @@ window.__ModuleLoader__.load({
 						return;
 					}
 					beacon("remount-controls", { tries });
-					own(() => ctx.slots.inject("conversation.input.left", () => ctx.slots.register({
-						name: "conversation.input.left", id: "prompt-optimizer", order: 20,
-					}, Controls)), NS + ": composer controls (retry " + tries + ")");
+					own(() => ctx.slots.inject("conversation.input.left", () => {
+						// dsh-launcher 幂等保护：自愈与正常路径注册的是**同一个 id**
+						// (prompt-optimizer)。dsh 的 slot 表对重复 id 直接抛错，于是本自愈每
+						// 1.2s 重试一次就抛一次 "already has an entry"（真机 Android WebView 上
+						// [data-dpo="controls"] 的检测时机与上游假设不一致，导致自愈被反复触发）。
+						// 语义上「同 id 已存在」= 控件已经挂上了（正常路径注册成功），故视为
+						// 「已愈合」并停止自愈；其它错误照常抛出，自愈在正常路径确实失败时仍能
+						// 生效 —— 不削弱兜底能力，也不是让它静默失效。
+						try {
+							return ctx.slots.register({
+								name: "conversation.input.left", id: "prompt-optimizer", order: 20,
+							}, Controls);
+						} catch (e) {
+							if (String(e && e.message).includes("already has an entry")) {
+								if (tries > 1) beacon("controls-healed", { tries });
+								window.clearInterval(timer);
+								return;
+							}
+							throw e;
+						}
+					}), NS + ": composer controls (retry " + tries + ")");
 					if (tries >= 8) {
 						beacon("remount-give-up", { tries });
 						window.clearInterval(timer);
