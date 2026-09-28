@@ -9,6 +9,27 @@ import { rename, access, constants, open, copyFile } from 'node:fs/promises';
 
 export * from 'node:fs/promises';
 
+/**
+ * 与原生 `node:fs/promises` 的 **default 语义对齐**（原生 default 即整个命名空间）。
+ *
+ * 为什么必须补（真机实测根因）：fs-loader.mjs 会把 `node:fs/promises` 与
+ * `fs/promises` 的导入重定向到本文件，而 **`export *` 不转发 default**。
+ * 于是「原生默认导入可用、经本 loader 后不可用」：
+ *   · 原生 `import fs from 'node:fs/promises'`  → OK
+ *   · 经 fs-register 后同一条语句                  → SyntaxError:
+ *       "The requested module 'node:fs/promises' does not provide an export named 'default'"
+ * 任何做默认导入的依赖都会直接崩在模块链接期。实测命中：
+ * `which-command@0.1.0`（`@deepseek-ai/dsh-plugin-manager` 的依赖链上），
+ * 导致该插件 import 失败 → entry.fiber 永不创建 → dsh 记为
+ * "plugin-manager: failed to import" → pluginManager 服务缺失 →
+ * host-plugin-inventory 不置 managementAvailable →
+ * 插件页显示「本部署没有可管理的 profile」。整条链的**唯一源头就是这里少一个 default**。
+ *
+ * default 里用本模块的 `link`（覆盖原生的硬链接实现），其余转发原生命名空间，
+ * 与「命名导出走本模块」的现有语义保持一致。
+ */
+export default { ...orig, link };
+
 let compatLinkCount = 0;
 /** 诊断钩子：兼容层触发次数（供运行时排查，无内部消费者属预期）。 */
 globalThis.__compatLinkCount = () => compatLinkCount;
