@@ -84,16 +84,25 @@ export function ensureLink(link) {
     return `skip ${link.name}: target is the link itself (self-reference)`;
   }
 
+  // 先判「这个位置是什么」，再决定动不动它。刻意把三种情况分开报，避免
+  // 旧版那种「删除失败」被误报成「被非链接占用」（用户会去删一个本来就不该删的东西）。
   let previous = null;
   try {
     previous = readlinkSync(link.path);
-    if (previous === link.target) return `kept ${link.name}`;
-    /* 符号链接已存在但指向不同：先记住原目标，替换失败时要能回滚（A2）。 */
-    unlinkSync(link.path);
   } catch (e) {
-    if (e && e.code !== 'ENOENT' && previous === null) {
+    if (e && e.code !== 'ENOENT') {
       /* 不是符号链接：可能是普通文件/真实目录——绝不覆盖 */
       return `skip ${link.name}: path occupied by non-link entry`;
+    }
+    previous = null; // ENOENT：位置空闲
+  }
+  if (previous === link.target) return `kept ${link.name}`;
+  if (previous !== null) {
+    /* 符号链接已存在但指向不同：先记住原目标，替换失败时要能回滚（A2）。 */
+    try {
+      unlinkSync(link.path);
+    } catch (e) {
+      return `skip ${link.name}: cannot remove stale link (${e && e.code ? e.code : e && e.message})`;
     }
   }
   try {
