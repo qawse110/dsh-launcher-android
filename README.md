@@ -182,7 +182,7 @@ adb shell am start -n com.dsh.nextapp1/.MainActivity   # 或直接点应用图�
 
 ## 已知限制
 
-- 系统 WebView 版本较旧（本机 Chromium 94）：本仓已**无条件注入带守卫的前端 polyfill**（见上表）。上游若再引入更新的 Web API，只需在 `stub-dsh.mjs` 的 polyfill 里追加一条 `if(!X)` 并**递增 `SHIM_ID`**，设备端会自动替换旧 shim，无需人工介入。
+- **系统 WebView 版本**：测试机原先为 Chromium 94，现已侧载升级到 **155.0.8059.16**（`com.google.android.webview`，arm64）。升级后实测 5 个兜底 API（`Promise.withResolvers` / `AbortSignal.any` / `AbortSignal.timeout` / `throwIfAborted` / `structuredClone`）**全部原生存在**，即上表那条 polyfill 的逐条 `if(!X)` 守卫在新内核上**确实 no-op**；控件栏的「逐字竖排」也在新内核上自愈（Chromium 94 下 flex 换行行为不同）。polyfill **保留不动**——它仍是旧 WebView 设备的兜底，且在新内核上零副作用。上游若再引入更新的 Web API，只需在 `stub-dsh.mjs` 的 polyfill 里追加一条 `if(!X)` 并**递增 `SHIM_ID`**，设备端会自动替换旧 shim，无需人工介入。
 - `sharp` 为 stub：依赖图片处理的能力不可用，不影响核心会话功能。
 - 设备内存有限：**不要在设备上执行 `pnpm build` / 类型检查**（会 OOM）；内置插件以源码打包进 APK，装配用官方 `dsh plugin`，不在设备端编译。
 - 重新安装 APK 会终止旧 web 进程，需再次触发一键引导（幂等；已安装时走 npm 增量更新）。

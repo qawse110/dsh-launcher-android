@@ -352,7 +352,17 @@ window.__ModuleLoader__.load({
       // 窄屏用：只显示图标 + 标题，把摘要隐掉（由下面的 @media 决定何时启用）
       optSummaryHidden: { display: 'none' },
       optCaret: { color: OVS.fg3, fontSize: '10px', lineHeight: 1 },
-      optPop: { position: 'fixed', zIndex: 60, width: '300px', maxHeight: 'min(62vh, 460px)', overflowY: 'auto',
+      // dsh-launcher fork：宽度改为**视口感知**（360 CSS px 视口下 300px 偏窄，
+      // 左右各只剩 30px；min(340, 100vw-24) 把可用宽度用足，同时永远留 12px 边距）。
+      // ⚠ boxSizing 必须显式声明（真机实测）：本样式默认是 **content-box**，
+      //   于是「声明宽度 + 左右 padding 24 + 左右 border 2」才是实际宽度。
+      //   原先宽 300 时 300+26=326 < 360 尚能放下；改成 min(340,100vw-24)=336 后
+      //   实际变成 **362**，比 360 的视口还宽 14px ⇒ 面板右侧被裁（探针实测
+      //   pop=12/33/362/338，rightOverflow=14，inViewport=no）。
+      //   加 border-box 后 336 即含 padding/border，12+336=348 ≤ 360，正好留 12px 边距。
+      optPop: { position: 'fixed', zIndex: 60, boxSizing: 'border-box',
+        width: 'min(340px, calc(100vw - 24px))',
+        maxHeight: 'min(62vh, 460px)', overflowY: 'auto',
         display: 'flex', flexDirection: 'column', gap: '8px', padding: '10px 12px',
         background: OVS.surface, color: OVS.fg,
         border: '1px solid ' + OVS.line, borderRadius: '12px',
@@ -406,7 +416,10 @@ window.__ModuleLoader__.load({
         color: OVS.fg, font: 'inherit', fontSize: '12px', cursor: 'pointer' },
       dis: { opacity: .45, filter: 'grayscale(1)', cursor: 'not-allowed' },
       // 「?」帮助弹层（要求②）：正文由宿主从包里的 HELP-0.6.md 取，这里只做最轻的排印
-      helpPop: { position: 'fixed', right: '16px', bottom: '84px', width: 'min(560px, 92vw)', maxHeight: '72vh',
+      // 同上：缺 box-sizing 时 92vw(331.2) + padding 28 + border 2 = 361.2 > 360，
+      // 而它是 right:16 定位 ⇒ 会从**左侧**溢出约 17px。加 border-box 归位。
+      helpPop: { position: 'fixed', right: '16px', bottom: '84px', boxSizing: 'border-box',
+        width: 'min(560px, 92vw)', maxHeight: '72vh',
         overflow: 'auto', background: OVS.surface,
         color: OVS.fg, border: '1px solid ' + OVS.line,
         borderRadius: '12px', padding: '14px', zIndex: 70, boxShadow: T('shadow'),
@@ -2102,7 +2115,9 @@ window.__ModuleLoader__.load({
                   const vw = (typeof window !== 'undefined' && window.innerWidth) || 800
                   const vh = (typeof window !== 'undefined' && window.innerHeight) || 600
                   setOptPos({
-                    left: Math.max(8, Math.min(Math.round(r.left), Math.max(8, vw - 308))),
+                    // 与上面的 optPop 宽度保持一致：左侧夹紧预留「面板宽 + 8px 边距」。
+                    // 面板最宽 340px ⇒ 预留 348px；视口更窄时退化为 8px 左侧边距。
+                    left: Math.max(8, Math.min(Math.round(r.left), Math.max(8, vw - 348))),
                     bottom: Math.max(8, Math.round(vh - r.top + 6)),
                   })
                 }
@@ -2483,6 +2498,16 @@ window.__ModuleLoader__.load({
             '@media (max-width:560px){[data-po06="bar"] button{min-height:34px;padding-left:10px;padding-right:10px}}',
             // ④ 窄屏下控件栏自身纵向堆叠、留出间距，避免与宿主控件互相挤占
             '@media (max-width:560px){[data-po06="bar-row-1"]{row-gap:6px;max-width:100%}}',
+            // ⑤ 触控目标：真机量得控件栏按钮仅 **34px** 高（低于 40px 的常用下限），
+            //    窄屏下抬到 40px。宽度也留够，避免「看得见点不准」。
+            '@media (max-width:560px){[data-po06="bar"] button{min-height:40px;padding-left:12px;padding-right:12px}}',
+            // ⑥ 弹出层避开系统栏：全面屏手势条 / 刘海会盖住贴着屏幕边的弹层。
+            //    options-pop 与 help-pop 都是 position:fixed 的贴边浮层，故补安全区内边距。
+            '@supports (padding:max(0px)){'
+              + '[data-po06="options-pop"],[data-po06="help-pop"]{'
+              + 'padding-bottom:max(10px,env(safe-area-inset-bottom));'
+              + 'padding-left:max(12px,env(safe-area-inset-left));'
+              + 'padding-right:max(12px,env(safe-area-inset-right))}}',
             // 全面屏安全区：避开刘海/挖孔与底部手势条，防止按钮被系统栏吃掉。
             // ★ 显式 box-sizing:border-box —— 内联的 width 是 calc(100vw - Npx)，
             //   若按 content-box 再加 padding 会反而溢出（窄屏横向滚动）。
