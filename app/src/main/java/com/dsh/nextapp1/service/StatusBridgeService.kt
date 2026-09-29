@@ -113,30 +113,46 @@ class StatusBridgeService : Service() {
             PowerGovernor.setTaskStatus(lastStatus)
             syncWakeLock(PowerGovernor.wantWakeLock())
             try {
-                val json = fetchStatus()
-                if (json != null) {
-                    val status = json.optString("status", "idle")
-                    val text = json.optString("lastText", "")
-                    val event = if (json.has("lastEvent")) json.optString("lastEvent", null) else null
-                    val updatedAt = json.optLong("updatedAt", 0L)
-                    val prev = lastStatus
-                    lastStatus = status
-                    mainHandler.post {
-                        updateOverlay(status, text, event)
-                        updateForeground(status, text)
-                        writeHeartbeat(status, text)
-                    }
-                    if (prev == "running" && status == "finished") {
-                        if (updatedAt > lastFinishedAt) {
-                            lastFinishedAt = updatedAt
-                            mainHandler.post { StatusBridgeAlerts.onAiFinished(this, text) }
+                when (val r = fetchStatus()) {
+                    is FetchResult.Ok -> {
+                        val json = r.json
+                        val status = json.optString("status", "idle")
+                        val text = json.optString("lastText", "")
+                        val event = if (json.has("lastEvent")) json.optString("lastEvent", null) else null
+                        val updatedAt = json.optLong("updatedAt", 0L)
+                        val prev = lastStatus
+                        lastStatus = status
+                        mainHandler.post {
+                            updateOverlay(status, text, event)
+                            updateForeground(status, text)
+                            writeHeartbeat(status, text)
+                        }
+                        if (prev == "running" && status == "finished") {
+                            if (updatedAt > lastFinishedAt) {
+                                lastFinishedAt = updatedAt
+                                mainHandler.post { StatusBridgeAlerts.onAiFinished(this, text) }
+                            }
                         }
                     }
-                } else {
-                    // dsh 暂时不可达也要记录心跳，证明 Service 本身还活着；
-                    // 同时 watchdog 自动拉起 dsh web（60s 冷却，双路幂等）
-                    mainHandler.post { writeHeartbeat(lastStatus ?: "idle", "", "poll-null") }
-                    DshWatchdog.maybeRevive(this)
+                    is FetchResult.Bad -> {
+                        // 连上了但响应不可用（401/空/坏 JSON）：只记心跳，**不**触发
+                        // revive —— 否则一次坏响应可能被放大成回滚重装（审查项 X2）。
+                        mainHandler.post { writeHeartbeat(lastStatus ?: "idle", "", "poll-bad:" + r.why) }
+                    }
+                    FetchResult.Unreachable -> {
+                        // 审查项 X3：契约文件不存在 ⇒ 桥接插件**根本没装配**（默认策略），
+                        // 此时「连不上」说明不了 dsh web 的健康状况，跳过 revive，
+                        // 并用心跳 note 把这件事显式化（旧版只写 poll-null，无法归因）。
+                        val spec = BridgeContract.read(this)
+                        if (!spec.present) {
+                            mainHandler.post { writeHeartbeat(lastStatus ?: "idle", "", "bridge-absent") }
+                        } else {
+                            // 装了但连不上：dsh 可能暂时不可达，记心跳证明 Service 还活着，
+                            // 同时 watchdog 自动拉起 dsh web（60s 冷却，双路幂等）
+                            mainHandler.post { writeHeartbeat(lastStatus ?: "idle", "", "poll-null") }
+                            DshWatchdog.maybeRevive(this)
+                        }
+                    }
                 }
             } catch (t: Throwable) {
                 // ignore transient polling errors
@@ -145,16 +161,50 @@ class StatusBridgeService : Service() {
         }
     }
 
-    private fun fetchStatus(): JSONObject? = try {
-        val conn = URL("http://127.0.0.1:3190/status").openConnection() as HttpURLConnection
-        conn.connectTimeout = 800
-        conn.readTimeout = 800
-        conn.requestMethod = "GET"
-        val text = conn.inputStream.bufferedReader().use { it.readText() }
-        conn.disconnect()
-        if (text.isBlank()) null else JSONObject(text)
-    } catch (e: Exception) {
-        null
+    /**
+     * 一次轮询的结果。**必须区分「连不上」与「连上了但响应不可用」**（审查项 X2）：
+     * 旧版把二者都折叠成 null，于是「401 / 空响应 / 坏 JSON」也会走到 poll-null 分支，
+     * 进而调 [DshWatchdog.maybeRevive] —— 而后者在 web 判为不可用时可能触发
+     * `Supervisor.maybeRollbackOnCrashLoop` ⇒ **一次坏响应被放大成回滚重装**。
+     * 现在只有真正连不上才允许进入 revive 判据。
+     */
+    private sealed interface FetchResult {
+        data class Ok(val json: JSONObject) : FetchResult
+
+        /** 连不上（拒绝/超时/IO 失败）：**唯一**允许触发 revive 的情形。 */
+        object Unreachable : FetchResult
+
+        /** 连上了但响应不可用（401 / 非 2xx / 空 / 坏 JSON）：不得据此 revive。 */
+        data class Bad(val why: String) : FetchResult
+    }
+
+    private fun fetchStatus(): FetchResult {
+        val spec = BridgeContract.read(this)
+        val code: Int
+        val body: String
+        try {
+            val conn = URL(BridgeContract.statusUrl(spec)).openConnection() as HttpURLConnection
+            conn.connectTimeout = 800
+            conn.readTimeout = 800
+            conn.requestMethod = "GET"
+            conn.useCaches = false
+            spec.token?.let { conn.setRequestProperty("X-Dsh-Bridge-Token", it) }
+            code = conn.responseCode
+            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+            body = stream?.bufferedReader()?.use { it.readText() } ?: ""
+            conn.disconnect()
+        } catch (e: Exception) {
+            return FetchResult.Unreachable
+        }
+        // 以下都属「连上了，但对方给的不能用」——不计入 revive/回滚判据。
+        if (code == 401) return FetchResult.Bad("unauthorized")
+        if (code !in 200..299) return FetchResult.Bad("http-$code")
+        if (body.isBlank()) return FetchResult.Bad("empty")
+        return try {
+            FetchResult.Ok(JSONObject(body))
+        } catch (e: Exception) {
+            FetchResult.Bad("bad-json")
+        }
     }
 
     // ---------------- 配置读取 ----------------

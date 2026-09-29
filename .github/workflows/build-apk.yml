@@ -14,6 +14,7 @@ on:
   push:
     branches:
       - main
+      - next
 
 jobs:
   build:
@@ -38,30 +39,49 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x gradlew
 
+      # 先把「要构建什么」算清楚，再据此决定产物上传条件。
+      # 旧写法用 inputs.variant || 'release'：push 事件没有 inputs ⇒ 一律 release，
+      # 而 debug 产物的上传条件却是「event_name == 'push'」⇒ 会去传一个根本不存在的
+      # app/build/outputs/apk/debug/*.apk，又被 if-no-files-found: ignore 静默吞掉，
+      # 于是「推送后由 Actions 产出 debug 包」实际上永远不会发生。
+      - name: Resolve variant
+        id: variant
+        run: |
+          V="${{ inputs.variant }}"
+          if [ -z "$V" ]; then
+            # push 触发：main 走 release（保持既有发布语义），其余分支（含 next）走 debug
+            if [ "${{ github.ref_name }}" = "main" ]; then V=release; else V=debug; fi
+          fi
+          case "$V" in
+            debug)   D=true;  R=false ;;
+            release) D=false; R=true  ;;
+            both)    D=true;  R=true  ;;
+            *) echo "unknown variant: $V"; exit 1 ;;
+          esac
+          echo "variant=$V"      >> "$GITHUB_OUTPUT"
+          echo "want_debug=$D"   >> "$GITHUB_OUTPUT"
+          echo "want_release=$R" >> "$GITHUB_OUTPUT"
+          echo "resolved variant=$V (debug=$D release=$R) ref=${{ github.ref_name }}"
+
       - name: Build APKs
         run: |
-          VARIANT="${{ inputs.variant || 'release' }}"
-          case "$VARIANT" in
-            debug)
-              ./gradlew :app:assembleDebug --no-daemon ;;
-            release)
-              ./gradlew :app:assembleRelease --no-daemon ;;
-            both)
-              ./gradlew :app:assembleDebug :app:assembleRelease --no-daemon ;;
-            *)
-              echo "unknown variant: $VARIANT"; exit 1 ;;
+          case "${{ steps.variant.outputs.variant }}" in
+            debug)   ./gradlew :app:assembleDebug --no-daemon ;;
+            release) ./gradlew :app:assembleRelease --no-daemon ;;
+            both)    ./gradlew :app:assembleDebug :app:assembleRelease --no-daemon ;;
           esac
 
       - name: Upload debug APK artifact
-        if: ${{ github.event_name == 'push' || inputs.variant == 'debug' || inputs.variant == 'both' }}
+        if: ${{ steps.variant.outputs.want_debug == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: app-debug-apk
           path: app/build/outputs/apk/debug/*.apk
-          if-no-files-found: ignore
+          # 该分支既然决定要 debug 包，就必须真的存在 —— 不允许静默跳过。
+          if-no-files-found: error
 
       - name: Upload release APK artifact
-        if: ${{ github.event_name == 'push' || inputs.variant == 'release' || inputs.variant == 'both' }}
+        if: ${{ steps.variant.outputs.want_release == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: app-release-apk

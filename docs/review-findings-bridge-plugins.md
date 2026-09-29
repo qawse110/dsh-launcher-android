@@ -182,4 +182,39 @@ package.json 现读，所以显示没问题；但**清单自身不可追溯**（
 | P1 | X1 | 端口三处硬编码、覆盖能力不对称，故障表现静默 |
 | P2 | S4 / S5 / S6 / S7 / A1 / A2 / A3 / M1 | 健壮性与整洁度，可随下次改动一起做 |
 
-**这份审查没有改动任何代码**；以上为问题清单与建议，是否修、修哪几条待定。
+---
+
+## 六、修复落地记录（本轮逐条修完）
+
+上面那份审查当时**没有改动任何代码**；本节记录逐条修复的结果与判据。
+
+| 项 | 修法 | 判据 / 落点 |
+|---|---|---|
+| S1 | 删掉 `assistant/chunk` 分支；只按 `assistant/message` 更新 `lastText`；文件头与 README 同步降级「按句增量朗读」 | 证据：`dsh-session/lib/types/known-event-types.js` 权威事件表 56 项，含 chunk 者为 **0**，assistant 仅 `attempt`/`message` |
+| S2 | 每次启动生成随机 token 写入 `<HOME>/status-bridge.json`(0600)；`/status` 无 token 回 401；**移除 CORS 头**；`LAST_TEXT_CAP` 2000→600 | 无鉴权请求不再能读到状态；原生消费端本不需要 CORS |
+| S3 | 守卫定时器从**模块顶层**移入 `apply()`；返回 dispose 钩子关端口 + `clearInterval` | 卸载后不再监听 3190、不再被守卫拉起 |
+| S4 | 加在途标记 `inFlight` 合并「error 重试」与「守卫」两条路径 | 不再并发 createServer |
+| S5 | `case 'assistant/message'` 加块作用域 | 消除 `no-case-declarations` 与潜在 TDZ |
+| S6 | 失败时**保留** `lastText`，错误改存独立字段 `lastError` | 失败前已生成的正文不再被丢弃（原「需产品确认」按「信息不丢失」方向落定） |
+| S7 | 删除未使用的 `server` 变量；`/health` 改为**有明确用途**的运维探针并在文件头与 README 写明 | 无残留死代码 |
+| X1 | 新增 `core/BridgeContract.kt` 作为端口+token **单一真源**；两个 Service 均从它读取，删除各自的硬编码 URL | 全仓 `3190` 只剩「默认值常量 + 注释」 |
+| X2 | 新增 `FetchResult(Ok/Unreachable/Bad)`；只有 `Unreachable` 才进 `maybeRevive`，401/空/坏 JSON 只记 `poll-bad:*` | 坏响应不再可能被放大成回滚重装 |
+| X3 | 契约文件不存在（=插件未装配）时心跳记 `bridge-absent` 并**跳过 revive**，与「装了但掉线」区分 | 默认失效不再静默；默认装配策略**未改**（用户未授权改开箱行为） |
+| A1 | `parseSpec` 增加反斜杠拒绝；目标 realpath 后拒绝自引用 | 不再有路径归一的意外与自环 |
+| A2 | 替换链接失败时**回滚为原目标**；回滚不成才返回 `LOST`，与「没动过」区分 | 失败不再静默丢链接 |
+| A3 | 新增 `<HOME>/dsh-android-links.json` 记账本次创建/替换的链接 | 日后清理有据可依 |
+| M1 | 4 条 optional 条目补 `version`；本地自研的两份桥接**不编造 upstream**，用段注释说明 | 清单可追溯 |
+
+顺带修掉一个**会让本轮目标无法达成**的流水线缺陷（`.github/workflows/build-apk.yml`）：
+
+- 旧版 `push` 只监听 `main`（本仓开发分支是 `next`）；且 push 事件下 `inputs.variant` 为空
+  ⇒ 回落到 `release`，而 debug 产物的上传条件却是 `event_name == 'push'`，
+  `if-no-files-found: ignore` 把「传了个不存在的文件」静默吞掉 ——
+  即「推送后由 Actions 产出 debug 包」**实际上永远不会发生**。
+- 现改为：先由 `Resolve variant` 步骤算出 variant 与两个布尔量，构建与上传都以它为唯一依据；
+  `next` 分支 push 走 debug、`main` 保持 release；两个上传步骤都改成 `if-no-files-found: error`，
+  不再允许「要产物却悄悄没有」。
+
+**仍未处理（如实标注）**：S1 的降级是「承认拿不到流式」，不是「把流式做出来」。
+若日后要在 Android 侧实现按句增量朗读，需要另找数据通道（客户端 wire 事件或 LLM 流直连），
+不属于本次修复范围。

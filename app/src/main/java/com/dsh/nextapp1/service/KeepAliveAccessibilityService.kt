@@ -175,11 +175,15 @@ class KeepAliveAccessibilityService : AccessibilityService() {
 
     private fun fetchStatus(): StatusData? {
         return try {
-            val conn = URL(STATUS_URL).openConnection() as HttpURLConnection
+            // 端口/token 走单一真源（审查项 X1）：不再硬编码 3190，
+            // 否则插件被 DSH_STATUS_BRIDGE_PORT 覆盖后本通道会静默连不上。
+            val spec = BridgeContract.read(this)
+            val conn = URL(BridgeContract.statusUrl(spec)).openConnection() as HttpURLConnection
             conn.connectTimeout = 800
             conn.readTimeout = 800
             conn.requestMethod = "GET"
             conn.useCaches = false
+            spec.token?.let { conn.setRequestProperty("X-Dsh-Bridge-Token", it) }
             try {
                 if (conn.responseCode != 200) return null
                 val text = BufferedReader(InputStreamReader(conn.inputStream)).use { it.readText() }
@@ -206,7 +210,7 @@ class KeepAliveAccessibilityService : AccessibilityService() {
     )
 
     companion object {
-        private const val STATUS_URL = "http://127.0.0.1:3190/status"
+        // STATUS_URL 已移除：端口+token 的单一真源是 core/BridgeContract.kt（审查项 X1）。
 
         /** 唤醒锁单次持有超时：轮询循环每轮（≤30s）续期，超时兜底防误判后永久持锁。 */
         private const val WAKELOCK_RENEW_MS = 10 * 60_000L

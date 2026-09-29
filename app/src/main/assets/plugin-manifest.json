@@ -29,34 +29,39 @@
       "upstream": "https://gitee.com/iJetLi/deepseek-harness-codearts"
     }
   ],
+  "$optionalComment": "optional 条目与 builtin 一样带 version（便于追溯副本对应哪一版）；本仓自研的两份桥接插件是**本地实现、无上游仓库**，故不带 upstream 字段——不编造出处。",
   "optional": [
     {
       "dir": "dsh-status-bridge",
       "name": "@dsh-external/dsh-status-bridge",
       "id": "dsh-status-bridge",
       "title": "状态桥接",
-      "desc": "悬浮窗/通知显示 dsh 运行情况（与启动器 Kotlin 侧强耦合，默认不装配）"
+      "desc": "悬浮窗/通知显示 dsh 运行情况（与启动器 Kotlin 侧强耦合，默认不装配）",
+      "version": "0.1.2"
     },
     {
       "dir": "dsh-android-links",
       "name": "@dsh-external/dsh-android-links",
       "id": "dsh-android-links",
       "title": "Android 存储桥接",
-      "desc": "共享存储软链入 dsh home，目录选择器可浏览 /storage"
+      "desc": "共享存储软链入 dsh home，目录选择器可浏览 /storage",
+      "version": "0.1.1"
     },
     {
       "dir": "dsh-llm-codebuddy",
       "name": "dsh-llm-codebuddy",
       "id": "llm-codebuddy",
       "title": "CodeBuddy Provider",
-      "desc": "CodeBuddy Provider（中国区/国际版共存模式）"
+      "desc": "CodeBuddy Provider（中国区/国际版共存模式）",
+      "version": "1.6.0"
     },
     {
       "dir": "dsh-oh-we-need",
       "name": "@dsh-external/dsh-oh-we-need",
       "id": "dsh-oh-we-need",
       "title": "oh-we-need",
-      "desc": "提示词/技能增强包（历史遗留，从未接入装配链）"
+      "desc": "提示词/技能增强包（历史遗留，从未接入装配链）",
+      "version": "0.2.0"
     }
   ]
 }

@@ -91,7 +91,7 @@ Kotlin 展示面与 `install-dsh.mjs` 装配面都从它派生；一致性由 `n
 
 | 插件 | 作用 |
 |---|---|
-| `dsh-status-bridge` | dsh 运行状态桥接到悬浮窗/通知（本地 HTTP :3190）。**与启动器 Kotlin 侧强耦合**：不装配则悬浮窗状态显示/TTS 播报链路失效 |
+| `dsh-status-bridge` | dsh 运行状态桥接到悬浮窗/通知（本地 HTTP，默认 :3190）。**与启动器 Kotlin 侧强耦合**：不装配则悬浮窗状态显示/TTS 播报链路失效（此时心跳 note 记为 `bridge-absent`，与「装了但掉线」区分开）。`/status` **需要 token**（每次启动轮换、写入 `files/status-bridge.json`，Kotlin 同源读取；不再回 CORS 头）；`lastText` 的更新粒度是**每条 assistant 消息**，不是逐字流式 |
 | `dsh-android-links` | 在 dsh HOME 创建 `sdcard → /storage/emulated/0` 符号链接，让工作区目录浏览器直达 SD 卡 |
 | `dsh-llm-codebuddy` | CodeBuddy 中国区/国际版 LLM Provider（独立命名空间 `llm-codebuddy`，只新增 Provider） |
 | `@dsh-external/dsh-oh-we-need` | 推理风格 Skill（历史遗留，此前从未接入装配链） |
@@ -186,7 +186,7 @@ adb shell am start -n com.dsh.nextapp1/.MainActivity   # 或直接点应用图�
 - `sharp` 为 stub：依赖图片处理的能力不可用，不影响核心会话功能。
 - 设备内存有限：**不要在设备上执行 `pnpm build` / 类型检查**（会 OOM）；内置插件以源码打包进 APK，装配用官方 `dsh plugin`，不在设备端编译。
 - 重新安装 APK 会终止旧 web 进程，需再次触发一键引导（幂等；已安装时走 npm 增量更新）。
-- `dsh web` 只监听 loopback（本机 + adb forward 可访问）；`dsh-status-bridge` `/status` 同绑 loopback。
+- `dsh web` 只监听 loopback（本机 + adb forward 可访问）；`dsh-status-bridge` `/status` 同绑 loopback，且**要求 token**（回环在 Android 上没有 per-app 访问控制，任何有 INTERNET 权限的 app 都能直连；`/health` 是无需 token 的常量探针）。
 - 状态桥接普通通道无开机自启：重启后由无障碍通道自动恢复，或打开一次 app 拉起；部分 ROM 对无障碍冷启懒绑定（关一次再开即可）。
 - 悬浮窗 watchdog 为 30s 自续式精确闹钟；Doze 深度休眠下可能被合并到 ≥9 分钟一次。
 - **PowerGovernor** 自适应后台：按「屏幕 × 任务态 × 后台时长」分档轮询（亮屏 1s / 灭屏任务 3s+唤醒锁 / 灭屏空闲 10~30s），看门狗仅在任务运行或刚灭屏 5 分钟内允许唤醒。
