@@ -89,7 +89,7 @@ object DshFlow {
     )
 
     /** 需整目录同步的 assets 子目录（新增目录只加这里一处）。 */
-    val ASSET_DIRS = listOf("install", "extra-plugins", "optional-plugins")
+    val ASSET_DIRS = listOf("install", "stub", "extra-plugins", "optional-plugins")
 
     /** 模板资产读取失败时的兜底内联模板（内容与 tpl 保持一致）。 */
     private val DEFAULT_WEB_LAUNCHER_TPL = """
