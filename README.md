@@ -84,6 +84,17 @@ Kotlin 展示面与 `install-dsh.mjs` 装配面都从它派生；一致性由 `n
 | `dsh-web-mobile` | <https://github.com/mexiaosqwq/dsh-web-mobile> | 竖屏/窄屏 Web 适配（抽屉导航、全宽会话、安全区、触控人体工学） |
 | `dsh-prompt-optimizer-mobile` | **本仓库 fork**，基于 <https://github.com/WestFox-AwA/dsh-prompt-optimizer> `v0.7.6`（见 [FORK.md](app/src/main/assets/extra-plugins/dsh-prompt-optimizer-mobile/FORK.md)） | 提示词优化（发送前用独立 AI 改写成命令）。fork 相对上游：**默认启用**（仅显式 `enabled:false` 关闭）、视口感知面板尺寸、窄屏断点、全面屏安全区、触控人体工学 |
 | `dsh-codearts-auth` | <https://gitee.com/iJetLi/deepseek-harness-codearts> | CodeArts / Buddy / Qoder / Trae / Cline / Loomy 等多 Provider 登录与模型接入 |
+| `dsh-status-bridge` | **本仓库自研** | dsh 运行状态桥接到悬浮窗/通知（本地 HTTP，默认 :3190）。**与启动器 Kotlin 侧强耦合**：不装配则悬浮窗状态显示/TTS 播报链路失效（心跳 note 记为 `bridge-absent`，与「装了但掉线」区分开）。`/status` **需要 token**（每次启动轮换、写入 `files/status-bridge.json`，Kotlin 通过 `BridgeContract` 同源读取；不再回 CORS 头）；`lastText` 支持**逐段实时增长**（经 LLM 层 `llm/stream` waterfall 钩子对主请求做 tee，只取 `text-delta`，`reasoning`/`tool-call` 不外放） |
+| `dsh-android-links` | **本仓库自研** | 在 dsh HOME 创建 `sdcard → /storage/emulated/0` 符号链接，让工作区目录浏览器直达 SD 卡 |
+| `dsh-net-proxy` | 自 `prebuilt.tgz` 恢复 | 让 agent 自身的网络请求（web_search / web_fetch / 外部 API）走已配置的 HTTP(S) 代理 |
+| `dsh-provider-headers` | 自 `prebuilt.tgz` 恢复 | 在 Web 的模型设置页为自定义（llm-pi-ai）Provider 配置自定义请求头 |
+| `dsh-vision` | 自 `prebuilt.tgz` 恢复 | 给纯文本模型加上 `view_image` 工具：复用宿主 Provider 配置，或接自定义 OpenAI 兼容 VLM 端点 |
+
+### 内置集合的构成
+
+内置集合**由用户逐项决定**（原先「仅内置三个」的约束已撤回），当前为 **8 个**。
+装完即可用；源码在 `assets/extra-plugins/`，唯一真源见
+[`plugin-manifest.json`](app/src/main/assets/plugin-manifest.json)。
 
 ### 可选插件（随 APK 分发，**默认不装配**）
 
@@ -91,20 +102,29 @@ Kotlin 展示面与 `install-dsh.mjs` 装配面都从它派生；一致性由 `n
 
 | 插件 | 作用 |
 |---|---|
-| `dsh-status-bridge` | dsh 运行状态桥接到悬浮窗/通知（本地 HTTP，默认 :3190）。**与启动器 Kotlin 侧强耦合**：不装配则悬浮窗状态显示/TTS 播报链路失效（此时心跳 note 记为 `bridge-absent`，与「装了但掉线」区分开）。`/status` **需要 token**（每次启动轮换、写入 `files/status-bridge.json`，Kotlin 同源读取；不再回 CORS 头）；`lastText` 支持**逐段实时增长**（经 LLM 层 `llm/stream` waterfall 钩子对主请求做 tee，只取 `text-delta`，`reasoning`/`tool-call` 不外放） |
-| `dsh-android-links` | 在 dsh HOME 创建 `sdcard → /storage/emulated/0` 符号链接，让工作区目录浏览器直达 SD 卡 |
 | `dsh-llm-codebuddy` | CodeBuddy 中国区/国际版 LLM Provider（独立命名空间 `llm-codebuddy`，只新增 Provider） |
 | `@dsh-external/dsh-oh-we-need` | 推理风格 Skill（历史遗留，此前从未接入装配链） |
 
-> 原内置的 `dsh-mobile-nav` / `dsh-super-injector` / `dsh-net-proxy` / `dsh-provider-headers` /
-> `dsh-vision` 已随 `prebuilt.tgz` 供给链一并移除。
->
-> **⚠ 内置集合的构成待定**：原先「仅内置三个插件」这条约束已由用户撤回，
-> 哪些内置、哪些删除改为**逐项决定**。候选清单与每项的删除影响见
-> [`docs/plugin-roster.md`](docs/plugin-roster.md)；在你给出结论前，本仓维持现状不改动。
-> 未装配的可选插件心跳 note 为 `bridge-absent`（与「装了但掉线」区分），在插件管理页点「装配」即可启用。
+> **⚠ 其中三项（`dsh-net-proxy` / `dsh-provider-headers` / `dsh-vision`）的来源需说明**：
+> 它们原先只存在于 `prebuilt.tgz` 的 `third_party/`，而该供给链已在提交 `e3cf666` 移除，
+> 仓库里**从未有过**它们的独立副本（`git ls-files` 0 命中）。本次是从本地构建残留
+> `app/build/intermediates/.../prebuilt.tgz` 恢复源码后重新纳入的——
+> **该残留不在 git 中，其 sha256 与 git LFS 记录的指针也不一致**，
+> 因此无法断言这就是当年入库的那一版。恢复后已针对 dsh 0.1.7-rc.2 做过适配（见下）。
 
 > `dsh-web-mobile` 是原 `dsh-mobile-nav` 的**改名后继**（同一插件的新名），故旧名已一并退役，避免双份注册。
+> 已彻底退役、不再出现在本仓任何位置的旧插件：`dsh-mobile-nav`、`dsh-super-injector`。
+
+### 针对 dsh 0.1.7-rc.2 的适配（恢复的三项）
+
+| 插件 | 上游写法 | 适配后 | 依据 |
+|---|---|---|---|
+| `dsh-provider-headers` | `require('@deepseek-ai/dsh-client-runtime/client').createSnapshotStore` | 改从 **`@deepseek-ai/dsh-client-store`** 取 | `dsh-client-runtime` 在 0.1.7-rc.2 全仓 **0 命中**（已不存在）；`createSnapshotStore` 现存于 `dsh-client-store`，签名一致，宿主自带的 `dsh-client-ui-sidebar/lib/client.js` 正是这么用的 |
+| `dsh-vision` | `import { settingsNamespace } from '@deepseek-ai/dsh-settings'` | **就地内联**该函数 | 0.1.7-rc.2 的导出面实测仅 `{SettingsConflictError, SettingsForms, SettingsForms as default, redactSecrets}`，该符号已移除；ESM 具名导入在链接期即抛错，try/catch 兜不住。原实现只是「校验后原值返回」，源码既已随 APK 分发，内联比启动期改写干净 |
+| `dsh-net-proxy` | — | 无需改动 | 依赖仅 `node:*` / `react` / `dsh-client-ui-primitives` / `schemastery`，均存在 |
+
+三者在真机上均通过 **ESM 链接测试**（`import()` 插件入口）：
+`dsh-net-proxy` → `name="net-proxy"`、`dsh-provider-headers`、`dsh-vision` → `apply` 均为 function。
 
 ## dsh 版本适配
 

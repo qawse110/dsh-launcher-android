@@ -1,0 +1,52 @@
+{
+  "name": "@dsh-external/dsh-vision",
+  "version": "0.2.0",
+  "description": "给纯文本的 DeepSeek 加上眼睛：view_image 工具回答关于图片的问题。两种后端：(1) 直接复用 DSH 提供商配置（Settings → Models 里的 provider/model/密钥，走 ctx.llm 流式调用）；(2) 自定义 OpenAI 兼容 VLM 端点（默认智谱免费 glm-4.6v-flash 零成本开箱）。",
+  "private": true,
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": { "types": "./lib/types/index.d.ts", "default": "./lib/index.js" },
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": ["lib", "assets", "cordis.patch.yml"],
+  "license": "BSD-3-Clause",
+  "engines": { "dsh": ">=0.0.1" },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-api-remotes"
+      ],
+      "platform": "web"
+    }
+  },
+  "dshx": {
+    "contributes": { "tools": ["view_image"], "skills": [] }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1-rc.1",
+    "@deepseek-ai/dsh-attachment": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-llm": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-settings": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-system-prompt": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/react": "^18.2.0",
+    "esbuild": "^0.21.5",
+    "typescript": "^5.9.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && tsc -p tsconfig.client.json && node scripts/build-client.mjs",
+    "build:all": "powershell -ExecutionPolicy Bypass -File scripts/build.ps1"
+  }
+}

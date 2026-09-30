@@ -2,6 +2,7 @@
   "$comment": "内置插件装配清单 —— 单一真源。install-dsh.mjs 与 PluginManagerActivity.kt 都从这里读取；两侧不得再各自硬编码。dir = assets/extra-plugins/<dir>，name = package.json 的 name，id = cordis.patch.yml 的 insert id。",
   "version": 1,
   "profile": "web",
+  "$builtinComment": "内置集合由用户逐项决定（原「仅内置三个」约束已撤回）。builtin = 源码在 assets/extra-plugins/、随 APK 装配进 web profile；optional = 源码在 assets/optional-plugins/、分发但不默认装配。",
   "builtin": [
     {
       "dir": "dsh-web-mobile",
@@ -9,6 +10,7 @@
       "id": "dsh-web-mobile",
       "title": "移动端适配",
       "desc": "竖屏/窄屏 Web 适配（抽屉导航、全宽会话、安全区、触控人体工学）",
+      "version": "3.0.3",
       "upstream": "https://github.com/mexiaosqwq/dsh-web-mobile"
     },
     {
@@ -26,17 +28,15 @@
       "id": "codearts-auth",
       "title": "CodeArts 多 Provider",
       "desc": "CodeArts/Buddy/Qoder/Trae/Cline 等 Provider 登录、积分与模型接入",
+      "version": "0.1.0",
       "upstream": "https://gitee.com/iJetLi/deepseek-harness-codearts"
-    }
-  ],
-  "$optionalComment": "optional 条目与 builtin 一样带 version（便于追溯副本对应哪一版）；本仓自研的两份桥接插件是**本地实现、无上游仓库**，故不带 upstream 字段——不编造出处。",
-  "optional": [
+    },
     {
       "dir": "dsh-status-bridge",
       "name": "@dsh-external/dsh-status-bridge",
       "id": "dsh-status-bridge",
       "title": "状态桥接",
-      "desc": "悬浮窗/通知显示 dsh 运行情况（与启动器 Kotlin 侧强耦合，默认不装配）",
+      "desc": "悬浮窗/通知显示 dsh 运行情况（本地 HTTP，默认 :3190，token 鉴权）。经 LLM 层 llm/stream 钩子做流式；与启动器 Kotlin 侧强耦合",
       "version": "0.1.3"
     },
     {
@@ -47,6 +47,33 @@
       "desc": "共享存储软链入 dsh home，目录选择器可浏览 /storage",
       "version": "0.1.1"
     },
+    {
+      "dir": "dsh-net-proxy",
+      "name": "dsh-net-proxy",
+      "id": "net-proxy",
+      "title": "网络代理",
+      "desc": "让 agent 自身的网络请求（web_search / web_fetch / 外部 API）走已配置的 HTTP(S) 代理。自 prebuilt.tgz 恢复并适配 dsh 0.1.7-rc.2",
+      "version": "0.2.5"
+    },
+    {
+      "dir": "dsh-provider-headers",
+      "name": "dsh-provider-headers",
+      "id": "provider-headers",
+      "title": "Provider 请求头",
+      "desc": "在 Web 的模型设置页为自定义（llm-pi-ai）Provider 配置自定义请求头。适配：createSnapshotStore 改由 @deepseek-ai/dsh-client-store 提供",
+      "version": "0.1.0"
+    },
+    {
+      "dir": "dsh-vision",
+      "name": "@dsh-external/dsh-vision",
+      "id": "dsh-vision",
+      "title": "图片理解",
+      "desc": "给纯文本模型加上 view_image 工具：复用宿主 Provider 配置或自定义 OpenAI 兼容 VLM 端点。适配：settingsNamespace 就地内联（上游已在 0.1.7-rc.2 移除该导出）",
+      "version": "0.2.0"
+    }
+  ],
+  "$optionalComment": "optional 条目与 builtin 一样带 version（便于追溯副本对应哪一版）；本仓自研的桥接插件是本地实现、无上游仓库，故不带 upstream 字段——不编造出处。",
+  "optional": [
     {
       "dir": "dsh-llm-codebuddy",
       "name": "dsh-llm-codebuddy",

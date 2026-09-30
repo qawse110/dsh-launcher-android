@@ -1,0 +1,7 @@
+# dsh-provider-headers bundle patch: mounts the browser plugin row.
+# The host side is inert (see lib/index.js); this row exists so the cordis
+# loader mounts the package and dsh-client-modules composes its browser half
+# into window.__DSH_BOOT__.
+- insert:
+    - id: provider-headers
+      name: dsh-provider-headers

@@ -1,0 +1,4 @@
+# dsh-net-proxy — network-proxy plugin bundle patch.
+- insert:
+    - id: net-proxy
+      name: 'dsh-net-proxy'

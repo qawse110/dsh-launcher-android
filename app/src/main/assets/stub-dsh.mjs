@@ -76,8 +76,9 @@ const DSH_PREFIX = process.env.DSH_PREFIX || join(HOME, 'dsh-prefix');
 const PROFILE = process.env.DSH_PROFILE || 'web';
 const NODE_MODULES = join(DSH_PREFIX, 'node_modules');
 const PNPM_DIR = join(NODE_MODULES, '.pnpm');
-// 内置插件（prebuilt.tgz 解出的 dsh-vision 等，以及 extra-plugins 同步来的
-// dsh-status-bridge 等）安装在 files/plugins/ 下，**不在** dsh-prefix/node_modules 里。
+// 内置插件（全部来自 extra-plugins 同步，含 dsh-status-bridge / dsh-vision 等）
+// 安装在 files/plugins/ 下，**不在** dsh-prefix/node_modules 里。
+// （prebuilt.tgz 供给链已于 e3cf666 移除；dsh-vision 等三项现已随 assets 分发。）
 // 历史实现只扫 node_modules，导致这些插件的源码问题完全不在修补范围内——
 // 真机事故：codebuddy 修好后 dsh-vision 又炸，同类错误换了个插件。
 const PLUGINS_DIR = process.env.DSH_PLUGINS_DIR || join(HOME, 'plugins');
@@ -154,7 +155,7 @@ function findNestedPkg(pkgName, rel) {
 /**
  * 枚举 files/plugins/<dir> 下每个内置插件的入口文件。
  *
- * 为什么需要：内置插件（dsh-vision 等来自 prebuilt.tgz 解包，dsh-status-bridge 等
+ * 为什么需要：内置插件（dsh-vision / dsh-provider-headers 等由 assets 同步，dsh-status-bridge 等
  * 来自 extra-plugins 同步）都装在 files/plugins/ 下，而 [findPkg] 只扫
  * dsh-prefix/node_modules —— 这些插件的源码补丁长期不在覆盖范围内，
  * 真机表现为「同类错误换一个插件继续炸」（codebuddy 修好后 dsh-vision 又炸）。
@@ -1074,11 +1075,17 @@ try {
  *       - dsh-web-mobile / dsh-prompt-optimizer-mobile：**完全不引用** dsh-settings。
  *         （后者是本仓库对上游 dsh-prompt-optimizer 的 fork，基于 v0.7.6 即上游的
  *         dsh-po06；实测其 lib/*.js 对 settingsNamespace 命中 0 处。）
- *     → 0.1.7 三个内置插件当前**均非本补丁的消费者**。
- *   · 本补丁**真实的消费者**是 dsh-vision（来自 prebuilt.tgz 的 third_party/）与
+ *     → 上述原生三个内置插件均**不是**本补丁的消费者。
+ *   · 本补丁**当时的真实消费者**是 dsh-vision（来自 prebuilt.tgz 的 third_party/）与
  *     手动装配的 dsh-llm-codebuddy，两者都写
  *       import { settingsNamespace } from '@deepseek-ai/dsh-settings';
- *     （dsh-vision 另有 installSettingsSection 的文档提及）。
+ *
+ *     **2026 变更（用户逐项决定内置集合后）**：
+ *       - dsh-vision 已自 prebuilt.tgz 残留恢复进 assets/extra-plugins/ 并转为内置，
+ *         其在 lib/index.js 的 settingsNamespace 具名导入**已就地内联**（源码随 APK 分发，
+ *         不再需要启动期改写）。因此 **dsh-vision 不再是本补丁的消费者**。
+ *       - 本补丁保留，消费者现为 dsh-llm-codebuddy（可选插件，仍靠它兜住链接期错误）。
+ *       - 该内联也顺带绕开了下方「只扫入口文件」的覆盖边界问题。
  *
  * 关于扫描范围（本次核实项）：eachPluginEntry() 返回的是**每个插件目录的单一入口**
  * （package.json exports['.'].default ?? main ?? lib/index.js），**不是** lib/*.js 全量。

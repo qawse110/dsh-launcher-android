@@ -35,18 +35,47 @@
 | 6 | 无法用 CodeBuddy 作为 Provider | 与 #3 无重叠：codearts-auth 的包描述是 CodeArts 浏览器登录，不含 CodeBuddy；**但清单里 #3 的描述写了「Buddy」，两处表述不一致，建议你按实际需要判断** |
 | 7 | 失去该 Skill（此前**从未接入装配链**，默认部署下等于不存在） | 无 —— 这一项删除成本最低 |
 
-## C. 已退役（当前源码树里已无，仅备查）
+## C. 已退役（彻底不再出现）
 
-这五项随 `prebuilt.tgz` 供给链一并移除（`install-dsh.mjs:434`、`DshFlow.kt:245` 记「third_party 链已删除」），
-**现在不在仓库、也不在装配链里**：
+| dir | 说明 | 现状 |
+|---|---|---|
+| `dsh-mobile-nav` | 原名插件；`dsh-web-mobile` 是它的**改名后继**（同一插件新名），旧名退役以免双份注册 | **已彻底退役**，本仓无任何引用 |
+| `dsh-super-injector` | 原 prebuilt `third_party/` 内 | **已彻底退役**，本仓无任何引用 |
+| `dsh-net-proxy` | 原 prebuilt `third_party/` 内 | ⚠ **已恢复并转为内置**，见下方「落地结果」 |
+| `dsh-provider-headers` | 同上 | ⚠ **已恢复并转为内置**，见下方「落地结果」 |
+| `dsh-vision` | 同上 | ⚠ **已恢复并转为内置**，见下方「落地结果」 |
 
-| dir | 说明 |
-|---|---|
-| `dsh-mobile-nav` | 原名插件；`dsh-web-mobile` 是它的**改名后继**（同一插件新名），旧名退役以免双份注册 |
-| `dsh-super-injector` | 原 prebuilt `third_party/` 内 |
-| `dsh-net-proxy` | 同上 |
-| `dsh-provider-headers` | 同上 |
-| `dsh-vision` | 同上（`stub-dsh.mjs` 里仍留有面向它的兼容补丁） |
+---
+
+## E. 落地结果（用户逐项结论已执行）
+
+用户结论：**内置** = `dsh-status-bridge`、`dsh-android-links`、`dsh-net-proxy`、
+`dsh-provider-headers`、`dsh-vision`（先做 0.1.7-rc.2 适配再登记）；
+**彻底删除** = 已退役项的仓库残留引用；**其余现存插件保持不动**。
+
+### 内置集合（8 个）
+
+`dsh-web-mobile`、`dsh-prompt-optimizer-mobile`、`dsh-codearts-auth`（原有三个，未动）
+＋ `dsh-status-bridge`、`dsh-android-links`（由 optional 移入 `assets/extra-plugins/`）
+＋ `dsh-net-proxy`、`dsh-provider-headers`、`dsh-vision`（自 `prebuilt.tgz` 残留恢复并适配）。
+
+### 可选集合（2 个，未动）
+
+`dsh-llm-codebuddy`、`dsh-oh-we-need`。
+
+### 适配记录
+
+| 插件 | 问题 | 适配 |
+|---|---|---|
+| `dsh-provider-headers` | `require('@deepseek-ai/dsh-client-runtime/client')` —— 该包在 0.1.7-rc.2 **全仓 0 命中** | 改从 `@deepseek-ai/dsh-client-store` 取 `createSnapshotStore`（签名一致；宿主的 `dsh-client-ui-sidebar` 即如此） |
+| `dsh-vision` | `import { settingsNamespace }` —— 该导出**已被移除** | 就地内联原实现（仅校验后原值返回） |
+| `dsh-net-proxy` | 无 | 依赖仅 `node:*` / `react` / `dsh-client-ui-primitives` / `schemastery`，均存在 |
+
+三者均通过**真机 ESM 链接测试**（`import()` 入口）：`apply` 均为 function。
+
+> ⚠ **来源可靠性**：这三个插件的唯一本地副本是构建残留
+> `app/build/intermediates/.../prebuilt.tgz`（**不在 git**，且 sha256 与 git LFS 指针不一致），
+> 无法断言即当年入库版本。
 
 ## D. 不在仓库、可另行获取（1 个）
 

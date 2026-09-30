@@ -1,0 +1,6 @@
+# dsh-vision bundle patch: mounts the plugin row (host half = the view_image
+# tool + settings wiring; browser half = the Vision settings page, composed
+# into __DSH_BOOT__ by dsh-client-modules because the row name is the package).
+- insert:
+    - id: dsh-vision
+      name: '@dsh-external/dsh-vision'
