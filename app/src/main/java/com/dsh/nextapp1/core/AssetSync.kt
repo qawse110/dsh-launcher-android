@@ -256,6 +256,17 @@ object AssetSync {
             false
         }
 
+    /**
+     * 整目录同步并返回拷贝的文件数（目录本身不计；assets 里无该目录时返回 0）。
+     *
+     * 与 [copyAssetDir] 的区别：那个只回 boolean。调用方常需「拷了几个文件」来判断
+     * assets 是否真的为空（空目录与不存在都会给 false，日志里无从区分）。
+     */
+    fun copyDirRecursiveCount(context: Context, assetPath: String, dest: File): Int {
+        if (context.assets.list(assetPath) == null) return 0
+        return copyDirRecursive(context, assetPath, dest)
+    }
+
     /** 返回成功拷贝的文件数（目录本身不计）。 */
     private fun copyDirRecursive(context: Context, assetPath: String, dest: File): Int {
         val children = context.assets.list(assetPath) ?: return 0

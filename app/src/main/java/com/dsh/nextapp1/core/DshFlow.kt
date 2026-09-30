@@ -69,13 +69,27 @@ object DshFlow {
     private const val WARMUP_MARKER = "web-modules-warmed"
 
     /**
-     * Node loader 兼容层脚本清单（assets → files 同步的**单一真源**）。
+     * 安装/装配链路的脚本与随附 JSON（assets → files 同步的**单一真源**）。
+     *
+     * 含 Node loader 兼容层（fs-register / fs-loader / fs-promises-compat）——
      * SELinux 禁止 app 对 data 文件硬链接，dsh 会话首次落盘用 link()，
      * 故需把 node:fs/promises 的 link 重定向为 rename 兼容实现。
+     *
+     * 为什么收敛到这里：此前 DshFlow.syncCompatScripts 与 MainActivity 的
+     * APK 更新后同步各自维护一份清单，新增文件必然漏改一处（历史上已发生）。
+     * 现在两处都引用本常量。
+     *
+     * `install/` 是 install-dsh.mjs 拆分后的职责模块目录（整目录同步，
+     * 见 [ASSET_DIRS]）；主脚本只留编排逻辑。
      */
-    private val COMPAT_SCRIPTS = listOf(
-        "fs-register.mjs", "fs-loader.mjs", "fs-promises-compat.mjs",
+    val INSTALL_SCRIPTS = listOf(
+        "install-dsh.mjs", "routing-suite.mjs",
+        "fs-register.mjs", "fs-loader.mjs", "fs-promises-compat.mjs", "stub-dsh.mjs",
+        "plugin-manifest.json", "dsh-pin.json",
     )
+
+    /** 需整目录同步的 assets 子目录（新增目录只加这里一处）。 */
+    val ASSET_DIRS = listOf("install", "extra-plugins", "optional-plugins")
 
     /** 模板资产读取失败时的兜底内联模板（内容与 tpl 保持一致）。 */
     private val DEFAULT_WEB_LAUNCHER_TPL = """
@@ -225,6 +239,16 @@ object DshFlow {
             fl("FAIL 2/4 assets copy install-dsh.mjs: ${t.message}")
             onState?.invoke("出错")
             return false
+        }
+        // ⚠ install/ 必须紧跟主脚本同步：主脚本第 3 步就会被执行，而
+        //   syncCompatScripts（步骤 3.5）**晚于**它。漏这一步的真机表现是
+        //   ERR_MODULE_NOT_FOUND: files/install/env.mjs（安装直接失败）。
+        try {
+            val n = AssetSync.copyDirRecursiveCount(ctx, "install", File(ctx.filesDir, "install"))
+            fl("  安装脚本职责模块 $n 个文件（install/）")
+            if (n == 0) fl("  WARN assets 无 install/：install-dsh.mjs 将无法加载")
+        } catch (t: Throwable) {
+            fl("  WARN assets 无 install/")
         }
         // 插件清单（单一真源）：装配面与展示面都从它派生，Kotlin/JS 两侧不再各自硬编码。
         try {
@@ -451,13 +475,24 @@ object DshFlow {
      * @return stub 补丁载荷的目标文件（调用方据此决定是否重打补丁）
      */
     private fun syncCompatScripts(ctx: Context, onLog: (String) -> Unit): File {
-        for (name in COMPAT_SCRIPTS + STUB_SCRIPT) {
+        for (name in INSTALL_SCRIPTS) {
             try {
                 ctx.assets.open(name).use { input ->
                     File(ctx.filesDir, name).outputStream().use { output -> input.copyTo(output) }
                 }
             } catch (t: Throwable) {
                 onLog("WARN assets copy $name: ${t.message}")
+            }
+        }
+        // 整目录资产：`install/`（install-dsh.mjs 拆分出的职责模块）与插件源。
+        // 不 clearFirst：这些目录由本函数持续维护，清空再拷会在中途失败时留下空目录。
+        for (dir in ASSET_DIRS) {
+            try {
+                if (!AssetSync.copyAssetDir(ctx, dir, File(ctx.filesDir, dir), clearFirst = false)) {
+                    onLog("WARN assets dir missing: $dir")
+                }
+            } catch (t: Throwable) {
+                onLog("WARN assets dir $dir: ${t.message}")
             }
         }
         return File(ctx.filesDir, STUB_SCRIPT)

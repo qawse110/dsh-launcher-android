@@ -935,24 +935,25 @@ class MainActivity : AppCompatActivity() {
         thread {
             var ok = true
             try {
-                for (name in listOf(
-                    "install-dsh.mjs", "routing-suite.mjs",
-                    "fs-register.mjs", "fs-loader.mjs", "fs-promises-compat.mjs", "stub-dsh.mjs",
-                    "plugin-manifest.json", "dsh-pin.json"
-                )) {
+                // 脚本清单引用 DshFlow.INSTALL_SCRIPTS（**单一真源**）——此前这里与
+                // DshFlow.syncCompatScripts 各维护一份，新增文件必然漏改一处。
+                for (name in DshFlow.INSTALL_SCRIPTS) {
                     if (!AssetSync.copyAsset(this, name, File(filesDir, name))) ok = false
                 }
+                // 整目录资产同步（含 install/ 职责模块目录）。
+                for (dir in DshFlow.ASSET_DIRS) {
+                    val dest = File(filesDir, dir)
+                    // extra/optional-plugins 采用 clearFirst（源与装配副本需严格一致，
+                    // 残留旧文件会被当成"仍在"）；install/ 直接覆盖即可，避免中途失败留空目录。
+                    val clear = dir != "install"
+                    if (AssetSync.copyAssetDir(this, dir, dest, clearFirst = clear)) {
+                        if (clear) AssetSync.markSyncedWithFingerprint(this, dir, dest, stamp)
+                    } else {
+                        ok = false
+                    }
+                }
+                // 装配副本刷新需要内置源目录（optional 不需要：它默认不装配）。
                 val extraPlugins = File(filesDir, "extra-plugins")
-                if (AssetSync.copyAssetDir(this, "extra-plugins", extraPlugins, clearFirst = true)) {
-                    AssetSync.markSyncedWithFingerprint(this, "extra-plugins", extraPlugins, stamp)
-                } else {
-                    ok = false
-                }
-                // 可选插件源（随 APK 分发、默认不装配）：与内置源同等对待地保持最新。
-                val optionalPlugins = File(filesDir, "optional-plugins")
-                if (AssetSync.copyAssetDir(this, "optional-plugins", optionalPlugins, clearFirst = true)) {
-                    AssetSync.markSyncedWithFingerprint(this, "optional-plugins", optionalPlugins, stamp)
-                }
                 // ★ 同步了「源」还不够：运行时加载的是 files/plugins 下的**装配副本**，
                 //   profile 登记的是 link: 到该目录 → 必须把副本也刷一遍。否则装了含插件
                 //   修复的新 APK，快速启动仍加载旧代码、报完全相同的错（真机事故）。
