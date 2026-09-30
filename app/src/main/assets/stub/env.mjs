@@ -9,9 +9,10 @@ import { writeFileSync, existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 
 const HOME = process.env.HOME || '/data/user/0/com.dsh.nextapp1/files';
-const NODE = process.env.NODE_DIR || join(HOME, 'node');
+// 已删除（无用代码清理）：NODE / PROFILE 两个常量定义了却**从无任何使用点**——
+// 它们是拆分前 stub-dsh.mjs 的遗留（那一版自己起进程、自己读写 profile；
+// 现在起进程与装配都归 install-dsh.mjs，stub 只改宿主包源码，两者都用不到）。
 const DSH_PREFIX = process.env.DSH_PREFIX || join(HOME, 'dsh-prefix');
-const PROFILE = process.env.DSH_PROFILE || 'web';
 const NODE_MODULES = join(DSH_PREFIX, 'node_modules');
 const PNPM_DIR = join(NODE_MODULES, '.pnpm');
 // 内置插件（全部来自 extra-plugins 同步，含 dsh-status-bridge / dsh-vision 等）
@@ -144,8 +145,11 @@ function eachPluginClientFile() {
   return out;
 }
 
+// 只导出**跨模块实际被 import 的**符号（其余是本模块内部实现细节）。
+// 此前把 16 个符号全列出来，其中 11 个无人 import（NODE/PROFILE 连内部都不用），
+// 空导出面会误导读者以为它们是公共 API，也让「谁在用」无从判断。
 export {
-  HOME, NODE, DSH_PREFIX, PROFILE, NODE_MODULES, PNPM_DIR, PLUGINS_DIR, OUT, OUT_SHARED,
-  log, getPnpmEntries, findPkg, findPkgUncached, findNestedPkg,
+  HOME,
+  log, findPkg,
   eachPluginEntry, eachPluginClientFile,
 };

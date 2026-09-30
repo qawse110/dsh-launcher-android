@@ -302,8 +302,10 @@ function cleanBuiltinPatch() {
   }
 }
 
+// 只导出编排层真正调用的三个。其余（loadManifest / dshPlugin / cleanBuiltinPatch /
+// syncExtraPlugin / profileDeps / profileBundles / removeProfileDep / MANIFEST /
+// BUILTIN_NAMES / BUILTIN_IDS）都是本模块内部实现细节。
 export {
-  MANIFEST, BUILTIN_PLUGINS, BUILTIN_NAMES, BUILTIN_IDS, loadManifest, dshPlugin,
-  installBuiltins, pruneRetiredBuiltins, cleanBuiltinPatch, syncExtraPlugin,
-  profileDeps, profileBundles, removeProfileDep,
+  BUILTIN_PLUGINS,
+  installBuiltins, pruneRetiredBuiltins,
 };

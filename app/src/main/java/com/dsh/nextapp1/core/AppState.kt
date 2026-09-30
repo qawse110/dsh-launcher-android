@@ -24,13 +24,7 @@ object AppState {
         const val BRIDGE = "status_bridge"
     }
 
-    // ---- 常用类型化读写便捷方法（按需扩展）----
-
-    fun bool(ctx: Context, ns: String, key: String, default: Boolean = false): Boolean =
-        ctx.getSharedPreferences(ns, Context.MODE_PRIVATE).getBoolean(key, default)
-
-    fun setBool(ctx: Context, ns: String, key: String, value: Boolean) {
-        ctx.getSharedPreferences(ns, Context.MODE_PRIVATE)
-            .edit().putBoolean(key, value).apply()
-    }
+    // 已删除（无用代码清理）：bool/setBool 两个便捷方法——定义后**从无调用点**，
+    // 且与上方 KDoc 的约定相悖（那条规定「必须引用 [Prefs] 常量，禁止字符串字面量」，
+    // 而它们收 `ns: String` 正好在鼓励传字面量）。各消费方都在用自己的类型化读法。
 }

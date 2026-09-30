@@ -139,10 +139,11 @@ function dshInstalled() {
   return existsSync(dshCli());
 }
 
+// 只导出**跨模块实际被 import 的**符号。OUT / OUT_SHARED / FALLBACK_DSH_TAG 是
+// 本模块内部实现细节（分别被 log 与 pinnedDshTag 使用），此前一并列出属于空导出面。
 export {
   HOME, FILES_DIR, NODE_BIN, NPM_BIN, DSH_PREFIX, DSH_PROFILE, DSH_APK_VER,
   PLUGINS_DIR, EXTRA_PLUGINS_SRC, TOOLS, TERMUX, REGISTRY, REGISTRY_FALLBACK,
-  PNPM_VERSION, NPM_TIMEOUT_MS, PLUGIN_TIMEOUT_MS, NPM_NET_ARGS, OUT, OUT_SHARED,
-  FALLBACK_DSH_TAG,
+  PNPM_VERSION, NPM_TIMEOUT_MS, PLUGIN_TIMEOUT_MS, NPM_NET_ARGS,
   log, runEx, run, isOom, envBase, pinnedDshTag, dshCli, dshInstalled,
 };

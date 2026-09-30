@@ -68,10 +68,16 @@ pruneRetiredBuiltins();
 installBuiltins();
 // 桥接启动器自管的 files/plugins（可清理旧链接）
 linkPluginDeps();
-// 桥接 dsh/pnpm 自管的 profile 目录（只补不删）——dsh 的 loader 以 profile 目录为
-// 模块解析基准，缺这一步则 dsh 自身的条目（plugin-manager / hmr 等）解析不到，
-// 表现为插件页「本部署没有可管理的 profile」。必须在 installBuiltins()（即
-// dsh plugin add）之后执行：pnpm 写入 profile node_modules 会晚于我们。
+// 桥接 dsh/pnpm 自管的 profile 目录（只补不删）：补上 profile 目录对 dsh 自身
+// 包的可见性（此前从该目录解析 @deepseek-ai/dsh-plugin-manager 会 MODULE_NOT_FOUND）。
+//
+// ⚠ 别把它当成「插件页无可管理 profile」的修复——该缺陷的三轮假设（条目 disabled /
+//   导入太慢 / profile 解析不到包）已被真机实验逐条证伪，本函数补上后症状依旧；
+//   问题在**挂载层**（条目 id 前缀 include:）而非解析层。详见 deps.mjs 的长注释。
+//   保留它是因为它修的是另一个**真实但独立**的解析缺口（幂等、无副作用）。
+//
+// 必须在 installBuiltins()（即 dsh plugin add）之后执行：pnpm 写入 profile
+// node_modules 会晚于我们。
 linkProfileDeps();
 
 try {

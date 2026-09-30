@@ -35,8 +35,8 @@ object TermuxRuntime {
 
     fun isBashReady(context: Context): Boolean = bashPath(context).isFile
 
-    /** Harness 附加工具（git/rg/file/curl/less）是否已安装就绪。 */
-    fun harnessToolsReady(context: Context): Boolean = PackageKit.ready(context)
+    // 已删除（无用代码清理）：harnessToolsReady——全仓无调用点；
+    // 调用方若要判断工具就绪，直接用 PackageKit.ready(ctx)。
 
     /**
      * 解压并准备 Termux 环境（同步，可能耗时 10~60 秒）。

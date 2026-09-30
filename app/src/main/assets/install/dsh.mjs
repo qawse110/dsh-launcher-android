@@ -253,4 +253,6 @@ function ensureRipgrepFallback() {
   }
 }
 
-export { ensurePnpm, ensureHostPkg, ensureDsh, ensureRipgrepFallback, runCapture };
+// ensureHostPkg 被 ensureDsh 内部调用、runCapture 被 ensureRipgrepFallback 内部调用，
+// 均无外部消费者，故不导出（导出面 = 真实消费面）。
+export { ensurePnpm, ensureDsh, ensureRipgrepFallback };

@@ -29,7 +29,7 @@
 
 - 结论：**质量高**。全部补丁带内容幂等标记；写盘前 `node --check` 语法校验（防毒化）；锚点失配优雅降级 skip；逐块 try/catch 隔离。
 - ✅ `/sdcard` 日志双写与 install-dsh 同款门控。
-- 记录：`patch-koffi.yml` 占位每跑必写（有意保留的旧版兼容）；base64 桩导出面靠生成时保证，运行期不校验。
+- 记录：`patch-koffi.yml` 占位写入**已于后续提交删除**（本行原记「每跑必写」）；base64 桩导出面靠生成时保证，运行期不校验。
 
 ## 交叉契约验证
 
@@ -44,7 +44,7 @@
 | 脚本 | 程序当前需要 | 符合度 | 处置 |
 |---|---|---|---|
 | install-dsh.mjs | npm 渠道安装/升级 dsh + 装配 7 内置插件；弱网鲁棒 | ✅（本轮 P0/P1 已修） | 保留 |
-| stub-dsh.mjs | 上游无 android 产物模块的免编译适配 + WebView polyfill | ✅ 全补丁幂等带校验 | 保留；删除 patch-koffi.yml 死写入 |
+| stub-dsh.mjs | 上游无 android 产物模块的免编译适配 + WebView polyfill | ✅ 全补丁幂等带校验 | 保留（`patch-koffi.yml` 死写入**已删除**，本行原为待办） |
 | fs-register/loader/promises-compat | SELinux 禁硬链接的会话落盘兼容 | ✅ loader 补齐裸说明符；并发语义修正 | 保留 |
 | routing-suite.mjs | 用户手动安装 yjh051108/dsh-routing-suite 时的特殊适配（按需触发，非主流程） | ⚠️→✅ 文件根三级推导修复多用户/手动运行错位；超时/退出码/slip 防护已修 | 保留 |
 | tpkg.sh | pkg 安装失败时的 deb 手动兜底 | ✅ 与原生 apt 主链路互补，职责清晰 | 保留 |

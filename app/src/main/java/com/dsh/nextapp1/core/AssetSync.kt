@@ -98,9 +98,8 @@ object AssetSync {
         }
     }
 
-    /** [openAsset] 的字节变体，供「读小文件为文本」的调用点复用。 */
-    fun readAssetBytes(context: Context, assetName: String): ByteArray =
-        openAsset(context, assetName).use { it.readBytes() }
+    // 已删除（无用代码清理）：readAssetBytes 字节变体——注释称「供调用点复用」，
+    // 但全仓无任何调用点（各消费方直接 openAsset(...).use { ... }）。
 
     /**
      * marker 值为 `apk:<安装戳>#<目标内容指纹>`，且目标存在时视为已同步。
@@ -125,9 +124,9 @@ object AssetSync {
         return marker == "apk:$apkStamp#$fp"
     }
 
-    fun markSynced(ctx: Context, key: String, apkStamp: String) {
-        MarkerStore.put(ctx, key, "apk:$apkStamp")
-    }
+    // 已删除（无用代码清理）：markSynced（不带指纹的旧版）——全仓无调用点。
+    // 它写出的 `apk:<stamp>` 无 `#`，会被 isSynced 判为「未同步」（见上方注释的旧格式兼容），
+    // 即写进去也无效；现行唯一写法是下面的 markSyncedWithFingerprint。
 
     /** 携带目标内容指纹写入 marker（isSynced 校验用）。 */
     fun markSyncedWithFingerprint(ctx: Context, key: String, target: File, apkStamp: String) {

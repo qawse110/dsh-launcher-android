@@ -27,7 +27,6 @@ object StatusBridgeAlerts {
 
     private const val FINISH_NOTIFICATION_ID = 0x5A18
     private const val CHANNEL_ID = "dsh_status_bridge_finish_silent"
-    private const val PREFS_NAME = "status_bridge"
     private const val LAST_ALERT_AT = "last_finish_alert_at"
     private const val DEDUPE_MS = 2000L
 

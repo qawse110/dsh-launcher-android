@@ -34,11 +34,9 @@ let compatLinkCount = 0;
 /** 诊断钩子：兼容层触发次数（供运行时排查，无内部消费者属预期）。 */
 globalThis.__compatLinkCount = () => compatLinkCount;
 
-function eexist(what) {
-  const err = new Error(`EEXIST: file already exists, link '${what}'`);
-  err.code = 'EEXIST';
-  return err;
-}
+// 已删除（无用代码清理）：`eexist(what)` 构造 EEXIST 错误的辅助函数——
+// 定义后**从未被调用**。link() 的 EEXIST 分支是直接 `throw ee`（抛原生错误对象），
+// 不由这里构造，属拆分/演进遗留的空壳。
 
 export async function link(oldPath, newPath) {
   try {

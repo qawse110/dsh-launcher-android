@@ -249,4 +249,5 @@ function linkProfileDeps() {
   }
 }
 
-export { cmpVer, linkPluginDeps, linkProfileDeps };
+// cmpVer 被 linkPluginDeps 内部调用，无外部消费者，故不导出。
+export { linkPluginDeps, linkProfileDeps };

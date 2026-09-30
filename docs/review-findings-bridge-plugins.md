@@ -90,8 +90,12 @@
 
 - `server` 变量（`:20` 声明、`:139` 赋值）**赋值后从未读取**——状态已由
   `globalThis.__dshStatusBridgeServer` 承担。
-- `/health` 端点（`:124-125`）**无消费者**：全仓 grep `3190` 只命中 Kotlin 的
-  `StatusBridgeService.kt:149` 与 `KeepAliveAccessibilityService.kt:209`，两者都只用 `/status`。
+- `/health` 端点（`:124-125`）：**审查当时**确无消费者（全仓 grep `3190` 只命中 Kotlin 的
+  `StatusBridgeService.kt:149` 与 `KeepAliveAccessibilityService.kt:209`，两者都只用 `/status`）。
+
+  > **后续处置（见下方 S7 修复行）**：没有删除该端点，而是把它明确为**无需 token 的运维探针**
+  > （只回 `{ok, port}` 常量、不泄漏状态），用途是「进程活着吗」这一与鉴权解耦的存活检查——
+  > `/status` 需要 token，不能拿来当健康检查。
 
 ---
 
@@ -222,11 +226,14 @@ package.json 现读，所以显示没问题；但**清单自身不可追溯**（
 而留在 `optional` 却默认装配，`optional` 这个分类就失去意义。
 
 **⚠ 这条依据已被撤回**：用户后续明确要求「更改仅内置三个插件的要求」，
-内置集合的构成改为逐项决定。因此 X3 现在只保留两件**与约束无关**的成果——
-① 心跳 `bridge-absent` 让「没装配」不再与「掉线」混淆；
-② 装配路径明确（插件管理页一键装配）。
-「状态桥接要不要默认装配」本身**转为开放问题**，随 [`plugin-roster.md`](plugin-roster.md)
-的逐项结论一起定，本文不再预设。
+内置集合的构成改为逐项决定。
+
+**最终结论（已由用户逐项决定并落地）**：`dsh-status-bridge` 已登记为 **builtin**
+（`plugin-manifest.json` builtin 段），随 APK 装配进 web profile —— 即「默认装配」
+**已经发生**，不再是开放问题。X3 保留下来的两件与约束无关的成果仍然有效：
+① 心跳 `bridge-absent` 让「没装配」不再与「掉线」混淆（现已装配，该 note 不再出现）；
+② 装配路径明确。
+决定过程与其余插件的去留见 [`plugin-roster.md`](plugin-roster.md)。
 
 **S1 已从「降级」推进到「做出来」**：session 事件层确实拿不到进行中的正文
 （`SURFACE_EVENT_TYPES` 六类全是已完成消息），但 **LLM 层有官方 waterfall 钩子
