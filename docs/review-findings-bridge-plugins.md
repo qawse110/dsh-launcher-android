@@ -199,7 +199,7 @@ package.json 现读，所以显示没问题；但**清单自身不可追溯**（
 | S7 | 删除未使用的 `server` 变量；`/health` 改为**有明确用途**的运维探针并在文件头与 README 写明 | 无残留死代码 |
 | X1 | 新增 `core/BridgeContract.kt` 作为端口+token **单一真源**；两个 Service 均从它读取，删除各自的硬编码 URL | 全仓 `3190` 只剩「默认值常量 + 注释」 |
 | X2 | 新增 `FetchResult(Ok/Unreachable/Bad)`；只有 `Unreachable` 才进 `maybeRevive`，401/空/坏 JSON 只记 `poll-bad:*` | 坏响应不再可能被放大成回滚重装 |
-| X3 | 契约文件不存在（=插件未装配）时心跳记 `bridge-absent` 并**跳过 revive**，与「装了但掉线」区分 | 默认失效不再静默。**默认装配策略经确认后仍保持不变**，理由见下 |
+| X3 | 契约文件不存在（=插件未装配）时心跳记 `bridge-absent` 并**跳过 revive**，与「装了但掉线」区分 | 默认失效不再静默。默认装配策略当时**保持不变**（理由见下）；该理由所依赖的「仅内置三个」约束**已于后续轮次由用户撤回**，去留改由 [`plugin-roster.md`](plugin-roster.md) 逐项决定 |
 | A1 | `parseSpec` 增加反斜杠拒绝；目标 realpath 后拒绝自引用 | 不再有路径归一的意外与自环 |
 | A2 | 替换链接失败时**回滚为原目标**；回滚不成才返回 `LOST`，与「没动过」区分 | 失败不再静默丢链接 |
 | A3 | 新增 `<HOME>/dsh-android-links.json` 记账本次创建/替换的链接 | 日后清理有据可依 |
@@ -215,17 +215,18 @@ package.json 现读，所以显示没问题；但**清单自身不可追溯**（
   `next` 分支 push 走 debug、`main` 保持 release；两个上传步骤都改成 `if-no-files-found: error`，
   不再允许「要产物却悄悄没有」。
 
-### X3 的收口结论：默认装配策略**有意**保持不变（不是遗漏）
+### X3 的收口结论：**当时**默认装配策略保持不变（该依据现已失效）
 
-改这条会与项目最初就定下的约束冲突 —— 需求原文是「**仅内置** codearts-auth /
-prompt-optimizer / web-mobile 三个插件」。把 dsh-status-bridge 从 `optional` 挪进
-`builtin` 会让装配集合变成 4 个，直接违背该约束；而它若留在 `optional` 却又默认装配，
-`optional` 这个分类本身就失去意义。
+当时的理由是需求原文「**仅内置** codearts-auth / prompt-optimizer / web-mobile 三个插件」——
+把 dsh-status-bridge 挪进 `builtin` 会让装配集合变 4 个、违背该约束；
+而留在 `optional` 却默认装配，`optional` 这个分类就失去意义。
 
-因此本项收口为：**默认不变 + 失效可归因 + 装配路径明确**——
-心跳 `bridge-absent` 让「没装配」不再与「掉线」混为一谈，用户在插件管理页点「装配」即启用。
-我方**不再把这句留作待裁定项**：这是基于既有约束的结论，若日后要改开箱行为，
-应连同那条「仅内置三个」的约束一起重新确认。
+**⚠ 这条依据已被撤回**：用户后续明确要求「更改仅内置三个插件的要求」，
+内置集合的构成改为逐项决定。因此 X3 现在只保留两件**与约束无关**的成果——
+① 心跳 `bridge-absent` 让「没装配」不再与「掉线」混淆；
+② 装配路径明确（插件管理页一键装配）。
+「状态桥接要不要默认装配」本身**转为开放问题**，随 [`plugin-roster.md`](plugin-roster.md)
+的逐项结论一起定，本文不再预设。
 
 **S1 已从「降级」推进到「做出来」**：session 事件层确实拿不到进行中的正文
 （`SURFACE_EVENT_TYPES` 六类全是已完成消息），但 **LLM 层有官方 waterfall 钩子

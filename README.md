@@ -96,10 +96,13 @@ Kotlin 展示面与 `install-dsh.mjs` 装配面都从它派生；一致性由 `n
 | `dsh-llm-codebuddy` | CodeBuddy 中国区/国际版 LLM Provider（独立命名空间 `llm-codebuddy`，只新增 Provider） |
 | `@dsh-external/dsh-oh-we-need` | 推理风格 Skill（历史遗留，此前从未接入装配链） |
 
-> 内置集合**只保留上述三个**。原内置的 `dsh-mobile-nav` / `dsh-super-injector` / `dsh-net-proxy` /
-> `dsh-provider-headers` / `dsh-vision` 已随 `prebuilt.tgz` 供给链一并移除；
-> 与启动器功能耦合的 `dsh-status-bridge` / `dsh-android-links` / `dsh-llm-codebuddy` 按「保留代码、默认不装配」处理。
-> 这是**有意**的：内置装配集合按需求固定为三个（codearts-auth / prompt-optimizer / web-mobile），把状态桥接提升为默认装配会打破该约束。未装配时心跳 note 为 `bridge-absent`（与「装了但掉线」区分），在插件管理页点「装配」即可启用。
+> 原内置的 `dsh-mobile-nav` / `dsh-super-injector` / `dsh-net-proxy` / `dsh-provider-headers` /
+> `dsh-vision` 已随 `prebuilt.tgz` 供给链一并移除。
+>
+> **⚠ 内置集合的构成待定**：原先「仅内置三个插件」这条约束已由用户撤回，
+> 哪些内置、哪些删除改为**逐项决定**。候选清单与每项的删除影响见
+> [`docs/plugin-roster.md`](docs/plugin-roster.md)；在你给出结论前，本仓维持现状不改动。
+> 未装配的可选插件心跳 note 为 `bridge-absent`（与「装了但掉线」区分），在插件管理页点「装配」即可启用。
 
 > `dsh-web-mobile` 是原 `dsh-mobile-nav` 的**改名后继**（同一插件的新名），故旧名已一并退役，避免双份注册。
 
