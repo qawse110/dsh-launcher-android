@@ -43,9 +43,20 @@ function log(m) {
   console.log(`[dsh-android-links] ${m}`);
 }
 
+/**
+ * 可注入的文件系统操作集。
+ *
+ * 为什么要这个缝：A2 的回滚分支（「unlink 成功但 symlink 失败」→ 还原原目标）
+ * 在真实文件系统上很难稳定构造（删得掉就建得上），只能靠**注入**让 symlink 失败一次，
+ * 否则该分支永远只有代码审读、没有用例覆盖。
+ */
+const FS_OPS = Object.freeze({
+  existsSync, statSync, lstatSync, readlinkSync, symlinkSync, unlinkSync, realpathSync,
+});
+
 /** 目标归一化：存在的目标取 realpath（跟随链接，防环），失败的返回 null。 */
-function normalizeTarget(target) {
-  try { return realpathSync(target); } catch { return null; }
+function normalizeTarget(target, ops) {
+  try { return ops.realpathSync(target); } catch { return null; }
 }
 
 /**
@@ -69,17 +80,20 @@ export function parseSpec(raw) {
       && l.name !== '.' && l.name !== '..');
 }
 
-/** 确保单个符号链接存在且指向正确；返回动作说明（用于日志/测试）。 */
-export function ensureLink(link) {
-  if (!link.target || !existsSync(link.target)) {
+/**
+ * 确保单个符号链接存在且指向正确；返回动作说明（用于日志/测试）。
+ * @param ops 文件系统操作集，默认真实 fs；测试可注入以覆盖失败分支（见 FS_OPS 注释）。
+ */
+export function ensureLink(link, ops = FS_OPS) {
+  if (!link.target || !ops.existsSync(link.target)) {
     return `skip ${link.name}: target missing (${link.target})`;
   }
   let st;
-  try { st = statSync(link.target); } catch { return `skip ${link.name}: target not statable`; }
+  try { st = ops.statSync(link.target); } catch { return `skip ${link.name}: target not statable`; }
   if (!st.isDirectory()) return `skip ${link.name}: target not a directory`;
 
   // A1：目标 realpath 后不得等于链接自身（自引用会形成无法遍历的环）。
-  const realTarget = normalizeTarget(link.target);
+  const realTarget = normalizeTarget(link.target, ops);
   if (realTarget !== null && resolve(realTarget) === resolve(link.path)) {
     return `skip ${link.name}: target is the link itself (self-reference)`;
   }
@@ -88,7 +102,7 @@ export function ensureLink(link) {
   // 旧版那种「删除失败」被误报成「被非链接占用」（用户会去删一个本来就不该删的东西）。
   let previous = null;
   try {
-    previous = readlinkSync(link.path);
+    previous = ops.readlinkSync(link.path);
   } catch (e) {
     if (e && e.code !== 'ENOENT') {
       /* 不是符号链接：可能是普通文件/真实目录——绝不覆盖 */
@@ -100,19 +114,19 @@ export function ensureLink(link) {
   if (previous !== null) {
     /* 符号链接已存在但指向不同：先记住原目标，替换失败时要能回滚（A2）。 */
     try {
-      unlinkSync(link.path);
+      ops.unlinkSync(link.path);
     } catch (e) {
       return `skip ${link.name}: cannot remove stale link (${e && e.code ? e.code : e && e.message})`;
     }
   }
   try {
-    lstatSync(link.path);
+    ops.lstatSync(link.path);
     return `skip ${link.name}: path occupied by non-link entry`;
   } catch {
     /* ENOENT：位置空闲，可以创建 */
   }
   try {
-    symlinkSync(link.target, link.path);
+    ops.symlinkSync(link.target, link.path);
     return previous === null
       ? `linked ${link.name} -> ${link.target}`
       : `relinked ${link.name}: ${previous} -> ${link.target}`;
@@ -122,7 +136,7 @@ export function ensureLink(link) {
     // 并在返回值里**明确区分**「没动过」与「旧的丢了」。
     if (previous !== null) {
       try {
-        symlinkSync(previous, link.path);
+        ops.symlinkSync(previous, link.path);
         return `skip ${link.name}: symlink failed (${why}), original link restored`;
       } catch {
         return `LOST ${link.name}: symlink failed (${why}) and original link could NOT be restored`;

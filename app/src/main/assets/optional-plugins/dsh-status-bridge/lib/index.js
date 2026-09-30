@@ -19,15 +19,29 @@
  *   · **不再回 CORS 头**（消费方是原生 HttpURLConnection，本就不需要 CORS）。
  * 该文件同时是**端口与 token 的单一真源**：Kotlin 侧读它，而不是各自硬编码 3190。
  *
- * ── 文本捕获的真实边界（勿再承诺做不到的事）─────────────────────────
- * 旧版监听 `assistant/chunk` 以「随生成实时增长 lastText」——该事件在
+ * ── 实时文本：走 llm/stream，不走 session 事件 ──────────────────────
+ * 旧版监听 `assistant/chunk` 以求「随生成实时增长 lastText」——该事件在
  * dsh 0.1.7-rc.2 上**不存在**：宿主权威事件表
- * `@deepseek-ai/dsh-session/lib/types/known-event-types.js` 共 56 项，
- * 含 "chunk" 的为 0；assistant 事件只有 `assistant/attempt` 与
- * `assistant/message`。`assistant/chunk` 仅残留在 session-format
- * v0→v1/v1→v2 两个迁移包里，且在 v1→v2 中被显式当**已废弃事件**过滤。
- * 故本版**只按 `assistant/message`（每个 step 一条）更新 lastText** ，
- * 不再声称「按句增量朗读」——那是拿不到的能力。
+ * `@deepseek-ai/dsh-session/lib/types/known-event-types.js` 共 56 项、
+ * 含 "chunk" 的为 0；session 的 surface 也只折叠**已完成**消息
+ * （SURFACE_EVENT_TYPES 六类里没有进行中的正文）。
+ *
+ * 真正可用的入口是 **LLM 层的 waterfall 钩子 `llm/stream`**（一等扩展点，
+ * 不是 monkey-patch）：
+ *   ```
+ *   streamWithRegistration(options, prepared) {
+ *     return this.ctx.waterfall(this, 'llm/stream', options, () => this.adapterStream(...))
+ *   }
+ *   ```
+ * 本插件在 `apply()` 里挂 `ctx.on('llm/stream', …, { global: true })`，把
+ * **主请求**（`isAgentLoopRequest(options)`，由 `@deepseek-ai/dsh-llm` 导出）
+ * 返回的异步流包一层 tee：遇到 `{type:'text-delta', text}` 就累积进
+ * `streamBuf` 并实时更新 `lastText`，于是 Android 端可以**按句增量朗读**。
+ * `reasoning-delta` / `tool-call-delta` 不朗读、不外放。
+ *
+ * 过滤是两层：拿得到权威判据就用它；拿不到（动态 import 失败）则退化为
+ * 「本会话处于 running 且 sessionId 一致」，避免把标题生成等辅助请求的
+ * 文本混进 lastText。`assistant/message` 仍是**最终**正文的权威来源。
  */
 import { createServer } from 'node:http'
 import { randomBytes } from 'node:crypto'
@@ -58,8 +72,61 @@ const state = globalThis.__dshStatusBridgeState ?? (globalThis.__dshStatusBridge
   lastText: '',
   lastError: null,
   lastEvent: null,
+  /** 是否正处于「逐段生成中」（由 llm/stream 的 text-delta 驱动）。 */
+  streaming: false,
   updatedAt: 0,
 })
+
+/** 当前 step 的流式文本累积（仅 text-delta，不含 reasoning / tool-call）。 */
+let streamBuf = ''
+
+/**
+ * `@deepseek-ai/dsh-llm` 导出的权威判据（WeakSet 成员判断），用来区分
+ * 「agent-loop 的主请求」与标题生成之类的辅助请求。**动态 import**：
+ * 解析不到时不能把插件整个搞挂，退化为保守判据即可。
+ */
+let isAgentLoopRequest = null
+
+/**
+ * 把 LLM 流包一层 tee：只旁听 `text-delta`，把文本实时写进 state。
+ *
+ * 返回的仍是**异步可迭代**（宿主以 `for await (const chunk of stream)` 消费），
+ * 因此必须同时实现 `Symbol.asyncIterator` / `next` / `return` / `throw`，
+ * 并原样透传每个 chunk —— 我们只是观察者，绝不改变流的语义。
+ */
+function teeTextDeltas(stream) {
+  const iterator = stream[Symbol.asyncIterator]()
+  const observe = (chunk) => {
+    if (!chunk || typeof chunk !== 'object') return
+    if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
+      streamBuf += chunk.text
+      state.lastText = cap(streamBuf)
+      state.streaming = true
+      state.updatedAt = Date.now()
+    } else if (chunk.type === 'finish') {
+      state.streaming = false
+      state.updatedAt = Date.now()
+    }
+    // reasoning-delta / tool-call-delta / block-* 一律不朗读、不外放。
+  }
+  return {
+    [Symbol.asyncIterator]() { return this },
+    async next() {
+      const r = await iterator.next()
+      if (!r.done) { try { observe(r.value) } catch (e) { /* 观察失败不影响流 */ } }
+      return r
+    },
+    async return(value) {
+      state.streaming = false
+      return typeof iterator.return === 'function' ? iterator.return(value) : { done: true, value }
+    },
+    async throw(error) {
+      state.streaming = false
+      if (typeof iterator.throw === 'function') return iterator.throw(error)
+      throw error
+    },
+  }
+}
 
 function textFromMessage(message) {
   if (!message || !message.content) return ''
@@ -82,6 +149,8 @@ function updateState(session, event) {
       state.status = 'running'
       state.lastText = ''
       state.lastError = null
+      state.streaming = false
+      streamBuf = ''
       break
     case 'user/message':
       state.status = 'running'
@@ -109,6 +178,7 @@ function updateState(session, event) {
         state.status = 'finished'
         state.lastError = null
       }
+      state.streaming = false
       break
     }
     default:
@@ -210,6 +280,35 @@ export function apply(ctx) {
     }
   }
   ctx.on('session/event', onEvent)
+
+  // 流式正文：挂 LLM 层的 waterfall 钩子。**必须 global** —— 发起 LLM 调用的是
+  // agent-loop，不是本插件，作用域不写 global 就收不到。
+  import('@deepseek-ai/dsh-llm')
+    .then((m) => {
+      if (typeof m.isAgentLoopRequest === 'function') isAgentLoopRequest = m.isAgentLoopRequest
+      else console.warn('[dsh-status-bridge] isAgentLoopRequest 不可用，流式改用保守判据')
+    })
+    .catch((e) => {
+      console.warn('[dsh-status-bridge] 无法 import @deepseek-ai/dsh-llm，流式改用保守判据:', e?.message || e)
+    })
+
+  const onStream = (options, next) => {
+    const stream = next()
+    try {
+      const isMain = isAgentLoopRequest !== null
+        ? isAgentLoopRequest(options)
+        // 拿不到权威判据时的保守判据：只在本会话 running 且 sessionId 一致时累积，
+        // 免得把标题生成之类的辅助请求文本混进 lastText。
+        : (state.status === 'running' && Boolean(options) && options.sessionId === state.sessionId)
+      if (!isMain) return stream
+      streamBuf = ''
+      return teeTextDeltas(stream)
+    } catch (e) {
+      console.error('[dsh-status-bridge] llm/stream tee failed', e?.message || e)
+      return stream
+    }
+  }
+  ctx.on('llm/stream', onStream, { global: true })
   // 守卫：任何原因导致的掉线都会在 ≤15s 内被重新拉起。
   // ⚠ 必须建在 apply() 内、并在 dispose 时清掉：旧版把它放在**模块顶层**，
   //   等于「导入该模块」本身就具备起 HTTP 服务的副作用，且卸载后仍会把

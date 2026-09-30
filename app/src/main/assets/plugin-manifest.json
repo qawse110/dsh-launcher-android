@@ -37,7 +37,7 @@
       "id": "dsh-status-bridge",
       "title": "状态桥接",
       "desc": "悬浮窗/通知显示 dsh 运行情况（与启动器 Kotlin 侧强耦合，默认不装配）",
-      "version": "0.1.2"
+      "version": "0.1.3"
     },
     {
       "dir": "dsh-android-links",

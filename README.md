@@ -91,7 +91,7 @@ Kotlin 展示面与 `install-dsh.mjs` 装配面都从它派生；一致性由 `n
 
 | 插件 | 作用 |
 |---|---|
-| `dsh-status-bridge` | dsh 运行状态桥接到悬浮窗/通知（本地 HTTP，默认 :3190）。**与启动器 Kotlin 侧强耦合**：不装配则悬浮窗状态显示/TTS 播报链路失效（此时心跳 note 记为 `bridge-absent`，与「装了但掉线」区分开）。`/status` **需要 token**（每次启动轮换、写入 `files/status-bridge.json`，Kotlin 同源读取；不再回 CORS 头）；`lastText` 的更新粒度是**每条 assistant 消息**，不是逐字流式 |
+| `dsh-status-bridge` | dsh 运行状态桥接到悬浮窗/通知（本地 HTTP，默认 :3190）。**与启动器 Kotlin 侧强耦合**：不装配则悬浮窗状态显示/TTS 播报链路失效（此时心跳 note 记为 `bridge-absent`，与「装了但掉线」区分开）。`/status` **需要 token**（每次启动轮换、写入 `files/status-bridge.json`，Kotlin 同源读取；不再回 CORS 头）；`lastText` 支持**逐段实时增长**（经 LLM 层 `llm/stream` waterfall 钩子对主请求做 tee，只取 `text-delta`，`reasoning`/`tool-call` 不外放） |
 | `dsh-android-links` | 在 dsh HOME 创建 `sdcard → /storage/emulated/0` 符号链接，让工作区目录浏览器直达 SD 卡 |
 | `dsh-llm-codebuddy` | CodeBuddy 中国区/国际版 LLM Provider（独立命名空间 `llm-codebuddy`，只新增 Provider） |
 | `@dsh-external/dsh-oh-we-need` | 推理风格 Skill（历史遗留，此前从未接入装配链） |
@@ -99,6 +99,7 @@ Kotlin 展示面与 `install-dsh.mjs` 装配面都从它派生；一致性由 `n
 > 内置集合**只保留上述三个**。原内置的 `dsh-mobile-nav` / `dsh-super-injector` / `dsh-net-proxy` /
 > `dsh-provider-headers` / `dsh-vision` 已随 `prebuilt.tgz` 供给链一并移除；
 > 与启动器功能耦合的 `dsh-status-bridge` / `dsh-android-links` / `dsh-llm-codebuddy` 按「保留代码、默认不装配」处理。
+> 这是**有意**的：内置装配集合按需求固定为三个（codearts-auth / prompt-optimizer / web-mobile），把状态桥接提升为默认装配会打破该约束。未装配时心跳 note 为 `bridge-absent`（与「装了但掉线」区分），在插件管理页点「装配」即可启用。
 
 > `dsh-web-mobile` 是原 `dsh-mobile-nav` 的**改名后继**（同一插件的新名），故旧名已一并退役，避免双份注册。
 

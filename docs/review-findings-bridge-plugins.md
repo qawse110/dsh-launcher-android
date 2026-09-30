@@ -190,7 +190,7 @@ package.json 现读，所以显示没问题；但**清单自身不可追溯**（
 
 | 项 | 修法 | 判据 / 落点 |
 |---|---|---|
-| S1 | 删掉 `assistant/chunk` 分支；只按 `assistant/message` 更新 `lastText`；文件头与 README 同步降级「按句增量朗读」 | 证据：`dsh-session/lib/types/known-event-types.js` 权威事件表 56 项，含 chunk 者为 **0**，assistant 仅 `attempt`/`message` |
+| S1 | 删掉失效的 `assistant/chunk` 分支；**改走 LLM 层的 `llm/stream` waterfall 钩子**（cit. `streamWithRegistration` → `ctx.waterfall(this,'llm/stream',…)`），对**主请求**（`isAgentLoopRequest(options)`，由 `@deepseek-ai/dsh-llm` 导出）的异步流做 tee，只取 `{type:'text-delta',text}` 实时累积 | 权威事件表 56 项含 chunk 者为 0（故 session 层无解）；改走 LLM 层后**逐段实时增长已跑通**（假流验证：`""`→`"你好，"`→`"你好，世界"`，`reasoning`/`tool-call` 不外放，6 个 chunk 全透传，辅助请求不 tee） |
 | S2 | 每次启动生成随机 token 写入 `<HOME>/status-bridge.json`(0600)；`/status` 无 token 回 401；**移除 CORS 头**；`LAST_TEXT_CAP` 2000→600 | 无鉴权请求不再能读到状态；原生消费端本不需要 CORS |
 | S3 | 守卫定时器从**模块顶层**移入 `apply()`；返回 dispose 钩子关端口 + `clearInterval` | 卸载后不再监听 3190、不再被守卫拉起 |
 | S4 | 加在途标记 `inFlight` 合并「error 重试」与「守卫」两条路径 | 不再并发 createServer |
@@ -199,7 +199,7 @@ package.json 现读，所以显示没问题；但**清单自身不可追溯**（
 | S7 | 删除未使用的 `server` 变量；`/health` 改为**有明确用途**的运维探针并在文件头与 README 写明 | 无残留死代码 |
 | X1 | 新增 `core/BridgeContract.kt` 作为端口+token **单一真源**；两个 Service 均从它读取，删除各自的硬编码 URL | 全仓 `3190` 只剩「默认值常量 + 注释」 |
 | X2 | 新增 `FetchResult(Ok/Unreachable/Bad)`；只有 `Unreachable` 才进 `maybeRevive`，401/空/坏 JSON 只记 `poll-bad:*` | 坏响应不再可能被放大成回滚重装 |
-| X3 | 契约文件不存在（=插件未装配）时心跳记 `bridge-absent` 并**跳过 revive**，与「装了但掉线」区分 | 默认失效不再静默；默认装配策略**未改**（用户未授权改开箱行为） |
+| X3 | 契约文件不存在（=插件未装配）时心跳记 `bridge-absent` 并**跳过 revive**，与「装了但掉线」区分 | 默认失效不再静默。**默认装配策略经确认后仍保持不变**，理由见下 |
 | A1 | `parseSpec` 增加反斜杠拒绝；目标 realpath 后拒绝自引用 | 不再有路径归一的意外与自环 |
 | A2 | 替换链接失败时**回滚为原目标**；回滚不成才返回 `LOST`，与「没动过」区分 | 失败不再静默丢链接 |
 | A3 | 新增 `<HOME>/dsh-android-links.json` 记账本次创建/替换的链接 | 日后清理有据可依 |
@@ -215,6 +215,22 @@ package.json 现读，所以显示没问题；但**清单自身不可追溯**（
   `next` 分支 push 走 debug、`main` 保持 release；两个上传步骤都改成 `if-no-files-found: error`，
   不再允许「要产物却悄悄没有」。
 
-**仍未处理（如实标注）**：S1 的降级是「承认拿不到流式」，不是「把流式做出来」。
-若日后要在 Android 侧实现按句增量朗读，需要另找数据通道（客户端 wire 事件或 LLM 流直连），
-不属于本次修复范围。
+### X3 的收口结论：默认装配策略**有意**保持不变（不是遗漏）
+
+改这条会与项目最初就定下的约束冲突 —— 需求原文是「**仅内置** codearts-auth /
+prompt-optimizer / web-mobile 三个插件」。把 dsh-status-bridge 从 `optional` 挪进
+`builtin` 会让装配集合变成 4 个，直接违背该约束；而它若留在 `optional` 却又默认装配，
+`optional` 这个分类本身就失去意义。
+
+因此本项收口为：**默认不变 + 失效可归因 + 装配路径明确**——
+心跳 `bridge-absent` 让「没装配」不再与「掉线」混为一谈，用户在插件管理页点「装配」即启用。
+我方**不再把这句留作待裁定项**：这是基于既有约束的结论，若日后要改开箱行为，
+应连同那条「仅内置三个」的约束一起重新确认。
+
+**S1 已从「降级」推进到「做出来」**：session 事件层确实拿不到进行中的正文
+（`SURFACE_EVENT_TYPES` 六类全是已完成消息），但 **LLM 层有官方 waterfall 钩子
+`llm/stream`**，插件可对其做 tee。现在的数据通道是「LLM 流」，不是客户端 wire 事件。
+
+仍如实标注的边界：过滤用的 `isAgentLoopRequest` 取自 `@deepseek-ai/dsh-llm`（**动态 import**，
+失败则退化为「本会话 running + sessionId 一致」）；该判据基于 WeakSet 成员关系，
+依赖宿主把同一个 options 对象传进钩子。若上游改这两点，流式会退化为「只在 running 期间累积」。
