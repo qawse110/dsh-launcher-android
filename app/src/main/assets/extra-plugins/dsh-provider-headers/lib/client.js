@@ -67,8 +67,20 @@ _client_runtime_client = require("@deepseek-ai/dsh-client-store");
 		*/
 		const NS = "llm-pi-ai";
 		var HeadersSectionStore = class {
-			constructor(api) {
-				this.api = api;
+			/**
+			* ── dsh-launcher 修复（dsh 0.1.7-rc.2）──────────────────────────
+			* 上游构造签名是 (api)，调用方传的是 `ctx.get("connection").api`。
+			* 但 0.1.7-rc.2 的 connection 服务**没有 api 成员**（全仓 grep `connection.api` 0 命中），
+			* 故 `this.api.settings.describe` 直接抛 TypeError → 设置页显示「无法加载提供方请求头」。
+			*
+			* 正确契约是 **ctx.remote.settings**（宿主自带插件一致用法）：
+			*   describe()                        → { ok, value: { writable, namespaces: [{ns, value, revision}] } }
+			*   mutate(ns, ops, expectedRevision) → { ok, value: { revision, … } } | { ok:false, error:{code,message} }
+			* 注意返回值是**直接响应**（`response.ok/value`），不是上游代码里写的 `response.result.ok`。
+			* ──────────────────────────────────────────────────────────────
+			*/
+			constructor(settings) {
+				this.api = { settings };
 				this.generation = 0;
 				this.store = (0, _client_runtime_client.createSnapshotStore)({
 					status: "idle",
@@ -87,10 +99,11 @@ _client_runtime_client = require("@deepseek-ai/dsh-client-store");
 				let view;
 				let writable;
 				try {
-					const response = await this.api.settings.describe({});
-					if (!response.result.ok) throw new Error(response.result.error.message);
-					writable = response.result.value.writable;
-					const namespaces = response.result.value.namespaces;
+					// 直接响应形状：{ ok, value } | { ok:false, error }（见构造器注释）
+					const response = await this.api.settings.describe();
+					if (!response.ok) throw new Error(response.error && response.error.message || "settings.describe failed");
+					writable = response.value.writable;
+					const namespaces = response.value.namespaces;
 					view = Array.isArray(namespaces) ? namespaces.find((entry) => entry.ns === NS) : void 0;
 				} catch (error) {
 					if (generation !== this.generation) return;
@@ -134,14 +147,12 @@ _client_runtime_client = require("@deepseek-ai/dsh-client-store");
 				const ops = [{ op: "set", path: ["providers", route, "headers"], value: headers }];
 				if (sendAttribution === false) ops.push({ op: "set", path: ["providers", route, "sendAttribution"], value: false });
 				else ops.push({ op: "unset", path: ["providers", route, "sendAttribution"] });
-				const response = await this.api.settings.mutate({
-					ns: NS,
-					ops,
-					expectedRevision: snapshot.revision
-				});
-				if (!response.result.ok) throw new Error(response.result.error.message);
+				// mutate 是**位置参数**（ns, ops, expectedRevision），不是对象参数；
+				// 返回**直接响应** { ok, value } | { ok:false, error }（非上游写的 response.result）。
+				const response = await this.api.settings.mutate(NS, ops, snapshot.revision);
+				if (!response.ok) throw new Error(response.error && response.error.message || "settings.mutate failed");
 				await this.load();
-				return response.result.value;
+				return response.value;
 			}
 		};
 		//#endregion
@@ -412,8 +423,10 @@ _client_runtime_client = require("@deepseek-ai/dsh-client-store");
 		const inject = [
 			"slots",
 			"locale",
-			"connection",
-			"remote"
+			// 修复：上游声明 "connection"，但它要的其实是 settings 远程面。
+			// 0.1.7-rc.2 的 connection 服务**没有 api 成员**（全仓 0 命中）；
+			// 宿主自带插件一致声明 "remote.settings" 并从 ctx.remote.settings 调用。
+			"remote.settings"
 		];
 		/**
 		* Register the "请求头" settings section once the settings.section
@@ -423,9 +436,10 @@ _client_runtime_client = require("@deepseek-ai/dsh-client-store");
 		*/
 		function apply(ctx) {
 			ctx.effect(() => ctx.locale.register(NS_LOCALE, { zh, en }), "provider-headers: copy dictionaries");
-			const connection = ctx.get("connection");
-			if (connection === void 0) return;
-			const controller = new HeadersSectionStore(connection.api);
+			// 修复：从 ctx.remote.settings 取（而非已不存在的 connection.api）。
+			const settings = ctx.remote && ctx.remote.settings;
+			if (settings === void 0) return;
+			const controller = new HeadersSectionStore(settings);
 			const useSnapshot = (selector) => react.useSyncExternalStore((callback) => controller.store.subscribe(callback), () => selector === void 0 ? controller.store.getSnapshot() : selector(controller.store.getSnapshot()));
 			const t = ctx.locale.bind(NS_LOCALE);
 			const injected = () => ({ controller, useSnapshot, t });
