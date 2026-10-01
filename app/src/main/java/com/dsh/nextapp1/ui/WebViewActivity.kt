@@ -139,6 +139,7 @@ class WebViewActivity : AppCompatActivity() {
                 progressBar.visibility = View.GONE
                 maybeInjectPrompt()
                 injectComposerLayoutFix()
+                injectBackNavigation()
             }
 
             override fun onReceivedError(
@@ -165,11 +166,42 @@ class WebViewActivity : AppCompatActivity() {
         loadWebUi()
     }
 
+    /**
+     * 返回键：**优先做 Web 页面后退**，历史耗尽才离开 WebUI。
+     *
+     * 旧实现无条件 `super.onBackPressed()`（直接回启动器主界面），理由是
+     * 「dsh 是 SPA，浏览器级回退没意义」。该前提经真机实测**只对了一半**：
+     *
+     *   · dsh 前端确实**一次都不写 History**（主 bundle 与全部插件 client bundle 的
+     *     pushState/replaceState/history.back/go 全为 0 命中），所以**开箱时**
+     *     `canGoBack()` 恒为 false —— 直接改判 `canGoBack()` 会是空操作；
+     *   · 但 History 栈**本身可用**（真机探针：`history.pushState` 让 history.length
+     *     1→2 成功），dsh 的「页面」是设置面板/目录抽屉这类**可关闭的层**。
+     *
+     * 故配套由 [injectBackNavigation] 在页面侧把这些层登记进 History（层打开时
+     * pushState、返回时点关闭控件），使 `canGoBack()` 对「打开了一个面板」为真。
+     * 这样返回键的语义就是：**先退层，层退完再退页面，都退完才离开 WebUI**。
+     */
+    /** 防止连按返回时并发询问页面（询问是异步的）。 */
+    private var backProbePending = false
+
     override fun onBackPressed() {
-        // dsh WebUI 是 SPA：内部路由会向 WebView history 压入大量记录，
-        // goBack 后视觉上往往没有变化，用户连按返回像"卡住无法退出"。
-        // WebUI 有自己的导航（侧栏/抽屉），浏览器级回退没有意义——直接退出。
-        super.onBackPressed()
+        // ① 真实页面导航优先（URL 变过的话 canGoBack 才为真）
+        if (webView.canGoBack()) {
+            webView.goBack()
+            return
+        }
+        // ② dsh 的「层」不进 WebView 历史（真机实测：pushState 只改 JS 的
+        //    history.length，WebView.canGoBack() 仍为 false），所以改**问页面**：
+        //    页面侧检测到可关闭层就关掉并回 '1'，否则回 '0' 由我们退出。
+        if (backProbePending) return
+        backProbePending = true
+        webView.evaluateJavascript(
+            "(function(){try{return (window.__dshBackNav && window.__dshBackNav.handleBack()) ? '1' : '0';}catch(e){return '0';}})()"
+        ) { result ->
+            backProbePending = false
+            if (result == null || !result.contains("1")) super.onBackPressed()
+        }
     }
 
     override fun onNewIntent(intent: android.content.Intent?) {
@@ -310,6 +342,59 @@ class WebViewActivity : AppCompatActivity() {
               setTimeout(fix, 800);
               new MutationObserver(schedule).observe(document.body, {childList:true, subtree:true});
               window.addEventListener('resize', schedule);
+              return 'ok';
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(js) { }
+    }
+
+    /**
+     * 在页面侧提供 `window.__dshBackNav.handleBack()`，让返回键能退掉 dsh 的
+     * 「可关闭层」（设置面板 / 目录抽屉等）。
+     *
+     * **为什么不是 `webView.canGoBack()`**：真机实测两条都成立——
+     *   ① dsh 前端**从不写 History**（主 bundle 与全部插件 client bundle 的
+     *      pushState/replaceState/history.back/go 全 0 命中），栈里恒为 1 条；
+     *   ② 即使我们在页面里 `history.pushState`（JS 侧 length 确实 1→2，探针实测），
+     *      **`WebView.canGoBack()` 依然返回 false** —— 它只认真正的导航条目，
+     *      不认同文档 pushState。
+     * 所以「判 canGoBack + goBack」对 dsh 是死路，改为**Kotlin 主动问页面**：
+     * [onBackPressed] 调本函数，页面有层就关掉并回 '1'，没有则回 '0' 交回 Kotlin 退出。
+     *
+     * **为什么认文案不认类名**：dsh 的 class 是构建期哈希，每次发版都变
+     * （同 injectComposerLayoutFix 的判断）。这里按无障碍名/文本匹配，真机取证到
+     * 两种形态：设置面板的「关闭」、目录抽屉的「点击关闭目录」。
+     * 匹配不到就回 '0'，行为退化为旧实现（直接离开 WebUI）——本注入是增强，不是前提。
+     */
+    private fun injectBackNavigation() {
+        val js = """
+            (function(){
+              if (window.__dshBackNav) return 'skip';
+              // 层的关闭控件：无障碍名/文字匹配（无类名依赖，发版哈希变了也不影响）
+              var CLOSE_RE = /^(关闭|点击关闭目录|返回|关闭目录|Close)$/;
+              function closeControl(){
+                var els = document.querySelectorAll('button,[role=button]');
+                for (var i = 0; i < els.length; i++) {
+                  var el = els[i];
+                  var r = el.getBoundingClientRect();
+                  if (r.width < 8 || r.height < 8) continue;
+                  var cs = getComputedStyle(el);
+                  if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+                  var label = (el.getAttribute('aria-label') || el.textContent || '').trim();
+                  if (CLOSE_RE.test(label)) return el;
+                }
+                return null;
+              }
+              window.__dshBackNav = {
+                // 有层则关掉并返回 true；无层返回 false（由 Kotlin 决定是否退出）
+                handleBack: function(){
+                  var c = closeControl();
+                  if (!c) return false;
+                  try { c.click(); } catch (e) { return false; }
+                  return true;
+                },
+                hasLayer: function(){ return closeControl() !== null; }
+              };
               return 'ok';
             })();
         """.trimIndent()
