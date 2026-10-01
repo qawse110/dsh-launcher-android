@@ -424,8 +424,13 @@ _client_runtime_client = require("@deepseek-ai/dsh-client-store");
 			"slots",
 			"locale",
 			// 修复：上游声明 "connection"，但它要的其实是 settings 远程面。
-			// 0.1.7-rc.2 的 connection 服务**没有 api 成员**（全仓 0 命中）；
-			// 宿主自带插件一致声明 "remote.settings" 并从 ctx.remote.settings 调用。
+			// 0.1.7-rc.2 的 connection 服务**没有 api 成员**（全仓 0 命中）。
+			//
+			// ⚠ 两个都要声明：cordis 里访问 `ctx.remote` **本身**要求 inject 里有
+			// "remote"；"remote.settings" 只是进一步把子服务解析出来。
+			// 只写 "remote.settings" 会抛 `cannot get property "remote" without inject`
+			// （真机 console 实测）。宿主自带插件同样是两者并列声明。
+			"remote",
 			"remote.settings"
 		];
 		/**
