@@ -4,7 +4,7 @@
  * 职责边界：读清单 → 同步插件源 → 摘除退役身份 → 逐个装配 → 清理 profile patch 冗余。
  * 不负责 dsh 本体安装（见 dsh.mjs），也不负责 node_modules 依赖桥接（见 deps.mjs）。
  */
-import { existsSync, writeFileSync, mkdirSync, readFileSync, readdirSync, rmSync, cpSync } from 'node:fs';
+import { existsSync, writeFileSync, readFileSync, readdirSync, rmSync, cpSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
@@ -185,31 +185,12 @@ function addLocalPlugin(dir) {
   return dshPlugin(['add', p]);
 }
 
-function removePresets() {
-  const destRoot = join(FILES_DIR, '.dsh/.agent-presets');
-  if (!existsSync(destRoot)) return;
-  try {
-    let removed = 0;
-    for (const stale of ['router-preset', 'router-spec', 'router-standard', 'router-pro']) {
-      const p = join(destRoot, stale);
-      if (!existsSync(p)) continue;
-      rmSync(p, { recursive: true, force: true });
-      removed++;
-      log('removed retired preset: ' + stale);
-    }
-    if (removed > 0) log(`retired presets cleaned: ${removed}`);
-  } catch (e) {
-    log('WARN preset cleanup failed: ' + e.message);
-  }
-}
-
 function installBuiltins() {
   let ok = 0, fail = 0;
   for (const d of BUILTIN_PLUGINS) {
     if (addLocalPlugin(d)) ok++; else fail++;
   }
   log(`builtin plugins assembled: ${ok} ok, ${fail} failed / ${BUILTIN_PLUGINS.length} total`);
-  removePresets();
   cleanBuiltinPatch();
 }
 

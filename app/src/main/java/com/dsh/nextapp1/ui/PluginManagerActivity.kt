@@ -59,8 +59,15 @@ class PluginManagerActivity : AppCompatActivity() {
 
         /**
          * 路由预设已于 v4.10.3 从内置资产下线（其源码曾随旧的内置插件压缩包分发），
-         * 故不再有 PRESET 卡片。需要时走「在线扩展」里的路由套件安装（ROUTING_REPO），
-         * 或由 install-dsh.mjs 的 removePresets() 清理老设备残留。
+         * 故不再有 PRESET 卡片。需要时走「在线扩展」里的路由套件安装（ROUTING_REPO）。
+         *
+         * 「清理老设备残留」原由 install-dsh.mjs 的 removePresets() 承担，**该函数已删除**：
+         * 它维护的是一份写死的 `router-*` 预设名单，而 .agent-presets 只有
+         * routing-suite.mjs（外部可选套件）才会创建 —— 内置装配链从不创建该目录，
+         * 所以那份名单在本仓内置路径上**恒不命中**；而且它把 routing-suite 仍在使用的
+         * 三个预设也列了进去，装了套件后再跑一次内置装配会误删。
+         * 真正退役的 router-pro 由 routing-suite.mjs 自己按**上游发布内容比对**清理，
+         * 不需要本仓另存一份名单。
          */
         const val ROUTING_REPO = "yjh051108/dsh-routing-suite"
 
