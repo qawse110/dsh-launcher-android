@@ -100,6 +100,30 @@ function removeProfileDep(name) {
   } catch (e) { log('WARN removeProfileDep: ' + e.message); }
 }
 
+/* ---------------------------------------------------------------------------
+ * 用户主动禁用的插件（.extra-plugins-disabled.json）
+ *
+ * 为什么需要一份独立的意图记录：装配链与插件管理页的「禁用」在数据上**长得一样**——
+ * 都是「profile 里有 link: 依赖、但包名不在 dsh.profile.bundles 里」。而装配链
+ * （见 addLocalPlugin）把这种状态一律当作「换名/换目录升级留下的半吊子登记」，
+ * 会**摘掉登记再重新 add**，把用户刚做的禁用**直接撤销**。
+ *
+ * 两份数据必须能区分开：profile 的 bundles 是**结果**（dsh 实际加载什么），
+ * 本 marker 是**意图**（用户想让它是启用还是禁用）。装配时以意图为准。
+ *
+ * 放在 files/ 而非 profile 里：profile 是 dsh/pnpm 自管、会被重置，
+ * 而用户意图应当跨越重装/重置存活（与 .extra-plugins-synced.json 同处）。
+ * ------------------------------------------------------------------------- */
+const DISABLED_MARKER = join(FILES_DIR, '.extra-plugins-disabled.json');
+
+/** 读用户禁用的插件目录集合。文件缺失/损坏一律视为「没有禁用任何插件」。 */
+function readDisabled() {
+  try {
+    const j = JSON.parse(readFileSync(DISABLED_MARKER, 'utf8'));
+    return new Set(Array.isArray(j.disabled) ? j.disabled : []);
+  } catch { return new Set(); }
+}
+
 const EXTRA_SYNC_MARKER = join(FILES_DIR, '.extra-plugins-synced.json');
 function readSyncMarker() {
   try { return JSON.parse(readFileSync(EXTRA_SYNC_MARKER, 'utf8')); } catch { return {}; }
@@ -168,6 +192,14 @@ function addLocalPlugin(dir) {
   //    换名/换目录的升级场景里，dependencies 可能已经是新 link、而 bundles 里
   //    旧的包名已被 prune 掉 —— 只看 dependencies 就会「跳过 add」，
   //    结果是**登记了却永不装配**（dump-config 里 0 命中，插件静默消失）。
+  // 2b) 用户主动禁用 → **不装配、也不重新登记**，尊重意图（见 DISABLED_MARKER 注释）。
+  //     必须在下面的「wired but missing from bundles → re-adding」之前判断：
+  //     那个分支本意是修「换名/换目录留下的半吊子登记」，但它与「用户禁用」
+  //     在 profile 数据上完全同形，不先看意图就会把禁用撤销掉。
+  if (readDisabled().has(dir)) {
+    log(`plugin ${dir} disabled by user, skip add`);
+    return true;   // 有意为之，不是失败
+  }
   const link = 'link:' + p;
   const deps = profileDeps();
   const wired = Object.entries(deps).find(([, v]) => v === link);

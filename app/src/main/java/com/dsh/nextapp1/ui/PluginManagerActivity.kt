@@ -396,7 +396,16 @@ class PluginManagerActivity : AppCompatActivity() {
                 h.compat?.compatible == false -> {
                     status = "已装配 · 与 dsh 不兼容（运行时禁用）"
                 }
-                else -> status = "已装配"
+                // ★ 用户主动禁用：依赖还在、只是不在 bundles 里。旧逻辑会显示"已装配"
+                //   并给不出任何操作，用户再也点不回来 —— 这里必须单列并给「启用」。
+                !h.bundled -> {
+                    status = "已装配 · 已禁用"
+                    actions.add("启用" to { setBundled(e, true, "启用 ${e.dir}") })
+                }
+                else -> {
+                    status = "已装配"
+                    actions.add("禁用" to { setBundled(e, false, "禁用 ${e.dir}") })
+                }
             }
             listBox.addView(makeCard(e.title.ifBlank { e.dir }, e.desc, ver, status, actions))
         }
@@ -779,6 +788,14 @@ class PluginManagerActivity : AppCompatActivity() {
         val staleVsSource: Boolean = false,
         /** 对钉死版 dsh 的兼容性判定；无数据（未审计过）时为 null。 */
         val compat: CompatInfo? = null,
+        /**
+         * 是否登记在 profile 的 bundles 里（= dsh 启动时会加载它）。
+         *
+         * 放在这里由后台线程算，而**不是**在 renderList 里现读：本页曾因主线程同步
+         * 扫描被系统判 ANR 杀进程（见 refreshList 的注释），读 profile 是大 JSON 解析，
+         * 不能上主线程。
+         */
+        val bundled: Boolean = false,
     )
 
     /** 兼容性判定表（dir → 判定），由 [refreshList] 在后台线程读一次后填入。 */
@@ -796,6 +813,7 @@ class PluginManagerActivity : AppCompatActivity() {
             srcOk,
             staleVsSource = isStaleVsSource(e, dir),
             compat = compatStatus[e.dir],
+            bundled = isBundled(e),
         )
     }
 
@@ -992,6 +1010,124 @@ class PluginManagerActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * 该插件是否**在 profile 的 bundles 里**（= dsh 启动时会加载它）。
+     *
+     * 与 [isWired] 的区别很重要：isWired 看「依赖 **或** bundles 命中」，而禁用只摘 bundles，
+     * 依赖（link: 登记）仍在 —— 所以禁用后 isWired 依旧为真。要区分「已装配但被禁用」，
+     * 必须单独看 bundles。
+     */
+    private fun isBundled(e: PluginEntry): Boolean = bundleNameOf(e) != null
+
+    /** 该插件在 bundles 里登记的名字（找不到返回 null）。 */
+    private fun bundleNameOf(e: PluginEntry): String? {
+        val bundles = readBundles()
+        val names = listOf(e.name, e.dir, "@dsh-external/${e.name}", "@dsh-external/${e.dir}").distinct()
+        return names.firstOrNull { n -> bundles.any { it == n } }
+    }
+
+    /**
+     * 启用 / 禁用插件 —— 只增删 profile 的 `dsh.profile.bundles` 条目。
+     *
+     * 为什么这个机制是对的：dsh 只装配列进 bundles 的包（读它的 cordis.patch.yml 往条目表插行）。
+     * 把包名从 bundles 摘掉即可让该插件**不加载**，而 `dependencies` 里的 link: 登记保留 ——
+     * node_modules 解析链不受影响、别的插件引用它也不会断，且**完全可逆**（加回去即恢复）。
+     * 这比 `dsh plugin remove` 温和得多：后者删依赖，恢复要重走一遍 pnpm 解析。
+     *
+     * 生效需重启 dsh web（bundles 是启动期读取的），故完成后提示用户。
+     */
+    private fun setBundled(e: PluginEntry, enabled: Boolean, label: String) {
+        if (!guardBusy()) return
+        setBusy(true)
+        Thread {
+            try {
+                val file = profilePkg()
+                val pkg = JSONObject(file.readText())
+                val profile = pkg.optJSONObject("dsh")?.optJSONObject("profile")
+                if (profile == null) {
+                    appendLog("   ✗ $label 失败：profile 里没有 dsh.profile")
+                    return@Thread
+                }
+                val current = readBundles()
+                val hit = bundleNameOf(e)
+                if (enabled && hit == null) {
+                    // 用清单里的规范包名（dsh 按 package.json 的 name 匹配，不是目录名）
+                    val add = e.name.ifBlank { e.dir }
+                    profile.put("bundles", JSONArray(current + add))
+                    appendLog("   ${label}：已启用（bundles += $add）")
+                } else if (!enabled && hit != null) {
+                    profile.put("bundles", JSONArray(current.filter { it != hit }))
+                    appendLog("   ${label}：已禁用（bundles -= $hit）")
+                } else {
+                    appendLog("   $label：无需变更（当前${if (hit != null) "已启用" else "未启用"}）")
+                    return@Thread
+                }
+                // 关键：把「用户意图」写进 files/.extra-plugins-disabled.json。
+                // 只改 bundles 是**不够**的 —— 装配链（install/plugins.mjs 的 addLocalPlugin）
+                // 看到「有 link: 依赖但不在 bundles」会当作换名/换目录留下的半吊子登记，
+                // 摘掉登记再重新 add，把这次禁用直接撤销。两份数据的分工：
+                //   · profile 的 bundles = 结果（dsh 实际加载什么）
+                //   · 本文件 = 意图（用户想让它启用还是禁用），装配时以意图为准
+                // 格式必须与 plugins.mjs 的 readDisabled() 一致：{"disabled":[...]}，
+                // 元素是**清单里的目录名**（e.dir，与 BUILTIN_PLUGINS 同口径）。
+                writeDisabledIntent(e.dir, enabled)
+                // 原子写：先写临时文件再替换，避免中途失败留下半个 JSON
+                val tmp = File(file.parentFile, file.name + ".tmp")
+                tmp.writeText(pkg.toString(2) + "\n")
+                if (!tmp.renameTo(file)) {
+                    tmp.copyTo(file, overwrite = true)
+                    tmp.delete()
+                }
+                appendLog("   ✓ $label 完成")
+                // bundles 是 dsh **启动期**读取的 —— 不重启则界面上的状态已变、
+                // 运行时却还是旧的。所以这里主动引导重启（而不是只写一句日志了事），
+                // 否则用户会以为「点了没用」。
+                runOnUiThread {
+                    AlertDialog.Builder(this)
+                        .setTitle(if (enabled) "已启用" else "已禁用")
+                        .setMessage("需要重启 dsh 服务才会生效。现在重启？（进行中的会话会中断）")
+                        .setPositiveButton("立即重启") { _, _ -> restartFlow() }
+                        .setNegativeButton("稍后", null)
+                        .show()
+                }
+            } catch (t: Throwable) {
+                appendLog("   ✗ $label 异常：${t.message}")
+            } finally {
+                runOnUiThread { setBusy(false); refreshListSafe() }
+            }
+        }.start()
+    }
+
+    /** 与 install/plugins.mjs 的 DISABLED_MARKER 同名同级（files/ 下）。 */
+    private fun disabledMarkerFile() = File(filesDir, ".extra-plugins-disabled.json")
+
+    /**
+     * 记录/撤销「用户禁用」的意图 —— 格式必须与 install/plugins.mjs 的 readDisabled() 一致。
+     *
+     * 为什么必须有这份文件：装配链把「有 link: 依赖但不在 bundles」一律当作换名/换目录
+     * 留下的半吊子登记，会摘掉登记重新 add —— 那会把用户刚做的禁用撤销。两份数据分工：
+     *   · profile 的 bundles = **结果**（dsh 实际加载什么）
+     *   · 本文件 = **意图**（用户想让它启用还是禁用），装配时以意图为准
+     * 元素是**清单里的目录名**（e.dir），与 BUILTIN_PLUGINS 同口径。
+     */
+    private fun writeDisabledIntent(dir: String, enabled: Boolean) {
+        try {
+            val f = disabledMarkerFile()
+            val set = runCatching {
+                val arr = JSONObject(f.readText()).optJSONArray("disabled")
+                (0 until (arr?.length() ?: 0)).mapNotNull { arr?.optString(it)?.takeIf(String::isNotBlank) }
+                    .toMutableSet()
+            }.getOrElse { mutableSetOf() }
+            if (enabled) set.remove(dir) else set.add(dir)
+            val tmp = File(f.parentFile, f.name + ".tmp")
+            tmp.writeText(JSONObject().put("disabled", JSONArray(set.toList().sorted())).toString(2) + "\n")
+            if (!tmp.renameTo(f)) { tmp.copyTo(f, overwrite = true); tmp.delete() }
+            appendLog("   · 禁用意图已记录：${if (enabled) "移除" else "加入"} $dir（共 ${set.size} 个被禁用）")
+        } catch (t: Throwable) {
+            appendLog("   WARN 禁用意图记录失败：${t.message}")
+        }
+    }
+
     /** 装配判定：官方 dsh plugin add 后会在 profile node_modules / bundles 里出现对应包。 */
     private fun isWired(e: PluginEntry): Boolean {
         val nm = profileNm()
@@ -1087,10 +1223,11 @@ class PluginManagerActivity : AppCompatActivity() {
     /** 状态 pill 颜色显式映射（「已损坏」不得命中 contains(已) 变绿）。 */
     private fun statusColor(status: String): Int = when {
         status.contains("损坏") || status.contains("缺失") -> Ui.DANGER
-        // ⚠ 必须排在「已装配」之前：不兼容的条目文案是
-        // 「已装配 · 与 dsh 不兼容（运行时禁用）」，含「已装配」——
-        // 落到下面那条就会显示成绿色的"一切正常"，正是要避免的误导。
+        // ⚠ 以下两条必须排在「已装配」之前：它们的文案都以「已装配 ·」开头，
+        // 落到「已装配」那条会被染成绿色的"一切正常"——正是要避免的误导。
         status.contains("不兼容") -> Ui.DANGER
+        // 用户主动禁用是**正常状态**（不是错误），用中性灰而非红色。
+        status.contains("已禁用") -> Ui.TEXT_MUTED
         status.contains("落后") -> Ui.WARNING
         status.contains("已装配") || status.contains("已安装") || status.contains("已连接") -> Ui.SUCCESS
         status.contains("待") || status.contains("需") -> Ui.WARNING

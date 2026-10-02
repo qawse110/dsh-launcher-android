@@ -97,15 +97,14 @@ object DshUpdater {
             return null
         }
         return try {
-            val body = fetchOrNull(NPM_REGISTRY) ?: fetchOrNull(NPM_REGISTRY_FALLBACK)
-            if (body == null) {
+            val body = fetchDistTags() ?: run {
                 // 失败也要节流：否则 UI 轮询每次都会空耗两个 20s+30s 的连接超时
                 writeState(ctx, System.currentTimeMillis(), ok = false)
                 log("版本检查失败（网络不可用），${FAILED_CHECK_BACKOFF_MS / 60000} 分钟内不再重试")
                 return null
             }
             val j = JSONObject(body)
-            val remote = j.optJSONObject("dist-tags")?.optString(tag)?.takeIf { it.isNotBlank() } ?: run {
+            val remote = j.optString(tag)?.takeIf { it.isNotBlank() } ?: run {
                 writeState(ctx, System.currentTimeMillis(), ok = false)
                 return null
             }
@@ -124,7 +123,31 @@ object DshUpdater {
         }
     }
 
-    private fun fetchOrNull(url: String): String? {
+    /**
+     * 只取 registry 的 **dist-tags**，不拉整包文档。
+     *
+     * 为什么单独做这一步：原先直接 GET 包文档 —— 那是**几百 KB 的全量元数据**
+     * （每个历史版本的 tarball/依赖/描述都在里面），而这里只需要 3 个 tag 字符串。
+     * 弱网/移动数据下这一项是版本检查耗时与失败率的主要来源。改用 npm registry 的
+     * **精简元数据**表示（Accept: application/vnd.npm.install-v1+json，即所谓 corgi 格式）：
+     * 仍返回 dist-tags，但省掉绝大部分版本明细，体积小两个数量级。
+     *
+     * 兼容性：响应仍是同一份 JSON 结构（顶层就有 dist-tags）。若镜像不认该 Accept 头而
+     * 返回了全量文档，顶层同样有 dist-tags —— 故解析结果一致，**不需要**区分处理。
+     * 两个 registry 依序尝试（主镜像 → 官方源）。
+     */
+    private fun fetchDistTags(): String? {
+        for (url in listOf(NPM_REGISTRY, NPM_REGISTRY_FALLBACK)) {
+            val body = fetchOrNull(url, accept = "application/vnd.npm.install-v1+json")
+            if (body != null && runCatching { JSONObject(body).has("dist-tags") }.getOrDefault(false)) {
+                // 归一化：只回传 dist-tags 这一段，调用方无需知道用的是哪种格式
+                return runCatching { JSONObject(body).getJSONObject("dist-tags").toString() }.getOrNull()
+            }
+        }
+        return null
+    }
+
+    private fun fetchOrNull(url: String, accept: String? = null): String? {
         var conn: HttpURLConnection? = null
         return try {
             conn = URL(url).openConnection() as HttpURLConnection
@@ -132,6 +155,7 @@ object DshUpdater {
             conn.readTimeout = 30_000
             conn.instanceFollowRedirects = true
             conn.setRequestProperty("User-Agent", "DshLauncher/4.0")
+            if (accept != null) conn.setRequestProperty("Accept", accept)
             conn.connect()
             if (conn.responseCode !in 200..399) return null
             conn.inputStream.bufferedReader().use { it.readText() }

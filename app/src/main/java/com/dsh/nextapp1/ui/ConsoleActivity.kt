@@ -405,8 +405,14 @@ class ConsoleActivity : AppCompatActivity() {
     }
 
     /**
-     * 主动检查 dsh 更新（「更新」按钮，force=true 忽略 6h 间隔）。
+     * 主动检查 dsh 更新（「检查更新」按钮，force=true 忽略 6h 间隔）。
      * 发现新版本时杀掉 node 进程并重启 flow，由 install-dsh.mjs 执行 npm 官方更新。
+     *
+     * ⚠ **必须把发现的版本写到 dsh_install_tag**（原实现漏了这一步，是真机可复现的缺陷）：
+     * DshFlow 决定装哪个版本时读的是 prefs 里的 dsh_install_tag，缺省回落到**钉死版本**
+     * （assets/dsh-pin.json）。所以只调 checkRemote 而不写 tag 的话，流程会拿钉死版本去
+     * npm 装 —— 检查到的那个新版本**根本不会被安装**，用户看到「发现新版本」却装了个旧版，
+     * 点了个寂寞。「更新 next」按钮（见 startUpdateCheckNext）一直是正确写法，本函数对齐它。
      */
     private fun startUpdateCheck(force: Boolean, onLog: ((String) -> Unit)? = null) {
         val log: (String) -> Unit = onLog ?: { appendLine(it) }
@@ -414,6 +420,10 @@ class ConsoleActivity : AppCompatActivity() {
             val version = DshUpdater.checkRemote(this, force, log)
             if (version != null) {
                 log("发现 dsh v$version，重启流程执行 npm 官方更新…")
+                // 传下去的是**精确版本号**而非 "latest"：检查与安装之间若 registry 又发了新版，
+                // 精确号能保证装的就是刚刚检查到的那一版（与用户看到的日志一致）。
+                getSharedPreferences(CONSOLE_PREFS, Context.MODE_PRIVATE)
+                    .edit().putString("dsh_install_tag", version).apply()
                 Thread.sleep(3_000)
                 DshFlow.killAllNode(this@ConsoleActivity) { appendLine(it) }
                 runOnUiThread { runDshFlow(forceFullInstall = true) }
