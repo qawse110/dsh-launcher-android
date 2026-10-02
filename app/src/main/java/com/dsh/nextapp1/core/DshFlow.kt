@@ -50,7 +50,7 @@ object DshFlow {
      * 两侧不再各自硬编码（历史上 0.1.1→0.1.2→0.1.5 每次升级都要手工同步两处，
      * 漏一处就静默装成另一个版本）。这里的常量是「读不到 pin 文件」时的编译期兜底。
      */
-    const val PINNED_DSH_TAG = "0.1.7-rc.2"
+    const val PINNED_DSH_TAG = "0.2.0-rc.2"
 
     /** 统一日志文件名（files/logs/ 下，见 [FileLog]）。 */
     const val FLOW_LOG = "flow.log"

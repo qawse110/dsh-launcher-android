@@ -72,16 +72,29 @@ function linkPluginDeps() {
     let removed = 0;
     let warns = 0;
     const keep = new Set();
+    /**
+     * 把 dest/<name> 指向 target。
+     *
+     * ⚠ **不许把已经指向 src 的条目再改成「指向 src」以外的任何形态**：
+     * dest 里的 scope 目录（如 @deepseek-ai）在历史布局中**本身就是指向 src 同名目录的
+     * 符号链接**（见下方 bridgeScope 注释）。对这样的条目执行 rm + symlink 会把它
+     * 从「指向 src 目录」改成「指向 src 下某个具体包」，从而**改写了 dsh-prefix 自己的
+     * node_modules 布局**——真机事故：升级到 0.2.0-rc.2 后，pnpm 已把
+     * dsh-prefix/node_modules/@deepseek-ai/dsh 指向 0.2.0，本函数却因遍历 src 顶层
+     * 时把 @deepseek-ai 当普通条目重链，最终让 dsh 链接**回退到 .pnpm 里的旧版本
+     * 0.1.7-rc.2**（导致装完仍报旧版本、临时更新保护误判「版本未变化」）。
+     * 判据：目标已存在且 readlink 相等 → 直接复用，绝不 rm。
+     */
     const ensureLink = (name, target) => {
       if (keep.has(name)) return true;
       keep.add(name);
+      const link = join(dest, ...name.split('/'));
+      try { if (readlinkSync(link) === target) { kept++; return true; } } catch {}
       if (name.includes('/')) {
         const scope = name.slice(0, name.indexOf('/'));
         keep.add(scope);
         mkdirSync(join(dest, scope), { recursive: true });
       }
-      const link = join(dest, ...name.split('/'));
-      try { if (readlinkSync(link) === target) { kept++; return true; } } catch {}
       rmSync(link, { recursive: true, force: true });
       try {
         symlinkSync(target, link);
@@ -93,10 +106,40 @@ function linkPluginDeps() {
         return false;
       }
     };
+    /**
+     * 桥接一个顶级条目。
+     *
+     * 若 dest/<name> 已是指向 **src/<name> 自身**的符号链接（旧布局留下的 scope 软链），
+     * 那么 names 下的每个包都已经能透过它解析到，**不需要也不允许**再逐项重链——
+     * 逐项重链会把该 scope 软链变成具体包的软链，等于改写 dsh-prefix 的布局。
+     * 这正是本函数曾经把 dsh 链接打回旧版本的机制。
+     */
+    const isScopeSharedWithSrc = (name) => {
+      if (!name.startsWith('@')) return false;
+      try { return readlinkSync(join(dest, name)) === join(src, name); } catch { return false; }
+    };
     // 1) 直接依赖（两种布局都存在）
     for (const ent of readdirSync(src, { withFileTypes: true })) {
       if (ent.name.startsWith('.')) continue;
+      // scope 已与 src 共享 → 内容天然可见，保持原样（勿重写）
+      if (isScopeSharedWithSrc(ent.name)) {
+        keep.add(ent.name);
+        for (const g of readdirSync(join(src, ent.name))) keep.add(ent.name + '/' + g);
+        kept++;
+        continue;
+      }
       ensureLink(ent.name, join(src, ent.name));
+    }
+    // 1b) scope 内部条目：src 里已有（如 @deepseek-ai/dsh）但 dest 侧缺链接的补上。
+    //     仅对**未与 src 共享**的 scope 逐项处理；共享 scope 由上面整体跳过。
+    for (const ent of readdirSync(src, { withFileTypes: true })) {
+      if (ent.name.startsWith('.') || !ent.name.startsWith('@')) continue;
+      if (isScopeSharedWithSrc(ent.name)) continue;
+      try {
+        for (const g of readdirSync(join(src, ent.name))) {
+          ensureLink(ent.name + '/' + g, join(src, ent.name, g));
+        }
+      } catch {}
     }
     // 2) pnpm 传递依赖：扫描 .pnpm/<pkg>@<ver>_peerhash/node_modules/*
     const store = join(src, '.pnpm');

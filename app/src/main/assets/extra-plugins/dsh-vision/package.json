@@ -7,15 +7,26 @@
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
   "exports": {
-    ".": { "types": "./lib/types/index.d.ts", "default": "./lib/index.js" },
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
     "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },
-  "files": ["lib", "assets", "cordis.patch.yml"],
+  "files": [
+    "lib",
+    "assets",
+    "cordis.patch.yml"
+  ],
   "license": "BSD-3-Clause",
-  "engines": { "dsh": ">=0.0.1" },
+  "engines": {
+    "dsh": ">=0.0.1"
+  },
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "inject": [
         "@deepseek-ai/dsh-client-ui-slots",
@@ -26,15 +37,20 @@
     }
   },
   "dshx": {
-    "contributes": { "tools": ["view_image"], "skills": [] }
+    "contributes": {
+      "tools": [
+        "view_image"
+      ],
+      "skills": []
+    }
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1-rc.1",
-    "@deepseek-ai/dsh-attachment": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-llm": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-settings": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-system-prompt": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6"
+    "@deepseek-ai/dsh-attachment": "^0.1.0-rc.6 || >=0.2.0-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-llm": "^0.1.0-rc.6 || >=0.2.0-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-settings": "^0.1.0-rc.6 || >=0.2.0-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-system-prompt": "^0.1.0-rc.6 || >=0.2.0-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6 || >=0.2.0-rc.2 <0.3.0"
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.0"

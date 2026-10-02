@@ -32,7 +32,7 @@ import {
   ensurePnpm, ensureDsh, ensureRipgrepFallback,
 } from './install/dsh.mjs';
 import {
-  BUILTIN_PLUGINS, installBuiltins, pruneRetiredBuiltins,
+  BUILTIN_PLUGINS, installBuiltins, pruneRetiredBuiltins, auditBuiltinCompatibility,
 } from './install/plugins.mjs';
 import {
   linkPluginDeps, linkProfileDeps,
@@ -44,6 +44,16 @@ log('HOME=' + HOME + ' DSH_PREFIX=' + DSH_PREFIX + ' PROFILE=' + DSH_PROFILE);
 try { mkdirSync(join(FILES_DIR, 'tmp'), { recursive: true }); } catch {}
 
 const pluginsOnly = process.argv.includes('--plugins-only');
+
+// 单独重跑兼容性审计（插件管理页在「装配/修复」成功后调用）：
+// UI 的那些操作直接走 `dsh plugin add`，不经过本文件的装配流程，
+// 若不补这一步，files/plugin-status.json 就永远停在旧结果上——
+// 界面会拿过期判定继续显示，正是要消除的那类静默不一致。
+if (process.argv.includes('--audit-only')) {
+  await auditBuiltinCompatibility();
+  log('=== audit only done ===');
+  process.exit(0);
+}
 
 ensurePnpm();
 if (!pluginsOnly) {
@@ -66,6 +76,10 @@ if (!pluginsOnly) {
 // 先摘掉旧身份、再登记新插件，才是正确的升级顺序。
 pruneRetiredBuiltins();
 installBuiltins();
+// dsh 0.2.0 起新增兼容性前置校验：不满足 dsh-* peer 范围的插件会被运行时**静默禁用**
+// （dsh plugin add 照旧成功）。装配后立刻用 dsh 自带的同一函数核对并落盘，
+// 把「静默消失」变成日志里一条醒目的 WARN + 插件管理页可见的状态。
+await auditBuiltinCompatibility();
 // 桥接启动器自管的 files/plugins（可清理旧链接）
 linkPluginDeps();
 // 桥接 dsh/pnpm 自管的 profile 目录（只补不删）：补上 profile 目录对 dsh 自身

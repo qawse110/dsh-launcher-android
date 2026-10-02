@@ -12,6 +12,116 @@ import {
   log, run, runEx, isOom, envBase, pinnedDshTag, dshCli, dshInstalled,
 } from './env.mjs';
 
+/**
+ * 升级后修复**陈旧的 hoist 链接**——pnpm 升 minor 时不会重建顶层 hoist 面。
+ *
+ * 真机实证（0.1.7-rc.2 → 0.2.0-rc.2）：
+ *   `pnpm add @deepseek-ai/dsh@0.2.0-rc.2` exit=0；`node_modules/@deepseek-ai/dsh`
+ *   正确指向 0.2.0；lockfile 里每个内部包都解析成 0.2.0-rc.2 —— **但顶层 287 个
+ *   hoist 链接里有 272 个仍指向 0.1.7-rc.2**（时间戳停在首次安装那天）。
+ *
+ * 为什么这个故障特别隐蔽：日志、版本号、lockfile 三处**都显示升级成功**，
+ * 唯一不对的是文件系统里那批链接。而它足以让应用起不来——
+ * dsh 本体是 0.2.0、它 require 的内部包却是 0.1.7，0.2.0 新增的服务
+ * （webStartup）找不到提供方：
+ *   dsh: startup failed: 1 required plugin did not activate
+ *   webserver (required)  webStartup
+ * 同一份目录用 0.1.7 跑却完全正常，所以现象只在升级后出现。
+ *
+ * 判据：拿**顶层链接的 readlink** 与 **.pnpm 里该包名的最优版本目录** 比。
+ * 只要 dsh 本体已是目标版本、却有内部包链接仍指向**别的版本**，就判定 hoist 面陈旧。
+ * 修法用「删 node_modules + pnpm install」全量重建：比逐条重链更不容易漏
+ * （hoist 面还牵扯 peer 变体目录名），且与首次安装走同一条路径、幂等；
+ * 代价是一次重装——但只在**确实检测到陈旧**时才发生，正常路径零开销。
+ *
+ * 失败不致命：不抛异常、只记 WARN，下一次启动会重新检测并再试。
+ */
+function fixStaleHoistedLinks(pkgDir) {
+  const nm = join(DSH_PREFIX, 'node_modules');
+  const scopeDir = join(nm, '@deepseek-ai');
+  const store = join(nm, '.pnpm');
+  const selfVersion = (() => {
+    try { return JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8')).version || ''; } catch { return ''; }
+  })();
+  if (!selfVersion || !existsSync(store)) return;
+
+  // .pnpm 里每个 @deepseek-ai/<name> 的最高版本目录（hoist 应指向的那个）
+  const best = new Map();
+  for (const d of readdirSync(store)) {
+    if (d.startsWith('.')) continue;
+    const inner = join(store, d, 'node_modules/@deepseek-ai');
+    if (!existsSync(inner)) continue;
+    for (const name of readdirSync(inner)) {
+      const dir = join(inner, name);
+      let ver = '0.0.0';
+      try { ver = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')).version || ver; } catch {}
+      const cur = best.get(name);
+      if (!cur || cmpVerLocal(ver, cur.ver) > 0) best.set(name, { dir, ver });
+    }
+  }
+  if (!best.size) return;
+
+  let stale = 0;
+  const samples = [];
+  for (const [name, info] of best) {
+    const link = join(scopeDir, name);
+    let points = '';
+    try { points = readlinkSync(link); } catch { continue; }   // 不存在/非链接 → 不属本判据
+    if (points === info.dir) continue;                          // 已指向最优版本 → 正常
+    let at = '';
+    try { at = JSON.parse(readFileSync(join(link, 'package.json'), 'utf8')).version || ''; } catch {}
+    if (at && at === info.ver) continue;                        // 解析出的版本一致（peer 变体目录不同名）→ 无需处理
+    stale++;
+    if (samples.length < 3) samples.push(`${name}(${at || '?'}→${info.ver})`);
+    // 顶层自身那个包（@deepseek-ai/dsh）不参与：pinned 版本由 ensureDsh 负责
+  }
+  if (!stale) return;
+  log(`stale hoisted links detected: ${stale}/${best.size} 指向非最优版本（如 ${samples.join(', ')}）`);
+  log('rebuilding node_modules to refresh the hoist face (pnpm does not relink across a minor bump) ...');
+  try {
+    rmSync(nm, { recursive: true, force: true });
+  } catch (e) {
+    log('WARN stale-link repair: cannot remove node_modules: ' + e.message);
+    return;
+  }
+  const pnpmBin = join(FILES_DIR, '.tools', 'bin', 'pnpm');
+  const r = runEx(pnpmBin, [
+    'install', '--dir', DSH_PREFIX, '--registry', REGISTRY,
+    '--ignore-scripts', '--reporter', 'append-only', '--loglevel', 'warn',
+  ], { env: { ...envBase(), npm_config_store_dir: join(FILES_DIR, '.tools', 'pnpm-store') }, timeoutMs: NPM_TIMEOUT_MS });
+  if (r.ok) log('stale hoisted links repaired (node_modules rebuilt)');
+  else log(`WARN stale-link repair: pnpm install exit ${r.code}; 下次启动会重试`);
+}
+
+/** 本模块私用的 semver 比较（与 deps.mjs 的 cmpVer 同规则，避免跨模块导出内部件）。 */
+function cmpVerLocal(a, b) {
+  const parse = (v) => {
+    const noBuild = String(v).trim().split('+')[0];
+    const dash = noBuild.indexOf('-');
+    const core = (dash === -1 ? noBuild : noBuild.slice(0, dash)).split('.').map((n) => parseInt(n, 10) || 0);
+    const pre = dash === -1 ? null : noBuild.slice(dash + 1).split('.');
+    return { core, pre };
+  };
+  const pa = parse(a), pb = parse(b);
+  for (let i = 0; i < 3; i++) { const d = (pa.core[i] || 0) - (pb.core[i] || 0); if (d) return d; }
+  if (!pa.pre && !pb.pre) return 0;
+  if (!pa.pre) return 1;
+  if (!pb.pre) return -1;
+  const len = Math.min(pa.pre.length, pb.pre.length);
+  for (let i = 0; i < len; i++) {
+    const x = pa.pre[i], y = pb.pre[i];
+    const xn = /^\d+$/.test(x) ? parseInt(x, 10) : null;
+    const yn = /^\d+$/.test(y) ? parseInt(y, 10) : null;
+    let c;
+    if (xn !== null && yn !== null) c = xn - yn;
+    else if (xn !== null) c = -1;
+    else if (yn !== null) c = 1;
+    else c = x < y ? -1 : x > y ? 1 : 0;
+    if (c) return c;
+  }
+  return pa.pre.length - pb.pre.length;
+}
+
 function ensurePnpm() {
   mkdirSync(TOOLS, { recursive: true });
   const pnpmRoot = join(FILES_DIR, '.tools', 'lib/node_modules/pnpm');
@@ -143,6 +253,24 @@ function ensureDsh() {
     log('FATAL: official dsh install/update failed after all engines/registries');
     process.exit(1);
   }
+  // ── 升级后的一致性修复：pnpm 的 hoist 链接不会随版本升级自动重建 ──
+  //
+  // 真机实证（0.1.7-rc.2 → 0.2.0-rc.2）：`pnpm add @deepseek-ai/dsh@0.2.0-rc.2` 报告
+  // exit=0，`dsh-prefix/node_modules/@deepseek-ai/dsh` 也正确指向 0.2.0，lockfile 里
+  // 全部内部包都解析为 0.2.0-rc.2 —— **但 dsh-prefix 顶层那 287 个 hoist 链接里
+  // 有 272 个仍指向 0.1.7-rc.2**（时间戳停在首次安装那天）。
+  //
+  // 后果不是"版本号显示不对"这么轻：dsh 本体是 0.2.0、它 require 的内部包却是 0.1.7，
+  // 两代混用导致 0.2.0 新增的服务（webStartup）找不到提供方，启动直接失败：
+  //   dsh: startup failed: 1 required plugin did not activate
+  //   webserver (required)  webStartup
+  // 而同一份 node_modules 用 dsh 0.1.7 运行时完全正常——所以这个故障只在升级后出现，
+  // 且从日志上完全看不出"链接没重建"这一层。
+  //
+  // 判据：拿**顶层链接实际指向的版本**与**真身 package.json 的版本**比。
+  // 不一致即说明 hoist 面是陈旧的，删掉 node_modules 重装一次（幂等；失败不致命，
+  // 下次启动会再试）。
+  fixStaleHoistedLinks(pkgDir);
   // 升级有效性校验：包管理器在已有依赖满足 spec（如 ^0.1.1-rc.2 对 latest
   // 解析出 0.1.2-rc.1 视为已满足）时会 exit=0 但什么都不装。这里对照
   // dist-tag 实际解析版本；未达 tag 则 remove 后强制重装一次。

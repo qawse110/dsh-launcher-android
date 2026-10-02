@@ -6,10 +6,11 @@
  */
 import { existsSync, writeFileSync, mkdirSync, readFileSync, readdirSync, rmSync, cpSync } from 'node:fs';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import {
   HOME, FILES_DIR, NODE_BIN, DSH_PREFIX, DSH_PROFILE, DSH_APK_VER, PLUGINS_DIR, EXTRA_PLUGINS_SRC,
   PLUGIN_TIMEOUT_MS,
-  log, run, envBase, dshCli, dshInstalled,
+  log, run, envBase, dshCli, dshInstalled, pinnedDshTag,
 } from './env.mjs';
 
 /**
@@ -212,6 +213,82 @@ function installBuiltins() {
   cleanBuiltinPatch();
 }
 
+/* ---------------------------------------------------------------------------
+ * 兼容性审计 —— dsh 0.2.0 起新增的**装配契约**，必须显式核对
+ *
+ * 0.2.0 的 app-boot 多了一道前置校验（compatibility-preflight）：
+ *   evaluatePluginCompatibility(manifest, exemptions, runtimeVersion)
+ * 它把插件 package.json 里**每个** `@deepseek-ai/dsh` / `@deepseek-ai/dsh-*` peer
+ * 范围拿去比对运行时版本（预发布版参与范围比较），任一不满足即判该插件不兼容；
+ * 随后 prepareProfileEntries「只对不兼容冲突禁用行」——**该插件行会被静默标 disabled**，
+ * `dsh plugin add` 照旧成功，但插件在运行时根本不激活。
+ *
+ * 这对启动器是**静默失败**：装配日志一切正常、插件却不见了。更糟的是它极易在
+ * 「只把 dsh-pin.json 的 tag 调大、忘了同步插件 peer 范围」时发生——那正是升级时的
+ * 典型疏忽。故这里在装配后立刻用 **dsh 自带的那个函数**核对一遍：
+ *   · 判定逻辑与运行时**完全同源**（不自己重写 semver，避免判定漂移）；
+ *   · 结果写 files/plugin-status.json，供插件管理页展示；
+ *   · 不兼容时打醒目 WARN，把「静默消失」变成「一眼可见」。
+ *
+ * 刻意**不自动**调用 `dsh plugin allow-version` 豁免：dsh 对此的告警是
+ * 「可能弄坏应用或损坏数据」，那是需要人知晓的风险决定，不该由安装脚本代按。
+ * ------------------------------------------------------------------------- */
+
+/** 载入 dsh 自带的兼容性判定；旧版 dsh（无此导出）返回 null，审计自动跳过。 */
+async function loadCompatEvaluator() {
+  const entry = join(DSH_PREFIX, 'node_modules/@deepseek-ai/dsh-app-boot/lib/index.js');
+  if (!existsSync(entry)) return null;
+  try {
+    const mod = await import(pathToFileURL(entry).href);
+    return typeof mod.evaluatePluginCompatibility === 'function' ? mod.evaluatePluginCompatibility : null;
+  } catch (e) {
+    log('WARN compat evaluator load failed: ' + e.message);
+    return null;
+  }
+}
+
+/** 审计内置插件对**钉死版 dsh** 的兼容性，并落盘状态供 UI 读取。 */
+async function auditBuiltinCompatibility() {
+  const evaluate = await loadCompatEvaluator();
+  if (!evaluate) {
+    log('compat audit: skipped (该 dsh 版本无 evaluatePluginCompatibility，属 0.2.0 之前的契约)');
+    return;
+  }
+  const runtime = pinnedDshTag();
+  const report = { dsh: runtime, checkedAt: new Date().toISOString(), plugins: [] };
+  let bad = 0;
+  for (const d of BUILTIN_PLUGINS) {
+    const pj = join(PLUGINS_DIR, d, 'package.json');
+    let manifest;
+    try { manifest = JSON.parse(readFileSync(pj, 'utf8')); } catch { continue; }
+    let issue;
+    try {
+      issue = evaluate(manifest, void 0, runtime);
+    } catch (e) {
+      issue = { peers: { '(evaluate threw)': e.message } };
+    }
+    const compatible = issue === void 0;
+    if (!compatible) bad++;
+    report.plugins.push({
+      dir: d,
+      name: manifest.name,
+      version: manifest.version,
+      compatible,
+      peers: compatible ? void 0 : issue.peers,
+    });
+    if (!compatible) {
+      log(`WARN plugin ${d} 对 dsh ${runtime} **不兼容** → dsh 会在运行时禁用该行；`
+        + `不满足的 peer: ${JSON.stringify(issue.peers)}；`
+        + `修法：同步该插件 package.json 的 dsh-* peer 范围，或（需人工确认风险）`
+        + `dsh plugin --profile ${DSH_PROFILE} allow-version <name>@<version> --dsh-version ${runtime} --accept-risk`);
+    }
+  }
+  log(`compat audit: ${report.plugins.length - bad} compatible, ${bad} incompatible / ${report.plugins.length} total (dsh ${runtime})`);
+  try {
+    writeFileSync(join(FILES_DIR, 'plugin-status.json'), JSON.stringify(report, void 0, 2) + '\n');
+  } catch (e) { log('WARN plugin-status write: ' + e.message); }
+}
+
 function pruneRetiredBuiltins() {
   const profilePkgFile = join(FILES_DIR, '.dsh/profiles', DSH_PROFILE, 'package.json');
   if (!existsSync(profilePkgFile)) return;
@@ -302,10 +379,11 @@ function cleanBuiltinPatch() {
   }
 }
 
-// 只导出编排层真正调用的三个。其余（loadManifest / dshPlugin / cleanBuiltinPatch /
+// 只导出编排层真正调用的四个。其余（loadManifest / dshPlugin / cleanBuiltinPatch /
 // syncExtraPlugin / profileDeps / profileBundles / removeProfileDep / MANIFEST /
-// BUILTIN_NAMES / BUILTIN_IDS）都是本模块内部实现细节。
+// BUILTIN_NAMES / BUILTIN_IDS / loadCompatEvaluator）都是本模块内部实现细节。
 export {
   BUILTIN_PLUGINS,
   installBuiltins, pruneRetiredBuiltins,
+  auditBuiltinCompatibility,
 };

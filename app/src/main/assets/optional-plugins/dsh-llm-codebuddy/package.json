@@ -36,7 +36,6 @@
     "client": {
       "inject": [
         "react",
-        "@deepseek-ai/dsh-client-runtime",
         "@deepseek-ai/dsh-client-ui-slots"
       ],
       "platform": "web"
@@ -46,11 +45,11 @@
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-credentials": ">=0.1.0-rc.6 <0.2",
-    "@deepseek-ai/dsh-launch-environment": ">=0.1.0-rc.6 <0.2",
-    "@deepseek-ai/dsh-llm": ">=0.1.0-rc.6 <0.2",
-    "@deepseek-ai/dsh-llm-pi-ai": ">=0.1.0-rc.6 <0.2",
-    "@deepseek-ai/dsh-settings": ">=0.1.0-rc.6 <0.2",
+    "@deepseek-ai/dsh-credentials": ">=0.1.0-rc.6 <0.2 || >=0.2.0-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-launch-environment": ">=0.1.0-rc.6 <0.2 || >=0.2.0-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-llm": ">=0.1.0-rc.6 <0.2 || >=0.2.0-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-llm-pi-ai": ">=0.1.0-rc.6 <0.2 || >=0.2.0-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-settings": ">=0.1.0-rc.6 <0.2 || >=0.2.0-rc.2 <0.3.0",
     "@earendil-works/pi-ai": "0.82.x"
   },
   "license": "MIT"

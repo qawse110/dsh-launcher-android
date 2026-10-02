@@ -41,7 +41,7 @@ const OUT_SHARED = '/sdcard/Download/DshLauncher/install_log.txt';
 
 /** dsh 钉死版本：读 assets/dsh-pin.json（与 DshFlow.PINNED_DSH_TAG 同源）。
  *  读不到时回退编译期常量，保证脚本独立可跑（离线调试/CI）。 */
-const FALLBACK_DSH_TAG = '0.1.7-rc.2';
+const FALLBACK_DSH_TAG = '0.2.0-rc.2';
 
 function log(m) {
   const l = `${new Date().toISOString()} [install] ${m}`;

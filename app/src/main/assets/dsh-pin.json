@@ -1,6 +1,6 @@
 {
   "$comment": "dsh 本体钉死版本 —— 单一真源。DshFlow.kt（PINNED_DSH_TAG）与 install-dsh.mjs（默认 DSH_TAG）都从这里读取，两侧不得再各自硬编码。tag 为 next dist-tag 对应的精确版本；升级时只改这一处。",
-  "tag": "0.1.7-rc.2",
+  "tag": "0.2.0-rc.2",
   "distTag": "next",
-  "note": "0.1.7-rc.2 = registry.npmjs.org 的 next dist-tag（latest=0.1.5-rc.3）。启动器整套 Android 兼容层已针对该版本逐锚点核实。"
+  "note": "0.2.0-rc.2 = registry.npmjs.org 的 next dist-tag（本轮实测 latest 亦为 0.2.0-rc.2）。相对 0.1.7-rc.2 的关键变化：app-boot 新增**插件兼容性前置校验**（evaluatePluginCompatibility / prepareProfileEntries）——凡声明了 @deepseek-ai/dsh 或 @deepseek-ai/dsh-* peer 的插件，其 peer 范围若不覆盖运行时版本，该插件行会被**判定不兼容并禁用**（只有 compatibility.json 里的精确豁免能放行）。故本仓插件副本的 dsh-* peer 范围已同步放开到 0.2.x。升级时只改这一处。"
 }

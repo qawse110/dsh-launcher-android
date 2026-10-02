@@ -2,6 +2,9 @@
   "$comment": "内置插件装配清单 —— 单一真源。install-dsh.mjs 与 PluginManagerActivity.kt 都从这里读取；两侧不得再各自硬编码。dir = assets/extra-plugins/<dir>，name = package.json 的 name，id = cordis.patch.yml 的 insert id。",
   "version": 1,
   "profile": "web",
+  "$targetDsh": "本清单内的插件副本已针对该 dsh 版本适配；与 assets/dsh-pin.json 的 tag 同源，升级 pin 时必须回头核对每个插件 package.json 的 @deepseek-ai/dsh-* peer 范围是否覆盖新版本。",
+  "targetDsh": "0.2.0-rc.2",
+  "$compatContract": "dsh 0.2.0 起 app-boot 新增兼容性前置校验（evaluatePluginCompatibility + prepareProfileEntries）：插件任一 @deepseek-ai/dsh / @deepseek-ai/dsh-* peer 范围不覆盖运行时版本，该插件行即被判定不兼容并在运行时禁用——而 dsh plugin add 照旧成功，属静默失败。install/plugins.mjs 的 auditBuiltinCompatibility() 会在装配后用 dsh 自带的同一函数核对，结果写入 files/plugin-status.json 并在日志打 WARN。",
   "$builtinComment": "内置集合由用户逐项决定（原「仅内置三个」约束已撤回）。builtin = 源码在 assets/extra-plugins/、随 APK 装配进 web profile；optional = 源码在 assets/optional-plugins/、分发但不默认装配。",
   "builtin": [
     {

@@ -307,6 +307,8 @@ class PluginManagerActivity : AppCompatActivity() {
 
         thread(name = "plugin-health-scan") {
             val manifest = loadManifest()
+            // 兼容性判定一次读入（dsh 0.2.0 起的装配契约，见 readCompatStatus 注释）
+            compatStatus = readCompatStatus()
             // 可选插件源目录不存在时（旧 APK / 资产未同步）整区不显示，也不参与健康扫描
             val optionalEntries = if (optionalPluginsDir().isDirectory) manifest.optional else emptyList()
             val bundled = manifest.builtin.map { e -> Triple(e, healthOf(e), readVersion(e.dir)) }
@@ -326,6 +328,8 @@ class PluginManagerActivity : AppCompatActivity() {
                 !h.dirExists -> issues.add(e.dir to "目录缺失")
                 !h.healthy -> issues.add(e.dir to "副本损坏")
                 !h.wired -> issues.add(e.dir to "未装配")
+                // 装配了却会被运行时禁用：与"未装配"同等严重，必须进总览计数
+                h.compat?.compatible == false -> issues.add(e.dir to "与 dsh 不兼容")
             }
             for ((e, h, _) in optionals) when {
                 // optional「未装配」是正常态，不算异常；只有已有副本损坏、或登记了却没副本才提示
@@ -333,9 +337,10 @@ class PluginManagerActivity : AppCompatActivity() {
                 h.wired && !h.dirExists -> issues.add(e.dir to "可选已登记但副本缺失")
             }
 
+            val installedDsh = readInstalledDshVersion()
             runOnUiThread {
                 if (isFinishing || isDestroyed || gen != listGeneration) return@runOnUiThread
-                renderList(manifest, bundled, optionals, extras, issues)
+                renderList(manifest, bundled, optionals, extras, issues, installedDsh)
             }
         }
     }
@@ -346,10 +351,11 @@ class PluginManagerActivity : AppCompatActivity() {
         bundled: List<Triple<PluginEntry, BundledHealth, String>>,
         optionals: List<Triple<PluginEntry, BundledHealth, String>>,
         extras: List<PluginInfo>,
-        issues: List<Pair<String, String>>
+        issues: List<Pair<String, String>>,
+        installedDsh: String?
     ) {
         listBox.removeAllViews()
-        listBox.addView(buildOverviewCard(bundled.size, optionals.size, extras.size, issues))
+        listBox.addView(buildOverviewCard(bundled.size, optionals.size, extras.size, issues, manifest.targetDsh, installedDsh))
 
         listBox.addView(sectionHeader("内置插件", "${bundled.size} 个"))
         // 清单不可用时不静默空列表：显式告警卡（原因已由 loadManifest 写入日志）
@@ -376,6 +382,12 @@ class PluginManagerActivity : AppCompatActivity() {
                 h.staleVsSource -> {
                     status = "已装配 · 副本落后于内置源"
                     if (h.srcOk) actions.add("修复" to { repairSingle(e) })
+                }
+                // ★ 兼容性门禁（dsh 0.2.0 起）：装配成功、结构完好，但 peer 范围不覆盖
+                //   运行时版本 → dsh 在加载时把该行标 disabled，插件**静默不生效**。
+                //   旧逻辑落进 else 显示"已装配"，用户完全看不出它其实没跑起来。
+                h.compat?.compatible == false -> {
+                    status = "已装配 · 与 dsh 不兼容（运行时禁用）"
                 }
                 else -> status = "已装配"
             }
@@ -461,8 +473,15 @@ class PluginManagerActivity : AppCompatActivity() {
             })
         }
 
-    /** 概览卡：数量总览 + 异常明细 + 主操作行。 */
-    private fun buildOverviewCard(builtinCount: Int, optionalCount: Int, extraCount: Int, issues: List<Pair<String, String>>): View {
+    /** 概览卡：数量总览 + dsh 版本对齐状态 + 异常明细 + 主操作行。 */
+    private fun buildOverviewCard(
+        builtinCount: Int,
+        optionalCount: Int,
+        extraCount: Int,
+        issues: List<Pair<String, String>>,
+        targetDsh: String?,
+        installedDsh: String?,
+    ): View {
         val card = Ui.card(this, radiusDp = 16, background = Ui.SURFACE_CONTAINER_HIGH, elevationDp = 1f)
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
@@ -497,6 +516,25 @@ class PluginManagerActivity : AppCompatActivity() {
         col.addView(countsRow, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ))
+
+        // dsh 版本对齐：清单声明的 targetDsh 是插件副本的适配基准。
+        // 装着的 dsh 与它不一致时，插件的 peer 判定很可能是拿旧范围对新运行时
+        // ——那正是兼容性门禁最容易踩空的地方，所以在总览里直接摆出来。
+        if (targetDsh != null || installedDsh != null) {
+            val aligned = targetDsh != null && installedDsh != null && targetDsh == installedDsh
+            col.addView(TextView(this).apply {
+                text = buildString {
+                    append("dsh：已装 ").append(installedDsh ?: "未知")
+                    append(" · 清单目标 ").append(targetDsh ?: "未声明")
+                    if (targetDsh != null && installedDsh != null && !aligned) append("（不一致）")
+                }
+                textSize = 11.5f
+                setTextColor(if (aligned || targetDsh == null || installedDsh == null) Ui.TEXT_MUTED else Ui.WARNING)
+                setPadding(0, dp(6), 0, 0)
+            }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ))
+        }
 
         if (issues.isNotEmpty()) {
             col.addView(TextView(this).apply {
@@ -732,7 +770,12 @@ class PluginManagerActivity : AppCompatActivity() {
         val srcOk: Boolean,
         /** 装配副本落后于内置源（装了新 APK 但副本未刷新）。 */
         val staleVsSource: Boolean = false,
+        /** 对钉死版 dsh 的兼容性判定；无数据（未审计过）时为 null。 */
+        val compat: CompatInfo? = null,
     )
+
+    /** 兼容性判定表（dir → 判定），由 [refreshList] 在后台线程读一次后填入。 */
+    private var compatStatus: Map<String, CompatInfo> = emptyMap()
 
     /** 只许在后台线程调用（目录内容指纹比对是重活，结果按 apkVer:源目录:dir 缓存）。 */
     private fun healthOf(e: PluginEntry): BundledHealth {
@@ -745,6 +788,7 @@ class PluginManagerActivity : AppCompatActivity() {
             isWired(e),
             srcOk,
             staleVsSource = isStaleVsSource(e, dir),
+            compat = compatStatus[e.dir],
         )
     }
 
@@ -817,6 +861,8 @@ class PluginManagerActivity : AppCompatActivity() {
         val builtin: List<PluginEntry> = emptyList(),
         val optional: List<PluginEntry> = emptyList(),
         val error: String? = null,
+        /** 清单声明的目标 dsh 版本（$targetDsh）：插件副本就是针对它适配的。 */
+        val targetDsh: String? = null,
     )
 
     /**
@@ -837,12 +883,13 @@ class PluginManagerActivity : AppCompatActivity() {
             val j = JSONObject(text)
             val builtin = parseManifestList(j.optJSONArray("builtin"), File(filesDir, "extra-plugins"))
             val optional = parseManifestList(j.optJSONArray("optional"), optionalPluginsDir())
+            val target = j.optString("targetDsh").takeIf { it.isNotBlank() }
             if (builtin.isEmpty()) {
                 val msg = "$MANIFEST_NAME 的 builtin 列表为空"
                 appendLog("WARN 插件清单异常：$msg")
-                PluginManifest(builtin, optional, msg)
+                PluginManifest(builtin, optional, msg, target)
             } else {
-                PluginManifest(builtin, optional, null)
+                PluginManifest(builtin, optional, null, target)
             }
         } catch (t: Throwable) {
             val msg = "$MANIFEST_NAME 解析失败：${t.message}"
@@ -987,9 +1034,56 @@ class PluginManagerActivity : AppCompatActivity() {
         }
     }
 
+    /** 单个内置插件对钉死版 dsh 的兼容性判定。[peers] 为不满足的 peer 明细（可空）。 */
+    private data class CompatInfo(val compatible: Boolean, val peers: String?)
+
+    /**
+     * 读取每个内置插件对**钉死版 dsh** 的兼容性判定，来自安装脚本写的 files/plugin-status.json。
+     *
+     * 为什么要有这一层：dsh 0.2.0 起 app-boot 新增兼容性前置校验（compatibility-preflight），
+     * 插件任一 `@deepseek-ai/dsh` / `@deepseek-ai/dsh-*` peer 范围不覆盖运行时版本时，
+     * 该插件行会被**静默禁用**——`dsh plugin add` 照旧成功、目录健康检查也全绿，
+     * 用户在插件页看不到任何异常，只在真正需要该插件时才发现它没生效。
+     * install/plugins.mjs 在装配后调用 **dsh 自带的同一判定函数**核对并落盘，
+     * 这里读回来展示，把静默失败变成可见状态。
+     *
+     * 文件不存在（旧 APK / 尚未跑过安装）时返回空表，UI 因此不渲染兼容性行——
+     * 不把「没有数据」渲染成「不兼容」。
+     */
+    private fun readCompatStatus(): Map<String, CompatInfo> {
+        val f = File(filesDir, "plugin-status.json")
+        if (!f.isFile) return emptyMap()
+        return try {
+            val arr = JSONObject(f.readText()).optJSONArray("plugins") ?: return emptyMap()
+            val out = mutableMapOf<String, CompatInfo>()
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val dir = o.optString("dir").takeIf { it.isNotBlank() } ?: continue
+                out[dir] = CompatInfo(o.optBoolean("compatible", true), o.optJSONObject("peers")?.toString())
+            }
+            out
+        } catch (t: Throwable) {
+            appendLog("WARN plugin-status.json 解析失败：${t.message}")
+            emptyMap()
+        }
+    }
+
+    /** 设备上实际安装的 dsh 版本（对比清单声明的 targetDsh，不一致即提示升级未落实）。 */
+    private fun readInstalledDshVersion(): String? {
+        val p = File(dshPrefix(), "node_modules/@deepseek-ai/dsh/package.json")
+        if (!p.isFile) return null
+        return runCatching {
+            JSONObject(p.readText()).optString("version").takeIf { it.isNotBlank() }
+        }.getOrNull()
+    }
+
     /** 状态 pill 颜色显式映射（「已损坏」不得命中 contains(已) 变绿）。 */
     private fun statusColor(status: String): Int = when {
         status.contains("损坏") || status.contains("缺失") -> Ui.DANGER
+        // ⚠ 必须排在「已装配」之前：不兼容的条目文案是
+        // 「已装配 · 与 dsh 不兼容（运行时禁用）」，含「已装配」——
+        // 落到下面那条就会显示成绿色的"一切正常"，正是要避免的误导。
+        status.contains("不兼容") -> Ui.DANGER
         status.contains("落后") -> Ui.WARNING
         status.contains("已装配") || status.contains("已安装") || status.contains("已连接") -> Ui.SUCCESS
         status.contains("待") || status.contains("需") -> Ui.WARNING
@@ -1042,7 +1136,32 @@ class PluginManagerActivity : AppCompatActivity() {
         appendLog("   $ ${cmd.replace(cli.absolutePath, "dsh")}")
         val code = runProcess(cmd, baseEnv(), label)
         appendLog(if (code == 0) "   ✓ $label 完成（exit=0）" else "   ✗ $label 失败（exit=$code）")
+        // profile 变了 → 兼容性判定可能随之变化，刷新一次（见 refreshCompatStatus 注释）。
+        if (code == 0) refreshCompatStatus()
         return code
+    }
+
+    /**
+     * 重跑兼容性审计，刷新 files/plugin-status.json（dsh 0.2.0 起的装配契约）。
+     *
+     * 为什么需要：本页的单插件操作（装配/修复/卸载/在线安装）走 [dshPluginSync] 直连
+     * `dsh plugin add`，**不经过** install-dsh.mjs 的完整流程，因此那份状态文件不会自己更新——
+     * 不补这一步，界面就会拿**过期判定**继续显示，正是要消除的那类静默不一致。
+     * 「重新装配」「一键重置」走的是 rewireCore（--plugins-only），那条路径已含审计。
+     *
+     * 审计本身只读清单 + 调用 dsh 自带的兼容性判定，开销很小；失败不影响主操作结果。
+     */
+    private fun refreshCompatStatus() {
+        val script = File(filesDir, "install-dsh.mjs")
+        val node = File(File(nodeDir, "bin"), "node")
+        if (!script.exists() || !node.exists()) return
+        val env = baseEnv().apply {
+            put("DSH_PREFIX", dshPrefix().absolutePath)
+            put("DSH_PROFILE", "web")
+            put("DSH_PLUGINS_DIR", pluginsDir().absolutePath)
+            put("DSH_APK_VER", AssetSync.apkVersion(this@PluginManagerActivity).toString())
+        }
+        runProcess("${node.absolutePath} ${script.absolutePath} --audit-only", env, "兼容性审计")
     }
 
     /** 异步包装（卸载/在线安装等独立操作）。 */
