@@ -749,28 +749,37 @@ var STYLES = `
   .dim-jh-rail::-webkit-scrollbar { width: 0; height: 0; display: none; }
 
   /* rail 内的分组在横向模式下不再各自成列 */
-  .dim-jh-railGroup { display: flex; flex-direction: row; flex-wrap: nowrap; gap: 6px; }
+  /* 分组是 .dim-jh-rail 的直接子项：必须 flex:0 0 auto，否则会被压缩、
   .dim-jh-railGroup + .dim-jh-railGroup { margin-top: 0; }
   /* 分组小标题在横向 tab 条里没有位置（它原本是纵向列表的分隔） */
   .dim-jh-railGroupTitle { display: none; }
 
   /* provider 按钮：压成「图标 + 标签」的紧凑 tab，且不被压缩 */
-  .dim-jh-providerRow .dim-jh-provider, .dim-jh-rail .dim-jh-provider {
-    width: auto;
+  /* ⚠️ 关键结构：每个供应商是 <div class="dim-jh-providerRow"><button class="dim-jh-provider"> 两层。
+     在横向 tab 条模式下，.dim-jh-rail 是 flex-direction: row，它的**直接子项是
+     .dim-jh-providerRow**（不是 button）。因此宽度约束必须加在外层 row 上：
+     只给内层 button 加 min-width 会让 button 溢出只有图标宽的父级 ⇒ 相邻按钮**视觉重叠**
+     （真机现象：探针量 button=104px 看着正常，画面里外框却一个压一个）。
+     同时 .dim-jh-providerRow 原是 display:grid 竖列（一行一个），横排模式下要显式
+     设成 flex:0 0 auto 才不会被压缩。 */
+  .dim-jh-rail .dim-jh-providerRow {
+    display: block;
     flex: 0 0 auto;
+    min-width: 108px;
+    max-width: 108px;
+  }
+  .dim-jh-providerRow .dim-jh-provider, .dim-jh-rail .dim-jh-provider {
+    width: 100%;
     min-width: 0;
     min-height: 40px;
-    /* 用户反馈「提供商选择按钮过窄」：原 22px 图标列 + 无最小宽，
-       窄屏下被压到只剩图标宽、图标互相重叠、文字标签全部不可见。
-       ⚠️ 选择器必须带 .dim-jh-providerRow 前缀（特异性 2）：原样式表里有一条
-          .dim-jh-providerRow .dim-jh-provider 的 min-width: 0，单类选择器压不过它 ——
-          真机实测写单类时 min-width 不生效，渲染出来仍是 22px。 */
-    min-width: 104px;
     grid-template-columns: 24px minmax(0, 1fr);
     gap: 6px;
     padding: 6px 10px;
     white-space: nowrap;
+    box-sizing: border-box;
   }
+  .dim-jh-providerIcon { width: 24px; height: 24px; }
+  .dim-jh-providerLabel { min-width: 0; white-space: nowrap; overflow: hidden; }
   .dim-jh-providerIcon { width: 24px; height: 24px; }
   .dim-jh-providerLabel { min-width: 0; white-space: nowrap; overflow: hidden; }
 
