@@ -437,13 +437,24 @@ const useStatus = (sessionId) => usePoll(React.useCallback(
       // ── 「优化选项」入口与弹出面板（极简：一个按钮 + 一块克制的卡片）──────────
       optBtn: { display: 'inline-flex', alignItems: 'center', gap: '6px', padding: '3px 10px 3px 8px',
         borderRadius: '9px', border: '1px solid ' + OVS.line, background: 'transparent',
-        color: 'inherit', cursor: 'pointer', fontSize: '12px', lineHeight: '18px' },
+        color: 'inherit', cursor: 'pointer', fontSize: '12px', lineHeight: '18px',
+        // dsh-launcher 补丁（移动端适配）：窄屏修复——按钮/文字一律不换行、不被压缩。
+        // 真机（360 CSS px 视口）实测：宿主 conversation.input.left 是横向挤占的 flex 容器，
+        // 本按钮被压到比内容还窄，而中日韩文字**可在任意字符间断行** ⇒ 「优化选项」被
+        // 逐字竖排成「优/化/选/项」，外框变成竖条并与相邻控件重叠。
+        flex: '0 0 auto', whiteSpace: 'nowrap', maxWidth: '100%', boxSizing: 'border-box' },
       optBtnOn: { background: T('hover'), borderColor: OVS.acc },
-      optBtnText: { fontWeight: 600, letterSpacing: '.2px' },
+      optBtnText: { fontWeight: 600, letterSpacing: '.2px', whiteSpace: 'nowrap' },
       // ⚠ 用**颜色**压暗，不用 opacity：浅色底上 `opacity:.65` 会变成看不清的浅灰细字（用户截图）。
-      optSummary: { color: OVS.fg3, fontSize: '11px', whiteSpace: 'nowrap' },
+      // dsh-launcher 补丁：窄屏下摘要（「标准 · 自动」）优先让位给标题，允许省略号收尾。
+      optSummary: { color: OVS.fg3, fontSize: '11px', whiteSpace: 'nowrap',
+        overflow: 'hidden', textOverflow: 'ellipsis', minWidth: 0, flex: '0 1 auto' },
       optCaret: { color: OVS.fg3, fontSize: '10px', lineHeight: 1 },
-      optPop: { position: 'fixed', zIndex: OV_Z.pop, width: '300px', maxHeight: 'min(62vh, 460px)', overflowY: 'auto',
+      // dsh-launcher 补丁：宽度改为视口感知（360 CSS px 视口下 300px 偏窄），并显式 border-box。
+      // ⚠ 本样式默认是 content-box：声明宽度 + padding 24 + border 2 才是实际宽度，
+      //   不显式声明会「声明 336、实际 362」，比 360 视口还宽 ⇒ 面板右侧被裁。
+      optPop: { position: 'fixed', zIndex: OV_Z.pop, boxSizing: 'border-box',
+        width: 'min(340px, calc(100vw - 24px))', maxHeight: 'min(62vh, 460px)', overflowY: 'auto',
         display: 'flex', flexDirection: 'column', gap: '8px', padding: '10px 12px',
         background: OVS.surface, color: OVS.fg,
         border: '1px solid ' + OVS.line, borderRadius: '12px',
@@ -465,10 +476,12 @@ const useStatus = (sessionId) => usePoll(React.useCallback(
       prov: (p) => ({ fontSize: '11px', padding: '0 5px', borderRadius: '8px', marginLeft: '6px',
         background: p === 'user' ? 'rgba(57,192,122,.18)' : (p === 'machine' ? 'rgba(120,150,255,.18)' : 'rgba(230,90,90,.22)') }),
       // P10 控件栏专用（要能在输入区那一行里挤下，所以比浮层里的控件小一号）
+      // dsh-launcher 补丁：控件栏不许横向溢出宿主槽位（minWidth:0 允许被压缩，
+      // 但内部按钮已 flex:0 0 auto + nowrap，因此只会换行、不会把文字挤成竖排）。
       bar: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '6px', fontSize: '12px',
-        lineHeight: '18px', color: 'inherit' },
+        lineHeight: '18px', color: 'inherit', maxWidth: '100%', boxSizing: 'border-box', minWidth: 0 },
       // 控件栏分两层：每层各自横排、可换行（行内间距沿用原来的 6px）
-      barRow: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '6px' },
+      barRow: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '6px', minWidth: 0, maxWidth: '100%' },
       grp: { display: 'inline-flex', alignItems: 'center', gap: '4px', whiteSpace: 'nowrap' },
       // 分段控件：**铺满整格**（用户 2026-09-22："这几个按钮都没有布满区域,而且实际点击区域和反应区域还不一样"）。
       // 判据两条：① 容器 `width:100%` + 每项 `flex:1 1 0` ⇒ 视觉上填满；② 命中判定本来就按**容器矩形**等分
@@ -2468,7 +2481,10 @@ const useStatus = (sessionId) => usePoll(React.useCallback(
               },
             },
               h(OptIcon),
-              h('span', { style: S.optBtnText }, L('优化选项', 'Options')),
+              // dsh-launcher 补丁：给标题加标记，供窄屏 CSS 隐藏（见注入样式的 ⑨ 段）。
+              // ⚠ 上游 v0.8.1 把这里的 data-po06 去掉了，导致 CSS 的窄屏隐藏规则选不中它，
+              //   标题不收 ⇒ 按钮仍被撑宽 ⇒ 「优化选项」在 360px 视口下被逐字竖排。
+              h('span', { 'data-po06': 'options-label', style: S.optBtnText }, L('优化选项', 'Options')),
               h('span', { 'data-po06': 'options-summary', style: S.optSummary },
                 tierLabel(tier) + ' · ' + (permission === 'review' ? L('审查', 'Review') : L('自动', 'Auto'))
                   + (rtKnown && readTools ? ' · ' + L('工具开', 'tools on') : '')),
@@ -3158,6 +3174,53 @@ const useStatus = (sessionId) => usePoll(React.useCallback(
             '[data-po06] select{color-scheme:inherit}',
             '[data-po06] select option{background:var(--po06-surface);color:var(--po06-fg)}',
             '[data-po06] select option:checked{background:' + OVS.acc22 + ';color:' + OVS.acc + '}',
+            // ⑧ ── 移动端适配（dsh-launcher 补丁）────────────────────────────
+            // 上游的面板尺寸是桌面尺度（内联 width 460 / minWidth 360、几何下限 400×320），
+            // 而本机视口实测仅 **361 CSS px**（1264 物理 / 3.5 密度）：桌面规则照单全收会
+            // 「右侧被裁、按钮挤成一团、底部被导航栏盖住」。
+            // ⚠ 宽高是**内联**写在 [data-po06="intercept"] 上的，普通规则压不过内联，
+            //   故这里用 !important 明确覆盖（本补丁的既定手法）。
+            '@media (max-width:768px){[data-po06="intercept"]{width:calc(100vw - 20px) !important;min-width:0 !important;max-width:520px !important}}',
+            '@media (max-width:560px){[data-po06="intercept"]{width:calc(100vw - 16px) !important;min-width:0 !important;max-height:min(78vh,640px) !important}}',
+            '@media (max-width:420px){[data-po06="intercept"]{width:calc(100vw - 12px) !important;border-radius:10px}}',
+            // 触控目标：面板按钮原为 28px 高，手指点不准；窄屏下抬到 38px
+            '@media (max-width:560px){[data-po06] button{min-height:38px}}',
+            // ⑨ ── 控件栏窄屏修复（dsh-launcher 补丁）──────────────────────────
+            // 真机（360 CSS px）实测的原始故障：宿主 conversation.input.left 是横向挤占的
+            // flex 容器，本插件按钮被压到比内容更窄，而**中日韩文字可在任意字符间断行**
+            // ⇒「优化选项」被逐字竖排、外框变成竖条并与相邻控件（工作区内修改 / 模型选择）
+            // 重叠。以下四条 CSS 与内联样式互为保险（内联改的是常态，这里兜窄屏）。
+            //
+            // ① 控件栏整体不许横向溢出，且按钮一律不被压缩
+            '[data-po06="bar"]{max-width:100%;box-sizing:border-box;min-width:0}',
+            '[data-po06="bar"] button{flex:0 0 auto;white-space:nowrap}',
+            // ② 窄屏**收成图标按钮**：真机实测（360 CSS px）宿主 conversation.input.left 是
+            //    横向挤占的 flex 行，本插件按钮与宿主「工作区内修改」互相重叠。把标题与摘要
+            //    一起收起后按钮只剩 图标+箭头（约 46px），横向占用降到原来的 1/4，重叠消失。
+            //    **渐进隐藏**：点开后弹出面板里档位/权限/模型一应俱全，功能与信息不丢失。
+            '@media (max-width:560px){[data-po06="options-label"],[data-po06="options-summary"]{display:none}}',
+            // 图标按钮也要有足够的触控面积（视觉仍是小圆角按钮）
+            '@media (max-width:560px){[data-po06="options-btn"]{padding:0 8px;gap:4px}}',
+            // ③ 触控目标：控件栏按钮在窄屏下也要够大（原 18px 行高≈点不准）
+            '@media (max-width:560px){[data-po06="bar"] button{min-height:34px;padding-left:10px;padding-right:10px}}',
+            // ④ 窄屏下控件栏自身纵向堆叠、留出间距，避免与宿主控件互相挤占
+            '@media (max-width:560px){[data-po06="bar-row-1"]{row-gap:6px;max-width:100%}}',
+            // ⑤ 触控目标：真机量得控件栏按钮仅 **34px** 高（低于 40px 的常用下限），
+            //    窄屏下抬到 40px。宽度也留够，避免「看得见点不准」。
+            '@media (max-width:560px){[data-po06="bar"] button{min-height:40px;padding-left:12px;padding-right:12px}}',
+            // ⑥ 弹出层避开系统栏：全面屏手势条 / 刘海会盖住贴着屏幕边的弹层。
+            //    options-pop 与 help-pop 都是 position:fixed 的贴边浮层，故补安全区内边距。
+            '@supports (padding:max(0px)){'
+              + '[data-po06="options-pop"],[data-po06="help-pop"]{'
+              + 'padding-bottom:max(10px,env(safe-area-inset-bottom));'
+              + 'padding-left:max(12px,env(safe-area-inset-left));'
+              + 'padding-right:max(12px,env(safe-area-inset-right))}}',
+            // 全面屏安全区：避开刘海/挖孔与底部手势条，防止按钮被系统栏吃掉。
+            // ★ 显式 box-sizing:border-box —— 内联的 width 是 calc(100vw - Npx)，
+            //   若按 content-box 再加 padding 会反而溢出（窄屏横向滚动）。
+            '@supports (padding:max(0px)){[data-po06="intercept"]{box-sizing:border-box;padding-left:env(safe-area-inset-left);padding-right:env(safe-area-inset-right);padding-bottom:env(safe-area-inset-bottom)}}',
+            // 拖动面板时禁止页面滚动/缩放干扰（仅拖拽头，不影响内容区滚动）
+            '[data-po06="intercept-head"]{touch-action:none}',
           ].join('')
           document.head.appendChild(tag)
           own(() => { try { tag.remove() } catch (e) { /* 已被别处摘掉 */ } })
