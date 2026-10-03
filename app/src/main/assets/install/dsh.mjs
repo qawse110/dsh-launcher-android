@@ -6,6 +6,10 @@
  */
 import { existsSync, writeFileSync, mkdirSync, readFileSync, rmSync, readdirSync, cpSync, chmodSync, symlinkSync, readlinkSync } from 'node:fs';
 import { join } from 'node:path';
+// runCapture 需要**捕获子进程 stdout**，故用 spawnSync 的管道模式。
+// 不复用 env.mjs 的 runEx：它刻意用 stdio=[ignore,inherit,inherit] 让日志实时进控制台，
+// 拿不到 stdout —— 复用它就得改那个共享契约，改动面更大。
+import { spawnSync } from 'node:child_process';
 import {
   FILES_DIR, NODE_BIN, NPM_BIN, DSH_PREFIX, TOOLS, TERMUX, REGISTRY, REGISTRY_FALLBACK,
   PNPM_VERSION, NPM_TIMEOUT_MS, NPM_NET_ARGS,
@@ -290,8 +294,11 @@ function ensureDsh() {
   } catch (e) {
     log('WARN dist-tag probe failed: ' + e.message);
   }
+  // 注意用本文件的 cmpVerLocal：此前这里写的是 cmpVer，而该符号在本文件**从未定义**
+  // （typeof 守卫让它恒为 false）→ 判定退化成「必须精确相等」，一旦 registry 解析出的
+  // 版本比装到的新（预发布序）就会被误判为 stale 而反复重装。
   const tagSatisfied = !distTagVersion || afterVersion === distTagVersion ||
-    (typeof cmpVer === 'function' && cmpVer(afterVersion, distTagVersion) >= 0);
+    cmpVerLocal(afterVersion, distTagVersion) >= 0;
   if (!tagSatisfied) {
     log(`stale install detected: ${afterVersion} != dist-tag ${tag}=${distTagVersion}, force reinstall`);
     runEx(pnpmBin, ['remove', '--dir', DSH_PREFIX, '@deepseek-ai/dsh', ...pnpmCommon],
