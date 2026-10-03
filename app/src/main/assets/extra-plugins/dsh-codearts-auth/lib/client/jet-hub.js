@@ -748,30 +748,36 @@ var STYLES = `
   }
   .dim-jh-rail::-webkit-scrollbar { width: 0; height: 0; display: none; }
 
-  /* rail 内的分组在横向模式下不再各自成列 */
-  /* 分组是 .dim-jh-rail 的直接子项：必须 flex:0 0 auto，否则会被压缩、
+  /* ══ 供应商导航：横向可滑条带（三层结构都要改，缺一层就退化成竖列）══
+     结构：.dim-jh-rail > .dim-jh-railGroup > .dim-jh-providerRow > button.dim-jh-provider
+     上游三层全是 grid（各自单列）⇒ 只把 rail 改成 flex row 是不够的，
+     railGroup 与 providerRow 仍是 grid 单列 ⇒ 实际渲染成竖排（上一版就是这么翻的车）。
+     ⚠️ 每一层都必须显式参与横向 flex，且**不许被压缩**（flex: 0 0 auto），
+        否则 flex 会按默认 flex-shrink:1 把它们压扁 ⇒ 按钮互相压盖。 */
+  .dim-jh-railGroup {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: nowrap;
+    gap: 6px;
+    flex: 0 0 auto;
+    min-width: 0;
+  }
   .dim-jh-railGroup + .dim-jh-railGroup { margin-top: 0; }
-  /* 分组小标题在横向 tab 条里没有位置（它原本是纵向列表的分隔） */
+  /* 分组小标题是纵向列表的分隔，横向条带里没有位置 */
   .dim-jh-railGroupTitle { display: none; }
 
-  /* provider 按钮：压成「图标 + 标签」的紧凑 tab，且不被压缩 */
-  /* ⚠️ 关键结构：每个供应商是 <div class="dim-jh-providerRow"><button class="dim-jh-provider"> 两层。
-     在横向 tab 条模式下，.dim-jh-rail 是 flex-direction: row，它的**直接子项是
-     .dim-jh-providerRow**（不是 button）。因此宽度约束必须加在外层 row 上：
-     只给内层 button 加 min-width 会让 button 溢出只有图标宽的父级 ⇒ 相邻按钮**视觉重叠**
-     （真机现象：探针量 button=104px 看着正常，画面里外框却一个压一个）。
-     同时 .dim-jh-providerRow 原是 display:grid 竖列（一行一个），横排模式下要显式
-     设成 flex:0 0 auto 才不会被压缩。 */
   .dim-jh-rail .dim-jh-providerRow {
     display: block;
     flex: 0 0 auto;
-    min-width: 108px;
-    max-width: 108px;
+    /* 宽度**由内容决定**：不设 max-width，标签完整显示不截断（用户要求「内容完整」）。
+       min-width 只是下限，保证短标签的按钮也够大、点得中。
+       最长的标签是「WorkBuddy (国际版)」这类，实测需要约 180px 才能完整放下。 */
+    min-width: 124px;
   }
-  .dim-jh-providerRow .dim-jh-provider, .dim-jh-rail .dim-jh-provider {
+  .dim-jh-rail .dim-jh-provider {
     width: 100%;
     min-width: 0;
-    min-height: 40px;
+    min-height: 44px;
     grid-template-columns: 24px minmax(0, 1fr);
     gap: 6px;
     padding: 6px 10px;
@@ -779,9 +785,9 @@ var STYLES = `
     box-sizing: border-box;
   }
   .dim-jh-providerIcon { width: 24px; height: 24px; }
-  .dim-jh-providerLabel { min-width: 0; white-space: nowrap; overflow: hidden; }
-  .dim-jh-providerIcon { width: 24px; height: 24px; }
-  .dim-jh-providerLabel { min-width: 0; white-space: nowrap; overflow: hidden; }
+  /* 标签不截断：给足宽度后让它自然显示，不加省略号（用户要求「内容完整」） */
+  .dim-jh-providerLabel { min-width: 0; }
+  .dim-jh-providerLabel strong { overflow: visible; text-overflow: clip; white-space: nowrap; }
 
   /* 面板占满整宽，杜绝溢出 */
   .dim-jh-panel {
