@@ -1,0 +1,426 @@
+{
+  "at": "2026-09-24T10:57:28.508Z",
+  "package": {
+    "name": "@dsh-external/dsh-po06",
+    "version": "0.6.10"
+  },
+  "contractVersions": {
+    "interpreter": "0.6.0-alpha.1",
+    "verifierHtml": "1.1.0"
+  },
+  "files": {
+    "lib/answer-audit.js": {
+      "sha256": "326cb336bf00485bb9c76c28b9e6741eba9bd01aaf3193c169c7e03e90480989",
+      "bytes": 26680
+    },
+    "lib/assembly-gate.js": {
+      "sha256": "dec0a2238f20599bdc9037d49dc17d5edcdff5553ec2595e40aadd435e9bf8d4",
+      "bytes": 12027
+    },
+    "lib/clarifier.js": {
+      "sha256": "b18aa91213aa0c15b89aa2aa96ae3e1e2052a85d9ec0ce0c3149297ad80e22a7",
+      "bytes": 6734
+    },
+    "lib/client.js": {
+      "sha256": "5405cc56c05fa7910de622bd3e1cd1859a58956ceda2ceb38452c4fb3b633e60",
+      "bytes": 169880
+    },
+    "lib/compiler.js": {
+      "sha256": "b9f2370dffa76de25e1f02b74c802b7da822e6a15b68b931c13e25b1129461ea",
+      "bytes": 9291
+    },
+    "lib/control-api.js": {
+      "sha256": "e629414f8252ab623c60c02d5c234ff99d15254570532823a08dbdb1693c7963",
+      "bytes": 33329
+    },
+    "lib/detect-old.js": {
+      "sha256": "3091998a6f1ba8447e5a7ef4e861d85c6cb4dc5eafeceec993684bd0435f1e71",
+      "bytes": 3429
+    },
+    "lib/eval-e001.js": {
+      "sha256": "862b81e4e3b12bad37e90fb5481b22d9ae9173c1bd688786790c7771cbb283d1",
+      "bytes": 14248
+    },
+    "lib/eval-llm.js": {
+      "sha256": "55ee0a453d0ecb0604b9fb251b386023780ddaadfff85fbc94662983e09037ab",
+      "bytes": 3454
+    },
+    "lib/eval-plan.js": {
+      "sha256": "38adbf75782f0e79220ffd12cc4717f4473c5bb74b020961d6f09a8a40f6278a",
+      "bytes": 21742
+    },
+    "lib/eval-run.js": {
+      "sha256": "f3d7973a3fbcebb4d4f0ff3db0d2b559a14d5511cda48776338e5ab4d385d5eb",
+      "bytes": 9306
+    },
+    "lib/eval-smoke.js": {
+      "sha256": "e3a95d796ef2960fb72d73e8fe66ec9e71d5830d573c32664f1f5aaffe75d6cc",
+      "bytes": 6163
+    },
+    "lib/feedback.js": {
+      "sha256": "14b5dc8e4af35266e99bcc469b61d3084847320d46f75e4bcdaa27f3f6f82113",
+      "bytes": 6464
+    },
+    "lib/gate.js": {
+      "sha256": "f458847afff2711eddcac165586a1a92b4722f28a27889099fa8f4545e7d3429",
+      "bytes": 6183
+    },
+    "lib/host-migrate.js": {
+      "sha256": "ae59f9a8c4e0f9228f9457fb74f92506de224a66e4ae21a7c706c71d54cb1c8f",
+      "bytes": 8033
+    },
+    "lib/index.js": {
+      "sha256": "8a1d1b79096e4a9b347fa3aa289dcb725c5fcb1aabc1ae8075303bf8fcd1a8e1",
+      "bytes": 156845
+    },
+    "lib/interpreter.js": {
+      "sha256": "1692f8f6b39899bb925a41fa240970d2e6a267e0063d9631e1b107a9b2cd6e98",
+      "bytes": 28413
+    },
+    "lib/llm-lib.js": {
+      "sha256": "31ee1eeffb312c38d0fa6e76e0e20aeb17e9616f6664f84b3e1335037d34bcf0",
+      "bytes": 9698
+    },
+    "lib/migration.js": {
+      "sha256": "e2e5bb467223397711da1d3c0498e53e97bd9ee086b480d22a2b55a088b4e10a",
+      "bytes": 14622
+    },
+    "lib/pipeline.js": {
+      "sha256": "7736c9e2b224b0f75750349db95d827a64b91303d6099413bf31e6ef6139c76c",
+      "bytes": 24789
+    },
+    "lib/policy.js": {
+      "sha256": "35327a8ecd3e68e14240e31974eb9e7b1cb3e970a7d46bc33fefff0641aca46e",
+      "bytes": 4666
+    },
+    "lib/posix.js": {
+      "sha256": "bbba8856276c90b7a74cca2bb69380d4773d66d6d61fcafc85186327e420b0e2",
+      "bytes": 16919
+    },
+    "lib/projection.js": {
+      "sha256": "2190b5196548b7b411a726e40785560b77ab167506f647bfd69f8d0d9ec5f35e",
+      "bytes": 7672
+    },
+    "lib/read-tools.js": {
+      "sha256": "b13f67995cfcd2abef512b9b4ab8d45740fe841590cc2a2c1e90f372afaadf56",
+      "bytes": 30981
+    },
+    "lib/reducer.js": {
+      "sha256": "aa9c012b4d2bc097d28bae70a5459063c77f0455199002967670d48c7c12292f",
+      "bytes": 10042
+    },
+    "lib/rollout.js": {
+      "sha256": "a87085a09c561a15c7ae658c869a75029c0525e8502814e5f2f8514081ad866d",
+      "bytes": 6133
+    },
+    "lib/schema.js": {
+      "sha256": "475a18de9525482a91792f5718806e023c015f2eababf026fb2f6369cfe56421",
+      "bytes": 18549
+    },
+    "lib/session-context.js": {
+      "sha256": "3cc052e7d9ffec71aa3573236fe4f14158c94b1454ae53865153793b09a4c3b2",
+      "bytes": 16350
+    },
+    "lib/settings.js": {
+      "sha256": "c0aca249b4b635c4a5b27d2b336c6f05ae05ff790258b99e401a02c0355b43b0",
+      "bytes": 17053
+    },
+    "lib/store.js": {
+      "sha256": "06921cd957236982737a265ae11ca06746c543dcf5154d3399efdd9d54a1322f",
+      "bytes": 9328
+    },
+    "lib/strategy.js": {
+      "sha256": "6b7cba313a788a0be74432bc2a6dc40995461c77445ff225ee8a52b8e53989bf",
+      "bytes": 8187
+    },
+    "lib/temp-sweep.js": {
+      "sha256": "5595e5273fddcdf06dcb9e6b3891326335db07a27c90cd2c216905408fe19ac5",
+      "bytes": 3083
+    },
+    "lib/verifier-html.js": {
+      "sha256": "ee448943042e6b19b543a4d5d86b6f5da638aeb729a93d976f3d2f6546e81414",
+      "bytes": 34237
+    },
+    "lib/verifier.js": {
+      "sha256": "4ebcf648b4f302fce0afd6a983a4e3b54c6332c5c5566f9fe04ce6d5a5aa43f1",
+      "bytes": 7338
+    },
+    "lib/wire.js": {
+      "sha256": "a1e6daf1eb0f3bb785709837a471de14b8c936ed03beb9fe625f04f861cfbecb",
+      "bytes": 9072
+    }
+  },
+  "packageJsonSha256": "8217b7b32e1194e6556a0a3d53c8bb2432c414ccbdd76c94b25b09a04d86b151",
+  "tests": {
+    "analyze-e001.test.mjs": {
+      "pass": 4,
+      "fail": 0,
+      "skipped": 0
+    },
+    "answer-audit.test.mjs": {
+      "pass": 32,
+      "fail": 0,
+      "skipped": 0
+    },
+    "assembly-gate.test.mjs": {
+      "pass": 20,
+      "fail": 0,
+      "skipped": 0
+    },
+    "audit-clarify.test.mjs": {
+      "pass": 10,
+      "fail": 0,
+      "skipped": 0
+    },
+    "capability.test.mjs": {
+      "pass": 16,
+      "fail": 0,
+      "skipped": 0
+    },
+    "carryover.test.mjs": {
+      "pass": 9,
+      "fail": 0,
+      "skipped": 0
+    },
+    "check-docs.test.mjs": {
+      "pass": 19,
+      "fail": 0,
+      "skipped": 0
+    },
+    "check-install.test.mjs": {
+      "pass": 10,
+      "fail": 0,
+      "skipped": 0
+    },
+    "clarifier.test.mjs": {
+      "pass": 23,
+      "fail": 0,
+      "skipped": 0
+    },
+    "client-file.test.mjs": {
+      "pass": 26,
+      "fail": 0,
+      "skipped": 0
+    },
+    "coexist-config.test.mjs": {
+      "pass": 8,
+      "fail": 0,
+      "skipped": 0
+    },
+    "compiler.test.mjs": {
+      "pass": 16,
+      "fail": 0,
+      "skipped": 0
+    },
+    "control-api.test.mjs": {
+      "pass": 17,
+      "fail": 0,
+      "skipped": 0
+    },
+    "detect-old.test.mjs": {
+      "pass": 11,
+      "fail": 0,
+      "skipped": 0
+    },
+    "dump-wire.test.mjs": {
+      "pass": 10,
+      "fail": 0,
+      "skipped": 0
+    },
+    "eval-e001.test.mjs": {
+      "pass": 3,
+      "fail": 0,
+      "skipped": 0
+    },
+    "eval-plan.test.mjs": {
+      "pass": 34,
+      "fail": 0,
+      "skipped": 0
+    },
+    "eval-rehearsal.test.mjs": {
+      "pass": 6,
+      "fail": 0,
+      "skipped": 0
+    },
+    "eval-run.test.mjs": {
+      "pass": 18,
+      "fail": 0,
+      "skipped": 0
+    },
+    "feedback.test.mjs": {
+      "pass": 24,
+      "fail": 0,
+      "skipped": 0
+    },
+    "gate.test.mjs": {
+      "pass": 16,
+      "fail": 0,
+      "skipped": 0
+    },
+    "holdout-clarify.test.mjs": {
+      "pass": 9,
+      "fail": 0,
+      "skipped": 0
+    },
+    "holdout-longtask.test.mjs": {
+      "pass": 9,
+      "fail": 0,
+      "skipped": 0
+    },
+    "host-migrate.test.mjs": {
+      "pass": 15,
+      "fail": 0,
+      "skipped": 0
+    },
+    "intercept-timing.test.mjs": {
+      "pass": 8,
+      "fail": 0,
+      "skipped": 0
+    },
+    "interpreter.test.mjs": {
+      "pass": 20,
+      "fail": 0,
+      "skipped": 0
+    },
+    "llm-lib.test.mjs": {
+      "pass": 12,
+      "fail": 0,
+      "skipped": 0
+    },
+    "longtask.test.mjs": {
+      "pass": 15,
+      "fail": 0,
+      "skipped": 0
+    },
+    "migration.test.mjs": {
+      "pass": 15,
+      "fail": 0,
+      "skipped": 0
+    },
+    "no-inherit.test.mjs": {
+      "pass": 4,
+      "fail": 0,
+      "skipped": 0
+    },
+    "pipeline.test.mjs": {
+      "pass": 23,
+      "fail": 0,
+      "skipped": 0
+    },
+    "policy.test.mjs": {
+      "pass": 7,
+      "fail": 0,
+      "skipped": 0
+    },
+    "posix-tool-schema.test.mjs": {
+      "pass": 8,
+      "fail": 0,
+      "skipped": 0
+    },
+    "preflight-e001.test.mjs": {
+      "pass": 8,
+      "fail": 0,
+      "skipped": 0
+    },
+    "projection.test.mjs": {
+      "pass": 9,
+      "fail": 0,
+      "skipped": 0
+    },
+    "provenance-ref.test.mjs": {
+      "pass": 13,
+      "fail": 0,
+      "skipped": 0
+    },
+    "provenance.test.mjs": {
+      "pass": 4,
+      "fail": 0,
+      "skipped": 0
+    },
+    "read-session.test.mjs": {
+      "pass": 6,
+      "fail": 0,
+      "skipped": 0
+    },
+    "read-tools.test.mjs": {
+      "pass": 10,
+      "fail": 0,
+      "skipped": 0
+    },
+    "recap.test.mjs": {
+      "pass": 13,
+      "fail": 0,
+      "skipped": 0
+    },
+    "reducer.test.mjs": {
+      "pass": 18,
+      "fail": 0,
+      "skipped": 0
+    },
+    "rollout.test.mjs": {
+      "pass": 11,
+      "fail": 0,
+      "skipped": 0
+    },
+    "settings.test.mjs": {
+      "pass": 10,
+      "fail": 0,
+      "skipped": 0
+    },
+    "temp-sweep.test.mjs": {
+      "pass": 5,
+      "fail": 0,
+      "skipped": 0
+    },
+    "tool-note.test.mjs": {
+      "pass": 3,
+      "fail": 0,
+      "skipped": 0
+    },
+    "verifier-html.test.mjs": {
+      "pass": 14,
+      "fail": 0,
+      "skipped": 0
+    },
+    "verify-artifact.test.mjs": {
+      "pass": 10,
+      "fail": 0,
+      "skipped": 0
+    },
+    "wire.test.mjs": {
+      "pass": 34,
+      "fail": 0,
+      "skipped": 0
+    }
+  },
+  "mutation": {
+    "total": 231,
+    "sourceFiles": 42,
+    "missed": [],
+    "verdict": "PASS: 每个变异都被测试捕获，且源文件已字节还原"
+  },
+  "packaging": {
+    "ok": true,
+    "exit": 0,
+    "verdict": "PASS: 打包产物自足——35 个 lib 模块 + package.json + README + cordis.patch.yml + 封存题集，仓库外可直接 import；未夹带 test/、scripts/、题集之外的 eval 文件；源树字节未变"
+  },
+  "docs": {
+    "ok": true,
+    "exit": 0,
+    "output": [
+      "文档漂移检查（状态类文档；EVIDENCE.md 作为历史日志**不在范围内**）",
+      "权威值：{\"suites\":48,\"pass\":645,\"mutants\":231,\"sourceFiles\":42,\"libModules\":35}",
+      "预算口径：S1 上界 105048 / 期望 35016；S2 上界 4591098 / 期望 1530366；S3 上界 105048 / 期望 35016；S4 上界 35016 / 期望 11672",
+      "检查文件：4 份",
+      "✅ 计数类数字：未发现过期",
+      "✅ 预算类数字：未发现与 plan-E001.json 不符的上界/期望值",
+      "ℹ 外部引用豁免 27 处（运行时配置 11 · 产物 12 · 包内 2 · 本机工具 2）——这些按定义不在仓里",
+      "✅ 指向：文档里引用的仓内路径都存在",
+      "✅ 门面：根 README 提到了当前 0.6 版本号",
+      "✅ 引文：全仓引用的 EV 编号都能在 EVIDENCE.md 里找到（扫过 140 个文件）"
+    ]
+  },
+  "problems": [],
+  "notes": [],
+  "ok": true
+}

@@ -82,7 +82,7 @@ Kotlin 展示面与 `install-dsh.mjs` 装配面都从它派生；一致性由 `n
 | 插件 | 来源 | 作用 |
 |---|---|---|
 | `dsh-web-mobile` | <https://github.com/mexiaosqwq/dsh-web-mobile> | 竖屏/窄屏 Web 适配（抽屉导航、全宽会话、安全区、触控人体工学） |
-| `dsh-prompt-optimizer-mobile` | **本仓库 fork**，基于 <https://github.com/WestFox-AwA/dsh-prompt-optimizer> `v0.7.6`（见 [FORK.md](app/src/main/assets/extra-plugins/dsh-prompt-optimizer-mobile/FORK.md)） | 提示词优化（发送前用独立 AI 改写成命令）。fork 相对上游：**默认启用**（仅显式 `enabled:false` 关闭）、视口感知面板尺寸、窄屏断点、全面屏安全区、触控人体工学 |
+| `dsh-prompt-optimizer-mobile` | <https://github.com/WestFox-AwA/dsh-prompt-optimizer> `v0.8.1-stable` **原版**（见 [FORK.md](app/src/main/assets/extra-plugins/dsh-prompt-optimizer-mobile/FORK.md)） | 提示词优化（发送前用独立 AI 改写成命令）。⚠ **上游默认不启用**：需在 `.dsh/po06.json` 写 `{"enabled":true,"settingsVersion":"0.6"}` 才生效，否则表现为「面板在、点了没反应」 |
 | `dsh-codearts-auth` | <https://gitee.com/iJetLi/deepseek-harness-codearts> | CodeArts / Buddy / Qoder / Trae / Cline / Loomy 等多 Provider 登录与模型接入 |
 | `dsh-status-bridge` | **本仓库自研** | dsh 运行状态桥接到悬浮窗/通知（本地 HTTP，默认 :3190）。**与启动器 Kotlin 侧强耦合**：不装配则悬浮窗状态显示/TTS 播报链路失效（心跳 note 记为 `bridge-absent`，与「装了但掉线」区分开）。`/status` **需要 token**（每次启动轮换、写入 `files/status-bridge.json`，Kotlin 通过 `BridgeContract` 同源读取；不再回 CORS 头）；`lastText` 支持**逐段实时增长**（经 LLM 层 `llm/stream` waterfall 钩子对主请求做 tee，只取 `text-delta`，`reasoning`/`tool-call` 不外放） |
 | `dsh-android-links` | **本仓库自研** | 在 dsh HOME 创建 `sdcard → /storage/emulated/0` 符号链接，让工作区目录浏览器直达 SD 卡 |

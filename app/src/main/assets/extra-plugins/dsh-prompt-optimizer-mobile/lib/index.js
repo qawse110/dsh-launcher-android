@@ -1948,11 +1948,7 @@ export function apply(ctx, config) {
     return {
       configPath: ENABLE_CONFIG_PATH,
       configExists: existsSync(ENABLE_CONFIG_PATH),
-      // ⚠ dsh-launcher fork：本 fork 把「未配置」的回落值改成 rollout: null（FORK.md 改动 2），
-      // 而上游这行诊断直接读 i.rollout.mode —— 会抛 TypeError 让整个插件挂不上（真机实测：
-      //   prompt-optimizer: TypeError: Cannot read properties of null (reading 'mode')）。
-      // 这里对 null 容错：诊断字段而已，不该因为「没配置」就把插件打挂。
-      intent: { ok: i.ok, ours: i.ours, reason: i.reason, enabled: i.settings.enabled, rolloutMode: i.rollout == null ? null : i.rollout.mode },
+      intent: { ok: i.ok, ours: i.ours, reason: i.reason, enabled: i.settings.enabled, rolloutMode: i.rollout.mode },
       note: '未判定期间一律不启用（保守）；判定按 agent 懒触发',
     }
   })()

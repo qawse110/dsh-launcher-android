@@ -18,10 +18,6 @@ import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { SYSTEM_PROMPT } from './interpreter.js'
 import { parseEnableIntent } from './assembly-gate.js'
-// dsh-launcher fork：诊断字段要读 rollout 的归一化结果 —— 本 fork 把「未配置」的回落值
-// 改成 rollout: null（FORK.md 改动 2），直接读 intent.rollout.mode 会抛 TypeError。
-// normalizeRollout 对 null 安全（内部 `raw && typeof raw === "object" ? raw : {}`）。
-import { normalizeRollout } from './rollout.js'
 import { effectiveSettings } from './policy.js'
 import { normalizeSettings, describeSettings, writeSettings, SETTINGS_KEYS, parseJsonText } from './settings.js'
 
@@ -383,13 +379,12 @@ export function createControlHandler({ home, stateDir, ledgerPath, version = nul
           ok: true, version, home: H,
           advisorCollaboration: typeof advisorStageStatus==='function' ? (()=>{try{return advisorStageStatus(qsid || null)}catch{return {ok:false,reason:'stage-status-unavailable'}}})() : null,
           enabled: intent.settings.enabled === true,
-          // fork：走 normalizeRollout 以容忍 rollout 为 null（见文件头 import 的说明）
-          rollout: normalizeRollout(intent.rollout).mode,
+          rollout: intent.rollout.mode,
           // 诊断：`rollout` 是**回落来的 off**（配置里没写/写错）还是**用户显式写的 off**——
           // 这两种在界面上必须能分开，否则"什么都没发生"永远无从归因（用户 2026-09-22 要求查清
           // `gate:rollout-off`）。见 rollout.js 的 normalizeRollout/decideEnabled。
-          rolloutDefaulted: normalizeRollout(intent.rollout).defaulted === true,
-          rolloutNote: normalizeRollout(intent.rollout).defaulted === true
+          rolloutDefaulted: intent.rollout.defaulted === true,
+          rolloutNote: intent.rollout.defaulted === true
             ? (intent.settings.enabled === true
               ? '配置里没有（或写错了）rollout：已按 "all" 处理（因为你显式写了 enabled:true）'
               : '配置里没有（或写错了）rollout，且没有显式 enabled:true ⇒ 保守不启用')

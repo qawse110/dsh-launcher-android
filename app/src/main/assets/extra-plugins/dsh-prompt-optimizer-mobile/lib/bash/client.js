@@ -159,24 +159,11 @@ window.__ModuleLoader__.load({
     const inject = ["slots"]
     function apply(ctx) {
       if (!ctx || !ctx.slots || typeof ctx.slots.register !== "function") return
-      // dsh-launcher 补丁（FORK.md 改动 3）：keyed 座位按 key 唯一，而宿主在**非 Windows 平台自带 bash**
-      // 工具与卡片 ⇒ 这里注册 key:'bash' 会撞上宿主已占用的同一个 key，抛
-      //   Uncaught Error: keyed slot "tool.call.toolview" already has an entry for key "bash"
-      // 上游只在**服务端**按 hostProvidesBash = process.platform !== 'win32' 让位，
-      // 客户端这一侧漏了（v0.8.1 仍未修）。语义上「同名 key 已存在」= 宿主已提供 ⇒ 本卡片让位即可。
-      // 只吞这一种冲突，**其它错误照常抛出**（不掩盖真问题）。
-      ctx.slots.inject("tool.call.toolview", () => {
-        try {
-          return ctx.slots.register({
-            name: "tool.call.toolview",
-            key: "bash",
-            locale: "@dsh-external/dsh-bash-runtime",
-          }, Safe(BashRow))
-        } catch (e) {
-          if (/already has an entry/.test(String(e && e.message))) return null
-          throw e
-        }
-      })
+      ctx.slots.inject("tool.call.toolview", () => ctx.slots.register({
+        name: "tool.call.toolview",
+        key: "bash",
+        locale: "@dsh-external/dsh-bash-runtime",
+      }, Safe(BashRow)))
     }
 
     exports.apply = apply

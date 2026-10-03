@@ -1,0 +1,108 @@
+{
+  "probe": "po06-install-drill",
+  "phase": "P8",
+  "at": "2026-09-24T10:57:27.192Z",
+  "steps": {
+    "pack": {
+      "tgz": "dsh-external-dsh-po06-0.6.10.tgz",
+      "bytes": 298031,
+      "sha256": "d04528f407e8a07032559d54c8e92e65a86f63f26d3e9df5d2120ceb23383ce7"
+    },
+    "content": {
+      "count": 42,
+      "files": [
+        "HELP-0.6.en.md",
+        "HELP-0.6.md",
+        "README.md",
+        "cordis.patch.yml",
+        "eval/HOLDOUT-v1.md",
+        "eval/HOLDOUT-v2.md",
+        "lib/answer-audit.js",
+        "lib/assembly-gate.js",
+        "lib/clarifier.js",
+        "lib/client.js",
+        "lib/compiler.js",
+        "lib/control-api.js",
+        "lib/detect-old.js",
+        "lib/eval-e001.js",
+        "lib/eval-llm.js",
+        "lib/eval-plan.js",
+        "lib/eval-run.js",
+        "lib/eval-smoke.js",
+        "lib/feedback.js",
+        "lib/gate.js",
+        "lib/host-migrate.js",
+        "lib/index.js",
+        "lib/interpreter.js",
+        "lib/llm-lib.js",
+        "lib/migration.js",
+        "lib/pipeline.js",
+        "lib/policy.js",
+        "lib/posix.js",
+        "lib/projection.js",
+        "lib/read-tools.js",
+        "lib/reducer.js",
+        "lib/rollout.js",
+        "lib/schema.js",
+        "lib/session-context.js",
+        "lib/settings.js",
+        "lib/store.js",
+        "lib/strategy.js",
+        "lib/temp-sweep.js",
+        "lib/verifier-html.js",
+        "lib/verifier.js",
+        "lib/wire.js",
+        "package.json"
+      ]
+    },
+    "contentCheck": {
+      "onlyDeclared": true,
+      "unexpected": [],
+      "libCount": 35,
+      "declared": [
+        "lib",
+        "cordis.patch.yml",
+        "README.md",
+        "HELP-0.6.md",
+        "HELP-0.6.en.md",
+        "eval/HOLDOUT-v2.md",
+        "eval/HOLDOUT-v1.md"
+      ],
+      "hasBundleLayer": true,
+      "hasTestDir": false,
+      "hasScriptsDir": false,
+      "hasEvalDir": true,
+      "evalFiles": [
+        "eval/HOLDOUT-v1.md",
+        "eval/HOLDOUT-v2.md"
+      ],
+      "hasStrayEvalFiles": false,
+      "hasHoldout": true
+    },
+    "standaloneImport": {
+      "ok": true,
+      "exports": [
+        "POSIX_TOOL_PARAMETERS",
+        "__resetObservedModelsForTest",
+        "__test",
+        "adapter",
+        "apply",
+        "interpretViaLlm",
+        "ledgerContextFields",
+        "name",
+        "parameterSchemaViolations",
+        "plainDrain",
+        "posixToolState",
+        "readToolsFor",
+        "registerPosixTool"
+      ]
+    },
+    "sourceUnchanged": {
+      "ok": true,
+      "changed": []
+    }
+  },
+  "ok": true,
+  "verdict": "PASS: 打包产物自足——35 个 lib 模块 + package.json + README + cordis.patch.yml + 封存题集，仓库外可直接 import；未夹带 test/、scripts/、题集之外的 eval 文件；源树字节未变",
+  "packageDir": "C:\\Users\\WestFox\\AppData\\Local\\Temp\\po06-install-drill\\extracted\\package"
+}

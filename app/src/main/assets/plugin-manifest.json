@@ -21,8 +21,8 @@
       "name": "dsh-prompt-optimizer-mobile",
       "id": "prompt-optimizer",
       "title": "提示词优化",
-      "desc": "发送前用独立 AI 把输入改写成命令。dsh-launcher fork（基于上游 WestFox-AwA/dsh-prompt-optimizer v0.7.6）：本部署默认启用（仅显式 enabled:false 关闭），并含视口感知面板尺寸、窄屏断点、安全区、触控人体工学等移动端适配",
-      "version": "0.8.1-dshlauncher.1",
+      "desc": "发送前用独立 AI 把输入改写成命令。**上游 WestFox-AwA/dsh-prompt-optimizer v0.8.1-stable 原版**（不含 dsh-launcher fork 改动）。⚠ 上游设计为默认不启用：需在配置里显式 enabled:true 才生效",
+      "version": "0.8.1-stable",
       "upstream": "https://github.com/WestFox-AwA/dsh-prompt-optimizer"
     },
     {

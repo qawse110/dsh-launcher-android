@@ -42,8 +42,8 @@ import { log, eachPluginEntry, eachPluginClientFile } from '../env.mjs';
  *         **没有任何文件 import 这两个已删除符号**（唯一的 dsh-settings 提及是
  *         jet-hub-store.js 里的一句文档注释）。
  *       - dsh-web-mobile / dsh-prompt-optimizer-mobile：**完全不引用** dsh-settings。
- *         （后者是本仓库对上游 dsh-prompt-optimizer 的 fork，基于 v0.7.6 即上游的
- *         dsh-po06；实测其 lib/*.js 对 settingsNamespace 命中 0 处。）
+ *         （后者为上游 dsh-prompt-optimizer v0.8.1-stable 的原版内容，未叠加本地 fork
+ *         改动；实测其 lib/*.js 对 settingsNamespace 命中 0 处。）
  *     → 上述原生三个内置插件均**不是**本补丁的消费者。
  *   · 本补丁**当时的真实消费者**是 dsh-vision（来自 prebuilt.tgz 的 third_party/）与
  *     手动装配的 dsh-llm-codebuddy，两者都写

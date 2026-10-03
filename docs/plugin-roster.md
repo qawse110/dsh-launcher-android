@@ -16,7 +16,7 @@
 | # | dir | 插件名 (id) | 来源 | 作用 | 现状 | 默认装配 | 体积 | 版本 |
 |---|---|---|---|---|---|---|---|---|
 | 1 | `dsh-web-mobile` | 移动端适配 (`dsh-web-mobile`) | 上游 mexiaosqwq/dsh-web-mobile | 竖屏/窄屏 Web 适配：抽屉导航、全宽会话、安全区、触控人体工学 | 内置 | 是 | 595 KB / 8 文件 | 3.0.3 |
-| 2 | `dsh-prompt-optimizer-mobile` | 提示词优化 (`prompt-optimizer`) | **本仓 fork**（基于 WestFox-AwA/dsh-prompt-optimizer v0.7.6） | 发送前用独立 AI 把输入改写成命令；含移动端适配（视口感知面板、窄屏断点、安全区、触控） | 内置 | 是 | 963 KB / 54 文件 | 0.7.6-dshlauncher.1 |
+| 2 | `dsh-prompt-optimizer-mobile` | 提示词优化 (`prompt-optimizer`) | 上游 WestFox-AwA/dsh-prompt-optimizer v0.8.1-stable **原版** | 发送前用独立 AI 把输入改写成命令。⚠ 上游**默认不启用**（需显式配置） | 内置 | 是 | 约 960 KB | 0.8.1-stable |
 | 3 | `dsh-codearts-auth` | CodeArts 多 Provider (`codearts-auth`) | 上游 gitee iJetLi/deepseek-harness-codearts | CodeArts（华为云）浏览器登录，经 `ctx.credentials` 存临时凭据；清单描述另称覆盖 Buddy/Qoder/Trae/Cline | 内置 | 是 | 2268 KB / 170 文件 | 0.1.0 |
 | 4 | `dsh-status-bridge` | 状态桥接 (`dsh-status-bridge`) | **本仓自研** | dsh 运行状态 → Android 悬浮窗/通知/TTS（本地 HTTP，默认 :3190，token 鉴权，支持逐段流式） | 可选 | 否 | 14 KB / 3 文件 | 0.1.3 |
 | 5 | `dsh-android-links` | Android 存储桥接 (`dsh-android-links`) | **本仓自研** | 在 dsh HOME 建 `sdcard → /storage/emulated/0` 软链，让工作区目录选择器直达 SD 卡 | 可选 | 否 | 10 KB / 4 文件 | 0.1.1 |

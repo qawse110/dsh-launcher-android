@@ -142,13 +142,7 @@ export function createEnableGate({ decide, ttlMs = 5 * 60 * 1000, now = Date.now
 export function parseEnableIntent(text) {
   const conservative = {
     ok: false, ours: false, reason: 'not-enabled',
-    // ⚠ dsh-launcher fork（FORK.md 改动 2）：上游这里写 settings:{enabled:false}，
-    // 即「读不到/读不懂配置 = 用户关闭了」。但「完全没配置」会被 decideEnabled
-    // 当成显式 enabled:false ⇒ 默认启用永远不成立。fork 改为空 settings。
-    // rollout 必须是 **null 而不是 {mode:'off'}**：normalizeRollout 只在
-    // "mode 非法/缺失" 时才标 defaulted=true，而显式 {mode:'off'} 会被读成
-    // 用户的选择 ⇒ 默认启用同样不成立。
-    settings: {}, rollout: null,
+    settings: { enabled: false }, rollout: { mode: 'off' },
   }
   let cfg = null
   // 解析前**只去一个前导 BOM**（EV-0132 实测）：Windows 上记事本、PowerShell 的
@@ -188,12 +182,6 @@ export function parseEnableIntent(text) {
  * @param legacyText  旧路径文件的文本；文件不存在时传 `null`
  */
 export function pickEnableIntent(primaryText, legacyText) {
-  // ⚠ dsh-launcher fork（FORK.md 改动 2）：两个文件都不存在（未配置）时也必须返回
-  // **空 settings**（见 parseEnableIntent 的说明），否则「没配置」会经 legacy 分支
-  // 变成"显式关闭"，默认启用永远不成立。
-  if (primaryText == null && legacyText == null) {
-    return { ok: false, ours: false, reason: 'not-enabled', settings: {}, rollout: null }
-  }
   if (primaryText != null) return parseEnableIntent(primaryText)
   const legacy = parseEnableIntent(legacyText == null ? '' : legacyText)
   if (legacy.ours) return legacy
@@ -237,9 +225,7 @@ export function toActiveTriState(signal) {
  * @param oldPluginActive  旧插件是否仍在装配（true/false/**null=拿不到作用域**）
  */
 export function resolveEnableDecision({ intent, sessionId, oldPluginActive }) {
-  // ⚠ dsh-launcher fork（FORK.md 改动 2）：未配置时**不再回落成 settings.enabled:false**
-  // —— 那会被 decideEnabled 读成「用户显式关闭」。空对象 = 没表态 ⇒ 走 fork 的默认启用。
-  const base = intent && intent.ok ? intent : { settings: {}, rollout: null }
+  const base = intent && intent.ok ? intent : { settings: { enabled: false }, rollout: { mode: 'off' } }
   // 拿不到作用域时**不得**当作"不在装"（ADR-0033）：直接把结论降为 unknown 且不启用。
   if (oldPluginActive === null || oldPluginActive === undefined) {
     return {
