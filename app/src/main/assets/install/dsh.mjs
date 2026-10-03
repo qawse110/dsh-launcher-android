@@ -4,7 +4,7 @@
  * 职责边界：本模块只关心「把 @deepseek-ai/dsh 装到 DSH_PREFIX、版本钉死、
  * 必要时装 ripgrep 兜底」。不涉及插件装配（见 plugins.mjs）与依赖桥接（见 deps.mjs）。
  */
-import { existsSync, writeFileSync, mkdirSync, readFileSync, rmSync, readdirSync, cpSync, chmodSync } from 'node:fs';
+import { existsSync, writeFileSync, mkdirSync, readFileSync, rmSync, readdirSync, cpSync, chmodSync, symlinkSync, readlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   FILES_DIR, NODE_BIN, NPM_BIN, DSH_PREFIX, TOOLS, TERMUX, REGISTRY, REGISTRY_FALLBACK,
@@ -45,52 +45,54 @@ function fixStaleHoistedLinks(pkgDir) {
   })();
   if (!selfVersion || !existsSync(store)) return;
 
-  // .pnpm 里每个 @deepseek-ai/<name> 的最高版本目录（hoist 应指向的那个）
-  const best = new Map();
+  if (!existsSync(scopeDir)) return;
+
+  // 目标版本 = **已装 dsh 的版本**，不是「store 里最高版本」。
+  // `@deepseek-ai/dsh` 与 `@deepseek-ai/dsh-*` 一族是**同版本发布**的，运行时必须同版本；
+  // 而 store 里常同时残留新旧两版（升级/回滚都会往里加），取「最高」在回滚场景下会
+  // 反而选成新版 —— 那正是「dsh 0.1.7 + 内部包 0.2.0」这类混版的来源。
+  // 其余包（cordis / schemastery / cosmokit …）各有独立版本，不归本函数管。
+  const target = new Map();   // name -> 该版本的 .pnpm 目录
   for (const d of readdirSync(store)) {
     if (d.startsWith('.')) continue;
     const inner = join(store, d, 'node_modules/@deepseek-ai');
     if (!existsSync(inner)) continue;
     for (const name of readdirSync(inner)) {
+      if (name !== 'dsh' && !name.startsWith('dsh-')) continue;
+      if (target.has(name)) continue;
       const dir = join(inner, name);
-      let ver = '0.0.0';
-      try { ver = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')).version || ver; } catch {}
-      const cur = best.get(name);
-      if (!cur || cmpVerLocal(ver, cur.ver) > 0) best.set(name, { dir, ver });
+      let ver = '';
+      try { ver = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')).version || ''; } catch { continue; }
+      if (ver === selfVersion) target.set(name, dir);
     }
   }
-  if (!best.size) return;
+  if (!target.size) return;
 
-  let stale = 0;
+  // **原地重指**，不删 node_modules：只动 scope 目录里的符号链接。
+  // 旧实现是「发现不一致就 rm -rf node_modules 再 pnpm install」——代价高（数百 MB 重链），
+  // 且中途失败会把可用的 dsh 变成零安装。这里逐条改指向，幂等、可中断、失败不影响其它条目。
+  let fixed = 0;
   const samples = [];
-  for (const [name, info] of best) {
+  for (const [name, dir] of target) {
     const link = join(scopeDir, name);
     let points = '';
-    try { points = readlinkSync(link); } catch { continue; }   // 不存在/非链接 → 不属本判据
-    if (points === info.dir) continue;                          // 已指向最优版本 → 正常
+    try { points = readlinkSync(link); } catch { continue; }   // 不存在/非链接 → 跳过
+    if (points === dir) continue;                              // 已指向目标目录
     let at = '';
     try { at = JSON.parse(readFileSync(join(link, 'package.json'), 'utf8')).version || ''; } catch {}
-    if (at && at === info.ver) continue;                        // 解析出的版本一致（peer 变体目录不同名）→ 无需处理
-    stale++;
-    if (samples.length < 3) samples.push(`${name}(${at || '?'}→${info.ver})`);
-    // 顶层自身那个包（@deepseek-ai/dsh）不参与：pinned 版本由 ensureDsh 负责
+    if (at === selfVersion) continue;                          // 版本已一致（peer 变体目录名不同）
+    try {
+      rmSync(link, { recursive: true, force: true });
+      symlinkSync(dir, link);
+      fixed++;
+      if (samples.length < 4) samples.push(`${name}(${at || '?'}→${selfVersion})`);
+    } catch (e) {
+      log('WARN relink ' + name + ': ' + e.message);
+    }
   }
-  if (!stale) return;
-  log(`stale hoisted links detected: ${stale}/${best.size} 指向非最优版本（如 ${samples.join(', ')}）`);
-  log('rebuilding node_modules to refresh the hoist face (pnpm does not relink across a minor bump) ...');
-  try {
-    rmSync(nm, { recursive: true, force: true });
-  } catch (e) {
-    log('WARN stale-link repair: cannot remove node_modules: ' + e.message);
-    return;
+  if (fixed) {
+    log(`stale hoisted links re-pointed to dsh ${selfVersion}: ${fixed} 个（如 ${samples.join(', ')}）`);
   }
-  const pnpmBin = join(FILES_DIR, '.tools', 'bin', 'pnpm');
-  const r = runEx(pnpmBin, [
-    'install', '--dir', DSH_PREFIX, '--registry', REGISTRY,
-    '--ignore-scripts', '--reporter', 'append-only', '--loglevel', 'warn',
-  ], { env: { ...envBase(), npm_config_store_dir: join(FILES_DIR, '.tools', 'pnpm-store') }, timeoutMs: NPM_TIMEOUT_MS });
-  if (r.ok) log('stale hoisted links repaired (node_modules rebuilt)');
-  else log(`WARN stale-link repair: pnpm install exit ${r.code}; 下次启动会重试`);
 }
 
 /** 本模块私用的 semver 比较（与 deps.mjs 的 cmpVer 同规则，避免跨模块导出内部件）。 */

@@ -91,6 +91,15 @@ class MainActivity : AppCompatActivity() {
 
     private var updateCheckCount = 0
 
+    /**
+     * 最近一次版本检查发现的**目标版本号**（null = 无更新可用）。
+     *
+     * 为什么必须记住它：[startUpdate] 要把这个精确版本号写进 `dsh_install_tag`，
+     * 否则流程会回落到**钉死版本**（见 startUpdate 的注释）——那正是「发现新版本却
+     * 更新不动」的成因。检查与安装是两次独立调用，所以版本号得在这里传递。
+     */
+    private var pendingUpdateVersion: String? = null
+
     private val pollRunnable = object : Runnable {
         override fun run() {
             if (!flowing) refreshRunState(silent = true)
@@ -104,6 +113,7 @@ class MainActivity : AppCompatActivity() {
                     val latest = runCatching { DshUpdater.checkRemote(this@MainActivity, false) { } }.getOrNull()
                     if (latest != null) {
                         runOnUiThread {
+                            pendingUpdateVersion = latest
                             updateLabel.text = "🆕 发现新版本 v$latest"
                             updateLabel.setTextColor(Ui.BRAND)
                             updateBtn.visibility = View.VISIBLE
@@ -608,11 +618,13 @@ class MainActivity : AppCompatActivity() {
                 if (isFinishing || isDestroyed) return@runOnUiThread
                 when {
                     latest != null -> {
+                        pendingUpdateVersion = latest
                         updateLabel.text = "🆕 发现新版本 v$latest"
                         updateLabel.setTextColor(Ui.BRAND)
                         updateBtn.visibility = View.VISIBLE
                     }
                     else -> {
+                        pendingUpdateVersion = null
                         updateLabel.text = "✓ 已是最新版本 v" + DshUpdater.currentVersion(this@MainActivity)
                         updateLabel.setTextColor(Ui.SUCCESS)
                         updateBtn.visibility = View.GONE
@@ -622,11 +634,32 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 一键更新 DSH 核心 + 插件，完成后自动重启 web。 */
+    /**
+     * 一键更新 DSH 核心 + 插件，完成后自动重启 web。
+     *
+     * ⚠ **必须先把目标版本号写进 `dsh_install_tag`**（原实现漏了这一步，是真机可复现的缺陷）：
+     * DshFlow 决定装哪个版本时读的是该 pref，**缺省回落到钉死版本**（assets/dsh-pin.json）。
+     * 所以只调 launch(INSTALL_ONLY) 而不写 tag，流程会拿钉死版本去装 —— 界面明明显示
+     * 「🆕 发现新版本 vX」，点「立即更新」却装了个同版本，等于**什么都没更新**
+     * （用户侧表现就是「应用内更新 dsh 失败」）。
+     *
+     * 这与 DshFlow 第 ~318 行的设计注释一致：「检查到新版本→更新」路径**应当**显式置
+     * tag=远端精确版本号，否则回滚基线也记不上、临时更新保护失效。
+     * 写精确号而非 "latest"：保证装的就是界面刚展示给用户的那一版，两者不会因为
+     * registry 在检查与安装之间又发新版而对不上。
+     */
     private fun startUpdate() {
         if (!guardBusy("update")) return
+        val target = pendingUpdateVersion
+        if (target == null) {
+            // 没检查到版本就点更新：明确告知，而不是静默装一遍钉死版本假装成功
+            toast("请先「检查更新」")
+            return
+        }
         setBusy(true)
-        appendMiniLog(">> 开始更新 DSH 核心…")
+        getSharedPreferences(AppState.Prefs.CONSOLE, Context.MODE_PRIVATE)
+            .edit().putString("dsh_install_tag", target).apply()
+        appendMiniLog(">> 开始更新 DSH 核心到 v$target …")
         DshFlow.launch(
             this, DshFlow.Mode.INSTALL_ONLY,
             onLog = { line -> runOnUiThread { appendMiniLog(line) } },
