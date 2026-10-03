@@ -448,7 +448,15 @@ class PluginManagerActivity : AppCompatActivity() {
 
         listBox.addView(sectionHeader("在线扩展", "${extras.size} 个"))
         for (info in extras) {
-            listBox.addView(makeCard(info.name, info.desc, info.version, "已装配", listOf("卸载" to { uninstall(info.name) })))
+            // 在线扩展只挂「卸载」时，用户无法让它跟上上游（见 checkPluginUpdate 注释）。
+            // 有来源记录（本页装过）才给更新入口：无记录时无从比对上游。
+            val acts = mutableListOf<Pair<String, () -> Unit>>()
+            if (sourceOf(info.name) != null) {
+                acts.add("检查更新" to { checkPluginUpdate(info.name, apply = false) })
+                acts.add("更新" to { checkPluginUpdate(info.name, apply = true) })
+            }
+            acts.add("卸载" to { uninstall(info.name) })
+            listBox.addView(makeCard(info.name, info.desc, info.version, "已装配", acts))
         }
         listBox.addView(buildInstallCard())
     }
@@ -1239,29 +1247,81 @@ class PluginManagerActivity : AppCompatActivity() {
     private fun installFromRepo() {
         if (!guardBusy()) return
         val raw = input.text.toString().trim()
-        val repo = parseRepo(raw)
-        if (repo == null) {
-            appendLog("仓库格式无效：$raw（应形如 owner/repo 或 https://github.com/owner/repo）")
+        val parsed = parseRepo(raw)
+        if (parsed == null) {
+            appendLog("仓库格式无效：$raw（应形如 owner/repo、https://github.com/owner/repo 或 https://gitee.com/owner/repo）")
             return
         }
-        when (repo) {
-            ROUTING_REPO -> {
-                appendLog(">> 特殊适配安装 $repo …")
-                runRoutingSuite()
-            }
-            else -> runDshPlugin(listOf("add", "github:$repo"), "安装 $repo")
+        val (domain, repo) = parsed
+        if (repo == ROUTING_REPO) {
+            appendLog(">> 特殊适配安装 $repo …")
+            runRoutingSuite()
+            return
         }
+        // spec 形态按来源域选择（见 parseRepo 注释）：GitHub 用简写，Gitee 用完整 git URL
+        val spec = when (domain) {
+            "gitee" -> "git+https://gitee.com/$repo.git"
+            else -> "github:$repo"
+        }
+        pendingSource = repo to domain
+        if (!guardBusy()) return
+        setBusy(true)
+        Thread {
+            try {
+                // ① 预置 allowBuilds（git 源插件的 prepare 构建需放行，见 allowGitBuild 注释）
+                allowGitBuild(domain, repo)
+                var code = dshPluginSync(listOf("add", spec), "安装 $repo")
+                if (code != 0) {
+                    // ② pnpm 会把真实包名写成占位行（仓库名 ≠ 包名）——批准它再试一次
+                    if (approvePendingBuilds()) {
+                        appendLog(">> 构建许可已批准，重试安装…")
+                        code = dshPluginSync(listOf("add", spec), "重试安装 $repo")
+                    }
+                }
+                if (code == 0) rememberPendingSource()
+            } catch (t: Throwable) {
+                appendLog("安装异常: " + t.message)
+            } finally {
+                runOnUiThread { setBusy(false); refreshListSafe() }
+            }
+        }.start()
     }
 
-    private fun parseRepo(raw: String): String? {
-        var r = raw.trim().removeSuffix("/").removeSuffix(".git")
-        if (r.startsWith("github:")) r = r.removePrefix("github:")
-        if (r.startsWith("https://github.com/")) r = r.removePrefix("https://github.com/")
-        else if (r.startsWith("http://github.com/")) r = r.removePrefix("http://github.com/")
-        if (r.startsWith("github.com/")) r = r.removePrefix("github.com/")
+    /**
+     * 解析仓库输入 → (来源域, "owner/repo")，无法识别时返回 null。
+     *
+     * 为什么要带上**来源域**：装配 spec 的形态随域不同 —— GitHub 支持 github:owner/repo
+     * 简写，而 Gitee 不在 dsh/pnpm 的 GIT_SHORTHAND 白名单里（dsh 的 install-spec.js 里是
+     * /^(?:github|gitlab|bitbucket|gist):/i），必须用完整 git URL。
+     * 真机实测：gitee 裸 URL 交给 pnpm 会被当成 tarball（ERR_PNPM_TARBALL_EXTRACT: Invalid
+     * checksum for TAR header），而 git+https://gitee.com/<owner>/<repo>.git 能正常装成。
+     *
+     * 旧实现只剥 github 前缀、装配处硬编码 github: 前缀 —— 输入 gitee 地址要么被判「格式无效」，
+     * 要么被拼成 github:gitee.com/... 去装错仓库。
+     */
+    private fun parseRepo(raw: String): Pair<String, String>? {
+        val r = raw.trim().removeSuffix("/").removeSuffix(".git")
+        // 各域的可识别前缀（顺序无关，命中即按该域处理）
+        val hosts = listOf(
+            "github" to listOf("github:", "https://github.com/", "http://github.com/", "github.com/"),
+            "gitee" to listOf("https://gitee.com/", "http://gitee.com/", "gitee.com/"),
+        )
+        for ((domain, prefixes) in hosts) {
+            for (p in prefixes) {
+                if (!r.startsWith(p)) continue
+                val seg = r.removePrefix(p).split("/")
+                if (seg.size >= 2 && seg[0].isNotEmpty() && seg[1].isNotEmpty()) {
+                    return domain to (seg[0] + "/" + seg[1])
+                }
+                return null   // 前缀命中但路径不全 → 无效，不回退成裸 owner/repo
+            }
+        }
+        // 裸 owner/repo：无域信息，按 GitHub 处理（保持既有行为）
         val seg = r.split("/")
-        if (seg.size < 2 || seg[0].isEmpty() || seg[1].isEmpty()) return null
-        return "${seg[0]}/${seg[1]}"
+        if (seg.size >= 2 && seg[0].isNotEmpty() && seg[1].isNotEmpty()) {
+            return "github" to (seg[0] + "/" + seg[1])
+        }
+        return null
     }
 
     // ── dsh plugin CLI ─────────────────────────────────────
@@ -1314,7 +1374,8 @@ class PluginManagerActivity : AppCompatActivity() {
         setBusy(true)
         Thread {
             try {
-                dshPluginSync(args, label)
+                val code = dshPluginSync(args, label)
+                if (code == 0) rememberPendingSource()
                 refreshListSafe()
             } catch (t: Throwable) {
                 appendLog("$label 异常: ${t.message}")
@@ -1533,6 +1594,210 @@ class PluginManagerActivity : AppCompatActivity() {
     }
 
     /** 卸载：官方 dsh plugin --profile web remove <package>。 */
+    // ── 在线扩展的来源记录与更新 ─────────────────────────
+
+
+    /** 读回某个在线插件的来源（无记录返回 null）。 */
+    private fun sourceOf(pkg: String): Pair<String, String>? {
+        val v = prefs().getString("src_" + pkg, null) ?: return null
+        val i = v.indexOf('|')
+        if (i <= 0) return null
+        return v.substring(0, i) to v.substring(i + 1)
+    }
+
+    /** 待落盘的来源（安装是异步的，包名要装完才拿得到）。 */
+    @Volatile private var pendingSource: Pair<String, String>? = null
+    /**
+     * 允许 git 源插件的 prepare 构建 —— 否则 pnpm 出于供应链安全**默认阻止**，装不上。
+     *
+     * 为什么不能只靠自己拼 key（真机踩到）：key 里的**包名是 package.json 的 name**，不是仓库名。
+     * 例如 gitee.com/iJetLi/deepseek-harness-codearts 的包名其实是 `dsh-codearts-auth`。
+     * 仓库要 clone 下来才知道包名，预拼必然写错；pnpm 会把它当无效条目，另写一条占位：
+     *
+     *   allowBuilds:
+     *     dsh-codearts-auth@git+https://…git#<sha>: set this to true or false
+     *
+     * 所以分两步：① 先按 repo 名尽力写一条（有些仓库确实同名，能一次过）；
+     * ② 安装后由 approvePendingBuilds() 扫 pnpm 写下的占位行，用**真实包名**改成 true。
+     */
+    private fun allowGitBuild(domain: String, repo: String) {
+        try {
+            val head = remoteHead(domain, repo)
+            if (head == null) {
+                appendLog("   （未取到上游 HEAD，跳过 allowBuilds 预置）")
+                return
+            }
+            val spec = when (domain) {
+                "gitee" -> "git+https://gitee.com/$repo.git"
+                else -> "git+https://github.com/$repo.git"
+            }
+            val guess = repo.substringAfter('/')
+            appendAllowBuild(guess + "@" + spec + "#" + head)
+            appendLog("   已预置 allowBuilds（猜测包名 " + guess + "，装后按 pnpm 写下的实际包名纠正）")
+        } catch (t: Throwable) { appendLog("   WARN allowGitBuild: " + t.message) }
+    }
+
+    /**
+     * 把 pnpm 写下的 `set this to true or false` 占位行改成 true。
+     *
+     * pnpm 在 add 时会把识别出的**真实包名**写进 allowBuilds（值留成待裁决的占位），
+     * 这是唯一可靠的包名来源（仓库名 ≠ 包名）。改完重跑 add，prepare 构建即被放行。
+     * @return 是否改动了占位（true 表示值得再试一次 add）
+     */
+    private fun approvePendingBuilds(): Boolean {
+        val f = File(profileWebDir(), "pnpm-workspace.yaml")
+        if (!f.isFile) return false
+        return try {
+            val txt = f.readText()
+            val marker = "set this to true or false"
+            if (!txt.contains(marker)) return false
+            val out = StringBuilder()
+            for (line in txt.split("\n")) {
+                if (line.contains(marker) && line.contains("@git+")) {
+                    out.append(line.substringBeforeLast(":")).append(": true")
+                } else {
+                    out.append(line)
+                }
+                out.append("\n")
+            }
+            f.writeText(out.toString())
+            appendLog("   已批准 pnpm 列出的构建许可（prepare 脚本）")
+            true
+        } catch (t: Throwable) {
+            appendLog("   WARN approvePendingBuilds: " + t.message)
+            false
+        }
+    }
+
+    /** 往 profile 的 pnpm-workspace.yaml 追加一条 allowBuilds（幂等、保留原有内容）。 */
+    private fun appendAllowBuild(key: String) {
+        val f = File(profileWebDir(), "pnpm-workspace.yaml")
+        val cur = if (f.isFile) f.readText() else "packages:\n  - .\n"
+        if (cur.contains(key)) return
+        val line = "  '" + key + "': true"
+        val out = if (Regex("^allowBuilds:", RegexOption.MULTILINE).containsMatchIn(cur)) {
+            cur.trimEnd() + "\n" + line + "\n"
+        } else {
+            cur.trimEnd() + "\nallowBuilds:\n" + line + "\n"
+        }
+        f.parentFile?.mkdirs()
+        f.writeText(out)
+    }
+
+    /** 安装成功后把来源按**真实包名**落盘（供检查更新按包名查）。 */
+    private fun rememberPendingSource() {
+        val p = pendingSource ?: return
+        pendingSource = null
+        val (repo, domain) = p
+        val pkg = try {
+            val j = JSONObject(profilePkg().readText())
+            val deps = j.optJSONObject("dependencies")
+            if (deps == null) null else deps.keys().asSequence().firstOrNull { k -> deps.optString(k).contains(repo) }
+        } catch (t: Throwable) { null }
+        if (pkg == null) {
+            appendLog("   （未能识别包名，来源未记录；更新入口将不可用）")
+            return
+        }
+        prefs().edit().putString("src_" + pkg, domain + "|" + repo).apply()
+        appendLog("   已记录来源：" + pkg + " ← " + domain + "/" + repo)
+    }
+
+    private fun prefs() = getSharedPreferences("dsh_plugin_src", MODE_PRIVATE)
+
+    /** 该插件在 lockfile 里钉住的 commit（无则 null）。 */
+    private fun installedCommit(pkg: String): String? {
+        return try {
+            val lf = File(profileWebDir(), "pnpm-lock.yaml")
+            if (!lf.isFile) return null
+            val re = Regex("\\s" + Regex.escape(pkg) + ":\\s*")
+            val txt = lf.readText()
+            val m = re.find(txt) ?: return null
+            val tail = txt.substring(m.range.last + 1).take(600)
+            Regex("#([0-9a-f]{40})").find(tail)?.groupValues?.get(1)
+        } catch (t: Throwable) { null }
+    }
+
+    /** 上游 HEAD commit（git ls-remote）。失败返回 null。 */
+    private fun remoteHead(domain: String, repo: String): String? {
+        val url = when (domain) {
+            "gitee" -> "https://gitee.com/$repo.git"
+            else -> "https://github.com/$repo.git"
+        }
+        val out = captureProcess("git ls-remote " + url + " HEAD", baseEnv()) ?: return null
+        return Regex("^([0-9a-f]{40})").find(out.trim())?.groupValues?.get(1)
+    }
+
+    /** 执行命令并**捕获 stdout**（runProcess 只回 exit code，版本查询需要输出）。 */
+    private fun captureProcess(cmd: String, env: Map<String, String>): String? {
+        return try {
+            val bash = TermuxRuntime.bashPath(this)
+            if (!bash.isFile) return null
+            val pb = ProcessBuilder(bash.absolutePath, "-c", cmd)
+            pb.redirectErrorStream(true)
+            pb.directory(File(filesDir, "tmp").apply { mkdirs() })
+            val e = pb.environment()
+            env.forEach { (k, v) -> e[k] = v }
+            val p = pb.start()
+            val out = p.inputStream.bufferedReader().readText()
+            p.waitFor()
+            out
+        } catch (t: Throwable) { appendLog("   WARN capture: ${t.message}"); null }
+    }
+
+    /**
+     * 检查某个在线插件是否有上游更新，并（可选）执行更新。
+     *
+     * **为什么必须用「显式 commit」重装**（真机实测）：
+     * pnpm 把 git spec 的解析结果钉进 lockfile，之后 `pnpm update` / `pnpm add` /
+     * `--force` 在 specifier 未变时**根本不会调用 git ls-remote**（用 git 包装脚本实测确认：
+     * 五种方式全部未触发），所以点「更新」会空转。
+     * 唯一可靠的做法是自己 `git ls-remote` 取上游 HEAD，再以
+     * `git+https://<host>/<owner>/<repo>.git#<commit>` 重新 add —— specifier 因此变化，
+     * pnpm 必须重新解析（实测 specifier 与 version 都推进到新 commit）。
+     */
+    private fun checkPluginUpdate(pkg: String, apply: Boolean) {
+        if (!guardBusy()) return
+        val src = sourceOf(pkg)
+        if (src == null) {
+            appendLog("$pkg：无来源记录（非本页安装，无法比对上游）")
+            toast("该插件没有来源记录")
+            return
+        }
+        val (domain, repo) = src
+        setBusy(true)
+        Thread {
+            try {
+                appendLog(">> 检查 $pkg 上游（$domain/$repo）…")
+                val head = remoteHead(domain, repo)
+                if (head == null) {
+                    appendLog("   ✗ 无法获取上游 HEAD（网络或仓库不可达）")
+                    return@Thread
+                }
+                val cur = installedCommit(pkg)
+                appendLog("   已装 commit: ${cur ?: "?"}")
+                appendLog("   上游 commit: $head")
+                if (cur == head) {
+                    appendLog("   ✓ 已是最新")
+                    return@Thread
+                }
+                appendLog("   ↑ 发现新版本")
+                if (!apply) return@Thread
+                // 以显式 commit 重装：specifier 变化 → pnpm 必须重新解析（见上方注释）
+                val spec = when (domain) {
+                    "gitee" -> "git+https://gitee.com/$repo.git#$head"
+                    else -> "git+https://github.com/$repo.git#$head"
+                }
+                appendLog(">> 更新到 ${head.take(8)} …")
+                val code = dshPluginSync(listOf("add", spec), "更新 $pkg")
+                appendLog(if (code == 0) "   ✓ 更新完成" else "   ✗ 更新失败（exit=$code）")
+            } catch (t: Throwable) {
+                appendLog("检查更新异常: ${t.message}")
+            } finally {
+                runOnUiThread { setBusy(false); refreshListSafe() }
+            }
+        }.start()
+    }
+
     private fun uninstall(name: String) {
         runDshPlugin(listOf("remove", name), "卸载 $name")
     }
