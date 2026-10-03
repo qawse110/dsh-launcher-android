@@ -32,10 +32,16 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials';
 import { createUserMessage, LlmError } from '@deepseek-ai/dsh-llm';
 import { BuddyAdapter } from './buddy-adapter.js';
 import { LobsteraiAdapter } from './lobsterai-adapter.js';
+import { QoderAdapter } from './qoder-adapter.js';
+import { ClineAdapter } from './cline-adapter.js';
+import { ZcodeAdapter } from './zcode-adapter.js';
 import { TraeAdapter } from './trae-adapter.js';
 import { CodeArtsAdapter, isRateLimited, parseRateLimitError } from './llm-adapter.js';
 import { productById } from './product.js';
 import { lobsteraiProductById } from './lobsterai-product.js';
+import { qoderProductById } from './qoder-product.js';
+import { clineProductById } from './cline-product.js';
+import { zcodeProductById } from './zcode-product.js';
 /**
  * TRAE 的 provider id。
  *
@@ -114,26 +120,51 @@ async function probeWithAdapter(entry, credential, modelId, timeoutMs) {
     // refresh 设为 no-op：探测不应触发全局续期流程（那会影响其他账号与
     // 其他并发会话），凭据真的过期就让它以 AUTH 失败并如实上报。
     //
-    // **四条产品线各自选适配器**，顺序不能颠倒也不能漏判：
+    // **七条产品线各自选适配器**，顺序不能颠倒也不能漏判：
     // - CodeBuddy 系（buddy / workbuddy）→ BuddyAdapter，按各自 product 发请求；
     // - LobsterAI → LobsteraiAdapter（自己的端点与头族）；
+    // - Qoder 系（qoder / qodercn）→ QoderAdapter（WASM 加密体 + 签名头族）；
+    // - Cline → ClineAdapter（WorkOS 凭据 + 自己的端点）；
+    // - ZCode（智谱）→ ZcodeAdapter（Anthropic Messages 体 + 阿里云 captcha 参数）；
     // - TRAE → TraeAdapter（SOLO 格式请求体 + Cloud-IDE-JWT 头族）；
     // - 其余（codearts）→ CodeArtsAdapter（华为云 HMAC 签名）。
     //
-    // ⚠️ **这个分派表已两次因「新增 provider 没同步」而出缺陷**，改它前先读完：
+    // ⚠️ **这个分派表已四次因「新增 provider 没同步」而出缺陷**，改它前先读完：
     //
     // 1. 初版只判断 `provider === 'buddy'` → workbuddy 落入 else，用华为云
     //    HMAC 签名去发 WorkBuddy 凭据而必然失败；
     // 2. 加了 lobsterai 分支后**仍漏掉 trae** → TRAE 账号同样落入 else，
     //    用 CodeArts 签名发 TRAE 请求而必然失败（2026-09-25 排查 workbuddy
     //    缺陷时发现，实测 `productById('trae')` 与 `lobsteraiProductById('trae')`
-    //    均为 undefined）。
+    //    均为 undefined）；
+    // 3. 加了 trae 分支后**仍漏掉 qoder / qodercn / cline** → 三者同样落入
+    //    else，被交给 CodeArtsAdapter 用华为云 HMAC 签名去发 Qoder / Cline
+    //    凭据。它们的「重测 / 重置」按钮**确实会渲染**（`RATE_LIMIT_CAPABILITIES`
+    //    对未登记的 provider 默认视为有限流，只有 loomy 显式登记为 false），
+    //    且 Qoder 的额度受限**每次都会**写 `modelRateLimits`（按 UTC+8 当日
+    //    24:00 标记），于是「点重测 → 拿到签名错误 → 标记也清不掉」成为稳定
+    //    可复现的死循环；
+    // 4. 补上 qoder / qodercn / cline 之后**仍漏掉 zcode**（本次）→ 同型第 4 次。
+    //    它的写入点 `zcode-adapter.ts` 的 `switchAccountOnQuota()` 与 Qoder
+    //    **完全同款**（同样按 UTC+8 当日 24:00 标记该模型），而那个写入点是
+    //    在本分支建立**之后**才进 master 的 —— 正是「清单靠记忆维护」必漏的情形。
     //
-    // 判据是「**该 provider 会不会写 `modelRateLimits`**」—— 写了才会有重测
-    // 按钮，才需要在这里分派。新增 provider 时务必同步本分支，
+    // ⚠️ **判据是「该 provider 会不会写 `modelRateLimits`」**（写了才有重测按钮、
+    // 才需要在这里分派）。但**不要靠记忆维护清单**，直接机械核对写入方：
+    //
+    //     grep -n 'updateModelRateLimit(' src/*.ts
+    //
+    // 命中者（除 `account-pool.ts` 的定义与 `account-probe.ts` 自身的回写）的每个
+    // 适配器都必须在这里有分支：buddy（含 workbuddy）/ lobsterai / qoder（含
+    // qodercn）/ cline / zcode / trae / codearts。反例：loomy 的积分耗尽时静默
+    // 降级、**不写**标记，故它落 else 无害（`retestAccount` 取不到 modelId 时
+    // 根本不构造适配器）。新增 provider 时务必同步本分支，
     // 并补 `tests/unit/account-probe-adapter.spec.ts` 的对应用例。
     const buddyProduct = productById(entry.provider);
     const lobsteraiProduct = lobsteraiProductById(entry.provider);
+    const qoderProduct = qoderProductById(entry.provider);
+    const clineProduct = clineProductById(entry.provider);
+    const zcodeProduct = zcodeProductById(entry.provider);
     let adapter;
     if (buddyProduct !== undefined) {
         adapter = new BuddyAdapter({
@@ -149,6 +180,48 @@ async function probeWithAdapter(entry, credential, modelId, timeoutMs) {
             resolveCredential: async () => credential,
             refresh: async () => { },
             product: lobsteraiProduct,
+        });
+    }
+    else if (qoderProduct !== undefined) {
+        // Qoder 国际版与中国版**共用同一个适配器类**，差异全在 product 配置里
+        // （区域端点、client_id、模型表）。探测只发一次最小纯文本请求，不涉及
+        // 工具/图片，故除了 product 之外无需注入其它钩子；`uid` 由凭据自身携带
+        // （旧凭据缺 uid 时适配器会明确报错，而不是发出必然失败的请求）。
+        adapter = new QoderAdapter({
+            credentialRef: ref,
+            resolveCredential: async () => credential,
+            refresh: async () => { },
+            product: qoderProduct,
+        });
+    }
+    else if (clineProduct !== undefined) {
+        adapter = new ClineAdapter({
+            credentialRef: ref,
+            resolveCredential: async () => credential,
+            refresh: async () => { },
+            product: clineProduct,
+        });
+    }
+    else if (zcodeProduct !== undefined) {
+        // ZCode 的免费额度通道（`/zcode-plan/anthropic`）**按需**要 captcha：
+        // 默认先不带验证头探一次，被 `3007` 拒才产出（需要验证时复用同一个 param
+        // 必再得 `3007`）。
+        // ⇒ 探测路径若上游当下不要验证，**不会**拉起浏览器；要验证才拉。
+        //
+        // ⚠️ 已知取舍：探测路径**没有** `mintCaptcha` 透传通道（`ProbeDeps` 里没有
+        // 这一项），故**一旦上游索要验证**，这里的适配器就**自建**一个常驻浏览器
+        // （上游不要验证时压根不 mint，也就不会拉）。若宿主里已有 `index.ts`
+        // 注入的那台（`zcode.mintCaptcha`），短时会并存两台（约 200MB/台）。
+        // 这仍然远好于本缺陷的形态 —— 落 else 会被交给**华为云 HMAC 签名**的
+        // `CodeArtsAdapter` 去发 zcode 凭据，探测必然失败，而 zcode 的额度标记
+        // （UTC+8 当日 24:00）会一直清不掉。
+        // 后续若要消除这层浪费，应给 `ProbeDeps` 加一条 `mintCaptcha` 透传，
+        // 与 `index.ts` 的 `zcode.mintCaptcha` 共用同一台常驻浏览器。
+        adapter = new ZcodeAdapter({
+            credentialRef: ref,
+            resolveCredential: async () => credential,
+            refresh: async () => { },
+            product: zcodeProduct,
         });
     }
     else if (entry.provider === TRAE_PROVIDER_ID) {

@@ -19,6 +19,18 @@ import { CLINE_HTTP_TIMEOUT_MS, runClineLoginFlow, startClineLoginFlow, } from '
 import { applyClineRefresh, isClineExpired, isClineRefreshable, parseClineTokenPayload, clineCredentialExpiresAtMs, clineRefreshBody, } from './cline.js';
 import { CLINE, CLINE_REFRESH_PATH, } from './cline-product.js';
 import { RefreshScheduler } from './refresh.js';
+import { refreshAccountWithReconcile, syncAccountExpiry, } from './expiry-sync.js';
+/**
+ * Cline 凭据 → 账号池有效期所需的提取器（`refreshAll` 与按需续期共用一份）。
+ *
+ * ⚠️ `identityOf` 必须是 `access_token`：`AccountPool.findAccountIdByCredential`
+ * 对非 codearts 的 provider 比对的就是这个字段，传 ref 名会恒匹配失败且静默。
+ */
+const CLINE_EXPIRY_ACCESSORS = {
+    expiresAtOf: clineCredentialExpiresAtMs,
+    refreshableOf: isClineRefreshable,
+    identityOf: (credential) => credential.access_token ?? '',
+};
 /**
  * Cline 的默认凭据 ref。
  *
@@ -242,8 +254,18 @@ export class ClineAuth extends Service {
      *
      * 同样**不触碰** `refreshTokenInvalid` / `lastRefreshError` / 调度器：
      * 那些状态属于单凭据路径，被多账号操作污染会让 UI 显示错误的失效提示。
+     *
+     * ⚠️ **必须回写账号池的 `expiresAt`**（issue !IKIRTT 的真实缺陷）：
+     * UI 账号卡片读的正是池里的值。早期七个 provider 都只 `credentials.set`，
+     * 于是用户点「刷新」后凭据确实续好了，界面却**一直显示「已过期」**，
+     * 且「重测」按钮的 refresh 是刻意的 no-op —— 等于没有任何自救手段。
+     * 只有 raccoon 记得回写，故它是当时唯一能自愈的面板。
+     *
+     * @param pool 账号池；提供时会把新 `expiresAt` / `refreshable` 写回。
+     * @param accountId 账号 id。**调用方已知时请显式传入** ——
+     *   否则只能按凭据内容反查（代价高，且反查会跳过已停用账号）。
      */
-    async refreshAccountCredential(refName) {
+    async refreshAccountCredential(refName, pool, accountId) {
         const ref = credentialRef(refName);
         const resolved = await this.ctx.credentials.resolve(ref);
         if (!resolved)
@@ -256,6 +278,15 @@ export class ClineAuth extends Service {
         }
         const refreshed = await this.refreshCredential(credential);
         await this.ctx.credentials.set(ref, JSON.stringify(refreshed));
+        await syncAccountExpiry({
+            pool,
+            provider: this.product.id,
+            credential: refreshed,
+            accessors: CLINE_EXPIRY_ACCESSORS,
+            accountId,
+            tag: '[cline]',
+            warn: (message) => this.ctx.logger?.warn?.(message),
+        });
     }
     /**
      * 对一份凭据执行一次续期并返回新凭据（不触碰存储）。
@@ -313,6 +344,12 @@ export class ClineAuth extends Service {
      * 选号，不该让凭据烂掉 —— 否则用户重新启用时只能重新登录。
      * 详见 `BuddyAuth.refreshAll` 的注释（同一缺陷）。
      * 单账号失败不影响其他账号（与 `BuddyAuth.refreshAll` 同语义）。
+     *
+     * ⚠️ **lead-time 过滤**（issue !IKIRTT）：早先这里是**无条件全量续期** ——
+     * 定时器每 30 分钟就把每个账号的 refresh_token 轮换一次，与「凭据还剩 719 小时」
+     * 无关。现复用单凭据时代 `REFRESH_LEAD_MS` 的语义：**距过期不足 1 小时才刷**。
+     * 跳过续期的账号仍会做一次**有效期对账**（见 `refreshAccountWithReconcile`），
+     * 因为「不刷」与「不回写池值」正是 UI 假过期的两个来源，必须分开处理。
      */
     async refreshAll(pool) {
         const accounts = await pool.listAccounts(this.product.id);
@@ -331,11 +368,17 @@ export class ClineAuth extends Service {
                     await pool.updateAccount(entry.id, { refreshable: false });
                     continue;
                 }
-                const refreshed = await this.refreshCredential(credential);
-                await this.ctx.credentials.set(ref, JSON.stringify(refreshed));
-                await pool.updateAccount(entry.id, {
-                    expiresAt: clineCredentialExpiresAtMs(refreshed) ?? undefined,
-                    refreshable: isClineRefreshable(refreshed),
+                await refreshAccountWithReconcile({
+                    pool,
+                    provider: this.product.id,
+                    tag: '[cline]',
+                    accountId: entry.id,
+                    credential,
+                    accessors: CLINE_EXPIRY_ACCESSORS,
+                    current: entry,
+                    refresh: (c) => this.refreshCredential(c),
+                    save: (c) => this.ctx.credentials.set(ref, JSON.stringify(c)),
+                    warn: (message) => this.ctx.logger?.warn?.(message),
                 });
             }
             catch (error) {

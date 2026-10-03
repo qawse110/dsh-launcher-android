@@ -73,13 +73,19 @@ export async function requestToken(body, keyPair, fetcher = fetch) {
     }
     if (!response.ok || !data?.credentials) {
         const message = `CodeArts token request failed: ${response.status}${data ? ` ${JSON.stringify(data)}` : ''}`;
-        // 终态判定：invalid_grant 或后端错误码明确为 refresh_token 失效/DPoP 非法时，
-        // 都视为 refresh_token 已失效（停止调度、refreshable:false、提示重新登录），
-        // 避免 error_code 为 InvalidDPoPHeader 时每 10 分钟无限重试。
+        // 终态判定：**只认 refresh_token 自己失效的那两种信号**。
+        //
+        // ⚠️ `InvalidDPoPHeader` 已从这里**移除**（真实缺陷：CodeArts 账号被永久标成
+        // 「不可续期」、重启也不自愈）。它说的是「这次 DPoP proof 没通过校验」
+        // —— 时钟偏差让 `iat` 落在窗口外、proof 被判定重放、网关抖动，全都是
+        // **一次请求层面**的拒绝，跟「refresh_token 还能不能用」无关。
+        // 把它当终态的代价是把账号材料完好（refresh_token 还有十几天寿命、
+        // code_verifier 与 DPoP 私钥都在）的账号一步标死，用户只能重新登录；
+        // 而把它当普通失败的代价只是 10 分钟后再试一次一个 HTTP 请求。
+        // 两相对比，这里选择后者。
         const errorCode = String(data?.error_code ?? '');
         if (data?.error === 'invalid_grant'
-            || errorCode.includes('ExpiredRefreshToken')
-            || errorCode.includes('InvalidDPoPHeader')) {
+            || errorCode.includes('ExpiredRefreshToken')) {
             throw new RefreshTokenExpiredError(message);
         }
         throw new Error(message);

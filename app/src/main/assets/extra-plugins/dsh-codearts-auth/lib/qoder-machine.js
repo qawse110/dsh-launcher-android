@@ -99,19 +99,32 @@ let cached;
  * `%APPDATA%` 下，测试必须能指向 fixture，否则用例结果会随开发机是否装了
  * Qoder 桌面端而变）。
  */
+/**
+ * 磁盘缓存 `machine_token.json` 的候选路径（**退路**，主路径是实时 spawn）。
+ *
+ * ⚠️ 这份缓存可能**非常陈旧**（实测停在 179 天前，且跑 exe 也不会更新它），
+ * 所以只在实时拿不到时才用它 —— 但「聊胜于无」：带了陈旧头至少比不带强。
+ *
+ * 桌面端在 `APPDATA` / `Application Support` / `.config` 下的目录名带空格
+ * （`Qoder` / `Qoder CN`），**两站都列**：只装了其中一个的用户仍应有机会命中。
+ * 读不到的文件会被 `parseFile` 静默跳过，多列无副作用。
+ */
 function candidatePaths() {
     const override = process.env.QODER_MACHINE_TOKEN_PATH;
     if (override !== undefined && override.length > 0)
         return [override];
-    const suffix = ['Qoder', 'SharedClientCache', 'cache', 'machine_token.json'];
     const paths = [];
     const appData = process.env.APPDATA;
     if (appData !== undefined && appData.length > 0) {
-        paths.push(join(appData, ...suffix));
+        for (const dir of ['Qoder', 'Qoder CN']) {
+            paths.push(join(appData, dir, 'SharedClientCache', 'cache', 'machine_token.json'));
+        }
     }
     const home = homedir();
-    paths.push(join(home, 'Library', 'Application Support', ...suffix));
-    paths.push(join(home, '.config', ...suffix));
+    for (const dir of ['Qoder', 'Qoder CN']) {
+        paths.push(join(home, 'Library', 'Application Support', dir, 'SharedClientCache', 'cache', 'machine_token.json'));
+        paths.push(join(home, '.config', dir, 'SharedClientCache', 'cache', 'machine_token.json'));
+    }
     return paths;
 }
 /** 从单个文件解析；形状不符或读取失败返回 undefined。 */
@@ -232,12 +245,56 @@ export async function resolveQoderMachineIdentityAsync(forceExecutable) {
     return undefined;
 }
 /**
- * 定位 `runtime-info.exe`。
+ * 本机 Qoder 系客户端的数据目录名（相对 home，**按顺序尝试**）。
  *
- * 路径形态：`~/.qoder/.bin/umid-<platform>-<hash>/runtime-info.exe`
+ * ⚠️ 这是**模块常量而不是产品字段**：实测（设计文档 E12）中国版与国际版的
+ * `runtime-info.exe` **SHA256 相同**，在同一 `environment` 下返回**逐字节相同**的
+ * machine 身份 —— 身份由「设备 + environment」决定，与产品无关。
+ * 把它挂进 `QoderProduct` 会让人误以为「一个产品认一个目录」（误导性的抽象），
+ * 而且除了本文件没有任何调用方会读它（死配置）。
+ *
+ * 列两个目录的唯一目的：让**只装了其中一个客户端**的用户也能拿到身份。
+ */
+const QODER_DATA_DIR_NAMES = ['.qoder', '.qoder-cn'];
+/**
+ * 在给定 home 下按 `dataDirNames` 顺序定位 `runtime-info.exe`。
+ *
+ * 路径形态：`<home>/<dataDir>/.bin/umid-<platform>-<hash>/runtime-info(.exe)`
  * —— **目录名带哈希**（随版本变），故必须枚举而不能写死。
  *
- * 非 Windows 平台的可执行文件名为 `runtime-info`（无 `.exe`）。
+ * ⚠️ 必须遍历**多个**数据目录（真实缺陷）：原先只认国际版的 `.qoder`，于是
+ * 「只装了中国版」的用户找不到 exe → 退到陈旧磁盘缓存 → 拿不到 machine 头 →
+ * `/sash/api/v1/me/campaigns` 只回 `VIEW_DETAILS` → 插件误报「今天已领」。
+ * 那正是 2026-09-25 那次修复的复发路径。
+ *
+ * ⚠️ 某个目录存在但 exe 缺失时**继续试下一个**，不能就此返回 undefined ——
+ * 半安装/清理残留会留下 `.bin/umid-*` 空目录。
+ *
+ * 导出是为了让单测能传入临时 home；生产路径由 {@link locateRuntimeInfo} 调。
+ */
+export function findRuntimeInfoExecutable(home, dataDirNames = QODER_DATA_DIR_NAMES) {
+    const exeName = process.platform === 'win32' ? 'runtime-info.exe' : 'runtime-info';
+    for (const dirName of dataDirNames) {
+        const binDir = join(home, dirName, '.bin');
+        let entries;
+        try {
+            entries = readdirSync(binDir);
+        }
+        catch {
+            // 该目录不存在（未安装该版本）：试下一个
+            continue;
+        }
+        const dir = entries.find((name) => name.startsWith('umid-'));
+        if (dir === undefined)
+            continue;
+        const exe = join(binDir, dir, exeName);
+        if (existsSync(exe))
+            return exe;
+    }
+    return undefined;
+}
+/**
+ * 定位本机 `runtime-info.exe`（生产入口）。
  *
  * ⚠️ `QODER_RUNTIME_INFO` 可覆盖（**供单测隔离**：默认会真的 spawn 开发机上
  * 的可执行文件，单测必须能把它指到不存在的路径以强制走磁盘缓存退路，
@@ -251,20 +308,7 @@ function locateRuntimeInfo(override) {
         // 显式指定的路径必须真实存在，否则视为「没有可执行文件」而走退路。
         return existsSync(candidate) ? candidate : undefined;
     }
-    const binDir = join(homedir(), '.qoder', '.bin');
-    let entries;
-    try {
-        entries = readdirSync(binDir);
-    }
-    catch {
-        // 未安装 Qoder 桌面端：正常降级
-        return undefined;
-    }
-    const dir = entries.find((name) => name.startsWith('umid-'));
-    if (dir === undefined)
-        return undefined;
-    const exe = join(binDir, dir, process.platform === 'win32' ? 'runtime-info.exe' : 'runtime-info');
-    return existsSync(exe) ? exe : undefined;
+    return findRuntimeInfoExecutable(homedir());
 }
 /**
  * `runtime-info.exe` 的第一个位置参数 `environment`。

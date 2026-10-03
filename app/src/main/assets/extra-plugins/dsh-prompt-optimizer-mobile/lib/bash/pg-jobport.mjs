@@ -1,7 +1,9 @@
 // Test port based on the host's Win32 Job Object primitives.
 // 与上一版的关键差别：终止靠作业句柄（Job），不靠 taskkill /T 的父链遍历——
 // 实测 MSYS 的 fork 会让 sleep.exe 脱离父链，taskkill /T 杀不掉它。
-import { openSync, closeSync, readFileSync } from "node:fs";
+import { openSync, closeSync, fstatSync, readSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { devNull } from "node:os";
 import { spawn as nodeSpawn, spawnSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -72,135 +74,199 @@ export function sweepByCommandLine(marker) {
   return text.split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
 }
 
-export function createJobPort({ cwd, makePaths }) {
-  if (jobApi) return createWin32JobPort({ cwd, makePaths });
-  return createFallbackJobPort({ cwd, makePaths });
+export function createJobPort(options) {
+  return jobApi ? createWin32JobPort(options) : createFallbackJobPort(options);
 }
 
-/**
- * 降级版（0.7.4）：拿不到宿主的 Win32 Job 原语时使用（别人的机器上很常见）。
- * 普通 spawn + taskkill /T /F 终止整棵树。
- * ⚠ 已知弱点：MSYS 的 fork 会让子进程脱离父链，taskkill /T 可能漏杀个别孙进程——
- *   这恰恰是 win32 作业对象要解决的问题。但"偶尔漏杀"远好于"工具完全跑不起来"：
- *   可用性优先，能力按环境浮动。
- */
-function createFallbackJobPort({ cwd, makePaths }) {
+function pathFactory(cwd, makePaths) {
+  const id = randomUUID();
   let counter = 0;
-  return {
-    graceMs: 3000,
-    async spawn(request) {
-      const paths = makePaths(++counter);
-      const stdoutFd = openSync(paths.stdout, "w");
-      const stderrFd = openSync(paths.stderr, "w");
-      let child;
-      try {
-        child = nodeSpawn(request.command, request.args || [], {
-          cwd: request.cwd || cwd,
-          env: { ...process.env, ...(request.env || {}) },
-          stdio: ["ignore", stdoutFd, stderrFd],
-          windowsHide: true,
-        });
-      } finally {
-        closeSync(stdoutFd); closeSync(stderrFd);
-      }
-      let exited = false;
-      const done = new Promise((resolve) => {
-        child.on("exit", (code, signal) => resolve({ exitCode: typeof code === "number" ? code : undefined, signal: signal || null }));
-        child.on("error", (e) => resolve({ exitCode: undefined, signal: null, error: String((e && e.message) || e) }));
-      });
-      done.then(() => { exited = true; });
-      const limit = Number(request.stdoutMaxBytes || 4096);
-      const bound = (file) => {
-        try {
-          const buf = readFileSync(file);
-          if (buf.length <= limit) return { bytes: buf, truncated: false };
-          return { bytes: buf.subarray(buf.length - limit), truncated: true, spillPath: file };
-        } catch { return { bytes: Buffer.alloc(0), truncated: false }; }
-      };
-      return {
-        pid: child.pid,
-        done,
-        terminate() {
-          try { spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", timeout: 15000 }); } catch { /* best effort */ }
-          try { child.kill("SIGKILL"); } catch { /* best effort */ }
-        },
-        async waitForExit(ms) {
-          const until = Date.now() + Number(ms || 3000);
-          while (!exited && Date.now() < until) await new Promise((r) => setTimeout(r, 40));
-          return exited;
-        },
-        output() {
-          const out = bound(paths.stdout);
-          const err = bound(paths.stderr);
-          return {
-            stdoutBytes: out.bytes, stdoutTruncated: out.truncated, stdoutSpillPath: out.spillPath,
-            stderrBytes: err.bytes, stderrTruncated: err.truncated, stderrSpillPath: err.spillPath,
-          };
-        },
-      };
-    },
+  return () => {
+    const n = ++counter;
+    const paths = makePaths ? makePaths(n) : { stdout: join(cwd || process.cwd(), "stdout"), stderr: join(cwd || process.cwd(), "stderr") };
+    return { stdout: paths.stdout + "." + id + "." + n + ".stdout", stderr: paths.stderr + "." + id + "." + n + ".stderr" };
   };
 }
 
-/** win32 作业对象版（原实现）：终止靠 Job，MSYS 的 fork 逃不掉。 */
-function createWin32JobPort({ cwd, makePaths }) {
-  let counter = 0;
+function withDescriptors(files, action) {
+  const fds = [];
+  try {
+    for (const [file, mode] of files) fds.push(openSync(file, mode));
+    return action(fds);
+  } finally {
+    for (const fd of fds) closeSync(fd);
+  }
+}
+
+export function readOutputWindow(file, maxBytes = 4096) {
+  const limit = Number(maxBytes);
+  if (!Number.isSafeInteger(limit) || limit < 0) throw new RangeError("output limit must be a nonnegative safe integer");
+  return withDescriptors([[file, "r"]], ([fd]) => {
+    const totalBytes = fstatSync(fd).size;
+    const desired = Math.max(0, totalBytes - limit);
+    const start = Math.max(0, desired - 3);
+    const buffer = Buffer.alloc(totalBytes - start);
+    let count = 0;
+    while (count < buffer.length) {
+      const n = readSync(fd, buffer, count, buffer.length - count, start + count);
+      if (!n) break;
+      count += n;
+    }
+    const data = buffer.subarray(0, count);
+    let offset = desired - start;
+    // Only trim a boundary continuation if the preceding bytes prove a valid
+    // codepoint crossing the cut. Genuine malformed bytes remain diagnostic.
+    if (desired > 0 && (data[offset] & 0xc0) === 0x80) {
+      for (let i = Math.max(0, offset - 3); i < offset; i += 1) {
+        const lead = data[i];
+        const length = lead >= 0xc2 && lead <= 0xdf ? 2 : lead >= 0xe0 && lead <= 0xef ? 3 : lead >= 0xf0 && lead <= 0xf4 ? 4 : 0;
+        if (!length || i + length <= offset || i + length > data.length) continue;
+        try {
+          new TextDecoder("utf-8", { fatal: true }).decode(data.subarray(i, i + length));
+          offset = i + length;
+          break;
+        } catch { /* preserve invalid bytes */ }
+      }
+    }
+    return { bytes: data.subarray(offset), totalBytes, truncated: desired > 0, spillPath: file, windowOffset: start + offset };
+  });
+}
+
+function outputReader(paths, request) {
+  return () => {
+    const out = {};
+    for (const name of ["stdout", "stderr"]) {
+      const window = readOutputWindow(paths[name], request[name + "MaxBytes"] ?? request.stdoutMaxBytes ?? 4096);
+      out[name + "Bytes"] = window.bytes;
+      out[name + "Truncated"] = window.truncated;
+      out[name + "SpillPath"] = window.spillPath;
+      out[name + "TotalBytes"] = window.totalBytes;
+      out[name + "WindowOffset"] = window.windowOffset;
+    }
+    return out;
+  };
+}
+
+// This fallback cannot prove that detached descendants have exited.
+export function createFallbackJobPort({ cwd, makePaths, spawn = nodeSpawn, platform = process.platform, killTimeoutMs = 3000 } = {}) {
+  const nextPaths = pathFactory(cwd, makePaths);
+  return {
+    graceMs: 3000,
+    async spawn(request) {
+      const paths = nextPaths();
+      const child = withDescriptors([[paths.stdout, "wx"], [paths.stderr, "wx"]], ([stdout, stderr]) => spawn(request.command, request.args || [], {
+        cwd: request.cwd || cwd, env: { ...process.env, ...(request.env || {}) },
+        stdio: ["ignore", stdout, stderr], windowsHide: true
+      }));
+      let exited = false;
+      let released = false;
+      let termination;
+      let resolveDone;
+      const done = new Promise((resolve) => { resolveDone = resolve; });
+      const onExit = (code, signal) => { exited = true; resolveDone({ exitCode: typeof code === "number" ? code : undefined, signal: signal || null }); };
+      const onError = (error) => { exited = true; resolveDone({ exitCode: undefined, signal: null, error: String(error?.message || error) }); };
+      child.once("exit", onExit);
+      child.once("error", onError);
+      return {
+        pid: child.pid, done, scope: "root-only",
+        terminate() {
+          if (termination) return termination;
+          termination = (async () => {
+            if (platform === "win32" && Number.isInteger(child.pid) && !exited) {
+              await new Promise((resolve, reject) => {
+                let killer;
+                let timer;
+                const finish = (error) => {
+                  clearTimeout(timer);
+                  if (error) reject(error); else resolve();
+                };
+                try {
+                  killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+                  killer.once("error", finish);
+                  killer.once("exit", (code) => finish(code === 0 ? null : new Error("taskkill exit " + code)));
+                  timer = setTimeout(() => {
+                    try { killer.kill("SIGKILL"); } catch { /* owned helper only */ }
+                    killer.unref?.();
+                    finish(new Error("taskkill timed out"));
+                  }, killTimeoutMs);
+                } catch (error) { finish(error); }
+              }).finally(() => { if (!exited) child.kill("SIGKILL"); });
+            } else if (!exited) child.kill("SIGKILL");
+          })();
+          return termination;
+        },
+        async waitForExit(ms) {
+          const until = Date.now() + Math.max(0, Number(ms));
+          while (!exited && Date.now() < until) await new Promise((resolve) => setTimeout(resolve, Math.min(40, until - Date.now())));
+          return exited;
+        },
+        release() {
+          if (released) return;
+          released = true;
+          child.removeListener("exit", onExit);
+          child.removeListener("error", onError);
+          // A still-running owned process remains diagnosable but cannot keep
+          // the caller's event loop alive after a failed bounded cleanup.
+          child.unref?.();
+        },
+        output: outputReader(paths, request)
+      };
+    }
+  };
+}
+
+export function createWin32JobPort({ cwd, makePaths, bindings = win32, api = jobApi } = {}) {
+  const nextPaths = pathFactory(cwd, makePaths);
   return {
     async spawn(request) {
-      const paths = makePaths(++counter);
-      const stdinFd = openSync("\\\\.\\NUL", "r");
-      const stdoutFd = openSync(paths.stdout, "w");
-      const stderrFd = openSync(paths.stderr, "w");
-      let spawned;
-      try {
-        spawned = win32.spawnCurrentTokenJobProcess(jobApi, {
-          command: request.command,
-          applicationName: request.command,
-          args: request.args || [],
-          cwd: request.cwd || cwd,
-          env: { ...process.env, ...(request.env || {}) },
-          stdio: { stdin: stdinFd, stdout: stdoutFd, stderr: stderrFd }
-        });
-      } finally {
-        closeSync(stdinFd); closeSync(stdoutFd); closeSync(stderrFd);
-      }
-      const limit = Number(request.stdoutMaxBytes || 4096);
-      let settled = null;
-      const done = (async () => {
-        for (;;) {
-          const code = win32.pollProcessExit(jobApi, spawned.process);
-          if (code !== undefined) { settled = { exitCode: code, signal: null }; return settled; }
-          await new Promise((r) => setTimeout(r, 40));
-        }
-      })();
+      const paths = nextPaths();
+      const spawned = withDescriptors([[devNull, "r"], [paths.stdout, "wx"], [paths.stderr, "wx"]], ([stdin, stdout, stderr]) => bindings.spawnCurrentTokenJobProcess(api, {
+        command: request.command, applicationName: request.command, args: request.args || [],
+        cwd: request.cwd || cwd, env: { ...process.env, ...(request.env || {}) },
+        stdio: { stdin, stdout, stderr }
+      }));
+      let released = false;
+      let timer;
+      let finishDone;
+      const done = new Promise((resolve, reject) => {
+        finishDone = resolve;
+        const poll = () => {
+          if (released) return;
+          try {
+            const code = bindings.pollProcessExit(api, spawned.process);
+            if (code !== undefined) return resolve({ exitCode: code, signal: null });
+            timer = setTimeout(poll, 40);
+          } catch (error) { reject(error); }
+        };
+        poll();
+      });
+      // Attach immediately: a native poll error may arrive before governance
+      // receives the handle and installs its own rejection handler.
+      done.catch(() => {});
       return {
-        pid: spawned.pid,
-        job: spawned.job,
-        done,
-        terminate() { try { win32.terminateJob(jobApi, spawned.job, 1); } catch (e) { return String(e && e.message || e); } },
+        pid: spawned.pid, job: spawned.job, done, scope: "job",
+        terminate() { bindings.terminateJob(api, spawned.job, 1); },
         async waitForExit(ms) {
-          const until = Date.now() + ms;
+          const until = Date.now() + Math.max(0, Number(ms));
           for (;;) {
-            if (win32.isJobEmpty(jobApi, spawned.job)) return true;
-            if (Date.now() > until) return win32.isJobEmpty(jobApi, spawned.job);
-            await new Promise((r) => setTimeout(r, 40));
+            if (bindings.isJobEmpty(api, spawned.job)) return true;
+            if (Date.now() >= until) return false;
+            await new Promise((resolve) => setTimeout(resolve, Math.min(40, until - Date.now())));
           }
         },
-        jobEmpty() { return win32.isJobEmpty(jobApi, spawned.job); },
-        release() { try { win32.closeHandleChecked(jobApi, spawned.job, "test-job"); } catch (e) { return String(e && e.message || e); } },
-        output() {
-          const bound = (file) => {
-            const buf = readFileSync(file);
-            if (buf.length <= limit) return { bytes: buf, truncated: false };
-            return { bytes: buf.subarray(buf.length - limit), truncated: true, spillPath: file };
-          };
-          const out = bound(paths.stdout);
-          const err = bound(paths.stderr);
-          return {
-            stdoutBytes: out.bytes, stdoutTruncated: out.truncated, stdoutSpillPath: out.spillPath,
-            stderrBytes: err.bytes, stderrTruncated: err.truncated, stderrSpillPath: err.spillPath
-          };
-        }
+        jobEmpty() { return bindings.isJobEmpty(api, spawned.job); },
+        release() {
+          if (released) return;
+          released = true;
+          clearTimeout(timer);
+          finishDone({ exitCode: undefined, signal: null });
+          const errors = [];
+          for (const [handle, label] of [[spawned.process, "governed-process"], [spawned.job, "governed-job"]]) {
+            try { bindings.closeHandleChecked(api, handle, label); } catch (error) { errors.push(error); }
+          }
+          if (errors.length) throw new AggregateError(errors, "failed to release governed handles");
+        },
+        output: outputReader(paths, request)
       };
     }
   };

@@ -108,11 +108,17 @@ export function strategyInstructions(strategy) {
   const min = qualityDimsMin(s.qualityDims)
   if (min > 0) {
     out.push('【质量落到维度】用户用"精细/高级感/真实/帅气"这类**质量词**时，'
-      + '**至少给 ' + min + ' 条** `quality_interpretation`，每条 text 写成**该领域可检查的维度**'
-      + '（不是复述那个形容词），rationale 里指明它来自原话的哪几个字。'
+      + '**至少给 ' + min + ' 条** `quality_interpretation`，每条 text 写成**该领域可肉眼判断的维度**'
+      + '，并给出**最低可接受线**（做到什么程度算够）；**不是复述那个形容词，也不是零件清单**。'
+      + 'rationale 里指明它来自原话的哪几个字。'
       + '领域只能从上下文里读到的线索推断；**推不出领域就不要硬套**，把"这是哪个领域"写成 unknown。')
   } else if (s.qualityDims === 'refer') {
     out.push('【质量】质量词照常写成 `quality_interpretation`，能落到可检查的维度就落，落不了就如实描述原意。')
+  }
+  if (min > 0) {
+    out.push('【结构性分叉】如果存在"选错了后面全要返工"的结构性选择（例如依赖怎么引入、资源怎么组织、'
+      + '精度与性能怎么取舍），用 `implementation_option` 写成一条：**先写分叉是什么，再写推荐哪个、为什么、'
+      + '以及怎么替换**。信息不足时只指出分叉本身，让工作 AI 自己决定——这类选择比细节更早锁死结果。')
   }
   out.push('【条目上限】这一轮最多 ' + s.maxItems + ' 条；**少而准**优先，凑数会挤掉真正有用的条目。')
   return out

@@ -113,6 +113,10 @@ export async function handleUserInput(adapter, session, input) {
     return { parsed: p, renamed, droppedTargets }
   }
   let prepared = prepare(raw)
+    // 0.7.8 硬邦邦加码：先原样收下，**引用校验放到拿到 current 之后**（prepare 里看不到 current）。
+    if (adapter && prepared && prepared.parsed && prepared.parsed.ok) {
+      adapter.framingNoteRaw = { note: prepared.parsed.hardNote || '', ids: prepared.parsed.hardOn || [] }
+    }
   step('parse', {
     ok: prepared.parsed.ok, code: prepared.parsed.code || null, reason: prepared.parsed.reason || null,
     warnings: prepared.parsed.warnings || [],
@@ -166,6 +170,7 @@ export async function handleUserInput(adapter, session, input) {
   //    CAS 会变成"旧 revision 比旧 revision"——永远相等、永远通过，
   //    这个最该拦下晚到补丁的地方反而给出假 OK。（P3 流水线测试抓到的真实缺陷）
   const current = adapter.intentStateOf(session)
+  // 硬邦邦加码的引用校验**不在这里**——见 finish()：这条主路径有两条 early-return
   if (!current) {
     step('recheck', { ok: false, code: 'NO_CURRENT_STATE' })
     return finish(trace, base, null, 'state-lost', adapter, session)
@@ -229,7 +234,31 @@ function finish(trace, state, _unused, outcome, adapter, session) {
   if (adapter && session) {
     const cur = adapter.intentStateOf(session)
     if (cur) {
-      packet = compileAudited(cur, { budget: adapter.packetBudget })
+      // 0.7.8 硬邦邦加码的**引用校验**：放在这里是因为 finish() 是唯一出口——
+      // 早先放在主路径上，于是"解析失败"与"无新增(noop)"两条 early-return 都绕过它，
+      // 结果**只有第一轮对话有加码，之后全是纯骨架**（用户实测 2026-09-27）。
+      // 规则不变：必须引用包内真实存在的条目，否则整段不采用（退回骨架，骨架含边界行，永远安全）。
+      if (adapter.framingNoteRaw) {
+        const raw = adapter.framingNoteRaw
+        const known = new Set((Array.isArray(cur.items) ? cur.items : []).map((it) => it.id))
+        const cited = (Array.isArray(raw.ids) ? raw.ids : []).filter((id) => known.has(id))
+        adapter.framingNote = (raw.note && cited.length > 0) ? raw.note : null
+        // 本轮用完即清：**绝不让上一轮的加码顺着本轮继续用**（那会变成"固定模板"的观感）。
+        adapter.framingNoteRaw = null
+        if (raw.note) {
+          trace.push({ step: 'hardNote', chars: String(raw.note).length, cited: cited.length, used: !!adapter.framingNote })
+        }
+      }
+      // ⚠ 每轮都要重算：本轮没给加码就**清空**，不许沿用上一轮那份。
+      if (!adapter.framingNoteRaw) adapter.framingNote = adapter.framingNote || null
+      // 0.7.8：本轮任务类检查项（由 index.js 按用户原话预先算好，照 packetBudget 同一模式传进来）
+      packet = compileAudited(cur, {
+        budget: adapter.packetBudget,
+        extraItems: adapter.checkItems,
+        // 0.7.8：协作基调（按会话覆盖后的生效值）。neutral 时编译器什么都不加。
+        framing: adapter.framing,
+        framingNote: adapter.framingNote,
+      })
       // 审计不过 → 不写入上下文（宁可静默，也不投递不可信的包）
       if (!packet.ok) {
         trace.push({ step: 'audit', ok: false, problems: packet.problems })

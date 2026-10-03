@@ -44,7 +44,57 @@ const jetHubSchema = Schema.object({
     accounts: Schema.array(Schema.any()).default([]),
     disabledModels: Schema.dict(Schema.any()).default({}),
     loomyPermanentLocked: Schema.boolean().default(false),
+    gatewayEnabled: Schema.boolean().default(true),
 });
+/**
+ * 归一化「本机 OpenAI 网关」开关。
+ *
+ * 判据与 `sanitizePermanentLocks` 相反：**只有显式 `false` 才算停用**，
+ * 其余（缺键 / `true` / 字符串 / 对象 / 数组）一律按启用处理。
+ *
+ * ⚠️ 方向不能反。文档缺失、被手工编辑成脏值、或老版本代码整体重写时丢了本键，
+ * 都必须**回到默认启用** —— 那正是升级前的行为；反过来（只认 `true`）会让
+ * 任何一次读取失败都变成「网关被静默关闭」，而用户根本不知道自己关过它。
+ */
+export function sanitizeGatewayEnabled(raw) {
+    return raw !== false;
+}
+/**
+ * 归一化「锁定永久积分」开关表。
+ *
+ * 与 `sanitizeDisabledModels` 同款口径：**只保留显式 `true`**，其余值（`false` /
+ * 字符串 / 对象）一律丢弃 —— 于是「缺键」与「值为 false」在语义上完全一致
+ * （未锁定），文档也不会随开关操作累积噪音。
+ * ⚠️ 单测专门覆盖「`{ loomy: 'yes' }` 不得判成已锁定」这一类脏数据。
+ */
+export function sanitizePermanentLocks(raw) {
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw))
+        return {};
+    const result = {};
+    for (const [provider, value] of Object.entries(raw)) {
+        if (value === true && provider.length > 0)
+            result[provider] = true;
+    }
+    return result;
+}
+/**
+ * 把**老的单字段**并进锁定表 —— 仅用于「独立文档尚不存在」的那一次迁移。
+ *
+ * 背景：锁定开关早于 `permanent-locks.json` 存在，住在 state.json 的
+ * `loomyPermanentLocked` 里，老用户磁盘上只有它。不并进来的话，升级后 Loomy 的
+ * 锁定会**静默消失**（用户看到的是「永久积分被烧掉了」且毫无提示）——
+ * 那是最坏的一类回归。
+ *
+ * ⚠️ 调用方**只能在新文档不存在时**用它（`PermanentLockStore.load()` 的
+ * `exists: false`）。新文档一旦存在就以它为准：否则用户在 desktop 里解锁 Loomy
+ * 之后（表里没有 `loomy` 键 = 未锁定），只要镜像字段因为任何原因还留着
+ * `true`，锁定就会被重新打开 —— 那种"解不掉"的开关比丢状态更难排查。
+ */
+export function mergeLegacyLoomyLock(locks, legacyLoomyLocked) {
+    if (locks.loomy === undefined && legacyLoomyLocked === true)
+        return { ...locks, loomy: true };
+    return locks;
+}
 /**
  * 把读到的原始值归一化为 {@link ModelDisableMap}。
  *
@@ -115,15 +165,21 @@ class SettingsStore {
         return {
             accounts: sanitizeAccounts(value.accounts),
             disabledModels: sanitizeDisabledModels(value.disabledModels),
-            // 老文档没有该字段 → 缺省 false（解锁），与既有行为一致。
+            // 只是**镜像**（权威表在 permanent-locks.json）；老文档没这个键 → false。
             loomyPermanentLocked: value.loomyPermanentLocked === true,
+            // 老文档没这个键 → 启用，与升级前行为一致。
+            gatewayEnabled: sanitizeGatewayEnabled(value.gatewayEnabled),
         };
     }
     async save(state) {
         await this.scope.replace({
             accounts: state.accounts,
             disabledModels: state.disabledModels,
+            // 镜像字段由 AccountPool 与独立文档**同源写出**：同机上只认这个字段的
+            // 旧版本代码（其它 profile）读它、也会原样写回它，故两边不会脱节。
             loomyPermanentLocked: state.loomyPermanentLocked === true,
+            // 开关丢失只会让网关回到默认启用（可逆），故接受老版本重写时丢掉本键。
+            gatewayEnabled: state.gatewayEnabled !== false,
         });
     }
 }
@@ -139,21 +195,67 @@ class MemoryStore {
     }
 }
 /**
- * 旧凭据 ref → 账号条目的前缀表。
+ * provider id ↔ 凭据 ref 前缀的**单一真相源**。
  *
- * 六个 provider 的账号凭据一律存 `{PREFIX}_ACCOUNT_{UUID_SHORT}`（本插件的既有
- * 约定），故可据 ref 名反推 provider。
+ * 账号凭据一律存 `{PREFIX}_ACCOUNT_{UUID_SHORT}`（本插件的既有约定），故可据
+ * ref 名反推 provider。**表与正则都由本表派生** —— 这是刻意的：
+ *
+ * ⚠️ 表与正则分家会漂移出「加了 provider 却漏改正则」这类缺陷。真实缺陷（**同型两次**）：
+ *
+ * ① 本表原先只有 **6 项**（注释也写着「六个 provider」），而插件实际有 **11 个**
+ * —— `qodercn` / `cline` / `loomy` / `raccoon` / `zcode` 五个 provider 的账号在
+ * `state.json`（Jet Hub 状态文档）缺失时（重装 / 迁移 / profile 重建）
+ * **无法从 `.credentials.yaml` 的 `refs:` 恢复**，用户侧表现为「重装 / 迁移后
+ * 这几个面板的账号凭空消失，只能重新登录」。凭据本体一直完好，只是索引建不出来。
+ *
+ * ② **2026-10-02 同型复发**：上游合并第 12 个 provider `minimax` 时**又漏加了本表**
+ * —— `tests/unit/jet-hub-store.spec.ts` 的派生用例当场变红（期望 12 项、实得 11 项），
+ * 但那条用例没在合并前跑到。⇒ 教训：**合并任何「新增 provider」的分支前先跑它**；
+ * 靠人眼维护本表已经漏过两次。
+ *
+ * ⚠️ **必须与 `src/jet-hub-rpc.ts` 的 `account.create` 生成的 ref 前缀一致**
+ * （那里是 `${provider.toUpperCase()}_ACCOUNT_${suffix}`）。**新增 provider 时
+ * 漏加本表 = 该 provider 的账号在状态文档丢失后静默消失**。
+ *
+ * ⚠️ 单凭据回退 ref（如 `CODEARTS_ACCESS_TOKEN` / `ZCODE_CREDENTIAL`）不含
+ * `_ACCOUNT_`，故不会被本表误吞 —— 这里只需登记账号 ref 前缀。
+ *
+ * ⚠️ 本表的顺序与客户端 `plugin-src/client/jet-hub.js` 的 `PROVIDERS` **保持一致** ——
+ * 派生用例不校验顺序（恢复顺序由 refs 文件决定），但两者对齐后便于逐项核对。
+ *
+ * 依据 `src/product.ts` 与各 `*-product.ts` 的 `id` 字段：
+ * `codearts` / `buddy` / `workbuddy` / `lobsterai` / `qoder` / `qodercn`
+ * / `trae` / `cline` / `loomy` / `raccoon` / `minimax` / `zcode`。
  */
-const PROVIDER_BY_REF_PREFIX = {
-    CODEARTS: 'codearts',
-    BUDDY: 'buddy',
-    WORKBUDDY: 'workbuddy',
-    LOBSTERAI: 'lobsterai',
-    QODER: 'qoder',
-    TRAE: 'trae',
-};
-/** 账号凭据 ref 形态：`{PREFIX}_ACCOUNT_{HEX}`。 */
-const ACCOUNT_REF_RE = /^(CODEARTS|BUDDY|WORKBUDDY|LOBSTERAI|QODER|TRAE)_ACCOUNT_([0-9A-Fa-f]{6,})$/;
+const REF_PREFIX_TO_PROVIDER = [
+    ['CODEARTS', 'codearts'],
+    ['BUDDY', 'buddy'],
+    ['WORKBUDDY', 'workbuddy'],
+    ['LOBSTERAI', 'lobsterai'],
+    ['QODER', 'qoder'],
+    ['QODERCN', 'qodercn'],
+    ['TRAE', 'trae'],
+    ['CLINE', 'cline'],
+    ['LOOMY', 'loomy'],
+    ['RACCOON', 'raccoon'],
+    // ⚠️ 第 12 个 provider（上游 2026-10-02 合并）—— 曾漏加，见上方注释 ②。
+    ['MINIMAX', 'minimax'],
+    ['ZCODE', 'zcode'],
+    // ⚠️ 第 13 个 provider（opencode，2026-10-01）—— 与上面 minimax 同款坑：
+    // 漏加会让「恢复备份」认不出 opencode 账号（见上方注释 ②）。
+    ['OPENCODE', 'opencode'],
+];
+/** 账号凭据 ref 形态：`{PREFIX}_ACCOUNT_{HEX}`（前缀由单一真相源派生）。 */
+const ACCOUNT_REF_RE = new RegExp(
+// ⚠️ 按前缀长度**降序**排列：`QODERCN` 必须排在 `QODER` 之前。虽然正则的
+// 回溯最终仍能让 `QODERCN_*` 匹配成功（所以顺序错了也**暂时**看不出问题），
+// 但那时匹配结果就取决于引擎的尝试顺序而非规则 —— 一旦将来加入更多同前缀的
+// provider（如 `QODERX`），就会变成静默错归属：账号挂到 `qoder` 面板，而它的
+// 凭据是 CN 的，请求必然失败。故这里显式定序，而非依赖回溯。
+`^(${REF_PREFIX_TO_PROVIDER
+    .map(([prefix]) => prefix)
+    .sort((a, b) => b.length - a.length)
+    .join('|')})_ACCOUNT_([0-9A-Fa-f]{6,})$`);
 /**
  * 从 `.credentials.yaml` 的 `refs:` 段提取 ref 名（**只取键名，不读值**）。
  *
@@ -185,9 +287,14 @@ function accountFromCredentialRef(ref) {
     const match = ACCOUNT_REF_RE.exec(ref);
     if (match === null)
         return undefined;
-    const provider = PROVIDER_BY_REF_PREFIX[match[1]];
+    const prefix = match[1];
     const suffix = match[2];
-    if (provider === undefined || suffix === undefined)
+    if (prefix === undefined || suffix === undefined)
+        return undefined;
+    // 查表也走同一份真相源：正则捕获组只证明「前缀被登记过」，provider 仍由表给出，
+    // 避免这里再写一份「前缀 → provider」的映射。
+    const provider = REF_PREFIX_TO_PROVIDER.find(([candidate]) => candidate === prefix)?.[1];
+    if (provider === undefined)
         return undefined;
     const id = `${provider}-${suffix.toLowerCase()}`;
     return {
@@ -226,8 +333,10 @@ class FileStore {
             return {
                 accounts: sanitizeAccounts(value.accounts),
                 disabledModels: sanitizeDisabledModels(value.disabledModels),
-                // 老文档没有该字段 → 缺省 false（解锁），与既有行为一致。
+                // 只是镜像（权威表在 permanent-locks.json）；老文档没这个键 → false。
                 loomyPermanentLocked: value.loomyPermanentLocked === true,
+                // 老文档没这个键 → 启用，与升级前行为一致。
+                gatewayEnabled: sanitizeGatewayEnabled(value.gatewayEnabled),
             };
         }
         catch (error) {
@@ -266,7 +375,14 @@ class FileStore {
                 .flatMap(ref => accountFromCredentialRef(ref) ?? []);
             if (accounts.length === 0)
                 return undefined;
-            const state = { accounts, disabledModels: {}, loomyPermanentLocked: false };
+            const state = {
+                accounts,
+                disabledModels: {},
+                // 凭据文件里没有任何锁定信息 → 镜像写 false（权威表另有其文档）。
+                loomyPermanentLocked: false,
+                // 恢复出的文档本来就不含任何开关信息 → 启用（与全新安装一致）。
+                gatewayEnabled: true,
+            };
             try {
                 this.write(state);
             }

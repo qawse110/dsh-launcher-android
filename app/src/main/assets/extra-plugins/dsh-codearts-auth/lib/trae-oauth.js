@@ -310,6 +310,11 @@ export async function exchangeTraeCallback(callback, session, product, fetcher =
         uid: callback.uid,
         screenName: callback.nickname,
         enterpriseId: callback.enterpriseId,
+        // ⚠️ 回调的 `userInfo` 参数**不含**脱敏手机号 / 邮箱（实测只有 UserID /
+        // ScreenName / TenantID），它们只在 `GetUserInfo` 响应里 —— 故这里回退空串，
+        // 由下面的 GetUserInfo 分支补上。
+        phone: '',
+        email: '',
     };
     try {
         const uHeaders = traeOAuthHeaders(product);
@@ -327,6 +332,9 @@ export async function exchangeTraeCallback(callback, session, product, fetcher =
                     uid: fetched.uid,
                     screenName: fetched.screenName.length > 0 ? fetched.screenName : userInfo.screenName,
                     enterpriseId: fetched.enterpriseId.length > 0 ? fetched.enterpriseId : userInfo.enterpriseId,
+                    // 手机号 / 邮箱只在 GetUserInfo 里有，拿到即用（空串表示确实没有）。
+                    phone: fetched.phone,
+                    email: fetched.email,
                 };
             }
         }

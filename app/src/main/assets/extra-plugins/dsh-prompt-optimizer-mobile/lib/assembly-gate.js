@@ -140,18 +140,14 @@ export function createEnableGate({ decide, ttlMs = 5 * 60 * 1000, now = Date.now
  * 启用是"必须显式成立"的事，不是"默认成立"的事。
  */
 export function parseEnableIntent(text) {
-  // ══════════ dsh-launcher fork ══════════
-  // 上游这里写 settings:{enabled:false}，即「读不到/读不懂配置 = 用户关闭了」。
-  // fork 把默认值翻转为启用后，这个回落必须改成**空对象 = 没有表态**，否则
-  // 「完全没配置」会被 decideEnabled 当成显式 enabled:false，默认启用永远不成立
-  // （实测：未配置 => rollout-off，插件仍是静默不生效）。
-  // 注意它同时携带 rollout:{mode:'off'}，与 defaulted 一起表达"这是回落、不是用户写的 off"。
-  // ⚠ rollout 必须是 **null 而不是 {mode:'off'}**：normalizeRollout 只在
-  // "mode 非法/缺失" 时才标 defaulted=true，而显式 {mode:'off'} 会被读成
-  // **用户自己写的 off**（defaulted=false）⇒ 回落路径会变成显式关闭，
-  // fork 的默认启用就永远不成立（实测踩到）。null 才表达"没配置灰度"。
   const conservative = {
     ok: false, ours: false, reason: 'not-enabled',
+    // ⚠ dsh-launcher fork（FORK.md 改动 2）：上游这里写 settings:{enabled:false}，
+    // 即「读不到/读不懂配置 = 用户关闭了」。但「完全没配置」会被 decideEnabled
+    // 当成显式 enabled:false ⇒ 默认启用永远不成立。fork 改为空 settings。
+    // rollout 必须是 **null 而不是 {mode:'off'}**：normalizeRollout 只在
+    // "mode 非法/缺失" 时才标 defaulted=true，而显式 {mode:'off'} 会被读成
+    // 用户的选择 ⇒ 默认启用同样不成立。
     settings: {}, rollout: null,
   }
   let cfg = null
@@ -173,8 +169,7 @@ export function parseEnableIntent(text) {
     ok: true,
     ours: true,
     reason: null,
-    // fork：只有**显式 false** 才算关闭；字段缺失/为 true 都是"没有关闭意图"。
-    settings: cfg.enabled === false ? { enabled: false } : {},
+    settings: { enabled: cfg.enabled === true },
     rollout: normalizeRollout(cfg.rollout),
   }
 }
@@ -193,8 +188,9 @@ export function parseEnableIntent(text) {
  * @param legacyText  旧路径文件的文本；文件不存在时传 `null`
  */
 export function pickEnableIntent(primaryText, legacyText) {
-  // fork：两个文件都不存在（未配置）时也必须返回**空 settings**（见 parseEnableIntent 的说明），
-  // 否则「没配置」会经 legacy 分支变成"显式关闭"。
+  // ⚠ dsh-launcher fork（FORK.md 改动 2）：两个文件都不存在（未配置）时也必须返回
+  // **空 settings**（见 parseEnableIntent 的说明），否则「没配置」会经 legacy 分支
+  // 变成"显式关闭"，默认启用永远不成立。
   if (primaryText == null && legacyText == null) {
     return { ok: false, ours: false, reason: 'not-enabled', settings: {}, rollout: null }
   }
@@ -241,15 +237,16 @@ export function toActiveTriState(signal) {
  * @param oldPluginActive  旧插件是否仍在装配（true/false/**null=拿不到作用域**）
  */
 export function resolveEnableDecision({ intent, sessionId, oldPluginActive }) {
-  // ══════════ dsh-launcher fork：两处「保守方向」按本部署现实调整 ══════════
-  // ① 未配置时**不再回落成 settings.enabled:false**：那会被 decideEnabled 读成
-  //    「用户显式关闭」。空对象 = 没表态 ⇒ 走 fork 的默认启用。
+  // ⚠ dsh-launcher fork（FORK.md 改动 2）：未配置时**不再回落成 settings.enabled:false**
+  // —— 那会被 decideEnabled 读成「用户显式关闭」。空对象 = 没表态 ⇒ 走 fork 的默认启用。
   const base = intent && intent.ok ? intent : { settings: {}, rollout: null }
-  // ② 拿不到旧插件作用域时**不再一律拒绝**。上游据 ADR-0033 取保守方向（不确定就不启用），
-  //    其前提是「桌面端可能同时装着 0.5.x 旧插件」；本部署内置清单里只有本 fork 一个
-  //    提示词插件，旧包从未装配，继续保守只会得到「面板在、点了没反应」。
-  //    **确定**旧插件仍在装时的 DOUBLE_INTERCEPT 守卫（decideEnabled 内）保持不变 ——
-  //    真正有并存风险时依然会拦住。
+  // 拿不到作用域时**不得**当作"不在装"（ADR-0033）：直接把结论降为 unknown 且不启用。
+  if (oldPluginActive === null || oldPluginActive === undefined) {
+    return {
+      enabled: false, code: 'old-plugin-unknown',
+      reason: '拿不到 per-agent 作用域，无法确认旧插件是否仍在装配：按保守方向不启用',
+    }
+  }
   return decideEnabled({
     rollout: base.rollout,
     sessionId,

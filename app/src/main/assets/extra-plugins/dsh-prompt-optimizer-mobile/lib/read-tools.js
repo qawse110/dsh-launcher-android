@@ -40,6 +40,8 @@
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 import { toolResultShape, loadLlmLib } from './llm-lib.js'
+import { createHash } from 'node:crypto'
+import { readBounded } from './advisor-materials.js'
 import { runPosix, SUPPORTED_COMMANDS, SUPPORTED_OPERATORS } from './posix.js'
 
 /** 文件大小上限：超过直接拒绝（0.5 的 LOOP_MAX_FILE_BYTES）。 */
@@ -216,7 +218,8 @@ export function toolRead(root, args) {
     const info = statSync(abs)
     if (!info.isFile()) return ok('不是文件：' + String(a.path))
     if (info.size > MAX_FILE_BYTES) return ok('拒绝：文件过大（>' + MAX_FILE_BYTES + ' 字节，本次 ' + info.size + ' 字节）')
-    const lines = readFileSync(abs, 'utf8').split('\n')
+    const bytes=readBounded(root,String(a.path),MAX_FILE_BYTES).data
+    const lines = bytes.toString('utf8').split('\n')
     const startRaw = a.startLine === undefined || a.startLine === null ? 1 : Number(a.startLine)
     const endRaw = a.endLine === undefined || a.endLine === null ? startRaw + DEFAULT_READ_LINES - 1 : Number(a.endLine)
     if (!Number.isFinite(startRaw) || !Number.isFinite(endRaw)) return reject('拒绝：startLine/endLine 必须是数字')
@@ -225,7 +228,9 @@ export function toolRead(root, args) {
     const slice = end >= start ? lines.slice(start - 1, end) : []
     const body = slice.map((line, i) => String(start + i).padStart(5, ' ') + '| ' + line).join('\n')
     const head = '文件 ' + String(a.path) + '（共 ' + lines.length + ' 行，返回 ' + start + '-' + end + '）'
-    return ok(capText(head + '\n' + body))
+    const full=head+'\n'+body,text=capText(full)
+    const ref='read:'+String(a.path).replaceAll(String.fromCharCode(92),'/')
+    return {...ok(text),evidence:{ref,path:String(a.path),sha256:createHash('sha256').update(bytes).digest('hex'),kind:'file',status:full===text?'ready':'truncated',selectionComplete:full===text,wholeFileComplete:start===1 && end===lines.length && full===text,startLine:start,endLine:end}}
   } catch (e) {
     return ok('读取失败：' + String((e && e.message) || e))
   }
@@ -464,7 +469,7 @@ export async function runReadOnlyToolLoop(opts) {
   const llmMod = shapeT && shapeT.mod && typeof shapeT.mod === 'object' ? shapeT.mod : (shapeT && typeof shapeT.createAssistantMessage === 'function' ? shapeT : null)
 
   const messages = Array.isArray(o.messages) ? o.messages.slice() : []
-  const system = String(o.system || '') + TOOLS_SYSTEM_NOTE
+  const system = String(o.system || '') + (o.systemNote === undefined ? TOOLS_SYSTEM_NOTE : String(o.systemNote))
   // 顶层清单**预注入**：0.5 实测模型会把整轮预算花在 glob 上、一次都不 read。
   // 清单只声明**存在**，不等于知道内容——这条要写清楚，否则又变成"没读就写事实"。
   if (o.rootListing !== false) {
@@ -486,12 +491,15 @@ export async function runReadOnlyToolLoop(opts) {
     } catch { /* 清单拿不到就不给：少一样证据，不是错误 */ }
   }
 
+  const notify = (event) => { try { if (typeof o.onEvent === 'function') o.onEvent(event) } catch { /* UI only */ } }
+  const usageSum = {}
   const trace = []
   let rounds = 0
   let capped = false
   let error = null
   let text = ''
   for (let round = 1; round <= maxRounds + 1; round += 1) {
+    if (signal?.aborted) { error = 'cancelled'; break }
     const useTools = round <= maxRounds && now() < deadline
     if (round > 1) {
       // 上一轮的正文是**脚手架**（"我先读一下项目结构…"），到下一轮就作废。
@@ -502,10 +510,15 @@ export async function runReadOnlyToolLoop(opts) {
     if (round === maxRounds + 1) {
       messages.push({
         role: 'user',
-        content: [{ type: 'text', text: '【系统】已达本次查证轮次上限，请立即用已获得的证据给出 JSON 产出，不要再请求工具。' }],
+        content: [{ type: 'text', text: o.finalNote || '【系统】已达本次查证轮次上限，请立即用已获得的证据给出 JSON 产出，不要再请求工具。' }],
       })
     }
+    if(typeof o.evidenceNote==='function') {
+      const note=o.evidenceNote(trace)
+      if(note)messages.push({role:'user',content:[{type:'text',text:String(note)}]})
+    }
     const rt = now()
+    notify({ kind: 'round', round, final: !useTools })
     let stream = null
     try {
       stream = llm.stream({
@@ -526,6 +539,9 @@ export async function runReadOnlyToolLoop(opts) {
     }
     const r = await drainWithTools(stream, rt, typeof opts.onDelta === 'function' ? opts.onDelta : null)
     rounds = round
+    if (r.usage) for (const [key, value] of Object.entries(r.usage)) {
+      if (typeof value === 'number' && Number.isFinite(value)) usageSum[key] = (usageSum[key] || 0) + value
+    }
     if (r.text) text = r.text
     if (r.error) { error = r.error; break }
     const calls = Array.isArray(r.calls) ? r.calls.filter((c) => c && c.id && c.name) : []
@@ -536,13 +552,18 @@ export async function runReadOnlyToolLoop(opts) {
       let args = {}
       try { args = JSON.parse(call.arguments || '{}') } catch { args = {} }
       const st = now()
+      if (signal?.aborted) { error = 'cancelled'; break }
       const res = executeReadOnlyTool(root, call.name, args)
       trace.push({
         round, tool: String(call.name), args, ok: res.ok === true && res.rejected !== true,
         rejected: res.rejected === true,
         ms: now() - st,
         resultLines: String(res.text).split('\n').length,
+        resultAvailable: call.name === 'read' && res.ok && String(res.text).startsWith('文件 '),
+        evidence:res.evidence || null,
       })
+      notify({ kind: 'tool', round, tool: call.name, target: args.path || args.pattern || args.command || '',
+        ok: res.ok === true && res.rejected !== true, ms: now() - st })
       outputs.push(res)
     }
     messages.push(...toolResultMessages(calls, outputs, resultShape))
@@ -553,6 +574,7 @@ export async function runReadOnlyToolLoop(opts) {
   const outText = String(text || '')
   return {
     ...base, ok: !error, error, text: outText, rounds, toolCalls: trace.length,
+    usageSum: Object.keys(usageSum).length ? usageSum : null,
     names: namesOf(trace), trace, capped, ms: now() - t0, empty: outText.trim().length === 0,
   }
 }

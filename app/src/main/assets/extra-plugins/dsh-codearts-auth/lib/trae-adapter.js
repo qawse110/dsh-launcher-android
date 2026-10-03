@@ -19,12 +19,13 @@
 import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 import { ToolCallId } from '@deepseek-ai/dsh-llm';
 import { providerCatalogVisible } from './account-pool.js';
-import { settingsNamespaceFor } from './settings-compat.js';
+import { RemoteCatalogGate } from './remote-catalog-gate.js';
 import { TRAE_MAX_CONTEXT_TOKENS, clampTraeMaxTokens, isTraeExpired, parseTraeSSELine, isTraeModelCallable, traeMaxModeFields, traeSOLOHeaders, transformToSOLOBody, } from './trae.js';
 import { TRAE } from './trae-product.js';
 import { classifyTraeError, recordsTraeRateLimit, shouldRotateTraeAccount } from './trae-errors.js';
 import { normalizeHarnessMessages } from './message-shape.js';
-import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js';
+import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js';
+import { registerAdapterIdempotent, } from './llm-register-compat.js';
 /** 本适配器注册的 provider 路由名。 */
 export const PROVIDER = 'trae';
 /**
@@ -143,6 +144,39 @@ function resolveChunkTimeoutMs() {
 const TRAE_RATE_LIMIT_FALLBACK_MS = 3_600_000;
 /** 单次请求最多换几个账号（含首次），防雪崩。 */
 const TRAE_MAX_ROTATE = 3;
+/**
+ * **流内**（SSE `event:error`）可换号错误的哨兵码。
+ *
+ * ## 为什么需要它（真实缺陷）
+ *
+ * 换号逻辑整体位于 `if (!response.ok)` 分支内 —— 只在 **HTTP 非 2xx** 时执行。
+ * 而上游确实会用 **HTTP 200 + SSE `event:error`** 下发额度/限流错误
+ * （实测依据见 {@link traeStreamErrorMessage} 的 4001 记录）。
+ * 那条路径下换号代码**一行都不执行**，直接抛 `QUOTA_EXCEEDED` ——
+ * 而它**不在 DSH 的可重试集合**里，用户看到的就是「不会切换账号」。
+ *
+ * 故流内错误在「**尚未产出任何内容**」时用本码抛出，交由
+ * {@link TraeAdapter.stream} 的外层循环捕获并换号重发。
+ *
+ * ⚠️ **必须与真实 provider-neutral 码区分**：这个码**只在本适配器内部**
+ * 传递，绝不会漏给 DSH（外层要么换号成功，要么改抛真实错误码）。
+ * 用一个明显不可能与 DSH taxonomy 冲突的字符串，避免调用方误判。
+ */
+const TRAE_ROTATABLE_STREAM_ERROR = 'TRAE_ROTATABLE_STREAM_ERROR';
+/**
+ * 流内错误是否**值得换号**。
+ *
+ * 与 HTTP 层共用同一张判据表（{@link classifyTraeError}），避免两处各写一套
+ * 而逐渐分叉 —— 这正是本次缺陷的成因（流内分支当年自己写了一套「一律
+ * 不可重试」的判据）。
+ *
+ * 对齐既有类别：`hard-plan`(1005) / `soft-rate`(4011/429) /
+ * `quota-exceeded`(4008) 都换号；`4001`（模型不可调用）换号无意义
+ * —— 换账号也是同一个模型被拒，故**不换号**，直接如实报错。
+ */
+function isRotatableStreamError(code) {
+    return code === 1005 || code === 4008 || code === 4011;
+}
 /**
  * 机器指纹轮换间隔（每 N 次请求换一代，仅在显式启用时生效）。
  *
@@ -482,6 +516,11 @@ export class TraeAdapter extends LlmAdapter {
     fetchImpl;
     /** 动态模型缓存。 */
     remoteModels;
+    /**
+     * 目录加载闸门：并发去重 + 失败/空结果冷却。
+     * 依据见 `src/remote-catalog-gate.ts`（首屏「加载模型巨长」的实测归因）。
+     */
+    catalogGate = new RemoteCatalogGate();
     /** 远端模型元数据索引。 */
     remoteMeta = new Map();
     /** 产品级兜底模型索引。 */
@@ -504,16 +543,20 @@ export class TraeAdapter extends LlmAdapter {
     }
     /** 懒加载远端模型目录（仅拉取一次）。 */
     async ensureRemoteModels() {
-        if (this.remoteModels !== undefined || this.options.fetchRemoteModels === undefined)
+        const fetchRemote = this.options.fetchRemoteModels;
+        if (this.remoteModels !== undefined || fetchRemote === undefined)
             return;
-        try {
-            const models = await this.options.fetchRemoteModels();
-            if (models.length > 0) {
-                this.remoteModels = models;
-                this.remoteMeta = new Map(models.map((model) => [model.id, model]));
-            }
-        }
-        catch { /* 远端不可用：回退兜底目录 */ }
+        // 闸门：并发去重 + 失败/空结果冷却（依据见 src/remote-catalog-gate.ts）。
+        // Trae 的目录超时上限 30s（src/trae.ts:68），失败不冷却会被 buildModelCatalog
+        // 放大成「每模型一次」。
+        await this.catalogGate.run(async () => {
+            const models = await fetchRemote();
+            if (models.length === 0)
+                return false;
+            this.remoteModels = models;
+            this.remoteMeta = new Map(models.map((model) => [model.id, model]));
+            return true;
+        });
     }
     /**
      * 模型接受的输入模态 —— **逐模型**判定，不是按 provider 一刀切。
@@ -750,10 +793,16 @@ export class TraeAdapter extends LlmAdapter {
         //    这里只作兜底（已加载时是空操作）。
         await this.ensureRemoteModels();
         // 1. 获取凭据（过期则先静默续期）
-        let credential = await this.options.resolveCredential();
+        //
+        // ⚠️ **必须传 `options.model`**：这是选号主路径，`resolveCredential` 会把
+        // 它透传给 `getAvailableAccount` 的 `modelId` 过滤限流账号。传空串等于
+        // 不按模型过滤，限流标记被忽略（用户报障「没有切换」的根因之一）。
+        let credential = await this.options.resolveCredential(options.model);
         if (credential === undefined || isTraeExpired(credential)) {
             await this.options.refresh();
-            credential = await this.options.resolveCredential();
+            // ⚠️ 传 `options.model`：选号必须按**本轮的模型**过滤限流账号，
+            // 否则刚标记的限流账号会被再次选中（见 options 类型处的说明）。
+            credential = await this.options.resolveCredential(options.model);
         }
         if (credential === undefined || credential.access_token.length === 0) {
             throw new LlmError('trae: no usable credential; log in first', 'MISSING_CREDENTIAL');
@@ -880,7 +929,8 @@ export class TraeAdapter extends LlmAdapter {
         let response = await this.send(credential, body, options);
         if (!response.ok && (response.status === 401 || response.status === 403)) {
             await this.options.refresh();
-            const refreshed = await this.options.resolveCredential();
+            // 与主路径一致：按本模型选号（跳过正在限流的账号）。
+            const refreshed = await this.options.resolveCredential(options.model);
             if (refreshed === undefined || refreshed.access_token.length === 0) {
                 throw new LlmError('trae: credential expired and refresh failed', 'AUTH', { status: response.status });
             }
@@ -926,16 +976,68 @@ export class TraeAdapter extends LlmAdapter {
         }
         // 5. 消费 SSE 流（SOLO → OpenAI 转换）
         //
-        // 空响应（HTTP 200 但一个事件都没发）**重试一次**。这是安全的：
-        // `consumeSse` 只在「尚未产出任何 chunk」时抛该错误，因此不存在
-        // 「已经吐了一半再重放」的重复计费风险（对齐 CN 项目的
-        // `TRAE_REMOTE_WORK_FALLBACK` 语义：只在首个模型事件之前允许重试）。
+        // ## 两条重试路径，共用同一个循环
+        //
+        // ① **空响应**（HTTP 200 但一个事件都没发）→ 重试一次（同账号）；
+        // ② **流内可换号错误**（`event:error` 1005/4008/4011，见
+        //    {@link TRAE_ROTATABLE_STREAM_ERROR}）→ **换号重发**。
+        //
+        // 两者都**只在尚未产出任何 chunk 时**才允许：`consumeSse` 保证空响应
+        // 错误只在首个事件前抛；流内错误则由 `!gotAnyContent` 把关。因此不存在
+        // 「已经吐了一半再重放」的重复计费与重复执行工具风险（对齐 CN 项目的
+        // `TRAE_REMOTE_WORK_FALLBACK` 语义）。
+        const triedStreamAccounts = new Set();
+        if (currentAccountId.length > 0)
+            triedStreamAccounts.add(currentAccountId);
+        let rotateBudget = TRAE_MAX_ROTATE - 1;
         for (let attempt = 0;; attempt++) {
             try {
                 yield* this.consumeSse(response, options);
                 return;
             }
             catch (error) {
+                // ② 流内可换号错误 → 标记当前账号 + 取下一个账号重发。
+                if (error instanceof LlmError && error.code === TRAE_ROTATABLE_STREAM_ERROR) {
+                    // 无账号池、或换号预算用尽 → 如实抛出（去掉哨兵码，换真实语义）。
+                    if (this.options.accountPool === undefined || rotateBudget <= 0) {
+                        throw new LlmError(error.message, 'QUOTA_EXCEEDED');
+                    }
+                    if (options.signal?.aborted)
+                        throw error;
+                    rotateBudget -= 1;
+                    // 标记当前账号在本模型上受限（UI 据此亮「限额重置」徽章）。
+                    //
+                    // ⚠️ 与 HTTP 层同款：只标记**该模型**，该账号在别的模型上仍可用。
+                    if (currentAccountId.length > 0) {
+                        await this.options.accountPool.updateModelRateLimit(currentAccountId, options.model, Date.now() + TRAE_RATE_LIMIT_FALLBACK_MS);
+                    }
+                    // 取下一个账号。
+                    //
+                    // ⚠️ **必须传真实 modelId 且传 `tried`**：
+                    // - 传空串会让限流过滤整体短路（`if (modelId.length === 0) return true`），
+                    //   刚标记的账号立刻又被选中 —— 换号形同虚设；
+                    // - 不传 `tried` 会在 A/B 之间反复空转（Qoder 已踩过，见
+                    //   `qoder-adapter.ts` 的 `switchAccountOnQuota` 注释）。
+                    const next = await this.options.accountPool.getAvailableAccount(this.product.id, options.model, triedStreamAccounts);
+                    if (next === null || next === undefined || triedStreamAccounts.has(next.entry.id)) {
+                        throw new LlmError(error.message, 'QUOTA_EXCEEDED');
+                    }
+                    triedStreamAccounts.add(next.entry.id);
+                    credential = next.credential;
+                    currentAccountId = next.entry.id;
+                    response = await this.send(credential, body, options);
+                    if (!response.ok) {
+                        const text = await response.text().catch(() => '');
+                        const kind = classifyTraeError(response.status, text);
+                        if (!shouldRotateTraeAccount(kind)) {
+                            throw new LlmError(`trae: ${errorDetail(text)}`, httpErrorCode(response.status), { status: response.status });
+                        }
+                        // 新账号在 HTTP 层就失败 → 继续下一轮（受 rotateBudget 约束）。
+                        continue;
+                    }
+                    continue;
+                }
+                // ① 空响应重试（同账号，一次）。
                 const empty = error instanceof LlmError
                     && error.message.includes('upstream returned no events');
                 if (!empty || attempt >= 1)
@@ -1033,8 +1135,9 @@ export class TraeAdapter extends LlmAdapter {
          */
         const proseLoopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined;
         let proseLoopDetected = false;
-        /** `</think:hex>` 泄漏探测（跨帧，收尾再切分）。 */
-        let proseHasThinkTag = false;
+        // ⚠️ 此处**曾有** `proseHasThinkTag` 门禁变量，2026-09-27 **删除**。
+        // 逐帧探测在跨帧时必然漏判（实测二分帧 7/11 漏）→ 收尾不切分 → 标签泄漏。
+        // 现改为收尾**无条件**调用 `splitThinkTaggedContent`。
         /**
          * 纯空白思考抑制器（见 `createBlankReasoningSuppressor`）。与 `blocks` /
          * `loopGuard` 同生命周期：**每个 `stream()` 调用建一个实例**。
@@ -1141,9 +1244,9 @@ export class TraeAdapter extends LlmAdapter {
                                                 if (proseLoopGuard.observe(delta.content))
                                                     proseLoopDetected = true;
                                             }
-                                            // `</think:hex>` 泄漏探测（跨帧，收尾再切分）。
-                                            if (!proseHasThinkTag && delta.content.includes('think:'))
-                                                proseHasThinkTag = true;
+                                            // ⚠️ **不要在这里逐帧探测 think 标签**（2026-09-27 移除）：
+                                            // 跨帧必然漏判（实测二分帧 7/11 漏）→ 收尾不切分 → 标签泄漏。
+                                            // 改为收尾无条件调用 `splitThinkTaggedContent`。
                                             if (!proseLoopDetected) {
                                                 block.text += delta.content;
                                                 yield { type: 'text-delta', index: block.index, text: delta.content };
@@ -1258,11 +1361,28 @@ export class TraeAdapter extends LlmAdapter {
                                     streamEnded = true;
                                     break;
                                 case 'error': {
-                                    // 上游 event:error → 作为业务错误抛出
-                                    // 如果是配额/plan 限流等可换号的错误，不应该走到这里（错误响应走 HTTP 400+ 路径）
-                                    // 但如果流内出现 error，按不可重试处理
+                                    // 上游 `event:error` → 作为业务错误抛出。
+                                    //
+                                    // ⚠️ **这里曾经的注释是错的**（本次修复）：
+                                    // > 如果是配额/plan 限流等可换号的错误，**不应该**走到这里
+                                    // >（错误响应走 HTTP 400+ 路径）
+                                    //
+                                    // 该假设与同文件的实测记录矛盾 —— 上游**确实**用流内
+                                    // `event:error` 下发错误（4001「param is invalid」已实测，
+                                    // 见 `traeStreamErrorMessage` 与 README 的 4001 条目）。
+                                    // 后果：额度类错误在此直接抛 QUOTA_EXCEEDED，**换号代码一行
+                                    // 都不执行**（它只写在 `if (!response.ok)` 里），而该码不在
+                                    // DSH 的可重试集合 → 用户报障「不会切换账号」。
+                                    //
+                                    // 现在：**未产出任何内容**时抛哨兵码，让外层换号重发；
+                                    // 已有输出则如实抛真实错误码（绝不重放，防重复计费）。
                                     if (ev.errorCode !== undefined && ev.errorMessage !== undefined) {
-                                        throw new LlmError(traeStreamErrorMessage(ev.errorCode, ev.errorMessage, options.model), ev.errorCode === 1005 || ev.errorCode === 4008 ? 'QUOTA_EXCEEDED' : 'SERVER');
+                                        const message = traeStreamErrorMessage(ev.errorCode, ev.errorMessage, options.model);
+                                        if (isRotatableStreamError(ev.errorCode) && !gotAnyContent) {
+                                            throw new LlmError(message, TRAE_ROTATABLE_STREAM_ERROR);
+                                        }
+                                        // 4001（模型不可调用）不换号：换账号也是同一模型被拒。
+                                        throw new LlmError(message, ev.errorCode === 1005 || ev.errorCode === 4008 ? 'QUOTA_EXCEEDED' : 'SERVER');
                                     }
                                     break;
                                 }
@@ -1328,6 +1448,8 @@ export class TraeAdapter extends LlmAdapter {
          * （EMPTY_RESPONSE）覆盖 —— 与 `kind !== 'stop'` 不改写同一条道理。
          */
         let blockCount = 0;
+        /** 本步**最终发出的正文**，供 finish 归类判定「是否被上游停止串截断」。 */
+        let emittedProse = '';
         // 按创建顺序关闭每个块
         const textBlock = blocks.find(block => block.kind === 'text');
         for (const index of toolOrder) {
@@ -1349,11 +1471,16 @@ export class TraeAdapter extends LlmAdapter {
             };
         }
         if (textBlock !== undefined) {
-            // ── `</think:hex>` 泄漏归位（见 `splitThinkTaggedContent`）──
+            // ── think 标签归位（见 `splitThinkTaggedContent`）──
             // 标签**前**的内心独白 → reasoning 块；标签**后**的真正文 → 本 text 块。
             // 无标签时**逐字节不变**。
+            //
+            // ⚠️ **必须无条件调用，不得加「先探测有没有标签」的门禁**（2026-09-27 修）：
+            // 标签会**跨帧**到达，任何逐帧探测都会漏判（实测二分帧 7/11 漏），
+            // 漏了就不切分、标签原样泄漏。无标签时本函数返回 undefined，故普通响应
+            // 逐字节不变（仅多一次字符串扫描）。
             let textOut = textBlock.text;
-            if (proseHasThinkTag) {
+            {
                 const split = splitThinkTaggedContent(textBlock.text);
                 if (split !== undefined) {
                     // ⚠️ **必须同时喂 `suppressor`**：收尾以 `suppressor.text()` 为
@@ -1371,6 +1498,19 @@ export class TraeAdapter extends LlmAdapter {
                     textOut = split.text;
                 }
             }
+            // ── 残留标签**兜底剥离**（见 `stripBareThinkCloseTag`）──
+            //
+            // ⚠️ **默认关闭**（`DSH_THINK_LEAK_STRIP=1` 才启用）。用户决定（2026-09-27）：
+            // > 暂时不需要泄露过滤……**加了过滤可能有思考解析失败但是被过滤我们发现不了。**
+            // 即兜底会**掩盖解析层的失败**；当前要让泄漏如实呈现以便观测。
+            //
+            // ⚠️ **必须在切分之后**：切分负责「解析」，本行只兜底纯标签块。
+            //
+            // ⚠️ **必须在 hex 切分之后**（顺序不可颠倒）：若放在切分之前，
+            // `思考</think:6124c78e></think>` 这类「hex 后跟裸标签」的形态会漏 ——
+            // 切分把裸标签留在正文侧，直接泄漏进 UI（审计实测到的真实缺陷）。
+            // 放在末尾同时覆盖两种形态：切分产物再剥一次、纯裸标签块（无 hex）也在此剥离。
+            textOut = stripBareThinkCloseTagIfEnabled(textOut);
             // 正文死循环截断：只保留循环前的干净前缀。
             // ⚠️ **不改 finish reason**：工具调用仍要被执行。
             const truncated = proseLoopDetected && proseLoopGuard?.cutAt !== undefined
@@ -1382,6 +1522,7 @@ export class TraeAdapter extends LlmAdapter {
             // `EMPTY_RESPONSE` 契约禁止产出空内容块。思考段已归位，故仍有产出。
             if (cleaned !== '') {
                 blockCount += 1;
+                emittedProse = cleaned;
                 yield { type: 'block-end', index: textBlock.index, block: { type: 'text', text: cleaned } };
             }
         }
@@ -1410,18 +1551,44 @@ export class TraeAdapter extends LlmAdapter {
         // 否则模型本意调工具、harness 却认为「正常答完了」（无报错中断）。
         const argsTruncated = [...toolCalls.values()].some(block => isTruncatedArguments(block.text));
         const droppedUnnamedCalls = [...toolCalls.values()].some(block => !block.announced);
-        const reason = loopDetected
-            // 思考死循环：截断并报可重试。**优先级最高** —— 循环中生成的工具调用
-            // 参数不可信；且若无可用调用，落到 `stop` 会让任务静默中断。
-            ? { kind: 'max-tokens' }
-            : finishReason === 'length'
-                || (finishReason === undefined && toolOrder.length > 0)
-                || argsTruncated
-                || (droppedUnnamedCalls && toolOrder.length === 0)
+        /**
+         * 正文是否被**上游停止串**掐断（见 `isProseTruncatedByStopString`）。
+         *
+         * 上游把 `</think>` 当停止串：模型在正文里写它（哪怕包在反引号里）就会被
+         * 掐断，但仍报 `finish_reason:"stop"` —— 我们据此判「正常答完」会让本轮
+         * **没有任何报错就停住**。
+         */
+        const proseCutByStopString = finishReason === 'stop'
+            && toolOrder.length === 0
+            && isProseTruncatedByStopString(emittedProse);
+        /**
+         * 思考死循环是否**是唯一的产出**（无正文、无工具调用）。
+         *
+         * ⚠️ 与 `buddy-adapter.ts` / `openai-compat.ts` 同因同修（Gitee !IKIZNK）：
+         * 只有该步没有可见产出时才报 `error` —— `error` 路径**不落
+         * `assistant/message`**（实测 219 会话里 222 例），有正文/工具调用时报它会把
+         * 用户可见内容整块丢掉。实测守卫命中的 25 例全部只有思考。
+         */
+        const reasoningLoopIsSoleOutput = loopDetected
+            && emittedProse === ''
+            && toolOrder.length === 0;
+        const reason = reasoningLoopIsSoleOutput
+            // 思考死循环且无可见产出：报**有分辨力的 error**（见 REASONING_LOOP_CODE）。
+            // ⚠️ 不能报 max-tokens —— UI 对它的固定文案是「已达到输出 token 上限」，
+            // 把「检测到死循环」误导成「额度用满」（真实缺陷，Gitee !IKIZNK）。
+            ? { kind: 'error', failure: reasoningLoopFailure(loopGuard?.diagnostics, options.maxTokens, 'reasoning') }
+            // 循环命中但另有可见产出：只能报 max-tokens（保住内容），不能报 error。
+            : loopDetected
                 ? { kind: 'max-tokens' }
-                : finishReason === 'tool_calls' || toolOrder.length > 0
-                    ? { kind: 'tool-calls' }
-                    : { kind: 'stop' };
+                : finishReason === 'length'
+                    || (finishReason === undefined && toolOrder.length > 0)
+                    || argsTruncated
+                    || proseCutByStopString
+                    || (droppedUnnamedCalls && toolOrder.length === 0)
+                    ? { kind: 'max-tokens' }
+                    : finishReason === 'tool_calls' || toolOrder.length > 0
+                        ? { kind: 'tool-calls' }
+                        : { kind: 'stop' };
         // 零内容块响应（例如本次只收到过那个被压制的空白 reasoning）否则会以
         // `stop` 收场 —— 那是 DSH `EMPTY_RESPONSE` 契约明令禁止的静默结束。
         // ⚠️ 传入的是**上面已算好的** `reason`（含 loopDetected / length /
@@ -1515,17 +1682,8 @@ function trimTraeHistory(messages, maxChars = resolveMaxHistoryChars()) {
  */
 export function registerTraeLlm(ctx, options) {
     const product = options.product ?? TRAE;
-    ctx.llm.registerConfigurableProviders([
-        {
-            provider: product.id,
-            displayName: product.displayName,
-            // 0.1.7 起 settings 命名空间只能是 profile 条目 id（见 settingsNamespaceFor）。
-            settingsNs: settingsNamespaceFor(ctx, `llm-${product.id}`),
-            settingsPath: [],
-        },
-    ]);
     const adapter = new TraeAdapter(options);
-    ctx.llm.registerAdapter([product.id], adapter);
+    registerAdapterIdempotent(ctx.llm, [product.id], adapter);
     // 返回实例：Jet Hub 的「显示列表」需要它的 `listAllModels()`（不受用户黑名单
     // 影响的全量目录，带最终展示名/倍率）。DSH 的 `ctx.llm` 不透传自定义方法，
     // 故必须由调用方持有引用。

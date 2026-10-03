@@ -34,8 +34,9 @@
  *   重试；正确做法是判 `max-tokens` 让 dsh 重试。
  */
 import { LlmError, ToolCallId } from '@deepseek-ai/dsh-llm';
-import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled, } from './sse.js';
+import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled, } from './sse.js';
 import { normalizeHarnessMessages } from './message-shape.js';
+import { isBillingBusinessCode, looksLikeBillingError, parseQueueError, queueDelayMs } from './model-queue.js';
 /** 将消息内容载荷展平为纯文本字符串。 */
 export function contentToText(content) {
     if (typeof content === 'string')
@@ -282,6 +283,42 @@ export function httpErrorCode(status) {
     return `HTTP_${status}`;
 }
 /**
+ * **模型排队**（Qoder 业务码 `10605`）—— 从 SSE 错误帧里透出来的专用错误。
+ *
+ * ## 为什么需要它（真实缺陷，用户报障 2026-09-27）
+ *
+ * Qoder 的排队错误有**两种**下发形态，第一版修复只覆盖了第一种：
+ *
+ * | 形态 | 第一版 | 说明 |
+ * |---|---|---|
+ * | HTTP **403** + 排队 JSON | ✅ 已覆盖 | 在适配器的 HTTP 状态分支里识别 |
+ * | HTTP **200** + **SSE 内嵌** `{code:"10605",…}` | ❌ **漏掉** | 走 `consumeOpenAiSse`，被一律归为 `SERVER` 抛出 |
+ *
+ * 真实症状：`失败原因：qoder: {"code":"10605",…} (403)` + harness 以
+ * `500/1000/2000/4000/8000`（约 15.5 秒）重试 5 次 —— 而服务端要求等 30 秒，
+ * 于是**永远等不到**。
+ *
+ * ⚠️ 该模块是**共享**的（qoder 适配器在用），故这里只**认码并透出信息**，
+ * 不在此处等待 —— 等待策略属于各 provider（只有 qoder 有排队语义）。
+ * 消费方捕获本类后自行按 `retryAfterMs` 内部重试。
+ *
+ * ⚠️ `code` 故意用 `'QUEUE'`（**不是** `SERVER`）：harness 的
+ * `DEFAULT_RETRYABLE_CODES` 不含 `QUEUE`，这样万一没人捕获，它会**直接失败**
+ * 并把「排队」这一语义暴露给用户，而不是被 harness 当作 `SERVER` 静默快重试。
+ */
+export class ModelQueuedError extends LlmError {
+    /** 解析出的排队信息（`isQueued` / `serviceAvailable` / `waitTime` 等）。 */
+    queueInfo;
+    /** 服务端要求的等待时长（毫秒）；无法解析时为 undefined。 */
+    retryAfterMs;
+    constructor(message, options) {
+        super(message, 'QUEUE');
+        this.name = 'ModelQueuedError';
+        this.queueInfo = options.queueInfo;
+        this.retryAfterMs = options.retryAfterMs;
+    }
+}
+/**
  * 判断是否为传输级错误（可重试的 TRANSPORT）。
  *
  * 半开连接与 TCP 重置都会以这些特征出现。
@@ -362,14 +399,11 @@ export async function* consumeOpenAiSse(response, options, config) {
      */
     const proseLoopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined;
     let proseLoopDetected = false;
-    /**
-     * `</think:hex>` 泄漏的**待定正文**（见 `splitThinkTaggedContent`）。
-     *
-     * 实测 `hy4-preview-f` 把思考写进 `content` 通道，只在思考段末尾留一个闭标签。
-     * 由于标签**可能跨帧到达**（`</think:612` + `4c78e>`），不能逐帧判定 ——
-     * 必须缓冲到收尾时一次性切分。故这里只累积，`block-end` 时再归位。
-     */
-    let proseHasThinkTag = false;
+    // ⚠️ 此处**曾有** `proseHasThinkTag` 门禁变量，2026-09-27 **删除**。
+    // 它逐帧匹配标签来决定收尾是否切分，而标签**必然跨帧**（上游可切成任意片段），
+    // 实测二分帧时 7/11 种切法漏判 → 标签落盘泄漏。现改为收尾**无条件**调用
+    // `splitThinkTaggedContent`（无标签时返回 undefined，普通响应逐字节不变）。
+    // 详见收尾处的说明。
     /**
      * 纯空白思考抑制器（见 `createBlankReasoningSuppressor`）。与 `blocks` /
      * `loopGuard` 同生命周期：**每个 `stream()` 调用建一个实例**。
@@ -458,6 +492,15 @@ export async function* consumeOpenAiSse(response, options, config) {
                 catch {
                     continue;
                 }
+                // 旁路观测（如 Cline 的网关路由元数据）：失败绝不影响这次推理。
+                if (config.onFrame !== undefined) {
+                    try {
+                        config.onFrame(data);
+                    }
+                    catch {
+                        // 观测是尽力而为，吞掉异常（见选项注释）。
+                    }
+                }
                 if (data.error !== undefined) {
                     throw new LlmError(`${label}: ${data.error.message ?? 'unknown error'}`, 'SERVER');
                 }
@@ -467,6 +510,42 @@ export async function* consumeOpenAiSse(response, options, config) {
                 if (data.choices === undefined
                     && data.code !== undefined
                     && typeof data.message === 'string') {
+                    // ⚠️ **排队识别：绝不能拿顶层 `code` 当门禁**（真实缺陷，用户报障
+                    // 2026-09-27 的**第三次**回归）。
+                    //
+                    // 实测帧（用户贴出的后缀 `(403/model_error)` 反推所得）：
+                    // ```json
+                    // { "code": 403,
+                    //   "message": "{\"code\":\"10605\",\"message\":\"{\\\"isQueued\\\":…}\"}",
+                    //   "type": "model_error" }
+                    // ```
+                    // **顶层 `code` 是 403，业务码 `10605` 在 `message` 里再嵌一层。**
+                    // 上一版写成 `if (isQueueBusinessCode(data.code))` —— 拿 403 比 10605
+                    // **必然不命中**，于是又落到 `SERVER`（这就是「修了两次仍失败」的原因）。
+                    //
+                    // 正确处理：**直接尝试解析 `message`**。`parseQueueError` 自身会递归
+                    // 遍历 `data`/`result`/`message`/`body` 并解析字符串，命中 `10605`
+                    // **或**出现排队标志即返回信息 —— 嵌套几层都能穿透。
+                    const queueInfo = parseQueueError(data.message);
+                    if (queueInfo !== undefined) {
+                        const retryAfterMs = queueDelayMs(queueInfo);
+                        throw new ModelQueuedError(`${label}: ${data.message}`, {
+                            queueInfo: { ...queueInfo },
+                            ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
+                        });
+                    }
+                    // ⚠️ **额度用尽必须归为不可重试**（真实缺陷，用户报障 2026-09-27）：
+                    // 帧形如 `{code:110, message:"Billing daily count exceeded",
+                    // type:"model_error"}`，原先落到下面的 `SERVER` —— 而 `SERVER` **在**
+                    // harness 的 `DEFAULT_RETRYABLE_CODES` 里，于是「今日额度已用尽」这种
+                    // **确定性**错误被**白重试 5 次**（≈15.5 秒，用户看到 `重试延迟：7220毫秒`）。
+                    //
+                    // 客户端权威映射（obf 产物）：`billing_error` → `permission`（不重试），
+                    // 与 `rate_limit` → `rate_limited`（可重试）**明确分开**。
+                    // 故这里抛 `QUOTA_EXCEEDED`（harness 不将其列入可重试集合）。
+                    if (isBillingBusinessCode(data.code) || looksLikeBillingError(data.message)) {
+                        throw new LlmError(`${label}: ${data.message}`, 'QUOTA_EXCEEDED', { ...(typeof data.code === 'number' ? { status: data.code } : {}) });
+                    }
                     const detail = [String(data.code), data.type].filter(Boolean).join('/');
                     throw new LlmError(`${label}: ${data.message}${detail.length > 0 ? ` (${detail})` : ''}`, 'SERVER');
                 }
@@ -475,10 +554,37 @@ export async function* consumeOpenAiSse(response, options, config) {
                 // 早期解析器对这种帧**全部条件都不命中** → 整帧丢弃 → 流照常结束 →
                 // 报 `{kind:'stop'}`，UI 表现为「没有任何报错就中断」（真实缺陷，
                 // 与顶层 code/message 那条同源）。判据必须**显式覆盖**这一形态。
+                //
+                // ⚠️ **另有一条来自信封剥离的变体**：`unwrapQoderEnvelopeStream` 把
+                // 内层错误统一转成 `{code?, message, type:'model_error'}`，此时
+                // `statusCodeValue` 已被信封吃掉 —— 若只判 `statusCodeValue >= 400`，
+                // **整帧会被静默丢弃**。故把 `type === 'model_error'` 也算作错误判据
+                //（真实缺陷：网关形态的排队错误因此既不被识别、连报错都没有）。
                 if (data.choices === undefined && typeof data.message === 'string') {
                     const status = typeof data.statusCodeValue === 'number' ? data.statusCodeValue : undefined;
-                    const looksLikeError = (status !== undefined && status >= 400) || data.stackTrace !== undefined;
+                    const looksLikeError = (status !== undefined && status >= 400)
+                        || data.stackTrace !== undefined
+                        || data.type === 'model_error';
                     if (looksLikeError) {
+                        // ⚠️ **这一形态也可能是排队**（实测内层
+                        // `{statusCodeValue:403, message:"{…isQueued…}"}`，或信封剥离后的
+                        // `{message:"{…}", type:'model_error'}`）—— 都**没有顶层 `code`**，
+                        // 故必须靠 `message` 里的排队字段识别。
+                        const queueInfo = parseQueueError(data.message);
+                        if (queueInfo !== undefined) {
+                            const retryAfterMs = queueDelayMs(queueInfo);
+                            throw new ModelQueuedError(`${label}: ${data.message}`, {
+                                queueInfo: { ...queueInfo },
+                                ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
+                            });
+                        }
+                        // ⚠️ 额度用尽同样要归为**不可重试**（与上面那条分支一致 ——
+                        // 两处判据必须同源，否则会重演「只修了一条通道」的缺陷）。
+                        if (looksLikeBillingError(data.message)) {
+                            throw new LlmError(`${label}: ${data.message}`, 'QUOTA_EXCEEDED', {
+                                ...(status === undefined ? {} : { status }),
+                            });
+                        }
                         const suffix = status === undefined ? '' : ` (status=${status})`;
                         throw new LlmError(`${label}: ${data.message}${suffix}`, 'SERVER', {
                             ...(status === undefined ? {} : { status }),
@@ -522,12 +628,20 @@ export async function* consumeOpenAiSse(response, options, config) {
                         if (proseLoopGuard.observe(textDelta))
                             proseLoopDetected = true;
                     }
-                    // `</think:hex>` 泄漏探测（见 `splitThinkTaggedContent`）：标签可能
-                    // **跨帧**到达，故只做「是否出现过」的廉价判定，真正切分放在收尾。
-                    // 判据用 `think` 子串而非完整正则：跨帧时正则匹配不到，
-                    // 但完整子串判定能可靠地把「本步需切分」标记出来。
-                    if (!proseHasThinkTag && textDelta.includes('think:'))
-                        proseHasThinkTag = true;
+                    // ⚠️ **不要在这里逐帧探测 think 标签**（2026-09-27 移除）。
+                    //
+                    // 历史实现用一个 `proseHasThinkTag` 布尔量当**门禁**，逐帧判
+                    // `textDelta.includes('</think>')`，命中才在收尾调切分。
+                    // 该门禁**在跨帧时必然漏判**：标签会被上游切成任意片段
+                    // （`思考<` + `/think>正文`、`思考</thi` + `nk>正文` …），
+                    // 实测（`scripts/probe-think-flag-split.mjs`）裸闭标签二分帧时
+                    // **7/11 种切法漏判** → 收尾不切分 → 标签原样落盘泄漏。
+                    // 这与本变量注释里自己写明的「标签可能跨帧到达，必须缓冲到收尾」
+                    // **自相矛盾** —— 门禁本身就是那个不该存在的逐帧判定。
+                    //
+                    // 现改为**收尾无条件调用** `splitThinkTaggedContent`：
+                    // 它无闭标签时返回 `undefined`，调用方走原路径，
+                    // 故普通响应仍**逐字节不变**（功能等价，只是多一次字符串扫描）。
                     if (!proseLoopDetected) {
                         block.text += textDelta;
                         yield { type: 'text-delta', index: block.index, text: textDelta };
@@ -689,6 +803,14 @@ export async function* consumeOpenAiSse(response, options, config) {
      * 故此处**在每个 `block-end` 的发射点自增**，与下面三段发射逻辑逐条对齐。
      */
     let blockCount = 0;
+    /**
+     * 本步**最终发出的正文**（`block-end` 的权威文本），供 finish 归类判定
+     * 「是否被上游停止串截断」（见 `isProseTruncatedByStopString`）。
+     *
+     * ⚠️ 必须取**清洗后**的值：`stripBareThinkCloseTag` 可能把纯标签块清成空串，
+     * 那种块**不会发射**，也就不是「被截断的正文」。
+     */
+    let emittedProse = '';
     // 按创建顺序关闭每个块
     const textBlock = blocks.find(block => block.kind === 'text');
     for (const index of toolOrder) {
@@ -722,15 +844,20 @@ export async function* consumeOpenAiSse(response, options, config) {
         };
     }
     if (textBlock !== undefined) {
-        // ── `</think:hex>` 泄漏归位（见 `splitThinkTaggedContent`）──
+        // ── think 标签归位（见 `splitThinkTaggedContent`）──
         //
-        // ⚠️ 必须在**收尾**做，不能逐帧做：标签会跨帧到达
-        // （`</think:61` + `24c78e>`），逐帧匹配不到完整标签。
+        // ⚠️ **必须无条件调用，不得加「先探测有没有标签」的门禁**（2026-09-27 修）。
+        // 标签会**跨帧**到达（`</think:61` + `24c78e>`，甚至 `思考<` + `/think>正文`），
+        // 任何逐帧探测都会漏判 —— 实测二分帧时裸闭标签 **7/11 种切法漏判**，
+        // 漏了就不切分、标签原样落盘泄漏给用户。
+        //
+        // 无标签时 `splitThinkTaggedContent` 返回 `undefined`，此处整段跳过，
+        // 故普通响应**逐字节不变**（只是多一次字符串扫描，代价可忽略）。
         //
         // 归位语义：标签**前**的内心独白 → 既有 reasoning 块（或新建一个），
-        // 标签**后**的真正文 → 本 text 块。无标签时**逐字节不变**。
+        // 标签**后**的真正文 → 本 text 块。覆盖配对/hex/裸三种形态。
         let textOut = textBlock.text;
-        if (proseHasThinkTag) {
+        {
             const split = splitThinkTaggedContent(textBlock.text);
             if (split !== undefined) {
                 // 思考段并入既有 reasoning 块（实测有 3 步两者同时存在），
@@ -752,6 +879,17 @@ export async function* consumeOpenAiSse(response, options, config) {
                 textOut = split.text;
             }
         }
+        // ── 残留标签**兜底剥离**（见 `stripBareThinkCloseTag`）──
+        //
+        // ⚠️ **默认关闭**（`DSH_THINK_LEAK_STRIP=1` 才启用）。用户决定（2026-09-27）：
+        // > 暂时不需要泄露过滤……**加了过滤可能有思考解析失败但是被过滤我们发现不了。**
+        // 即：兜底会**掩盖解析层的失败**。当前阶段要让泄漏**如实呈现**，
+        // 才能观测「解析是否真的做对了」；确需应急再打开。
+        //
+        // ⚠️ **必须放在切分之后**（顺序不可颠倒）：切分负责「解析」，
+        // 本行只兜底删掉切分没处理的**纯标签块**（无正文可解析的那种）。
+        // 判据只认纯标签块 → 含正文的块原样返回，故模型**讨论**标签的正文不受影响。
+        textOut = stripBareThinkCloseTagIfEnabled(textOut);
         // 正文死循环截断：只保留循环前的干净前缀（与思考守卫同一机制 ——
         // `block-end` 的 block 是**权威覆盖**，见 scripts/verify-blockend-override.ts）。
         //
@@ -768,6 +906,7 @@ export async function* consumeOpenAiSse(response, options, config) {
         // 但**思考段已归位**，故本响应仍有内容产出，不会被误判为零块。
         if (cleanedText !== '') {
             blockCount += 1;
+            emittedProse = cleanedText;
             yield { type: 'block-end', index: textBlock.index, block: { type: 'text', text: cleanedText } };
         }
     }
@@ -843,26 +982,75 @@ export async function* consumeOpenAiSse(response, options, config) {
      * `outputTokens=319` 远未触上限 —— 典型的「断在即将调用工具处」。
      */
     const truncatedStream = finishReason === undefined && !streamEnded;
-    const reason = loopDetected
-        // 思考死循环：截断并报可重试。优先级最高 —— 循环中生成的工具调用
-        // 参数不可信，且若无任何可用调用，落到 `stop` 会让任务静默中断。
-        ? { kind: 'max-tokens' }
-        : finishReason === 'length'
-            || incompleteTools
-            || truncatedStream
-            || argsTruncated
-            // 丢弃了无名 tool-call、且**没有**任何可用调用留下来时，本步否则会以
-            // `stop` 收场 —— 模型本意要调工具、harness 却认为「正常答完了」，
-            // 又是一次无报错中断。报 max-tokens 让它重试。
-            //
-            // 若同批还有可用调用（`toolOrder.length > 0`），则照常报 `tool-calls`：
-            // 那几个调用与无名块各自独立，没理由因一个坏块把它们一起作废
-            // （实测线上形态正是「一个无名 + 一个合法 pwsh」）。
-            || (droppedUnnamedCalls && toolOrder.length === 0)
+    /**
+     * 正文是否被**上游停止串**掐断（见 `isProseTruncatedByStopString`）。
+     *
+     * ⚠️ **用户报障的真实缺陷**（2026-09-27）：「正文引用 `</think>` 导致对话中断」。
+     * 上游把 `</think>` 当停止串，模型在正文里写它（哪怕包在反引号里）就会被掐断，
+     * 但服务端仍报 `finish_reason:"stop"` —— 我们据此判「模型正常答完」，
+     * harness 认为本轮已完成 → **没有任何报错就停住**（与 AGENTS.md 记的
+     * 「静默中断」同一类）。
+     *
+     * 判据收紧为**三条同时成立**，避免误伤正常回答：
+     *   1. 上游报 `stop`（`length` / 中途断流已被上面的分支覆盖，不必重复）；
+     *   2. **本步没有可执行的工具调用** —— 有工具调用说明模型是「写完就去调工具」，
+     *      正文以反引号收尾只是碰巧（实测判据 B 的 3 个命中全都是无工具调用的收尾步）；
+     *   3. 正文止于**未闭合的行内代码**（反引号奇数且以反引号收尾）。
+     *
+     * 报 `max-tokens`（不完整、可重试）而非 `stop`：DSH 收到 `max-tokens` 会
+     * 结束本轮并提示用户，**不会**把半句话当成完整答复 —— 用户可据此继续。
+     * ⚠️ 不可报 `tool-calls`：本步没有工具调用，报它会让 harness 空执行。
+     */
+    const proseCutByStopString = finishReason === 'stop'
+        && toolOrder.length === 0
+        && isProseTruncatedByStopString(emittedProse);
+    /**
+     * 本次思考死循环是否**是唯一的产出**（无正文、无工具调用）。
+     *
+     * ⚠️ 这层门禁**不可省** —— 用户的要求正是「**如果只是**陷入思考循环的出错，
+     * 就要给出有分辨力的错误提示」：
+     *
+     * | 命中时的产出 | 报什么 | 为什么 |
+     * |---|---|---|
+     * | **只有思考**（实测 25/25 例都是这种）| `error` + `REASONING_LOOP` | 可见内容为零，报 error 不丢东西，且文案有分辨力 |
+     * | 还有正文或工具调用 | `max-tokens`（保持原行为）| error 路径**不落 `assistant/message`**，会把用户可见内容整块丢掉 |
+     *
+     * 后一行的代价已实测（`scripts/probe-error-finish-content-loss.mjs`）：
+     * `finish=error` 的步**确实不落 message**（219 会话里 222 例），
+     * 故有可见产出时**绝不能**走 error —— 那会把「文案误导」换成「内容消失」，更糟。
+     */
+    const reasoningLoopIsSoleOutput = loopDetected
+        && emittedProse === ''
+        && toolOrder.length === 0;
+    const reason = reasoningLoopIsSoleOutput
+        // 思考死循环：报**有分辨力的 error**（见 REASONING_LOOP_CODE 的长注释）。
+        //
+        // ⚠️ **不能报 max-tokens**（真实缺陷，Gitee !IKIZNK）：UI 对 max-tokens 只有
+        // 一句固定文案「已达到输出 token 上限 / 发送"继续"可让模型接着输出」，
+        // 把「检测到死循环」误导成「额度用满」，且建议的「继续」往往立刻再次循环
+        // （实测 25 例全部由用户手动补「继续」，其中 2 次用户自己诊断出「陷入思考循环」）。
+        ? { kind: 'error', failure: reasoningLoopFailure(loopGuard?.diagnostics, config.maxTokens, 'reasoning') }
+        // 循环命中但**另有可见产出**：只能报 max-tokens（保住内容），
+        // 不能报 error（会丢内容）。见上面 `reasoningLoopIsSoleOutput` 的表格。
+        : loopDetected
             ? { kind: 'max-tokens' }
-            : finishReason === 'tool_calls' || toolOrder.length > 0
-                ? { kind: 'tool-calls' }
-                : { kind: 'stop' };
+            : finishReason === 'length'
+                || incompleteTools
+                || truncatedStream
+                || argsTruncated
+                || proseCutByStopString
+                // 丢弃了无名 tool-call、且**没有**任何可用调用留下来时，本步否则会以
+                // `stop` 收场 —— 模型本意要调工具、harness 却认为「正常答完了」，
+                // 又是一次无报错中断。报 max-tokens 让它重试。
+                //
+                // 若同批还有可用调用（`toolOrder.length > 0`），则照常报 `tool-calls`：
+                // 那几个调用与无名块各自独立，没理由因一个坏块把它们一起作废
+                // （实测线上形态正是「一个无名 + 一个合法 pwsh」）。
+                || (droppedUnnamedCalls && toolOrder.length === 0)
+                ? { kind: 'max-tokens' }
+                : finishReason === 'tool_calls' || toolOrder.length > 0
+                    ? { kind: 'tool-calls' }
+                    : { kind: 'stop' };
     // 零内容块响应（例如本次只收到过那个被压制的空白 reasoning）否则会以
     // `stop` 收场 —— 那是 DSH `EMPTY_RESPONSE` 契约明令禁止的静默结束。
     // ⚠️ 传入的是**上面已算好的** `reason`：`loopDetected` / `length` /

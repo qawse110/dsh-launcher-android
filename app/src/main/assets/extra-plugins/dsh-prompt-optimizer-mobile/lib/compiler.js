@@ -8,6 +8,8 @@
 //   ② **不写无信息章节**：某类没有有效条目就不出现该节。
 //   ③ **超预算时按固定顺序丢弃，并写明丢了什么**；绝不静默截断。
 import { activeItems } from './reducer.js'
+// 0.7.8 协作基调：语域块（见 framing.js 的说明）。neutral 时是空串，等于不存在。
+import { framingBlock } from './framing.js'
 
 export const DEFAULT_BUDGET = 1200
 
@@ -19,11 +21,14 @@ export const SECTIONS = [
   { key: 'facts', kinds: ['observed_fact'], label: '已查证事实（含来源）' },
   { key: 'options', kinds: ['implementation_option'], label: '实现选项（工作 AI 可自行调整）' },
   { key: 'proposals', kinds: ['proposal'], label: '建议（未采纳；请勿当作已确认需求）' },
+  // 0.7.8 单轮提升：完成前自检。内容来自任务类 playbook（不是模型编的、也不是用户说的），
+  // 所以标签必须写明"检查项，不是新增要求"——否则工作 AI 会把它当成新命令去满足。
+  { key: 'checks', kinds: ['acceptance_check'], label: '完成前自检（检查项，不是新增要求）' },
   { key: 'unknowns', kinds: ['unknown'], label: '未决项（尚未确定，不要替我拍板）' },
 ]
 
 /** 丢弃顺序：越靠前越先被丢。`required` 的节永不丢弃。 */
-export const DROP_ORDER = ['proposals', 'options', 'facts', 'quality']
+export const DROP_ORDER = ['proposals', 'options', 'checks', 'facts', 'quality']
 
 function sourceSummary(item) {
   const kinds = [...new Set((item.sourceRefs || []).map((r) => r.kind))]
@@ -73,7 +78,9 @@ export function groupActive(state) {
 /**
  * 编译。
  * @param state  IntentState
- * @param opts   { budget?: number, header?: string }
+ * @param opts   { budget?: number, header?: string, extraItems?: object[] }
+ *   `extraItems` 用于**不进入 IntentState 的条目**（0.7.8：任务类 playbook 的 `acceptance_check`）。
+ *   它们只作用于本轮渲染，不写状态、不跨轮积累——所以按会话状态存的包不会因此膨胀。
  * @returns { text, sections, dropped, chars, budget }
  */
 export function compile(state, opts = {}) {
@@ -83,8 +90,17 @@ export function compile(state, opts = {}) {
   // 从"全量"开始，超预算就按 DROP_ORDER 逐节丢，直到放得下或无处可丢
   const included = {}
   for (const s of SECTIONS) included[s.key] = groups[s.key].slice()
+  // 外部条目（本轮 playbook 的检查项）只并进 `checks` 节：仍走同一套渲染、预算与丢弃逻辑。
+  const extras = Array.isArray(opts.extraItems)
+    ? opts.extraItems.filter((it) => it && it.kind === 'acceptance_check')
+    : []
+  if (extras.length > 0) included.checks = included.checks.concat(extras)
   const dropped = []
 
+  // 协作基调块（0.7.8）：放在**最前**，先入为主地设定这一轮的语域。
+  // ⚠ 它不参与丢弃（不是条目），但**计入预算**——诚实起见，它花的字符和别的块一样要算。
+  // ⚠ 只有存在其它内容时才注入：没有条目时不该凭空冒出一段语气，那会变成"只有口号没有内容"。
+  const framingText = framingBlock(opts.framing, opts.framingNote)
   const render = () => {
     const blocks = []
     for (const s of SECTIONS) {
@@ -92,7 +108,8 @@ export function compile(state, opts = {}) {
       if (!items || items.length === 0) continue
       blocks.push('【' + s.label + '】\n' + items.map(lineFor).join('\n'))
     }
-    return blocks
+    if (blocks.length === 0) return blocks
+    return framingText ? [framingText].concat(blocks) : blocks
   }
 
   // 丢弃循环：**把"省略声明"本身也算进预算**。
@@ -163,11 +180,13 @@ function compose(state, blocks, opts, dropped, overBy) {
  *   · 越预算时必须给出 droppedSummary。
  * @returns 问题清单（空 = 通过）
  */
-export function auditCompilation(result, state) {
+export function auditCompilation(result, state, extraItems) {
   const problems = []
   if (!result || typeof result.text !== 'string') return ['compilation result invalid']
 
   const byId = new Map(state.items.map((it) => [it.id, it]))
+  // 外部条目（playbook 检查项）也要在表里，否则渲染出来会被判成 unknown item 而整包拒投。
+  if (Array.isArray(extraItems)) for (const it of extraItems) if (it && it.id) byId.set(it.id, it)
   for (const sec of result.sections) {
     for (const id of sec.itemIds) {
       const item = byId.get(id)
@@ -193,6 +212,6 @@ export function auditCompilation(result, state) {
 /** 便捷入口：编译 + 审计，一并返回。 */
 export function compileAudited(state, opts = {}) {
   const result = compile(state, opts)
-  const problems = auditCompilation(result, state)
+  const problems = auditCompilation(result, state, opts.extraItems)
   return { ...result, problems, ok: problems.length === 0 }
 }

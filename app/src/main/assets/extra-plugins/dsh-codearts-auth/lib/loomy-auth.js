@@ -27,6 +27,19 @@ import { LOOMY_SESSION_TTL_SECONDS, loginLoomyBySmsCode, sendLoomySmsCode } from
 import { startLoomyWechatLoginFlow, } from './loomy-wechat-login.js';
 import { claimLoomyDailyQuota, fetchLoomyCreditBalance, fetchLoomyCreditDetail } from './loomy-credits.js';
 import { claimAllLoomyOnboardingTasks, fetchLoomyOnboardingTasks, } from './loomy-onboarding.js';
+import { syncAccountExpiry } from './expiry-sync.js';
+/**
+ * Loomy 凭据 → 账号池有效期的提取器。
+ *
+ * ⚠️ **刻意不提供 `refreshableOf`**：`isLoomyRefreshable` 恒为 `false`
+ * （服务端没有任何 refresh 端点，这是「诚实标记」而非凭据状态），若让共享
+ * 实现据此回写 `refreshable`，会把账号池改成与该产品实际行为不符的状态。
+ * Loomy 这里只需要同步 `expiresAt`。
+ */
+const LOOMY_EXPIRY_ACCESSORS = {
+    expiresAtOf: credentialExpiresAtMs,
+    identityOf: (credential) => credential.access_token ?? '',
+};
 /**
  * Loomy 的默认凭据 ref。
  *
@@ -235,8 +248,13 @@ export class LoomyAuth extends Service {
      *
      * ⚠️ **不触碰** `lastRefreshError`：那个状态属于单凭据路径，
      * 被多账号操作污染会让 UI 显示错误的失效提示。
+     *
+     * ⚠️ 探测成功后**要把凭据的过期时间对账回账号池**（issue !IKIRTT）：
+     * UI 卡片读的正是池值。Loomy 虽不能续期（凭据里的 exp 不会变），但池值
+     * 可能与凭据实际 exp 不一致（历史写入偏差），对账能让显示恢复正确。
+     * 只回写 `expiresAt`，见 `LOOMY_EXPIRY_ACCESSORS` 的说明。
      */
-    async refreshAccountCredential(refName) {
+    async refreshAccountCredential(refName, pool, accountId) {
         const ref = credentialRef(refName);
         const resolved = await this.ctx.credentials.resolve(ref);
         if (!resolved)
@@ -245,6 +263,15 @@ export class LoomyAuth extends Service {
         if (!credential)
             throw new Error('凭据解析失败');
         await this.probeCredential(credential);
+        await syncAccountExpiry({
+            pool,
+            provider: this.product.id,
+            credential,
+            accessors: LOOMY_EXPIRY_ACCESSORS,
+            accountId,
+            tag: '[loomy]',
+            warn: (message) => this.ctx.logger?.warn?.(message),
+        });
     }
     /**
      * 用一次轻量只读请求验证凭据是否仍然有效。
@@ -312,8 +339,24 @@ export class LoomyAuth extends Service {
             if (credential === undefined)
                 continue;
             // 只探测**已过期**的账号：Loomy 不可续期，未过期的账号无事可做。
-            if (!isLoomyExpired(credential))
+            //
+            // ⚠️ 但「无事可做」不等于「什么都不做」（issue !IKIRTT）：账号池的
+            // `expiresAt` 是 UI 唯一的显示依据，存量账号的池值可能与凭据实际 exp
+            // 不一致（早先各路径都不回写）。若这里直接 `continue`，这条不一致就
+            // **永远无人更正** —— 于是明明有效的账号一直挂着红字「已过期」。
+            if (!isLoomyExpired(credential)) {
+                await syncAccountExpiry({
+                    pool,
+                    provider: this.product.id,
+                    credential,
+                    accessors: LOOMY_EXPIRY_ACCESSORS,
+                    accountId: entry.id,
+                    current: entry,
+                    tag: '[loomy]',
+                    warn: (message) => this.ctx.logger?.warn?.(message),
+                });
                 continue;
+            }
             try {
                 await this.probeCredential(credential);
             }

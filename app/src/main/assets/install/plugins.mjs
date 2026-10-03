@@ -130,6 +130,25 @@ function readSyncMarker() {
 }
 /** 目录内容聚合指纹：递归每个文件取 fnv1a(相对路径+长度+头 64KB 采样) 后再聚合。
  *  覆盖「版本号没 bump 但内容变了」与同 versionCode 换包两种场景。 */
+/**
+ * 单文件内容指纹（fnv1a）。
+ *
+ * ⚠ 本函数曾被随 prebuilt.tgz 供给链一并删除（见上方「已移除」注释），但 dirFingerprint
+ * 仍在调用它 —— 于是每次都抛 ReferenceError 被 catch 吞掉，**一个文件都读不到**，
+ * 目录指纹恒等于 fnv1a 初始值 0x811c9dc5。后果：源内容变了、指纹却不变，
+ * syncExtraPlugin 的判据永远认为「无需同步」——真机实测：codearts 源已是新版
+ * （client bundle 365572 B），装配副本却停在旧版（144051 B），且无任何 synced 日志。
+ * 这里把实现补回（仅按内容算，不依赖已删除的 tgz 链）。
+ */
+function contentFingerprint(buf) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < buf.length; i++) {
+    h ^= buf[i];
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16);
+}
+
 function dirFingerprint(dir) {
   let h = 0x811c9dc5;
   const update = (s) => {

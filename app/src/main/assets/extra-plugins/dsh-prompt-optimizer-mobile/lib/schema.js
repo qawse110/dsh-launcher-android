@@ -16,6 +16,10 @@ export const ITEM_KINDS = Object.freeze([
   'implementation_option',  // 实现手段与候选方案（工作 AI 可调整）
   'proposal',               // 建议：新功能、审美方向、结果取舍（待采纳）
   'unknown',                // 尚缺的选择或事实（保持未知）
+  // 0.7.8：**完成前自检项**（单轮提升）。由任务类 playbook 产生，来源是 project_convention，
+  // 不是 human ⇒ 结构上就不可能升格成用户要求（范围审计会挡）。它只说"做完了该检查什么"，
+  // 不改变用户的要求，因此必须与 user_requirement / quality_interpretation 分开。
+  'acceptance_check',
 ])
 
 export const ITEM_STATUSES = Object.freeze([

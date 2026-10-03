@@ -28,9 +28,11 @@ import {
   createStats, createProjectionDefinition, commitPatch, PROJECTION_KEY, STATE_EVENT,
 } from './projection.js'
 import { recordUserInput } from './reducer.js'
+// 0.7.8 单轮提升：任务类检查项（完成前自检）。见 playbook.js 顶部说明其边界。
+import { playbookItems } from './playbook.js'
 import { createState } from './schema.js'
 import { handleUserInput } from './pipeline.js'
-import { SYSTEM_PROMPT, buildUserMessage } from './interpreter.js'
+import { SYSTEM_PROMPT, buildUserMessage, HARD_NOTE_SYSTEM, extractJson } from './interpreter.js'
 import { TOOLS_SYSTEM_NOTE } from './read-tools.js'
 import { drain } from './eval-llm.js'
 import { createStateStore, inheritStateForFork } from './store.js'
@@ -44,6 +46,13 @@ import { loadLlmLib } from './llm-lib.js'
 // （在此之前它们只是字段，没有任何代码读——界面上摆着却是装饰品）。
 import { createSessionHistory, renderObserverBlock } from './session-context.js'
 import { runReadOnlyToolLoop } from './read-tools.js'
+import { createAdvisor, registerAdvisorTool, resolveAdvisorTimeoutMs } from './advisor.js'
+import { createAdvisorProgress } from './advisor-progress.js'
+import { withAdvisorWorkflow } from './advisor-workflow.js'
+import { createAdvisorFeedback } from './advisor-context.js'
+import { createAdvisorCoverage } from './advisor-coverage.js'
+import { createAdvisorStages } from './advisor-stages.js'
+import { registerAdvisorStageTool } from './advisor-stage-tool.js'
 import { strategyInstructions } from './strategy.js'
 // 0.7.1：内置 Bash —— 原独立插件 dsh-bash-runtime 的实现已并入本包 `lib/bash/`，
 // 运行时随包分发在 `<plugin>/runtime/`。装配即提供；详情里的开关决定是否注册给模型。
@@ -53,7 +62,7 @@ import { registerControlApi, resolvePrompt } from './control-api.js'
 // 手动结案（用户 2026-09-21 拍板 A 案）后要**立刻重编译并写回动态上下文**：
 // 不重编译的话，包里还是旧的那一份，用户会以为"点了没用"。
 import { compileAudited } from './compiler.js'
-import { readPolicy } from './policy.js'
+import { readPolicy, packetShapeChanged } from './policy.js'
 import { runGate, createMemoryLedgerStore, LEVEL, resolveLevel } from './gate.js'
 import { detectOldPluginRuntime, mergeOldPluginSignals } from './detect-old.js'
 import { decideEnabled } from './rollout.js'
@@ -164,7 +173,7 @@ const WIRE_LOG_PATH = join(DSH_HOME, 'po06-wire.jsonl')
  * 本机 0.1.6 侧不受影响：v3 对用户消息的 kind 不设白名单（只要求非空字符串），
  * 而"绝不自我触发"那道闸是**正向白名单**（只认 `kind === 'user'`，见 `wire.js`），不依赖这个名字。
  */
-const PRODUCER_KIND = 'plugin:dsh-prompt-optimizer-mobile'
+const PRODUCER_KIND = 'plugin:@dsh-external/dsh-arbiter-wf'
 
 /** 追加一条生产接线记录。**尽力而为**：台账写不进去也绝不打断会话。 */
 function appendWireLog(rec) {
@@ -608,7 +617,7 @@ export function syncBashTool(ctx) {
 }
 
 /** 组装这次解释要用的 system：用户覆盖优先，拼上工具说明、（可选）会话上下文、以及**档位策略**。 */
-function buildInterpreterSystem({ home, observerText, toolsEnabled, strategy }) {
+function buildInterpreterSystem({ home, observerText, toolsEnabled, strategy, framing }) {
   const base = resolvePrompt({ home }).text
   // 顺序即阅读顺序：先工具用法（"怎么查"），再会话上下文（"已经发生了什么"），最后是原话。
   // 两者都为空 ⇒ 与旧行为**逐字节相同**（这是"默认路径不变"那条约束的落点）。
@@ -625,6 +634,8 @@ function buildInterpreterSystem({ home, observerText, toolsEnabled, strategy }) 
     const lines = strategyInstructions(strategy)
     if (lines.length > 0) parts.push('\n\n【本轮策略（由档位决定，不是新增需求）】\n' + lines.join('\n'))
   }
+  // 0.7.8 · 硬邦邦：**只在选中该档时**要求模型产出加码；其它档一个字都不加（旧行为逐字节不变）。
+  if (framing === 'hard' && typeof HARD_NOTE_SYSTEM === 'string') parts.push(HARD_NOTE_SYSTEM)
   if (observerText) parts.push('\n\n' + observerText)
   return parts.join('')
 }
@@ -774,7 +785,14 @@ export async function interpretViaLlm({ llm, cfg, userPrompt, system, systemNoTo
     // 机制：工具循环跑完，模型往往给的是**查证后的散文**（"我看过 xxx 文件……"），
     // 而 pipeline 需要的是**那一个 JSON**（`{"ops":[…]}`）⇒ 解析不出补丁 ⇒ `noop` ⇒ `no-packet`。
     // 所以这里收紧接受条件：**只有看起来真是那份 JSON 才认工具路径的产出**，否则一律回落无工具单次调用。
-    const looksLikeJson = /"ops"\s*:/.test(String(loop.text || ''))
+    // issue #22 修复：原先只查 ops 子串，于是「合法 JSON + 中间散文 + JSON 尾巴」的混合体
+    //   被判为通过 ⇒ 接受工具路径产出 ⇒ **跳过紧随其后的 no-tools-retry 回落** ⇒ pipeline 取首个 { 到
+    //   末个 } 去 parse、撞上中间散文 ⇒ BAD_JSON ⇒ 空包 ⇒ 界面「失败：no-packet」。
+    //   这与本段的设计意图（工具路径是增强，绝不该有能力把整轮弄死）正好相反。
+    //   现在改用**与 pipeline 同一个抽取器**（interpreter.js 的 extractJson：容忍围栏与前后废话，
+    //   取首 { 到末 } 再 JSON.parse）：只有**真能 parse 成对象**才认，否则照旧回落重跑一次。
+    const toolJson = extractJson(loop.text)
+    const looksLikeJson = toolJson.ok === true && toolJson.value !== null && typeof toolJson.value === 'object'
     if (loop.ok && !loop.empty && looksLikeJson) {
       return { text: loop.text, ms: Date.now() - t0, via: 'tools', context: {
         toolRounds: loop.rounds, toolCalls: loop.toolCalls, toolNames: loop.names,
@@ -789,7 +807,7 @@ export async function interpretViaLlm({ llm, cfg, userPrompt, system, systemNoTo
       toolRounds: loop.rounds, toolCalls: loop.toolCalls, toolNames: loop.names,
       toolCapped: loop.capped === true, toolTrace: loop.trace, toolMs: loop.ms,
       toolRoot: loop.root, toolsEnabled: true, toolsReason: tools.reason || 'enabled',
-      toolLoopError: String(loop.error || (loop.empty ? 'empty-output' : (looksLikeJson ? 'unknown' : 'tools-answer-not-json'))),
+      toolLoopError: String(loop.error || (loop.empty ? 'empty-output' : (looksLikeJson ? 'unknown' : (toolJson.code === 'BAD_JSON' ? 'tools-answer-bad-json' : 'tools-answer-not-json')))),
       toolFallback: 'no-tools-retry',
     }
     const r2 = await plainDrain(() => llm.stream(withSignal({
@@ -875,7 +893,8 @@ async function runProductionInput(ctx, session, message, { trigger = 'user-messa
     // 用户设置 → 政策（EV-0143）：`assist: off` 就是"只记录、不补充"——
     // **不解释、不注入**（省一次模型调用），并在台账里留下可归因的理由。
     // 这一条让控制面板上那句"只记录、不补充"**真的**是那个意思。
-    const pol = readPolicy({ home: DSH_HOME })
+    // ⚠ 档位按会话（0.7.7）：这里必须带上 sid，否则会话级覆盖读不到
+    const pol = readPolicy({ home: DSH_HOME, sessionId: sid })
     if (!pol.injectPacket) {
       appendWireLog({ ...base, trigger, ok: false, reason: 'assist-off',
         policy: { assist: pol.assist, detail: pol.detail, budget: pol.budget } })
@@ -922,6 +941,11 @@ async function runProductionInput(ctx, session, message, { trigger = 'user-messa
     // 补充程度 → 意图包预算：pipeline 从 `adapter.packetBudget` 取（它本来就是这么设计的）。
     // 设置是**按 home** 的、不按会话，所以写在这里是安全的（不存在"两个会话各要不同预算"的情形）。
     adapter.packetBudget = pol.packetBudgetChars
+    // 0.7.8：本轮任务类检查项。命中任务类才发（宁可漏发，不要错发），条数随补充程度缩放。
+    // 放在这里而不是 pipeline 里：只有这里**同时**拿得到用户原话与生效档位。
+    adapter.checkItems = playbookItems(text, { detail: pol.detail, sessionId: String(session && session.id || '') })
+    // 0.7.8：协作基调（普通 / 硬邦邦）。只有显式选硬邦邦时才注入那段语域块。
+    adapter.framing = pol.framing
     // P11：这一轮**真正喂进解释层的上下文**要能被解析阶段读到（短消息的引文可以来自上下文）。
     let renderedCtx = ''
     const out = await adapter.handleInput(session, {
@@ -947,10 +971,10 @@ async function runProductionInput(ctx, session, message, { trigger = 'user-messa
         // 不记的话，"这一轮解析不到 cwd"的会话会在整条会话里永远用不上工具。
         if (cwd) sessionHistory.setCwd(sessionId, cwd)
         const tools = readToolsFor({ readTools: pol.readTools, cwd: cwd || sessionHistory.getCwd(sessionId) })
-        const sys = buildInterpreterSystem({ home: DSH_HOME, observerText: rendered.text, toolsEnabled: tools.enabled, strategy: pol.strategy })
+        const sys = buildInterpreterSystem({ home: DSH_HOME, observerText: rendered.text, toolsEnabled: tools.enabled, strategy: pol.strategy, framing: pol.framing })
         // 回落用：**同一份上下文、但不带工具说明**的系统提示词（见 interpretViaLlm 里的回落注释）
         const sysNoTools = tools.enabled
-          ? buildInterpreterSystem({ home: DSH_HOME, observerText: rendered.text, toolsEnabled: false, strategy: pol.strategy })
+          ? buildInterpreterSystem({ home: DSH_HOME, observerText: rendered.text, toolsEnabled: false, strategy: pol.strategy, framing: pol.framing })
           : sys
         renderedCtx = String(rendered.text || '')      // 供解析阶段校验"引文来自上下文"
         const um = buildUserMessage({ userText, state, sessionId, messageId: mid, observations, context: rendered.text, retryEmpty, emptyReason })
@@ -1159,7 +1183,12 @@ async function ensureModelRoute(ctx, sid) {
   // ③ 宿主的默认模型服务（Agent 没有会话级选择时，宿主自己会用的那条）
   try {
     const adm = ctx.get('agentDefaultModel')
-    for (const fn of ['current', 'read', 'get', 'selection']) {
+    // ⚠ 2026-09-26 修（用户反馈）：方法名原先写的是 current/read/get/selection ——**四个都不存在**，
+    // 于是这一整段空转，直接掉到下面的第④步"清单第一条"，新会话首条消息便用一个与会话无关的模型
+    // 去优化（用户实测：选「跟随会话模型」时复现；之后的消息正常，因为那时已从 request/header 观测到）。
+    // 实测该服务的真方法是 **currentSelection()**（返回 {provider, model} 形状，正好能被 pickProviderModel 解析），
+    // 另有 saveSelection()。旧名一并保留在后面，便于宿主改名时仍能兜住。
+    for (const fn of ['currentSelection', 'current', 'read', 'get', 'selection']) {
       if (adm && typeof adm[fn] === 'function') {
         const p = pickProviderModel(await adm[fn]())
         if (p) { observeModel(sid, p); return { ok: true, source: 'host-default' } }
@@ -1262,7 +1291,7 @@ async function runInterceptInput(ctx, payload) {
   //      `adapter.getIntentText(sid)` 会把**上一轮的包**当成"这一轮的产出"返回给界面并注入。
   {
     let pol = null
-    try { pol = readPolicy({ home: DSH_HOME }) } catch { pol = null }
+    try { pol = readPolicy({ home: DSH_HOME, sessionId: sid }) } catch { pol = null }
     if (pol && pol.injectPacket !== true) {
       const cleared = adapter.clearIntentTexts('intercept:assist-off')
       interceptedText.delete(sid)
@@ -1353,7 +1382,7 @@ async function decideEnableFor(agentId) {
   return { ...decision, probe }
 }
 
-export const name = 'dsh-prompt-optimizer-mobile'
+export const name = '@dsh-external/dsh-arbiter-wf'
 /** 版本号从**随包发行的 package.json** 读，不写死（写死就会漂——本项目栽过这类跟头）。 */
 const PKG_VERSION = (() => {
   try { return JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json'), 'utf8')).version } catch { return null }
@@ -1392,12 +1421,15 @@ class DshAdapter {
    * 却挡不住**已经存在**的那一份包 —— 它继续被注入到后面每一轮装配里。
    * 档位是政策（`assist:'off'` ⇒ `injectPacket:false`），注入前必须按政策硬短路。
    */
-  policyNow() {
+  policyNow(sessionId) {
+    const key = (sessionId === undefined || sessionId === null) ? '' : String(sessionId)
     const now = Date.now()
-    if (this.policyCache && (now - this.policyCache.at) < 2000) return this.policyCache.pol
+    // ⚠ 缓存必须**按会话分键**（0.7.7）：档位现在是会话级的，
+    //   若还按单一键缓存，A 会话算出的政策会被 B 会话直接复用 ⇒ 会话级档位形同虚设。
+    if (this.policyCache && this.policyCache.key === key && (now - this.policyCache.at) < 2000) return this.policyCache.pol
     let pol = null
-    try { pol = readPolicy({ home: DSH_HOME }) } catch { pol = null }
-    this.policyCache = { at: now, pol }
+    try { pol = readPolicy({ home: DSH_HOME, sessionId: key }) } catch { pol = null }
+    this.policyCache = { at: now, key, pol }
     return pol
   }
 
@@ -1641,7 +1673,8 @@ class DshAdapter {
             text: (assemblyCtx) => {
               try {
                 const agent = assemblyCtx && assemblyCtx.agent
-                const sid = agent && agent.id !== undefined ? String(agent.id) : ''
+                const session = agent && (agent.session || (typeof agent.getSession === 'function' ? agent.getSession() : null))
+                const sid = session?.id !== undefined ? String(session.id) : agent && agent.id !== undefined ? String(agent.id) : ''
                 if (!sid) return ''
                 // ── 启用闸门（A10/A12）──────────────────────────────
                 // 灰度 + 设置 + 双重拦截守卫**在这里**生效，而不是只在自检里生效。
@@ -1654,9 +1687,12 @@ class DshAdapter {
                 // 它挡的是"**产生新包**"，挡不住"**注入已有包**"。于是关档之后，缓存里那份上一轮的包
                 // 继续被注入到每一轮装配里 —— 两条成因（缓存没清 / 门禁漏判）**都成立**，两条都要修。
                 // 这里是硬短路：读到"不注入"就连缓存都不看。
-                const pol = adapter.policyNow ? adapter.policyNow() : null
+                const pol = adapter.policyNow ? adapter.policyNow(sid) : null
                 if (pol && pol.injectPacket !== true) return ''
-                return this.intentBySession.get(sid) || ''
+                // Tool presence alone did not cause a review in the tank test. Keep the working
+                // workflow available even when the interpreter has no new intent items.
+                const feedback = this.reviewFeedback ? this.reviewFeedback(agent, pol) : ''
+                return withAdvisorWorkflow(this.intentBySession.get(sid) || '', pol, feedback)
               } catch (e) {
                 // ⚠ **不得静默**（EV-0102）：这条路径若抛错，意图包会在**毫无痕迹**的情况下消失——
                 // 正是 EV-0078 那一类事故（产品安静地不做事，用户以为它开着）。
@@ -1776,7 +1812,7 @@ export function apply(ctx, config) {
         if (!live) return
         try {
           const cm = scope.clientModules || scope.get('clientModules')
-          const name = 'dsh-prompt-optimizer-mobile'
+          const name = '@dsh-external/dsh-arbiter-wf'
           if (!cm?.pkgMeta || !cm?.dirty || typeof cm.flush !== 'function') return
           for (const key of cm.pkgMeta.keys()) {
             if (key === name || String(key).endsWith('\0' + name)) cm.pkgMeta.delete(key)
@@ -1789,6 +1825,69 @@ export function apply(ctx, config) {
     })
   } catch { /* optional on headless hosts */ }
   pluginConfig = config && typeof config === 'object' ? config : {}
+  const advisorProgress = createAdvisorProgress({ home: DSH_HOME })
+  const advisorCoverage = createAdvisorCoverage({ home: DSH_HOME })
+  const advisorStages = createAdvisorStages({ home: DSH_HOME })
+  adapter.reviewFeedback = createAdvisorFeedback({stages:advisorStages,coverage:advisorCoverage})
+  ctx.effect(() => () => { adapter.reviewFeedback = null })
+  ctx.effect(() => () => advisorProgress.dispose(), 'dsh-po06: advisor progress')
+  // 斜杠命令表：只有拿到它，才能确认名单里的命令**当前真的存在**（见 control-api 的 slashReview）。
+  // 拿不到就 fail-closed（不拦截）——与改动前行为一致，不会因为我们报错。
+  let commandsService = null
+  ctx.inject(['commands'], scope => {
+    try { commandsService = scope.commands || null } catch { commandsService = null }
+    scope.effect(() => () => { commandsService = null }, 'dsh-po06: commands service')
+  })
+  // agents 也是延迟提供的（见下方 1894 的注释）；这里单独抓一份，供命令表查询兜底。
+  let agentsService = null
+  ctx.inject(['agents'], scope => {
+    try { agentsService = scope.agents || null } catch { agentsService = null }
+    scope.effect(() => () => { agentsService = null }, 'dsh-po06: agents service')
+  })
+  let advisorAttachments = null
+  ctx.inject(['attachments'], scope => {
+    advisorAttachments = scope.attachments
+    scope.effect(() => () => { advisorAttachments = null }, 'dsh-po06: advisor attachment service')
+  })
+  // Independent advisor: fresh invocation, existing optimizer route, read-only capabilities.
+  ctx.inject(['tools', 'llm'], (scope) => {
+    const execute = createAdvisor({
+      log: appendWireLog, progress: advisorProgress, coverage: advisorCoverage, stages: advisorStages,
+      // 限时走同一个解析口：默认 5 分钟，环境变量可调（钳制在 60s~15min）。
+      timeoutMs: resolveAdvisorTimeoutMs(process.env),
+      resolveRuntime: async (session, signal) => {
+        const sid = String(session.id)
+        const pol = readPolicy({ home: DSH_HOME, sessionId: sid })
+        if (!pol.injectPacket) return { ok: false, reason: 'assist-off' }
+        const gate = await awaitGateDecision(sid)
+        if (gate?.enabled !== true) return { ok: false, reason: 'advisor-gate-disabled:' + String(gate?.code || 'pending') }
+        await ensureModelRoute(scope, sid)
+        const cfg = resolveInterpreterCfg({ config: pol.model ? { interpreter: pol.model } : pluginConfig,
+          observed: ownModelFor(sid), effortByModel: pol.effortByModel })
+        if (!cfg?.ok) return { ok: false, reason: cfg?.reason || 'no-model-route' }
+        const llm = scope.llm || scope.get('llm')
+        let imageSupport = null
+        try {
+          const info = await llm.resolveModelInfo(cfg.provider, cfg.model, signal)
+          if (Array.isArray(info?.inputModalities)) imageSupport = info.inputModalities.includes('image')
+        } catch { /* Unknown capability is explicitly shown as not inspected. */ }
+        return { ok: true, llm, cfg, imageSupport, attachments: advisorAttachments,
+          cwd: resolveSessionCwd(session), readTools: pol.readTools === true }
+      },
+    })
+    scope.effect(() => {
+      const dispose = registerAdvisorTool(scope, execute)
+      const stageDispose = registerAdvisorStageTool(scope, advisorStages, {
+        resolveAccess: async session => {
+          const sid=String(session.id); const pol=readPolicy({home:DSH_HOME,sessionId:sid})
+          if(!pol.injectPacket)return {ok:false,reason:'assist-off'}
+          const gate=await awaitGateDecision(sid); if(gate?.enabled!==true)return {ok:false,reason:'advisor-gate-disabled'}
+          return {ok:true,readTools:pol.readTools===true}
+        },
+      })
+      return () => { execute.dispose(); if (typeof dispose === 'function') dispose(); if(typeof stageDispose==='function') stageDispose() }
+    }, 'dsh-po06: independent advisor tool')
+  })
   const report = {
     probe: 'dsh-po06-adapter',
     phase: 'P1-6',
@@ -1849,16 +1948,12 @@ export function apply(ctx, config) {
     return {
       configPath: ENABLE_CONFIG_PATH,
       configExists: existsSync(ENABLE_CONFIG_PATH),
-      // fork：rollout 在"未配置"时是 **null**（表示没表态，不是用户写的 off），
-      // 故这里必须空安全 —— 原来直接读 i.rollout.mode 会在未配置时抛
-      // TypeError: Cannot read properties of null (reading 'mode')，
-      // 把整个插件打成 "failed to import"（真机实测踩到）。
-      intent: {
-        ok: i.ok, ours: i.ours, reason: i.reason,
-        enabled: i.settings && i.settings.enabled,
-        rolloutMode: (i.rollout && i.rollout.mode) || null,
-      },
-      note: 'dsh-launcher fork：默认启用（未配置 = 启用）；仅显式 enabled:false 才关闭。判定按 agent 懒触发',
+      // ⚠ dsh-launcher fork：本 fork 把「未配置」的回落值改成 rollout: null（FORK.md 改动 2），
+      // 而上游这行诊断直接读 i.rollout.mode —— 会抛 TypeError 让整个插件挂不上（真机实测：
+      //   prompt-optimizer: TypeError: Cannot read properties of null (reading 'mode')）。
+      // 这里对 null 容错：诊断字段而已，不该因为「没配置」就把插件打挂。
+      intent: { ok: i.ok, ours: i.ours, reason: i.reason, enabled: i.settings.enabled, rolloutMode: i.rollout == null ? null : i.rollout.mode },
+      note: '未判定期间一律不启用（保守）；判定按 agent 懒触发',
     }
   })()
 
@@ -1915,6 +2010,12 @@ export function apply(ctx, config) {
           interpret: (p) => runInterceptInput(ctx, p),
           // P11：拦截进度面（"优化中"那几十秒要看得见它在想什么）
           progress: (sid) => progressGet(sid),
+          advisorProgress: (sid, identity) => advisorProgress.get(sid, identity),
+          advisorStageStatus: sid => {
+            const pol=sid ? readPolicy({home:DSH_HOME,sessionId:sid}) : null
+            const stage=sid ? advisorStages.status({sessionId:String(sid),readEnabled:false}) : null
+            return {ok:true,protocolVersion:2,enabled:pol?.injectPacket===true,stage,verification:'diagnostic-only-no-file-reread'}
+          },
           // P11：读回"这一轮注入的包"（回退后把新正文读回界面）
           getPacket: (p) => adapter.getIntentText(p && p.sessionId),
           // P11：包级回退（宿主侧保存了每会话最近 10 版非空包）
@@ -2009,16 +2110,26 @@ export function apply(ctx, config) {
            *   ③ 启用闸门作废 —— `enabled` / 灰度也在这份配置里，改完必须重判（原来只靠 5 分钟 TTL）。
            */
           onSettingsWritten: () => {
+            // ⚠ 必须在 invalidatePolicy() **之前**取：那是写盘前的生效政策，
+            //   与写盘后的一比，就知道"包的整体形状"变没变。
+            let polBefore = null
+            try { polBefore = adapter.policyNow() } catch { polBefore = null }
             adapter.invalidatePolicy()
             let pol = null
             try { pol = adapter.policyNow() } catch { pol = null }
             const cleared = (pol && pol.injectPacket !== true) ? adapter.clearIntentTexts('settings:assist-off') : 0
+            // 协作基调 / 档位 / 补充程度变了 ⇒ **旧的包文本必须作废**：
+            // 它是按当时的政策编译好的一整段字符串，政策一变就过期；不作废的话，
+            // 切回普通档后那段硬邦邦文本会继续被注入（用户实测 2026-09-29）。
+            // 清掉不是"丢内容"：下一次拦截会按新政策重编译，那才是正确时机。
+            const shapeChanged = packetShapeChanged(polBefore, pol)
+            const clearedShape = shapeChanged ? adapter.clearIntentTexts('settings:packet-shape-changed') : 0
             // 内置 Bash 的开关在同一份配置里：写盘后立刻按差额同步（关掉即从模型视野消失，
             // 不需要重启、也不需要重载插件）。
             let bashSync = null
             try { bashSync = syncBashTool(hostCtxForBashSync) } catch (e) { bashSync = { ok: false, reason: String((e && e.message) || e) } }
             try { if (adapter.enableGate && typeof adapter.enableGate.invalidateAll === 'function') adapter.enableGate.invalidateAll() } catch { /* best effort */ }
-            return { injectPacket: Boolean(pol && pol.injectPacket), cleared, bashSync }
+            return { injectPacket: Boolean(pol && pol.injectPacket), cleared, clearedShape, shapeChanged, bashSync }
           },
           /**
            * 闸门结论的**分布**（诊断用，见 control-api `/status.gate`）。
@@ -2026,6 +2137,40 @@ export function apply(ctx, config) {
            * （`gate:rollout-off` / `settings-disabled` / `DOUBLE_INTERCEPT` / `decision-pending`）。
            * 这两个不是一个东西 —— 不区分就会出现"界面写着已启用，插件什么都不做"。
            */
+          /**
+           * 名单里的命令**当前是否已注册**（供 /status.slashReview.active）。
+           * 三种失败都 fail-closed：命令表没就绪 / 会话未知 / 查询抛错 ⇒ 返回空名单 ⇒ 客户端不拦截。
+           */
+          registeredCommands: (sessionId) => {
+            const diag = { agents: 'unknown', liveAgents: null, via: null }
+            try {
+              const cmds = commandsService
+              if (!cmds || typeof cmds.list !== 'function') return { ok: false, reason: 'commands-service-unavailable', names: [], diagnostics: diag }
+              const sid = String(sessionId || '')
+              const reg = agentsService || adapter.services.agents || null
+              diag.agents = reg == null ? 'null' : (typeof reg.get === 'function' ? 'ok:get' : 'no-get')
+              // 三层查找：本会话 agent → 任意 live agent（全局命令在每个 agent 的视图里都有）→ 放弃。
+              let agent = sid ? adapter.agentFor(sid) : null
+              if (agent) diag.via = 'session'
+              if (!agent && reg && typeof reg.list === 'function') {
+                let all = []
+                try { all = reg.list() || [] } catch { all = [] }
+                diag.liveAgents = all.length
+                if (all.length) { agent = all[0]; diag.via = 'any-live-agent' }
+              }
+              if (!agent) {
+                try {
+                  const all = reg && typeof reg.list === 'function' ? (reg.list() || []) : null
+                  if (Array.isArray(all)) diag.liveAgents = all.length
+                } catch { /* 诊断失败不影响结论 */ }
+                return { ok: false, reason: diag.agents === 'null' ? 'agents-service-unavailable' : 'no-live-agent', names: [], diagnostics: diag }
+              }
+              const rows = cmds.list(agent) || []
+              return { ok: true, names: rows.map(r => String((r && r.name) || '').toLowerCase()).filter(Boolean), diagnostics: diag }
+            } catch (e) {
+              return { ok: false, reason: 'commands-list-threw:' + String((e && e.message) || e), names: [], diagnostics: diag }
+            }
+          },
           gateSummary: () => {
             try {
               const snap = (adapter.enableGate && typeof adapter.enableGate.snapshot === 'function') ? adapter.enableGate.snapshot() : {}

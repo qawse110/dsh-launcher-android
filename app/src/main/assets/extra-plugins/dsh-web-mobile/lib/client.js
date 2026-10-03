@@ -691,7 +691,15 @@ function createStatsLineTask() {
         const box = reserve.getBoundingClientRect();
         const base = container.getBoundingClientRect();
         const left = box.left - base.left - container.clientLeft;
-        const top = box.top - base.top - container.clientTop;
+        // Center the host on its slot vertically, not top-align it. Measured
+        // 2026-09-29 (issue #140 acceptance): the 20px ring top-aligned on its
+        // 16px reserve hung its center at y=793 while the neighbouring keys sit
+        // at 789-791 — reported as「不与其他小UI对齐」. Centering is a no-op for
+        // same-height overlays (the 0.1.5/0.1.6 TPS text) and aligns the ring
+        // with the cluster. hostRect is read BEFORE the style write below; its
+        // height does not depend on top/left, so the math is stable across flushes.
+        const hostRect = host.getBoundingClientRect();
+        const top = box.top - base.top - container.clientTop - (hostRect.height - box.height) / 2;
         const styled = host;
         if (styled.style.left !== `${left}px`)
             styled.style.left = `${left}px`;
@@ -4543,6 +4551,15 @@ exports.LAYOUT_CSS = `/* ---------- mobile-only layout (narrow viewport AND touc
   [data-phase] [class*="_card"]:has(textarea, [data-composer-input]) [class*="_row"]:has([class*="_trailing"]):has([class*="_primary"] ~ [class*="_primary"]) {
     flex-wrap: wrap;
   }
+  /* Issue #140: in that same dual-primary form the stop key and the send key
+     sit one 3px lane-gap apart — two same-shaped 34px pills where a mis-touch
+     on the left one interrupts the running reply. The 2026-09-23 「焊在一起」
+     3px decision keeps governing the main session's [model][send] cluster;
+     only this form (the one with two adjacent destructive-adjacent primaries)
+     gets +8px between the stop and the send key. Knob: margin-right. */
+  [data-phase] [class*="_card"]:has(textarea, [data-composer-input]) [class*="_row"]:has([class*="_trailing"]):has([class*="_primary"] ~ [class*="_primary"]) > [class*="_trailing"] > [class*="_primary"]:has(~ [class*="_primary"]) {
+    margin-right: 8px;
+  }
   [data-phase] [class*="_card"]:has(textarea, [data-composer-input]) [class*="_row"]:has([class*="_trailing"]) > :first-child {
     flex: 0 1 auto;
     min-width: 0;
@@ -4703,7 +4720,14 @@ exports.LAYOUT_CSS = `/* ---------- mobile-only layout (narrow viewport AND touc
      itself is shrinkable, so a squeezed root lets the trigger paint over
      the pinned send button. Keep the whole meter at its natural size; its
      trigger uses aria-haspopup="dialog", so the model-selector menu rules
-     (keyed on "menu") still do not apply. */
+     (keyed on "menu") still do not apply.
+     GENERATION NOTE (issue #140, 2026-09-29): 0.1.7-rc.2 moved the
+     ContextMeter out of this lane into the dock row under the card (next to
+     the TPS stats pills) — on rc.2 NONE of the trailing-lane meter rules in
+     this section match any more, and the trigger is back to its official
+     ~22px-tall box. They stay for the 0.1.5/0.1.6 generations where the
+     meter really rendered in the lane (structural anchors, inert elsewhere);
+     the rc.2+ hit-area repair lives in the dock-row section below. */
   [data-phase] [class*="_card"]:has(textarea, [data-composer-input]) [class*="_row"]:has([class*="_trailing"]) > [class*="_trailing"] > [class*="_root"] {
     flex: none;
     min-width: 0;
@@ -4794,6 +4818,37 @@ exports.LAYOUT_CSS = `/* ---------- mobile-only layout (narrow viewport AND touc
   }
   [data-phase] [class*="_card"]:has(textarea, [data-composer-input]) [class*="_row"]:has([class*="_trailing"]) > [class*="_trailing"]:has([class*="_trigger"][aria-haspopup="menu"], > [class*="_root"] > [class*="_trigger"][aria-haspopup="dialog"]) > [class*="_primary"] {
     margin-left: 0;
+  }
+
+  /* --- ContextMeter hit area on 0.1.7-rc.2+ (issue #140) ---
+     The stats-line overlay parks the ring in the composer card's trailing
+     lane (right cluster next to the send key — a deliberate 2026-09-23
+     placement, kept per the reporter's confirmation at acceptance). The
+     official trigger is 16x20px, far under the touch minimum. Regrow the
+     hit area IN PLACE with a transparent ::after (the 📎 recipe).
+     2026-09-29 acceptance, final geometry (headless-measured): the ring
+     svg and its reserve are set to 18px (compat.css.ts — 16px was too
+     small to aim, 24px/20px too big, the reporter settled on 18px), the
+     width growth is absorbed by the lane's left slack so the key gaps
+     stay 6px/5px, and the hit box is a SYMMETRIC 26x26 square
+     (inset -4px) keeping the generous touch area around the smaller
+     ring — 2px/1px clearance to the model and send keys. The track is
+     deepened to 25% black (compat.css.ts) so the donut reads as a
+     meter, not a spinner.
+     Knobs: the svg/reserve size (compat.css.ts) and this inset; the box
+     must stay a square hugging the ring, its edges clamped by the two
+     neighbouring keys. The dock container owns only this one dialog
+     trigger (the TPS stats pills render plain text), so a scoped
+     aria-haspopup="dialog" anchor cannot cross-match anything; the DOM
+     ancestry (ring inside the dock container) is unchanged by the
+     overlay's absolute positioning. */
+  [data-phase] [class*="_dock"] [class*="_trigger"][aria-haspopup="dialog"] {
+    position: relative;
+  }
+  [data-phase] [class*="_dock"] [class*="_trigger"][aria-haspopup="dialog"]::after {
+    content: '';
+    position: absolute;
+    inset: -4px;
   }
 
   /* --- Third-party model seats (issue #60: @hytime/dsh-thinking-effort) ---
@@ -6589,6 +6644,32 @@ exports.LAYOUT_CSS = `/* ---------- mobile-only layout (narrow viewport AND touc
   [data-mobile-nav="frame"] [class*="sessionRow"] [class*="_rowActions"] {
     display: inline-flex !important;
   }
+
+  /* ---------- 提问卡（ask-user）头部按钮热区（issue #140） ----------
+     宿主 dsh-client-ui-user-questions 的 QuestionComposer 头部两颗图标按钮
+     ——「收起问题卡片」与「放弃整组问题」——官方 24×24px、headerActions
+     gap 4px，远低于触控下限；「放弃」紧贴「收起」（放弃 = pending.cancel()
+     后 actions.clear，整组草稿不可恢复地清空，宿主无确认），单手误触即丢
+     内容。手机档原地放大命中盒（::after 透明扩展，墨迹与版式零变化），
+     同时拉开两颗按钮的节距：24px 按钮 + 12px gap + ±4px 扩展 = 32px 命中
+     盒、命中盒之间净空 4px——扩展幅度若超过节距的一半，两颗命中盒会互相
+     重叠，反而制造新的误触，这是本组数值的硬约束。
+     作用域：头部动作区专用（_headerActions 后代），翻页器的 prev/next 也
+     是同族 iconButton，但节距只有 6px，吃不下 ±4px 扩展，不掺和。哈希族
+     Mbwy4a_ 是该包 QuestionComposer.module.css 的稳定前缀，哈希变更时整组
+     规则自动失效，不误伤别家（哈希子串锚，非后缀锚，见 pitfalls「哈希子
+     串」）。 */
+  [class*="Mbwy4a_headerActions"] {
+    gap: 12px !important;
+  }
+  [class*="Mbwy4a_iconButton"] {
+    position: relative;
+  }
+  [class*="Mbwy4a_headerActions"] [class*="Mbwy4a_iconButton"]::after {
+    content: '';
+    position: absolute;
+    inset: -4px;
+  }
 }
 `;
 };
@@ -7309,9 +7390,24 @@ exports.COMPAT_CSS = `@media (max-width: 1023px) and (pointer: coarse) {
   }
   [data-mobile-nav="stats-ring"] svg {
     display: inline-block !important;
-    width: 16px !important;
-    height: 16px !important;
+    /* 2026-09-29 验收定稿（issue #140）：16px 难瞄准、24px 过大、20px 仍偏大，
+       店主拍板 18px；与 26×26 命中盒（见 layout.css.ts 的环规则）匹配。
+       增宽由尾道左侧富余吸收，按键间距不变。 */
+    width: 18px !important;
+    height: 18px !important;
     flex: 0 0 auto !important;
+  }
+  /* 轨道深化（2026-09-29 验收，issue #140）：宿主轨道只有 12% 黑，环放大到
+     24px 后深灰进度弧显得像残缺的加载圈（店主「什么玩意儿」）。加深到 25%
+     让 donut 成完整圆环——是「用量表」不是「spinner」。子串锚 class*=_track
+     与仓库哈希锚惯例一致，环标记内不会跨匹配（fill 类名不同）。
+     #142：25% 黑改按主题取色——color-mix 取 25% 标签色（label-primary 浅色
+     =近黑、暗色=近白），浅色维持 #140 验收观感，暗色自动翻成 25% 白（裸
+     rgba(0,0,0,.25) 在暗色下不可见，环又退回残缺加载圈）；token 缺失时 var
+     兜底 #000 与原值等价。border 族没有 25% 等价档，纯 var 兜底会让浅色回
+     归宿主 12%，故用 color-mix；宿主 CSS 已用同款 color-mix+var 组合。 */
+  [data-mobile-nav="stats-ring"] [class*="_track"] {
+    stroke: color-mix(in srgb, var(--dsw-alias-label-primary, #000) 25%, transparent) !important;
   }
   /* 环与 TPS 读数不再搬动宿主 React 节点（#104：搬动后宿主卸载调 removeChild
      对不上父节点直接抛 NotFoundError，SlotErrorBoundary 把整个 composer 槽位
@@ -7325,8 +7421,10 @@ exports.COMPAT_CSS = `@media (max-width: 1023px) and (pointer: coarse) {
   [data-mobile-nav="stats-ring-reserve"] {
     flex: 0 0 auto !important;
     display: inline-block !important;
-    width: 16px !important;
-    height: 16px !important;
+    /* 18px 与定稿的环（上方 svg 规则）同尺寸：占位顶住的槽位即环的落点，
+       尾道左侧富余吸收增宽，按键间距不变。 */
+    width: 18px !important;
+    height: 18px !important;
     margin: 0 2px 0 0 !important;
     padding: 0 !important;
   }
@@ -8622,6 +8720,7 @@ function installSessionMenuDelete(ctx) {
 __modules["effects/composer-keyboard-guard.js"] = function (require, module, exports) {
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.SHADOW_MARKER = void 0;
 exports.installComposerKeyboardGuard = installComposerKeyboardGuard;
 const phone_chrome_ts_1 = require("./effects/phone-chrome.js");
 /**
@@ -8675,8 +8774,10 @@ const phone_chrome_ts_1 = require("./effects/phone-chrome.js");
 const COMPOSER_CARD_SELECTOR = '[data-composer-card]';
 /** The Lexical editing surface (the only element allowed to raise the keyboard). */
 const COMPOSER_INPUT_SELECTOR = '[data-composer-input]';
-/** Re-arm marker kept on the editor element while its focus is shadowed. */
-const SHADOW_MARKER = 'data-mobile-nav-focus-shadow';
+/** Re-arm marker kept on the editor element while its focus is shadowed.
+ *  Exported: session-focus-guard.ts shares the same shadow slot (one marker,
+ *  one own-property recipe) so both guards stay interoperable. */
+exports.SHADOW_MARKER = 'data-mobile-nav-focus-shadow';
 function installComposerKeyboardGuard(ctx) {
     (0, phone_chrome_ts_1.installMobileEffect)(ctx, 'dsh-web-mobile: composer keyboard guard', () => {
         // 2026-09-23 扩档（店主报"点加号会弹键盘、而且再点关不掉"）：
@@ -8711,10 +8812,10 @@ function installComposerKeyboardGuard(ctx) {
         const restore = () => {
             window.clearTimeout(shadowTimer);
             shadowTimer = 0;
-            const el = document.querySelector(`[${SHADOW_MARKER}]`);
+            const el = document.querySelector(`[${exports.SHADOW_MARKER}]`);
             if (el === null)
                 return;
-            el.removeAttribute(SHADOW_MARKER);
+            el.removeAttribute(exports.SHADOW_MARKER);
             const shadowed = el;
             if (Object.prototype.hasOwnProperty.call(el, 'focus'))
                 delete shadowed.focus;
@@ -8739,7 +8840,7 @@ function installComposerKeyboardGuard(ctx) {
             }
             // A button-area tap: shadow focus for the remainder of this dispatch.
             restore();
-            editor.setAttribute(SHADOW_MARKER, '');
+            editor.setAttribute(exports.SHADOW_MARKER, '');
             Object.defineProperty(editor, 'focus', {
                 configurable: true,
                 writable: true,
@@ -9406,6 +9507,168 @@ function installShortcutModalKeyboardGuard(ctx) {
     });
 }
 };
+__modules["effects/session-focus-guard.js"] = function (require, module, exports) {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.installSessionFocusGuard = installSessionFocusGuard;
+const sessions_compat_ts_1 = require("./core/sessions-compat.js");
+const composer_keyboard_guard_ts_1 = require("./effects/composer-keyboard-guard.js");
+const phone_chrome_ts_1 = require("./effects/phone-chrome.js");
+/**
+ * Mobile guard: entering a session must not raise the soft keyboard by itself.
+ *
+ * `dsh-client-ui-conversation`'s InputBar focuses the Lexical editor from a
+ * passive effect keyed on `[locked, sessionId, editor]` — every session switch
+ * programmatically focuses the editing surface (`focusDraftEditor`:
+ * `getRootElement()?.focus(...)` plus `editor.focus(...)`). On desktop that is
+ * a convenience. On a phone it costs the user half the screen the moment the
+ * session opens — they typically want to READ the history first (issue #140).
+ *
+ * Fix strategy: on a snapshot-observed current-session change, open a short
+ * guard window and shadow the editor's own `focus` property (the same
+ * own-property recipe as `composer-keyboard-guard.ts`, sharing its marker) so
+ * the host's session-switch autofocus lands on the no-op. A real tap is
+ * unaffected: the browser focuses natively and never routes through the JS
+ * method. The window is finite (see the constant) and also closes early when
+ * the user taps the editing surface, so no legitimate programmatic refocus
+ * (e.g. the `+` command menu, which needs the caret) is swallowed after the
+ * switch has settled.
+ *
+ * Timing: the host focus runs in a PASSIVE effect, which React schedules after
+ * commit — a MutationObserver callback is a microtask and therefore runs
+ * before it (measured precedent: `shortcut-modal-keyboard-guard.ts` header).
+ * Session switches remount the InputBar (the editor is Session-owned), so the
+ * observer re-shadows the freshly mounted `[data-composer-input]` inside the
+ * window; arming also shadows an already-present input for switches that
+ * reuse the element.
+ *
+ * 2026-09-29 headless correction (issue #140 verification run): the shadow
+ * alone is NOT sufficient. When the InputBar remounts for the new session,
+ * the host's focus call runs inside the commit's synchronous layout-effect
+ * phase — BEFORE any MutationObserver microtask — so the freshly mounted
+ * editor got focused while it still had no shadow (focusin measured at
+ * t=314ms with marker=false; the observer only shadowed it afterwards). The
+ * guard therefore keeps a focusin fallback for the window's lifetime: any
+ * DOM focus landing on the editing surface is blurred synchronously — the
+ * same recipe `composer-keyboard-guard.ts` proved on a real device in the
+ * 2026-09-23 keepFocus loop (blur at the focusin capture phase happens
+ * before the IME can rise, and drafts/caret live in the host's keyboard
+ * state, not in DOM focus). A real tap is unaffected: the pointerdown
+ * early-close below shuts the window before the browser's native focus of
+ * that tap runs.
+ *
+ * DOM contract (verified against 0.1.7-rc.2):
+ * - `[data-composer-input]` — the Lexical contenteditable surface (count=1;
+ *   present in every released host since 0.1.2-alpha.2, per
+ *   docs/debug/composer-tree-recon.md).
+ * - `data-mobile-nav-focus-shadow` — the shared shadow marker.
+ * Re-audit when the conversation package upgrades.
+ */
+/** Guard window for one session switch. Long enough for a slow phone to
+ *  render + run passive effects; short enough that a user tapping `+` right
+ *  after the switch only rarely lands inside it. */
+const FOCUS_GUARD_WINDOW_MS = 800;
+/** The Lexical editing surface — the only element whose autofocus we swallow. */
+const COMPOSER_INPUT_SELECTOR = '[data-composer-input]';
+/**
+ * Keep the session-switch autofocus from raising the soft keyboard, on the
+ * mobile breakpoint only.
+ * @param ctx - client root context.
+ */
+function installSessionFocusGuard(ctx) {
+    (0, phone_chrome_ts_1.installMobileEffect)(ctx, 'dsh-web-mobile: session focus guard', () => {
+        const list = ctx.sessions.list;
+        // Snapshot value at install time: subscribing must not arm the window by
+        // itself — only a CHANGE of the current session id does.
+        let lastSessionId = (0, sessions_compat_ts_1.currentSessionIdOf)(list.getSnapshot());
+        let windowTimer = 0;
+        let windowOpen = false;
+        const restore = () => {
+            window.clearTimeout(windowTimer);
+            windowTimer = 0;
+            windowOpen = false;
+            const el = document.querySelector(`[${composer_keyboard_guard_ts_1.SHADOW_MARKER}]`);
+            if (el === null)
+                return;
+            el.removeAttribute(composer_keyboard_guard_ts_1.SHADOW_MARKER);
+            const shadowed = el;
+            if (Object.prototype.hasOwnProperty.call(el, 'focus'))
+                delete shadowed.focus;
+        };
+        const shadow = (el) => {
+            if (el.hasAttribute(composer_keyboard_guard_ts_1.SHADOW_MARKER))
+                return;
+            el.setAttribute(composer_keyboard_guard_ts_1.SHADOW_MARKER, '');
+            Object.defineProperty(el, 'focus', {
+                configurable: true,
+                writable: true,
+                value: function swallowedFocus() {
+                    /* session-switch autofocus; keep the keyboard down */
+                },
+            });
+        };
+        const arm = () => {
+            restore();
+            windowOpen = true;
+            const el = document.querySelector(COMPOSER_INPUT_SELECTOR);
+            if (el !== null)
+                shadow(el);
+            windowTimer = window.setTimeout(restore, FOCUS_GUARD_WINDOW_MS);
+        };
+        // Session switches remount the InputBar: catch the freshly mounted editor
+        // inside the window. Microtask timing beats the host's passive effect.
+        const observer = new MutationObserver(() => {
+            if (!windowOpen)
+                return;
+            const el = document.querySelector(COMPOSER_INPUT_SELECTOR);
+            if (el !== null)
+                shadow(el);
+        });
+        // A tap on the editing surface is the user saying "I want to type": close
+        // the window on the spot so the residual shadow cannot eat anything.
+        const onPointerDown = (event) => {
+            if (!windowOpen)
+                return;
+            const target = event.target;
+            if (target instanceof Element && target.closest(COMPOSER_INPUT_SELECTOR) !== null)
+                restore();
+        };
+        // Timing fallback for the window's lifetime: the host focuses the freshly
+        // mounted editor from the commit's synchronous phase, before the observer
+        // microtask can shadow it (headless-measured 2026-09-29, see header), so
+        // any focus that still lands on the editing surface inside the window is
+        // blurred on the spot — before the IME can rise. User taps never reach
+        // this: their pointerdown closed the window above.
+        const onFocusIn = (event) => {
+            if (!windowOpen)
+                return;
+            const target = event.target;
+            if (target instanceof HTMLElement && target.closest(COMPOSER_INPUT_SELECTOR) !== null)
+                target.blur();
+        };
+        // Invalidation callback (zustand-style): re-read the snapshot and arm only
+        // when the current session id actually changed — list churn (titles,
+        // ordering, refresh) must never open the window.
+        const unsubscribe = list.subscribe(() => {
+            const current = (0, sessions_compat_ts_1.currentSessionIdOf)(list.getSnapshot());
+            if (current === lastSessionId)
+                return;
+            lastSessionId = current;
+            arm();
+        });
+        observer.observe(document.documentElement, { childList: true, subtree: true });
+        document.addEventListener('pointerdown', onPointerDown, true);
+        document.addEventListener('focusin', onFocusIn, true);
+        return () => {
+            unsubscribe();
+            observer.disconnect();
+            document.removeEventListener('pointerdown', onPointerDown, true);
+            document.removeEventListener('focusin', onFocusIn, true);
+            restore();
+        };
+    });
+}
+};
 __modules["core/layout-compat.js"] = function (require, module, exports) {
 "use strict";
 // The layout service face drifted between host generations. rc.6's ILayout
@@ -9911,6 +10174,7 @@ const workspace_chip_toggle_ts_1 = require("./effects/workspace-chip-toggle.js")
 const team_chip_toggle_ts_1 = require("./effects/team-chip-toggle.js");
 const model_menu_anchor_ts_1 = require("./effects/model-menu-anchor.js");
 const shortcut_modal_keyboard_guard_ts_1 = require("./effects/shortcut-modal-keyboard-guard.js");
+const session_focus_guard_ts_1 = require("./effects/session-focus-guard.js");
 const aionui_compat_ts_1 = require("./effects/aionui-compat.js");
 const panel_exit_ts_1 = require("./effects/panel-exit.js");
 const raf_scheduler_ts_1 = require("./core/raf-scheduler.js");
@@ -10112,6 +10376,12 @@ function apply(ctx) {
     // EDIT, and the keyboard shrinking the viewport resizes the sheet (owner
     // report: 「打开的时候还是会闪，而且还会唤起键盘」).
     (0, shortcut_modal_keyboard_guard_ts_1.installShortcutModalKeyboardGuard)(ctx);
+    // Entering a session (issue #140): the host's InputBar focuses the editor
+    // from a [locked, sessionId, editor] passive effect on every switch, which
+    // raises the soft keyboard over the history the user wanted to read. A short
+    // shadow-focus window per observed session switch swallows that one
+    // autofocus; real taps are unaffected.
+    (0, session_focus_guard_ts_1.installSessionFocusGuard)(ctx);
     (0, phone_chrome_ts_1.installPhoneChrome)(ctx);
     (0, aionui_compat_ts_1.installAionuiCompat)(ctx);
     // Debug badge (?mobile-nav-debug=1): live state overlay for phone-side

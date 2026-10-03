@@ -52,6 +52,69 @@ export const LOBSTERAI_LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
  * 而签到每次都要带它 —— 不缓存会让每次签到多一次跨域请求。
  */
 export const LOBSTERAI_VERSION_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
+// ── 手机号脱敏（账号展示名）──
+/**
+ * 把手机号（完整或已脱敏）统一掩码为**只露末 2 位**的形态。
+ *
+ * ## 为什么需要它（用户要求 2026-09-27）
+ *
+ * > lobsterai 的用户名字显示的手机号尾号漏出 4 位，现在也改为只漏出 2 位
+ *
+ * 故这里做**归一化**而非改某个 `slice(-4)`：两种输入都收敛到同一形态，
+ * 因此**幂等**（已归一化的值再跑一次结果不变），老账号也无需重新登录。
+ *
+ * | 输入 | 输出 |
+ * |---|---|
+ * | `13011111100`（完整号码） | `130******00` |
+ * | `130****1100`（服务端脱敏，露 4 位） | `130******00` |
+ * | `130******00`（已归一化） | `130******00`（幂等） |
+ * | `测试账号` / `用户26815487395` | 原样返回（非手机号形态） |
+ *
+ * ⚠️ **只对「像手机号」的输入生效**：判据是 11 位纯数字（`1` 开头），或
+ * `3 位数字 + 星号 + 数字` 的脱敏形态。绝不能泛化到任意字符串 ——
+ * 那会把真实昵称（如 `用户26815487395`）也掩码掉。
+ *
+ * 星号个数按**原串总长**推算（`总长 - 3 - 2`），故对非 11 位的号码也自洽。
+ *
+ * @param visibleTail 保留的末位位数；默认 **2**（用户要求的展示口径）
+ */
+export function maskLobsteraiPhoneTail(value, visibleTail = 2) {
+    const trimmed = value.trim();
+    if (trimmed.length === 0)
+        return trimmed;
+    /** 按原串总长保持长度不变地重建掩码。 */
+    const rebuild = (prefix, totalLength, tail) => {
+        const starCount = totalLength - prefix.length - tail.length;
+        // 后缀已经比要保留的还短（异常输入）：不制造负数星号，原样返回。
+        return starCount < 0 ? trimmed : `${prefix}${'*'.repeat(starCount)}${tail}`;
+    };
+    // 形态 1：完整手机号（11 位纯数字，1 开头）。
+    if (/^1\d{10}$/.test(trimmed)) {
+        return rebuild(trimmed.slice(0, 3), trimmed.length, trimmed.slice(-visibleTail));
+    }
+    // 形态 2：服务端已脱敏 —— 3 位数字 + 星号 + 若干位后缀。
+    const masked = /^(\d{3})(\*+)(\d+)$/.exec(trimmed);
+    if (masked !== null) {
+        const [, prefix, stars, suffix] = masked;
+        const totalLength = prefix.length + stars.length + suffix.length;
+        return rebuild(prefix, totalLength, suffix.slice(-visibleTail));
+    }
+    // 非手机号形态（真实昵称 / 账号 id）：原样返回，绝不误伤。
+    return trimmed;
+}
+/**
+ * LobsterAI 账号在 Jet Hub 里的**展示名**：昵称经手机号掩码归一化。
+ *
+ * 服务端把**手机号本身**当昵称下发（见 {@link maskLobsteraiPhoneTail}），
+ * 故这里统一收敛到「只露末 2 位」；非手机号形态的昵称原样保留。
+ * 昵称为空时退回账号 id（与登录路径既有行为一致）。
+ */
+export function lobsteraiDisplayNickname(credential, fallbackId) {
+    const nickname = typeof credential?.nickname === 'string' ? credential.nickname.trim() : '';
+    if (nickname.length === 0)
+        return fallbackId;
+    return maskLobsteraiPhoneTail(nickname);
+}
 /** 从 JSON 安全读取字符串字段（兼容后端把数字返回成 number）。 */
 export function readStringField(source, key) {
     const value = source[key];

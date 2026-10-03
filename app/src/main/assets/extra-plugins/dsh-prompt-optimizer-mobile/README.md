@@ -1,9 +1,53 @@
-# dsh-prompt-optimizer 0.6（**0.7.6**）
+# dsh-arbiter-wf（**0.8.0-preview**）
 
-`dsh-prompt-optimizer-mobile` · **0.7.6** · GitHub Release（**未发 npm**：`private: true`，只发附件）
-→ 下载：<https://github.com/WestFox-AwA/dsh-prompt-optimizer/releases/tag/v0.7.6>（附件含 `tgz` 与 `SHA256SUMS`）
+## 0.8.0-preview：独立裁判层（改名首版）
 
-> **0.7.6 的一句话**：**档位终于真的分开了**——补充程度（700 / 1200 / 2000 字）与自主预算
+新增 `consult_task`，模型和思考档位沿用优化 AI 配置。启用本会话提示词辅助后可调用；要让顾问读取项目成果文件，开启已有“只读工具”选项。
+
+- 重复失败却没有新证据时：`mode: diagnose_failure`，提供具体问题和可选 `hypothesis`，返回下一步和停止条件。
+- 首次交付前：先自验并取得原始工具结果，再调用 `mode: review_result`；可提供最多四个项目内成果相对路径 `artifacts`。不提交自己的通过结论。
+- 自动读取最近一条真人消息以来的证据；成果复核不提供主模型正文或先前顾问结果。不实现跨轮记忆。
+- 验收状态分满足、不满足、未验证；顾问不是用户授权，也不能代替用户的视觉体验测试。
+- 取消/截止信号传至模型并等待收尾（依赖 provider 遵守取消）；一次最长目标 5 分钟，不自动重试。
+- 限时默认 300 秒，可用环境变量 `DSH_PO06_ADVISOR_TIMEOUT_MS` 调整（毫秒，钳制在 60 秒~15 分钟）；重启 DSH 生效。
+- 到点不会空手而归：已有完整报告就保留并标为部分产出；只跑到一半也会交回思考尾部与查证记录，供调用方判断下一步。
+- 专项输入：`scope` 是**检查维度、不是行业**（geometry形体与装配 / appearance画面观感 / code代码正确性 / interaction交互逻辑 / performance性能证据 / delivery交付覆盖 / custom其它专项），`focus` 为具体对象与检查点。省略scope保持general兼容；专项不能泛化成整体通过。按任务实际需要选维度，一次只选一个，不适用就不选。
+- 通用性约束：提示词与参数说明不含任何行业的专用词汇，由 `advisor-generality.test.mjs` 机械拦截——专项是“怎么查”，不是“查什么行业”。任何领域的成果都用同一套维度，`custom` 兜住维度外的情形。
+- 几何/外观只发图片、不注入开发历史或源码、不开放源码工具；误传文件在卡片标“本次范围排除”。代码/交互/性能仅发相关源码与原始日志，图片排除；可用`evidenceRefs`选择本次工具证据编号。用户原话和权限边界始终保留。
+- 按高风险阶段成形、返工成本将升、用户反馈和关键改动触发复核；视觉先独立看图，有疑点再同focus追源码，不固定堆次数。小任务可只做一次general。
+- 交付复核使用`scope: delivery`和`requiredReviews: [{scope,focus}]`逐项核对本轮覆盖、未解决项与材料变更。requiredScopes仅类别提示，不能用某一focus通过冒充整类别通过。覆盖仅同会话同真人请求，有界保存；材料指纹/已记录源码写事件变化后需重审。外部或任意shell写入不能保证全部感知。
+- 卡片显示专项对象、排除材料，delivery显示缺失项与既有报告的版本状态。当前仍没有强制拦截交付或自动调用，真实识图效果待用户手测。
+- 斜杠命令允许列表（0.8）：设置项 `slashReview`（命令名数组，不带斜杠，默认 `[]` = 所有斜杠命令仍交还宿主）。
+  - 只有**列在名单里、且宿主确认当前已注册**的命令才走「拦截 → 优化 → 可编辑确认」；官方命令（/clear、/model、/compact 等）与未注册命令照旧直发，行为与改动前一致。
+  - 名单项不存在（没装对应插件）**不会报错**。分两种情形：
+    - **问得到命令表**（有 live agent）：未注册的命令不进放行集合，我们不拦，完全等同没配这一条；
+    - **问不到命令表**（无 live agent / 服务缺失）：退回名单本身照常拦截，并在 `/status.slashReview` 标 `verified:false` + 具体原因，不假装核对过、也不静默失效。
+  - 任一情形下 `/status` 都照常 200、不抛异常；无会话时不拦截。
+  - 浮层可改内容，但不允许把命令本身换掉：编辑后不再是原命令时，按用户按下发送时的原话发出。
+  - 与 rollout 的 `allowlist` 是两回事：那个管「哪些会话启用」，本项管「哪些斜杠命令可被拦截」。
+  - 启用方法：`~/.dsh/po06.json` 写 `"slashReview": ["vmake"]`，改完重启 DSH 生效。
+- 材料参数：`files: [{path, purpose}]`（关键成果源码/配置/原始测试日志），`images: [{path, purpose}]`（真实默认画面/近景/异常截图）。`artifacts`旧字符串数组仍兼容。路径相对会话工作目录，files与artifacts合计最多4份、images最多4张。遵守用户文件限制，不自动上传整个工程。
+- 文件最多2 MiB，UTF-8文本每份附入最多16,000字符、合计48,000字符；超出明确标截断，不据此判完整通过。图片每张最多5 MiB、合计12 MiB，通过宿主附件服务校验和标准化。
+- 只有宿主确认所选优化模型支持图像时才附入真正image块；未知/文本模型显示“未检查图片”，不自动换模型。只读工具关闭时不读取材料。
+- 选哪个 shell（2026-10-01 修）：工具描述按**命令性质**给判据（POSIX 管线/glob/串联/bash 语义 → bash；PowerShell 对象语义 → pwsh），并保留一条**标明来源**的经验口径：两者都能做时优先 bash，不为同一条命令来回换 shell。
+  - 起因是我原先在描述里写了「跑 Windows 原生程序时 pwsh 通常更快更稳」——**没有实测支撑**，还把位置放错（塞在 `timeoutMs` 参数说明里），净效果是把模型推离 bash（本会话 pwsh 136 次 : bash 2 次）。
+  - 实测反向证据：`node -e`、`node --test` 这类 Windows 原生工具链经 bash 跑均正常（0.28–0.33s），且与 POSIX 管线可在同一进程完成；未发现 bash 更慢或更不稳。
+  - 机器守卫：`bash-execute.test.mjs` 断言描述里不再出现该未实测断言、且必须含「按命令性质选／优先 bash」。
+- 卡片逐项显示材料路径、用途、状态及实际附入字符数；文件可展开看咨询时片段，点击路径用DSH侧栏预览当前文件。两者版本可能不同，材料保留内容指纹。图片用同一侧栏预览，不自建文件下载接口。
+- 顾问专用卡片同时覆盖直接调用和代码中的子调用，固定四个分区：原 AI 询问内容、顾问思考内容、顾问答复内容、验收结果。询问和答复直接可见；思考与验收独立折叠、默认收起。展开思考可实时看 provider 返回的流，没有提供时明确标注。
+- 思考展开时默认跟随最新内容，向上滚动后暂停跟随；查证记录收在思考区内部，原始输出收在验收区内部。答复摘要可随生成显示，未完成校验前不当作最终结论。
+- 实时状态按会话和调用 ID 隔离；已完成记录在本机缓存中有界保留最近 80 次，可刷新后回看。旧调用没有补录思考；中止/部分产出不能显示为完整通过。
+- 卡片更新需要完整重启 DSH 并硬刷新浏览器；本机仍通过 link 指向开发目录，不必重装。
+- token 计数（0.8 修）：页脚显示本次咨询的 `Σ 合计 | 入 · 出 · 缓存`。用量有两个来源——宿主投影（已归一化）与进度记录（provider 原始字段）——格式化入口对两种形状都做容错归一。
+  - 2026-10-01 真机缺陷：卡片优先取原始记录，而格式化只认归一字段 ⇒ 页脚恒显 `Σ — tok`；修在格式化入口，**已落盘的旧卡片刷新后也会显示数字**。
+  - 仍然不折算、不估算：provider 没给合计就不替它加（只列分项）；整场没有上报用量（例如刚开始就到点）则如实显示 `Σ — tok`。
+
+这是本地开发版本，尚未 push 或发布。下面的下载链接仍指向已发布的 0.7.8。
+
+`@dsh-external/dsh-po06` · **0.7.8** · GitHub Release（**未发 npm**：`private: true`，只发附件）
+→ 下载：<https://github.com/WestFox-AwA/dsh-prompt-optimizer/releases/tag/v0.7.8>（附件含 `tgz` 与 `SHA256SUMS`）
+
+> **0.7.8 的一句话**：**档位终于真的分开了**——补充程度（700 / 1200 / 2000 字）与自主预算
 > （1 / 2 / 3 个问题）两个维度逐级递进；此前 `minimal` 从未被任何档位使用、且 standard 与 heavy 的
 > detail 相同，所以「重度」实际只等于「标准 + 多问 1 个」。同时**内部控制面信息不再写进工作模型的上下文**
 > （注入头部原先带「任务 `default` · 意图修订 N」，会被当成任务语义处理，现已移除）。
@@ -81,8 +125,8 @@
 **① 从 Release 下载安装包**（两个附件：`tgz` + 校验和）：
 
 ```powershell
-# 直链（版本号换成你要的；0.7.6 是最新版）
-$v = '0.7.6'
+# 直链（版本号换成你要的；0.7.8 是最新版）
+$v = '0.7.8'
 $dir = "$env:USERPROFILE\Downloads"
 Invoke-WebRequest "https://github.com/WestFox-AwA/dsh-prompt-optimizer/releases/download/v$v/dsh-external-dsh-po06-$v.tgz" -OutFile "$dir\dsh-external-dsh-po06-$v.tgz"
 Invoke-WebRequest "https://github.com/WestFox-AwA/dsh-prompt-optimizer/releases/download/v$v/SHA256SUMS-$v.txt" -OutFile "$dir\SHA256SUMS-$v.txt"
@@ -100,14 +144,14 @@ Get-Content "$dir\SHA256SUMS-$v.txt"
 # 用发行版自带的 web 模板新建 profile（不含 0.5.x）
 dsh --profile po06beta --from-default-profile web --dump-config
 # 装本包（tgz 路径换成你下载到的位置）
-dsh plugin --profile po06beta add "$env:USERPROFILE\Downloads\dsh-external-dsh-po06-0.7.6.tgz"
+dsh plugin --profile po06beta add "$env:USERPROFILE\Downloads\dsh-external-dsh-po06-0.7.8.tgz"
 ```
 
 **③（可选，但强烈建议）一条命令自检**"装好了、装的是这一份、会被装配"（**不调模型、不花钱**）：
 
 ```powershell
 # 需要仓库里的脚本；没克隆仓库就跳过这步，直接进 ④
-node <repo>\po06\scripts\check-install.mjs --profile po06beta --expect-version 0.7.6
+node <repo>\po06\scripts\check-install.mjs --profile po06beta --expect-version 0.7.8
 ```
 
 它会逐条回答：
@@ -146,7 +190,7 @@ Set-Content -Path "$env:USERPROFILE\.dsh\po06.json" -Encoding utf8 -Value '{"set
 # 关：把 enabled 改 false（或直接删掉这个文件——读不到就是不启用）
 Set-Content -Path "$env:USERPROFILE\.dsh\po06.json" -Encoding utf8 -Value '{"settingsVersion":1,"enabled":false,"rollout":{"mode":"off"}}'
 # 卸：从 profile 移除并把 profile 整个删掉
-dsh plugin --profile po06beta remove dsh-prompt-optimizer-mobile
+dsh plugin --profile po06beta remove @dsh-external/dsh-po06
 Remove-Item -Recurse -Force "$env:USERPROFILE\.dsh\profiles\po06beta"
 ```
 

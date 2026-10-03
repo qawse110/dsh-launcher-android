@@ -23,13 +23,15 @@
 import { LlmAdapter, LlmError, ReasoningEffortId, } from '@deepseek-ai/dsh-llm';
 import { ToolCallId } from '@deepseek-ai/dsh-llm';
 import { providerCatalogVisible } from './account-pool.js';
-import { settingsNamespaceFor } from './settings-compat.js';
+import { RemoteCatalogGate } from './remote-catalog-gate.js';
 import { parseRateLimitError } from './llm-adapter.js';
 import { LOBSTERAI_CHAT_PATH, LOBSTERAI_MODELS_PATH, LOBSTERAI_REQUEST_TIMEOUT_MS, isLobsteraiExpired, lobsteraiChatHeaders, lobsteraiKeyfromBody, readNumberField, readStringField, } from './lobsterai.js';
 import { LOBSTERAI } from './lobsterai-product.js';
+import { projectRequestImage } from './image-budget.js';
 import { classifyLobsteraiError, classifyLobsteraiStreamError, recordsLobsteraiRateLimit, shouldRotateLobsteraiAccount, } from './lobsterai-errors.js';
 import { normalizeHarnessMessages } from './message-shape.js';
-import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js';
+import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js';
+import { registerAdapterIdempotent, } from './llm-register-compat.js';
 /** 本适配器注册的 provider 路由名（历史常量，等价于 `LOBSTERAI.id`）。 */
 export const PROVIDER = 'lobsterai';
 /**
@@ -553,6 +555,11 @@ export class LobsteraiAdapter extends LlmAdapter {
     fetchImpl;
     /** 动态模型缓存（首次 listModels 成功后填充）。 */
     remoteModels;
+    /**
+     * 目录加载闸门：并发去重 + 失败/空结果冷却。
+     * 依据见 `src/remote-catalog-gate.ts`（首屏「加载模型巨长」的实测归因）。
+     */
+    catalogGate = new RemoteCatalogGate();
     /** 远端下发的模型元数据（id → 条目），listModels/resolveModel 共用。 */
     remoteMeta = new Map();
     /** 产品级兜底模型索引（`product.fallbackModels` 的 id → 条目）。 */
@@ -583,18 +590,18 @@ export class LobsteraiAdapter extends LlmAdapter {
      * 被调用（如直接从历史会话进入），此时同样需要触发一次拉取。
      */
     async ensureRemoteModels() {
-        if (this.remoteModels !== undefined || this.options.fetchRemoteModels === undefined)
+        const fetchRemote = this.options.fetchRemoteModels;
+        if (this.remoteModels !== undefined || fetchRemote === undefined)
             return;
-        try {
-            const models = await this.options.fetchRemoteModels();
-            if (models.length > 0) {
-                this.remoteModels = models;
-                this.remoteMeta = new Map(models.map((model) => [model.id, model]));
-            }
-        }
-        catch {
-            // 远端不可用：回退兜底目录（由 staticFallbackModels 提供）。
-        }
+        // 闸门：并发去重 + 失败/空结果冷却（依据见 src/remote-catalog-gate.ts）。
+        await this.catalogGate.run(async () => {
+            const models = await fetchRemote();
+            if (models.length === 0)
+                return false;
+            this.remoteModels = models;
+            this.remoteMeta = new Map(models.map((model) => [model.id, model]));
+            return true;
+        });
     }
     /**
      * 模型接受的输入模态。
@@ -780,18 +787,25 @@ export class LobsteraiAdapter extends LlmAdapter {
             // 保留**空 Map**（而非降级为 undefined）：图片存在但全部读取失败时，
             // 空 Map 仍会让 userContentParts 产出 [image unavailable] 占位符。
             imageUrls = new Map();
+            const readImage = this.options.readImage;
             for (const [id, ref] of imageRefs) {
-                const image = await this.options.readImage(ref);
+                // ⚠️ 先试**请求版本**（缩放），拿不到才发原图 —— 见 projectRequestImage。
+                const projected = await projectRequestImage(ref, {
+                    readImageRequest: this.options.readImageRequest,
+                    pixelBudget: this.product.imagePixelBudget,
+                    maxBytes: this.product.imageMaxBytes,
+                });
+                const image = projected ?? await readImage(ref);
                 if (image === undefined)
                     continue;
                 imageUrls.set(id, `data:${image.mediaType};base64,${Buffer.from(image.data).toString('base64')}`);
             }
         }
         // 1. 获取凭据（过期则先静默续期）
-        let credential = await this.options.resolveCredential();
+        let credential = await this.options.resolveCredential(options.model);
         if (credential === undefined || isLobsteraiExpired(credential)) {
             await this.options.refresh();
-            credential = await this.options.resolveCredential();
+            credential = await this.options.resolveCredential(options.model);
         }
         if (credential === undefined || credential.access_token.length === 0) {
             throw new LlmError('lobsterai: no usable credential; log in first', 'MISSING_CREDENTIAL');
@@ -854,7 +868,7 @@ export class LobsteraiAdapter extends LlmAdapter {
         let response = await this.send(credential, body, options);
         if (!response.ok && (response.status === 401 || response.status === 403)) {
             await this.options.refresh();
-            const refreshed = await this.options.resolveCredential();
+            const refreshed = await this.options.resolveCredential(options.model);
             if (refreshed === undefined || refreshed.access_token.length === 0) {
                 throw new LlmError('lobsterai: credential expired and refresh failed', 'AUTH', { status: response.status });
             }
@@ -1050,8 +1064,9 @@ export class LobsteraiAdapter extends LlmAdapter {
          */
         const proseLoopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined;
         let proseLoopDetected = false;
-        /** `</think:hex>` 泄漏探测（跨帧，收尾再切分）。 */
-        let proseHasThinkTag = false;
+        // ⚠️ 此处**曾有** `proseHasThinkTag` 门禁变量，2026-09-27 **删除**。
+        // 逐帧探测在跨帧时必然漏判（实测二分帧 7/11 漏）→ 收尾不切分 → 标签泄漏。
+        // 现改为收尾**无条件**调用 `splitThinkTaggedContent`。
         /**
          * 纯空白思考抑制器（见 `createBlankReasoningSuppressor`）。与 `blocks` /
          * `loopGuard` 同生命周期：**每个 `stream()` 调用建一个实例**。
@@ -1169,9 +1184,9 @@ export class LobsteraiAdapter extends LlmAdapter {
                             if (proseLoopGuard.observe(textDelta))
                                 proseLoopDetected = true;
                         }
-                        // `</think:hex>` 泄漏探测（跨帧，故只做子串判定，收尾再切分）。
-                        if (!proseHasThinkTag && textDelta.includes('think:'))
-                            proseHasThinkTag = true;
+                        // ⚠️ **不要在这里逐帧探测 think 标签**（2026-09-27 移除）：
+                        // 跨帧必然漏判（实测二分帧 7/11 漏）→ 收尾不切分 → 标签泄漏。
+                        // 改为收尾无条件调用 `splitThinkTaggedContent`。
                         if (!proseLoopDetected) {
                             block.text += textDelta;
                             yield { type: 'text-delta', index: block.index, text: textDelta };
@@ -1307,6 +1322,8 @@ export class LobsteraiAdapter extends LlmAdapter {
          * 故此处**在每个 `block-end` 的发射点自增**，与下面三段发射逻辑逐条对齐。
          */
         let blockCount = 0;
+        /** 本步**最终发出的正文**，供 finish 归类判定「是否被上游停止串截断」。 */
+        let emittedProse = '';
         // 按创建顺序关闭每个块
         const textBlock = blocks.find(block => block.kind === 'text');
         for (const index of toolOrder) {
@@ -1329,11 +1346,16 @@ export class LobsteraiAdapter extends LlmAdapter {
             };
         }
         if (textBlock !== undefined) {
-            // ── `</think:hex>` 泄漏归位（见 `splitThinkTaggedContent`）──
+            // ── think 标签归位（见 `splitThinkTaggedContent`）──
             // 标签**前**的内心独白 → reasoning 块；标签**后**的真正文 → 本 text 块。
             // 无标签时**逐字节不变**。
+            //
+            // ⚠️ **必须无条件调用，不得加「先探测有没有标签」的门禁**（2026-09-27 修）：
+            // 标签会**跨帧**到达，任何逐帧探测都会漏判（实测二分帧 7/11 漏），
+            // 漏了就不切分、标签原样泄漏。无标签时本函数返回 undefined，故普通响应
+            // 逐字节不变（仅多一次字符串扫描）。
             let textOut = textBlock.text;
-            if (proseHasThinkTag) {
+            {
                 const split = splitThinkTaggedContent(textBlock.text);
                 if (split !== undefined) {
                     // ⚠️ **必须同时喂 `suppressor`**：收尾以 `suppressor.text()` 为
@@ -1351,6 +1373,19 @@ export class LobsteraiAdapter extends LlmAdapter {
                     textOut = split.text;
                 }
             }
+            // ── 残留标签**兜底剥离**（见 `stripBareThinkCloseTag`）──
+            //
+            // ⚠️ **默认关闭**（`DSH_THINK_LEAK_STRIP=1` 才启用）。用户决定（2026-09-27）：
+            // > 暂时不需要泄露过滤……**加了过滤可能有思考解析失败但是被过滤我们发现不了。**
+            // 即兜底会**掩盖解析层的失败**；当前要让泄漏如实呈现以便观测。
+            //
+            // ⚠️ **必须在切分之后**：切分负责「解析」，本行只兜底纯标签块。
+            //
+            // ⚠️ **必须在 hex 切分之后**（顺序不可颠倒）：若放在切分之前，
+            // `思考</think:6124c78e></think>` 这类「hex 后跟裸标签」的形态会漏 ——
+            // 切分把裸标签留在正文侧，直接泄漏进 UI（审计实测到的真实缺陷）。
+            // 放在末尾同时覆盖两种形态：切分产物再剥一次、纯裸标签块（无 hex）也在此剥离。
+            textOut = stripBareThinkCloseTagIfEnabled(textOut);
             // 正文死循环截断：只保留循环前的干净前缀。
             // ⚠️ **不改 finish reason**：工具调用仍要被执行。
             const truncated = proseLoopDetected && proseLoopGuard?.cutAt !== undefined
@@ -1362,6 +1397,7 @@ export class LobsteraiAdapter extends LlmAdapter {
             // `EMPTY_RESPONSE` 契约禁止产出空内容块。思考段已归位，故仍有产出。
             if (cleaned !== '') {
                 blockCount += 1;
+                emittedProse = cleaned;
                 yield { type: 'block-end', index: textBlock.index, block: { type: 'text', text: cleaned } };
             }
         }
@@ -1398,18 +1434,41 @@ export class LobsteraiAdapter extends LlmAdapter {
         // 而非 stop（否则模型本意调工具、harness 却认为「正常答完了」）。
         const argsTruncated = [...toolCalls.values()].some(block => isTruncatedArguments(block.text));
         const droppedUnnamedCalls = [...toolCalls.values()].some(block => !block.announced);
-        const reason = loopDetected
-            // 思考死循环：截断并报可重试。**优先级最高** —— 循环中生成的工具调用
-            // 参数不可信；且若无可用调用，落到 `stop` 会让任务静默中断。
-            ? { kind: 'max-tokens' }
-            : finishReason === 'length'
-                || (finishReason === undefined && toolOrder.length > 0)
-                || argsTruncated
-                || (droppedUnnamedCalls && toolOrder.length === 0)
+        /**
+         * 正文是否被**上游停止串**掐断（见 `isProseTruncatedByStopString`）。
+         *
+         * 上游把 `</think>` 当停止串：模型在正文里写它（哪怕包在反引号里）就会被
+         * 掐断，但仍报 `finish_reason:"stop"` —— 我们据此判「正常答完」会让本轮
+         * **没有任何报错就停住**。
+         */
+        const proseCutByStopString = finishReason === 'stop'
+            && toolOrder.length === 0
+            && isProseTruncatedByStopString(emittedProse);
+        /**
+         * 思考死循环是否**是唯一的产出**（无正文、无工具调用）。
+         *
+         * ⚠️ 与 `buddy-adapter.ts` 同因同修（Gitee !IKIZNK）：只有该步没有可见产出
+         * 时才报 `error` —— `error` 路径不落 `assistant/message`，有正文/工具调用时
+         * 报它会把可见内容丢掉。实测守卫命中 25 例全部只有思考。
+         */
+        const reasoningLoopIsSoleOutput = loopDetected
+            && emittedProse === ''
+            && toolOrder.length === 0;
+        const reason = reasoningLoopIsSoleOutput
+            // 思考死循环且无可见产出：报有分辨力的 error（不能报 max-tokens，
+            // UI 会误显示「已达到输出 token 上限」）。
+            ? { kind: 'error', failure: reasoningLoopFailure(loopGuard?.diagnostics, options.maxTokens, 'reasoning') }
+            : loopDetected
                 ? { kind: 'max-tokens' }
-                : finishReason === 'tool_calls' || toolOrder.length > 0
-                    ? { kind: 'tool-calls' }
-                    : { kind: 'stop' };
+                : finishReason === 'length'
+                    || (finishReason === undefined && toolOrder.length > 0)
+                    || argsTruncated
+                    || proseCutByStopString
+                    || (droppedUnnamedCalls && toolOrder.length === 0)
+                    ? { kind: 'max-tokens' }
+                    : finishReason === 'tool_calls' || toolOrder.length > 0
+                        ? { kind: 'tool-calls' }
+                        : { kind: 'stop' };
         // 零内容块响应（例如本次只收到过那个被压制的空白 reasoning）否则会以
         // `stop` 收场 —— 那是 DSH `EMPTY_RESPONSE` 契约明令禁止的静默结束。
         // ⚠️ 传入的是**上面已算好的** `reason`（含 loopDetected / length /
@@ -1440,22 +1499,15 @@ function displayNameFor(model) {
 /**
  * 在 `ctx.llm` 上注册 LobsterAI provider 路由与适配器。
  *
- * 路由名与配置页展示名由产品配置驱动，得到 `lobsterai`。`settingsNs` 经
- * `settingsNamespaceFor()` 解析：老契约（≤0.1.6）下是 `llm-lobsterai`；
- * 0.1.7-rc.1 起 settings 命名空间只能是 profile 条目 id，故解析为本插件条目 id。
+ * 路由名与展示名由产品配置驱动，得到 `lobsterai`。
+ *
+ * ⚠️ 刻意**不**向 DSH 声明可配置 provider（`registerConfigurableProviders`）——
+ * 详见 `llm-register-compat.ts` 模块头。
  */
 export function registerLobsteraiLlm(ctx, options) {
     const product = options.product ?? LOBSTERAI;
-    ctx.llm.registerConfigurableProviders([
-        {
-            provider: product.id,
-            displayName: product.displayName,
-            settingsNs: settingsNamespaceFor(ctx, `llm-${product.id}`),
-            settingsPath: [],
-        },
-    ]);
     const adapter = new LobsteraiAdapter(options);
-    ctx.llm.registerAdapter([product.id], adapter);
+    registerAdapterIdempotent(ctx.llm, [product.id], adapter);
     // 返回实例：Jet Hub「显示列表」需要 `listAllModels()`（不受黑名单影响、
     // 带最终展示名/倍率）。`ctx.llm` 不透传自定义方法，须由调用方持有引用。
     return adapter;

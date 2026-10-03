@@ -13,11 +13,16 @@
 //   ② 出现 `Origin` 时其 host 必须是 loopback——挡跨站；
 //   ③ **写操作必须带自定义头 `x-po06: 1`**：自定义头会触发 CORS 预检，而我们**从不**回 CORS 头
 //      ⇒ 跨站写在预检阶段就被浏览器拦掉（同源页面不受影响）。这一条是"最小代价的 CSRF 防线"。
-import { readFileSync, writeFileSync, existsSync, renameSync, rmSync, copyFileSync } from 'node:fs'
+import { appendFileSync, readFileSync, writeFileSync, existsSync, renameSync, rmSync, copyFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { SYSTEM_PROMPT } from './interpreter.js'
 import { parseEnableIntent } from './assembly-gate.js'
+// dsh-launcher fork：诊断字段要读 rollout 的归一化结果 —— 本 fork 把「未配置」的回落值
+// 改成 rollout: null（FORK.md 改动 2），直接读 intent.rollout.mode 会抛 TypeError。
+// normalizeRollout 对 null 安全（内部 `raw && typeof raw === "object" ? raw : {}`）。
+import { normalizeRollout } from './rollout.js'
+import { effectiveSettings } from './policy.js'
 import { normalizeSettings, describeSettings, writeSettings, SETTINGS_KEYS, parseJsonText } from './settings.js'
 
 export const API_PREFIX = '/po06/api'
@@ -266,7 +271,7 @@ function readTextSafe(path) {
  *                         宿主就不知道政策变了。返回值原样带回给界面（诊断用）。
  * @param opts.now         注入时钟（测试用）
  */
-export function createControlHandler({ home, stateDir, ledgerPath, version = null, resolveEfforts = null, sessionModel = null, listModels = async () => ({ models: [], problems: [] }), listTools = null, toolState = null, now = () => Date.now(), help = {}, interpret = null, setPacket = null, progress = null, rollbackPacket = null, getPacket = null, onSettingsWritten = null, gateSummary = null } = {}) {
+export function createControlHandler({ home, stateDir, ledgerPath, version = null, resolveEfforts = null, sessionModel = null, listModels = async () => ({ models: [], problems: [] }), listTools = null, toolState = null, now = () => Date.now(), help = {}, interpret = null, setPacket = null, progress = null, advisorProgress = null, rollbackPacket = null, getPacket = null, onSettingsWritten = null, gateSummary = null, registeredCommands = null, advisorStageStatus = null } = {}) {
   const H = String(home)
   const cfgPath = join(H, 'po06.json')
   const ledger = ledgerPath || join(H, 'po06-wire.jsonl')
@@ -347,28 +352,47 @@ export function createControlHandler({ home, stateDir, ledgerPath, version = nul
           register: toolState ? { last: toolState.last, seen: toolState.seen } : null,
         })
       }
+      // 界面取证（临时）：记录浏览器实际发来的读写，用于判定"点击没反应"卡在哪一环。
+      // 写到独立文件而不是 wire 台账：形状简单、可直接读、不影响既有台账消费方。
+      const traceApi = (rec) => {
+        try {
+          const p = join(H, 'po06-api-trace.jsonl')
+          let cur = ''
+          try { cur = readFileSync(p, 'utf8') } catch { cur = '' }
+          const lines = cur.split('\n').filter(Boolean)
+          const keep = lines.slice(-400).concat(JSON.stringify({ at: new Date().toISOString(), ...rec }))
+          writeFileSync(p, keep.join('\n') + '\n', 'utf8')
+        } catch { /* best effort */ }
+      }
       if (method === 'GET' && path === API_PREFIX + '/status') {
         const raw = readJsonSafe(cfgPath)
         const intent = parseEnableIntent(readTextSafe(cfgPath))
         const norm = normalizeSettings(raw || {})
+        // 会话级档位（0.7.7）：带上 ?session= 时，额外给出**该会话实际生效**的档位与描述。
+        // 全局的 settings/described 原样保留（它们是"这台机器的默认"），
+        // 界面据此显示当前会话的值、并在改档时只写该会话的覆盖。
+        const qsid = String(query.get('session') || '').trim()
+        const sessEff = qsid ? effectiveSettings(raw || {}, qsid) : null
+        // ⚠ 档位必须用**推导值**（describeSettings 内部走 tierOf），不能用合并对象里的 `tier` 字段：
+        //   那个字段只是覆盖里写进来的别名原样，不代表实际生效的档位。
+        //   实测过这个坑：覆盖写了 tier=heavy 而三项没展开时，界面会显示"重度"，行为却是 standard。
+        const sessDesc = sessEff ? describeSettings(sessEff) : null
+        traceApi({ k: 'status', sid: qsid || null, tier: sessDesc ? sessDesc.tier : null, ua: String(req.headers['user-agent'] || '').slice(0, 40) })
         const prompt = resolvePrompt({ home: H })
-        // fork：rollout 在"未配置"时是 **null**（＝没表态，而非用户写的 off），
-        // 且判定默认值已翻转为「未配置即启用」。这里全部空安全 + 文案对齐 fork 语义，
-        // 否则未配置时读 .mode 会抛（真机实测：插件在 /status 上崩）。
-        const rollout = intent.rollout
-        const settingsOff = Boolean(intent.settings) && intent.settings.enabled === false
         return send(200, {
           ok: true, version, home: H,
-          enabled: !settingsOff,
-          rollout: rollout ? rollout.mode : null,
+          advisorCollaboration: typeof advisorStageStatus==='function' ? (()=>{try{return advisorStageStatus(qsid || null)}catch{return {ok:false,reason:'stage-status-unavailable'}}})() : null,
+          enabled: intent.settings.enabled === true,
+          // fork：走 normalizeRollout 以容忍 rollout 为 null（见文件头 import 的说明）
+          rollout: normalizeRollout(intent.rollout).mode,
           // 诊断：`rollout` 是**回落来的 off**（配置里没写/写错）还是**用户显式写的 off**——
           // 这两种在界面上必须能分开，否则"什么都没发生"永远无从归因（用户 2026-09-22 要求查清
           // `gate:rollout-off`）。见 rollout.js 的 normalizeRollout/decideEnabled。
-          rolloutDefaulted: Boolean(rollout && rollout.defaulted === true),
-          rolloutNote: rollout && rollout.defaulted === true
-            ? (settingsOff
-              ? 'dsh-launcher fork：设置里显式 enabled:false ⇒ 保持关闭'
-              : 'dsh-launcher fork：配置里没有（或写错了）rollout，且未被显式关闭 ⇒ 按 "all" 处理（默认启用）')
+          rolloutDefaulted: normalizeRollout(intent.rollout).defaulted === true,
+          rolloutNote: normalizeRollout(intent.rollout).defaulted === true
+            ? (intent.settings.enabled === true
+              ? '配置里没有（或写错了）rollout：已按 "all" 处理（因为你显式写了 enabled:true）'
+              : '配置里没有（或写错了）rollout，且没有显式 enabled:true ⇒ 保守不启用')
             : null,
           // ⚠ 上面那个 `enabled` 是**配置里的意图**，不是**闸门实际放行的结论**。两者可能不同
           //   （例：配置写了 enabled:true，但 rollout 显式 off / 旧插件仍在装配 ⇒ 闸门不放行）。
@@ -376,6 +400,39 @@ export function createControlHandler({ home, stateDir, ledgerPath, version = nul
           gate: typeof gateSummary === 'function' ? (() => { try { return gateSummary() } catch { return null } })() : null,
           ours: intent.ours, reason: intent.reason || null,
           settings: norm.settings, described: describeSettings(norm.settings),
+          // 斜杠命令允许列表（0.8）：只有**配置里列了、且当前真的已注册**的命令才允许被拦截。
+          // 问不到命令表时**退回名单本身**（verified:false 如实标注）——否则名单会被静默架空，
+          // 用户看到的是“配了也不生效”（2026-10-01 真机就是这个现象）。
+          // 已经问到时严格精确：没注册的命令绝不进 active。
+          // 真实失败模式汇总（每一条都如实回传）：
+          //   no-allowlist        没配名单（默认，全部交还宿主）
+          //   session-required    没带 ?session=
+          //   unverified:<原因>    查不到命令表，已按名单兜底并标注未核对
+          //   agents-service-unavailable / no-live-agent / commands-list-threw:*
+          slashReview: (() => {
+            const want = Array.isArray(norm.settings.slashReview) ? norm.settings.slashReview : []
+            if (!want.length) return { names: [], active: [], reason: 'no-allowlist' }
+            if (!qsid) return { names: want, active: [], reason: 'session-required' }
+            let reg = null
+            try { reg = typeof registeredCommands === 'function' ? registeredCommands(qsid) : { ok: false, reason: 'resolver-missing', names: [] } }
+            catch (e) { reg = { ok: false, reason: 'threw:' + String((e && e.message) || e), names: [] } }
+            const have = new Set((reg && Array.isArray(reg.names) ? reg.names : []).map((n) => String(n).toLowerCase()))
+            // ① 问到了命令表 ⇒ 精确匹配（没注册的绝不拦）。
+            if (reg && reg.ok === true) {
+              return { names: want, active: want.filter((n) => have.has(n)), verified: true,
+                via: (reg.diagnostics && reg.diagnostics.via) || null, reason: null, diagnostics: reg.diagnostics || null }
+            }
+            // ② 问不到（命令表或 agent 拿不到）⇒ 退回名单：列了就是用户要我拦的。
+            //    标记 verified:false + 具体原因，既不假装核对过，也不静默失效。
+            return { names: want, active: want.slice(), verified: false, via: null,
+              reason: 'unverified:' + String((reg && reg.reason) || 'unavailable'), diagnostics: (reg && reg.diagnostics) || null }
+          })(),
+          // 会话生效值（无 ?session= 时为 null）：界面用它显示"本会话的档位"
+          sessionId: qsid || null,
+          sessionEffective: sessEff
+            ? { tier: sessDesc.tier, assist: sessEff.assist, detail: sessEff.detail, budget: sessEff.budget, framing: sessEff.framing || 'neutral' }
+            : null,
+          sessionDescribed: sessDesc,
           // ⚠ 启动闸门自己的字段（enabled / rollout / settingsVersion）**不是**"不认识的字段"，
           // 只是不属于**设置**白名单。真实宿主实测（EV-0141）时它们被当成 problems 报给界面，
           // 界面会显示"配置里有 3 处不规范"——**假警报**，用户会以为自己把配置写坏了。
@@ -421,6 +478,11 @@ export function createControlHandler({ home, stateDir, ledgerPath, version = nul
       if (method === 'POST' && path === API_PREFIX + '/settings') {
         const body = await readBody(req)
         if (!body.ok) return send(400, { ok: false, reason: body.reason })
+        try {
+          const v = body.value || {}
+          traceApi({ k: 'settings', keys: Object.keys(v), by: v.bySession ? Object.keys(v.bySession) : null,
+            tier: v.bySession ? Object.values(v.bySession).map((x) => x && x.tier).filter(Boolean) : null })
+        } catch { /* best effort */ }
         const r = writeSettings({ path: cfgPath, patch: body.value || {}, now: now() })
         // 写盘成功 ⇒ 立刻通知宿主按**新政策**处理（作废政策缓存 / 清掉不该再注入的包 / 作废启用闸门）。
         // 钩子抛错**不得**把这次成功的写入回报成失败（文件已经写进去了，谎报失败更糟）：如实带上 hookError。
@@ -513,6 +575,14 @@ export function createControlHandler({ home, stateDir, ledgerPath, version = nul
         const r = await setPacket({ sessionId: String(v.sessionId || ''), text: String(v.text == null ? '' : v.text) })
         const out = (r && typeof r === 'object') ? r : { ok: false, reason: 'bad-hook-result' }
         return send(out.ok === true ? 200 : 400, { ok: out.ok === true, reason: out.reason || null, chars: typeof out.chars === 'number' ? out.chars : 0 })
+      }
+      if (method === 'GET' && path === API_PREFIX + '/advisor-progress') {
+        const sid = String(query.get('session') || '').trim()
+        const callId = String(query.get('call') || '').trim()
+        const runId = String(query.get('run') || '').trim()
+        if (!sid || (!callId && !runId)) return send(400, { ok: false, reason: 'session-and-call-required' })
+        const run = typeof advisorProgress === 'function' ? advisorProgress(sid, { callId, runId }) : null
+        return send(200, { ok: true, run })
       }
       if (method === 'GET' && path === API_PREFIX + '/interpret-progress') {
         // P11：让"优化中"那几十秒看得见（阶段 + 流式正文尾部）。**只读、无副作用**；

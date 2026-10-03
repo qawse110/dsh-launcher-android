@@ -6,6 +6,13 @@
 // profile/node_modules）解析不到它们，模块 import 会整体失败，表现是"bash 工具静默消失"。
 // 注册改为**裸 tools.register + 对象根 JSON Schema**（与 po06 自己的 posix 工具同一做法）。
 import { mkdirSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
+import { fileURLToPath } from 'node:url'
+import { dirname, delimiter, resolve } from 'node:path'
+import { performance } from 'node:perf_hooks'
+import { renderBashOutput } from './bash-output.mjs'
+import { beginInvocation, endInvocation, usageNote } from './bash-diagnostics.mjs'
+import { homedir } from 'node:os'
 
 export const name = "@dsh-external/dsh-bash-runtime"
 export const inject = ['tools']
@@ -38,6 +45,31 @@ export function normalizeBashConfig(c) {
 const load = (file) => import(new URL('./' + file, import.meta.url).href)
 
 /**
+ * issue #17：MSYS 的 /tmp 没有任何人负责创建（仓库里它是空目录 ⇒ 进不了 git、也进不了包，
+ * provision 也不建它），于是**非作者机器上每次调用**都往 stderr 打：
+ *   bash.exe: warning: could not find /tmp, please create!
+ * 这不只是噪音：任何断言 stderr 为空的测试/工具都会被弄红（报告者实测 8 个测试全红）。
+ *
+ * ⚠ 必须建在**任何一次 bash 启动之前**——运行时候选探测（probeRuntime）本身就会 spawn bash，
+ *   放在 spawn 前一步是不够的（实测：探测那次仍然把警告打了出来）。
+ * 只作用于**自带运行时根**，不去写别人的 Git/MSYS 安装目录。best effort：建不出来不阻断命令。
+ * 完整性校验只核清单内文件是否存在/哈希相符，不会因为多出 tmp/ 而失败（runtime-layout.verifyRuntime）。
+ */
+export function ensureMsysTmp(runtimeRoot) {
+  try {
+    if (!runtimeRoot) return false
+    mkdirSync(resolve(runtimeRoot, 'tmp'), { recursive: true })
+    return true
+  } catch { return false }
+}
+
+/** 自带运行时的默认位置（`<plugin>/runtime`）。 */
+function defaultBundledRuntimeDir() {
+  return fileURLToPath(new URL('../../runtime', import.meta.url))
+}
+
+
+/**
  * 把调用方给的 timeoutMs 收进 [1, max]；非法值回落缺省。**纯函数**。
  * 这是**安全网**，不是决策者：真实上限已写进工具描述，模型可据此自行判断该用多少。
  */
@@ -52,11 +84,21 @@ function bashRootFor(hostRoot) {
   return p.replace(/^([A-Za-z]):/, (_m, d) => '/' + d.toLowerCase())
 }
 
-export function apply(ctx, config) {
+// Diagnosis helpers are kept separately from execution.
+export { costNote, splitStages, chainFinding, heavyFindings, usageNote } from './bash-diagnostics.mjs'
+
+export function apply(ctx, config, dependencies = {}) {
   config = normalizeBashConfig(config)
+  // issue #17：注册期就先补一次（此后任何探测/调用都不该再为 /tmp 报警告）。
+  ensureMsysTmp(resolve(config.bundledRuntimeDir || defaultBundledRuntimeDir()))
   ctx.effect(() => ctx.tools.register({
     name: 'bash',
-    description: '执行 bash 命令（GNU bash / MSYS2，不是 PowerShell 也不是 cmd）；命令内用 POSIX 路径（盘符写作 /d/...），workdir 用宿主路径（D:/...）；需原样传参用 args 数组（成为 $1…$n，$0=dsh-bash）；非零退出不会自动重试或换后端。',
+    description: '执行 bash 命令（GNU bash / MSYS2，不是 PowerShell 也不是 cmd）；命令内用 POSIX 路径（盘符写作 /d/...），workdir 用宿主路径（D:/...）；需原样传参用 args 数组（成为 $1…$n，$0=dsh-bash）；非零退出不会自动重试或换后端。'
+      // 2026-10-01 修：这里原先写着“跑 Windows 原生程序时 pwsh 通常更快更稳”——那是我自己写的
+      // **未实测断言**，还把位置放错了（塞在 timeoutMs 参数说明里）。结果模型被推离 bash：
+      // 本会话 pwsh 136 次 / bash 2 次。现在移到工具描述本体，按**命令性质**给判据，
+      // 并把用户口径的经验如实标成经验（不当作实测事实）。
+      + '【选哪个 shell】按命令性质选，不要按习惯：需要 POSIX 管线（grep/sed/awk）、glob、多条命令串联、重定向或 bash 语义时用本工具；需要 PowerShell 对象语义（Get-ChildItem、Select-Object、$env:）时才用 pwsh。本机经验（用户口径）：两者都能做时 bash 通常更稳、更可预期，优先 bash；不要为同一条命令来回换 shell。',
     // ⚠ 裸 register 要求**对象根 JSON Schema**：逐属性 required:true 的方言只有 defineTool 的
     // 编译路径才认，裸传会被宿主直接拒（po06 的 posix 就栽过，且失败不冒泡 ⇒ 工具静默缺席）。
     parameters: {
@@ -77,10 +119,14 @@ export function apply(ctx, config) {
       // 比替它决定更可靠（用户 2026-09-25："模型本身应该也要有自主思考来调整的能力"）。
       timeoutMs: {
         type: 'number',
-        description: '毫秒截止时间；到期终止**整个进程树**并回收。缺省 ' + config.timeoutMs + 'ms，'
+        description: '毫秒截止时间（含准备与探测）；到期请求终止受管进程并等待收尾，无法证明树清空时明确标注。缺省 ' + config.timeoutMs + 'ms，'
           + '上限 ' + config.maxTimeoutMs + 'ms（超过会被钳制到上限）。判断依据：本地快命令（ls/cat/grep/printf）用缺省；'
           + '编译或测试可适当提高并**拆成多步**；网络操作（npm/pip/curl/git clone）耗时不可预测，**单独跑并确认能通**，不要并入长链。'
-          + '若本工具是在 run_code 等外层程序里被调用，外层的 deadline 必须**大于**这里的 timeoutMs，否则外层会先终止整个程序。',
+          + '若本工具是在 run_code 等外层程序里被调用，外层的 deadline 必须**大于**这里的 timeoutMs，否则外层会先终止整个程序。'
+          + '**一条命令只干一件事**：把组装、构建、取图这类阶段分开调用，别串成一条长链——'
+          + '串链一旦某步卡住，就是一次赔进去几分钟、还拿不到可比对的信息。'
+          + '**不要吞输出**（>/dev/null 这类）：命令的价值就是它的输出。'
+          + '跑编译/测试/构建这类耗时命令时，按最慢的单步给值，不要按整条链给。',
       },
       },
     },
@@ -89,116 +135,67 @@ export function apply(ctx, config) {
       render: (_args, value) => [{ type: 'text', text: String(value) }],
     },
     async execute(args, exec) {
-      let gov, jobport, contract, wsmod, provision
+      const started = performance.now()
+      const signal = exec?.signal
+      const cancelled = () => signal?.aborted === true
+      // issue #17：**在加载模块与探测之前**补 tmp——探测本身会 spawn bash，晚一步就会漏出警告。
+      ensureMsysTmp(resolve(config.bundledRuntimeDir || defaultBundledRuntimeDir()))
+      if (cancelled()) return '调用已取消，命令未执行。'
+      let gov, jobport, wsmod, provision
       try {
-        [gov, jobport, contract, wsmod, provision] = await Promise.all([
-          load('process-governance.mjs'), load('pg-jobport.mjs'), load('bash-tool-contract.mjs'), load('workspace-semantics.mjs'), load('runtime-provision.mjs'),
+        [gov, jobport, wsmod, provision] = dependencies.modules || await Promise.all([
+          load('process-governance.mjs'), load('pg-jobport.mjs'), load('workspace-semantics.mjs'), load('runtime-provision.mjs'),
         ])
-      } catch (e) {
-        // 安装损坏时给出可读诊断，而不是把异常抛给宿主
-        return [
-          '【发生了什么】插件运行时模块加载失败，命令未执行。',
-          '【为什么】' + String((e && e.message) || e),
-          '【下一步】1. 重新安装/重打包插件（lib 目录应包含 process-governance.mjs、pg-jobport.mjs、bash-tool-contract.mjs、workspace-semantics.mjs、runtime-provision.mjs、runtime-layout.mjs）。 2. 若为手工放置，确认上述文件齐全后重试。',
-        ].join('\n')
-      }
-      // 自带/指定的运行时必须把它自己的 bin 放进 PATH：
-      // 否则 bash 能启动，但 head/grep/sort 等外部命令全部 command not found（实测 rc=127）。
-      const withRuntimePath = (exePath) => {
-        const sep = exePath.lastIndexOf('\\') >= 0 ? '\\' : '/'
-        const bin = exePath.slice(0, exePath.lastIndexOf(sep))
-        return { ...process.env, PATH: bin + (process.platform === 'win32' ? ';' : ':') + (process.env.PATH || '') }
-      }
+      } catch (error) { return '运行时模块不可用，命令未执行：' + String(error?.message || error) }
+      const session = exec?.agent?.session
+      const root = [session?.header?.cwd, session?.meta?.cwd, exec?.cwd, process.cwd()].find(v => typeof v === 'string' && v)
+      const workspace = wsmod.createWorkspace({ hostRoot: root, bashRoot: bashRootFor(root) })
+      const target = args.workdir ? wsmod.toBashPath(workspace, args.workdir) : { ok: true, hostPath: root }
+      if (!target.ok) return '工作目录不可用：' + target.reason
+      const timeoutMs = clampTimeout(args.timeoutMs, config.timeoutMs, config.maxTimeoutMs)
+      const deadline = AbortSignal.timeout(timeoutMs)
+      const fused = signal ? AbortSignal.any([signal, deadline]) : deadline
       let bashPath = config.bashPath
       if (!bashPath) {
-        // 默认从插件自带目录解析。0.7.1 起本文件位于 <plugin>/lib/bash/index.js
-        // （以前是 <plugin>/lib/index.js），所以要多退一级才到 <plugin>/runtime。
-        const selfBundled = new URL('../../runtime', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1').replaceAll('/', '\\')
-        const resolved = provision.resolveBashRuntime({ env: process.env, platform: process.platform, bundledRuntimeDir: config.bundledRuntimeDir || selfBundled })
-        if (!resolved.ok) return resolved.repair.join('\n')
+        const resolved = await provision.resolveBashRuntime({ env: process.env, platform: process.platform, signal: fused,
+          bundledRuntimeDir: config.bundledRuntimeDir || fileURLToPath(new URL('../../runtime', import.meta.url)) })
+        if (!resolved.ok) return (resolved.repair || [resolved.reason || '运行时不可用']).join('\n')
         bashPath = resolved.path
       }
-      // 工作区根必须取**会话工作区**，而不是宿主进程 cwd：
-      // 实测宿主进程 cwd 通常是 C:\Users\<user>，而会话工作区可能在 D:\...，
-      // 用进程 cwd 会把用户真实工作区判成 OUTSIDE_WORKSPACE。
-      const session = exec && exec.agent && exec.agent.session ? exec.agent.session : null
-      const root = [
-        session && session.header ? session.header.cwd : undefined,
-        session && session.meta ? session.meta.cwd : undefined,
-        exec && exec.cwd,
-        process.cwd(),
-      ].find((v) => typeof v === 'string' && v.length > 0)
-      let workspace
-      try { workspace = wsmod.createWorkspace({ hostRoot: root, bashRoot: bashRootFor(root) }) }
-      catch (e) { return '工作区初始化失败：' + String(e && e.message || e) }
-      const target = args.workdir ? wsmod.toBashPath(workspace, args.workdir) : { ok: true, hostPath: root, bashPath: workspace.bashRoot }
-      if (!target.ok) {
-        return contract.renderToolError({ category: 'unmapped-path', paths: { errno: target.reason, path: args.workdir }, availableMappings: [root + ' → ' + workspace.bashRoot] }).message
-      }
-      let tempDir
+      if (fused.aborted) return '调用已取消或在准备阶段达到截止时间，命令未执行。'
+      const temp = wsmod.tempDirFor(workspace, 'tool-' + randomUUID())
+      mkdirSync(temp.hostPath, { recursive: true })
+      const env = { ...process.env }
+      const pathKey = Object.keys(env).find(key => key.toLowerCase() === 'path')
+      const oldPath = pathKey ? env[pathKey] : ''
+      for (const key of Object.keys(env)) if (key.toLowerCase() === 'path') delete env[key]
+      const bin = dirname(bashPath)
+      env.PATH = (bin === '.' ? '' : bin + delimiter) + oldPath
+      // Preserve MSYS conversion semantics; do not silently rewrite native-program arguments.
+      const prepareMs = performance.now() - started
+      let token = null
       try {
-        tempDir = wsmod.tempDirFor(workspace, 'tool-' + process.pid)
-        mkdirSync(tempDir.hostPath, { recursive: true })
-      } catch (e) { return '临时目录不可用：' + String(e && e.message || e) }
-      const port = jobport.createJobPort({
-        cwd: target.hostPath,
-        makePaths: (n) => ({ stdout: tempDir.hostPath + '/out-' + n + '.bin', stderr: tempDir.hostPath + '/err-' + n + '.bin' }),
-      })
-      let governed
-      try {
-        governed = await gov.runGoverned({
-          command: bashPath,
-          args: ['-c', args.command, 'dsh-bash', ...(args.args || [])],
-          cwd: target.hostPath,
-          env: withRuntimePath(bashPath),
-          timeoutMs: clampTimeout(args.timeoutMs, config.timeoutMs, config.maxTimeoutMs),
-          stdoutMaxBytes: 65536,
-          exitPlatform: 'win32',
-        }, port)
-      } catch (e) {
-        const m = String(e && e.message || e)
-        if (m.includes('RUNTIME_INTEGRITY_FAILED')) {
-          return contract.renderToolError({ category: 'integrity', integrity: { errno: 'RUNTIME_INTEGRITY_FAILED', problems: e.problems || [], repair: e.repair || [] } }).message
-        }
-        return contract.renderToolError({ category: 'spawn-error', spawnError: m }).message
-      }
-      const marker = (code, signal) => (typeof code === 'number' ? '[exit code: ' + code + ']' : signal ? '[killed by signal: ' + signal + ']' : '[exit code: 1]')
-      const bad = governed.reason !== 'exit' || governed.outcome.exitCode !== 0 || governed.streams.stderr.truncated
-      if (bad) {
-        const rendered = contract.renderToolError({
-          category: governed.reason === 'exit' ? 'exit' : governed.reason,
-          exitCode: governed.outcome.exitCode,
-          signal: governed.outcome.signal,
-          stderr: governed.streams.stderr.text,
-          truncated: governed.streams.stdout.truncated,
-          spillPath: governed.streams.stdout.spillPath,
-          timeoutMs: governed.timeoutMs,
-          maxTimeoutMs: config.maxTimeoutMs,
-          spawnError: governed.spawnError || undefined,
-        }).message
-        // 保留三段式可执行诊断，同时在**末尾**补上客户端可解析的状态标记
-        return rendered + '\n' + marker(governed.outcome.exitCode, governed.outcome.signal)
-      }
-      const LIMIT = 16000
-      const text = governed.streams.stdout.text
-      const tooLong = governed.streams.stdout.truncated || text.length > LIMIT
-      const parts = []
-      // 截断提示必须前置：否则模型先被海量输出淹没，看不到"完整输出在哪"
-      if (tooLong) {
-        // spill 路径必须转成 bash 可见形式，否则"用 grep/head 直接读该文件"在 bash 里不可用
-        let spillShown = governed.streams.stdout.spillPath || ''
-        if (spillShown) {
-          const mapped = wsmod.toBashPath(workspace, spillShown)
-          spillShown = mapped.ok ? mapped.bashPath : spillShown.replaceAll('\\', '/')
-        }
-        parts.push('[输出过长：仅显示' + (governed.streams.stdout.truncated ? '截取后的' : '前') + LIMIT + '字符' + (spillShown ? '；完整输出在 ' + spillShown : '') + '。需要细节时用 grep/head 直接读该文件]')
-      }
-      parts.push(tooLong ? text.slice(-LIMIT) : text)
-      if (governed.streams.stderr.text.length > 0) parts.push('[stderr] ' + governed.streams.stderr.text.slice(0, 4000))
-      // 客户端 dsh-client-ui-tool 的 parseExitStatus 需要文本以 "\n[exit code: N]" 结尾
-      // 才能渲染出 shell 卡片的退出状态；格式不符会退化为通用渲染。
-      parts.push('[exit code: 0]')
-      return parts.join('\n')
+        token = beginInvocation({ home: process.env.DSH_HOME || homedir() + '/.dsh', sessionId: session?.id || root, command: args.command })
+        const port = jobport.createJobPort({ cwd: target.hostPath,
+          makePaths: n => ({ stdout: temp.hostPath + '/out-' + n + '.bin', stderr: temp.hostPath + '/err-' + n + '.bin' }) })
+        const governed = await gov.runGoverned({ command: bashPath, args: ['-c', args.command, 'dsh-bash', ...(args.args || [])],
+          cwd: target.hostPath, env, signal: fused,
+          timeoutMs: Math.max(1, timeoutMs - Math.ceil(performance.now() - started)), stdoutMaxBytes: 65536,
+          exitPlatform: process.platform }, port)
+        const result = deadline.aborted && !signal?.aborted && governed.reason === 'cancelled'
+          ? { ...governed, reason: 'timeout' } : governed
+        if (result.reason === 'spawn-error') provision.clearBashRuntimeCache?.()
+        const note = usageNote({ ms: performance.now() - started, command: args.command,
+          outLen: result.streams.stdout.text.length + result.streams.stderr.text.length,
+          failed: result.reason !== 'exit' || result.outcome.exitCode !== 0,
+          timedOut: result.reason === 'timeout', cancelled: result.reason === 'cancelled',
+          stdoutBytes: result.streams.stdout.totalBytes, stderrBytes: result.streams.stderr.totalBytes })
+        return renderBashOutput(result, { command: args.command, elapsedMs: performance.now() - started, prepareMs,
+          note: [token?.note, note].filter(Boolean).join('\n'),
+          mapPath: p => { const mapped = wsmod.toBashPath(workspace, p); return mapped.ok ? mapped.bashPath : p } })
+      } catch (error) {
+        return '【发生了什么】执行工具异常：' + String(error?.message || error) + '\n[已结束本次调用记录；不把它误报成上次崩溃]'
+      } finally { if (token) endInvocation(token) }
     },
   }), '@dsh-external/dsh-bash-runtime: bash tool')
 }

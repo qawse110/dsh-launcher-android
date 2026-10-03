@@ -9,13 +9,15 @@
  */
 import { attributionHeaders, CONTEXT_WINDOW_EXCEEDED_CODE, isContextWindowExceededError, LlmAdapter, LlmError, ReasoningEffortId, } from '@deepseek-ai/dsh-llm';
 import { providerCatalogVisible } from './account-pool.js';
-import { settingsNamespaceFor } from './settings-compat.js';
-import { isRateLimited, parseRateLimitError } from './llm-adapter.js';
+import { RemoteCatalogGate } from './remote-catalog-gate.js';
+import { RATE_LIMIT_FALLBACK_MS, isRateLimited, parseRateLimitError } from './llm-adapter.js';
 import { ToolCallId } from '@deepseek-ai/dsh-llm';
 import { HTTP_HEADER_DOMAIN, HTTP_HEADER_PRODUCT, HTTP_HEADER_PRODUCT_CODE, credentialExpiresAtMs, formatCreditsRate, } from './buddy.js';
 import { CODEBUDDY, resolveUserAgent } from './product.js';
 import { normalizeHarnessMessages } from './message-shape.js';
-import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js';
+import { projectRequestImage } from './image-budget.js';
+import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js';
+import { registerAdapterIdempotent, } from './llm-register-compat.js';
 /**
  * CodeBuddy（中国版）的 chat completions 基址。
  *
@@ -309,6 +311,154 @@ function errorMessage(error) {
         return 'unknown error';
     }
 }
+/**
+ * 腾讯侧**安全策略拦截**（业务码 11140）判定。
+ *
+ * ⚠️ 这类拒绝**也回 HTTP 403**，报文实测（2026-09-27，workbuddy /
+ * deepseek-v4.1-flash）：
+ * ```json
+ * {"code":11140,"msg":"request illegal","requestId":"…",
+ *  "displayMsg":{"en":"The content did not pass the safety review. …",
+ *                "zh":"内容未通过安全审核，请调整后重试。"}}
+ * ```
+ * 同一报文在 CodeArts 侧还会以 HTTP 200 + SSE 内嵌错误帧的形式出现。
+ *
+ * ## ⚠️ 服务端称它「内容」问题，实测却是**账号级**的（2026-09-27 修正）
+ *
+ * 逐账号对照实测：**同一份请求体**（`system` + 两个字）发往池里 7 个账号，
+ * 结果 2 个 200、4 个 403/11140、1 个 429 —— 拦截**按账号生效**，与内容无关。
+ * 用户侧现象吻合：连「你好」都被拦，且换新会话照样被拦（排除上下文累积）。
+ *
+ * 因此**不能**把它当成「内容问题，与账号无关」而拒绝换号（早期实现的错误结论）：
+ * 那样池里有可用账号也永远用不上，且提示用户「请调整内容」——指错方向。
+ * 正确处理与 401/403 认证失败一致：**换号**，全部试完才报错。
+ *
+ * 判据用三个独立信号（任一命中即可）：业务码、`msg` 措辞、`displayMsg` 文案。
+ * 只看状态码无法区分 —— 403 同时覆盖「真认证失败 / 额度 / 权限 / 安全策略」。
+ */
+function isContentRejection(body) {
+    if (body.length === 0)
+        return false;
+    return /"code"\s*:\s*11140/.test(body)
+        || /request illegal/i.test(body)
+        || /安全审核|safety review/i.test(body);
+}
+/**
+ * 安全策略拦截的**账号冷却时长**（30 分钟）。
+ *
+ * ## 为什么必须自己定一个时长
+ *
+ * 服务端**不给解除时间**：11140 的报文里只有 `code` / `msg` / `displayMsg`，
+ * 没有任何 reset 字段。因此不能走 `parseRateLimitError` —— 它解析不到时间时
+ * 兜底成 1 小时（与限流的真实语义挂钩），把它当作「11140 的时长」属于偷换概念。
+ * 这里独立命名一个常量，把「策略拦截的冷却」与「限流的等待」在语义上分开。
+ *
+ * ## 为什么取 30 分钟
+ *
+ * - 太短（如 1 分钟）挡不住一个 agent 轮次里的连续重发 —— 那正是用户报障的
+ *   「每次都拿最先选中的坏账号去撞」；
+ * - 太长则把「其实已恢复」的账号白白锁死（服务端策略可能随时间/额度状态解除）；
+ * - 30 分钟也限制了误伤窗口：标记**只随时间到期失效**（`getAvailableAccount`
+ *   的判据是 `Date.now() >= resetAt`，见 `src/account-pool.ts:578`），
+ *   所以时长直接等于「这个账号在该模型上被藏起来多久」。
+ *   ⚠️ 别指望 `sweepExpiredRateLimits` 来清 —— 它在生产代码里**没有任何调用方**
+ *   （只有 `account-pool.spec.ts` 用），到期完全靠上面那个时间比较。
+ *
+ * ⚠️ 与 cline / lobsterai / trae 的 `*_RATE_LIMIT_FALLBACK_MS`（均 1 小时）**不同源**：
+ * 那三个是「解析不到限流重置时间」的兜底，本常量是「服务端压根不给时间」的策略拦截冷却。
+ * 别把它们合并成一个常量 —— 语义不同，将来调其中一个不该动另一个。
+ *
+ * ⚠️ UI 副作用（已知取舍）：复用的是 `modelRateLimits`，账号卡片因此显示
+ * 「限额重置 · <模型> · 30 分钟后」（`plugin-src/client/jet-hub.js:412-418`），
+ * 而不是「安全策略拦截」—— 该结构只有一个 `模型→时刻` 映射，不带原因字段。
+ * 换来的是现成的三条解禁路径都能用它：时间到期、Jet Hub「重置」按钮
+ * （`clearModelRateLimits`）、「重测」（`account-probe.ts` 真发一条最小消息，
+ * 通过才清标记）。
+ */
+const BUDDY_POLICY_BLOCK_COOLDOWN_MS = 30 * 60_000;
+/**
+ * 安全策略拦截的错误。
+ *
+ * ## 错误码：`PERMISSION_DENIED`，**绝不能**取 `AUTH`
+ *
+ * 早期实现先取 `INVALID_REQUEST`（把账号级拦截说成「你的请求有问题」，指错方向），
+ * !15 改成了 `AUTH` —— 而 `AUTH` 同样是错的，且错得更彻底：**它会吞掉整条 message**。
+ *
+ * DSH 聊天 UI 的判据（实测于安装包 `dsh-client-ui-chat/lib/client.js:1229-1234`）：
+ * ```js
+ * if (code === "QUOTA" || code === "ACCOUNT_QUOTA") return t("message.failure.quota");
+ * return code === "AUTH" ? t("message.failure.auth") : message;
+ * ```
+ * 即 `AUTH` 会把 message 整个替换成固定文案「API 密钥无效」（`displayFailure()`
+ * 那里甚至强制 `message: ""`），**本函数精心写的中文说明一个字都到不了用户眼前**。
+ * 这与 !16 描述里抱怨的「UI 把用户引向检查密钥，而 7 个 token 实测全部有效」
+ * 是同一个来源 —— 而除 `AUTH` / `QUOTA` / `ACCOUNT_QUOTA` 外的码**原样透传 message**，
+ * 所以换码之后 !15 的文案才第一次真正生效。
+ *
+ * ⚠️ 也不能取 `QUOTA` / `ACCOUNT_QUOTA`：除文案错位（「额度已用尽」）外，
+ * UI 还会为这两个码额外弹全局额度 Toast。
+ *
+ * 取 `PERMISSION_DENIED` 与本仓库既有惯例一致 —— `cline-adapter.ts` 的地域限制
+ * 分支就用的这个码，并配有专门用例断言「错误码不是 AUTH」（`cline-adapter.spec.ts:479`）。
+ * 它同时**不在** harness 的 `DEFAULT_RETRYABLE_CODES`
+ * （`EMPTY_RESPONSE / RATE_LIMIT / SERVER / TIMEOUT / TRANSPORT`）里：
+ * 「这个账号被策略拦了」是确定性结论，交给 harness 白退避 5 次毫无意义 ——
+ * 出路是换号（由本适配器的换号循环负责），不是重试同一个账号。
+ */
+function contentRejectionError(productId, status, body, rotated) {
+    // 两条通道的如实描述不同：HTTP 路径试完了全部候选，流内路径只撞到当前账号
+    // （那里不重发，避免「已吐了一半再重放」的重复计费与重复执行工具风险）。
+    const scope = rotated
+        ? `全部账号均被服务端安全策略拦截（HTTP ${status}，已逐个换号重试）`
+        : `当前账号被服务端安全策略拦截（HTTP ${status}，流内错误帧下发）`;
+    return new LlmError(`${productId}: ${scope}。该拦截按账号生效（同一请求在其他账号可正常返回），`
+        + `请在 Jet Hub 停用或更换被拦账号：${errorDetail(body)}`, 'PERMISSION_DENIED', { status });
+}
+/**
+ * 纯函数：由「现在」算出策略拦截冷却的到期时刻。
+ *
+ * 单测靠它锁死时长（不必等真实时间流逝），也与 {@link markPolicyBlockedAccount}
+ * 分开，避免为了验证一个数字而去 mock 整个账号池。
+ */
+export function policyBlockResetAtMs(nowMs) {
+    return nowMs + BUDDY_POLICY_BLOCK_COOLDOWN_MS;
+}
+/**
+ * 把被安全策略拦截的账号在**该模型**上冷却一段时间。
+ *
+ * ## 为什么必须标记（真实缺陷，2026-09-28）
+ *
+ * !15 / !16 之后「有可用账号就一定能用上」已经成立，但**每轮都要重撞坏账号**：
+ * 候选顺序是用户在 Jet Hub 拖拽定的（`getAvailableAccount` 不再按重置时间重排），
+ * 被拦账号若排在前面，每次请求都要先把那几个坏账号各发一遍才轮到可用账号 ——
+ * 白烧额度、白等往返，且每轮都一样。实测那个池是「前 4 个被 11140 拦、后 3 个可用」，
+ * 于是每次请求固定多发 4 次失败。
+ *
+ * ## 为什么复用 `modelRateLimits`
+ *
+ * 它是账号池里**唯一**的「账号 × 模型暂时不可用」载体（`ProviderAccountEntry`
+ * 只有 `模型id → 重置时间戳` 这一个映射，没有 reason / 级别字段），复用它的收益：
+ * ① `getAvailableAccount` 的过滤天然生效（`account-pool.ts:577-578`）；
+ * ② UI 已有徽章与「重测 / 重置」两条人工解禁路径（`account-probe.ts`）。
+ * 代价是徽章文案显示为「限额重置」而非「安全策略拦截」—— 已知取舍，见常量注释。
+ *
+ * **只标该模型**，与 qoder 额度那条（`qoder-adapter.ts` 的 `switchAccountOnQuota`）
+ * 同口径：实测只证明「同一模型下按账号生效」，没有跨模型证据，标全部模型会误伤
+ * 本可用的组合。
+ *
+ * ⚠️ 标记失败**只记日志、不上抛**（与 `src/expiry-sync.ts` 的回写惯例一致）：
+ * 本次请求的准确错误才是主线，写不进索引不该把它顶替成未知故障。
+ */
+async function markPolicyBlockedAccount(pool, productId, accountId, modelId) {
+    if (pool === undefined || accountId.length === 0 || modelId.length === 0)
+        return;
+    try {
+        await pool.updateModelRateLimit(accountId, modelId, policyBlockResetAtMs(Date.now()));
+    }
+    catch (error) {
+        console.warn(`[${productId}] 安全策略拦截的冷却标记写入失败（不影响本次请求）:`, error);
+    }
+}
 /** 从错误体提取可读 detail 文本。 */
 function errorDetail(body) {
     try {
@@ -316,10 +466,24 @@ function errorDetail(body) {
         const error = typeof data.error === 'object' && data.error !== null
             ? data.error
             : undefined;
+        // ⚠️ 腾讯系（buddy / workbuddy）用 `msg` + `displayMsg.{zh,en}` 报错，而标准
+        // `message` 字段**不存在**。早期实现只读 `error.*` / `data.message`，于是
+        // 全部落空、退化成「返回整段 JSON 原文」——实测把 291 字符的原始报文糊在
+        // 错误提示里，而服务端早已备好中文说明 `displayMsg.zh`，被白白埋掉。
+        const display = typeof data.displayMsg === 'object' && data.displayMsg !== null
+            ? data.displayMsg
+            : undefined;
+        const localized = typeof display?.zh === 'string'
+            ? display.zh
+            : typeof display?.en === 'string' ? display.en : undefined;
         const parts = [
+            // 本地化文案最可读，排在最前。
+            localized,
             typeof error?.code === 'string' ? error.code : undefined,
             typeof error?.type === 'string' ? error.type : undefined,
             typeof error?.message === 'string' ? error.message : undefined,
+            // 腾讯系用 `msg` 而非 `message`。
+            typeof data.msg === 'string' ? data.msg : undefined,
             typeof data.message === 'string' ? data.message : undefined,
         ].filter((value) => value !== undefined);
         if (parts.length > 0)
@@ -356,6 +520,33 @@ function errorDetail(body) {
  * 字样），而完整 body 因含 `extError.code = context_length_exceeded` 能稳定命中。
  * 判定看完整报文、展示用归一化文本，两者职责不同。
  */
+/**
+ * 腾讯网关「请求过大」的另一种措辞：`prompt is too long: 100001 tokens > 100000 maximum`。
+ *
+ * ⚠️ harness 的 `isContextWindowExceededError` **认不出这句话**（实测其五个分支
+ * 都要求出现 `context` / `for this model` / `maximum context` 之类字样，而这句
+ * 一个都没有）。报文若同时带 `extError.code = context_length_exceeded` 还能靠
+ * 结构化那条命中；**只带 `code`/`msg`/`displayMsg`** 时就漏判。
+ * 实测四种报文形态：带 extError ✅ 命中；仅 msg / 仅 msg+displayMsg / 拼给用户的
+ * 整行 ❌ 全部漏判 —— 这正是 issue !IKITT9 里「逐字相同的错误一会儿
+ * CONTEXT_WINDOW_EXCEEDED、一会儿 INVALID_REQUEST」的成因。
+ *
+ * ⚠️ 判据必须**同时**要求「prompt is too long」与「N tokens > M」两个特征：
+ * 只认前者的宽泛措辞会把别的内容类 400 误判成溢出。
+ */
+const GATEWAY_PROMPT_TOO_LONG = /\bprompt\s+is\s+too\s+long\b[\s\S]{0,40}?\b\d[\d,]*\s+tokens?\s*>/i;
+/**
+ * 漏判为什么必须修（后果是**不对称**的）：
+ *
+ * - `INVALID_REQUEST` **不在** harness 的 `DEFAULT_RETRYABLE_CODES`
+ *   （`[EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT]`）→ 不重试；
+ * - 更关键的是它**不触发溢出压缩**：`dsh-compaction-basic` 的 request-error
+ *   listener 第一行就是 `if (failure.code !== CONTEXT_WINDOW_EXCEEDED_CODE) return next()`
+ *   → 连「试一次压缩」的机会都没有，用户直接看到裸错误、会话从此每轮报废。
+ *
+ * 归成溢出的最坏结果只是一次无效的压缩尝试；归错成 INVALID_REQUEST 的代价是
+ * 整个会话不可恢复。方向因此取「宁可多判一次溢出」。
+ */
 function httpErrorCode(status, body) {
     if (status === 401 || status === 403)
         return 'AUTH';
@@ -363,8 +554,10 @@ function httpErrorCode(status, body) {
         return 'RATE_LIMIT';
     if (status === 400) {
         // 先判上下文超限，再退回通用 INVALID_REQUEST。
-        if (isContextWindowExceededError(body))
+        // 两条判据：harness 的通用分类器 + 本仓库补的网关措辞（见上）。
+        if (isContextWindowExceededError(body) || GATEWAY_PROMPT_TOO_LONG.test(body)) {
             return CONTEXT_WINDOW_EXCEEDED_CODE;
+        }
         return 'INVALID_REQUEST';
     }
     if (status >= 500)
@@ -491,6 +684,11 @@ export class BuddyAdapter extends LlmAdapter {
     sessionId;
     /** 动态模型缓存（首次 listModels 成功后填充）。 */
     remoteModels;
+    /**
+     * 目录加载闸门：并发去重 + 失败/空结果冷却。
+     * 依据见 `src/remote-catalog-gate.ts`（首屏「加载模型巨长」的实测归因）。
+     */
+    catalogGate = new RemoteCatalogGate();
     /** 远端下发的模型元数据（id → 能力），listModels/resolveModel/stream 共用。 */
     remoteMeta = new Map();
     /** 远端下发的模型上下文窗口（/v3/config data.models[].maxInputTokens）。 */
@@ -514,6 +712,52 @@ export class BuddyAdapter extends LlmAdapter {
         this.productFallbackContextWindows = new Map(fallback
             .filter((model) => model.contextWindow !== undefined)
             .map((model) => [model.id, model.contextWindow]));
+    }
+    /**
+     * 该模型此刻是否**免费**（消耗 0 积分）。
+     *
+     * ## 为什么需要它
+     *
+     * `pickBuddyCredential`（`src/index.ts`）只问「锁没锁 + 有没有临期积分」，
+     * 从不问「这个模型要不要钱」。于是免费模型也会被「锁定永久积分 + 无临期积分」
+     * 这道门拦下，报出「没有可用账号……已锁定永久积分，而所有账号的『N 天内到期』
+     * 积分都已用尽」，而它**一分积分都不需要** —— 用户看到的是
+     * 「账号明明有余额却失败」的矛盾错误（真实报障）。
+     *
+     * 免费模型既不消耗临时积分也不消耗永久积分，故它与「锁定」要保护的
+     * 目标（别把永久积分烧掉）无关，不该受该门约束。
+     *
+     * ## 判据（任一成立即免费，与展示层口径一致）
+     *
+     * 1. `creditsRate === 'x0'` —— 服务端 `credits: "0x"` / `"x0"`；
+     * 2. `discountedCreditsRate === 'x0'` —— 促销价打到 0；
+     * 3. 两者 === `'免费'` —— 促销 `factor: 0` 时 `parsePromotions` 直接写入的
+     *    **中文串**（不是 `x0`，这条最容易漏，见 `src/buddy.ts` 的 `rate = '免费'`）。
+     *
+     * ⚠️ **只在确定免费时返回 true**：字段缺失、解析失败、未知模型一律 false。
+     * 把付费模型误判成免费会绕开锁定，**真烧掉永久积分且不可撤回** ——
+     * 因此这里取「保守方向」：宁可让免费模型多走一次余额门，
+     * 也不放过任何无法确认的情形。
+     *
+     * ⚠️ 远端目录是懒加载的（`ensureRemoteModels()`），必须先 await：
+     * 调用点虽在 `prepareCall` 之后（目录通常已就绪），但「直接进会话」等路径
+     * 可能尚未拉取，漏掉这一步补丁会**静默失效**（退回被拦截的行为）。
+     *
+     * @param modelId - 模型 id。
+     * @returns true 仅当能确认该模型消耗 0 积分。
+     */
+    async isFreeModel(modelId) {
+        if (typeof modelId !== 'string' || modelId.length === 0)
+            return false;
+        await this.ensureRemoteModels();
+        // ⚠️ 兜底表（`BuddyFallbackModel`）**没有**倍率字段 —— 它是编译期快照，
+        // 价格会变，故刻意不写死（见 `reconcileWithFallback` 的说明）。
+        // 因此这里只信远端 `remoteMeta`；查不到即视为「无法确认免费」。
+        const meta = this.remoteMeta.get(modelId);
+        if (meta === undefined)
+            return false;
+        const isZeroRate = (rate) => rate === 'x0' || rate === '免费';
+        return isZeroRate(meta.creditsRate) || isZeroRate(meta.discountedCreditsRate);
     }
     /**
      * 描述本适配器拥有的 provider 路由。
@@ -541,26 +785,44 @@ export class BuddyAdapter extends LlmAdapter {
      * resolveModel 可能先于 listModels 被调用（如直接进入会话），此时同样
      * 触发一次远端拉取，保证 /v3/config 的 maxInputTokens 能生效。
      */
+    /**
+     * 按产品的像素预算派生一张图片的**请求版本**。
+     *
+     * 判据与回退都在共享的 `projectRequestImage` 里（raccoon 用的是同一份 ——
+     * 两个适配器各写一遍正是本仓库反复出缺陷的形态）。返回 `undefined`
+     * 表示本次发原图，四种正常情形见该函数的注释。
+     *
+     * ⚠️ 预算取 `product.imagePixelBudget`，未配置时用
+     * `DEFAULT_IMAGE_PIXEL_BUDGET`（640,000 px ≈ 1,037 视觉 token）。
+     */
+    async projectRequestImage(ref) {
+        return projectRequestImage(ref, {
+            readImageRequest: this.options.readImageRequest,
+            pixelBudget: this.product.imagePixelBudget,
+        });
+    }
     async ensureRemoteModels() {
-        if (this.remoteModels !== undefined || this.options.fetchRemoteModels === undefined)
+        const fetchRemote = this.options.fetchRemoteModels;
+        if (this.remoteModels !== undefined || fetchRemote === undefined)
             return;
-        try {
-            const models = await this.options.fetchRemoteModels();
-            if (models.length > 0) {
-                // /v3/config data.models[] 是权威来源（对齐 Rust TUI buddy_context_limits
-                // 注入逻辑）：远端下发的上下文窗口优先于静态 fallback 表；
-                // 能力字段（supportsImages / reasoning.supportedEfforts）同理。
-                const reconciled = this.reconcileWithFallback(models);
-                this.remoteModels = reconciled;
-                this.remoteMeta = new Map(reconciled.map((model) => [model.id, model]));
-                this.remoteContextWindows = new Map(reconciled
-                    .filter((model) => model.contextWindow !== undefined)
-                    .map((model) => [model.id, model.contextWindow]));
-            }
-        }
-        catch {
-            // 远端不可用：回退静态列表
-        }
+        // 闸门：并发去重 + 失败/空结果冷却（详见 src/remote-catalog-gate.ts 的
+        // 实测依据）。Buddy 的目录端点超时上限 60s，失败不冷却会让首屏在
+        // 「每个模型重试一次」的放大下长时间空转。
+        await this.catalogGate.run(async () => {
+            const models = await fetchRemote();
+            if (models.length === 0)
+                return false;
+            // /v3/config data.models[] 是权威来源（对齐 Rust TUI buddy_context_limits
+            // 注入逻辑）：远端下发的上下文窗口优先于静态 fallback 表；
+            // 能力字段（supportsImages / reasoning.supportedEfforts）同理。
+            const reconciled = this.reconcileWithFallback(models);
+            this.remoteModels = reconciled;
+            this.remoteMeta = new Map(reconciled.map((model) => [model.id, model]));
+            this.remoteContextWindows = new Map(reconciled
+                .filter((model) => model.contextWindow !== undefined)
+                .map((model) => [model.id, model.contextWindow]));
+            return true;
+        });
     }
     /**
      * 用产品兜底表校正远端结果。
@@ -812,13 +1074,16 @@ export class BuddyAdapter extends LlmAdapter {
     }
     async *stream(options) {
         // 1. 获取凭据（过期则先静默续期）
-        let credential = await this.options.resolveCredential();
+        let credential = await this.options.resolveCredential(options.model);
         if (credential === undefined || isCredentialExpired(credential)) {
             await this.options.refresh();
-            credential = await this.options.resolveCredential();
+            credential = await this.options.resolveCredential(options.model);
         }
         if (credential === undefined || credential.access_token.length === 0) {
-            throw new LlmError('buddy: no usable credential; log in first with /buddy-login', 'MISSING_CREDENTIAL');
+            throw new LlmError(
+            // ⚠️ 文案里**不能**再提 `/buddy-login` —— 该斜杠命令已随单凭据模式一并移除
+            // （AGENTS.md「不注册任何斜杠命令」），入口在 Jet Hub 设置页。
+            `${this.product.id}: no usable credential; log in from the Jet Hub panel first`, 'MISSING_CREDENTIAL');
         }
         // Track current account for rate limit switching
         let currentAccountId = '';
@@ -854,13 +1119,21 @@ export class BuddyAdapter extends LlmAdapter {
         let imageUrls;
         if (imageRefs.size > 0) {
             if (!this.inputModalitiesFor(options.model).includes('image')) {
-                throw new LlmError(`buddy: model "${options.model}" does not accept image input.`, 'UNSUPPORTED_CONTENT');
+                throw new LlmError(`${this.product.id}: model "${options.model}" does not accept image input.`, 'UNSUPPORTED_CONTENT');
             }
             if (this.options.readImage === undefined) {
-                throw new LlmError('buddy: image input requires the attachment service.', 'UNSUPPORTED_CONTENT');
+                throw new LlmError(`${this.product.id}: image input requires the attachment service.`, 'UNSUPPORTED_CONTENT');
             }
             imageUrls = new Map();
             for (const [id, ref] of imageRefs) {
+                // ⚠️ 先试**请求版本**（按像素预算缩放），拿到就用它；拿不到才发原图。
+                // 这一步是本 issue 的正题：原图直发让 36 张截图顶穿网关的图片 token
+                // 上限（≈100,000），此后每轮都失败且压缩救不回来。
+                const projected = await this.projectRequestImage(ref);
+                if (projected !== undefined) {
+                    imageUrls.set(id, `data:${projected.mediaType};base64,${Buffer.from(projected.data).toString('base64')}`);
+                    continue;
+                }
                 let image;
                 try {
                     image = await this.options.readImage(ref);
@@ -868,14 +1141,14 @@ export class BuddyAdapter extends LlmAdapter {
                 catch (error) {
                     // 读取抛错必须冒泡成明确的 LlmError：早先这里会把异常吞掉，
                     // 最终表现为「图片凭空消失、模型答非所问」，排查成本极高。
-                    throw new LlmError(`buddy: 读取图片附件失败（${id}）：${errorMessage(error)}`, 'UNSUPPORTED_CONTENT', { cause: error });
+                    throw new LlmError(`${this.product.id}: 读取图片附件失败（${id}）：${errorMessage(error)}`, 'UNSUPPORTED_CONTENT', { cause: error });
                 }
                 if (image === undefined) {
                     // 契约要求：读不到字节时报错，绝不静默丢弃整张图。
                     // 返回 undefined 的典型成因是附件服务未就绪或对象已被清理；
                     // 若此处 continue，线上请求会退化成纯文本，用户只看到模型
                     // 「看不到图」而没有任何错误提示。
-                    throw new LlmError(`buddy: 图片附件读取不到内容（${id}）；附件服务可能未就绪，或该对象已不存在。`, 'UNSUPPORTED_CONTENT');
+                    throw new LlmError(`${this.product.id}: 图片附件读取不到内容（${id}）；附件服务可能未就绪，或该对象已不存在。`, 'UNSUPPORTED_CONTENT');
                 }
                 imageUrls.set(id, `data:${image.mediaType};base64,${Buffer.from(image.data).toString('base64')}`);
             }
@@ -953,15 +1226,141 @@ export class BuddyAdapter extends LlmAdapter {
                 ?? (efforts.includes('high') ? 'high' : efforts[0]);
         }
         const body = JSON.stringify(bodyObj);
-        // 4. 发送请求（401/403 时刷新一次凭据后重试）
+        // 4. 发送请求（401/403 时刷新当前账号一次，仍失败则换号重试）
         let response = await this.send(credential, body, options);
         if (!response.ok && (response.status === 401 || response.status === 403)) {
-            await this.options.refresh();
-            credential = await this.options.resolveCredential();
-            if (credential === undefined || credential.access_token.length === 0) {
-                throw new LlmError('buddy: credential expired and refresh failed', 'AUTH', { status: response.status });
+            // ⚠️ 腾讯侧的安全策略拦截（`code:11140`）**也回 HTTP 403**。实测确认它是
+            // **账号级**拦截（同一请求体在池里 7 个账号上「2 通 4 拦 1 限流」），因此
+            // 处理方式与认证失败一致：**刷新 → 换号 → 全部试完才报错**。
+            //
+            // 早期实现把它当成「内容问题、与账号无关」而**拒绝换号**并直接抛
+            // `INVALID_REQUEST`，后果（2026-09-27 用户实测）：池里有可用账号也永远
+            // 用不上，每次都拿最先选中的坏账号去撞，且提示「请调整内容后重试」——
+            // 把用户引向改内容，而真正该做的是换号／停用坏账号。
+            //
+            // 判据必须在认证分支内联判定而非提前 return：坏账号可能排在任何位置，
+            // 必须让它和 401/403 一样进入下面的换号循环。
+            const rejectedBody = await response.clone().text().catch(() => '');
+            const contentRejected = isContentRejection(rejectedBody);
+            if (contentRejected) {
+                // 记诊断日志（便于在插件日志里区分「换号」与「被策略拦下」），**不中断**换号，
+                // 同时把这个账号在该模型上冷却 —— 否则它下次仍排第一，每轮都要重撞一遍。
+                console.warn(`[${this.product.id}] 账号 ${currentAccountId || '(current)'} 被安全策略拦截`
+                    + `（HTTP ${response.status}，code 11140），继续换号：${errorDetail(rejectedBody).slice(0, 200)}`);
+                await markPolicyBlockedAccount(this.options.accountPool, this.product.id, currentAccountId, options.model);
             }
-            response = await this.send(credential, body, options);
+            // ⚠️ 真实缺陷（2026-09-26，用户报障「账号池里明明有 3~4 个账号没被限流，
+            // 却报『未配置凭据，请先登录』」）。早期实现在这里刷新一次就 `return`：
+            //
+            // ① **不换号** —— 池首账号被服务端拒绝（401/403）时，池里其余可用账号
+            //    一个都用不上。轮换逻辑（下一段）只覆盖 `isRateLimited` 的 429 类，
+            //    而 401/403 在这里就返回了。
+            // ② **刷新失败直接冒泡** —— 刷新接线一旦指向单凭据 ref（见 `src/index.ts`
+            //    的 createPoolRefresh 注释），抛出的「未配置凭据，请先登录」与真实原因
+            //    毫无关系：账号池凭据完好，只是刷错了 ref。
+            // ③ **下一轮必然复现** —— 刷新抛错前没有写回任何凭据，池首账号不变，
+            //    于是「中断后继续 goal」永远撞同一条死路（自锁）。
+            //
+            // 现在的次序：刷新当前账号 → 重试 → 仍认证失败则按池顺序换号，
+            // 全部换完才报 AUTH。
+            const authStatus = response.status;
+            // 已尝试过的账号：换号时必须排除，否则会拿回刚失败的那个原地打转。
+            const triedAuth = new Set();
+            if (currentAccountId !== '')
+                triedAuth.add(currentAccountId);
+            let refreshedCredential;
+            try {
+                await this.options.refresh();
+                refreshedCredential = await this.options.resolveCredential(options.model);
+            }
+            catch (error) {
+                // 刷新失败**不致命**：换号仍有机会，单个账号故障不该让整轮陪葬。
+                console.warn(`[${this.product.id}] 刷新当前账号凭据失败，改用换号重试：${String(error)}`);
+            }
+            if (refreshedCredential !== undefined && refreshedCredential.access_token.length > 0) {
+                credential = refreshedCredential;
+                response = await this.send(credential, body, options);
+                if (response.ok) {
+                    yield* this.consumeSse(response, options, currentAccountId);
+                    return;
+                }
+            }
+            let rotated = false;
+            /** 换号过程中是否撞到过安全策略拦截（用于最后的报错口径）。 */
+            let sawContentRejection = contentRejected;
+            /**
+             * **最后一次**撞到的拦截与其响应体：报错时的 HTTP 状态与文案都取它。
+             *
+             * 早先这里直接用 `authStatus`（**首发**的状态码）—— 而首发是 401、
+             * 换号后才吃到 11140/403 的组合下，报出来的「HTTP 401」与实际被拦的
+             * 那一次对不上，排查时会把人引向「token 过期」。
+             */
+            let rejectionStatus = contentRejected ? authStatus : 0;
+            let rejectionBody = contentRejected ? rejectedBody : '';
+            if ((response.status === 401 || response.status === 403) && this.options.accountPool !== undefined) {
+                for (;;) {
+                    // modelId 参与过滤：正在限流期的账号不会被选中（与限流换号同语义）。
+                    const next = await this.options.accountPool.getAvailableAccount(this.product.id, options.model, triedAuth);
+                    if (!next || triedAuth.has(next.entry.id))
+                        break;
+                    triedAuth.add(next.entry.id);
+                    rotated = true;
+                    credential = next.credential;
+                    currentAccountId = next.entry.id;
+                    response = await this.send(credential, body, options);
+                    if (response.ok) {
+                        yield* this.consumeSse(response, options, currentAccountId);
+                        return;
+                    }
+                    // ⚠️ 安全策略拦截（11140）同样继续换号 —— 它按账号生效，换号是唯一出路。
+                    // 必须**先于**「仅 401/403 才继续」的判据检查，否则会被当成普通 403
+                    // 之外的错误而 break，退回到「只试一个账号」的老问题。
+                    const rotatedBody = await response.clone().text().catch(() => '');
+                    if (isContentRejection(rotatedBody)) {
+                        sawContentRejection = true;
+                        rejectionStatus = response.status;
+                        rejectionBody = rotatedBody;
+                        // 刚换到就是这个账号被拦：同样要冷却，否则下一轮它还是第一候选。
+                        await markPolicyBlockedAccount(this.options.accountPool, this.product.id, currentAccountId, options.model);
+                    }
+                    // 只有认证类失败（含安全策略拦截）才继续换号；
+                    // 429/5xx/400 交给下面的既有分类逻辑。
+                    if (response.status !== 401 && response.status !== 403)
+                        break;
+                }
+            }
+            // 刷新既没产出凭据、也没换到别的账号：保留原有的可诊断报错。
+            if (refreshedCredential === undefined && !rotated) {
+                // ⚠️ **必须先排除安全策略拦截**（补修，2026-09-28）：这条早退只看
+                // 「续期失败 + 没换到号」，而**单账号池**恰恰必然满足它 —— 于是真实原因是
+                // 11140（该账号被服务端策略拦下）时，报出来的却是
+                // 「credential expired and refresh failed」+ `AUTH`，UI 只显示
+                // 「API 密钥无效」，把用户引向重新登录（而实测 token 全部有效）。
+                // 与 !15 / !16 已统一的口径一致：拦截就是拦截，别冒充认证失败。
+                if (sawContentRejection) {
+                    throw contentRejectionError(this.product.id, rejectionStatus === 0 ? authStatus : rejectionStatus, rejectionBody.length === 0 ? rejectedBody : rejectionBody, true);
+                }
+                throw new LlmError(`${this.product.id}: credential expired and refresh failed`, 'AUTH', { status: authStatus });
+            }
+            if (response.status === 401 || response.status === 403) {
+                // ⚠️ **必须带上响应体**（真实缺陷，我自己引入的回归，2026-09-27）：
+                // 换号耗尽后若只报「所有账号均认证失败」，就把服务端真正说的原因丢掉了 ——
+                // 而 403 在腾讯侧**并不等于认证失败**（额度耗尽 / 模型无权限 / 安全策略
+                // 都可能回 403）。实测（2026-09-27 10:26）workbuddy 连续三轮报
+                // 「所有账号均认证失败（HTTP 403）」，而随后逐账号复验发现 5 个 token
+                // 全部有效（请求能进业务层、只因缺 system 提示回 400）—— 即那 403 并非
+                // 登录问题。没有响应体就完全无从判断，只能靠猜。
+                const detail = await response.text().catch(() => '');
+                // 换号途中撞上的安全策略拦截：报专门的提示（指向账号，而非内容）。
+                if (sawContentRejection || isContentRejection(detail)) {
+                    // 状态与响应体都取**最后一次拦截**（没有就退回首发的那一份 `detail`），
+                    // 免得「首发 401 + 途中 403/11140」报出一个对不上的 HTTP 401。
+                    throw contentRejectionError(this.product.id, rejectionStatus === 0 ? authStatus : rejectionStatus, rejectionBody.length === 0 ? detail : rejectionBody, true);
+                }
+                throw new LlmError(`${this.product.id}: 所有账号均被拒绝`
+                    + `（HTTP ${authStatus}${authStatus === 401 ? '，请在 Jet Hub 重新登录' : ''}）：${errorDetail(detail)}`, httpErrorCode(authStatus, detail), { status: authStatus });
+            }
+            // 换号途中遇到非认证类错误 → 落到下面的限流换号 / 错误码归类逻辑。
         }
         if (!response.ok) {
             let errorText = await response.text().catch(() => '');
@@ -969,17 +1368,52 @@ export class BuddyAdapter extends LlmAdapter {
             // 其余可用账号。每个失败账号都会被记录，只有真正试完全部候选才报
             // "所有账号均受限"——避免只试一个就下结论（那会让 UI 显示的限流
             // 状态与实际判定不一致）。
-            if (this.options.accountPool && isRateLimited(errorText)) {
+            // ⚠️ 必须把 `response.status` 一并传入：服务端可能返回**空体**的 429，
+            // 而只按正文判定时对空体恒为 false → 整段换号逻辑被跳过，本可自愈的限流
+            // 被直接抛给用户（表现为「池里明明还有可用账号，插件却报错且不换号」）。
+            if (this.options.accountPool && isRateLimited(errorText, response.status)) {
                 const tried = new Set();
                 if (currentAccountId)
                     tried.add(currentAccountId);
+                // ⚠️ 限流换号途中同样会撞上安全策略拦截（11140，HTTP 403）—— 它按账号
+                // 生效、与限流无关，但**必须继续换号**而不是中断。
+                //
+                // 真实缺陷（用户报障 2026-09-28「本轮运行失败 · API 密钥无效」）：早期
+                // 实现在这里遇到非限流错误就**直接抛**。而池里 7 个 workbuddy 账号中
+                // 前 4 个恰是被 11140 拦截的坏账号、后 3 个可用，于是换号在第 1 个坏
+                // 账号处就中断，后面 3 个可用账号**永远试不到**（实测复刻：中断于
+                // #1，若不中断则 #4 即成功）。错误码取 `httpErrorCode(403)` = `AUTH`，
+                // UI 把它渲染成「API 密钥无效」，把用户引向检查密钥 —— 而 7 个 token
+                // 实测全部有效（2027-09 才过期），真实原因完全丢失。
+                //
+                // 这与认证路径（上面的 401/403 分支）必须保持同一语义：坏账号可能排在
+                // 任何位置，安全策略拦截和认证失败一样只是「这个账号不可用」。
+                let sawContentRejection = false;
+                let contentRejectionStatus = 0;
+                let contentRejectionBody = '';
+                /**
+                 * 已经写过限流标记的账号：避免同一个账号被重复记账（换号途中可能取回它）。
+                 * 标记是「账号 × 模型」的快照，写两次没有意义，日志也会重复。
+                 */
+                const rateLimitMarked = new Set();
                 for (;;) {
-                    const parsed = parseRateLimitError(errorText, options.model);
-                    if (!parsed)
-                        break;
-                    // 记录当前账号在该模型上的限流重置时间（UI 据此展示限流标记）
-                    if (currentAccountId) {
-                        await this.options.accountPool.updateModelRateLimit(currentAccountId, parsed.modelId, parsed.resetTimeMs);
+                    // 先给**当前**账号记限流标记（UI 据「限额重置」徽章展示；它也是
+                    // 「重测 / 重置」两条人工解禁路径的唯一依据）。
+                    //
+                    // ⚠️ 判据从「解析出重置时间」改为 `isRateLimited(errorText, response.status)`：
+                    // 空体 429 根本没有 `msg` 可解析（`parseRateLimitError` 给兜底时长，
+                    // 不需要在这里区分），而**只要判为限流就必须留下标记** —— 否则用户
+                    // 既看不到限流徽章、也无法手动解禁。真实缺陷复现：空体 429 时旧写法
+                    // 连标记都不写（`recorded` 为空），而换号却发生了。
+                    //
+                    // ⚠️ `parseRateLimitError` 仍然优先：它能把**服务端声明的**真实重置
+                    // 时刻抠出来（有就绝不用兜底的 1 小时）。换号后 `errorText` 可能是
+                    // 11140 等非限流体 —— 那种情况下面①的分支会先 continue，走不到这里。
+                    if (currentAccountId !== '' && isRateLimited(errorText, response.status)
+                        && !rateLimitMarked.has(currentAccountId)) {
+                        rateLimitMarked.add(currentAccountId);
+                        const parsed = parseRateLimitError(errorText, options.model, response.status);
+                        await this.options.accountPool.updateModelRateLimit(currentAccountId, parsed?.modelId ?? options.model, parsed?.resetTimeMs ?? Date.now() + RATE_LIMIT_FALLBACK_MS);
                     }
                     // 取下一个未尝试过的可用账号（同样按本产品 id 过滤，否则 WorkBuddy
                     // 永远取不到候选账号，限流后无法自动切换）。
@@ -995,21 +1429,48 @@ export class BuddyAdapter extends LlmAdapter {
                     currentAccountId = next.entry.id;
                     response = await this.send(credential, body, options);
                     if (response.ok) {
-                        yield* this.consumeSse(response, options);
+                        yield* this.consumeSse(response, options, currentAccountId);
                         return;
                     }
                     errorText = await response.text().catch(() => '');
-                    if (!isRateLimited(errorText)) {
-                        // 新账号失败但不是限流：按原错误分类抛出，不要再吞成"均受限"
-                        throw new LlmError(`buddy: ${errorDetail(errorText)}`, httpErrorCode(response.status, errorText), { status: response.status });
+                    // ① 安全策略拦截（11140）：按账号生效，继续换号（与认证路径同语义）。
+                    //    判据必须**先于**下面的「非限流即抛」，否则会退回「只试一个账号」。
+                    if (isContentRejection(errorText)) {
+                        sawContentRejection = true;
+                        contentRejectionStatus = response.status;
+                        contentRejectionBody = errorText;
+                        console.warn(`[${this.product.id}] 账号 ${currentAccountId || '(current)'} 被安全策略拦截`
+                            + `（HTTP ${response.status}，code 11140），继续换号：${errorDetail(errorText).slice(0, 200)}`);
+                        // 与认证路径同一实现：被拦的账号在**该模型**上冷却一段时间。
+                        //
+                        // ⚠️ 这里**不能**用上面的 `updateModelRateLimit` 记账分支 —— 那个写的是
+                        // 服务端给的限流重置时刻；11140 报文里**没有**时间，`parseRateLimitError`
+                        // 会返回 `null`，走它的兜底等于把「策略拦截」冒充成「限流」。
+                        await markPolicyBlockedAccount(this.options.accountPool, this.product.id, currentAccountId, options.model);
+                        continue;
                     }
+                    // ② 认证类失败：该账号凭据不可用，与路径 A 一致继续换号。
+                    if (response.status === 401 || response.status === 403)
+                        continue;
+                    // ③ 其余非限流错误：请求本身有问题，换号无益，按原错误分类抛出。
+                    //    ⚠️ 同样必须传状态码：否则空体 429 会被当成「非限流」而在换号
+                    //    途中**中断**，池里其余可用账号一个都试不到。
+                    if (!isRateLimited(errorText, response.status)) {
+                        // 新账号失败但不是限流：按原错误分类抛出，不要再吞成"均受限"
+                        throw new LlmError(`${this.product.id}: ${errorDetail(errorText)}`, httpErrorCode(response.status, errorText), { status: response.status });
+                    }
+                    // ④ 仍是限流 → 继续下一轮（重置时间已在上方记录）。
                 }
-                throw new LlmError(`buddy: 模型 ${options.model} 所有账号均受限，请稍后再试`, 'QUOTA_EXCEEDED');
+                // 全部候选试完：若途中撞过安全策略拦截，报专门的提示（指向账号而非内容）。
+                if (sawContentRejection) {
+                    throw contentRejectionError(this.product.id, contentRejectionStatus || 403, contentRejectionBody, true);
+                }
+                throw new LlmError(`${this.product.id}: 模型 ${options.model} 所有账号均受限，请稍后再试`, 'QUOTA_EXCEEDED');
             }
-            throw new LlmError(`buddy: ${errorDetail(errorText)}`, httpErrorCode(response.status, errorText), { status: response.status });
+            throw new LlmError(`${this.product.id}: ${errorDetail(errorText)}`, httpErrorCode(response.status, errorText), { status: response.status });
         }
         // 5. 消费 SSE 流
-        yield* this.consumeSse(response, options);
+        yield* this.consumeSse(response, options, currentAccountId);
     }
     /** 发起一次 chat 请求；网络失败映射为可重试的 TRANSPORT 错误。 */
     async send(credential, body, options) {
@@ -1017,7 +1478,20 @@ export class BuddyAdapter extends LlmAdapter {
         headers.set('Authorization', `Bearer ${credential.access_token}`);
         headers.set('Accept', 'text/event-stream');
         headers.set('Content-Type', 'application/json');
-        headers.set(HTTP_HEADER_DOMAIN, credential.domain ?? this.product.apiDomain);
+        // ⚠️ 顺序与空值语义都不能改（真实缺陷，两个子问题都出在这一行）：
+        // ① **以产品配置为准**，而不是优先用凭据里的 `credential.domain`。凭据的
+        //    domain 是「登录时站点」的快照；产品改造后（早期 workbuddy 指向
+        //    copilot.tencent.com，现为 www.workbuddy.ai）旧凭据里仍是过期值。本请求的
+        //    baseURL 取自 `product.endpoint`，X-Domain 必须与之一致，否则身份标识与
+        //    目的地址自相矛盾。`src/credits.ts` 的 `checkinHeaders` 早已按此理由实现
+        //    （见其文档注释），此处原先与它相反 —— 同一账号的聊天与积分请求会声明
+        //    **不同的** X-Domain，属两处实现漂移。
+        // ② 必须用 `||` 而非 `??`：domain 经 `readStringField` 读取，字段缺失时返回
+        //    **空串**（不是 undefined），`??` 对空串不生效，X-Domain 会以空值发出
+        //    （已用单测复现：`''` 未回退到 `copilot.tencent.com`）。
+        // 末位 `|| ''` 只为满足 Headers.set 的非空类型要求：产品与凭据都为空属配置
+        // 错误，此时发出空值比编造一个域名更诚实。
+        headers.set(HTTP_HEADER_DOMAIN, this.product.apiDomain || credential.domain || '');
         headers.set(HTTP_HEADER_PRODUCT_CODE, this.product.productCode);
         // 用量归属头族：后台「使用端」列按这组头归因，缺任一个都会显示为 `-`。
         // 注意 X-Product 是**归属名**（产品名），不是部署类型 —— 历史实现发成
@@ -1043,7 +1517,7 @@ export class BuddyAdapter extends LlmAdapter {
             if (options.signal?.aborted)
                 throw error;
             if (isTransportError(error)) {
-                throw new LlmError(`buddy: transport error: ${errorMessage(error)}`, 'TRANSPORT', { cause: error });
+                throw new LlmError(`${this.product.id}: transport error: ${errorMessage(error)}`, 'TRANSPORT', { cause: error });
             }
             throw error;
         }
@@ -1056,9 +1530,15 @@ export class BuddyAdapter extends LlmAdapter {
      * 流式工具调用仅首个分片携带真实 id（chatcmpl-tool-xxx），后续参数分片
      * 只有 index——按 index 缓存 id 保证同一工具的所有分片 id 一致。
      */
-    async *consumeSse(response, options) {
+    async *consumeSse(response, options, 
+    /**
+     * 本次请求实际使用的账号 id（`''` 表示凭据没匹配到池条目）。
+     *
+     * 只用于流内安全策略拦截的冷却标记 —— 见 {@link isContentRejection}。
+     */
+    policyBlockedAccountId) {
         if (!response.body)
-            throw new LlmError('buddy: empty model response body', 'EMPTY_RESPONSE');
+            throw new LlmError(`${this.product.id}: empty model response body`, 'EMPTY_RESPONSE');
         const blocks = [];
         let nextIndex = 0;
         /**
@@ -1088,13 +1568,10 @@ export class BuddyAdapter extends LlmAdapter {
          */
         const proseLoopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined;
         let proseLoopDetected = false;
-        /**
-         * `</think:hex>` 泄漏的待定正文（见 `splitThinkTaggedContent`）。
-         *
-         * 标签可能**跨帧**到达（`</think:612` + `4c78e>`），故不能逐帧判定，
-         * 必须缓冲到收尾时一次性切分。
-         */
-        let proseHasThinkTag = false;
+        // ⚠️ 此处**曾有** `proseHasThinkTag` 门禁变量，2026-09-27 **删除**。
+        // 它逐帧匹配标签来决定收尾是否切分，而标签**必然跨帧**（上游可切成任意片段），
+        // 实测二分帧时 7/11 种切法漏判 → 标签落盘泄漏。现改为收尾**无条件**调用
+        // `splitThinkTaggedContent`（无标签时返回 undefined，普通响应逐字节不变）。
         /**
          * 纯空白思考抑制器（见 `createBlankReasoningSuppressor`）。与 `blocks` /
          * `loopGuard` 同生命周期：**每个 `stream()` 调用建一个实例**。
@@ -1138,7 +1615,7 @@ export class BuddyAdapter extends LlmAdapter {
                     if (error instanceof LlmError)
                         throw error;
                     if (isTransportError(error)) {
-                        throw new LlmError(`buddy: sse transport error: ${errorMessage(error)}`, 'TRANSPORT', { cause: error });
+                        throw new LlmError(`${this.product.id}: sse transport error: ${errorMessage(error)}`, 'TRANSPORT', { cause: error });
                     }
                     throw error;
                 }
@@ -1163,8 +1640,33 @@ export class BuddyAdapter extends LlmAdapter {
                     catch {
                         continue;
                     }
+                    // ⚠️ **流内**的安全策略拦截（HTTP 200 + SSE 内嵌 11140 帧）。
+                    //
+                    // ## 原状：整帧被**静默丢掉**
+                    //
+                    // 下面的帧类型里**根本没有** `code` / `msg` 字段（只有 `error` /
+                    // `choices` / `usage`），而这类报文恰好是**顶层** `{code,msg,displayMsg}`、
+                    // 没有 `error`、没有 `choices` —— 于是它一路走到循环末尾，既没内容也没报错，
+                    // UI 表现成「干净地停止、无任何失败」（与 qoder 的 10605、TRAE 的流内错误
+                    // 同型；`isContentRejection` 的注释也记着「同一报文在 CodeArts 侧就以
+                    // HTTP 200 + 内嵌错误帧的形式出现」）。
+                    //
+                    // ## 判据必须**窄**：只认「没有 choices 的帧」
+                    //
+                    // 正文里出现「安全审核」「request illegal」甚至字面 `11140` 都是常态
+                    // （模型在讨论审核策略时就会说这几个词），而**有效内容帧一定带 choices**；
+                    // 加上这一层门禁，才不会因为一句正文把整个回答误判成拦截。
+                    // 复用 `isContentRejection(payload)` 而非另写一套：与 HTTP 层**同一判据**，
+                    // 两处各写一套正是 trae 那次缺陷的成因。
+                    if (data.choices === undefined && isContentRejection(payload)) {
+                        // 按定下的口径：**标记 + 如实报错**，本轮不重发（流内重发需要
+                        // 「尚未产出内容」的判据 + 外层循环，是 trae 3823133 那种结构改造）。
+                        // 账号标了冷却，下一轮选号就会绕开它，不再反复重撞。
+                        await markPolicyBlockedAccount(this.options.accountPool, this.product.id, policyBlockedAccountId, options.model);
+                        throw contentRejectionError(this.product.id, 200, payload, false);
+                    }
                     if (data.error !== undefined) {
-                        throw new LlmError(`buddy: ${data.error.message ?? 'unknown error'}`, 'SERVER');
+                        throw new LlmError(`${this.product.id}: ${data.error.message ?? 'unknown error'}`, 'SERVER');
                     }
                     const choice = data.choices?.[0];
                     const delta = choice?.delta;
@@ -1187,10 +1689,11 @@ export class BuddyAdapter extends LlmAdapter {
                             if (proseLoopGuard.observe(delta.content))
                                 proseLoopDetected = true;
                         }
-                        // `</think:hex>` 泄漏探测：标签可能跨帧，故只做廉价子串判定，
-                        // 真正切分放在收尾（见文件末尾 text 段）。
-                        if (!proseHasThinkTag && delta.content.includes('think:'))
-                            proseHasThinkTag = true;
+                        // ⚠️ **不要在这里逐帧探测 think 标签**（2026-09-27 移除）。
+                        // 逐帧探测在跨帧时必然漏判（标签可被切成任意片段，实测二分帧时
+                        // 7/11 种切法漏判）→ 收尾不切分 → 标签落盘泄漏。
+                        // 现改为收尾**无条件**调用 `splitThinkTaggedContent`
+                        // （无标签时返回 undefined，普通响应逐字节不变）。
                         if (!proseLoopDetected) {
                             block.text += delta.content;
                             yield { type: 'text-delta', index: block.index, text: delta.content };
@@ -1331,6 +1834,11 @@ export class BuddyAdapter extends LlmAdapter {
          * 故此处**在每个 `block-end` 的发射点自增**，与下面三段发射逻辑逐条对齐。
          */
         let blockCount = 0;
+        /**
+         * 本步**最终发出的正文**（`block-end` 的权威文本），供 finish 归类判定
+         * 「是否被上游停止串截断」（见 `isProseTruncatedByStopString`）。
+         */
+        let emittedProse = '';
         // 按创建顺序关闭每个块
         const textBlock = blocks.find(block => block.kind === 'text');
         for (const index of toolOrder) {
@@ -1358,11 +1866,16 @@ export class BuddyAdapter extends LlmAdapter {
             };
         }
         if (textBlock !== undefined) {
-            // ── `</think:hex>` 泄漏归位（见 `splitThinkTaggedContent`）──
+            // ── think 标签归位（见 `splitThinkTaggedContent`）──
             // 标签**前**的内心独白 → reasoning 块；标签**后**的真正文 → 本 text 块。
             // 无标签时**逐字节不变**。
+            //
+            // ⚠️ **必须无条件调用，不得加「先探测有没有标签」的门禁**（2026-09-27 修）：
+            // 标签会**跨帧**到达，任何逐帧探测都会漏判（实测二分帧 7/11 漏），
+            // 漏了就不切分、标签原样泄漏。无标签时本函数返回 undefined，故普通响应
+            // 逐字节不变（仅多一次字符串扫描）。
             let textOut = textBlock.text;
-            if (proseHasThinkTag) {
+            {
                 const split = splitThinkTaggedContent(textBlock.text);
                 if (split !== undefined) {
                     // ⚠️ **必须同时喂 `suppressor`**：收尾以 `suppressor.text()` 为
@@ -1380,6 +1893,19 @@ export class BuddyAdapter extends LlmAdapter {
                     textOut = split.text;
                 }
             }
+            // ── 残留标签**兜底剥离**（见 `stripBareThinkCloseTag`）──
+            //
+            // ⚠️ **默认关闭**（`DSH_THINK_LEAK_STRIP=1` 才启用）。用户决定（2026-09-27）：
+            // > 暂时不需要泄露过滤……**加了过滤可能有思考解析失败但是被过滤我们发现不了。**
+            // 即兜底会**掩盖解析层的失败**；当前要让泄漏如实呈现以便观测。
+            //
+            // ⚠️ **必须在切分之后**：切分负责「解析」，本行只兜底纯标签块。
+            //
+            // ⚠️ **必须在 hex 切分之后**（顺序不可颠倒）：若放在切分之前，
+            // `思考</think:6124c78e></think>` 这类「hex 后跟裸标签」的形态会漏 ——
+            // 切分把裸标签留在正文侧，直接泄漏进 UI（审计实测到的真实缺陷）。
+            // 放在末尾同时覆盖两种形态：切分产物再剥一次、纯裸标签块（无 hex）也在此剥离。
+            textOut = stripBareThinkCloseTagIfEnabled(textOut);
             // 正文死循环截断：只保留循环前的干净前缀（与思考守卫同一覆盖机制）。
             // ⚠️ **不改 finish reason**：工具调用仍要被执行。
             const truncated = proseLoopDetected && proseLoopGuard?.cutAt !== undefined
@@ -1392,6 +1918,7 @@ export class BuddyAdapter extends LlmAdapter {
             // 故本响应仍有产出，不会被误判为零块。
             if (cleaned !== '') {
                 blockCount += 1;
+                emittedProse = cleaned;
                 yield { type: 'block-end', index: textBlock.index, block: { type: 'text', text: cleaned } };
             }
         }
@@ -1435,18 +1962,46 @@ export class BuddyAdapter extends LlmAdapter {
          * （不完整、可重试）。同批若还有可用调用，则照常报 tool-calls。
          */
         const droppedUnnamedCalls = [...toolCalls.values()].some(block => !block.announced);
-        const reason = loopDetected
-            // 思考死循环：截断并报可重试。**优先级最高** —— 循环中生成的工具调用
-            // 参数不可信；且若无可用调用，落到 `stop` 会让任务静默中断。
-            ? { kind: 'max-tokens' }
-            : finishReason === 'length'
-                || finishReason === undefined && toolOrder.length > 0
-                || argsTruncated
-                || droppedUnnamedCalls && toolOrder.length === 0
+        /**
+         * 正文是否被**上游停止串**掐断（见 `isProseTruncatedByStopString`）。
+         *
+         * 上游把 `</think>` 当停止串：模型在正文里写它（哪怕包在反引号里）就会被
+         * 掐断，但仍报 `finish_reason:"stop"` —— 我们据此判「正常答完」会让本轮
+         * **没有任何报错就停住**。判据三条同时成立：上游报 `stop`、本步无可用工具
+         * 调用、正文止于未闭合的行内代码。
+         */
+        const proseCutByStopString = finishReason === 'stop'
+            && toolOrder.length === 0
+            && isProseTruncatedByStopString(emittedProse);
+        /**
+         * 思考死循环是否**是唯一的产出**（无正文、无工具调用）。
+         *
+         * ⚠️ 这层门禁**不可省** —— 用户要求（Gitee !IKIZNK）：「**如果只是**陷入
+         * 思考循环的出错，就要给出有分辨力的错误提示」。只有该步没有任何可见产出时
+         * 才报 `error`：`error` 路径**不落 `assistant/message`**（实测 219 会话里
+         * 222 例），有正文/工具调用时报它会把用户可见内容整块丢掉。
+         * 实测守卫命中的 25 例**全部**只有思考，故正常路径都走 error。
+         */
+        const reasoningLoopIsSoleOutput = loopDetected
+            && emittedProse === ''
+            && toolOrder.length === 0;
+        const reason = reasoningLoopIsSoleOutput
+            // 思考死循环且无可见产出：报**有分辨力的 error**（见 REASONING_LOOP_CODE）。
+            // ⚠️ 不能报 max-tokens —— UI 对它的固定文案是「已达到输出 token 上限」，
+            // 把「检测到死循环」误导成「额度用满」（真实缺陷，Gitee !IKIZNK）。
+            ? { kind: 'error', failure: reasoningLoopFailure(loopGuard?.diagnostics, options.maxTokens, 'reasoning') }
+            // 循环命中但另有可见产出：只能报 max-tokens（保住内容），不能报 error。
+            : loopDetected
                 ? { kind: 'max-tokens' }
-                : finishReason === 'tool_calls' || toolOrder.length > 0
-                    ? { kind: 'tool-calls' }
-                    : { kind: 'stop' };
+                : finishReason === 'length'
+                    || finishReason === undefined && toolOrder.length > 0
+                    || argsTruncated
+                    || proseCutByStopString
+                    || droppedUnnamedCalls && toolOrder.length === 0
+                    ? { kind: 'max-tokens' }
+                    : finishReason === 'tool_calls' || toolOrder.length > 0
+                        ? { kind: 'tool-calls' }
+                        : { kind: 'stop' };
         // 零内容块响应（例如本次只收到过那个被压制的空白 reasoning）否则会以
         // `stop` 收场 —— 那是 DSH `EMPTY_RESPONSE` 契约明令禁止的静默结束。
         // ⚠️ 传入的是**上面已算好的** `reason`（含 loopDetected / length /
@@ -1539,24 +2094,16 @@ function positiveMaxTokens(value) {
 /**
  * 在 ctx.llm 上注册 CodeBuddy 系产品的 provider 路由与适配器。
  *
- * 路由名、配置页展示名与 settingsNs 全部由产品配置驱动：
- * CodeBuddy 得到 `buddy`，WorkBuddy 得到 `workbuddy`。
- * `settingsNs` 经 `settingsNamespaceFor()` 解析：老契约（≤0.1.6）下是各产品的
- * `llm-<id>` 命名空间；0.1.7-rc.1 起 settings 命名空间只能是 profile 条目 id，
- * 故解析为本插件条目 id。
+ * 路由名与展示名由产品配置驱动：CodeBuddy 得到 `buddy`，WorkBuddy 得到 `workbuddy`。
+ *
+ * ⚠️ 刻意**不**调用 `ctx.llm.registerConfigurableProviders`（即不向「设置 → 模型 →
+ * 提供商」声明配置行）：账号、模型开关与模型目录都由 Jet Hub 设置页管理，声明只会
+ * 在该页留下无人使用的行。原因、依据与恢复方式见 `llm-register-compat.ts` 模块头。
  */
 export function registerBuddyLlm(ctx, options) {
     const product = options.product ?? CODEBUDDY;
-    ctx.llm.registerConfigurableProviders([
-        {
-            provider: product.id,
-            displayName: product.displayName,
-            settingsNs: settingsNamespaceFor(ctx, `llm-${product.id}`),
-            settingsPath: [],
-        },
-    ]);
     const adapter = new BuddyAdapter(options);
-    ctx.llm.registerAdapter([product.id], adapter);
+    registerAdapterIdempotent(ctx.llm, [product.id], adapter);
     // 返回实例：Jet Hub「显示列表」需要 `listAllModels()`（不受黑名单影响、
     // 带最终展示名/倍率）。`ctx.llm` 不透传自定义方法，须由调用方持有引用。
     return adapter;

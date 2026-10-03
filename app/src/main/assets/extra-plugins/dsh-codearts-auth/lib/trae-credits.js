@@ -286,8 +286,19 @@ export async function fetchTraeCreditBalance(credential, _product, fetcher = fet
         const used = typeof usage === 'object' && usage !== null
             ? readNumber(usage, 'credits_amount')
             : 0;
+        // 到期时间（2026-09-29 抓包取证，推翻早前"起始日期+31天"的推断方案）：
+        // 服务端在**条目级**直接下发 `expire_time` —— **秒级** Unix 时间戳
+        // （实测 1790783999 = 2026-09-30 23:59:59，与官方 UI "2026/09/30 23:59 到期"
+        // 逐条吻合：每月登录赠送 500 的 1790783999、三个签到包的 10/28·29·30）。
+        // ⚠️ 秒 → 毫秒必须 ×1000；不乘会让显示落在 1970 年。
+        // `base_info.end_time` 与它同值（备用来源），`yearly_expire_time` 实测恒 0
+        // 不取。拿不到（0/缺失）就不设置 deductionEndTime（前端显示"永久"）。
+        const expireSec = readNumber(entry, 'expire_time');
+        const deductionEndMs = expireSec > 0 ? expireSec * 1000 : undefined;
         const pkg = {
-            name: readString(base, 'name') || '资源包',
+            // ⚠️ 包名用 `display_desc`（实测"每月登录赠送"/"签到奖励"/"免费"），
+            // 不是 `base.name` —— 后者实测为 undefined，旧代码全部回退成了"资源包"。
+            name: readString(base, 'display_desc') || readString(entry, 'display_desc') || '资源包',
             unit: 'credits',
             remaining: creditsLimit - used,
             total: creditsLimit,
@@ -296,6 +307,7 @@ export async function fetchTraeCreditBalance(credential, _product, fetcher = fet
             cycleStartTime: '',
             cycleEndTime: '',
             expiredTime: '',
+            ...(deductionEndMs !== undefined ? { deductionEndTime: deductionEndMs } : {}),
         };
         packages.push(pkg);
         total += pkg.remaining;

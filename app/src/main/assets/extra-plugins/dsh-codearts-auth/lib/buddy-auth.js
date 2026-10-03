@@ -10,6 +10,18 @@ import { credentialExpiresAtMs, isExpired, isRefreshable, } from './buddy.js';
 import { RefreshTokenExpiredError, fetchModels, refreshToken, runBuddyLoginFlow, } from './buddy-oauth.js';
 import { RefreshScheduler } from './refresh.js';
 import { CODEBUDDY } from './product.js';
+import { refreshAccountWithReconcile, syncAccountExpiry, } from './expiry-sync.js';
+/**
+ * CodeBuddy 系凭据 → 账号池有效期的提取器。
+ *
+ * `BuddyAuth` 一个类服务两个产品（buddy / workbuddy），故 tag 取
+ * `this.product.id`，日志里能区分是哪个面板。
+ */
+const BUDDY_EXPIRY_ACCESSORS = {
+    expiresAtOf: credentialExpiresAtMs,
+    refreshableOf: isRefreshable,
+    identityOf: (credential) => credential.access_token ?? '',
+};
 /**
  * CodeBuddy 的登录结果存储所用的凭据引用。
  *
@@ -214,8 +226,11 @@ export class BuddyAuth extends Service {
      *   用 `refresh()` 去刷账号池里的账号，实际刷的是另一个凭据；
      * - 本方法也**不触碰** `refreshTokenInvalid` / `lastRefreshError` / 调度器：
      *   那些状态属于「单凭据路径」，被多账号操作污染会让 UI 显示错误的失效提示。
+     *
+     * ⚠️ **必须回写账号池的 `expiresAt`**（issue !IKIRTT）：UI 卡片读的是池值，
+     * 只更新凭据会让「已过期」的红字在续期成功后依然挂着，用户无处自救。
      */
-    async refreshAccountCredential(refName) {
+    async refreshAccountCredential(refName, pool, accountId) {
         const ref = credentialRef(refName);
         const resolved = await this.ctx.credentials.resolve(ref);
         if (!resolved)
@@ -228,6 +243,15 @@ export class BuddyAuth extends Service {
         }
         const refreshed = await this.refreshCredential(credential);
         await this.ctx.credentials.set(ref, JSON.stringify(refreshed));
+        await syncAccountExpiry({
+            pool,
+            provider: this.product.id,
+            credential: refreshed,
+            accessors: BUDDY_EXPIRY_ACCESSORS,
+            accountId,
+            tag: `[${this.product.id}]`,
+            warn: (message) => this.ctx.logger?.warn?.(message),
+        });
     }
     /**
      * 批量续期本产品的所有账号。
@@ -242,7 +266,11 @@ export class BuddyAuth extends Service {
      * 时用过期凭据打腾讯接口，服务端回 HTML 错误页 → 前端报
      * `Unexpected token '<'`。续期不该依赖「是否参与自动选号」。
      *
-     * 单账号失败不影响其他账号。
+     * 单账号失败不影响其他账号，但失败**必须留日志**：静默的实现会让账号
+     * 在 UI 上永远显示「可续期」却刷不动，用户与开发者都拿不到线索。
+     *
+     * ⚠️ **lead-time 过滤**（issue !IKIRTT）：距过期不足 1 小时才发续期请求，
+     * 跳过的账号只做有效期对账。详见 `refreshAccountWithReconcile`。
      */
     async refreshAll(pool) {
         const accounts = await pool.listAccounts(this.product.id);
@@ -262,12 +290,17 @@ export class BuddyAuth extends Service {
                     await pool.updateAccount(entry.id, { refreshable: false });
                     continue;
                 }
-                const refreshed = await this.refreshCredential(credential);
-                await this.ctx.credentials.set(ref, JSON.stringify(refreshed));
-                const expiresAt = credentialExpiresAtMs(refreshed);
-                await pool.updateAccount(entry.id, {
-                    expiresAt: expiresAt ?? undefined,
-                    refreshable: isRefreshable(refreshed),
+                await refreshAccountWithReconcile({
+                    pool,
+                    provider: this.product.id,
+                    tag: `[${this.product.id}]`,
+                    accountId: entry.id,
+                    credential,
+                    accessors: BUDDY_EXPIRY_ACCESSORS,
+                    current: entry,
+                    refresh: (c) => this.refreshCredential(c),
+                    save: (c) => this.ctx.credentials.set(ref, JSON.stringify(c)),
+                    warn: (message) => this.ctx.logger?.warn?.(message),
                 });
             }
             catch (error) {
@@ -278,6 +311,12 @@ export class BuddyAuth extends Service {
                     catch {
                         // 忽略 updateAccount 本身的错误
                     }
+                    this.ctx.logger?.warn?.(`[${this.product.id}] 账号 ${entry.id} 的 refresh_token 已失效，`
+                        + '已标记为不可续期（需重新登录）');
+                }
+                else {
+                    this.ctx.logger?.warn?.(`[${this.product.id}] 账号 ${entry.id} 续期失败：`
+                        + `${error instanceof Error ? error.message : String(error)}`);
                 }
                 // 单账号失败不中断循环
             }
@@ -346,5 +385,42 @@ export class BuddyAuth extends Service {
     get fetchImpl() {
         return this.options.fetcher ?? fetch;
     }
+}
+/**
+ * 构造腾讯系（buddy / workbuddy）适配器的 `refresh` 回调。
+ *
+ * ⚠️ **必须刷新 `resolveCredential` 实际用到的那一个账号**，而不是
+ * {@link BuddyAuth.refresh} 读写的默认单凭据 ref（`BUDDY_ACCESS_TOKEN` /
+ * `WORKBUDDY_ACCESS_TOKEN`）。错配的后果是**整轮不可恢复的失败**
+ * （真实缺陷，2026-09-26 由用户报障定位：账号池里 5 个 workbuddy 账号、
+ * 凭据全部有效，却一直报「未配置凭据，请先登录」）：
+ *
+ * 1. Jet Hub 的登录入口只写 `WORKBUDDY_ACCOUNT_XXX`，**从不写**那个固定
+ *    ref —— 于是适配器在 `buddy-adapter.ts` 的 401/403 分支调 `refresh()`
+ *    时，本类 `refresh()` 里的 `resolve` 恒为 null，抛
+ *    「未配置凭据，请先登录」。该文案**完全是误导**：账号池里凭据齐全。
+ * 2. 那个 401/403 分支在刷新后即返回（修复前），**不走**账号轮换 ——
+ *    池里其余可用账号一个也用不上。
+ * 3. 刷新抛错前没有写回任何凭据 → 下一轮仍取池首账号 → 再次 401 →
+ *    再次同一条死路，表现为「中断后继续 goal 永远复现同一错误」的
+ *    **自锁**，重试与重启都无效。
+ *
+ * 池内无账号时才回退到 {@link BuddyAuth.refresh}（单凭据路径，供未迁移的
+ * 老数据）。与 LobsterAI / Qoder / TRAE 的既有实现同形。
+ */
+export function createPoolRefresh(pool, productId, auth) {
+    return async () => {
+        const available = await pool.getAvailableAccount(productId, '');
+        // ⚠️ 必须传 `pool` + `entry.id`（issue !IKIRTT）：这条是**发消息途中**按需续期
+        // 的路径（比账号卡片点「刷新」触发得频繁得多），不回写有效期就会让 UI 继续
+        // 挂着「已过期」—— 早先七个 provider 的 `refreshAccountCredential` 没有
+        // 回写能力时这里也无从传起，现在补全。
+        if (available) {
+            await auth.refreshAccountCredential(available.entry.credentialRef, pool, available.entry.id);
+        }
+        else {
+            await auth.refresh();
+        }
+    };
 }
 //# sourceMappingURL=buddy-auth.js.map

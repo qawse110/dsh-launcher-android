@@ -11,7 +11,7 @@
 //
 // ⚠ 边界说明（不要读成更多）：`budget` 目前**只**映射到"澄清提问配额"，
 // 返工门（P6）的生产触发本来就是默认关闭的，不因为档位而打开——档位不该悄悄放大自主权。
-import { normalizeSettings, tierOf } from './settings.js'
+import { normalizeSettings, tierOf, TIER_PRESETS } from './settings.js'
 import { strategyForTier } from './strategy.js'
 import { readFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
@@ -34,13 +34,39 @@ export const DEFAULT_ASSIST = 'auto'
  * 不可达的防御代码是一种**谎报**——它看起来在保证什么，其实什么都没保证。
  * 真正要守的不变量交给测试：**settings.js 的每个值域里的每个取值都必须在这里有映射**（见 policy.test.mjs）。
  */
-export function policyFor(settings) {
+/**
+ * 合并全局默认与某会话的档位覆盖（0.7.7）。
+ *
+ * 为什么要有这一层：档位此前是**全局单一值**——一个会话设成重度，所有会话一起变。
+ * 而用户的直觉是「会话模型都能独立，档位也该独立」（2026-09-26 提出）。
+ * 合并规则：**会话覆盖优先**，没被覆盖的项回落全局 —— 所以旧配置（无 bySession）行为完全不变。
+ * 越界的会话键已在 normalizeSettings 里被丢弃，这里不再重复校验。
+ */
+export function effectiveSettings(settings, sessionId) {
   const s = normalizeSettings(settings).settings
+  const sid = (sessionId === undefined || sessionId === null) ? '' : String(sessionId)
+  const ov = (sid && s.bySession && typeof s.bySession === 'object') ? s.bySession[sid] : null
+  if (!ov) return s
+  // 档位别名在**读取时**展开（存储里只留意图，见 settings.js 的说明）：
+  // 预设当基底、显式项优先。这样连续点档位不会带上上一次的展开残留——那正是"点了不生效"的根因。
+  let eff = ov
+  if (typeof ov.tier === 'string' && TIER_PRESETS[ov.tier]) {
+    const explicit = { ...ov }
+    delete explicit.tier
+    eff = { ...TIER_PRESETS[ov.tier], ...explicit, tier: ov.tier }
+  }
+  return { ...s, ...eff, bySession: s.bySession }
+}
+
+export function policyFor(settings, sessionId) {
+  const s = effectiveSettings(settings, sessionId)
   return {
     assist: s.assist,
     model: s.model,
     detail: s.detail,
     budget: s.budget,
+    // 0.7.8 协作基调：`neutral` 不注入任何东西，`hard` 由编译器加一段语域匹配的短块。
+    framing: s.framing,
     injectPacket: s.assist !== 'off',
     packetBudgetChars: DETAIL_BUDGET[s.detail],
     maxQuestions: BUDGET_QUESTIONS[s.budget],
@@ -63,8 +89,8 @@ export function policyFor(settings) {
     // 旧的四档只映射 assist/detail/budget，**标准与重度的 detail 是同一个值** ⇒
     // 「重度」= 「标准 + 多 1 个提问」。现在档位另外带一份**策略**（怎么想），
     // 由 strategy.js 唯一决定；下游（解释层提示词、编译器、只读工具）读 `pol.strategy`。
-    tier: tierOf(s),
-    strategy: strategyForTier(tierOf(s)),
+    tier: tierOf(effectiveSettings(settings, sessionId)),
+    strategy: strategyForTier(tierOf(effectiveSettings(settings, sessionId))),
   }
 }
 
@@ -72,10 +98,29 @@ export function policyFor(settings) {
  * 读**生效**的政策：`<home>/po06.json` 里的设置 → 归一化 → 政策。
  * 任何读/解析异常都回落到默认政策（保守：默认档位就是今天的行为）。
  */
-export function readPolicy({ home, readFile } = {}) {
+/**
+ * 包的"形状"——决定编译结果的那几个生效字段。
+ *
+ * 为什么单独拎出来：包文本是**按当时政策编译好的一整段字符串**（存在 intentBySession 里）。
+ * 政策一变，那份字符串就过期了；若不作废，它会在后续回合继续被注入 ——
+ * 用户实测 2026-09-29：切回普通档（framing=neutral）后，注入文里**仍然带着硬邦邦那段**。
+ */
+export function packetShapeOf(pol) {
+  if (!pol) return ''
+  return [pol.assist, pol.detail, pol.budget, pol.framing].join('|')
+}
+
+/** 写盘前后形状不同 ⇒ 已存的包文本必须作废（下一次拦截会重编译）。两侧都取不到时不作废。 */
+export function packetShapeChanged(before, after) {
+  const a = packetShapeOf(before)
+  const b = packetShapeOf(after)
+  return a !== '' && b !== '' && a !== b
+}
+
+export function readPolicy({ home, readFile, sessionId } = {}) {
   const read = readFile || ((p) => { try { return existsSync(p) ? readFileSync(p, 'utf8') : null } catch { return null } })
   let raw = null
   try { const t = read(join(String(home), 'po06.json')); raw = t ? JSON.parse(t) : null } catch { raw = null }
-  const p = policyFor(raw || {})
+  const p = policyFor(raw || {}, sessionId)
   return { ...p, source: raw ? 'config' : 'default' }
 }

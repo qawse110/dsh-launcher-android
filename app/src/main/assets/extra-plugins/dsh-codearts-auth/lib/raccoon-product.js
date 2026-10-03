@@ -19,6 +19,97 @@
  *   `GET /api/web/llm/v2/model_catalog` 取 `visible:true` 的 6 条
  */
 import { RACCOON_API_BASE, RACCOON_PHONE_CIPHER_SECRET } from './raccoon.js';
+import { RACCOON_REQUEST_IMAGE_MAX_BYTES } from './image-budget.js';
+/**
+ * 思考档位：小浣熊**只有两态（开 / 关）**，这是实测确证的。
+ *
+ * ## ⚠️ 为什么是「开 / 关」而不是「high / 关闭」
+ *
+ * 服务端**接受** `reasoning_effort`（8 个枚举值，报错原文：
+ * ``expected one of `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `ultra`, `max` ``），
+ * 但它**不产生任何可观测效果** —— 8 轮配对实验（`temperature=0`）：
+ *
+ * | 档位 | `reasoning_tokens` 均值 |
+ * |---|---|
+ * | `minimal` | 197 |
+ * | `max` | 226 |
+ *
+ * 逐轮配对差值 `max - minimal`：**正差 4 次 / 负差 4 次**（纯随机）。
+ * 4 轮小样本时曾观察到「单调趋势」（175→288），8 轮后消失 —— 那是巧合。
+ * 且 `none` 均值 301 ≠ `disabled` 的 0，说明**它也不控制思考开关**。
+ *
+ * ⇒ `reasoning_effort` 只是被 JSON schema 接受，不影响行为。
+ *
+ * ## 唯一有效通道：`extra_body.thinking.type`
+ *
+ * 报错原文：``thinking.type: expected one of `adaptive`, `enabled`, `disabled` ``。
+ * 实测（每组 6~8 次，判据为服务端上报的 `reasoning_tokens`）：
+ *
+ * | 请求 | 结果 |
+ * |---|---|
+ * | 基线（不发参数） | 均值 **222**，6/6 有思考 |
+ * | `extra_body.thinking={type:'disabled'}` | **6/6、8/8 全为 0** → ✅ 真关闭 |
+ * | `extra_body.thinking={type:'enabled'}` | 均值 **218** → ✅ 与默认等价 |
+ *
+ * 故我们**只暴露这两态**：开（enabled）与关（disabled）。
+ *
+ * ## ⚠️ 无效的写法（都实测过，别照着试）
+ *
+ * | 写法 | 结果 |
+ * |---|---|
+ * | `extra_body.enable_thinking=false` | ❌ 无效 |
+ * | `extra_body.extra_body.enable_thinking=false`（双层） | ❌ 无效 |
+ * | `reasoning_effort`（单层/双层/顶层） | ❌ 被接受但**无效果**（见上） |
+ * | `thinking` 放**顶层**（不在 `extra_body` 内） | ❌ 被忽略（非法值也不报错） |
+ * | `thinking.budget_tokens` | ⚠️ 仅被**格式校验**（`max_tokens < budget_tokens` 回 400），1~4096 全接受但思考量无规律 |
+ *
+ * ⚠️ 客户端注释说 `extra_body` 双层嵌套是 **LiteLLM SDK 的调用约定**
+ *（"LiteLLM expects another provider-owned extra_body object inside that body"）——
+ * 但实测**单层才生效**，故以实测为准。
+ */
+/**
+ * 档位 id：**开启**思考（`thinking:{type:'enabled'}`）。
+ *
+ * ⚠️ id 用 `on` 而不是 `high`：服务端虽接受 `high` 字样，但它走的是
+ * `reasoning_effort` 通道、**实测无效果**。用 `on` 避免让用户误以为
+ * 「选的是高强度档」—— 我们能表达的只有「开 / 关」。
+ */
+export const RACCOON_EFFORT_ON = 'on';
+/** 档位 id：**关闭**思考（`thinking:{type:'disabled'}`）。 */
+export const RACCOON_EFFORT_OFF = 'off';
+/**
+ * 档位展示名（DSH 直接渲染 `efforts[].name`，不本地化）。
+ *
+ * ⚠️ 用「开启 / 关闭」而非「深度思考 / 关闭思考」（用户 2026-09-28 要求：
+ * 「现在开启档位显示的深度思考，就显示开启就行了」）。
+ *
+ * 理由是**如实**：我们能表达的只有「思考开 / 关」这一个布尔维度，
+ * 没有任何强度档位（`reasoning_effort` 实测无效）。叫「深度思考」会让用户
+ * 以为存在「浅度思考」之类的其他档位可选，而实际上没有。
+ */
+export const RACCOON_EFFORT_NAMES = Object.freeze({
+    [RACCOON_EFFORT_ON]: '开启',
+    [RACCOON_EFFORT_OFF]: '关闭',
+});
+/**
+ * 该模型可选的思考档位（按展示顺序）。
+ *
+ * ⚠️ **所有 6 个可见模型都返回这两档** —— 实测 `extra_body.thinking` 是
+ * **provider 级方言**，与模型无关（`thinking.type` 的枚举在服务端全局一致）。
+ * 故不做 per-model 分派（那会是凭空猜测）。
+ */
+export const RACCOON_REASONING_EFFORTS = Object.freeze([
+    RACCOON_EFFORT_ON,
+    RACCOON_EFFORT_OFF,
+]);
+/**
+ * 默认档位 = `on`。
+ *
+ * 依据：实测「不发参数」与「显式 `{type:'enabled'}`」的思考量**等价**
+ *（均值 222 vs 218），即**服务端默认就是开启**。故默认标成 `on`
+ * 是**如实描述**，不是我们强行改变行为。
+ */
+export const RACCOON_DEFAULT_EFFORT = RACCOON_EFFORT_ON;
 /**
  * 兜底模型目录（6 个 `visible:true` 模型）。
  *
@@ -104,6 +195,10 @@ export const RACCOON = {
     clientPlatform: 'desktop-windows',
     clientVersion: 'v1.0.35',
     defaultCredentialRef: 'RACCOON_ACCESS_TOKEN',
+    // 实测该网关按**请求体字节**卡（`HTTP_413: request body exceeds 10MB`），
+    // 所以字节目标是主约束；像素预算保证图不至于大到压不进那个字节目标。
+    imagePixelBudget: 640_000,
+    imageMaxBytes: RACCOON_REQUEST_IMAGE_MAX_BYTES,
     phoneCipherSecret: RACCOON_PHONE_CIPHER_SECRET,
     aliyunCaptcha: { sceneId: '1pkmy0x3', prefix: 'hk1r5l' },
     fallbackModels: RACCOON_FALLBACK_MODELS,

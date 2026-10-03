@@ -317,6 +317,39 @@ export function isTruncatedArguments(raw) {
     }
 }
 /**
+ * 思考死循环中止的**错误码**。
+ *
+ * ## 为什么不复用 `max-tokens`（真实缺陷，Gitee !IKIZNK）
+ *
+ * 用户报障：循环守卫中断后，UI 显示
+ * 「**已达到输出 token 上限** / 回答被截断，已有输出保留在对话中。发送"继续"可让模型接着输出。」
+ *
+ * ⚠️ **这句话是错的，且误导方向**：DSH 客户端对 `max-tokens` 只有这一句**固定
+ * i18n 文案**（`dsh-client-ui-chat` 的 `message.maxTokens` / `.hint`），
+ * **不读适配器的任何 message**。于是「检测到死循环并主动止损」被显示成
+ * 「token 用满了」，用户既不知道真实原因，也被告知「继续就能接着输出」——
+ * 而实测继续之后往往**立刻再次进入同一循环**。
+ *
+ * 全库取证（219 会话，`scripts/probe-max-tokens-provenance.mjs`）：
+ * `finish=max-tokens` 的 35 步里 **25 步（71%）是循环守卫截断**，只有 5 步是
+ * 真的烧满额度。且这 25 步**全部**在截断后被迫由用户手动补「继续」
+ * （11× 「继续」、9× 「继续上面未完成的任务」，其中 2 次用户自己诊断出
+ * 「你陷入思考循环了」）。
+ *
+ * ## 为什么必须是**独立且不可重试**的码
+ *
+ * - **独立**：UI 的 `failureMessage()` 只对 `AUTH` / `QUOTA` / `ACCOUNT_QUOTA` /
+ *   `ACCOUNT_SIGNED_OUT` / `ACCOUNT_SIGN_IN_REQUIRED` 做文案替换，
+ *   **其余码一律原样显示我们给的 message**（`dsh-client-ui-chat/lib/client.js`
+ *   的 `failureMessage`）——故自定义码是「把真实原因送到用户眼前」的**唯一**通道。
+ * - **不可重试**：`REASONING_LOOP` **刻意不在** harness 的
+ *   `DEFAULT_RETRYABLE_CODES`（`EMPTY_RESPONSE` / `RATE_LIMIT` / `SERVER` /
+ *   `TIMEOUT` / `TRANSPORT`）里。死循环是**确定性**病理，白退避 5 次
+ *   （500/1000/2000/4000/8000 ≈ 15.5 秒）只会再烧一轮额度。
+ *   这与 `QUOTA_EXCEEDED` / `PERMISSION_DENIED` 的既有口径一致。
+ */
+export const REASONING_LOOP_CODE = 'REASONING_LOOP';
+/**
  * 归一化 `sliceChars`：非有限值（NaN / Infinity）回退默认值，并钳到 ≥1。
  *
  * ⚠️ **必须钳下限**：`observe` 用 `offset += sliceChars` 推进切片循环，
@@ -394,6 +427,14 @@ export function createReasoningLoopDetector(options = {}) {
     let runStart = 0;
     let runChars = 0;
     /**
+     * 命中瞬间的尾部窗口统计（供 {@link ReasoningLoopDiagnostics}）。
+     *
+     * ⚠️ **必须在 `feedPiece` 里就地记录**，不能等 `observe` 返回后再由调用方
+     * 复算 —— 那时 `text` 已继续增长，窗口统计会与真实判据不一致。
+     */
+    let hitLines = 0;
+    let hitDistinct = 0;
+    /**
      * 喂入一个**固定小片**并推进状态机。
      *
      * ⚠️ 判据的「持续体量」必须按**内部切片**累加，不能按调用方给的 delta 累加。
@@ -442,11 +483,25 @@ export function createReasoningLoopDetector(options = {}) {
             return false;
         detected = true;
         cutAt = runStart;
+        // 就地记录命中瞬间的窗口统计（见 hitLines / hitDistinct 的注释）。
+        hitLines = lines.length;
+        hitDistinct = new Set(lines).size;
         return true;
     }
     return {
         get detected() { return detected; },
         get cutAt() { return cutAt; },
+        get diagnostics() {
+            if (!detected)
+                return undefined;
+            return {
+                observedChars: text.length,
+                runChars,
+                lines: hitLines,
+                distinctLines: hitDistinct,
+                distinctLineRatio: hitLines === 0 ? 1 : hitDistinct / hitLines,
+            };
+        },
         observe(delta) {
             if (detected)
                 return false;
@@ -460,6 +515,66 @@ export function createReasoningLoopDetector(options = {}) {
             return false;
         },
     };
+}
+/**
+ * 构造思考死循环中止的**失败原因**（`finish` 报 `error`）。
+ *
+ * ## 文案要回答用户三个问题
+ *
+ * 用户要求（Gitee !IKIZNK）：
+ * > 如果只是陷入思考循环的出错，就要给出**有分辨力**的错误提示，
+ * > 现在用「达到输出 token 上限」是不对的
+ * > 提示中要加上**当前窗口还有多少可用**，没有真的占满可以尝试继续任务
+ *
+ * 故文案必须含：
+ * 1. **真实原因**：模型思考陷入病态重复，**不是** token 上限；
+ * 2. **额度实况**：本次只烧掉多少、还剩多少（证明"没有真的占满"）；
+ * 3. **可执行建议**：直接继续即可（因为额度还在），并提示若再次循环可降思考档位。
+ *
+ * ⚠️ **额度是估算**，必须如实标注：`observedChars` 是**字符数**、不是 token 数，
+ * 只有 `usage` 才给权威 token 数；而守卫命中时 `reader.cancel()` 已中止上游，
+ * `usage` 帧**往往根本没到达**（实测 25 例中 0 例带 usage）。
+ * 故用「按经验约 1 token ≈ 3.5 字符」估算，并明确写成「约」。
+ * 这个系数的选取依据：中文为主的思考文本实测 token/字符比约 1:1.5~1:2，
+ * 英文短句（`OK.` / `Hmm.` / `Let me write.` 这类循环体）约 1:4~1:5，
+ * 取 **3.5** 作为两者之间的保守中值 —— 宁可低估剩余额度，也不要让用户
+ * 以为还有很多而反复撞墙。
+ *
+ * @param diagnostics - 检测器给出的命中快照；**允许 undefined**（见下）。
+ * @param maxTokens - 本次请求的输出额度；undefined 表示上游未声明。
+ * @param channel - 命中通道（思考 / 正文），用于文案区分。
+ *
+ * ⚠️ `diagnostics` 允许 undefined 是**刻意的防御**：调用点写的是
+ * `loopGuard!.diagnostics!`，虽然当前实现下「`loopDetected === true` ⇒
+ * `diagnostics !== undefined`」恒成立（`loopDetected` 只在 `observe()` 返回 true
+ * 时置位），但**这里抛错会发生在 `finish` 路径上** —— 那是收尾的最后一步，
+ * 抛错会把「有分辨力的错误」变成「连 finish 都没有」的更糟故障。
+ * 故缺诊断信息时**降级成不带数值的文案**，而不是崩。
+ */
+export function reasoningLoopFailure(diagnostics, maxTokens, channel) {
+    const label = channel === 'reasoning' ? '思考' : '正文';
+    const parts = [
+        `模型${label}陷入病态重复，已中止本轮（**不是**输出 token 上限）。`,
+    ];
+    if (diagnostics !== undefined) {
+        parts.push(`判据：尾部 ${diagnostics.lines} 行里只有 ${diagnostics.distinctLines} 行不重复`
+            + `（去重率 ${diagnostics.distinctLineRatio.toFixed(3)}，阈值 <0.35），`
+            + `连续循环体量 ${diagnostics.runChars} 字符。`);
+    }
+    // ⚠️ 只有拿到 maxTokens 才能给「还剩多少」；拿不到就**不要编造**数字
+    // （与 `maxOutputTokens` 那条口径一致：三者皆无则不发该字段，不编造数值）。
+    if (diagnostics !== undefined && maxTokens !== undefined && maxTokens > 0) {
+        const usedTokens = Math.ceil(diagnostics.observedChars / 3.5);
+        const remaining = Math.max(0, maxTokens - usedTokens);
+        parts.push(`本次${label}仅产出约 ${diagnostics.observedChars} 字符（约 ${usedTokens} token），`
+            + `额度 ${maxTokens} token 中**还剩约 ${remaining}**（估算值）——`
+            + `额度没有占满，可以直接继续任务。`);
+    }
+    else {
+        parts.push(`额度没有占满，可以直接继续任务。`);
+    }
+    parts.push('若继续后再次陷入同一循环，建议降低思考档位或更换模型。');
+    return { message: parts.join(''), code: REASONING_LOOP_CODE };
 }
 /**
  * 解析 `DSH_REASONING_LOOP_GUARD`；**默认开启**。
@@ -479,49 +594,77 @@ export function isReasoningLoopGuardEnabled() {
     return resolveReasoningLoopGuardFlag(process.env.DSH_REASONING_LOOP_GUARD);
 }
 /**
- * `</think:hex>` 闭标签的匹配式（**区分大小写、hex 至少 1 位**）。
+ * **闭标签**匹配式（认 hex 后缀，也认裸闭标签）—— 用作思考/正文的分界。
  *
- * 刻意不做大小写兼容：实测 28 处标签**恒为小写**，放宽只会扩大误伤面
- * （`</THINK:…>` 从未出现过）。
+ * ⚠️ 2026-09-27 从 `<\/think:([0-9a-f]+)>` **放宽为兼容裸标签**。
+ * 放宽的依据是普查（`scripts/probe-think-forms.mjs`，41 会话全量）：
+ *
+ * | 形态 | 块数 | 含义 |
+ * |---|---|---|
+ * | `close-only-bare` | **38** | 裸 `</think>`（qoder/qfmodel 主形态）|
+ * | `close-only-hex` | 4 | 既有生产路径（workbuddy）|
+ * | `mixed-hex-and-bare` | 2 | 两种并存 |
+ * | `paired`（开+闭）| 2 | **配对格式** |
+ *
+ * 旧判据只认 hex → **38 + 2 + 2 = 42 处解析失败**，原文直接落盘泄漏给用户。
+ * 这正是用户指出的病根：**应先保证配对/闭标签被正确解析，过滤只是兜底**。
+ *
+ * ⚠️ 开标签 `<think>` **不参与定界**（实测恒缺失；仅见开标签无法判定思考边界）。
+ * 它只作为「思考段内的标签」被剔除 —— 故配对形态无需单独分支（见下方注释）。
  */
-const THINK_CLOSE_TAG_RE = /<\/think:([0-9a-f]+)>/g;
+const THINK_CLOSE_TAG_RE = /<\/think(?::[0-9a-f]+)?>/g;
 /**
- * 按 `</think:hex>` **闭标签**把正文拆成「思考 + 真正文」。
+ * **任意** think 标签（开或闭，含 hex）—— 仅用于**剔除**，不用于定界。
  *
- * ## 真实缺陷（用户报障，2026-09-25）
+ * 配对形态 `<think>思考</think>正文` 正是靠这条把开标签剔掉：
+ * 定界仍用最后一个闭标签 ⇒ 思考段 = `<think>思考` → 剔除标签 → `思考`。
+ */
+const THINK_ANY_TAG_RE = /<\/?think(?::[0-9a-f]+)?>/g;
+/**
+ * 按 **think 闭标签**把正文块拆成「思考 + 真正文」。
  *
- * `workbuddy/hy4-preview-f` 把**思考**写进 `content`（正文）通道，只在思考段
- * 末尾留一个 `</think:6124c78e>` 闭标签。实测该会话 93 步里只有 9 步的
- * reasoning 通道非空 —— 思考总量 9563 字符，而正文 64043 字符。
+ * ## 真实缺陷（用户报障，2026-09-25 / 2026-09-27 两次）
  *
- * 两个后果：
- *  1. 思考落在正文块里 → 思考死循环守卫（只喂 reasoning 增量）**完全看不见**
- *     → 该模型正文出现真循环（去重率 0.0412），实测三段
- *     （seq 34752 / 34768 / 34823，最长 34406 字符）；
- *  2. 用户界面上看到「模型把内心独白当正文输出」。
+ * **第一次**：`workbuddy/hy4-preview-f` 把**思考**写进 `content`（正文）通道，
+ * 只在思考段末尾留一个 `</think:6124c78e>` 闭标签。实测该会话 93 步里只有 9 步
+ * 的 reasoning 通道非空 —— 思考 9563 字符 vs 正文 64043 字符。后果：
+ * ① 思考落在正文块里 → 思考死循环守卫（只喂 reasoning 增量）**完全看不见**
+ * → 正文出现真循环（去重率 0.0412，实测 seq 34752/34768/34823，最长 34406 字符）；
+ * ② 用户看到「模型把内心独白当正文输出」。
  *
- * ## 实测形态（155 会话全量普查）
+ * **第二次**（用户报障，同一函数）：qoder/qfmodel 吐**裸** `</think>`（无 hex）。
+ * 旧判据只认 `</think:hex>` → 解析失败 → 标签原样落盘。
  *
- * | 项 | 值 |
- * |---|---|
- * | 含标签的步数 | 28（仅 2 个模型：`hy4-preview-f` 25、`workbuddy/deepseek-v4.1-flash` 3）|
- * | **开标签** | **0** |
- * | 闭标签 | 28（每步恰好 1 个）|
- * | hex | 恒为 `6124c78e`（会话级 id）|
- * | 标签前 | 内心独白（`让me check.` 重复），13~34364 字符 |
- * | 标签后 | **真正文**，13~56 字符 |
+ * ## 覆盖率（41 会话全量普查，`scripts/probe-think-forms.mjs`）
  *
- * ## 三个刻意的设计取舍
+ * | 形态 | 块数 | 旧判据 | 现判据 |
+ * |---|---|---|---|
+ * | `close-only-bare`（裸闭标签）| **38** | ❌ | ✅ |
+ * | `close-only-hex` | 4 | ✅ | ✅ |
+ * | `mixed-hex-and-bare` | 2 | ❌ | ✅ |
+ * | **`paired`（开+闭）** | 2 | ❌ | ✅ |
  *
- * 1. ⚠️ **以最后一个闭标签为界**，且**剔除思考段里的全部标签**：实测每步只有
- *    一个标签，但多标签时「以最后一个为界」才能保证正文完整 —— 若以第一个
- *    为界，第二个标签会留在正文里。
- * 2. ⚠️ **只认闭标签、不猜开标签**：实测开标签**恒缺失**。仅见开标签时无法
- *    确定「思考到哪结束」，**不切分**（保持原样）比猜错安全。
- * 3. ⚠️ **无标签时返回 `undefined`**（而非空切分结果）：调用方据此走原路径，
- *    保证 99.6% 的普通响应**逐字节不受影响**。
+ * ⇒ 旧判据漏 **42** 处（占 46 处中的 91%）。**这就是「解析做对」的价值** ——
+ * 若只靠事后过滤，这 42 处全都会把标签泄漏给用户。
  *
- * @returns 命中时返回切分结果；无闭标签时返回 `undefined`。
+ * ## 设计取舍（三条，都有实测依据）
+ *
+ * 1. ⚠️ **以最后一个闭标签为界**，且**剔除全部 think 标签**（开+闭）。
+ *    「最后一个」保证正文完整（以第一个为界会把后续标签留在正文里）；
+ *    「剔除全部」使**配对形态无需单独分支** ——
+ *    `<think>思考</think>正文` 定界于闭标签 ⇒ 思考段 = `<think>思考`
+ *    ⇒ 剔除标签 ⇒ `思考`。这正是「配对格式也能正确解析」的实现方式。
+ * 2. ⚠️ **开标签不参与定界、只被剔除**：实测**开标签常缺失**（28 处仅闭标签），
+ *    仅见开标签时无法判定「思考到哪结束」—— 此时**返回 undefined**（保持原样，
+ *    比猜错安全）。
+ * 3. ⚠️ **无闭标签时返回 `undefined`**（而非空切分结果）：调用方据此走原路径，
+ *    保证绝大多数普通响应**逐字节不受影响**。
+ *
+ * ⚠️ **引用语境必须排除**（`isQuotedThinkTag`）：模型**讨论**标签时（如
+ * `'</think>无 hex</think>'`）若被当分界，会把正文前半段误当思考移走。
+ * 实测 46 处标签里 **39 处处于引用语境**（反引号/单双引号/围栏），只有 7 处裸露。
+ *
+ * @returns 命中闭标签时返回切分结果；无闭标签时返回 `undefined`。
  */
 export function splitThinkTaggedContent(raw) {
     if (raw.length === 0)
@@ -535,39 +678,49 @@ export function splitThinkTaggedContent(raw) {
     if (last === undefined)
         return undefined;
     // ⚠️ **引用判据（不可省）**：标签可能只是被模型**讨论/复述**，而非泄漏分界。
-    // 实测 28 处 text 块标签里有 **3 处是反引号包裹的行内引用** —— 包括排查
-    // 本缺陷时会话里复述该标签字面量的正常正文。若只看「有没有标签」，会把
-    // 这类正文的前半段误当思考移走。
-    //
-    // 实测该判据分离度 **3/3 与 25/25 全部正确**：反引号包裹 ⇔ 引用。
+    // 实测 46 处标签里 39 处是引用（含排查本缺陷时我自己复述该字面量的正文）。
+    // 若只看「有没有标签」，会把这类正文的前半段误当思考移走。
     if (isQuotedThinkTag(raw, last.index))
         return undefined;
     const boundary = last.index;
     const textStart = boundary + last[0].length;
-    // 思考段里可能还残留更早的标签，一并剔除（否则会把标签当思考内容展示）。
-    const reasoning = raw.slice(0, boundary).replace(new RegExp(THINK_CLOSE_TAG_RE.source, 'g'), '');
+    // 思考段里可能残留更早的标签（含**开标签**与更早的闭标签），一并剔除 ——
+    // 这使配对形态 `<think>思考</think>正文` 无需单独分支。
+    const reasoning = raw.slice(0, boundary).replace(new RegExp(THINK_ANY_TAG_RE.source, 'g'), '');
     return { reasoning, text: raw.slice(textStart), textStart };
 }
 /**
- * 判断 `index` 处的标签是否处于**引用语境**（反引号 / 代码块），而非真泄漏。
+ * 判断 `index` 处的标签是否处于**引用语境**，而非真泄漏分界。
  *
  * ## 为什么必须有这条判据（实测依据）
  *
- * 普查 155 会话的全部 `text` 块标签（28 处），发现两类形态：
+ * 模型**讨论/复述**这个标签时，标签会被引号包裹。若把这类正文当分界切分，
+ * 会把**正文的前半段误当思考移走**（真实风险，不是理论风险）。
  *
- * | 形态 | 处数 | 标签前一非空字符 | 含义 |
- * |---|---|---|---|
- * | **行内引用** | 3 | 反引号 `` ` `` | 模型在讨论/复述该标签 |
- * | **真泄漏** | 25 | `.` / `。`（句子结尾）| 思考与正文的分界 |
+ * 全库普查 46 处标签（`scripts/probe-think-quote-detect.mjs`）：
  *
- * 判据「标签是否被反引号包裹」的分离度是 **3/3 与 25/25**，零交叉。
+ * | 语境 | 处数 |
+ * |---|---|
+ * | 反引号包裹 / span 内 | 40+ |
+ * | 单引号内（`'</think>无 hex</think>'`）| 25（与反引号共现）|
+ * | 双引号内 | 3 |
+ * | 代码围栏内 | 2 |
+ * | **裸露（真分界）** | **7** |
  *
- * ⚠️ 3 处引用里包含**排查本缺陷时我自己输出的正文**（复述 `</think:6124c78e>`
- * 这个字面量）—— 这正是「只看有没有标签会误伤」的直接证据。
+ * ⚠️ 其中包含**排查本缺陷时我自己输出的分析正文**（复述该字面量）——
+ * 这正是「只看有没有标签会误伤」的直接证据。
  *
- * 两种语境都认：
- * - **行内代码**：紧邻标签的字符是反引号（`` `</think:hex>` ``）；
- * - **围栏代码块**：标签之前存在**未闭合**的 ``` 围栏（奇偶计数）。
+ * ## 四种语境都认
+ *
+ * 1. **行内代码**：紧邻标签的字符是反引号（`` `</think>` ``）；
+ * 2. **反引号 span 内**：标签之前有**奇数个**反引号（`` `a</think>b` ``）；
+ * 3. **围栏代码块**：标签之前有**奇数个** ``` 围栏；
+ * 4. **同行引号内**：标签所在**行**内 `'` 或 `"` 的个数为奇数
+ *    （覆盖 `'</think>无 hex</think>'` 这类测试字符串复述）。
+ *
+ * ⚠️ 判据 4 会**误判含撇号的英文**（`don't use </think>` 的 `don't` 有一个 `'`）。
+ * 方向是**故意偏保守**：误判的后果是「该切分却没切分」（标签留在正文，
+ * 由 `stripBareThinkCloseTag` 兜底），而不是「把正文当思考移走」（不可逆的内容错位）。
  *
  * 只做廉价判定，不做完整 Markdown 解析 —— 判据只需覆盖实测形态。
  */
@@ -581,9 +734,21 @@ function isQuotedThinkTag(raw, index) {
     const tagEnd = raw.indexOf('>', index);
     if (tagEnd !== -1 && raw.slice(tagEnd + 1).trimStart().startsWith('`'))
         return true;
-    // ② 围栏代码块：标签之前有**奇数个** ``` 围栏（即处于未闭合的代码块内）。
+    // ② 反引号 span 内：标签之前有**奇数个**反引号（即处于未闭合的行内代码内）。
+    if ((before.match(/`/g) ?? []).length % 2 === 1)
+        return true;
+    // ③ 围栏代码块：标签之前有**奇数个** ``` 围栏。
     const fences = raw.slice(0, index).match(/```/g);
-    return fences !== null && fences.length % 2 === 1;
+    if (fences !== null && fences.length % 2 === 1)
+        return true;
+    // ④ 同行引号内：只数标签**所在行**的引号（跨行计数会误伤正常正文）。
+    const lineStart = before.lastIndexOf('\n') + 1;
+    const lineBefore = raw.slice(lineStart, index);
+    if ((lineBefore.match(/'/g) ?? []).length % 2 === 1)
+        return true;
+    if ((lineBefore.match(/"/g) ?? []).length % 2 === 1)
+        return true;
+    return false;
 }
 /**
  * ASCII 字母（仅用于「`course` 后接字母则不删」的保护面判定）。
@@ -792,5 +957,143 @@ export function stripCourseLeakFromHistoryContent(role, content) {
         return { ...block, text: stripped };
     });
     return changed ? cleaned : content;
+}
+/**
+ * 解析 `DSH_THINK_LEAK_STRIP`；**默认关闭**（与上文两个开关语义**相反**）。
+ *
+ * ## 为什么默认关（用户决定，2026-09-27）
+ *
+ * > 我们现在暂时不需要泄露过滤，代码可以保留，文档和注释记明白，后续再实际
+ * > 使用中看是否还有泄露问题。**加了过滤可能有思考解析失败但是被过滤我们
+ * > 发现不了。**
+ *
+ * 即：过滤是**兜底**，而兜底会**掩盖解析层的失败**。当前阶段的首要目标是
+ * 观测「解析是否真的做对了」—— 若把泄漏静默删掉，就永远不知道解析是否漏了。
+ * 故默认**不剥**，让泄漏**如实呈现**；确需应急时用 `DSH_THINK_LEAK_STRIP=1` 打开。
+ *
+ * ⚠️ **本开关只管「过滤」，不管「解析」**：
+ * - **解析**（`splitThinkTaggedContent` 认配对/hex/裸闭标签）**恒开**，不可关 ——
+ *   那是「把格式做对」，不是兜底。关掉它才是真缺陷（标签会进正文）。
+ * - **过滤**（`stripBareThinkCloseTag` 删纯标签块）默认关 —— 它只是兜底。
+ *
+ * ⚠️ 取值语义与 `resolveCourseLeakStripFlag` / `resolveReasoningLoopGuardFlag`
+ * **完全相反**（那两个默认开、显式假值才关）。故**必须**用独立的
+ * `isTruthyFlag`，绝不能混用 —— 混了会让本开关「默认开」，正好与意图相反。
+ */
+export function resolveThinkLeakStripFlag(raw) {
+    if (raw === undefined)
+        return false;
+    const value = raw.trim().toLowerCase();
+    return value === '1' || value === 'true' || value === 'yes' || value === 'on';
+}
+/** 裸标签泄漏过滤是否启用（读环境变量）。**默认 false**。 */
+export function isThinkLeakStripEnabled() {
+    return resolveThinkLeakStripFlag(process.env.DSH_THINK_LEAK_STRIP);
+}
+/**
+ * 按开关决定是否剥离纯裸标签块；**供适配器的 `block-end` 收尾处调用**。
+ *
+ * ⚠️ **默认不剥**（见 `resolveThinkLeakStripFlag` 的说明）：过滤会掩盖解析失败，
+ * 当前阶段需要让泄漏如实呈现以便观测。确需应急时设 `DSH_THINK_LEAK_STRIP=1`。
+ *
+ * ⚠️ 调用位置必须在 `splitThinkTaggedContent` **之后**：切分才负责「解析」，
+ * 本函数只负责「兜底删掉切分没处理掉的纯标签块」。
+ */
+export function stripBareThinkCloseTagIfEnabled(text) {
+    return isThinkLeakStripEnabled() ? stripBareThinkCloseTag(text) : text;
+}
+/**
+ * 剥离**纯裸 `</think>` 闭标签**的整块内容。
+ *
+ * ## 根因（2026-09-27）
+ *
+ * 模型单独吐出一个 **`\n</think>\n\n`** 的独立 text 块，既有逻辑只认
+ * `</think:hex>` → 漏网之鱼，把闭标签字面量当正文发回 Web。
+ *
+ * ## 判据设计
+ *
+ * - **纯裸闭标签**（去掉首尾空白与**全部裸标签**后为空）→ 返回**空串**；
+ * - **含正文的块**、引用语境、hex 标签 → **原样返回**（不做处理）。
+ *   原因：① 正文明确时保留原样由下游决定；② hex 标签交给
+ *   `splitThinkTaggedContent` 切分；③ 引用语境不能动（3/3 分离度）。
+ *
+ * ⚠️ **本函数是兜底，默认不启用**（见 `stripBareThinkCloseTagIfEnabled`）。
+ * 真正负责「把标签格式解析对」的是 `splitThinkTaggedContent`。
+ *
+ * @returns 纯裸闭标签块 → 空串；其余 → 原样返回。
+ */
+export function stripBareThinkCloseTag(text) {
+    const trimmed = text.trim();
+    // ① 引用语境检测：先查是否被反引号或代码块围栏包裹（必须放在前面）
+    if (/^`.*<\/think>.*`$/.test(trimmed))
+        return text;
+    let backtickCount = 0;
+    for (const ch of text)
+        if (ch === '`')
+            backtickCount++;
+    if (backtickCount % 2 === 1)
+        return text;
+    // ② 核心判定：去除首尾空白 + 全部裸标签 + 内部空白后，若结果为空则视为纯裸标签块
+    const stripped = trimmed.replace(/<\/think>/g, '').trim();
+    if (stripped.length === 0)
+        return '';
+    // ③ 其余情形原样返回（含 hex / 正文 / 变体）
+    return text;
+}
+/**
+ * 判定正文是否被**上游停止串**截断 —— 即「正文引用 `</think>` 导致对话中断」。
+ *
+ * ## 真实缺陷（用户报障，2026-09-27，本会话实时复现）
+ *
+ * 上游（Qwen 系，实测 `qoder/qfmodel`）把 **`</think>` 当停止串**。当模型在
+ * **正文里引用**这个标签（例如讨论它、写 `` `</think>` ``）时，服务端在
+ * `</think>` 处**掐断生成**，随后仍报 `finish_reason:"stop"` ——
+ * 我们据此判成「模型正常答完」，harness 认为本轮已完成 → **静默中断**。
+ *
+ * 三条实测证据（同一会话，`outputTokens` 极小 + 正文止于半句）：
+ *
+ * | 行 | 正文尾部 | outTok | 正要写 |
+ * |---|---|---|---|
+ * | 5378 | ``…清洗器只认 ` `` | 369 | `` `</think:hex>` `` |
+ * | 5412 | ``…多吐了一个孤立的裸 ` `` | 643 | `` `</think>` `` |
+ * | 5600 | `` 找到了，`trae-adapter.ts` 还没补 ` `` | **37** | `` `</think>` `` |
+ *
+ * ## 判据（为什么是「反引号奇数 + 以反引号收尾」）
+ *
+ * 模型写 `` `</think>` `` 时会**先输出开引号**，服务端在标签处掐断，
+ * 于是我们收到的正文**恰好止于一个未闭合的开引号**。两步判定：
+ *
+ * 1. **反引号总数为奇数** → 存在未闭合的行内代码；
+ * 2. **以反引号收尾** → 该未闭合的正是**最后一个**开引号。
+ *
+ * ⚠️ 第 2 步不可省：只有「奇数」时，未闭合的开引号可能在**中间**
+ * （`` `a` b ` `` 的反引号在末尾仍成立，但 `a\`b\` c\`` 这种更乱）；
+ * 而「奇数 **且** 以反引号收尾」可**证明**末字符是未配对的开引号
+ * （若末字符是闭引号，则它之前必然两两配对 ⇒ 总数为偶数，矛盾）。
+ *
+ * ⚠️ **不能用「以反引号结尾」单独判定**：正常的行内代码
+ * （`` 运行 `pnpm test` ``）也以反引号结尾，但配对完整。实测该粗判据
+ * 命中 9 处，其中 6 处是正常正文；本判据命中 3 处，**全部**是真截断。
+ *
+ * ⚠️ 本函数只管**文本形态**，是否据此上报「不完整」由调用方决定
+ * （还需结合 `finish_reason === 'stop'` 与本步**没有工具调用**）。
+ *
+ * @returns 疑似被停止串截断时返回 `true`。
+ */
+export function isProseTruncatedByStopString(text) {
+    if (text.length === 0)
+        return false;
+    const tail = text.trimEnd();
+    if (tail.length === 0)
+        return false;
+    // ① 反引号必须为奇数（存在未闭合的行内代码）
+    let ticks = 0;
+    for (const ch of tail)
+        if (ch === '`')
+            ticks += 1;
+    if (ticks % 2 === 0)
+        return false;
+    // ② 必须以未闭合的开引号收尾（或半个标签，服务端可能已吐出一部分）
+    return /`$/.test(tail) || /<$/.test(tail) || /<\/think$/.test(tail);
 }
 //# sourceMappingURL=sse.js.map

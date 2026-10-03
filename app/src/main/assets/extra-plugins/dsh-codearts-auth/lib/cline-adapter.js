@@ -28,10 +28,15 @@
  */
 import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 import { providerCatalogVisible } from './account-pool.js';
-import { settingsNamespaceFor } from './settings-compat.js';
+import { RemoteCatalogGate } from './remote-catalog-gate.js';
 import { isClineExpired, clineHeaders } from './cline.js';
-import { clineDisplayName, loadClineModels, } from './cline-models.js';
+import { clineDisplayName, hasClineRemoteModels, loadClineModels, } from './cline-models.js';
 import { CLINE, CLINE_CHAT_PATH, CLINE_DEFAULT_REASONING_EFFORT, CLINE_REASONING_EFFORTS, } from './cline-product.js';
+import { projectRequestImage } from './image-budget.js';
+import { applyModelsDevCatalog, makeClineModelsDevLoader } from './cline-models-dev.js';
+import { parseClineRouting } from './cline-routing.js';
+import { recordClineRequest } from './cline-request-log.js';
+import { registerAdapterIdempotent, } from './llm-register-compat.js';
 import { collectImages, consumeOpenAiSse, errorDetail, httpErrorCode, isTransportError, serializeMessages, } from './openai-compat.js';
 /** 本适配器注册的 provider 路由名（等价于 `CLINE.id`）。 */
 export const PROVIDER = 'cline';
@@ -129,11 +134,32 @@ export class ClineAdapter extends LlmAdapter {
     remoteModels;
     /** 正在进行中的目录加载（避免并发重复请求）。 */
     loading;
+    /**
+     * models.dev 目录（`模型 id → 条目`，含名字/窗口/图片能力）。
+     *
+     * ⚠️ `undefined` = **还没读到**（不是「空目录」）：读不到时目录照常工作，
+     * 只是少了它补的那几条。这条区分是整个模块的要点 ——
+     * 把「没读到」当「不支持」正是「支持图片的模型发不了图」那个缺陷的形态。
+     */
+    modelsDev;
+    /** 正在进行中的 models.dev 加载（并发去重）。 */
+    modelsDevLoading;
+    /** models.dev 加载器。 */
+    loadModelsDev;
+    /**
+     * 目录加载闸门：并发去重 + 失败/空结果冷却。
+     *
+     * 此前这里只有 in-flight 去重（`private loading`），失败后立刻允许重试 ⇒
+     * `buildModelCatalog` 的「每模型一次 resolveModel」会把一次失败放大成 N 次。
+     * 详见 `src/remote-catalog-gate.ts` 的实测依据。
+     */
+    catalogGate = new RemoteCatalogGate();
     constructor(options) {
         super();
         this.options = options;
         this.product = options.product ?? CLINE;
         this.fetchImpl = options.fetchImpl ?? fetch;
+        this.loadModelsDev = options.loadModelsDev ?? makeClineModelsDevLoader({ fetcher: this.fetchImpl });
     }
     /**
      * 描述本适配器拥有的 provider 路由。
@@ -150,9 +176,19 @@ export class ClineAdapter extends LlmAdapter {
     /**
      * 模型接受的输入模态。
      *
-     * 按**模型**判定（内嵌目录的 `capabilities` 含 `images`），不是按 provider
-     * 一刀切。未声明时**保守报 text**：宁可少报能力（用户改用文本描述），
-     * 也不要报一个服务端不认的模态（请求会失败）。
+     * 两级判据（**顺序不能颠倒**）：
+     * 判据是**目录条目上的 `supportsImage`**，而它有两个来源（优先级即顺序）：
+     * 1. **本地兜底表/内嵌目录**（`product.fallbackModels` 的策展条目）——
+     *    从官方客户端内嵌目录提取的，比社区目录权威；显式 `false` 也照样赢。
+     * 2. **models.dev**（`src/cline-models-dev.ts` 补进目录）—— 补前者覆盖不到的
+     *    模型（`cline-pass/*` 等）。
+     *
+     * ⚠️ **这是「支持图片的模型发不了图」的修复点**：修复前只看第 1 级，而它
+     * 全表只有 5 条 `cline-free/*` 条目 ⇒ `cline-pass/*` 等**全部**被播报成
+     * 纯文本 ⇒ DSH 根本不把图片送进来。详见 `src/cline-models-dev.ts`。
+     *
+     * ⚠️ 没有结论时保守报 `text`（宁可少报能力，也不要报一个服务端不认的模态）
+     * —— 注意这与「明确读到不支持」是两回事，但外部行为一致。
      */
     inputModalitiesFor(model) {
         const entry = this.remoteModels?.find((candidate) => candidate.id === model);
@@ -170,39 +206,82 @@ export class ClineAdapter extends LlmAdapter {
     async ensureRemoteModels() {
         if (this.remoteModels !== undefined)
             return;
-        if (this.loading !== undefined) {
-            await this.loading;
-            return;
-        }
-        this.loading = (async () => {
+        await this.catalogGate.run(async () => {
             try {
+                // 目录加载路径**没有**目标模型（它要一次列出全部模型），故不传 modelId：
+                // 空串在 `getAvailableAccount` 里是「不按模型过滤」的合法语义，正是这里要的。
                 const credential = await this.options.resolveCredential();
                 const load = this.options.loadModels ?? ((opts) => loadClineModels(this.product, {
                     ...opts.credential === undefined ? {} : { credential: opts.credential },
                     fetcher: this.fetchImpl,
                 }));
-                const { models, warnings } = await load({
+                const { models, warnings, remote } = await load({
                     ...credential === undefined ? {} : { credential },
                 });
-                if (models.length > 0)
-                    this.remoteModels = models;
+                // ⚠ **不能**用 `models.length === 0` 判断「没拿到目录」：`mergeClineModels`
+                // 会无条件把兜底表并进 `models`（展示需要），实测两个端点全挂时它仍是 5 条
+                // ⇒ 旧判据是死代码，冷却永不触发、兜底被永久当成远端结果缓存。
+                const gotRemote = remote !== undefined
+                    ? hasClineRemoteModels(remote)
+                    : models.length > 0;
+                let merged = models;
+                if (models.length > 0) {
+                    // ⚠️ **models.dev 是目录的第三个来源**（补缺的模型 + 可读名 + 上下文
+                    // 窗口 + 图片能力），必须在这里合并 —— 合并进目录后，
+                    // `inputModalitiesFor` 只看目录条目就够了（见其注释）。
+                    // 它失败不影响目录本身（只记日志）。
+                    merged = applyModelsDevCatalog(models, await this.ensureModelsDev());
+                }
                 // 目录部分失败时留下日志：静默降级会让用户看到「少了模型」却无从排查
                 // （两个端点独立容错，故这里只记 warning 不抛错）。
                 for (const warning of warnings) {
                     // eslint-disable-next-line no-console
                     console.warn(`[cline] 模型目录来源失败：${warning}`);
                 }
+                if (!gotRemote)
+                    return false;
+                this.remoteModels = merged;
+                return true;
+                return true;
             }
             catch (error) {
                 // 拉取失败保持未定义，后续 listModels/resolveModel 仍回退静态兜底表。
                 // eslint-disable-next-line no-console
                 console.warn(`[cline] 模型目录拉取失败：${error instanceof Error ? error.message : String(error)}`);
+                return false;
+            }
+        });
+    }
+    /**
+     * 懒加载 models.dev 目录，并发去重。
+     *
+     * ⚠️ **失败只记日志、返回空表**：拿不到就相当于「这一层没有补充」，
+     * 目录与图片能力都退回本地兜底表；下一次调用会重试（`TtlCache` 不缓存失败）。
+     * 它是**补充**信息，不能因为一次抖动就让整个 provider 不可用。
+     *
+     * @returns 读到的条目；失败返回空 Map（调用方无需区分）。
+     */
+    async ensureModelsDev() {
+        if (this.modelsDev !== undefined)
+            return this.modelsDev;
+        if (this.modelsDevLoading !== undefined) {
+            await this.modelsDevLoading;
+            return this.modelsDev ?? new Map();
+        }
+        this.modelsDevLoading = (async () => {
+            try {
+                this.modelsDev = await this.loadModelsDev();
+            }
+            catch (error) {
+                // eslint-disable-next-line no-console
+                console.warn(`[cline] models.dev 目录拉取失败（缺的模型与图片能力退回本地兜底表）：${error instanceof Error ? error.message : String(error)}`);
             }
             finally {
-                this.loading = undefined;
+                this.modelsDevLoading = undefined;
             }
         })();
-        await this.loading;
+        await this.modelsDevLoading;
+        return this.modelsDev ?? new Map();
     }
     /** 兜底目录（远端不可用时的静态表，含 5 个免费模型）。 */
     fallbackCatalog() {
@@ -233,7 +312,10 @@ export class ClineAdapter extends LlmAdapter {
         const source = this.remoteModels ?? this.fallbackCatalog();
         if (this.remoteModels === undefined)
             void this.ensureRemoteModels();
-        return source.map((model) => ({ id: model.id, name: clineDisplayName(model) }));
+        // ⚠️ 必须带上 `isFree`：Jet Hub 的模型列表要按「计费/来源」分组
+        // （订阅 / 免费 / Cloud / 按量计费），而**免费集合是远端动态下发的**
+        // （见 `cline-models.ts` 的并集规则）—— 让客户端按前缀猜会漂移。
+        return source.map((model) => ({ id: model.id, name: clineDisplayName(model), isFree: model.isFree }));
     }
     async listModels(_provider) {
         // ⚠️ 没有任何已登录账号时返回空数组 → DSH 的 `buildModelCatalog` 把整个
@@ -247,6 +329,8 @@ export class ClineAdapter extends LlmAdapter {
             return [];
         // 必须 await：冷缓存时目录尚未落地就返回，模型选择器会短暂显示错误的
         // 模型集合（Jet Hub 的模型开关也据此渲染）。
+        // ⚠️ 目录里**已经**并入 models.dev（补缺的模型 / 可读名 / 图片能力），
+        // 故这里不需要再单独 await 一次模态表。
         await this.ensureRemoteModels();
         const source = this.remoteModels ?? this.fallbackCatalog();
         // 用户在 Jet Hub 关闭的模型（黑名单制：不在表里即默认打开）。
@@ -267,6 +351,8 @@ export class ClineAdapter extends LlmAdapter {
         }));
     }
     async resolveModel(provider, model, _signal) {
+        // 目录里已并入 models.dev（名字 / 窗口 / 图片能力），故 `inputModalities`
+        // 与展示名在这一次 await 之后就都是最终值。
         await this.ensureRemoteModels();
         const source = this.remoteModels ?? this.fallbackCatalog();
         const entry = source.find((candidate) => candidate.id === model);
@@ -324,6 +410,11 @@ export class ClineAdapter extends LlmAdapter {
         }
         let imageUrls;
         if (imageRefs.size > 0) {
+            // ⚠️ 判定能力之前先把**目录**读进来（`resolveModel` 通常已 await 过，
+            // 这里命中缓存、不发请求）；`stream()` 也可能被直接调用而没有前置
+            // `resolveModel`，缺了这一步会把支持图片的模型误判成纯文本
+            // —— 那正是「支持图片的模型发不了图」的形态。
+            await this.ensureRemoteModels();
             if (!this.inputModalitiesFor(options.model).includes('image')) {
                 throw new LlmError(`cline: 模型 "${options.model}" 不支持图片输入`, 'UNSUPPORTED_CONTENT');
             }
@@ -333,18 +424,26 @@ export class ClineAdapter extends LlmAdapter {
             // 保留**空 Map**（而非降级为 undefined）：图片存在但全部读取失败时，
             // 空 Map 仍会让 userContentParts 产出 [image unavailable] 占位符。
             imageUrls = new Map();
+            const readImage = this.options.readImage;
             for (const [id, ref] of imageRefs) {
-                const image = await this.options.readImage(ref);
+                // ⚠️ 先试**请求版本**（缩放），拿不到才发原图。
+                // ⚠️ 先试**请求版本**（缩放），拿不到才发原图。
+                const projected = await projectRequestImage(ref, {
+                    readImageRequest: this.options.readImageRequest,
+                    pixelBudget: this.product.imagePixelBudget,
+                    maxBytes: this.product.imageMaxBytes,
+                });
+                const image = projected ?? await readImage(ref);
                 if (image === undefined)
                     continue;
                 imageUrls.set(id, `data:${image.mediaType};base64,${Buffer.from(image.data).toString('base64')}`);
             }
         }
         // 1. 获取凭据（过期则先静默续期）
-        let credential = await this.options.resolveCredential();
+        let credential = await this.options.resolveCredential(options.model);
         if (credential === undefined || isClineExpired(credential)) {
             await this.options.refresh();
-            credential = await this.options.resolveCredential();
+            credential = await this.options.resolveCredential(options.model);
         }
         if (credential === undefined || credential.access_token.length === 0) {
             throw new LlmError('cline: no usable credential; log in first', 'MISSING_CREDENTIAL');
@@ -388,12 +487,19 @@ export class ClineAdapter extends LlmAdapter {
             bodyObj.reasoning_effort = options.reasoningEffort;
         }
         const body = JSON.stringify(bodyObj);
+        // 计时起点:**首次发起请求**的时刻(图片读取/凭据解析不算 —— 那是本地开销,
+        // 记录的是「这笔请求等了多久」,与参考实现的 startedAt 同口径)。
+        const startedAt = Date.now();
         // 3. 发送请求（401/403 时刷新一次凭据后重试）
         //
         // ⚠️ **403 必须先排除「地域限制」**：它与凭据无关，续期在这里永远无用，
         // 且最终会被归成 AUTH（UI 显示「API 密钥无效」），真实原因彻底丢失。
         // 命中时直接抛出带真实原因的错误（见 isClineRegionForbidden）。
-        let currentAccountId = '';
+        // ⚠️ 用**账号池 id** 起步，**不是**凭据里的 `account_id`（`usr-…`）：
+        // 面板用 `cline.quota` 下发的池 id 过滤请求记录，用错 id 空间会让表格
+        // **永远空白**（真实缺陷，用户报障「请求记录中数据空白」）。
+        // ⚠️ 回调只用于**首次**确定起点，换号后由下面的局部变量跟进（与 Qoder 同因）。
+        let currentAccountId = this.options.currentAccountId?.() ?? '';
         let response = await this.send(credential, body, options);
         if (!response.ok && (response.status === 401 || response.status === 403)) {
             const forbiddenText = await response.text().catch(() => '');
@@ -401,7 +507,7 @@ export class ClineAdapter extends LlmAdapter {
                 throw new LlmError(`cline: ${errorDetail(forbiddenText)}`, 'PERMISSION_DENIED', { status: response.status });
             }
             await this.options.refresh();
-            const refreshed = await this.options.resolveCredential();
+            const refreshed = await this.options.resolveCredential(options.model);
             if (refreshed === undefined || refreshed.access_token.length === 0) {
                 throw new LlmError('cline: credential expired and refresh failed', 'AUTH', { status: response.status });
             }
@@ -433,7 +539,11 @@ export class ClineAdapter extends LlmAdapter {
                     currentAccountId = next.entry.id;
                     response = await this.send(credential, body, options);
                     if (response.ok) {
-                        yield* this.consume(response, options);
+                        yield* this.consumeWithLog(response, options, {
+                            model: options.model,
+                            accountId: currentAccountId.length > 0 ? currentAccountId : (credential.account_id ?? ''),
+                            startedAt,
+                        });
                         return;
                     }
                     errorText = await response.text().catch(() => '');
@@ -444,15 +554,146 @@ export class ClineAdapter extends LlmAdapter {
             }
             throw new LlmError(`cline: ${errorDetail(errorText)}`, httpErrorCode(response.status), { status: response.status });
         }
-        // 5. 消费 SSE 流
-        yield* this.consume(response, options);
+        // 5. 消费 SSE 流(并记录请求流水,见 consumeWithLog)
+        yield* this.consumeWithLog(response, options, {
+            model: options.model,
+            // ⚠️ **池 id 优先**：面板按 `cline.quota` 的池 id 过滤记录，用凭据里的
+            // `usr-…` 会让过滤恒空（表格永远空白）。只有**没有池账号**（回退到单凭据
+            // ref 的模式）时才退回 `usr-…` —— 那种模式下 `cline.quota` 同样没有账号
+            // 可翻页，记录查不到但至少不会张冠李戴。
+            accountId: currentAccountId.length > 0 ? currentAccountId : (credential.account_id ?? ''),
+            startedAt,
+        });
+    }
+    /**
+     * 消费 OpenAI 兼容 SSE 并**记录请求流水**（「订阅额度」面板的请求记录，
+     * 见 `src/cline-request-log.ts`）。
+     *
+     * 记录字段对齐参考实现（`github.com/codeOct/dsh-cline-pass` 的请求记录部分）：
+     * 总延迟、**首个内容块耗时（ttft）**、token 用量（含**思考 token** ——
+     * 它是解释「为什么等了这么久才出字」的关键数字：这个网关不流式输出思考内容，
+     * 思考量只出现在 usage 里）、失败原因。
+     *
+     * ⚠️ 与参考实现的**差异及理由**：
+     * - 不记 `ttfb`（响应体首字节）：本适配器只有单一网关、无 upstream 路由，
+     *   响应头到达与首块之间没有独立的「选路」阶段，展示位只剩两个 ——
+     *   表格显示「首块 / 总延迟」两个数即可。
+     * - 换号过程**不逐笔记**：只记**最终结果**一笔。参考实现会把 AUTH/QUOTA
+     *   的每次 attempt 都记成失败行；本适配器的 429 换号风暴（最多 3 轮）
+     *   会把 100 条上限刷满，而用户真正要看的是「这笔请求成了没、花了多少」，
+     *   「所有账号均不可用」这行已包含换号语义。
+     *
+     * ⚠️ **失败也必须记**：失败的请求是排查「为什么没回复」的第一线索
+     * （429 / 11140 安全策略 / 网络错误各是不同的原因）。记录本身绝不抛错
+     * （`recordClineRequest` 已兜底），记账失败不得反噬推理。
+     *
+     * @param meta - `accountId` 是**最终服务的那笔**账号（换号后即最后一个）。
+     */
+    async *consumeWithLog(response, options, meta) {
+        /** 首个内容块耗时；0 表示还没有任何块到达。 */
+        let ttftMs = 0;
+        /**
+         * 首个**正文**块耗时；0 = 本次没有任何正文（纯思考/纯 usage 的响应）。
+         *
+         * ⚠️ 与 `ttftMs` 是**两个时刻**：Cline 会流式下发思考增量
+         * （`delta.reasoning`），故「第一块」常常是思考块。展示层的「输出速率」
+         * 必须让分子分母落在**正文阶段**（`outputTokens − reasoningTokens`
+         * ÷ `totalMs − ttfcMs`），否则速率被无限放大 —— 用户报障的
+         * `11814.8 t/s` 正是这样来的（见 `src/cline-request-log.ts` 的 `ttfcMs`）。
+         */
+        let ttfcMs = 0;
+        /**
+         * usage 帧，**在它经过时捕获**：网关把它放在内容之后的最后一帧，
+         * 流结束才记账的前提是「这块真的被读到了」—— 若调用方中途 abort、
+         * 或上游提前断开，usage 帧可能永远没被消费到。此时**如实标为「未收到」**
+         * （`usageReported: false`），由展示层显示 `—` 而不是 `0`
+         * —— 0 会被读成「瞬间完成、没花 token」（参考实现同约定）。
+         */
+        let usage;
+        /**
+         * 网关报告的**真实上游渠道**（`alibaba` / `baseten` / `GMICloud` …）。
+         *
+         * ⚠️ 逐帧观测、**最后一次非空为准**（参考实现注释：路由元数据出现在
+         * 「携带它的那一帧」上）。读不到时留空串，展示层回落到模型命名空间
+         * —— 「记录成模型前缀」正是用户报障的「上游显示不正确」，见
+         * `src/cline-routing.ts`。
+         */
+        let upstream = '';
+        const observeFrame = (frame) => {
+            const found = parseClineRouting(frame);
+            if (found.length > 0)
+                upstream = found;
+        };
+        try {
+            for await (const chunk of this.consume(response, options, observeFrame)) {
+                if (ttftMs === 0)
+                    ttftMs = Date.now() - meta.startedAt;
+                // 正文块（文本 / 工具调用）才算「正文阶段」的起点：Cline 会先流式下发
+                // 思考增量（`delta.reasoning`），把思考块当成正文会让速率的分子分母
+                // 落在不同时间段（用户报障 11814.8 t/s 的根因）。
+                if (ttfcMs === 0 && (chunk.type === 'text-delta' || chunk.type === 'tool-call-delta')) {
+                    ttfcMs = Date.now() - meta.startedAt;
+                }
+                if (chunk.type === 'usage' && typeof chunk.usage === 'object' && chunk.usage !== null) {
+                    usage = {
+                        inputTokens: Number(chunk.usage.inputTokens ?? 0) || 0,
+                        outputTokens: Number(chunk.usage.outputTokens ?? 0) || 0,
+                        // 缓存命中/思考量：有值才带（表格的 ⚡ / 🧠 两项据此出现）。
+                        ...(typeof chunk.usage.cacheReadTokens === 'number' && chunk.usage.cacheReadTokens > 0
+                            ? { cacheReadTokens: chunk.usage.cacheReadTokens }
+                            : {}),
+                        ...(typeof chunk.usage.reasoningTokens === 'number' && chunk.usage.reasoningTokens > 0
+                            ? { reasoningTokens: chunk.usage.reasoningTokens }
+                            : {}),
+                    };
+                }
+                yield chunk;
+            }
+        }
+        catch (error) {
+            recordClineRequest({
+                model: meta.model,
+                accountId: meta.accountId,
+                usageReported: usage !== undefined,
+                inputTokens: usage?.inputTokens ?? 0,
+                outputTokens: usage?.outputTokens ?? 0,
+                ...(usage?.cacheReadTokens !== undefined ? { cacheReadTokens: usage.cacheReadTokens } : {}),
+                ...(usage?.reasoningTokens !== undefined ? { reasoningTokens: usage.reasoningTokens } : {}),
+                // 推理强度：**DSH 注入的原值**（未指定时空串 ⇒ 记录里少一行 tooltip）。
+                effort: options.reasoningEffort ?? '',
+                upstream,
+                ttftMs,
+                ttfcMs,
+                totalMs: Date.now() - meta.startedAt,
+                error: error instanceof Error ? error.message : String(error),
+            });
+            throw error;
+        }
+        recordClineRequest({
+            model: meta.model,
+            accountId: meta.accountId,
+            usageReported: usage !== undefined,
+            inputTokens: usage?.inputTokens ?? 0,
+            outputTokens: usage?.outputTokens ?? 0,
+            ...(usage?.cacheReadTokens !== undefined ? { cacheReadTokens: usage.cacheReadTokens } : {}),
+            ...(usage?.reasoningTokens !== undefined ? { reasoningTokens: usage.reasoningTokens } : {}),
+            // 推理强度：**DSH 注入的原值**（未指定时空串 ⇒ 记录里少一行 tooltip）。
+            effort: options.reasoningEffort ?? '',
+            upstream,
+            ttftMs,
+            ttfcMs,
+            totalMs: Date.now() - meta.startedAt,
+        });
     }
     /** 消费 OpenAI 兼容 SSE（共享实现）。 */
-    consume(response, options) {
+    consume(response, options, onFrame) {
         return consumeOpenAiSse(response, { ...options.signal === undefined ? {} : { signal: options.signal } }, {
             label: 'cline',
             firstTokenTimeoutMs: resolveFirstTokenTimeoutMs(),
             chunkTimeoutMs: resolveChunkTimeoutMs(),
+            ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
+            // 旁路观测网关路由元数据（真正服务这笔请求的上游渠道）。
+            ...onFrame === undefined ? {} : { onFrame },
         });
     }
     /** 发起一次 chat 请求；网络失败映射为可重试的 TRANSPORT 错误。 */
@@ -560,22 +801,15 @@ const CLINE_REGION_FORBIDDEN_MARKERS = [
 /**
  * 在 `ctx.llm` 上注册 Cline provider 路由与适配器。
  *
- * 路由名与配置页展示名由产品配置驱动，得到 `cline`。`settingsNs` 经
- * `settingsNamespaceFor()` 解析：老契约（≤0.1.6）下是 `llm-cline`；
- * 0.1.7-rc.1 起 settings 命名空间只能是 profile 条目 id，故解析为本插件条目 id。
+ * 路由名与展示名由产品配置驱动，得到 `cline`。
+ *
+ * ⚠️ 刻意**不**向 DSH 声明可配置 provider（`registerConfigurableProviders`）——
+ * 详见 `llm-register-compat.ts` 模块头。
  */
 export function registerClineLlm(ctx, options) {
     const product = options.product ?? CLINE;
-    ctx.llm.registerConfigurableProviders([
-        {
-            provider: product.id,
-            displayName: product.displayName,
-            settingsNs: settingsNamespaceFor(ctx, `llm-${product.id}`),
-            settingsPath: [],
-        },
-    ]);
     const adapter = new ClineAdapter(options);
-    ctx.llm.registerAdapter([product.id], adapter);
+    registerAdapterIdempotent(ctx.llm, [product.id], adapter);
     // 返回实例：Jet Hub「显示列表」需要 `listAllModels()`（不受黑名单影响、
     // 带最终展示名）。`ctx.llm` 不透传自定义方法，须由调用方持有引用。
     return adapter;

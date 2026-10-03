@@ -60,6 +60,7 @@ export function fuseDeadline(upstream, timeoutMs, code) {
       return { reason: "exit" };
     },
     dispose() {
+      if (disposed) return;
       disposed = true;
       if (timer) clearTimeout(timer);
       if (upstream) upstream.removeEventListener("abort", onUpstream);
@@ -170,6 +171,8 @@ function streamFacts(entry) {
       : { status: "not-evaluated", reason: "端口只提供已解码文本，无法做字节级编码诊断" }
   };
   if (entry.spillPath) out.spillPath = String(entry.spillPath);
+  if (entry.totalBytes !== undefined) { out.bytes = entry.totalBytes; out.totalBytes = entry.totalBytes; }
+  if (entry.windowOffset !== undefined) out.windowOffset = entry.windowOffset;
   return out;
 }
 
@@ -193,96 +196,105 @@ export async function runGoverned(request, ports) {
   if (!request || typeof request !== "object") throw new TypeError("request must be an object");
   if (!ports || typeof ports.spawn !== "function") throw new TypeError("ports.spawn is required");
   const req = request;
-  const graceMs = Number(ports.graceMs === undefined ? 3000 : ports.graceMs);
+  const graceMs = Math.max(0, Number(ports.graceMs === undefined ? 3000 : ports.graceMs));
   const timeoutMs = Number(req.timeoutMs === undefined ? 120000 : req.timeoutMs);
   const effective = req.onExpiry === "none" ? 0 : timeoutMs;
   const deadline = fuseDeadline(req.signal, effective, "GOVERNED_TIMEOUT");
-  const diagnostics = { termination: null, survivors: null, cleanup: { terminateCalled: false, waitForExit: null } };
+  const started = performance.now();
+  const diagnostics = { termination: null, survivors: null, cleanup: { terminateCalled: false, waitForExit: null }, timings: {} };
   let handle = null;
   let spawnError = null;
   let settled = null;
-
+  let onAbort;
+  const errorText = (error) => String(error?.message || error);
+  const cleanupRange = async () => {
+    diagnostics.cleanup.terminateCalled = true;
+    try { await handle.terminate(); }
+    catch (error) { diagnostics.cleanup.terminateError = errorText(error); }
+    try { diagnostics.cleanup.waitForExit = await handle.waitForExit(graceMs); }
+    catch (error) { diagnostics.cleanup.waitForExitError = errorText(error); }
+  };
+  // Clear the losing timer: a fast exit must not leave a grace timer alive.
+  const boundedOutcome = async (done) => {
+    let timer;
+    try {
+      return await Promise.race([done, new Promise((resolve) => {
+        timer = setTimeout(() => resolve({ kind: "still-running" }), graceMs);
+      })]);
+    } finally { clearTimeout(timer); }
+  };
   try {
-    handle = await ports.spawn({ ...req, signal: deadline.signal, timeoutMs });
-  } catch (error) {
-    spawnError = String((error && error.message) || error);
-  }
-
-  if (handle) {
-    const deadlineHit = new Promise((resolve) => {
-      if (deadline.signal.aborted) return resolve({ kind: "deadline" });
-      deadline.signal.addEventListener("abort", () => resolve({ kind: "deadline" }), { once: true });
-    });
-    settled = await Promise.race([
-      handle.done.then((outcome) => ({ kind: "outcome", outcome }), (error) => ({ kind: "error", error })),
-      deadlineHit
-    ]);
-    if (settled.kind === "deadline") {
-      try { await handle.terminate(); diagnostics.cleanup.terminateCalled = true; }
-      catch (error) { diagnostics.cleanup.terminateError = String((error && error.message) || error); }
-      let emptied = null;
-      try { emptied = await handle.waitForExit(graceMs); }
-      catch (error) { diagnostics.cleanup.waitForExitError = String((error && error.message) || error); }
-      diagnostics.cleanup.waitForExit = emptied;
-      settled = await Promise.race([
-        handle.done.then((outcome) => ({ kind: "outcome", outcome }), (error) => ({ kind: "error", error })),
-        new Promise((resolve) => setTimeout(() => resolve({ kind: "still-running" }), graceMs))
-      ]);
+    try {
+      if (deadline.signal.aborted) settled = { kind: "not-started" };
+      else handle = await ports.spawn({ ...req, signal: deadline.signal, timeoutMs });
+    } catch (error) { spawnError = errorText(error); }
+    diagnostics.timings.spawnMs = performance.now() - started;
+    if (handle) {
+      const done = Promise.resolve(handle.done).then(
+        (outcome) => ({ kind: "outcome", outcome }),
+        (error) => ({ kind: "error", error })
+      );
+      const deadlineHit = new Promise((resolve) => {
+        onAbort = () => resolve({ kind: "deadline" });
+        if (deadline.signal.aborted) onAbort();
+        else deadline.signal.addEventListener("abort", onAbort, { once: true });
+      });
+      settled = await Promise.race([done, deadlineHit]);
+      // Freeze exit attribution before cleanup so a late deadline cannot turn a
+      // completed command into a timeout. Cancellation still wins while waiting.
+      diagnostics.completionCause = deadline.cause().reason;
+      deadline.dispose();
+      if (settled.kind === "deadline" || settled.kind === "error") {
+        await cleanupRange();
+        if (settled.kind === "deadline") settled = await boundedOutcome(done);
+      } else if (typeof handle.waitForExit === "function") {
+        try { diagnostics.cleanup.waitForExit = await handle.waitForExit(0); }
+        catch (error) { diagnostics.cleanup.waitForExitError = errorText(error); }
+        if (diagnostics.cleanup.waitForExit === false) await cleanupRange();
+      }
+      if (settled.kind === "error") spawnError = errorText(settled.error);
+      if (settled.kind === "outcome" && settled.outcome?.error) spawnError = errorText(settled.outcome.error);
+      diagnostics.cleanup.scope = handle.scope || "port-managed";
+      if (typeof ports.observeSurvivors === "function") {
+        try { diagnostics.survivors = await ports.observeSurvivors(handle.pid); }
+        catch (error) { diagnostics.survivors = { error: errorText(error) }; }
+      }
     }
-    if (settled.kind === "error") spawnError = spawnError || String((settled.error && settled.error.message) || settled.error);
-    if (typeof ports.observeSurvivors === "function") {
-      try { diagnostics.survivors = await ports.observeSurvivors(handle.pid); }
-      catch (error) { diagnostics.survivors = { error: String((error && error.message) || error) }; }
+    const cause = deadline.cause();
+    const outcome = settled?.kind === "outcome" ? settled.outcome : null;
+    const raw = handle && typeof handle.output === "function" ? await handle.output() : {};
+    const streams = {};
+    for (const name of ["stdout", "stderr"]) {
+      streams[name] = streamFacts({ bytes: raw[name + "Bytes"], text: raw[name + "Text"], truncated: raw[name + "Truncated"], spillPath: raw[name + "SpillPath"], totalBytes: raw[name + "TotalBytes"], windowOffset: raw[name + "WindowOffset"] });
     }
+    const reason = spawnError ? "spawn-error" : (diagnostics.completionCause || cause.reason);
+    diagnostics.termination = { reason, cause: diagnostics.completionCause || cause.reason, settledKind: settled?.kind || "no-handle", timedOut: reason === "timeout", aborted: reason === "cancelled" };
+    diagnostics.exit = describeExit(outcome, request.exitPlatform);
+    const survivorCount = Array.isArray(diagnostics.survivors) ? diagnostics.survivors.length : null;
+    const rangeEmpty = diagnostics.cleanup.waitForExit;
+    const status = survivorCount > 0 || rangeEmpty === false ? "survivors-detected"
+      : handle?.scope === "root-only" && survivorCount === null ? "not-evaluated"
+      : !diagnostics.cleanup.terminateCalled ? "not-required"
+      : survivorCount === 0 ? "clean" : "not-evaluated";
+    diagnostics.orphanCheck = { status, survivorCount, rangeEmpty,
+      note: status === "clean" ? "终止后独立观测未发现残留"
+        : status === "survivors-detected" ? "命令已结束但受管范围内仍有存活进程：治理未达成"
+        : status === "not-evaluated" ? "未提供独立观测端口，无法证明受管范围已清空"
+        : "本次未触发终止，不适用" };
+    return {
+      governanceVersion: GOVERNANCE_VERSION,
+      ok: status !== "survivors-detected",
+      pid: handle ? handle.pid : null,
+      outcome: outcome ? { exitCode: outcome.exitCode ?? null, signal: outcome.signal ?? null } : { exitCode: null, signal: null },
+      streams, timeoutMs, timerArmed: effective > 0, reason, spawnError, diagnostics
+    };
+  } finally {
+    deadline.dispose();
+    if (onAbort) deadline.signal.removeEventListener("abort", onAbort);
+    if (handle && typeof handle.release === "function") {
+      try { await handle.release(); diagnostics.cleanup.released = true; }
+      catch (error) { diagnostics.cleanup.releaseError = errorText(error); }
+    }
+    diagnostics.timings.totalMs = performance.now() - started;
   }
-
-  const cause = deadline.cause();
-  const outcome = settled && settled.kind === "outcome" ? settled.outcome : null;
-  const raw = handle && typeof handle.output === "function" ? handle.output() : {};
-  const streams = {
-    stdout: streamFacts({ bytes: raw.stdoutBytes, text: raw.stdoutText, truncated: raw.stdoutTruncated, spillPath: raw.stdoutSpillPath }),
-    stderr: streamFacts({ bytes: raw.stderrBytes, text: raw.stderrText, truncated: raw.stderrTruncated, spillPath: raw.stderrSpillPath })
-  };
-  const reason = spawnError ? "spawn-error" : cause.reason === "exit" && settled && settled.kind === "still-running" ? "timeout" : cause.reason;
-  diagnostics.termination = { reason, cause: cause.reason, settledKind: settled ? settled.kind : "no-handle", timedOut: reason === "timeout", aborted: reason === "cancelled" };
-  diagnostics.exit = describeExit(outcome, request.exitPlatform);
-  const survivorCount = Array.isArray(diagnostics.survivors) ? diagnostics.survivors.length : null;
-  const terminateCalled = diagnostics.cleanup.terminateCalled;
-  const rangeEmpty = diagnostics.cleanup.waitForExit;
-  // 观测到残留就是残留，与“本次是否需要终止”无关：
-  // 根进程正常退出、把子进程留在受管范围里，同样是孤儿，不能判 ok。
-  const orphanStatus = survivorCount !== null && survivorCount > 0
-    ? "survivors-detected"
-    : !terminateCalled
-      ? "not-required"
-      : survivorCount === 0
-        ? "clean"
-        : "not-evaluated";
-  diagnostics.orphanCheck = {
-    status: orphanStatus,
-    survivorCount,
-    rangeEmpty,
-    note: orphanStatus === "clean"
-      ? "终止后独立观测未发现残留"
-      : orphanStatus === "survivors-detected"
-        ? (terminateCalled ? "终止后仍观测到残留进程：治理未达成" : "命令已结束但受管范围内仍有存活进程：治理未达成")
-        : orphanStatus === "not-evaluated"
-          ? "未提供独立观测端口，无法证明受管范围已清空"
-          : "本次未触发终止，不适用"
-  };
-  const ok = orphanStatus !== "survivors-detected" && rangeEmpty !== false;
-  deadline.dispose();
-
-  return {
-    governanceVersion: GOVERNANCE_VERSION,
-    ok,
-    pid: handle ? handle.pid : null,
-    outcome: outcome ? { exitCode: outcome.exitCode === undefined ? null : outcome.exitCode, signal: outcome.signal === undefined ? null : outcome.signal } : { exitCode: null, signal: null },
-    streams,
-    timeoutMs,
-    timerArmed: effective > 0,
-    reason,
-    spawnError,
-    diagnostics
-  };
 }

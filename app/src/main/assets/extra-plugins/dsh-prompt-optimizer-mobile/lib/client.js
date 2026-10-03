@@ -19,7 +19,7 @@
 // 与宿主控制 API 的约定（见 lib/control-api.js）：**写操作必须带 `x-po06: 1`**
 // —— 自定义头会触发 CORS 预检，而服务端从不回 CORS 头 ⇒ 跨站写在预检阶段就被浏览器拦掉。
 window.__ModuleLoader__.load({
-  id: 'dsh-prompt-optimizer-mobile',
+  id: '@dsh-external/dsh-arbiter-wf',
   factory: (require) => {
     var module = { exports: {} }
     var exports = module.exports
@@ -28,8 +28,35 @@ window.__ModuleLoader__.load({
     const React = require('react')
     const h = React.createElement
 
-    const NS = 'prompt-optimizer'
+    const NS = 'dsh-po06'
     const API = '/po06/api'
+    // ── 拦截态的**跨挂载小仓库**（issue #19）───────────────────────────────
+    // 控件栏是 per-session 挂载的：切到别的会话再回来会**重挂**，组件内的 hold 归零。
+    // 原先的做法是把 hold 顺手写一份到 `window.__PO06_HOLD__[sessionId]`，但那只在**挂载时**读一次；
+    // 于是"切走 → 解释在后台跑完 → 切回"这条路径上，完成结果是写进了桥、却没有任何东西再读它 ——
+    // 用户看到的就是"这一轮没有继续，也没有产出"。
+    // 现在把桥收敛成三个函数：写入即广播，订阅者按 sessionId 认领。
+    // 它**只按会话隔离**（绝不把 A 会话的拦截态显示到 B 会话），且桥不可用时静默降级（不影响本轮）。
+    const HOLD_BRIDGE_EVENT = NS + ':hold'
+    function holdBridgeRead(sessionId) {
+      try { return (window.__PO06_HOLD__ || {})[sessionId] || null } catch { return null }
+    }
+    function holdBridgeWrite(sessionId, value) {
+      if (!sessionId) return
+      try {
+        const b = window.__PO06_HOLD__ || (window.__PO06_HOLD__ = {})
+        if (value) b[sessionId] = value
+        else delete b[sessionId]
+      } catch { return }        // 桥写不进去就不广播（否则订阅者会读到旧值）
+      try { window.dispatchEvent(new CustomEvent(HOLD_BRIDGE_EVENT, { detail: { sessionId } })) } catch { /* 老环境没有 CustomEvent：本组件自己的状态仍然可用 */ }
+    }
+    /** 订阅某会话的拦截态变化；返回退订函数（挂载期用，卸载必须退订）。 */
+    function holdBridgeOn(sessionId, cb) {
+      const on = (e) => { if (e && e.detail && e.detail.sessionId === sessionId) cb(holdBridgeRead(sessionId)) }
+      try { window.addEventListener(HOLD_BRIDGE_EVENT, on) } catch { return () => {} }
+      return () => { try { window.removeEventListener(HOLD_BRIDGE_EVENT, on) } catch { /* 退不掉也不影响本轮 */ } }
+    }
+
     const WRITE_HEADERS = { 'content-type': 'application/json', 'x-po06': '1' }
     const INSTANCE_TOKEN = NS + '#' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7)
 
@@ -199,6 +226,11 @@ window.__ModuleLoader__.load({
         + block('[data-po06][data-po06-theme="dark"]', THEME_TOKENS.dark)   // 标记在自己身上
         + block('[data-po06-theme="dark"] [data-po06]', THEME_TOKENS.dark)  // 标记在祖先上（后代元素）
         + block('[data-ds-dark-theme] [data-po06]', THEME_TOKENS.dark)      // DSH 自己的深色属性
+        // ⚠ 浅色必须**显式**写、而且放在最后（2026-09-30 用户：「只有黑色模式」）：
+        //   上面那条「祖先深色 ⇒ 后代深色」与它是**同权重**，只能靠先后顺序决胜；
+        //   少了这两条，一个声明了 light 的卡片落在深色祖先里就再也翻不回浅色。
+        + block('[data-po06][data-po06-theme="light"]', THEME_TOKENS.light)
+        + block('[data-po06-theme="light"] [data-po06]', THEME_TOKENS.light)
     }
 
     // P11 浮层的配色 token：**逐条取自 0.5 的那张 CSS**（0.5:3259-3272 的自定义属性 + 各处的
@@ -233,6 +265,44 @@ window.__ModuleLoader__.load({
       if (v >= 1000) return (v / 1000).toFixed(1) + 'k'
       return String(v)
     }
+    /**
+     * 用量归一化（**容错**）：既认归一化后的 `{in,out,cache,total}`，也认 provider 原始字段。
+     *
+     * 为什么必须容错（2026-10-01 真机 bug）：同一个页脚会从两条路拿到用量——
+     *   · `presentationMeta.usage`：宿主侧已用 advisor.js 的 usageParts() 归一化过；
+     *   · `run.result.usage`（进度记录）：那是 **provider 原始字段**
+     *     `{inputTokens,outputTokens,cacheReadTokens,totalTokens}`。
+     * 卡片原先优先取后者 ⇒ usageText 认的四个键全 undefined ⇒ 页脚恒显 `Σ — tok`。
+     * 修在格式化的入口（而不是各调用点）：这样**已经落盘的旧记录**也一并修好，不必重跑咨询。
+     * 只做字段改名，**不折算、不估算**：拿不到的项仍然是 null → 显示 `—`。
+     */
+    const normalizeUsage = (u) => {
+      if (!u || typeof u !== 'object') return null
+      const num = (...keys) => {
+        for (const k of keys) if (typeof u[k] === 'number' && Number.isFinite(u[k])) return u[k]
+        return null
+      }
+      const inp = num('in', 'inputTokens', 'prompt_tokens', 'promptTokens', 'uncachedInputTokens')
+      const out = num('out', 'outputTokens', 'completion_tokens', 'completionTokens')
+      const cache = num('cache', 'cacheReadTokens', 'cachedTokens', 'cached_tokens', 'prompt_cache_hit_tokens')
+      const t0 = num('total', 'totalTokens', 'total_tokens')
+      // 合计**只认 provider 给的**；没给就不替它算（保持“不估算”口径，宁可显示 —）。
+      const total = t0
+      if (inp == null && out == null && cache == null && total == null) return null
+      return { in: inp, out, cache, total }
+    }
+    /**
+     * 用量文案：**只显示 provider 真给的字段，不折算、不估算**（拿不到的项显示 `—`）。
+     * 解释层的拦截浮层与顾问卡片页脚共用同一套口径（2026-09-30 抽出，原先只有浮层里那份内联实现）。
+     */
+    const usageText = (rawUsage, withTotal) => {
+      const u = normalizeUsage(rawUsage)
+      if (!u) return 'Σ — tok'
+      return (withTotal && u.total != null ? 'Σ ' + fmtTok(u.total) + ' tok | ' : 'Σ ') + L('入', 'in') + ' ' + fmtTok(u.in)
+        + ' · ' + L('出', 'out') + ' ' + fmtTok(u.out)
+        + ' · ' + L('缓存', 'cache') + ' ' + fmtTok(u.cache)
+        + ' tok'
+    }
 
     // ── 与宿主 API 的薄封装 ───────────────────────────────────────────
     // 两条都不许把 raw 异常抛到调用方：网络层失败也要变成**可读原因**
@@ -257,6 +327,21 @@ window.__ModuleLoader__.load({
     // ── 把任何失败都变成"人话" ────────────────────────────────────────
     // 已知原因给固定说法，未知原因截断到一行——**绝不允许 raw 异常冒到界面**。
     const briefly = (v) => String(v == null ? '' : v).replace(/\s+/g, ' ').trim().slice(0, 120)
+    /**
+     * 宿主尚未加载该项时的**可执行**提示（2026-09-27）。
+     *
+     * 现象：设置其实写成功了（ok:true），但 problems 里有 not-session-scoped / unknown-field，
+     * 界面按默认回退 —— 用户看到的是「已保存，但…按默认处理」，然后值自己弹回去，像坏了一样。
+     * 真因几乎总是**宿主仍跑旧模块**（热重载只清 1 个模块，依赖仍走缓存）。
+     * 与其让用户面对一个静默回退，不如直接说清该怎么办。
+     */
+    function staleSchemaHint(problems) {
+      const hit = (problems || []).some((x) => /not-session-scoped|unknown-field/.test(String((x && x.kind) || ''))
+        || /^bySession\[/.test(String((x && x.key) || '')))
+      return hit
+        ? L('（当前宿主还没加载这一项：重启 DSH 后生效）', ' (the host has not loaded this setting yet — restart DSH)')
+        : ''
+    }
     function reasonText(reason) {
       const raw = briefly(reason)
       const http = /^http-(\d+)$/.exec(raw)
@@ -290,7 +375,11 @@ window.__ModuleLoader__.load({
       return [state, tick]
     }
 
-    const useStatus = () => usePoll(React.useCallback(() => apiGet('/status'), []), 15000)
+    // ⚠ 0.7.7：带上 session —— 档位改成会话级后，界面必须读【本会话生效的档位】，
+//   而不是全局那个（否则 A 会话设成关闭、B 会话的界面也跟着显示关闭）。
+const useStatus = (sessionId) => usePoll(React.useCallback(
+  () => apiGet('/status' + (sessionId ? ('?session=' + encodeURIComponent(sessionId)) : '')),
+  [sessionId]), 15000)
     const useTurns = (n) => usePoll(React.useCallback(() => apiGet('/turns?limit=' + n), [n]), 15000)
     const useState_ = (sid) => usePoll(
       React.useCallback(() => (sid ? apiGet('/state?session=' + encodeURIComponent(sid)) : Promise.resolve(null)), [sid]),
@@ -316,6 +405,14 @@ window.__ModuleLoader__.load({
       return [state, run]
     }
 
+    // ── 浮层层级：**唯一来源**（issue #18）─────────────────────────────────
+    // 背景（报告者给的实测数值）：第三方右侧边栏把统一面板宿主挂在 `document.body`、`z-index: 25`，
+    // 它自己的浮窗是 `z-index: 90`；app 的 overlay stack 在 100+。
+    // 本插件原先的浮层是 60/70/80/88 —— **即使不被裁进层叠上下文，也压不过 90/100+**。
+    // 所以统一抬到 1000 段，并保持原有的相对次序（选项弹层 < 帮助 < 拦截浮层 < 悬浮球）。
+    // ⚠ `position: fixed` 若落在有 transform/filter 的祖先里仍会被关在那层上下文内；
+    //   真正的治本做法是 portal 到 document.body（需要 react-dom，未在本机浏览器实测）——留在 issue 里跟进。
+    const OV_Z = { pop: 1000, help: 1010, panel: 1020, ov: 1030, ball: 1040 }
     // ── 共用的样式与小部件 ───────────────────────────────────────────
     const S = {
       chip: { display: 'inline-flex', alignItems: 'center', gap: '6px', padding: '2px 8px', borderRadius: '10px',
@@ -324,7 +421,7 @@ window.__ModuleLoader__.load({
       dot: (on) => ({ width: '7px', height: '7px', borderRadius: '50%', background: on ? OVS.ok : OVS.cap }),
       panel: { position: 'fixed', right: '16px', bottom: '84px', width: '420px', maxHeight: '70vh', overflow: 'auto',
         background: OVS.surface, color: OVS.fg,
-        border: '1px solid ' + OVS.line, borderRadius: '12px', padding: '14px', zIndex: 60,
+        border: '1px solid ' + OVS.line, borderRadius: '12px', padding: '14px', zIndex: OV_Z.panel,
         boxShadow: T('shadow'), fontSize: '13px' },
       row: { display: 'flex', gap: '8px', alignItems: 'center', margin: '6px 0' },
       label: { minWidth: '92px', color: OVS.fg2 },
@@ -333,36 +430,15 @@ window.__ModuleLoader__.load({
       btn: { padding: '4px 10px', borderRadius: '6px', border: '1px solid ' + OVS.line,
         background: 'transparent', color: 'inherit', cursor: 'pointer' },
       // ── 「优化选项」入口与弹出面板（极简：一个按钮 + 一块克制的卡片）──────────
-      // dsh-launcher fork：窄屏修复 —— 按钮/文字**一律不换行、不被压缩**。
-      // 真机（360 CSS px 视口）实测：宿主 conversation.input.left 是横向挤占的 flex 容器，
-      // 本按钮被压到比内容还窄，而中日韩文字**可在任意字符间断行** ⇒ 「优化选项」被
-      // 逐字竖排成「优/化/选/项」，外框随之变成一条竖条并与相邻控件重叠。
-      // 修法两条：① 文字 nowrap（不让它断行）；② 按钮 flex:0 0 auto（不让它被压缩）。
       optBtn: { display: 'inline-flex', alignItems: 'center', gap: '6px', padding: '3px 10px 3px 8px',
         borderRadius: '9px', border: '1px solid ' + OVS.line, background: 'transparent',
-        color: 'inherit', cursor: 'pointer', fontSize: '12px', lineHeight: '18px',
-        flex: '0 0 auto', whiteSpace: 'nowrap', maxWidth: '100%', boxSizing: 'border-box' },
+        color: 'inherit', cursor: 'pointer', fontSize: '12px', lineHeight: '18px' },
       optBtnOn: { background: T('hover'), borderColor: OVS.acc },
-      optBtnText: { fontWeight: 600, letterSpacing: '.2px', whiteSpace: 'nowrap' },
+      optBtnText: { fontWeight: 600, letterSpacing: '.2px' },
       // ⚠ 用**颜色**压暗，不用 opacity：浅色底上 `opacity:.65` 会变成看不清的浅灰细字（用户截图）。
-      // dsh-launcher fork：窄屏下摘要（「标准 · 自动」）优先让位给标题，允许省略号收尾；
-      // 原来 nowrap 且无 overflow 约束，会把整个按钮撑破容器（与相邻控件重叠）。
-      optSummary: { color: OVS.fg3, fontSize: '11px', whiteSpace: 'nowrap',
-        overflow: 'hidden', textOverflow: 'ellipsis', minWidth: 0, flex: '0 1 auto' },
-      // 窄屏用：只显示图标 + 标题，把摘要隐掉（由下面的 @media 决定何时启用）
-      optSummaryHidden: { display: 'none' },
+      optSummary: { color: OVS.fg3, fontSize: '11px', whiteSpace: 'nowrap' },
       optCaret: { color: OVS.fg3, fontSize: '10px', lineHeight: 1 },
-      // dsh-launcher fork：宽度改为**视口感知**（360 CSS px 视口下 300px 偏窄，
-      // 左右各只剩 30px；min(340, 100vw-24) 把可用宽度用足，同时永远留 12px 边距）。
-      // ⚠ boxSizing 必须显式声明（真机实测）：本样式默认是 **content-box**，
-      //   于是「声明宽度 + 左右 padding 24 + 左右 border 2」才是实际宽度。
-      //   原先宽 300 时 300+26=326 < 360 尚能放下；改成 min(340,100vw-24)=336 后
-      //   实际变成 **362**，比 360 的视口还宽 14px ⇒ 面板右侧被裁（探针实测
-      //   pop=12/33/362/338，rightOverflow=14，inViewport=no）。
-      //   加 border-box 后 336 即含 padding/border，12+336=348 ≤ 360，正好留 12px 边距。
-      optPop: { position: 'fixed', zIndex: 60, boxSizing: 'border-box',
-        width: 'min(340px, calc(100vw - 24px))',
-        maxHeight: 'min(62vh, 460px)', overflowY: 'auto',
+      optPop: { position: 'fixed', zIndex: OV_Z.pop, width: '300px', maxHeight: 'min(62vh, 460px)', overflowY: 'auto',
         display: 'flex', flexDirection: 'column', gap: '8px', padding: '10px 12px',
         background: OVS.surface, color: OVS.fg,
         border: '1px solid ' + OVS.line, borderRadius: '12px',
@@ -384,12 +460,10 @@ window.__ModuleLoader__.load({
       prov: (p) => ({ fontSize: '11px', padding: '0 5px', borderRadius: '8px', marginLeft: '6px',
         background: p === 'user' ? 'rgba(57,192,122,.18)' : (p === 'machine' ? 'rgba(120,150,255,.18)' : 'rgba(230,90,90,.22)') }),
       // P10 控件栏专用（要能在输入区那一行里挤下，所以比浮层里的控件小一号）
-      // dsh-launcher fork：控件栏不许横向溢出宿主槽位（minWidth:0 允许被压缩，
-      // 但内部按钮已 flex:0 0 auto + nowrap，因此只会换行、不会把文字挤成竖排）。
       bar: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '6px', fontSize: '12px',
-        lineHeight: '18px', color: 'inherit', maxWidth: '100%', boxSizing: 'border-box', minWidth: 0 },
+        lineHeight: '18px', color: 'inherit' },
       // 控件栏分两层：每层各自横排、可换行（行内间距沿用原来的 6px）
-      barRow: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '6px', minWidth: 0, maxWidth: '100%' },
+      barRow: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '6px' },
       grp: { display: 'inline-flex', alignItems: 'center', gap: '4px', whiteSpace: 'nowrap' },
       // 分段控件：**铺满整格**（用户 2026-09-22："这几个按钮都没有布满区域,而且实际点击区域和反应区域还不一样"）。
       // 判据两条：① 容器 `width:100%` + 每项 `flex:1 1 0` ⇒ 视觉上填满；② 命中判定本来就按**容器矩形**等分
@@ -403,11 +477,8 @@ window.__ModuleLoader__.load({
       // 选中态：用 **DSH 的主题副色**（原版就是蓝）——只染底色与文字，克制、不加粗边框
       segOn: { background: OVS.acc12, color: OVS.acc, fontWeight: 600,
         boxShadow: 'inset 0 0 0 1px ' + OVS.acc22 },
-      // dsh-launcher fork：窄屏下与 optBtn 同样的道理 —— 不换行、不被压缩，
-      // 否则「?」「重试」这类小按钮也会被挤成竖排。
       small: { padding: '1px 8px', borderRadius: '8px', border: '1px solid ' + OVS.line,
-        background: 'transparent', color: 'inherit', fontSize: '12px', lineHeight: '18px', cursor: 'pointer',
-        flex: '0 0 auto', whiteSpace: 'nowrap' },
+        background: 'transparent', color: 'inherit', fontSize: '12px', lineHeight: '18px', cursor: 'pointer' },
       // 弹出面板里的下拉：**底色/文字必须成对取自同一套 token**（见 THEME_TOKENS）。
       // 旧写法用 `var(--dsw-alias-bg-l1, #141414)`：本机取不到该变量 ⇒ 深色兜底 + 浅色模式的深色文字
       // = **深字压深底**（用户浅色截图里那个黑框）。现在两个都来自 `--po06-*`，不可能再错配。
@@ -416,13 +487,10 @@ window.__ModuleLoader__.load({
         color: OVS.fg, font: 'inherit', fontSize: '12px', cursor: 'pointer' },
       dis: { opacity: .45, filter: 'grayscale(1)', cursor: 'not-allowed' },
       // 「?」帮助弹层（要求②）：正文由宿主从包里的 HELP-0.6.md 取，这里只做最轻的排印
-      // 同上：缺 box-sizing 时 92vw(331.2) + padding 28 + border 2 = 361.2 > 360，
-      // 而它是 right:16 定位 ⇒ 会从**左侧**溢出约 17px。加 border-box 归位。
-      helpPop: { position: 'fixed', right: '16px', bottom: '84px', boxSizing: 'border-box',
-        width: 'min(560px, 92vw)', maxHeight: '72vh',
+      helpPop: { position: 'fixed', right: '16px', bottom: '84px', width: 'min(560px, 92vw)', maxHeight: '72vh',
         overflow: 'auto', background: OVS.surface,
         color: OVS.fg, border: '1px solid ' + OVS.line,
-        borderRadius: '12px', padding: '14px', zIndex: 70, boxShadow: T('shadow'),
+        borderRadius: '12px', padding: '14px', zIndex: OV_Z.help, boxShadow: T('shadow'),
         fontSize: '12.5px', lineHeight: '19px' },
       helpTitle: { fontWeight: 700, fontSize: '14px', margin: '2px 0 6px' },
       helpH: { fontWeight: 600, margin: '10px 0 4px' },
@@ -436,7 +504,7 @@ window.__ModuleLoader__.load({
       // ❗**有意不搬**的部分（写在前面免得被当成漏搬）：`:hover` / `:active` / `@keyframes` /
       //   毛玻璃 / 渐变。内联样式表达不了伪类与关键帧 ⇒ 由**下面注入的一小段样式表**承担
       //   （`NS + '-ui'`，卸载即摘）。布局与配色仍然全在内联样式里，可预测、好测。
-      ov: { position: 'fixed', left: 0, top: 0, zIndex: 80, display: 'flex', flexDirection: 'column',
+      ov: { position: 'fixed', left: 0, top: 0, zIndex: OV_Z.ov, display: 'flex', flexDirection: 'column',
         width: '460px', minWidth: '360px', minHeight: '240px', maxHeight: 'min(78vh, 660px)',
         background: OVS.surface, border: '1px solid ' + OVS.line, borderRadius: '14px',
         boxShadow: T('shadow'), color: OVS.fg, fontSize: '12px',
@@ -532,7 +600,7 @@ window.__ModuleLoader__.load({
           : ((phase === 'review' || phase === 'sent' || phase === 'skipped') ? OVS.ok
             : ((phase === 'error' || phase === 'failed') ? OVS.dangerFg : OVS.cap)) }),
       // 46px 悬浮球（0.5:3533-3539 / 3636-3637）
-      ball: (tone, sent) => ({ position: 'fixed', left: 0, top: 0, zIndex: 88, display: 'flex',
+      ball: (tone, sent) => ({ position: 'fixed', left: 0, top: 0, zIndex: OV_Z.ball, display: 'flex',
         flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '1px',
         width: '46px', height: '46px', borderRadius: '50%', cursor: 'grab', touchAction: 'none',
         color: '#fff', background: tone, boxShadow: '0 4px 14px rgba(0,0,0,.28)',
@@ -775,10 +843,14 @@ window.__ModuleLoader__.load({
       h('circle', { cx: 8.5, cy: 12, r: 1.5, fill: 'currentColor' }))
     }
 
-    function ControlForm({ status, refresh }) {
+    function ControlForm({ status, refresh, sessionId }) {
       const [busy, setBusy] = React.useState(false)
       const [msg, setMsg] = React.useState(null)
       const s = (status && status.settings) || {}
+      // 会话级档位（0.7.8）：这三个控件显示【本会话生效值】，写入写进【本会话的覆盖】。
+      // 必须在本组件内定义：ControlForm 与 ControlBar 是两个独立作用域，
+      // 早先误把 ControlBar 的 eff/withSession 用到这里 ⇒ 渲染期未定义 ⇒ 面板调不动。
+      const eff = (status && status.sessionEffective) || s
       const [catalog, setCatalog] = React.useState({ models: [], problems: [] })
       React.useEffect(() => {
         let live = true
@@ -798,22 +870,29 @@ window.__ModuleLoader__.load({
         const probs = (r.problems || []).filter((x) => x.kind !== 'unknown-field')
         setMsg({ kind: probs.length ? 'warn' : 'ok',
           text: probs.length
-            ? L('已保存，但有 ','Saved, but ') + probs.length + L(' 项不认识的值，已按默认处理：',' unrecognized value(s) were handled as defaults: ') + probs.map((x) => x.key + '=' + JSON.stringify(x.got)).join('、')
+            ? L('已保存，但有 ','Saved, but ') + probs.length + L(' 项被按默认处理',' value(s) were handled by default') + staleSchemaHint(r.problems) + L('：',': ') + probs.map((x) => x.key + '=' + JSON.stringify(x.got)).join('、')
             : L('已保存','Saved') + (r.backup ? L('（旧配置已备份）',' (old config backed up)') : '') })
         if (refresh) refresh()
+      }
+      // 没有会话（例如未打开会话的设置页）就退回全局写入，保持老行为可用。
+      const saveTier = (patch) => {
+        const sid = (sessionId === undefined || sessionId === null) ? '' : String(sessionId)
+        if (!sid) return save(patch)
+        const all = (s.bySession && typeof s.bySession === 'object') ? s.bySession : {}
+        return save({ bySession: { ...all, [sid]: { ...(all[sid] || {}), ...patch } } })
       }
       return h('div', { 'data-po06': 'controls' },
         h('div', { style: S.row },
           h('span', { style: S.label }, L('辅助','Assist')),
-          h(Options, { value: s.assist, options: ['off', 'auto'], labels: ASSIST_LABELS, onChange: (v) => save({ assist: v }) }),
+          h(Options, { value: eff.assist, options: ['off', 'auto'], labels: ASSIST_LABELS, onChange: (v) => saveTier({ assist: v }) }),
         ),
         h('div', { style: S.row },
           h('span', { style: S.label }, L('补充程度','Detail')),
-          h(Options, { value: s.detail, options: ['minimal', 'standard', 'detailed'], labels: DETAIL_LABELS, onChange: (v) => save({ detail: v }) }),
+          h(Options, { value: eff.detail, options: ['minimal', 'standard', 'detailed'], labels: DETAIL_LABELS, onChange: (v) => saveTier({ detail: v }) }),
         ),
         h('div', { style: S.row },
           h('span', { style: S.label }, L('自主预算','Autonomy')),
-          h(Options, { value: s.budget, options: ['minimal', 'standard', 'generous'], labels: BUDGET_LABELS, onChange: (v) => save({ budget: v }) }),
+          h(Options, { value: eff.budget, options: ['minimal', 'standard', 'generous'], labels: BUDGET_LABELS, onChange: (v) => saveTier({ budget: v }) }),
         ),
         h('div', { style: S.row },
           h('span', { style: S.label }, L('解释层模型','Explainer model')),
@@ -966,17 +1045,65 @@ window.__ModuleLoader__.load({
       w: (typeof window !== 'undefined' && window.innerWidth) || 800,
       h: (typeof window !== 'undefined' && window.innerHeight) || 600,
     })
-    /* ================= 移动端适配补丁（dsh-launcher） =================
-     * 上游把面板下限硬编码 400×320。本机（Sharp 803SH / Android 11 / WebView 94）
-     * 视口实测仅 **361 CSS px**（1264 物理 / 3.5 密度）——400 已超屏宽：
-     *   · clampOvSize 里 Math.max(OV_MIN_W, v.w - 16) 取到 400，
-     *     于是 Math.min(max(400,w), 400) 恒为 400 ⇒ 面板固定 400 宽、右侧被裁；
-     *   · 且「最小值反而比可用空间大」自相矛盾，表现为**拖不窄 / 放不下**。
-     * 改为按视口留 16px 边距取下限，并保留 240/200 的绝对地板。
-     * 桌面（视口 ≥416）行为与上游**完全一致**：min(400, v.w-16) 仍为 400。
+    /**
+     * issue #18（用户澄清）：浮层**必须待在会话窗以内**，不许与右侧栏（图片等预览栏）重合。
+     * 判据不是"猜一个侧栏宽度常量"，而是**直接量会话窗本身**：从浮层所在节点向上找到输入卡片，
+     * 用它的矩形当会话窗边界 —— 侧栏一开，会话列变窄、卡片跟着变窄，浮层于是被挤进来。
+     * 量不到（卡片不在 DOM / 宽度为 0 / 读数不可信）就退回整个视口，行为与改动前一致（绝不因此不显示）。
+     * 纵向仍用视口：侧栏只压缩横向。
      */
-    const ovMinW = () => Math.max(240, Math.min(OV_MIN_W, ovViewport().w - 16))
-    const ovMinH = () => Math.max(200, Math.min(OV_MIN_H, ovViewport().h - 16))
+    /**
+     * 右侧栏**如果是固定浮层**（挂在 body、不压缩会话列），量输入卡片是发现不了它的 ——
+     * 这时只按卡片算，浮层仍会压在侧栏上（正是报告者看到的现象）。
+     * 这里做一条保守探测：body 的直属子节点里，**贴右缘、够高够宽、且是 fixed** 的那个，
+     * 它的左缘就是右侧栏的左缘。判据取得严（宁可不认，也不要误把提示条当侧栏）：
+     *   · 右缘离视口右边 ≤ 8px；宽度 160 ~ 60% 视口；高度 ≥ 40% 视口。
+     * 认不出就回 null（退化为"只按卡片算"，不会比改动前更差）。
+     */
+    const rightFixedSidebarLeft = (exclude) => {
+      const v = ovViewport()
+      try {
+        const body = (typeof document !== 'undefined' && document) ? document.body : null
+        if (!body || !body.children) return null
+        const cs = (typeof window !== 'undefined' && typeof window.getComputedStyle === 'function') ? window.getComputedStyle : null
+        if (!cs) return null
+        let best = null
+        for (const el of Array.from(body.children)) {
+          if (!el || !el.getBoundingClientRect) continue
+          if (el.getAttribute && el.getAttribute('data-po06') !== null) continue       // 我们自己的浮层不算
+          if (exclude && el.contains && el.contains(exclude)) continue
+          // ⚠ 顺序有意如此：**先做便宜的几何筛选，再问 computed style**。
+          //   反过来会在每次重算里对 body 的每个子节点调 getComputedStyle（流式对话时 body 变动频繁）。
+          const r = el.getBoundingClientRect()
+          if (!r || !(r.width > 0) || !(r.height > 0)) continue
+          if (r.right < v.w - 8) continue
+          if (r.width < 160 || r.width > v.w * 0.6) continue
+          if (r.height < v.h * 0.4) continue
+          if (cs.call(window, el).position !== 'fixed') continue
+          if (best === null || r.left < best) best = Math.round(r.left)
+        }
+        return best
+      } catch { return null }
+    }
+    const composerRegion = (node) => {
+      const v = ovViewport()
+      const full = { left: 0, top: 0, right: v.w, bottom: v.h, w: v.w, h: v.h, source: 'viewport' }
+      try {
+        const card = node ? composerCard(node) : null
+        const r = card && typeof card.getBoundingClientRect === 'function' ? card.getBoundingClientRect() : null
+        const cardLeft = (r && r.width > 0) ? Math.round(r.left) : null
+        const cardRight = (r && r.width > 0) ? Math.round(r.right) : null
+        const sideLeft = rightFixedSidebarLeft(node)
+        // 两侧取交：会话窗右缘 = min(输入卡片右缘, 固定侧栏左缘)
+        let left = Math.max(0, Math.min(cardLeft == null ? 0 : cardLeft, v.w))
+        let right = Math.max(0, Math.min(cardRight == null ? v.w : cardRight, v.w))
+        if (sideLeft != null) right = Math.min(right, Math.max(0, Math.min(sideLeft, v.w)))
+        // 太窄说明读数不可信（卡片被隐藏 / 侧栏算错）⇒ 退回视口，而不是把浮层挤成一条缝
+        if (right - left < 160) return full
+        const src = (sideLeft != null && sideLeft <= (cardRight == null ? v.w : cardRight)) ? 'composer-card+sidebar' : (cardRight == null ? 'viewport' : 'composer-card')
+        return { left, top: 0, right, bottom: v.h, w: right - left, h: v.h, source: src }
+      } catch { return full }
+    }
     /**
      * 位置夹紧。**判据不是"整块面板都得在视口内"，而是"至少留得住一个能抓的地方"**——
      * 用户 2026-09-22 真机："弹窗还是无法拖动"。真因就在这里：他把面板拉到 **400×748**，
@@ -986,35 +1113,107 @@ window.__ModuleLoader__.load({
      */
     const OV_KEEP_X = 96
     const OV_KEEP_Y = 48
-    const clampOvPos = (x, y, el) => {
+    /**
+     * issue #18：会话窗会因三种原因变，浮层必须**当场**跟上，所以观察点也要三条都接：
+     *   ① 窗口缩放 —— `window.resize`；
+     *   ② 会话列变窄 —— 输入卡片的 `ResizeObserver`；
+     *   ③ **右侧栏是固定浮层时卡片尺寸根本不变**，只有 body 子节点增删 —— `MutationObserver`。
+     * 任一触发就通知全部订阅者；用 rAF 合并，因为流式对话时 body 的增删非常频繁。
+     * 输入卡片可能被宿主**重挂载**（换会话/换布局）⇒ 重新认一次，不盯着脱离文档的旧节点。
+     */
+    const ovReflowSubs = new Set()
+    let ovReflowWired = false, ovReflowPending = false, ovCardObserver = null, ovObservedCard = null
+    function ovReflowAll() {
+      if (ovReflowPending) return
+      ovReflowPending = true
+      const run = () => {
+        ovReflowPending = false
+        // 宿主可能把输入卡片整个换掉（换会话/换布局）⇒ 每次重算都重认一次，别盯着脱离文档的旧节点
+        try { ovReflowWatchCard() } catch { /* 认不出来就沿用上一个 */ }
+        for (const fn of Array.from(ovReflowSubs)) { try { fn() } catch { /* 单个订阅者抛错不影响其它 */ } }
+      }
+      try {
+        if (typeof requestAnimationFrame === 'function') requestAnimationFrame(run)
+        else window.setTimeout(run, 16)
+      } catch { run() }        // 没有计时设施时同步跑一次，宁可多算也不要漏
+    }
+    /** 重认输入卡片并（必要时）把 ResizeObserver 挪到新节点上。 */
+    let ovReflowAnchor = null
+    function ovReflowWatchCard() {
+      const node = ovReflowAnchor
+      if (!node) return
+      const card = composerCard(node)
+      if (!card || card === ovObservedCard || typeof ResizeObserver !== 'function') return
+      if (ovCardObserver) { try { ovCardObserver.disconnect() } catch { /* best effort */ } }
+      ovCardObserver = new ResizeObserver(ovReflowAll)
+      ovCardObserver.observe(card)
+      ovObservedCard = card
+    }
+    function ovReflowWatch(fn, node) {
+      ovReflowSubs.add(fn)
+      if (!ovReflowAnchor) ovReflowAnchor = node || null
+      if (!ovReflowWired) {
+        ovReflowWired = true
+        try { window.addEventListener('resize', ovReflowAll) } catch { /* 没有 window 也不致命 */ }
+        try {
+          const body = (typeof document !== 'undefined' && document) ? document.body : null
+          // ⚠ 属性也必须看：右侧栏完全可能是**早就挂在 body 上、靠 class/style/hidden 显隐**的节点。
+          //   那种开关既不增删子节点、也不改输入卡片尺寸 ⇒ 只盯 childList 会整条漏掉（复核指出）。
+          if (body && typeof MutationObserver === 'function') {
+            new MutationObserver(ovReflowAll).observe(body, {
+              childList: true, subtree: true, attributes: true,
+              attributeFilter: ['class', 'style', 'hidden'],
+            })
+          }
+        } catch { /* 观察不到 body 就只靠尺寸与 resize */ }
+      }
+      ovReflowWatchCard()
+      return () => { ovReflowSubs.delete(fn) }
+    }
+    const clampOvPos = (x, y, el, region) => {
       const v = ovViewport()
+      const rg = region || { left: 0, top: 0, right: v.w, bottom: v.h, w: v.w, h: v.h }
       const w = (el && el.offsetWidth) || 460
       const h = (el && el.offsetHeight) || 320
-      const minX = Math.min(8, v.w - w)      // 面板比视口还宽时，左边界也跟着放宽（否则同样钉死）
-      const maxX = Math.max(8, v.w - OV_KEEP_X)
-      const minY = Math.min(8, v.h - h)
+      // 横向第一约束是「右缘收在会话窗内」——这正是"不许与侧栏重合"。
+      // 会话窗比面板还窄时无处可放 ⇒ 先贴左；宽度由 clampOvSize 按同一个 region 收窄，下一帧就能放下。
+      // ⚠ 与改动前的一处**有意差异**：旧实现允许把面板拖到只剩 OV_KEEP_X 露在边缘；
+      //   现在只要放得下就要求**整块可见**（"浮层整个仍在会话窗区域内"是用户给的判据）。
+      //   放不下（面板比会话窗还宽）才退回贴左，并由 clampOvSize 用同一个 region 收窄宽度。
+      const roomy = rg.w >= w + 8
+      const minX = rg.left
+      const maxX = roomy ? rg.right - w : rg.left
+      const minY = Math.min(8, v.h - h)      // 面板比视口还高时，上边界也跟着放宽（否则会被钉死、拖不动）
       const maxY = Math.max(8, v.h - OV_KEEP_Y)
       return {
         x: Math.min(Math.max(minX, Math.round(x)), maxX),
         y: Math.min(Math.max(minY, Math.round(y)), maxY),
       }
     }
-    /** 尺寸夹紧（0.5:1154-1161）：不小于视口感知的下限（桌面即 400×320），也不超出视口。 */
-    const clampOvSize = (w, h) => {
+    /** 尺寸夹紧（0.5:1154-1161）：不小于 400×320，也不超出视口。 */
+    const clampOvSize = (w, h, region) => {
       const v = ovViewport()
+      const rg = region || { left: 0, top: 0, right: v.w, bottom: v.h, w: v.w, h: v.h }
       const out = {}
-      // ★ 用视口感知的 ovMinW/ovMinH 而非硬编码常量：窄屏下 maxW(=v.w-16) < 400 时，
-      //   上游写法会让「最小值大于可用空间」，面板永远放不进屏幕（见上方补丁说明）。
-      const minW = ovMinW()
-      const minH = ovMinH()
-      if (w != null) out.w = Math.min(Math.max(minW, Math.round(w)), Math.max(minW, v.w - 16))
-      if (h != null) out.h = Math.min(Math.max(minH, Math.round(h)), Math.max(minH, v.h - 16))
+      // ⚠ 上限取**会话窗宽度**（不是视口宽度）：侧栏打开后会话窗变窄 ⇒ 面板跟着变窄。
+      //   下界仍尽量保 OV_MIN_W，但会话窗本身就比它窄时只能跟着窄——"放不下"优先于"最小尺寸"。
+      const maxW = Math.max(240, Math.min(rg.w - 16, v.w - 16))
+      const maxH = Math.max(OV_MIN_H, v.h - 16)
+      if (w != null) out.w = Math.min(Math.max(Math.min(OV_MIN_W, maxW), Math.round(w)), maxW)
+      if (h != null) out.h = Math.min(Math.max(OV_MIN_H, Math.round(h)), maxH)
       return out
     }
     /** 面板默认落点（0.5:1922：贴右侧、离顶 96px）。 */
-    const defaultOvPos = () => ({ x: Math.max(8, ovViewport().w - 480), y: 96 })
-    /** 悬浮球默认落点（0.5:1449：右下角内侧）。 */
-    const defaultBallPos = () => { const v = ovViewport(); return { x: Math.max(8, v.w - 76), y: Math.max(8, v.h - 160) } }
+    const defaultOvPos = (region) => {
+      const rg = region || { left: 0, right: ovViewport().w }
+      return { x: Math.max(rg.left, rg.right - 480), y: 96 }
+    }
+    /** 悬浮球默认落点（0.5:1449：右下角内侧）——同样收在会话窗内。 */
+    const defaultBallPos = (region) => {
+      const v = ovViewport()
+      const rg = region || { left: 0, right: v.w }
+      return { x: Math.max(rg.left, rg.right - 76), y: Math.max(8, v.h - 160) }
+    }
 
     /**
      * 折叠区块：照 0.5:1487-1501 的 `disclosure`（`›` 箭头 + 标题 + 摘要 + 展开体）。
@@ -1057,6 +1256,25 @@ window.__ModuleLoader__.load({
       const posRef = React.useRef(pos)
       posRef.current = pos
       React.useEffect(() => () => { if (offRef.current) offRef.current() }, [])
+      // issue #18：球是 `position: fixed`，侧栏打开时会落在会话窗外面（看起来"跑到侧栏上"）。
+      // 与面板同一套判据：量会话窗，把球收进去；侧栏开关（输入卡片尺寸变化）时立刻重算。
+      React.useEffect(() => {
+        const reflow = () => {
+          const el = ref.current
+          const rg = composerRegion(el)
+          const v = ovViewport()
+          setPos((p) => {
+            const n = {
+              x: Math.min(Math.max(rg.left, p.x), Math.max(rg.left, rg.right - 56)),
+              y: Math.min(Math.max(8, p.y), Math.max(8, v.h - 56)),
+            }
+            return (n.x === p.x && n.y === p.y) ? p : n
+          })
+        }
+        reflow()
+        // 三个观察点（窗口缩放 / 卡片尺寸 / body 子节点增删）由共享观察器一起接（见 ovReflowWatch）
+        return ovReflowWatch(reflow, ref.current)
+      }, [])
       const working = ball.phase === 'optimizing'
       const label = working ? L('优化中', 'Working') : (ball.sent ? L('已发送', 'Sent') : L('结果', 'Result'))
       const icon = ball.sent ? '✓' : (working ? '◌' : '◍')
@@ -1078,7 +1296,11 @@ window.__ModuleLoader__.load({
             if (!moved && Math.abs(dx) + Math.abs(dy) > 6) moved = true     // 0.5:1813 的 6px 阈值：小于它算"点击"
             if (!moved) return
             const v = ovViewport()
-            const next = { x: Math.max(8, Math.min(v.w - 56, start.bx + dx)), y: Math.max(8, Math.min(v.h - 56, start.by + dy)) }
+            const rg = composerRegion(el)
+            const next = {
+              x: Math.min(Math.max(rg.left, start.bx + dx), Math.max(rg.left, rg.right - 56)),
+              y: Math.min(Math.max(8, start.by + dy), Math.max(8, v.h - 56)),
+            }
             posRef.current = next
             if (el && el.style) el.style.transform = 'translate3d(' + next.x + 'px,' + next.y + 'px,0)'
           }
@@ -1130,10 +1352,57 @@ window.__ModuleLoader__.load({
       return h('div', { ref, onScroll, 'data-po06': 'intercept-think-body', style: S.ovFoldText }, text)
     }
 
+    // Decode only item.text values from the live protocol; incomplete escapes stay buffered.
+    function interceptDraftOutput(raw) {
+      const source=String(raw || ''),stack=[],rows=[]
+      for(let i=0;i<source.length;) {
+        const ch=source[i],frame=stack[stack.length-1]
+        if(ch==='{' || ch==='[') {stack.push({array:ch==='[',label:frame && frame.key,key:null,wantKey:ch==='{'});if(frame)frame.key=null;i++;continue}
+        if(ch==='}' || ch===']'){stack.pop();i++;continue}
+        if(ch===','){if(frame){frame.key=null;frame.wantKey=!frame.array}i++;continue}
+        if(ch===':' || /\s/.test(ch)){i++;continue}
+        if(ch!=='"'){while(i<source.length&&!/[\s,}\]]/.test(source[i]))i++;continue}
+        const start=++i;let end=i,closed=false
+        while(end<source.length) {if(source[end]==='\\'){end+=2;continue}if(source[end]==='"'){closed=true;break}end++}
+        const token=source.slice(start,Math.min(end,source.length))
+        if(frame && frame.wantKey) {
+          if(!closed)break
+          try {frame.key=JSON.parse('"'+token+'"')}catch {return rows.join('\n')}
+          frame.wantKey=false
+        } else if(frame && frame.label==='item' && frame.key==='text') {
+          let value=''
+          for(let n=0;n<token.length;n++) {
+            const c=token[n]
+            if(c!=='\\'){value+=c;continue}
+            if(n+1>=token.length)break
+            const esc=token[++n]
+            if(esc==='u') {
+              const hex=token.slice(n+1,n+5);if(!/^[0-9a-fA-F]{4}$/.test(hex))break
+              value+=String.fromCharCode(parseInt(hex,16));n+=4
+            } else {
+              const escapes={'"':'"','\\':'\\','/':'/','n':'\n','r':'\r','t':'\t','b':'\b','f':'\f'}
+              if(!Object.prototype.hasOwnProperty.call(escapes,esc))break
+              value+=escapes[esc]
+            }
+          }
+          if(value && /[\uD800-\uDBFF]$/.test(value))value=value.slice(0,-1)
+          if(value)rows.push('- '+value)
+        }
+        if(!closed)break
+        i=end+1
+      }
+      return rows.join('\n')
+    }
+    function InterceptDraftBody({text}) {
+      const ref=React.useRef(null),follow=React.useRef(true)
+      React.useEffect(()=>{const el=ref.current;if(el&&follow.current)el.scrollTop=el.scrollHeight},[text])
+      return h('div',{'data-po06':'intercept-output-stream',ref,onScroll:()=>{const el=ref.current;if(el)follow.current=el.scrollHeight-el.scrollTop-el.clientHeight<40},style:{...S.ovPane,...S.ovPaneBody,maxHeight:'300px',overflowY:'auto',whiteSpace:'pre-wrap',overflowWrap:'anywhere'},'aria-live':'off'},text)
+    }
     function InterceptPanel(props) {
       const prog = props.prog || null      // P11：宿主侧的实时进度（阶段 + 正在写的字）
       const hold = props.hold || {}
       const phase = props.phase
+      const outputDraft=phase==='optimizing' ? interceptDraftOutput(prog && prog.text) : ''
       const permission = props.permission
       const rootRef = React.useRef(null)
       const offRef = React.useRef(null)
@@ -1150,12 +1419,18 @@ window.__ModuleLoader__.load({
       React.useEffect(() => () => { if (offRef.current) offRef.current() }, [])
       // 窗口尺寸变化 ⇒ 重新夹紧位置与尺寸（0.5:1785-1794 的 reflowOverlay）
       React.useEffect(() => {
-        const onWinResize = () => {
-          setPos((p) => clampOvPos(p.x, p.y, rootRef.current))
-          setSize((s) => (s.w ? { ...s, ...clampOvSize(s.w, s.h) } : s))
+        // issue #18：**右缘收在会话窗内**，并且侧栏开关时立刻重算。
+        // ⚠ 只听 window.resize 会漏掉一半：侧栏开关时**窗口尺寸没变**，变的是会话列宽 ——
+        //   所以这里用 ResizeObserver 直接盯着输入卡片本身。
+        const reflow = () => {
+          const el = rootRef.current
+          const rg = composerRegion(el)
+          setPos((p) => { const n = clampOvPos(p.x, p.y, el, rg); return (n.x === p.x && n.y === p.y) ? p : n })
+          setSize((s) => (s.w ? (() => { const n = { ...s, ...clampOvSize(s.w, s.h, rg) }; return (n.w === s.w && n.h === s.h) ? s : n })() : s))
         }
-        window.addEventListener('resize', onWinResize)
-        return () => window.removeEventListener('resize', onWinResize)
+        reflow()                                    // 挂载即夹一次：默认落点/size 也不能越出会话窗
+        // 侧栏可能是**固定浮层**（不压缩会话列）⇒ 只盯卡片会漏，交给共享观察器（含 body 子节点增删）
+        return ovReflowWatch(reflow, rootRef.current)
       }, [])
 
       /** 一次指针拖动：move 只写本地值（父组件的 1 秒 tick 重渲染不会把面板弹回去）。 */
@@ -1188,7 +1463,7 @@ window.__ModuleLoader__.load({
         const d = { dx: e.clientX - r.left, dy: e.clientY - r.top }
         setDragging(true)
         beginPointer(e,
-          (ev) => { const n = clampOvPos(ev.clientX - d.dx, ev.clientY - d.dy, el); posRef.current = n; setPos(n) },
+          (ev) => { const n = clampOvPos(ev.clientX - d.dx, ev.clientY - d.dy, el, composerRegion(el)); posRef.current = n; setPos(n) },
           () => { setDragging(false); props.onMove(posRef.current) })
       }
       const onSizeDown = (e) => {
@@ -1199,7 +1474,7 @@ window.__ModuleLoader__.load({
         const st = { x: e.clientX, y: e.clientY, w: r.width, h: r.height }
         setSizing(true)
         beginPointer(e,
-          (ev) => { const n = clampOvSize(st.w + (ev.clientX - st.x), st.h + (ev.clientY - st.y)); sizeRef.current = n; setSize(n) },
+          (ev) => { const n = clampOvSize(st.w + (ev.clientX - st.x), st.h + (ev.clientY - st.y), composerRegion(el)); sizeRef.current = n; setSize(n) },
           () => { setSizing(false); props.onResize(sizeRef.current) })
       }
 
@@ -1333,14 +1608,7 @@ window.__ModuleLoader__.load({
                 // 于是这里只显示 provider 真给的字段：`in 1234 · out 567 · cache 890 tok`；
                 // 拿不到的项显示 `—`（不折算、不猜）。
                 // 用量来源：**结果优先**（拦截结束后仍在），其次才是进行中的进度面。
-                (() => {
-                  const u = (hold && hold.usage) ? hold.usage : ((prog && prog.usage) ? prog.usage : null)
-                  if (!u || (u.in == null && u.out == null && u.cache == null && u.total == null)) return 'Σ — tok'
-                  return 'Σ ' + L('入', 'in') + ' ' + fmtTok(u.in)
-                    + ' · ' + L('出', 'out') + ' ' + fmtTok(u.out)
-                    + ' · ' + L('缓存', 'cache') + ' ' + fmtTok(u.cache)
-                    + ' tok'
-                })()),
+                usageText((hold && hold.usage) ? hold.usage : ((prog && prog.usage) ? prog.usage : null))),
               // 拦截来路（回车 / 按钮 / 重新生成）：原来那块手写面板上有，真机排障时要看（保留，不新增真相）
               h('span', { 'data-po06': 'intercept-via', style: S.ovChipMuted },
                 hold.via === 'key' ? L('回车拦截', 'Enter')
@@ -1422,7 +1690,12 @@ window.__ModuleLoader__.load({
                   'Your message is held; preparing this round\u2019s interpretation (no timeout — skip or cancel anytime)'))
                 : null),
             // ── 「产出层」────────────────────────────────────────────────
-            (phase === 'review' || packet)
+            phase === 'optimizing'
+              ? h('div',{'data-po06':'intercept-review',style:S.ovReview},
+                h('div',{'data-po06':'intercept-output-title',style:S.ovPaneTitle},L('产出层','Output')),
+                h('div',{'data-po06':'intercept-caption',style:S.ovPaneTitle},L('正在生成 · 尚未校验','Generating · Not yet validated')),
+                outputDraft ? h(InterceptDraftBody,{text:outputDraft}) : h('div',{style:S.ovHintQuiet},L('等待产出正文…','Waiting for output…')))
+              : (phase === 'review' || packet)
               ? h('div', { 'data-po06': 'intercept-review', style: S.ovReview },
                 // 「产出层」标题（用户 2026-09-21："两层要分明，照 0.5"）：
                 // 思维层 = 它在想什么（上面那个折叠）；产出层 = 这一轮给出什么（从这行开始）。
@@ -1484,16 +1757,19 @@ window.__ModuleLoader__.load({
     const SEND_KEYS = ['input.send', 'input.send.queue', 'input.send.steer']
 
     /** 从**我们自己渲染的节点**往上找输入卡片（不用产品类名/选择器）；找不到 = 不在会话页 ⇒ 一律放行。 */
+    // ⚠ 选择器要**容错**：`contenteditable` 的合法写法不止 "true"（"" 与 "plaintext-only" 同样可编辑）。
+    // 原先只认 `[contenteditable="true"]` ⇒ 宿主换个写法就量不到卡片、退回视口、浮层重新压到侧栏上。
+    const EDITABLE_SEL = '[contenteditable]:not([contenteditable="false"])'
     function composerCard(node) {
       let el = node
       while (el && el !== document.body) {
-        if (el.querySelector && el.querySelector('[contenteditable="true"]')) return el
+        if (el.querySelector && el.querySelector(EDITABLE_SEL)) return el
         el = el.parentElement
       }
       return null
     }
     function composerDraft(card) {
-      const ed = card ? card.querySelector('[contenteditable="true"]') : null
+      const ed = card ? card.querySelector(EDITABLE_SEL) : null
       if (!ed) return ''
       const raw = (typeof ed.innerText === 'string' && ed.innerText.length > 0) ? ed.innerText : (ed.textContent || '')
       return String(raw).replace(/\u00a0/g, ' ')
@@ -1531,12 +1807,24 @@ window.__ModuleLoader__.load({
       // 宿主按**标准 props** 注入：`sessionId`（会话作用域）与 `inputActions`（放行通道，见 slots.d.ts:201-255）。
       // ⚠ `inputActions` 拿不到 ⇒ **绝不拦截**（拦下却没有放行通道 = 把用户的消息吞掉）。
       const { sessionId, inputActions } = props || {}
-      const [status, refreshStatus] = useStatus()
+      const [status, refreshStatus] = useStatus(sessionId)
       const [open, setOpen] = React.useState(false)
       // 「优化选项」弹出面板（用户 2026-09-22：档位这些收进一个按钮里）
       const [optOpen, setOptOpen] = React.useState(false)
       const [optPos, setOptPos] = React.useState(null)
       const optBtnRef = React.useRef(null)
+      // issue #18（用户澄清）：弹层/面板**不许与右侧栏重合** —— 它们的右边界要收在会话窗内。
+      // 会话窗宽度没有现成的常量可读，所以**量输入卡片**：侧栏一开，会话列变窄、卡片跟着变窄。
+      // 观察点用 ResizeObserver 而不是只听 window.resize：侧栏开关时窗口尺寸不变，变的是列宽。
+      const [region, setRegion] = React.useState(null)
+      React.useEffect(() => {
+        const reflow = () => {
+          const rg = composerRegion(optBtnRef.current)
+          setRegion((r) => ((r && r.left === rg.left && r.right === rg.right && r.source === rg.source) ? r : rg))
+        }
+        reflow()
+        return ovReflowWatch(reflow, optBtnRef.current)
+      }, [])
       // 点面板外 / 按 Esc 收起（键盘可达；不抢输入框的回车）
       React.useEffect(() => {
         if (!optOpen) return undefined
@@ -1562,16 +1850,10 @@ window.__ModuleLoader__.load({
       // 原因：控件栏是 per-session 挂载的，切会话会重挂 ⇒ 组件内的 hold 归零。
       // 而"消息还被我拦着"这件事**必须跨会话切换活下来** ⇒ hold 同时写一份到 window 上，
       // 重挂时按 sessionId 取回（只认同一会话，绝不把 A 会话的拦截态显示到 B 会话）。
-      const [hold, _setHold] = React.useState(() => {
-        try { return (window.__PO06_HOLD__ || {})[sessionId] || null } catch { return null }
-      })
+      const [hold, _setHold] = React.useState(() => holdBridgeRead(sessionId))
       const setHold = React.useCallback((v) => {
         _setHold(v)
-        try {
-          const b = window.__PO06_HOLD__ || (window.__PO06_HOLD__ = {})
-          if (v && sessionId) b[sessionId] = v
-          else if (sessionId) delete b[sessionId]
-        } catch { /* 桥只是保险，失败不影响本轮 */ }
+        holdBridgeWrite(sessionId, v)   // 写桥即广播（issue #19）：别的挂载/后台完成的那一份也能被认领
       }, [sessionId])
       const [tick, setTick] = React.useState(0)        // 只用于"已用 N 秒"重新渲染
       useLocaleLive()                                  // 语言是活的：DSH 里切语言 ⇒ 立刻换文案
@@ -1603,7 +1885,29 @@ window.__ModuleLoader__.load({
       const data = status.data
       const s = (data && data.settings) || {}
       const d = (data && data.described) || null
-      const tier = (d && typeof d.tier === 'string') ? d.tier : tierOfSettings(s)
+      // ⚠ 0.7.7 会话级档位：`sessionEffective/sessionDescribed` 是**本会话生效**的值
+      //   （全局 + 该会话覆盖的合并结果）。没有就回退全局，行为与改动前一致。
+      const eff = (data && data.sessionEffective) || s
+      const effD = (data && data.sessionDescribed) || d
+      const tier = (effD && typeof effD.tier === 'string') ? effD.tier : tierOfSettings(eff)
+      // 把档位补丁写进【本会话的覆盖】：只动这个会话，全局默认保持原样。
+      // 形状与 settings.js 的 bySession 一致；越界键（bash/model 等）会被后端丢弃并记问题，
+      // 所以这里只传档位四件套。
+      const withSession = (patch) => ({
+        ...((s.bySession && typeof s.bySession === 'object') ? s.bySession : {}),
+        [sessionId]: { ...(((s.bySession && typeof s.bySession === 'object') ? s.bySession[sessionId] : null) || {}), ...patch },
+      })
+      // 协作基调（0.7.8）：会话覆盖优先，其次全局，默认 neutral。
+      // 与档位**正交**——可以「轻度 + 硬邦邦」，也可以「重度 + 普通」。
+      const framing = (eff && (eff.framing === 'hard' || eff.framing === 'neutral')) ? eff.framing : 'neutral'
+      // 点档位 = 整份替换该会话覆盖（避免带上陈旧展开值），但**必须保留已选的协作基调**：
+      // 基调与档位是两件事，换档位不该把基调一起抹掉。
+      const replaceTier = (t) => {
+        const all = (s.bySession && typeof s.bySession === 'object') ? s.bySession : {}
+        const prev = all[sessionId] || {}
+        const keep = (prev.framing === 'hard' || prev.framing === 'neutral') ? { framing: prev.framing } : {}
+        return { ...all, [sessionId]: { ...keep, tier: t } }
+      }
       const tierOff = tier === 'off'
       // 关闭档 ⇒ **界面也要清干净**（真机 2026-09-22：拨到关闭档后，上一轮的优化上下文还在被注入）。
       // 宿主侧已按政策硬短路 + 清掉缓存里的包；客户端这边同步撤掉拦截浮层与进度，
@@ -1636,7 +1940,7 @@ window.__ModuleLoader__.load({
         }
         const probs = (r.problems || []).filter((x) => x.kind !== 'unknown-field')
         setMsg(probs.length
-          ? { kind: 'warn', text: L('已保存，但有 ' + probs.length + ' 项被按默认处理', 'Saved, but ' + probs.length + ' value(s) fell back to defaults') }
+          ? { kind: 'warn', text: L('已保存，但有 ' + probs.length + ' 项被按默认处理', 'Saved, but ' + probs.length + ' value(s) fell back to defaults') + staleSchemaHint(r.problems) }
           : { kind: 'ok', text: L('已保存', 'Saved') })
         refreshStatus()                                 // 成功后重新拉一次，界面与后端一致
       }
@@ -1650,6 +1954,17 @@ window.__ModuleLoader__.load({
       permissionRef.current = permission
       const canArm = !!(inputActions && typeof inputActions.submit === 'function' && sessionId)
       canArmRef.current = canArm
+      // 斜杠命令放行（0.8）：名单来自设置，但**只有宿主确认该命令当前已注册**才会出现在 active 里。
+      // 拿不到清单、没列、没注册 ⇒ 一律交还宿主（旧行为）——我们不认识这条命令，就绝不接管它。
+      const slashActive = (() => {
+        const rows = (data && data.slashReview && Array.isArray(data.slashReview.active)) ? data.slashReview.active : []
+        return new Set(rows.map((n) => String(n).toLowerCase()))
+      })()
+      const slashNameOf = (t) => {
+        const m = /^\/([A-Za-z0-9][A-Za-z0-9_-]*)(\s|$)/.exec(String(t == null ? '' : t))
+        return m ? m[1].toLowerCase() : null
+      }
+      const slashAllowedDraft = (t) => slashReviewAllowed([...slashActive], t)
 
       const clearHoldSoon = () => { window.setTimeout(() => { holdRef.current = null; setHold(null) }, 1600) }
       /** 放行：**先把拦下的那条原话写回草稿**，再交给宿主的 submit。
@@ -1659,7 +1974,13 @@ window.__ModuleLoader__.load({
        *  所以这里无条件对齐一次（草稿本来就一样时，写回是幂等的）。 */
       const releaseHold = (text, h, mark) => {
         try {
-          if (typeof inputActions.setDraft === 'function') inputActions.setDraft(text)
+          // 名单内命令的守门（0.8）：审查浮层可以改内容，但**不允许把命令本身换掉**。
+          // 换掉就不再是原命令了 ⇒ 退回用户按下发送时的那一条原话，交还宿主自行处理。
+          let outgoing = text
+          const held = h && typeof h.text === 'string' ? h.text : ''
+          const heldName = slashNameOf(held)
+          if (heldName && slashActive.has(heldName) && slashNameOf(outgoing) !== heldName) outgoing = held
+          if (typeof inputActions.setDraft === 'function') inputActions.setDraft(outgoing)
           inputActions.submit()
           setHold({ ...(h || {}), phase: mark || 'sent' })
           clearHoldSoon()
@@ -1846,12 +2167,15 @@ window.__ModuleLoader__.load({
       /** foot-sent 的「关闭」（0.5:1653 close-sent）：浮层与球一起收掉。 */
       const closeSent = () => { setOvOpen(false); setOvBall(null) }
 
-      // 重挂（切会话来回）后把 holdRef 也接回桥上的那一份——否则界面显示了面板，逻辑却以为"没在拦"
+      // 重挂（切会话来回）后把 holdRef 也接回桥上的那一份——否则界面显示了面板，逻辑却以为"没在拦"；
+      // 并**订阅**后续变化（issue #19）：切走期间跑完的那一轮，回来要能看见它的结果。
       React.useEffect(() => {
-        try {
-          const saved = (window.__PO06_HOLD__ || {})[sessionId] || null
-          if (saved && !holdRef.current) holdRef.current = saved
-        } catch { /* 同上 */ }
+        const saved = holdBridgeRead(sessionId)
+        if (saved && !holdRef.current) holdRef.current = saved
+        return holdBridgeOn(sessionId, (value) => {
+          holdRef.current = value
+          _setHold(value)
+        })
       }, [sessionId])
 
       // 计时器：只在"优化中"时走（用户要看得见已经等了多久，因为**不设超时**）
@@ -1937,7 +2261,8 @@ window.__ModuleLoader__.load({
           if (!focusInComposer(card, e.target)) return 'focus-outside'
           const t = draftNow()
           if (!t) return 'empty-draft'
-          if (t.startsWith('/')) return 'slash-command'          // 命令（/xxx）交还官方
+          // 斜杠命令默认交还官方；**只有名单内且已注册**的命令才继续走拦截（0.8）。
+          if (t.startsWith('/') && !slashAllowedDraft(t)) return 'slash-command'
           return null
         }
         const wantClick = (btn) => {
@@ -2060,12 +2385,23 @@ window.__ModuleLoader__.load({
             'Applies only to this explainer model; the levels listed are its own')
           : L('该模型未暴露可选档位，将按服务端默认档运行',
             'This model exposes no selectable effort; the provider default applies')
+        // ⚠ 没有可选档位时**不要再渲染一个能点的下拉**（2026-09-27 实测）：
+        //   宿主对某些模型（如 top-api/gpt-6-astra）根本没登记 reasoning，resolveModelInfo 里没有
+        //   `reasoning.efforts` ⇒ 这里 efforts = []。此前仍渲染出只有「默认（不指定）」的可点下拉，
+        //   用户点它当然没反应，观感就是"档位点了不动"。真实原因只是**这个模型没有档位**。
+        //   所以：禁用 + 就地写明原因（不能只放在 title 里——没人会去悬停）。
+        const noEfforts = efforts.length === 0
         const sel = h('select', {
           'data-po06': 'effort', 'data-po06-value': curEffort, value: curEffort,
-          style: { ...S.optSelect, colorScheme: themeIsDark() ? 'dark' : 'light' },
-          title, onChange: onPick,
+          style: { ...S.optSelect, colorScheme: themeIsDark() ? 'dark' : 'light',
+            ...(noEfforts ? { opacity: .5, cursor: 'default' } : null) },
+          title, onChange: onPick, disabled: noEfforts,
         }, opts)
-        return h('div', { style: S.optRow }, h('span', { style: S.optLabel }, L('思考档位', 'Thinking effort')), sel)
+        return h('div', { style: S.optRow }, h('span', { style: S.optLabel }, L('思考档位', 'Thinking effort')),
+          noEfforts
+            ? h('span', { 'data-po06': 'effort-none', style: S.muted },
+              L('该模型没有档位（宿主未登记 reasoning）', 'No levels for this model (host has no reasoning info)'))
+            : sel)
       })()
       const modelProblems = Array.isArray(cat.problems) ? cat.problems : []
 
@@ -2073,7 +2409,7 @@ window.__ModuleLoader__.load({
       const active = isActiveInstance()
       if (!active) return null
 
-      const on = !!(data && data.enabled && s.assist !== 'off')
+      const on = !!(data && data.enabled && eff.assist !== 'off')
       const last = null
       // P11 浮层要显示的那一份：`ovOpen` 是唯一的开关（0.5 的 `store.overlay.open`）。
       // ⚠ 不能写成 `hold || …`——那样"收起为球"在优化中根本收不起来（hold 还活着，面板又冒出来）。
@@ -2113,20 +2449,21 @@ window.__ModuleLoader__.load({
                   ? optBtnRef.current.getBoundingClientRect() : null
                 if (r) {
                   const vw = (typeof window !== 'undefined' && window.innerWidth) || 800
+                  const rg = composerRegion(optBtnRef.current)
+                  const popW = Math.min(300, Math.max(200, rg.w - 16))
                   const vh = (typeof window !== 'undefined' && window.innerHeight) || 600
                   setOptPos({
-                    // 与上面的 optPop 宽度保持一致：左侧夹紧预留「面板宽 + 8px 边距」。
-                    // 面板最宽 340px ⇒ 预留 348px；视口更窄时退化为 8px 左侧边距。
-                    left: Math.max(8, Math.min(Math.round(r.left), Math.max(8, vw - 348))),
+                    // 右缘收在会话窗内（侧栏打开时弹层跟着会话列一起左移/变窄）
+                    left: Math.min(Math.max(rg.left + 8, Math.round(r.left)), Math.max(rg.left + 8, rg.right - popW - 8)),
                     bottom: Math.max(8, Math.round(vh - r.top + 6)),
+                    width: popW,
                   })
                 }
                 setOptOpen((v) => !v)
               },
             },
               h(OptIcon),
-              // dsh-launcher fork：给标题加标记，供窄屏 CSS 隐藏（见注入样式的 ⑨ 段）。
-              h('span', { 'data-po06': 'options-label', style: S.optBtnText }, L('优化选项', 'Options')),
+              h('span', { style: S.optBtnText }, L('优化选项', 'Options')),
               h('span', { 'data-po06': 'options-summary', style: S.optSummary },
                 tierLabel(tier) + ' · ' + (permission === 'review' ? L('审查', 'Review') : L('自动', 'Auto'))
                   + (rtKnown && readTools ? ' · ' + L('工具开', 'tools on') : '')),
@@ -2160,9 +2497,10 @@ window.__ModuleLoader__.load({
               //   `left/top/bottom` 时会退回到"流里的位置"——实测就是**看不见任何弹窗**
               //   （用户 2026-09-22："点击优化选项没有任何弹窗出现"）。
               //   所以这里把按钮实测坐标铺上去，并在量不到时退回 `?` 弹层用的那套固定落点。
+              // issue #18：宽度按会话窗收（打开侧栏 ⇒ 会话列变窄 ⇒ 弹层跟着窄），右缘不越界。
               style: { ...S.optPop, ...(optPos
-                ? { left: optPos.left + 'px', bottom: optPos.bottom + 'px' }
-                : { left: '16px', bottom: '84px' }) } },
+                ? { left: optPos.left + 'px', bottom: optPos.bottom + 'px', ...(optPos.width ? { width: optPos.width + 'px' } : null) }
+                : { left: '16px', bottom: '84px', ...(region ? { width: Math.min(300, Math.max(120, region.w - 16)) + 'px' } : null) }) } },
               h('div', { style: S.optPopHead }, h(OptIcon), h('span', {}, L('优化选项', 'Options'))),
               // ① 档位（从第一行搬来；分段控件本身没变）
               h('div', { style: S.optRow }, h('span', { style: S.optLabel }, L('档位', 'Tier')),
@@ -2170,7 +2508,19 @@ window.__ModuleLoader__.load({
                   name: 'tier', value: tier, options: TIER_KEYS, label: (k) => tierLabel(k), failTick,
                   title: L('优化档位：关闭 / 轻度 / 标准 / 重度 —— 点击、按住拖动、或按 ←→ 方向键（Home/End 到两端）',
                     'Optimizer tier: Off / Low / High / Ultra — click, drag, or press the ←→ arrow keys (Home/End for the ends)'),
-                  onPick: (v) => save({ tier: v }),
+                  // ⚠ 点档位 = **整份替换**该会话的覆盖，不能与旧覆盖合并：
+                  //   合并会把上一次的 assist/detail/budget 残留带进来，读取时它们会盖过新预设，
+                  //   表现为"点了档位但档位不变"（用户实测 2026-09-27）。
+                  onPick: (v) => save({ bySession: replaceTier(v) }),
+                })),
+              // ①b 协作基调（0.7.8）：与档位正交，按会话存。语域本身就是效果来源（见 framing.js）。
+              h('div', { style: S.optRow }, h('span', { style: S.optLabel }, L('协作基调', 'Tone')),
+                h(Segmented, {
+                  name: 'framing', value: framing, options: ['neutral', 'hard'], failTick,
+                  label: (k) => (k === 'hard' ? L('硬邦邦', 'Hard') : L('普通', 'Plain')),
+                  title: L('硬邦邦：用更直接、更来劲的语气推动执行（不改你的原话，也不放松「不替你拍板」的边界）',
+                    'Hard: a blunter, more driven register (your words stay unchanged and decision boundaries stay intact)'),
+                  onPick: (v) => save({ bySession: withSession({ framing: v }) }),
                 })),
               // ② 优化权限：档位 off 时禁用
               h('div', { style: S.optRow }, h('span', { style: S.optLabel }, L('权限', 'Permission')),
@@ -2290,7 +2640,7 @@ window.__ModuleLoader__.load({
         !data && status.error ? h('span', { 'data-po06': 'status-error', style: { ...S.muted, color: T('err') } },
           L('读状态失败：', 'Status unavailable: ') + errorText(status.error)) : null,
         // 「?」帮助弹层（要求②）：正文来自宿主 GET /help；读不到就如实说，并给出文件路径
-        helpOpen ? h('div', { ...themeAttrs(), 'data-po06': 'help-pop', style: S.helpPop },
+        helpOpen ? h('div', { ...themeAttrs(), 'data-po06': 'help-pop', style: { ...S.helpPop, ...(region ? { right: Math.max(0, Math.round(((typeof window !== 'undefined' && window.innerWidth) || 800) - region.right) + 16) + 'px', width: Math.min(560, Math.max(120, region.w - 32)) + 'px' } : null) } },
           h('div', { style: { ...S.row, margin: '0 0 6px' } },
             h('strong', {}, L('使用帮助（怎么用 / 档位 / 权限 / 推荐组合）', 'Help (how to use / tier / permission / recommended combos)')),
             h('span', { style: S.muted }, (data && data.version) || ''),
@@ -2343,7 +2693,7 @@ window.__ModuleLoader__.load({
           onOpen: reopenFromBall,
           onMove: (p) => setOvBall((b) => (b ? { ...b, pos: p } : b)),
         }) : null,
-        open ? h('div', { ...themeAttrs(), 'data-po06': 'panel', style: S.panel },
+        open ? h('div', { ...themeAttrs(), 'data-po06': 'panel', style: { ...S.panel, ...(region ? { right: Math.max(0, Math.round(((typeof window !== 'undefined' && window.innerWidth) || 800) - region.right) + 16) + 'px', width: Math.min(420, Math.max(120, region.w - 32)) + 'px' } : null) } },
           h('div', { style: S.row },
             h('strong', {}, L('提示词优化器 0.6','Prompt Optimizer 0.6')),
             h('span', { style: S.muted }, (data && data.version) || ''),
@@ -2351,7 +2701,7 @@ window.__ModuleLoader__.load({
           ),
           status.error ? h('div', { style: { ...S.muted, color: T('err') } }, L('读状态失败：','Failed to read status: ') + errorText(status.error)) : null,
           h('div', { style: S.h }, L('控制','Controls')),
-          h(ControlForm, { status: data, refresh: refreshStatus }),
+          h(ControlForm, { status: data, refresh: refreshStatus, sessionId }),
           h('div', { style: S.h }, L('解释层提示词','Explainer prompt')),
           h(PromptEditor, { prompt: data && data.prompt, refresh: refreshStatus }),
         ) : null,
@@ -2359,16 +2709,20 @@ window.__ModuleLoader__.load({
     }
 
     // ── ② 设置页里的一页（同一套控件）─────────────────────────────────
-    function SettingsTab() {
+    function SettingsTab(props) {
       useLocaleLive()                                  // 语言是活的：DSH 里切语言 ⇒ 立刻换文案
       useThemeLive()                                   // 主题也是活的：切深浅色 ⇒ 立刻换配色
-      const [status, refresh] = useStatus()
+      // ⚠ 宿主按**标准 props** 注入 `sessionId`（与 ControlBar 同一契约，见 slots.d.ts）。
+      //   此前这个组件漏了形参，函数体里却引用 `sessionId` ⇒ 渲染期 ReferenceError
+      //   ⇒ 设置页整块失效（用户实测：点了没反应、界面不更新）。
+      const { sessionId } = props || {}
+      const [status, refresh] = useStatus(sessionId)
       const [turns] = useTurns(3)
       const data = status.data
       return h('div', { ...themeAttrs(), 'data-po06': 'settings', style: { fontSize: '13px' } },
         h('div', { style: S.muted }, 'dsh-prompt-optimizer 0.6 ｜ ' + ((data && data.version) || '') + ' ｜ ' + ((data && data.home) || '')),
         !data ? h('div', { style: S.muted }, status.error ? L('读状态失败：','Failed to read status: ') + errorText(status.error) : '读取中…') : null,
-        data ? h('div', {}, h('div', { style: S.h }, L('控制','Controls')), h(ControlForm, { status: data, refresh })) : null,
+        data ? h('div', {}, h('div', { style: S.h }, L('控制','Controls')), h(ControlForm, { status: data, refresh, sessionId })) : null,
         data ? h('div', {}, h('div', { style: S.h }, L('解释层提示词','Explainer prompt')), h(PromptEditor, { prompt: data.prompt, refresh })) : null,
         h('div', { style: S.h }, L('最近几轮','Recent rounds')),
         h(TurnsList, { turns: turns.data }),
@@ -2376,6 +2730,339 @@ window.__ModuleLoader__.load({
           ? h('div', { style: { ...S.muted, color: T('warn') } }, L('配置里有 ','Config has ') + data.problems.length + ' 处不规范（已按默认处理）')
           : null,
       )
+    }
+
+    // Advisor views share the keyed tool slot with root and PTC subcalls.
+    let AdvisorIcons = {}
+    try { AdvisorIcons = require('@deepseek-ai/dsh-client-ui-primitives') } catch { /* text fallback */ }
+    const advisorIcon = (name, fallback, style) => AdvisorIcons[name]
+      ? h(AdvisorIcons[name], { style: { width: '16px', height: '16px', flexShrink: 0, ...style } })
+      : h('span', { 'aria-hidden': true, style }, fallback)
+    const advisorTerminal = new Set(['done', 'failed', 'cancelled', 'timeout', 'interrupted'])
+    function advisorValueOf(block) {
+      const text = (Array.isArray(block && block.content) ? block.content : [])
+        .filter((b) => b && b.type === 'text').map((b) => b.text || '').join(String.fromCharCode(10))
+      const parseObject = (source) => {
+        try {
+          const value = JSON.parse(source)
+          return value && typeof value === 'object' && !Array.isArray(value) ? value : null
+        } catch { return null }
+      }
+      const value = parseObject(text)
+      if (value) return value
+      // Legacy banners precede an object on its own line. Never salvage nested JSON.
+      if (/^\s*[\[{]/.test(text)) return null
+      const boundary = /(?:^|\n)[\t ]*\{/.exec(text)
+      return boundary ? parseObject(text.slice(boundary.index)) : null
+    }
+    function advisorArgsOf(props, partial) {
+      const block = props.block || {}
+      const raw = props.phase === 'result' ? block.call && block.call.argsRaw : block.argsRaw
+      if (raw && typeof raw === 'object') return raw
+      try { return JSON.parse(raw || partial || '{}') } catch { return {} }
+    }
+    const advisorVerdict = (code) => ({
+      pass: L('通过', 'Passed'), gaps: L('有缺口', 'Gaps found'), unverified: L('未完整验证', 'Unverified'),
+      need_user: L('需要你决定', 'Needs your decision'), continue: L('继续当前路线', 'Continue'),
+      narrow: L('缩小实验', 'Narrow the experiment'), change: L('建议换路线', 'Change approach'),
+    }[code] || L('未给出结论', 'No conclusion'))
+    const advisorStage = (code) => ({
+      prepare: L('准备材料', 'Preparing evidence'), evidence: L('查证中', 'Checking evidence'),
+      thinking: L('思考中', 'Thinking'), conclude: L('生成结论', 'Concluding'), validate: L('核对引用', 'Validating citations'),
+      done: L('已完成', 'Completed'), failed: L('未通过校验', 'Not accepted'),
+      timeout: L('已到时限', 'Time limit reached'), cancelled: L('已取消', 'Cancelled'),
+      interrupted: L('运行已中断', 'Interrupted'),
+    }[code] || L('等待顾问', 'Waiting for advisor'))
+    const advisorReason = (reason) => ({
+      'assist-off': L('本会话的提示词辅助已关闭', 'Assistance is off for this session'),
+      'advisor-invalid-check': L('验收项没有通过证据校验', 'An acceptance check failed evidence validation'),
+      'advisor-invalid-citation': L('报告引用了无法核对的证据', 'The report contains an unverifiable citation'),
+      'advisor-invalid-json': L('顾问未返回完整的结构化报告', 'The advisor did not return a complete report'),
+      'advisor-invalid-report': L('顾问报告格式不完整', 'The advisor report is incomplete'),
+      'advisor-pass-without-evidence': L('缺少通过验收的证据', 'Not enough evidence to pass'),
+      'advisor-timeout': L('咨询已到时限', 'Consultation reached its time limit'),
+      'advisor-cancelled': L('咨询已取消', 'Consultation was cancelled'),
+      'host-restarted': L('宿主重启，中断了这次咨询', 'Host restart interrupted this consultation'),
+      'plugin-unloaded': L('插件卸载，中断了这次咨询', 'Plugin unload interrupted this consultation'),
+    }[reason] || reasonText(reason))
+    function useAdvisorRun(sessionId, callId, runId, settled) {
+      const [state, setState] = React.useState({ run: null, error: null, clock: Date.now() })
+      React.useEffect(() => {
+        let alive = true, timer = null, controller = null
+        setState({ run: null, error: null, clock: Date.now() })
+        if (!sessionId || (!callId && !runId)) return undefined
+        const tick = async () => {
+          controller = new AbortController()
+          let done = false
+          try {
+            const identity = runId ? '&run=' + encodeURIComponent(runId) : '&call=' + encodeURIComponent(callId)
+            const response = await fetch(API + '/advisor-progress?session=' + encodeURIComponent(sessionId) + identity,
+              { cache: 'no-store', signal: controller.signal })
+            if (!response.ok) throw new Error('HTTP ' + response.status)
+            const data = await response.json()
+            if (!alive) return
+            const run = data.run || null
+            done = !!(run && advisorTerminal.has(run.stage))
+            setState({ run, error: null, clock: Date.now() })
+          } catch (e) {
+            if (!alive || e.name === 'AbortError') return
+            setState((s) => ({ ...s, error: String(e.message || e), clock: Date.now() }))
+          }
+          if (alive && !settled && !done) timer = window.setTimeout(tick, 800)
+        }
+        void tick()
+        return () => { alive = false; window.clearTimeout(timer); if (controller) controller.abort() }
+      }, [sessionId, callId, runId, settled])
+      return state
+    }
+    // 进度条上限**优先用本轮记录里的限时**（advisor.js 写进来的），这份常量只是记录缺失时的兜底：
+    // 两份各写一个常量必然漂移（真发生过：限时放宽后进度条仍按旧值画满）。
+    const ADVISOR_MAX_MS = 300000
+    // 进度换算：**纯函数**（可单测）。没在跑、或还没有耗时 ⇒ 不画进度条。
+    const advisorProgressPct = (elapsedSec, running, maxMs) => (running && elapsedSec != null && Number.isFinite(elapsedSec))
+      ? Math.min(0.97, Math.max(0, elapsedSec / ((Number(maxMs) > 0 ? Number(maxMs) : ADVISOR_MAX_MS) / 1000))) : null
+    function advisorDraftReply(draft) {
+      const match = /"summary"\s*:\s*"((?:\\.|[^"\\])*)/.exec(String(draft || ''))
+      if (!match) return ''
+      try { return JSON.parse('"' + match[1] + '"') } catch { return '' }
+    }
+    /**
+     * 斜杠命令是否放行（纯函数，便于单测）：
+     * `active` 是**宿主确认已注册**的命令名清单——配置里列了但当前没注册的不会出现在这里。
+     * 判定要求命令名后紧跟空白或行尾，避免 `/vmakefoo` 被当成 `/vmake`。
+     */
+    function slashReviewAllowed(active, draft) {
+      const set = new Set((Array.isArray(active) ? active : []).map((n) => String(n == null ? '' : n).toLowerCase()).filter(Boolean))
+      if (!set.size) return false
+      const m = /^\/([A-Za-z0-9][A-Za-z0-9_-]*)(\s|$)/.exec(String(draft == null ? '' : draft))
+      return !!(m && set.has(m[1].toLowerCase()))
+    }
+    function AdvisorStageCard({ stageState, stagePassed }) {
+      const state = stageState
+      const stage = state && state.stage && state.stage.id ? state.stage : null
+      const field = (key, value) => h('div', { 'data-po06-advisor-stage-field': key }, h('strong', null, key + ': '), value == null ? L('未声明', 'Not declared') : String(value))
+      return h('div', { 'data-po06-advisor-stage-state': true, style: { marginTop: '12px', fontSize: '12px', overflowWrap: 'anywhere' } },
+        field('taskId', state && state.taskId), field('stageId', stage && stage.id), field('action', state && state.action),
+        h('p', { 'data-po06-advisor-stage-gate': true, style: { color: stagePassed ? T('ok') : T('warn') } },
+          stage ? stagePassed ? L('当前声明阶段可放行（非任务完成）', 'Current declared stage may advance (not task completion)') : L('当前声明阶段未放行', 'Current declared stage cannot advance') : L('缺少当前声明阶段状态', 'Current declared stage state is missing')),
+        stage && Array.isArray(stage.checks) ? stage.checks.map((check, i) => h('div', { key: check.id || i, 'data-po06-advisor-stage-check': check.id, style: { padding: '5px 0' } },
+          field('id', check.id), field('status', check.status), field('criterion', check.criterion))) : null,
+        state && Array.isArray(state.dependencyStages) ? field('dependencyStages', state.dependencyStages.join(' · ')) : null,
+        stage && Array.isArray(stage.limitations) ? field('limitations', stage.limitations.join(' · ')) : null)
+    }
+
+    function AdvisorMaterials({ materials, openFile }) {
+      const evidenceLabel = row => ({ source:L('源码','Source'), 'test-log':L('测试日志','Test log'), 'runtime-log':L('运行日志','Runtime log'), 'runtime-capture':L('运行截图（声明）','Runtime capture (declared)'), 'software-preview':L('替代预览','Software preview'), reference:L('参考图','Reference'), other:L('未指定证据类型','Unspecified evidence type') }[row.evidenceType || 'other'])
+      const statusLabel = row => row.status === 'ready' ? (row.kind === 'image' ? L('已附图像', 'Image attached') : L('已附内容', 'Content attached'))
+        : row.status === 'truncated' ? L('部分内容', 'Partial content') : row.status === 'not-inspected' ? L('未检查图片', 'Image not inspected')
+        : row.status === 'pending' ? L('待准备', 'Pending') : row.status === 'excluded' ? L('本次范围排除', 'Excluded by scope') : L('不可用', 'Unavailable')
+      const reasons = { 'scope-material-excluded': L('不属于本次专项，未读取、未附入', 'Outside this review scope; not read or attached'), 'model-text-only': L('当前模型不支持图像输入', 'Model does not accept images'),
+        'model-image-capability-unknown': L('宿主未确认当前模型的图像能力', 'Image capability is not declared'),
+        'read-tools-disabled-or-no-cwd': L('只读工具未开启或工作目录不可用', 'Read tools are off or workspace is unavailable'),
+        'file-not-found': L('文件不存在', 'File not found'), 'outside-workspace': L('路径不在本会话工作目录内', 'Outside workspace'),
+        'file-too-large': L('材料超过大小限制', 'Material exceeds size limit'), 'attachment-service-unavailable': L('图片附件服务不可用', 'Image attachment service unavailable') }
+      if (!materials.length) return null
+      return h('div', { 'data-po06-advisor-materials': true, style: { marginTop: '14px', minWidth: 0 } },
+        h('div', { style: { color: T('fg3'), fontSize: '11px', marginBottom: '6px' } }, L('本次提供的材料', 'Materials for this consultation') + ' · ' + materials.length),
+        materials.map((row, index) => h('details', { key: row.id || index, 'data-advisor-material': row.id || index,
+          style: { borderTop: '1px solid ' + T('line2'), padding: '7px 0', minWidth: 0 } },
+          h('summary', { style: { cursor: 'pointer', color: T('fg2'), overflowWrap: 'anywhere', fontSize: '12px' } },
+            h('span', { style: { marginRight: '7px', color: T('fg3') } }, row.kind === 'image' ? L('图像', 'Image') : L('文件', 'File')),
+            row.previewAvailable && typeof openFile === 'function' ? h('button', { type: 'button', title: L('在侧栏预览当前文件', 'Preview current file in sidebar'),
+              onClick: e => { e.preventDefault(); e.stopPropagation(); openFile(row.previewPath || row.path) },
+              style: { font: 'inherit', color: T('acc'), background: 'transparent', border: 0, padding: 0, cursor: 'pointer', textAlign: 'left', overflowWrap: 'anywhere' } }, row.path)
+              : h('span', null, row.path),
+            h('span', { style: { fontSize: '11px', marginLeft: '10px', color: row.sent ? T('fg3') : T('warn') } }, statusLabel(row))),
+          h('div', { style: { padding: '7px 0 2px 18px', fontSize: '12px', color: T('fg2'), minWidth: 0 } },
+            h('p', { style: { margin: '0 0 5px', overflowWrap: 'anywhere' } }, row.purpose || L('本次成果', 'Current artifact')),
+            row.reason ? h('p', { style: { margin: '4px 0', color: T('warn') } }, reasons[row.reason] || row.reason) : null,
+            h('p', { style: { margin:'4px 0',fontSize:'11px',color:T('fg3') } }, evidenceLabel(row), row.selectionScope === 'line-range' ? ' · ' + row.selectedStartLine + '-' + row.selectedEndLine : '', row.wholeFileComplete === false && row.kind !== 'image' ? L(' · 非全文',' · Not whole file') : ''),
+            row.sentChars != null ? h('p', { style: { margin: '4px 0', fontSize: '11px', color: T('fg3') } }, L('实际附入 ', 'Attached ') + row.sentChars + ' / ' + (row.selectedChars ?? row.chars) + L(' 字符（所选范围）', ' characters (selected range)')) : null,
+            row.image ? h('p', { style: { margin: '4px 0', fontSize: '11px', color: T('fg3') } }, row.image.width + ' × ' + row.image.height + (row.image.resized ? L(' · 经宿主缩放', ' · Normalized by host') : '')) : null,
+            row.excerpt ? h('pre', { style: { margin: '7px 0', fontSize: '11px', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', maxHeight: '160px', overflowY: 'auto' } }, row.excerpt) : null,
+            row.sha256 ? h('p', { style: { margin: '5px 0 0', fontSize: '10px', color: T('fg3'), overflowWrap: 'anywhere' } }, 'SHA256 ' + row.sha256.slice(0, 16) + L(' · 侧栏预览当前文件，可能与咨询时版本不同', ' · Sidebar shows the current file, which may differ from the reviewed version')) : null))))
+    }
+    function AdvisorToolRow(props) {
+      useLocaleLive()
+      // ⚠ 主题也是活的：少了这一行，切到浅色后卡片不会重渲染，标记停在 dark ⇒ 用户看到的
+      //   就是「只有黑色模式」（2026-09-30 实测反馈）。其余面板都调了它，这里此前漏了。
+      useThemeLive()
+      // 本组件自己的会话标识（宿主按 session scope 注入）。定义在本地，避免与其它组件的同名变量混淆。
+      const sessionId = props.sessionId
+      const partial = typeof props.useToolCallArgumentsPartial === 'function' ? props.useToolCallArgumentsPartial() : ''
+      const args = advisorArgsOf(props, partial)
+      const result = props.phase === 'result' ? advisorValueOf(props.block) : null
+      const state = useAdvisorRun(sessionId, props.callId, result && result.uiRunId, props.phase === 'result')
+      const candidate = state.run
+      const run = candidate && candidate.sessionId === String(sessionId)
+        && (result && result.uiRunId ? candidate.runId === result.uiRunId : candidate.callId === String(props.callId)) ? candidate : null
+      const value = (run && run.result) || result
+      const report = value && value.ok === true && value.report ? value.report : null
+      const stage = run ? run.stage : (props.phase === 'result' ? (value && value.ok ? 'done' : 'failed') : 'prepare')
+      const running = props.phase !== 'result' && !advisorTerminal.has(stage)
+      // 运行中默认展开思考：用户要的就是"实时看到思维链"，跑完再收起来才需要多点一次。
+      const [processOpen, setProcessOpen] = React.useState(props.phase !== 'result')
+      const [checksOpen, setChecksOpen] = React.useState(false)
+      const thinkBody = React.useRef(null)
+      const followThink = React.useRef(true)
+      const reasoning = run && run.reasoning || ''
+      React.useEffect(() => {
+        const body = thinkBody.current
+        if (processOpen && body && followThink.current) body.scrollTop = body.scrollHeight
+      }, [reasoning, processOpen])
+      const mode = args.mode || (value && value.mode) || (run && run.mode)
+      const title = mode === 'review_result' ? L('顾问 · 独立验收', 'Advisor · Independent review') : L('顾问 · 失败诊断', 'Advisor · Failure diagnosis')
+      const isPartial = !!(value && (value.partial || (value.presentationMeta && value.presentationMeta.partial)))
+      const stageState = value && ((value.presentationMeta && value.presentationMeta.stageState) || value.stageState)
+      const staged = !!(stageState || args.taskId || args.stageId || (value && (value.taskId || value.stageId)))
+      const declaredStage = stageState && stageState.stage && stageState.stage.id ? stageState.stage : null
+      const recordingFailed = !!(value && ((value.stageRecording && value.stageRecording.ok === false) || (value.presentationMeta && value.presentationMeta.stageRecording && value.presentationMeta.stageRecording.ok === false)))
+      const stagePassed = !!(declaredStage && stageState && stageState.advanceAllowed === true && stageState.ok === true && !isPartial && !(stageState.dependencyStages && stageState.dependencyStages.length) && !recordingFailed)
+      const status = staged && !running ? (stagePassed ? L('当前阶段可放行', 'Current stage may advance') : L('当前阶段未放行', 'Current stage cannot advance')) : running ? advisorStage(stage) : isPartial ? L('保留部分内容', 'Partial output')
+        : report ? advisorVerdict(report.verdict) : advisorStage(stage)
+      const tone = (staged ? stagePassed : report && !isPartial && report.verdict === 'pass') ? T('ok') : running ? T('acc') : T('warn')
+      const elapsed = run ? Math.max(0, ((run.finishedAt || state.clock) - run.startedAt) / 1000)
+        : value && typeof value.ms === 'number' ? value.ms / 1000 : null
+      // 用一个静止的进度条把"还在跑、跑了多久"画出来，比只有一个秒数直观；上限对齐 advisor.js 的 150s，
+      // 且**最多画到 97%**——没结束就不该看起来已经满了。
+      const progress = advisorProgressPct(elapsed, running, run && run.timeoutMs)
+      // 页脚要用的元信息（四分区重写时漏了声明，2026-09-30 由组件树断言抓出 `model is not defined`）。
+      const model = (run && run.model) || (value && value.model) || null
+      const effort = (run && run.effort) || (value && value.reasoningEffort) || null
+      const toolCalls = (run && run.toolCalls != null) ? run.toolCalls : (value && value.toolCalls != null ? value.toolCalls : null)
+      // 这次咨询的 token（结果里的 usage，已由 advisor.js 的 presentationMeta 投影过来）。
+      // ⚠ 这是**插件自己的账**：DSH 顶部那个数字只统计宿主自己发起的调用，这里进不去。
+      const usage = (run && run.result && run.result.usage) || (value && value.usage) || null
+      const question = args.question || (run && run.question) || ''
+      const reviewScope = (run && run.reviewScope) || (value && value.reviewScope) || args.scope || 'general'
+      const focus = (run && run.focus) || (value && value.focus) || args.focus || ''
+      const scopeLabels = { general: L('综合复核', 'General'), geometry: L('几何装配', 'Geometry'), appearance: L('画面表现', 'Appearance'), code: L('代码正确性', 'Code'), interaction: L('交互逻辑', 'Interaction'), performance: L('性能证据', 'Performance'), delivery: L('交付覆盖', 'Delivery coverage'), custom: L('自定义专项', 'Custom') }
+      const coverage = (run && run.coverage) || (value && value.coverage) || null
+      const supplied = [...(Array.isArray(args.artifacts) ? args.artifacts.map(path => ({ path, kind: 'file' })) : []),
+        ...(Array.isArray(args.files) ? args.files.map(x => ({ ...x, kind: 'file' })) : []),
+        ...(Array.isArray(args.images) ? args.images.map(x => ({ ...x, kind: 'image' })) : [])].map(x => ({ ...x, status: 'pending' }))
+      const materials = (run && run.materials) || (value && value.materials) || supplied
+      const draftReply = running && run ? advisorDraftReply(run.draft) : ''
+      const textStyle = { margin: 0, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontFamily: 'inherit', lineHeight: 1.75 }
+      const labelStyle = { fontSize: '12px', color: T('acc'), fontWeight: 600, letterSpacing: '.02em', marginBottom: '7px' }
+      // 分区题干：**主题色 + 加粗**（用户 2026-09-30 要求「题干更突出」）。
+      // 只在这一处用主题色，其余保持灰阶 ⇒ 卡面仍然克制、灰度下也能分出区块。
+      const sectionHead = (icon, text, extra) => h('div', { style: { display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '9px', minWidth: 0 } },
+        advisorIcon(icon, '', { color: T('acc'), width: '13px', height: '13px' }),
+        h('span', { style: { fontSize: '12px', color: T('acc'), fontWeight: 600, letterSpacing: '.02em' } }, text), extra || null)
+      const dot = (color, size) => h('span', { 'aria-hidden': true, style: { display: 'inline-block', flexShrink: 0,
+        width: (size || 7) + 'px', height: (size || 7) + 'px', borderRadius: '50%', background: color } })
+      const sectionStyle = { paddingTop: '16px', minWidth: 0 }
+      const disclosureStyle = { cursor: 'pointer', color: T('acc'), fontWeight: 600, fontSize: '12px', letterSpacing: '.02em', padding: '10px 0', outlineOffset: '3px' }
+      const refs = values => h('span', { style: { color: T('fg3'), fontSize: '11px', marginLeft: '8px', overflowWrap: 'anywhere' } },
+        (Array.isArray(values) ? values : []).join(' · '))
+      const checks = report && Array.isArray(report.checks) ? report.checks : []
+      const counts = checks.reduce((out, check) => { out[check.status] = (out[check.status] || 0) + 1; return out }, {})
+      const checkLabels = { satisfied: L('已满足', 'Satisfied'), failed: L('不满足', 'Failed'), unverified: L('待验证', 'Unverified') }
+      const checkSummary = checks.length ? checks.length + L(' 项', ' checks')
+        + (counts.failed ? ' · ' + counts.failed + L(' 项不满足', ' failed') : '')
+        + (counts.unverified ? ' · ' + counts.unverified + L(' 项待验证', ' unverified') : '') : running ? L('尚未验收', 'Pending') : L('无验收项', 'No checks')
+      return h('section', { ...themeAttrs(), 'data-po06': 'advisor-tool', 'data-advisor-call': props.callId,
+        style: { width: '100%', boxSizing: 'border-box', minWidth: 0, border: '1px solid ' + T('line2'), borderRadius: '8px',
+          background: T('surface'), color: T('fg'), padding: '16px 18px', fontSize: '13px', lineHeight: 1.65, overflowWrap: 'anywhere' } },
+        h('header', { style: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '10px', minHeight: '24px' } },
+          advisorIcon('IconSparkleRegular', '*', { color: T('fg2') }),
+          h('span', { style: { fontWeight: 600, color: T('acc'), fontSize: '13.5px', letterSpacing: '.01em' } }, title),
+          h('span', { role: 'status', style: { display: 'inline-flex', alignItems: 'center', gap: '6px', color: running ? T('fg2') : tone, fontSize: '12px' } },
+            dot(tone), h('span', null, status)),
+          h('span', { style: { marginLeft: 'auto', color: T('fg3'), fontVariantNumeric: 'tabular-nums', fontSize: '11px', minWidth: '34px', textAlign: 'right' } }, elapsed == null ? '' : Math.floor(elapsed) + 's'),
+          props.inspect ? h('button', { type: 'button', title: L('查看调用详情', 'Inspect call'), 'aria-label': L('查看调用详情', 'Inspect call'), onClick: props.inspect,
+            style: { border: 0, background: 'transparent', color: T('fg3'), padding: '4px', cursor: 'pointer', width: '24px', height: '24px' } }, advisorIcon('IconSearchOutlineRegular', '?')) : null),
+        progress != null ? h('div', { 'data-po06-advisor-progress': true, 'aria-hidden': true,
+          style: { marginTop: '12px', height: '2px', borderRadius: '1px', background: T('line2'), overflow: 'hidden' } },
+          h('div', { style: { width: Math.round(progress * 100) + '%', height: '100%', background: tone, transition: 'width .45s ease' } })) : null,
+        h('div', { 'data-po06-advisor-scope': true, style: { marginTop: '10px', fontSize: '12px', color: T('fg2'), overflowWrap: 'anywhere' } },
+          h('strong', { style: { color: T('acc') } }, scopeLabels[reviewScope] || reviewScope), focus ? ' · ' + focus : ''),
+        reviewScope !== 'general' && reviewScope !== 'delivery' ? h('div', { style: { color: T('fg3'), fontSize: '11px', marginTop: '4px' } }, L('结论仅限本次对象，不代表整体通过', 'This conclusion covers only the reviewed focus')) : null,
+        coverage ? h('details', { 'data-po06-advisor-coverage': true, style: { marginTop: '12px', fontSize: '12px' } },
+          h('summary', { style: { cursor: 'pointer', color: T('acc') } }, L('本轮专项覆盖', 'Coverage for this request') + ' · ' + (coverage.rows || []).length),
+          (coverage.missingScopes || []).length ? h('p', { style: { color: T('warn') } }, L('未覆盖：', 'Missing: ') + coverage.missingScopes.map(s=>scopeLabels[s]||s).join(' · ')) : null,
+          (coverage.missingReviews || []).map((row,index)=>h('p', { key:'missing-'+index, style:{color:T('warn')} }, L('未覆盖检查点：', 'Missing focus: ') + (scopeLabels[row.scope]||row.scope) + ' · ' + row.focus)),
+          (coverage.rows || []).map((row,index)=>h('div', { key: row.id || index, style: { borderTop: '1px solid ' + T('line2'), padding: '7px 0', overflowWrap: 'anywhere' } },
+            h('strong', null, (scopeLabels[row.scope]||row.scope) + ' · ' + (row.focus||'')),
+            h('span', { style: { marginLeft: '8px', color: row.status === 'current' ? T('fg3') : T('warn') } }, row.status === 'current' ? L('版本指纹一致', 'Version matches') : row.status === 'changed' ? L('材料已变更', 'Materials changed') : row.status === 'missing' ? L('材料已缺失', 'Materials missing') : L('版本或结果未确认', 'Version or result unconfirmed')),
+            h('p', { style: { margin: '4px 0', color: T('fg2') } }, row.summary || (row.report && row.report.summary) || ''),
+            (row.checks || []).filter(check=>check.status !== 'satisfied').map((check,i)=>h('div', { key:i, style:{color:T('warn'),fontSize:'11px'} }, check.criterion)))),
+          (coverage.limitations || []).map((note,index)=>h('p', {key:index,style:{color:T('warn'),fontSize:'11px'}}, String(note).startsWith('revision-marker-changed:') ? L('复核后记录到源码变更，需重审相关项', 'Recorded source changes require another focused review') : String(note).startsWith('required-focus-unspecified:') ? L('缺少该专项的具体检查对象清单', 'Required focus list is missing') : String(note).startsWith('evidence-limited:') ? L('既有复核证据不完整或未通过', 'Previous review is incomplete or has gaps') : note === 'scope-pass-is-focus-only' ? L('局部通过仅适用于已列出的对象', 'A pass applies only to the listed focus') : note === 'required-scopes-unspecified' ? L('尚未列出必要的专项检查点', 'Required reviews have not been specified') : note))) : null,
+        h('div', { 'data-po06-advisor-question': true, style: sectionStyle },
+          sectionHead('IconSearchOutlineRegular', L('原 AI 询问内容', 'Original AI question')),
+          h('p', { style: { ...textStyle, color: T('fg2'), maxHeight: '160px', overflowY: 'auto' } }, question || L('正在接收询问…', 'Receiving question…'))),
+        staged ? h(AdvisorStageCard, { stageState, stagePassed }) : null,
+        !staged && value && value.reviewPassed !== undefined ? h('div', {'data-po06-advisor-outcome':true,style:{marginTop:'10px',fontSize:'12px',color:T('fg2')}},
+          L('咨询调用：','Invocation: ') + (value.invocationSucceeded ? L('成功','Succeeded') : L('未成功','Unavailable')) + ' · ' +
+          (value.reviewPassed ? L('当前专项通过（非整体完成）','Reviewed scope passed (not task completion)') : L('验收待补','Verification pending')),
+          ((value.reviewState && value.reviewState.openIssues) || value.openIssues || []).map((row,i)=>h('p',{key:row.id||i,style:{margin:'5px 0',color:T('warn'),overflowWrap:'anywhere'}},
+            (row.id ? row.id + ' · ' : '') + row.criterion + ' · ' + (row.nextStep || row.action || '')))) : null,
+        h(AdvisorMaterials, { materials, openFile: props.openFile }),
+        value && value.inspectedMaterials && value.inspectedMaterials.length ? h('details',{'data-po06-advisor-reads':true,style:{marginTop:'8px',fontSize:'11px',color:T('fg3')}},
+          h('summary',null,L('顾问补读（不等于全文验收）','Advisor reads (not whole-file acceptance)')),
+          value.inspectedMaterials.map((row,i)=>h('p',{key:i,style:{overflowWrap:'anywhere'}},row.path + ' · ' + row.status + (row.offset ? ' · offset=' + row.offset : '') + (row.limit ? ' limit=' + row.limit : '')))) : null,
+        h('details', { 'data-po06-advisor-thinking': true, open: processOpen, onToggle: e => setProcessOpen(e.currentTarget.open),
+          style: { marginTop: '14px', borderTop: '1px solid ' + T('line2'), borderBottom: '1px solid ' + T('line2') } },
+          h('summary', { style: disclosureStyle },
+            h('span', { style: { display: 'inline-flex', alignItems: 'center', gap: '6px' } },
+              advisorIcon('IconSparkleRegular', '', { color: T('acc'), width: '13px', height: '13px' }),
+              h('span', null, L('顾问思考内容', 'Advisor thinking')),
+              running ? dot(tone, 6) : null),
+            running ? h('span', { style: { marginLeft: '10px', color: T('fg3'), fontSize: '11px' } }, advisorStage(stage)) : null),
+          processOpen ? h('div', { ref: thinkBody, onScroll: e => { const body = e.currentTarget; followThink.current = body.scrollHeight - body.scrollTop - body.clientHeight < 32 },
+            style: { maxHeight: '280px', overflowY: 'auto', padding: '0 0 12px', minWidth: 0 } },
+            h('pre', { style: { ...textStyle, color: T('fg2') } }, reasoning || (running ? L('等待模型返回思考流…', 'Waiting for model thinking…')
+              : run ? L('模型未提供思考流。', 'The model did not provide a thinking stream.') : L('本次没有可回放的思考记录。', 'No thinking transcript was recorded.'))),
+            run && run.reasoningTruncated ? h('p', { style: { fontSize: '11px', color: T('fg3'), marginBottom: 0 } }, L('仅保留最近 24,000 字符。', 'Only the latest 24,000 characters are retained.')) : null,
+            run && run.activities.length ? h('details', { style: { marginTop: '12px', color: T('fg3'), fontSize: '11px' } },
+              h('summary', { style: { cursor: 'pointer' } }, L('查证记录', 'Evidence activity') + ' · ' + run.toolCalls),
+              h('ul', { style: { paddingLeft: '18px', margin: '6px 0 0' } }, run.activities.map((item, i) => h('li', { key: i, style: { padding: '2px 0' } },
+                (item.ok ? L('已读取', 'Read') : L('未取得', 'Unavailable')) + ' · ' + item.tool + ' · ' + item.target)))) : null) : null),
+        h('div', { 'data-po06-advisor-output': true, style: sectionStyle },
+          sectionHead('IconCheckOutlineRegular', L('顾问答复内容', 'Advisor reply')),
+          h('p', { 'data-po06-advisor-summary': true, style: { ...textStyle, fontSize: '14px', color: T('fg') } }, report ? report.summary : draftReply || (running
+            ? L('顾问正在分析，答复将显示在这里。', 'The advisor is analyzing; its reply will appear here.')
+            : advisorReason((value && (value.reason || value.cut)) || (run && run.reason) || ''))),
+          draftReply ? h('span', { style: { fontSize: '11px', color: T('fg3') } }, L('答复生成中，尚未完成校验', 'Reply streaming; validation pending')) : null,
+          report && report.findings.length ? h('ul', { style: { paddingLeft: '18px', margin: '12px 0' } }, report.findings.map((finding, i) => h('li', { key: i, style: { margin: '7px 0', color: T('fg2') } }, finding.text, refs(finding.evidenceRefs)))) : null,
+          report ? h('div', { style: { marginTop: '12px', color: T('fg2') } },
+            h('div', null, h('span', { style: { color: T('fg3'), marginRight: '8px', fontSize: '12px' } }, L('下一步', 'Next step')), report.nextStep),
+            h('div', { style: { marginTop: '6px' } }, h('span', { style: { color: T('fg3'), marginRight: '8px', fontSize: '12px' } }, L('停止条件', 'Stop condition')), report.stopCondition)) : null,
+          isPartial ? h('p', { style: { ...textStyle, color: T('warn'), marginTop: '10px', fontSize: '12px' } }, L('仅保留已生成内容，不作为完整验收通过。', 'Retained output only; not a completed acceptance review.')) : null),
+        h('details', { 'data-po06-advisor-checks': true, open: checksOpen, onToggle: e => setChecksOpen(e.currentTarget.open),
+          style: { marginTop: '16px', borderTop: '1px solid ' + T('line2') } },
+          h('summary', { style: disclosureStyle },
+            h('span', { style: { display: 'inline-flex', alignItems: 'center', gap: '6px' } },
+              advisorIcon('IconChecklistOutlineRegular', '', { color: T('acc'), width: '13px', height: '13px' }),
+              h('span', null, L('验收结果', 'Acceptance results'))),
+            h('span', { style: { marginLeft: '10px', fontSize: '11px', display: 'inline-flex', alignItems: 'center', gap: '6px' } },
+              dot(counts.failed ? T('err') : counts.unverified ? T('warn') : counts.satisfied ? T('ok') : T('cap'), 6),
+              h('span', { style: { color: T('fg3') } }, checkSummary))),
+          checksOpen ? h('div', { style: { paddingBottom: '6px' } },
+            checks.length ? checks.map((check, i) => h('div', { key: i, style: { display: 'grid', gridTemplateColumns: '16px minmax(0,1fr)', gap: '8px', padding: '9px 0' } },
+              h('span', { style: { paddingTop: '6px' } }, dot(check.status === 'satisfied' ? T('ok') : check.status === 'failed' ? T('err') : T('cap'))),
+              h('div', null,
+                h('span', { style: { color: T('fg3'), fontSize: '11px', marginRight: '8px' } }, checkLabels[check.status] || check.status),
+                check.criterion, refs(check.evidenceRefs)))) : h('p', { style: { ...textStyle, color: T('fg3') } }, running ? L('等待顾问完成核验。', 'Waiting for the advisor review.') : L('本次未形成可采纳的验收项。', 'No accepted checks were produced.')),
+            !report && value && value.detail ? h('p', { style: textStyle }, L('未通过的验收项：', 'Rejected check: ') + String(value.detail.criterion || ''), refs(value.detail.refs)) : null,
+            // 到点但有进展：把思考尾部摆出来，而不是只给一句「超时」（复杂项目不能空手而归）。
+            !report && value && value.partialReasoning ? h('details', { style: { marginTop: '10px' }, 'data-po06-advisor-partial': true },
+              h('summary', { style: { cursor: 'pointer', color: T('warn'), fontSize: '11px' } }, L('到点前的思考尾部（未形成报告）', 'Thinking tail before the deadline (no report)')),
+              h('pre', { style: { ...textStyle, maxHeight: '200px', overflowY: 'auto', marginTop: '8px', color: T('fg2'), fontFamily: 'inherit', fontSize: '12px' } }, value.partialReasoning)) : null,
+            (!report && ((value && value.raw) || (run && run.draft))) ? h('details', { style: { marginTop: '10px' } },
+              h('summary', { style: { cursor: 'pointer', color: T('fg3'), fontSize: '11px' } }, L('未采纳的原始输出', 'Unaccepted raw output')),
+              h('pre', { style: { ...textStyle, maxHeight: '180px', overflowY: 'auto', fontFamily: 'monospace', fontSize: '12px', marginTop: '8px' } }, (value && value.raw) || run.draft)) : null) : null),
+        // 页脚：一行克制的元信息（模型 / 思考档 / 查证次数 / token 用量）。
+        h('div', { 'data-po06-advisor-meta': true, style: { display: 'flex', flexWrap: 'wrap', gap: '10px', color: T('fg3'), fontSize: '11px', marginTop: '10px' } },
+          model ? h('span', { style: { overflowWrap: 'anywhere' } }, model) : null,
+          effort ? h('span', null, L('思考档 ', 'Effort ') + effort) : null,
+          toolCalls != null ? h('span', null, L('查证 ', 'Evidence ') + toolCalls + L(' 次', ' calls')) : null,
+          usage ? h('span', { 'data-po06-advisor-usage': true,
+            title: L('本次咨询的 token（插件自己的账，不计入 DSH 顶部统计）', 'Tokens for this consultation (plugin-side accounting; not counted in DSH totals)') },
+            usageText(usage, true)) : null,
+          value && (value.truncated || value.omitted) ? h('span', { style: { color: T('warn') } }, L('材料不完整', 'Incomplete evidence')) : null),
+        state.error ? h('p', { style: { color: T('warn'), fontSize: '11px', margin: '6px 0 0' } }, L('实时进度暂不可用：', 'Live progress unavailable: ') + state.error) : null)
     }
 
     // ── 注册（含单例闸门与自愈重挂）──────────────────────────────────
@@ -2466,54 +3153,6 @@ window.__ModuleLoader__.load({
             '[data-po06] select{color-scheme:inherit}',
             '[data-po06] select option{background:var(--po06-surface);color:var(--po06-fg)}',
             '[data-po06] select option:checked{background:' + OVS.acc22 + ';color:' + OVS.acc + '}',
-            // ⑧ ── 移动端适配（dsh-launcher 补丁，v55 移植）────────────────────────
-            // 上游的面板尺寸是桌面尺度（内联 width 460 / minWidth 360、几何下限 400×320），
-            // 而本机视口实测仅 **361 CSS px**（1264 物理 / 3.5 密度）：桌面规则照单全收会
-            // 「右侧被裁、按钮挤成一团、底部被导航栏盖住」。
-            // ⚠ 宽高是**内联**写在 [data-po06="intercept"] 上的，普通规则压不过内联，
-            //   故这里用 !important 明确覆盖（本补丁的既定手法）。
-            '@media (max-width:768px){[data-po06="intercept"]{width:calc(100vw - 20px) !important;min-width:0 !important;max-width:520px}}',
-            '@media (max-width:560px){[data-po06="intercept"]{width:calc(100vw - 16px) !important;min-width:0 !important;max-height:min(88vh,660px);font-size:13px}}',
-            '@media (max-width:420px){[data-po06="intercept"]{width:calc(100vw - 12px) !important;border-radius:10px}}',
-            // 触控目标：面板按钮原为 28px 高，手指点不准；窄屏下抬到 38px
-            '@media (max-width:560px){[data-po06] button{min-height:38px}}',
-            // ⑨ ── 控件栏窄屏修复（dsh-launcher fork）────────────────────────────
-            // 真机（360 CSS px）实测的原始故障：宿主 conversation.input.left 是横向挤占的
-            // flex 容器，本插件按钮被压到比内容更窄，而**中日韩文字可在任意字符间断行**
-            // ⇒「优化选项」被逐字竖排、外框变成竖条并与相邻控件（工作区内修改 / 模型选择）
-            // 重叠。以下四条 CSS 与上面的内联样式互为保险（内联改的是常态，这里兜窄屏）。
-            //
-            // ① 控件栏整体不许横向溢出，且按钮一律不被压缩
-            '[data-po06="bar"]{max-width:100%;box-sizing:border-box;min-width:0}',
-            '[data-po06="bar"] button{flex:0 0 auto;white-space:nowrap}',
-            // ② 窄屏**收成图标按钮**：真机实测（360 CSS px）宿主 conversation.input.left 是
-            //    横向挤占的 flex 行，本插件按钮与宿主「工作区内修改」互相重叠。把标题与摘要
-            //    一起收起后按钮只剩 图标+箭头（约 46px），横向占用降到原来的 1/4，重叠消失。
-            //    **渐进隐藏**：点开后弹出面板里档位/权限/模型一应俱全，功能与信息不丢失。
-            //    （<=560 就收，因为 360 视口下 560 断点必然命中；>=560 的平板保留完整文字。）
-            '@media (max-width:560px){[data-po06="options-label"],[data-po06="options-summary"]{display:none}}',
-            // 图标按钮也要有足够的触控面积（视觉仍是小圆角按钮）
-            '@media (max-width:560px){[data-po06="options-btn"]{padding:0 8px;gap:4px}}',
-            // ③ 触控目标：控件栏按钮在窄屏下也要够大（原 18px 行高≈点不准）
-            '@media (max-width:560px){[data-po06="bar"] button{min-height:34px;padding-left:10px;padding-right:10px}}',
-            // ④ 窄屏下控件栏自身纵向堆叠、留出间距，避免与宿主控件互相挤占
-            '@media (max-width:560px){[data-po06="bar-row-1"]{row-gap:6px;max-width:100%}}',
-            // ⑤ 触控目标：真机量得控件栏按钮仅 **34px** 高（低于 40px 的常用下限），
-            //    窄屏下抬到 40px。宽度也留够，避免「看得见点不准」。
-            '@media (max-width:560px){[data-po06="bar"] button{min-height:40px;padding-left:12px;padding-right:12px}}',
-            // ⑥ 弹出层避开系统栏：全面屏手势条 / 刘海会盖住贴着屏幕边的弹层。
-            //    options-pop 与 help-pop 都是 position:fixed 的贴边浮层，故补安全区内边距。
-            '@supports (padding:max(0px)){'
-              + '[data-po06="options-pop"],[data-po06="help-pop"]{'
-              + 'padding-bottom:max(10px,env(safe-area-inset-bottom));'
-              + 'padding-left:max(12px,env(safe-area-inset-left));'
-              + 'padding-right:max(12px,env(safe-area-inset-right))}}',
-            // 全面屏安全区：避开刘海/挖孔与底部手势条，防止按钮被系统栏吃掉。
-            // ★ 显式 box-sizing:border-box —— 内联的 width 是 calc(100vw - Npx)，
-            //   若按 content-box 再加 padding 会反而溢出（窄屏横向滚动）。
-            '@supports (padding:max(0px)){[data-po06="intercept"]{box-sizing:border-box;padding-left:env(safe-area-inset-left);padding-right:env(safe-area-inset-right)}[data-po06="intercept-head"]{padding-top:max(9px,env(safe-area-inset-top))}}',
-            // 拖动面板时禁止页面滚动/缩放干扰（仅拖拽头，不影响内容区滚动）
-            '[data-po06="intercept-head"]{touch-action:none}',
           ].join('')
           document.head.appendChild(tag)
           own(() => { try { tag.remove() } catch (e) { /* 已被别处摘掉 */ } })
@@ -2642,21 +3281,7 @@ window.__ModuleLoader__.load({
         if (!isLive()) return null
         const id = NS + ':' + key
         if (typeof mounts[id] === 'function') { try { mounts[id]() } catch (e) { /* noop */ } mounts[id] = null }
-        // dsh-launcher 补丁：keyed 座位按 key 唯一，而宿主可能已经占了同一个 key。
-        // 实例（真机 WebView 实测）：非 Windows 平台宿主自带 bash 工具与卡片，而本插件的
-        // bash 卡片在 0.7.6 仍**无条件**注册 ⇒ 抛
-        //   Uncaught Error: keyed slot "tool.call.toolview" already has an entry for key "bash"
-        // 上游 v0.7.6 只修了**服务端**的让位（hostProvidesBash = process.platform !== 'win32'），
-        // 客户端这一侧漏了。语义上「同名 key 已存在」= 宿主已提供，插件让位即可，
-        // 因此这里捕获这一种冲突；**其它错误照常抛出**（不掩盖真问题）。
-        const register = () => {
-          try {
-            return ctx.slots.register({ name: slot, key }, Component)
-          } catch (e) {
-            if (/already has an entry/.test(String(e && e.message))) return null
-            throw e
-          }
-        }
+        const register = () => ctx.slots.register({ name: slot, key }, Component)
         mounts[id] = (typeof ctx.slots.inject === 'function') ? ctx.slots.inject(slot, register) : register()
         own(() => { if (typeof mounts[id] === 'function') { try { mounts[id]() } catch (e) { /* noop */ } } })
         return mounts[id]
@@ -2821,20 +3446,8 @@ const react = require("react")
         return BashRow
       })()
       mountKeyed('tool.call.toolview', 'posix', PosixToolRow)
-      // ── bash 卡片让位（dsh-launcher 补丁）──────────────────────────────
-      // keyed 座位按 key 唯一。宿主在**非 Windows 平台自带 bash** 工具与卡片，
-      // 而这一行无条件注册 key:'bash' ⇒ 撞上宿主已占用的同名 key，抛
-      //   Uncaught Error: keyed slot "tool.call.toolview" already has an entry for key "bash"
-      // 注：该异常**不是**在 register 同步调用点抛出的，包 try/catch 抓不到（实测），
-      //     因此这里改用与上游服务端**同源的判据**直接决定是否注册。
-      // 上游 server 端：hostProvidesBash = process.platform !== 'win32' ⇒ 成立则 po06 不注册 bash。
-      // 客户端没有 process，用 navigator.userAgent 取同一事实（Android/iOS/Linux/macOS 不含 "Windows"）。
-      // Windows 上宿主被官方禁用（dsh-base 里 disabled: !!js process.platform === 'win32'），
-      // 此时插件补位、卡片照常注册，行为与上游一致。
-      const hostProvidesBashCard = !/Windows/i.test(
-        (typeof navigator !== 'undefined' && navigator.userAgent) || ''
-      )
-      if (!hostProvidesBashCard) mountKeyed('tool.call.toolview', 'bash', BashToolRow)
+      mountKeyed('tool.call.toolview', 'bash', BashToolRow)
+      mountKeyed('tool.call.toolview', 'consult_task', AdvisorToolRow)
 
       // 测试钩子：让 Node 侧的单测能真的驱动"重挂"这条路（用来验单例闸门）。
       // 生产路径不读它；带 __ 前缀以免与宿主契约上的字段混淆。
@@ -2844,6 +3457,11 @@ const react = require("react")
         locale: () => LOCALE,
         detectLocale,
         // 主题调色板（单测拿它算对比度：浅色模式"看不清"这类问题要能被机器挡住，不能只靠肉眼）
+        InterceptPanel, InterceptDraftBody, interceptDraftOutput, advisorValueOf, advisorArgsOf, advisorDraftReply, advisorProgressPct, AdvisorToolRow, AdvisorMaterials, useAdvisorRun, slashReviewAllowed, usageText, normalizeUsage,
+        overlayZIndex: OV_Z,
+        composerRegion, clampOvPos, clampOvSize, defaultOvPos, defaultBallPos,
+        ovReflowWatch, ovReflowAll, EDITABLE_SEL,
+        holdBridgeRead, holdBridgeWrite, holdBridgeOn,
         themeTokens: THEME_TOKENS,
         tokenVars: TOKEN_VARS,
         themeIsDark,

@@ -67,12 +67,34 @@
  * `description: "每日 10:00（UTC+8）刷新，领取后 30 天有效"`）。
  */
 import { roundCredits } from './credits.js';
+import { QODER_BILLING_UTC_OFFSET_MS } from './model-queue.js';
 import { withQoderMachineHeadersAsync } from './qoder-machine.js';
 import { qoderBearerToken } from './qoder.js';
 /** 用量接口路径（挂 `openApiBase`）。 */
 export const QODER_USAGE_PATH = '/sash/api/v2/me/usage';
 /** 活动列表路径（挂 `openApiBase`）。 */
 export const QODER_CAMPAIGNS_PATH = '/sash/api/v1/me/campaigns';
+/**
+ * 每日活动**刷新时刻**（UTC+8 的小时）。来源是服务端自己下发的原文：
+ * `description: "每日 10:00（UTC+8）刷新，领取后 30 天有效"`（见文件头）。
+ *
+ * ⚠️ 它的意义：**刷新之前**查到的活动列表属于「昨天那一轮」——
+ * 看到 `CLAIMED` 只能说明昨天领过，**不能**说明今天已领。
+ * 这个事实曾经造成过真实损失（见 {@link hasQoderCampaignRefreshedToday}）。
+ */
+export const QODER_CAMPAIGN_REFRESH_HOUR_UTC8 = 10;
+/**
+ * 「今天的活动列表是否已经刷新」。
+ *
+ * **必须用算术平移而不是 `Date.getHours()`**：活动按 **UTC+8** 结算，
+ * 取本机时区会让用户出差 / 改系统时区时得到错的答案（偏东会提前把当天
+ * 记为已处理、真漏领；偏西会一天判两次）。口径与 `model-queue.ts` 的
+ * `QODER_BILLING_UTC_OFFSET_MS` 一致，不另立偏移常量。
+ */
+export function hasQoderCampaignRefreshedToday(nowMs = Date.now()) {
+    const utc8 = new Date(nowMs + QODER_BILLING_UTC_OFFSET_MS);
+    return utc8.getUTCHours() >= QODER_CAMPAIGN_REFRESH_HOUR_UTC8;
+}
 /** 单次请求超时（毫秒）。 */
 const QODER_CREDITS_TIMEOUT_MS = 15_000;
 /**
@@ -97,6 +119,15 @@ const QODER_CREDITS_TIMEOUT_MS = 15_000;
  */
 const NOT_ACTIVATED_HINT = '该账号尚未在 Qoder 侧开通每日领取（每日 100 Credits）。'
     + '请先用 Qoder 官方客户端登录一次该账号，开通后再回来领取。';
+/**
+ * 「今天的活动还没刷新」的提示。
+ *
+ * ⚠️ 必须与 {@link NOT_ACTIVATED_HINT} 区分开：前者是**等一会儿就好**（可重试），
+ * 后者要用户去官方客户端操作。判错的代价是方向性的 —— 说成「已领取」会让用户
+ * 真的错过今天的额度（2026-10-02 审查 PR !33 定位的缺陷）。
+ */
+const NOT_REFRESHED_YET_HINT = `今天的每日活动尚未刷新（每日 ${QODER_CAMPAIGN_REFRESH_HOUR_UTC8}:00（UTC+8）刷新），`
+    + '当前看到的是昨天那一轮，请稍后再来领取。';
 /**
  * 判断账号是否「尚未开通每日领取」。
  *
@@ -217,6 +248,14 @@ function readString(source, key) {
  * 负值一律 clamp 到 0：服务端在超额扣费/计量回滚下可能下发负值，
  * 原样透出会让卡片显示「-12.5 积分」。
  */
+/**
+ * 「套餐额度」这个包的**固定名**（本仓库自己合成的名字，服务端不下发）。
+ *
+ * ⚠️ 导出它是为了让「用量徽标」的套餐判定（`src/badge-subscription.ts`）与这里
+ * **共用同一个字面量**：判定靠的是包名精确等于它，两处各写一份字符串会在将来
+ * 改名时静默失配（表现为徽标永远不显示 Qoder 的订阅额度）。
+ */
+export const QODER_PLAN_PACKAGE = '套餐额度';
 function toPackage(name, quota, options = {}) {
     const total = readNumber(quota, 'total');
     const used = readNumber(quota, 'used');
@@ -228,6 +267,12 @@ function toPackage(name, quota, options = {}) {
     const remaining = remainingRaw !== undefined
         ? Math.max(0, remainingRaw)
         : Math.max(0, totalValue - usedValue);
+    // 到期时间归一化：Qoder 的专用资源包用 expiredTime 字段（ISO 日期字符串）。
+    // 套餐额度/资源包没有独立到期（统一"领取后 30 天"），不设置 deductionEndTime，
+    // 前端 formatPackageExpiry 对 Qoder 的特定包名走"30 天内有效"的特殊显示。
+    const expMs = options.expiredTime && options.expiredTime.length > 0
+        ? Date.parse(options.expiredTime.replace(' ', 'T'))
+        : Number.NaN;
     return {
         name,
         unit: readString(quota, 'unit') ?? 'credits',
@@ -238,6 +283,7 @@ function toPackage(name, quota, options = {}) {
         cycleStartTime: '',
         cycleEndTime: '',
         expiredTime: options.expiredTime ?? '',
+        ...(Number.isFinite(expMs) ? { deductionEndTime: expMs } : {}),
     };
 }
 /**
@@ -285,7 +331,7 @@ export async function fetchQoderCreditBalance(credential, product, fetcher = fet
         return null;
     const packages = [];
     // 顺序即展示顺序：套餐额度 → 赠送/资源包 → 专用资源包。
-    const userQuota = toPackage('套餐额度', usage.userQuota);
+    const userQuota = toPackage(QODER_PLAN_PACKAGE, usage.userQuota);
     if (userQuota !== undefined)
         packages.push(userQuota);
     const addOnQuota = toPackage('资源包', usage.addOnQuota);
@@ -408,19 +454,31 @@ async function loadCampaigns(credential, product, fetcher) {
  *   故「有 `CLAIM_BENEFIT`+`CLAIMED`」是「已领」的**充分且可靠**判据。
  *   方向仍取保守：误报未领最多让用户多点一次（服务端幂等，回
  *   `replayed:true`，无害）；误报已领会让其**真的错过当天积分**。
+ *
+ *   ⚠️⚠️ **但它只对「刷新之后」成立**（真实缺陷，2026-10-02 审查 PR !33 定位）：
+ *   活动每日 10:00（UTC+8）才刷新，故**刷新前**看到的那条 `CLAIMED` 属于
+ *   **昨天**。上午 9 点查状态若照旧判 `todayCheckedIn:true`，界面会显示「今天
+ *   已领」，而官方 IDE 里今天的活动其实还没出现 —— 正好落在「误报已领」那个
+ *   **不可逆**的方向上。刷新前一律判 `false`（见 `hasQoderCampaignRefreshedToday`）。
  * - `dailyCredit`：可领活动声明的 `benefit.amount`（实测 100）。
  */
-export async function fetchQoderCheckinStatus(credential, product, fetcher = fetch) {
+export async function fetchQoderCheckinStatus(credential, product, fetcher = fetch, nowMs = Date.now()) {
     const parsed = await loadCampaigns(credential, product, fetcher);
     if (parsed === undefined)
         return null;
+    const refreshed = hasQoderCampaignRefreshedToday(nowMs);
     const claimable = claimableCampaigns(parsed);
     const benefitCampaigns = parsed.campaigns.filter((c) => c.actionType === 'CLAIM_BENEFIT');
     const claimedBenefit = benefitCampaigns.filter((c) => c.claimStatus === 'CLAIMED');
     // 无可领项且非「已领」时，进一步判断是否**未开通**（需要用户去官方客户端登录）。
     // 判据与 `claimQoderDailyCheckin` 完全一致 —— 两处必须同源，否则状态查询说
     // 「未领取」而领取时报「未开通」，用户会困惑。
-    const todayCheckedIn = claimedBenefit.length > 0 && claimable.length === 0;
+    //
+    // ⚠️ `refreshed` 不可省：活动每日 10:00（UTC+8）才刷新，**刷新前**看到的那条
+    // `CLAIMED` 属于昨天。此处若不判，会在上午谎报「今天已领」—— 而误报已领
+    // 正是那个会让用户**真的错过当天积分**的方向（见文件头与
+    // `hasQoderCampaignRefreshedToday`）。
+    const todayCheckedIn = refreshed && claimedBenefit.length > 0 && claimable.length === 0;
     let actionRequired = false;
     if (!todayCheckedIn && claimable.length === 0) {
         const usage = await fetchQoderUsageRaw(credential, product, fetcher);
@@ -529,21 +587,32 @@ function describeNonJson(status, text) {
  * 界面就显示「今天已领取」，与 IDE 的「可领取」直接矛盾。
  * 二者语义完全不同：`inactive` = 没东西可领；`already-claimed` = 领过了。
  */
-export async function claimQoderDailyCheckin(credential, product, fetcher = fetch) {
+export async function claimQoderDailyCheckin(credential, product, fetcher = fetch, nowMs = Date.now()) {
     const parsed = await loadCampaigns(credential, product, fetcher);
     if (parsed === undefined) {
         return { kind: 'failed', code: -1, message: '活动列表查询失败' };
     }
+    // ⚠️ 今天的活动列表是否已刷新（每日 10:00 UTC+8）。**刷新前看到的全是
+    // 昨天那一轮**：既不能报「今天已领」，领取成功也不能算作「今天已处理」。
+    // 少了这一句，上层会把「昨天那条已领」记成今天已跑 ⇒ 当天新额度整天漏领
+    // （真实缺陷，2026-10-02 审查 PR !33 定位；字段语义见 `credits.ts`）。
+    const refreshed = hasQoderCampaignRefreshedToday(nowMs);
+    const stale = refreshed ? undefined : { coversToday: false };
     const targets = claimableCampaigns(parsed);
     if (targets.length === 0) {
         // 区分三种「没领到」：
-        //   ① 确实领过      → already-claimed
+        //   ① 确实领过      → already-claimed（**但仅限刷新之后**）
         //   ② 账号未开通    → inactive，但要给出**可操作**的提示（见 NOT_ACTIVATED_HINT）
         //   ③ 只是暂时没活动 → inactive
         // 判据同 fetchQoderCheckinStatus（抓包实证：领取后该活动变 CLAIMED）。
         const claimedBefore = parsed.campaigns.some((c) => c.actionType === 'CLAIM_BENEFIT' && c.claimStatus === 'CLAIMED');
-        if (claimedBefore)
+        if (claimedBefore) {
+            // 刷新前看到的那条 `CLAIMED` 属于**昨天**。说成「今天已领取」是谎报，
+            // 且方向不可逆（用户会以为今天不必再领，官方 IDE 里却还没刷新）。
+            if (!refreshed)
+                return { kind: 'inactive', message: NOT_REFRESHED_YET_HINT };
             return { kind: 'already-claimed', message: '今天已领取' };
+        }
         // 未开通时额外查一次用量（只读）以确认 —— 两条判据同时满足才提示，
         // 避免把「活动刚好刷新中」误报成「未开通」。
         const usage = await fetchQoderUsageRaw(credential, product, fetcher);
@@ -564,10 +633,13 @@ export async function claimQoderDailyCheckin(credential, product, fetcher = fetc
         else if (outcome.kind === 'failed' && firstError === undefined)
             firstError = outcome.message;
     }
+    // ⚠️ 三条返回都带 `stale`：刷新前领到的是**昨天那条**的补领 —— 它是一次
+    // 真实动作（该如实报「领取成功」），但**不证明今天已被处理**，记账方必须
+    // 能把这两种情况分开（否则当天 10 点刷新后的额度就没人领了）。
     if (total > 0)
-        return { kind: 'claimed', credit: total, streakDays: 0, isStreakDay: false };
+        return { kind: 'claimed', credit: total, streakDays: 0, isStreakDay: false, ...stale };
     if (firstError !== undefined)
         return { kind: 'failed', code: -1, message: firstError };
-    return { kind: 'already-claimed', message: '今天已领取' };
+    return { kind: 'already-claimed', message: '今天已领取', ...stale };
 }
 //# sourceMappingURL=qoder-credits.js.map

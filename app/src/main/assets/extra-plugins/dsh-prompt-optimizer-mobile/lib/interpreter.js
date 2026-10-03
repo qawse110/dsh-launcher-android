@@ -226,6 +226,55 @@ export function validateProvenance(ops, userText, contextText, stateText) {
  * 解析并校验模型输出，产出可交给 reducer 的候选 patch。
  * @returns {{ok:true, patch:object, warnings:string[]}} | {{ok:false, code:string, reason:string, problems?:string[]}}
  */
+/**
+ * 硬邦邦加码的生成规则（只在协作基调 = hard 时拼进系统提示词）。
+ *
+ * 三条要求各自对应一个真实风险：
+ *   · **语域**：写成正式条目就等于没有效果（正式语域采样"专业助手"簇）——这一档全部价值在语域上；
+ *   · **定点爆破**：通用口号放在任何任务都成立，等于没打中；要点名这一单的交付物与最可能做歪的点；
+ *   · **引用**：不许发明新要求；`hardOn` 写不出真实条目 id 时整段不予采用。
+ * 长度**不设上限**（用户 2026-09-27 明确要求由模型按实际情况定），只要求不灌水。
+ */
+/**
+ * 硬邦邦模式：**整份辅助包的写法**（不只是加一段口号）。用户 2026-09-27 反馈：
+ * "硬邦邦效果占比太少"——只加一个块、其余条目仍是正式体，语域就被稀释了。
+ *
+ * 所以这一档改的是**写法**，三条内容纪律原样保留：
+ *   · 条目集合不许因口气改变；每条仍带逐字依据；不许新增原话里没有的需求；
+ *   · **未决项**保持严肃清楚（没拍板的事必须说准）；
+ *   · **防御性限制**（不许做什么、范围边界、安全与授权）照字面写——一修辞就漏语义。
+ */
+export const HARD_NOTE_SYSTEM = [
+  '',
+  '',
+  '【硬邦邦模式 · 整份辅助包的写法（本轮协作基调 = 硬邦邦）】',
+  '这一轮**整份辅助上下文都用这个口气写**，不是只在最后加一句口号。读者是工作 AI；',
+  '语域本身就是效果来源（正式语域会把整包带回"专业助手"那一簇，等于白开这一档）。',
+  '',
+  '**要写成硬邦邦的**：解释用户原话、质量阐述、实现选项、建议——都用口语、直给、带劲的写法。',
+  '允许"贼拉牛逼""硬邦邦""别整那些虚的""给我往猛了造"这类口水话（它们不是脏话，是语域）。',
+  '要接地气：像兄弟催你干活，不像甲方发需求文档。',
+  '',
+  '**必须保持字面、不加修辞的**（一修辞就漏语义，代价比收益大）：',
+  '  · **未决项**：没拍板的事要说清楚说准（谁来拍板、影响什么），不许用口气词糊过去；',
+  '  · **防御性限制**：不许做什么、范围边界、安全与授权类要求（如"不许读其它文件""不许替我拍板"）',
+  '    照字面写，别改成顺口溜。',
+  '',
+  '**不许因为口气变了而改动内容**：',
+  '  · 条目集合一个字都不许增减——口语化只改**写法**，不改"该有哪些要求"；',
+  '  · 每条仍然必须带逐字依据（来源规则不变）；',
+  '  · 不许新增原话里没有的需求（型号、联网、加功能、改交付形态等）。',
+  '',
+  '**即使这一轮 `ops` 是空的**（例如只是接着往下聊、没有新的要求要记），也照常给 `hardNote`——',
+  '后续对话同样需要这份口气，别让第二轮起就只剩模板。',
+  '',
+  '另外照旧返回两个字段：',
+  '- `hardNote`：一段"打气 + 定点爆破"的话，放在包最前面。点名这一单的交付物与最可能做歪的点，',
+  '  不要铺开写放之四海皆准的口号；**长度自己定**（不设句数/字数上限），宁可短而准，不要凑长度灌水。',
+  '- `hardOn`：字符串数组，列出 `hardNote` 依据的**已有条目 id**（如 ["req-1","qi-1"]）。',
+  '  一条真实 id 都写不出 ⇒ 整段不予采用（退回纯骨架），所以别编 id。',
+].join('\n')
+
 export function parseInterpreterOutput(raw, { userText, contextText, stateText, sessionId, messageId, baseRevision, baseInputRevision, causeId }) {
   const ex = extractJson(raw)
   if (!ex.ok) return { ok: false, code: ex.code, reason: ex.reason }
@@ -234,6 +283,11 @@ export function parseInterpreterOutput(raw, { userText, contextText, stateText, 
     return { ok: false, code: 'BAD_SHAPE', reason: 'expected {"ops":[...]}' }
   }
   const warnings = []
+  // 0.7.8 · 硬邦邦加码（模型生成；仅 hard 档会要求它）。
+  // ⚠ **必须带引用**：这段文本会进工作模型上下文，最大的风险是"语气里夹带新要求"。
+  //    引用（hardOn = 已有条目 id）是机器可核的，校验在 pipeline 做——写不出引用就不采用。
+  const hardNote = typeof obj.hardNote === 'string' ? obj.hardNote.trim() : ''
+  const hardOn = Array.isArray(obj.hardOn) ? obj.hardOn.filter((x) => typeof x === 'string' && x) : []
   const truncatedItems = []      // 超过单轮上限被截断丢弃的条目（并进 dropped 记账）
   const ops = []
   let itemCount = 0
@@ -416,12 +470,16 @@ export function parseInterpreterOutput(raw, { userText, contextText, stateText, 
         ? ['no ops: nothing to add']
         : [...warnings, ...dropped.map((d) => '丢弃条目 ' + d.id + '：' + d.reason)],
       dropped: [...dropped, ...truncatedItems],
+      hardNote,
+      hardOn,
     }
   }
 
   return {
     ok: true,
     warnings,
+    hardNote,
+    hardOn,
     dropped: [...dropped, ...truncatedItems],
     patch: {
       causeId: String(causeId || 'interpret'),

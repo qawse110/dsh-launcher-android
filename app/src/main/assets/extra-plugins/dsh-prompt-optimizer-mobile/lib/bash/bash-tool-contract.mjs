@@ -19,7 +19,7 @@ export function contractFacts() {
     featuresRule: "支持管道、重定向、命令替换、进程替换、glob 展开（由 bash 执行）；globstar 需先 shopt -s globstar；未匹配的 glob 原样保留",
     streamRule: "stdout 与 stderr 分开返回；truncated 为真时完整输出在 spillPath；输出按 UTF-8 解码且非法字节会被诊断",
     retryPolicy: "非零退出不会自动重试、也不会自动换后端；失败原因由 exitCode/signal/timedOut/aborted 表达",
-    timeoutRule: "timeoutMs 到期会终止**整个进程树**并回收；onExpiry=none 表示不设截止时间（调用方须自带取消）",
+    timeoutRule: "timeoutMs 到期请求终止受管进程并等待收尾；无法独立证明树已清空时如实标注；onExpiry=none 表示不设截止时间（调用方须自带取消）",
     envVarRule: "bash 环境变量写作 $VAR 或 ${VAR}（不是 $env:VAR，也不是 %VAR%）",
     exitCodeRule: "上一条命令的退出码是 $?；管道各段用 ${PIPESTATUS[@]}",
     heredocRule: "多行输入用 heredoc（cat <<EOF … EOF）或 stdin 参数",
@@ -39,7 +39,7 @@ export const BASH_TOOL_DESCRIPTION = [
   "【失败语义】非零退出不会自动重试、也不会自动换后端；请根据返回的 exitCode/signal/timedOut/aborted 与 stderr 判断，并按返回的修复步骤处理。",
   "【bash 惯用写法】环境变量写作 $VAR 或 ${VAR}（不是 $env:VAR，也不是 %VAR%）；上一条命令的退出码是 $?，管道各段用 ${PIPESTATUS[@]}；多行输入用 heredoc（cat <<EOF … EOF）或 stdin 参数；逐行处理用 while IFS= read -r line。",
   "【换行与编码】输出原样保留换行（Windows 工具可能给 CRLF）；跨平台比较可先 tr -d \\r 或给 grep 加 -a。输出按 UTF-8 解码，非法字节会被诊断（invalid-bytes / window-started-mid-codepoint），不会静默替换。",
-  "【超时】timeoutMs 到期会终止整个进程树并回收子进程；onExpiry=none 表示不设截止时间（需由调用方取消）。"
+  "【超时】timeoutMs 到期请求终止受管进程并等待收尾；无法证明全部子进程已清空时明确标注；onExpiry=none 表示不设截止时间（需由调用方取消）。"
 ].join("\n");
 
 /** 模型可见 schema：字段与说明一一对应，未知字段应被拒绝。 */
@@ -99,7 +99,7 @@ export function renderToolError(input) {
     steps.push("确认路径写法：命令内用 POSIX 风格（/d/...），不要用 PowerShell 或 WSL 风格。");
     if (i.truncated) steps.push("输出被截断，完整内容在 " + i.spillPath + "；用 grep/head 直接读该文件。");
   } else if (category === "timeout") {
-    headline = "命令超过 " + String(i.timeoutMs) + "ms 被终止，进程树已回收。"
+    headline = "命令超过 " + String(i.timeoutMs) + "ms，已请求终止并等待收尾（树清空需另核对）。"
       + (i.maxTimeoutMs ? "（本次上限 " + String(i.maxTimeoutMs) + "ms）" : "");
     why = "超时属于明确的截止语义，不代表命令写错——但**先改做法，而不是先加等待**："
       + "把任务缩小或拆开，通常比提高 timeoutMs 更快拿到结果。";

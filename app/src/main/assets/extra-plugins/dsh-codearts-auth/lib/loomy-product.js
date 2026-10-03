@@ -35,15 +35,33 @@ import { LOOMY_ACCOUNT_BASE, LOOMY_API_BASE } from './loomy.js';
  * `MODEL_CONTEXT_OVERRIDES = { 'spark-x': 262144 }` 强制降到 262144。
  * 本表**先采信远端**；若实测长上下文被拒，改为 262144（见设计文档 §11）。
  */
+/**
+ * 实测的思考档位（8 个 chat 模型**完全一致**，2026-09-28 用真实凭据采集）。
+ *
+ * ⚠️ 抽成常量而不是逐条写 8 遍：远端对全部 chat 模型下发同一份档位，
+ * 逐条重复只会让将来上游变更时漏改其中几条。
+ * ⚠️ 远端可用时**优先用远端的 `reasoning_efforts`**，本常量只在远端整体失败时
+ * 顶替（与 `contextWindow` 同策略）。
+ */
+const LOOMY_EFFORTS = ['none', 'low', 'medium', 'high', 'xhigh'];
+/**
+ * 本插件选用的默认档位（**用户要求 `high`**）。
+ *
+ * ⚠️ 远端 `default_reasoning_effort` 声明的是 **`low`**，这里**有意不沿用** ——
+ * DSH 的「用户没选时发哪个档」完全取适配器声明的 `defaultEffort`
+ * （见 `loomy-adapter.ts` 的 `LOOMY_PREFERRED_DEFAULT_EFFORT` 说明）。
+ * 兜底表与适配器常量必须一致，否则「远端可用」与「远端失败」两条路径默认档不同。
+ */
+const LOOMY_DEFAULT_EFFORT = 'high';
 const LOOMY_FALLBACK_MODELS = [
-    { id: 'deepseek-v4-flash-0731', name: 'DeepSeek V4 Flash 0731 · x3.0', contextWindow: 1_048_576 },
-    { id: 'MiniMax-M3', name: 'MiniMax M3 · x4.0', contextWindow: 1_048_576 },
-    { id: 'Kimi-k2.6', name: 'Kimi k2.6 · x6.5', contextWindow: 262_144 },
-    { id: 'qwen-3.8-max', name: 'Qwen 3.8 Max · x12.0', contextWindow: 1_000_000 },
-    { id: 'GLM-5.3-Flash', name: 'GLM 5.3 Flash · x0.8', contextWindow: 1_048_576 },
-    { id: 'qwen3.8-flash', name: 'qwen 3.8 flash · x0.8', contextWindow: 1_000_000 },
-    { id: 'spark-x', name: 'Spark X2.5 · x0.1', contextWindow: 1_048_576 },
-    { id: 'mimo-v2.5', name: 'MiMo V2.5 · x3.3', contextWindow: 1_048_576 },
+    { id: 'deepseek-v4-flash-0731', name: 'DeepSeek V4 Flash 0731 · x3.0', contextWindow: 1_048_576, efforts: [...LOOMY_EFFORTS], defaultEffort: LOOMY_DEFAULT_EFFORT },
+    { id: 'MiniMax-M3', name: 'MiniMax M3 · x4.0', contextWindow: 1_048_576, efforts: [...LOOMY_EFFORTS], defaultEffort: LOOMY_DEFAULT_EFFORT },
+    { id: 'Kimi-k2.6', name: 'Kimi k2.6 · x6.5', contextWindow: 262_144, efforts: [...LOOMY_EFFORTS], defaultEffort: LOOMY_DEFAULT_EFFORT },
+    { id: 'qwen-3.8-max', name: 'Qwen 3.8 Max · x12.0', contextWindow: 1_000_000, efforts: [...LOOMY_EFFORTS], defaultEffort: LOOMY_DEFAULT_EFFORT },
+    { id: 'GLM-5.3-Flash', name: 'GLM 5.3 Flash · x0.8', contextWindow: 1_048_576, efforts: [...LOOMY_EFFORTS], defaultEffort: LOOMY_DEFAULT_EFFORT },
+    { id: 'qwen3.8-flash', name: 'qwen 3.8 flash · x0.8', contextWindow: 1_000_000, efforts: [...LOOMY_EFFORTS], defaultEffort: LOOMY_DEFAULT_EFFORT },
+    { id: 'spark-x', name: 'Spark X2.5 · x0.1', contextWindow: 1_048_576, efforts: [...LOOMY_EFFORTS], defaultEffort: LOOMY_DEFAULT_EFFORT },
+    { id: 'mimo-v2.5', name: 'MiMo V2.5 · x3.3', contextWindow: 1_048_576, efforts: [...LOOMY_EFFORTS], defaultEffort: LOOMY_DEFAULT_EFFORT },
 ];
 /**
  * Loomy provider 配置。

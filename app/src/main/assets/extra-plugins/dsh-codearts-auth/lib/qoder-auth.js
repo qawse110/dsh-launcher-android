@@ -19,6 +19,25 @@ import { QODER_REQUEST_TIMEOUT_MS, QODER_REFRESH_PATH, applyQoderRefresh, isQode
 import { QODER } from './qoder-product.js';
 import { runQoderLoginFlow, startQoderLoginFlow, } from './qoder-oauth.js';
 import { RefreshScheduler } from './refresh.js';
+import { refreshAccountWithReconcile, syncAccountExpiry, } from './expiry-sync.js';
+/**
+ * Qoder 凭据 → 账号池有效期所需的提取器（`refreshAll` 与按需续期共用一份）。
+ *
+ * `QoderAuth` 一个类服务两个产品（`qoder` / `qodercn`），故调用处的 tag 取
+ * `this.product.id`，日志里能区分是哪个面板。
+ *
+ * ⚠️ `identityOf` 用 `access_token` 而**不是** `security_oauth_token`：
+ * `AccountPool.findAccountIdByCredential` 对非 codearts 的 provider 比对的就是
+ * `access_token`（见其 `identifierKey`），选错字段会恒匹配失败且静默。
+ * Qoder 凭据里这两个字段是**双写同值**的（见 `QoderCredential` 注释），
+ * 故取 `access_token` 与客户端的取用顺序（`security_oauth_token ?? access_token`）
+ * 并不冲突。
+ */
+const QODER_EXPIRY_ACCESSORS = {
+    expiresAtOf: qoderCredentialExpiresAtMs,
+    refreshableOf: isQoderRefreshable,
+    identityOf: (credential) => credential.access_token ?? '',
+};
 /**
  * Qoder 的默认凭据 ref。
  *
@@ -236,8 +255,18 @@ export class QoderAuth extends Service {
      *
      * 同样**不触碰** `refreshTokenInvalid` / `lastRefreshError` / 调度器：
      * 那些状态属于单凭据路径，被多账号操作污染会让 UI 显示错误的失效提示。
+     *
+     * ⚠️ **必须回写账号池的 `expiresAt`**（issue !IKIRTT 的真实缺陷）：
+     * UI 账号卡片的「有效期」读的正是池里的值，而不是凭据里 access_token 的真实
+     * 过期时间。早期这里只 `credentials.set`，于是用户点「刷新」后凭据确实续好了、
+     * 界面却**一直显示「已过期」**，且没有任何自救手段（「重测」按钮的 refresh
+     * 是刻意的 no-op）。
+     *
+     * @param pool 账号池；提供时会把新 `expiresAt` / `refreshable` 写回。
+     * @param accountId 账号 id。**调用方已知时请显式传入** ——
+     *   否则只能按凭据内容反查（代价高，且反查会跳过已停用账号）。
      */
-    async refreshAccountCredential(refName) {
+    async refreshAccountCredential(refName, pool, accountId) {
         const ref = credentialRef(refName);
         const resolved = await this.ctx.credentials.resolve(ref);
         if (!resolved)
@@ -250,6 +279,15 @@ export class QoderAuth extends Service {
         }
         const refreshed = await this.refreshCredential(credential);
         await this.ctx.credentials.set(ref, JSON.stringify(refreshed));
+        await syncAccountExpiry({
+            pool,
+            provider: this.product.id,
+            credential: refreshed,
+            accessors: QODER_EXPIRY_ACCESSORS,
+            accountId,
+            tag: `[${this.product.id}]`,
+            warn: (message) => this.ctx.logger?.warn?.(message),
+        });
     }
     /**
      * 对一份凭据执行一次续期并返回新凭据（不触碰存储）。
@@ -306,6 +344,12 @@ export class QoderAuth extends Service {
      * 选号，不该让凭据烂掉 —— 否则用户重新启用时只能重新登录。
      * 详见 `BuddyAuth.refreshAll` 的注释（同一缺陷）。
      * 单账号失败不影响其他账号（与 `BuddyAuth.refreshAll` 同语义）。
+     *
+     * ⚠️ **lead-time 过滤**（issue !IKIRTT）：早先这里是**无条件全量续期** ——
+     * 定时器每 30 分钟就把每个账号的 refresh_token 轮换一次，与「凭据还剩多久」
+     * 无关。现复用单凭据时代 `REFRESH_LEAD_MS` 的语义：**距过期不足 1 小时才刷**。
+     * 跳过的账号仍会做一次**有效期对账**（见 `refreshAccountWithReconcile`），
+     * 因为「不刷」与「不回写池值」正是 UI 假过期的两个来源，必须分开处理。
      */
     async refreshAll(pool) {
         const accounts = await pool.listAccounts(this.product.id);
@@ -324,11 +368,18 @@ export class QoderAuth extends Service {
                     await pool.updateAccount(entry.id, { refreshable: false });
                     continue;
                 }
-                const refreshed = await this.refreshCredential(credential);
-                await this.ctx.credentials.set(ref, JSON.stringify(refreshed));
-                await pool.updateAccount(entry.id, {
-                    expiresAt: qoderCredentialExpiresAtMs(refreshed) ?? undefined,
-                    refreshable: isQoderRefreshable(refreshed),
+                await refreshAccountWithReconcile({
+                    pool,
+                    provider: this.product.id,
+                    // tag 取 product.id：本类一个实例服务 qoder 与 qodercn 两个面板。
+                    tag: `[${this.product.id}]`,
+                    accountId: entry.id,
+                    credential,
+                    accessors: QODER_EXPIRY_ACCESSORS,
+                    current: entry,
+                    refresh: (c) => this.refreshCredential(c),
+                    save: (c) => this.ctx.credentials.set(ref, JSON.stringify(c)),
+                    warn: (message) => this.ctx.logger?.warn?.(message),
                 });
             }
             catch (error) {
@@ -339,12 +390,12 @@ export class QoderAuth extends Service {
                     catch {
                         // 忽略 updateAccount 本身的错误
                     }
-                    this.ctx.logger?.warn?.(`[qoder] 账号 ${entry.id} 的 refresh_token 已失效，已标记为不可续期（需重新登录）`);
+                    this.ctx.logger?.warn?.(`[${this.product.id}] 账号 ${entry.id} 的 refresh_token 已失效，已标记为不可续期（需重新登录）`);
                 }
                 else {
                     // 非终态失败（网络抖动、5xx、429…）：**必须留下日志**。
                     // 静默失败会让账号在 UI 上仍显示「可续期」却永远刷不动，无从排查。
-                    this.ctx.logger?.warn?.(`[qoder] 账号 ${entry.id} 续期失败（将按调度器策略重试）: `
+                    this.ctx.logger?.warn?.(`[${this.product.id}] 账号 ${entry.id} 续期失败（将按调度器策略重试）: `
                         + `${error instanceof Error ? error.message : String(error)}`);
                 }
                 // 单账号失败不中断循环

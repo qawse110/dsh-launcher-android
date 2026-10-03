@@ -13,7 +13,7 @@
       "id": "dsh-web-mobile",
       "title": "移动端适配",
       "desc": "竖屏/窄屏 Web 适配（抽屉导航、全宽会话、安全区、触控人体工学）",
-      "version": "3.0.3",
+      "version": "3.0.4",
       "upstream": "https://github.com/mexiaosqwq/dsh-web-mobile"
     },
     {
@@ -22,7 +22,7 @@
       "id": "prompt-optimizer",
       "title": "提示词优化",
       "desc": "发送前用独立 AI 把输入改写成命令。dsh-launcher fork（基于上游 WestFox-AwA/dsh-prompt-optimizer v0.7.6）：本部署默认启用（仅显式 enabled:false 关闭），并含视口感知面板尺寸、窄屏断点、安全区、触控人体工学等移动端适配",
-      "version": "0.7.6-dshlauncher.1",
+      "version": "0.8.1-dshlauncher.1",
       "upstream": "https://github.com/WestFox-AwA/dsh-prompt-optimizer"
     },
     {
@@ -30,7 +30,7 @@
       "name": "dsh-codearts-auth",
       "id": "codearts-auth",
       "title": "CodeArts 多 Provider",
-      "desc": "CodeArts/Buddy/Qoder/Trae/Cline 等 Provider 登录、积分与模型接入",
+      "desc": "CodeArts/Buddy/Qoder/Trae/Cline/loomy/raccoon/zcode/opencode 等 Provider 登录、积分与模型接入。上游 tag 0.2.0-rc.2 构建（该仓库 tag 名与 package.json 的 version 不同步，后者仍写 0.1.0）",
       "version": "0.1.0",
       "upstream": "https://gitee.com/iJetLi/deepseek-harness-codearts"
     },

@@ -223,7 +223,7 @@ function readText(abs, cmd, shown) {
   if (!info.isFile()) return { error: cmd + ' 不是普通文件（目录？）：' + shown }
   if (info.size > READ_LIMIT_BYTES) {
     return { error: cmd + ' 文件过大：' + info.size + ' 字节 > 只读子集上限 ' + READ_LIMIT_BYTES + ' 字节（' + shown
-      + '）——只读子集只读小文件；要看大小请用 `wc -c`，要处理大文件请改用 pwsh' }
+      + '）——只读子集只读小文件；要看大小请用 `wc -c`，要处理大文件请改用 bash（需要 PowerShell 对象语义时才用 pwsh）' }
   }
   let text
   try { text = readFileSync(abs, 'utf8') } catch (e) { return { error: cmd + ' 读取失败：' + String((e && e.message) || e) } }

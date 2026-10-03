@@ -14,14 +14,67 @@
  * 而 `/models`、`/points/*` 只认 `token`。故 `stream()` 用
  * `loomyChatHeaders()`（两个都发），`listModels()` 用 `loomyBusinessHeaders()`。
  */
-import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm';
+import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 import { providerCatalogVisible } from './account-pool.js';
-import { settingsNamespaceFor } from './settings-compat.js';
+import { RemoteCatalogGate } from './remote-catalog-gate.js';
 import { isLoomyChatModel, isLoomyExpired, loomyChatHeaders, loomyDisplayName, splitLoomyRate, } from './loomy.js';
 import { LOOMY } from './loomy-product.js';
+import { registerAdapterIdempotent, } from './llm-register-compat.js';
 import { collectImages, consumeOpenAiSse, errorDetail, httpErrorCode, isTransportError, serializeMessages, } from './openai-compat.js';
 /** 本适配器注册的 provider 路由名（等价于 `LOOMY.id`）。 */
 export const PROVIDER = 'loomy';
+/**
+ * 档位 id → 中文展示名。
+ *
+ * ⚠️ **必须与官方 IDE 一致**。Loomy 是基于 **opencode** 构建的，其
+ * `opencode.json` 的 `variants` 用的就是 `low` / `medium` / `high` 这套 id
+ * （用户截图里的「低 / 中 / 高」正是它）。中文名沿用 Qoder 那套官方 i18n 表
+ * （`src/qoder-adapter.ts` 的 `QODER_EFFORT_NAMES`，同源产品命名一致）。
+ *
+ * ⚠️ DSH 的档位选择器**直接渲染 `efforts[].name`**（不本地化），
+ * 故这里给中文即中文界面。
+ */
+const LOOMY_EFFORT_NAMES = {
+    none: '关闭思考',
+    minimal: '最小',
+    low: '低',
+    medium: '中',
+    high: '高',
+    xhigh: '极高',
+    max: '最大',
+};
+/**
+ * 本插件选用的**默认思考档位**（用户要求：`high`）。
+ *
+ * ⚠️ **不采信远端的 `default_reasoning_effort`**（它声明的是 `low`）。
+ * 依据是 DSH 的取值逻辑 —— `dsh-client-ui-model-selection` 的
+ * `effectiveEffort = state.current?.reasoningEffort ?? reasoning?.defaultEffort`，
+ * 即「用户没选时发哪个档」**完全由适配器声明的 `defaultEffort` 决定**，
+ * 沿用远端的 `low` 会让默认思考偏浅。
+ *
+ * ⚠️ **必须落在该模型的 `efforts` 内**：DSH 会拿它**直接发请求**，给一个不存在的
+ * 档位会抛 `UNSUPPORTED_REASONING_EFFORT`。故 `reasoningFor` 里做了 `includes`
+ * 校验 —— 某模型若不提供 `high`（远端目录变化时可能发生），则**不下发默认档**，
+ * 退回 DSH 的「服务商默认」语义，而不是发一个非法值。
+ */
+const LOOMY_PREFERRED_DEFAULT_EFFORT = 'high';
+/** 把 `reasoning_efforts` 读成去重后的字符串数组（非法项丢弃）。 */
+function readReasoningEfforts(entry) {
+    const raw = entry.reasoning_efforts;
+    if (!Array.isArray(raw))
+        return [];
+    const seen = new Set();
+    const out = [];
+    for (const item of raw) {
+        if (typeof item !== 'string' || item.length === 0)
+            continue;
+        if (seen.has(item))
+            continue;
+        seen.add(item);
+        out.push(item);
+    }
+    return out;
+}
 /** 把 `capabilities.input_modalities` 读成小写字符串数组。 */
 function readInputModalities(entry) {
     const capabilities = entry.capabilities;
@@ -57,12 +110,20 @@ export function parseLoomyRemoteModels(payload) {
         const capabilities = typeof entry.capabilities === 'object' && entry.capabilities !== null
             ? entry.capabilities
             : {};
+        const efforts = readReasoningEfforts(entry);
+        const rawDefault = entry.default_reasoning_effort;
         models.push({
             id,
             name: loomyDisplayName(rawName),
             contextWindow: Number.isFinite(contextWindow) && contextWindow > 0 ? contextWindow : 0,
             supportsImage: readInputModalities(entry).includes('image'),
             supportsThinking: capabilities.reasoning === true,
+            // ⚠️ 档位缺失时**不写这两个键**（而不是写空数组）：下游据此区分
+            // 「该模型不提供档位」与「提供了但为空」。
+            ...efforts.length > 0 ? { efforts } : {},
+            ...typeof rawDefault === 'string' && rawDefault.length > 0
+                ? { defaultEffort: rawDefault }
+                : {},
         });
     }
     return models;
@@ -77,6 +138,10 @@ function fallbackToRemote(model) {
         // 也不要报一个服务端可能不认的模态。
         supportsImage: false,
         supportsThinking: true,
+        ...model.efforts !== undefined && model.efforts.length > 0
+            ? { efforts: [...model.efforts] }
+            : {},
+        ...model.defaultEffort !== undefined ? { defaultEffort: model.defaultEffort } : {},
     };
 }
 /** Loomy 模型适配器。chat 端点用 Bearer，业务端点用 token。 */
@@ -88,6 +153,8 @@ export class LoomyAdapter extends LlmAdapter {
     fallbackIndex;
     /** 远端模型缓存（含展示名与能力）；未拉取时为 undefined。 */
     remoteModels;
+    /** 目录加载闸门：并发去重 + 失败/空结果冷却（见 `remote-catalog-gate.ts`）。 */
+    catalogGate = new RemoteCatalogGate();
     constructor(options) {
         super();
         this.options = options;
@@ -112,25 +179,31 @@ export class LoomyAdapter extends LlmAdapter {
         const source = this.remoteModels ?? this.product.fallbackModels.map(fallbackToRemote);
         return source.map((model) => ({ id: model.id, name: model.name }));
     }
-    /** 取（并缓存）远端模型目录；失败时回退兜底表。 */
+    /**
+     * 取远端模型目录；**失败时不把兜底表写进缓存**。
+     *
+     * ⚠ 原实现是 `this.remoteModels = fallback; return fallback` —— 把兜底表当成
+     * 「已加载」记下，于是一次瞬时失败会让该 provider **整个进程生命周期**都只剩
+     * 兜底模型（用户看不到自己的模型，且无从触发重试，只能重启）。
+     * 改为：只缓存**真实远端目录**，兜底表每次现算（纯本地、零成本），
+     * 并用 {@link RemoteCatalogGate} 的冷却挡住「每模型重试一次」的放大。
+     */
     async loadModels() {
         if (this.remoteModels !== undefined)
             return this.remoteModels;
-        if (this.options.fetchRemoteModels !== undefined) {
-            try {
-                const fetched = await this.options.fetchRemoteModels();
-                if (fetched.length > 0) {
-                    this.remoteModels = fetched;
-                    return fetched;
-                }
-            }
-            catch {
-                // 远端失败静默回退兜底表：模型目录是展示信息，不该让整个 provider 报错。
-            }
+        const fetchRemote = this.options.fetchRemoteModels;
+        if (fetchRemote !== undefined) {
+            await this.catalogGate.run(async () => {
+                const fetched = await fetchRemote();
+                if (fetched.length === 0)
+                    return false;
+                this.remoteModels = fetched;
+                return true;
+            });
+            if (this.remoteModels !== undefined)
+                return this.remoteModels;
         }
-        const fallback = this.product.fallbackModels.map(fallbackToRemote);
-        this.remoteModels = fallback;
-        return fallback;
+        return this.product.fallbackModels.map(fallbackToRemote);
     }
     inputModalitiesFor(model) {
         return model?.supportsImage === true ? ['text', 'image'] : ['text'];
@@ -171,7 +244,45 @@ export class LoomyAdapter extends LlmAdapter {
         if (contextWindow !== undefined && contextWindow > 0) {
             resolved.context = { contextWindow };
         }
+        // 思考档位：**远端 `reasoning_efforts` 直接生成**（用户要求）。
+        const reasoning = this.reasoningFor(entry, fallback);
+        if (reasoning !== undefined)
+            resolved.reasoning = reasoning;
         return resolved;
+    }
+    /**
+     * 该模型的思考档位（`resolveModel` 的 `reasoning` 字段）。
+     *
+     * ⚠️ **此前根本不声明** —— DSH 的思考强度选择器**只会**从
+     * `resolveModel().reasoning` 渲染，故两个站点从来没出现过档位选择器，
+     * 尽管远端早就下发了 `reasoning_efforts`。这与 Qoder 那次（AGENTS.md 2.2 节）
+     * 是**完全同型**的缺陷。
+     *
+     * 三条口径：
+     * 1. `efforts` **原样取远端顺序**（服务端下发的就是展示顺序）；
+     * 2. `defaultEffort` **必须落在 `efforts` 内** —— DSH 会拿它直接发请求，
+     *    给一个不存在的档位会抛 `UNSUPPORTED_REASONING_EFFORT`，比不给更糟；
+     * 3. 远端未下发档位时不声明 `reasoning`（UI 显示「当前模型未提供推理等级」）。
+     */
+    reasoningFor(entry, fallback) {
+        // 远端优先；远端整体失败时用兜底表（两者字段同名同形）。
+        const efforts = entry?.efforts ?? fallback?.efforts;
+        if (efforts === undefined || efforts.length === 0)
+            return undefined;
+        // ⚠️ **默认档用本插件自己的「高」，不采信远端的 `default_reasoning_effort`**（用户要求）。
+        // 依据：远端声明的是 `low`，而 DSH 的 `effectiveEffort` 直接取 `defaultEffort`
+        // （`dsh-client-ui-model-selection`：`state.current?.reasoningEffort ?? reasoning?.defaultEffort`），
+        // 即「用户没选时发哪个档」完全由这里决定 —— 沿用 low 会让默认思考偏浅。
+        const defaultEffort = LOOMY_PREFERRED_DEFAULT_EFFORT;
+        const hasDefault = efforts.includes(defaultEffort);
+        return {
+            efforts: efforts.map((id) => ({
+                id: ReasoningEffortId(id),
+                // 未登记的中文名回退到 id 本身（新档位上线时不至于空白）。
+                name: LOOMY_EFFORT_NAMES[id] ?? id,
+            })),
+            ...hasDefault ? { defaultEffort: ReasoningEffortId(defaultEffort) } : {},
+        };
     }
     /**
      * 兼容 0.1.1-rc.2：新版 `LlmRuntime.prepareCall()` 会调用
@@ -237,6 +348,29 @@ export class LoomyAdapter extends LlmAdapter {
         const wireMessages = options.system !== undefined && options.system.length > 0
             ? [{ role: 'system', content: options.system }, ...messages]
             : messages;
+        /**
+         * 思考档位：仅当**该模型确实声明了它**时才下发。
+         *
+         * ⚠️ 字段名是 `reasoning_effort`（与远端声明的 `reasoning_efforts` /
+         * `default_reasoning_effort` 同源，也与 OpenAI 标准一致）。
+         * 本插件其余适配器同样用它（如 `buddy-adapter.ts`）。
+         *
+         * ⚠️ **必须校验档位在该模型的 `efforts` 内**：DSH 会把用户选的档位直接透传，
+         * 给一个远端不认的值比不给更糟。校验不过时**静默不下发**（退回服务端默认档），
+         * 而不是发一个可能被拒的值。
+         *
+         * ⚠️ **不能靠 HTTP 状态码判断该字段是否生效**：实测传
+         * `reasoning_effort` / `reasoningEffort` / `thinking` 三种名字**都返回 200**
+         * —— 服务端对未知字段静默忽略（与「无效模型名回退默认模型」同一模式）。
+         * 故这里的字段名依据是**远端自己的命名**，而非「试出来能通」。
+         */
+        const effortsForModel = (await this.loadModels()).find((m) => m.id === options.model)?.efforts
+            ?? this.fallbackIndex.get(options.model)?.efforts;
+        const effort = options.reasoningEffort !== undefined
+            && effortsForModel !== undefined
+            && effortsForModel.includes(options.reasoningEffort)
+            ? options.reasoningEffort
+            : undefined;
         /** 构造请求体。 */
         const buildBody = () => JSON.stringify({
             model: options.model,
@@ -245,6 +379,7 @@ export class LoomyAdapter extends LlmAdapter {
             ...options.maxTokens !== undefined ? { max_tokens: options.maxTokens } : {},
             ...options.temperature !== undefined ? { temperature: options.temperature } : {},
             ...options.stop !== undefined && options.stop.length > 0 ? { stop: options.stop } : {},
+            ...effort !== undefined ? { reasoning_effort: effort } : {},
             ...options.tools !== undefined && options.tools.length > 0
                 ? {
                     tools: options.tools.map((tool) => ({
@@ -283,7 +418,7 @@ export class LoomyAdapter extends LlmAdapter {
         // 但保留该路径以便将来上游开放续期时自动受益）。
         if (response.status === 401 || response.status === 403) {
             await this.options.refresh();
-            const refreshed = await this.options.resolveCredential();
+            const refreshed = await this.options.resolveCredential(options.model);
             if (refreshed === undefined || refreshed.access_token.length === 0) {
                 throw new LlmError('loomy: credential expired and refresh failed', 'AUTH', { status: response.status });
             }
@@ -298,6 +433,7 @@ export class LoomyAdapter extends LlmAdapter {
             label: 'loomy',
             firstTokenTimeoutMs: resolveFirstTokenTimeoutMs(),
             chunkTimeoutMs: resolveChunkTimeoutMs(),
+            ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
         });
     }
 }
@@ -320,16 +456,8 @@ function resolveChunkTimeoutMs() {
  */
 export function registerLoomyLlm(ctx, options) {
     const product = options.product ?? LOOMY;
-    ctx.llm.registerConfigurableProviders([
-        {
-            provider: product.id,
-            displayName: product.displayName,
-            settingsNs: settingsNamespaceFor(ctx, `llm-${product.id}`),
-            settingsPath: [],
-        },
-    ]);
     const adapter = new LoomyAdapter(options);
-    ctx.llm.registerAdapter([product.id], adapter);
+    registerAdapterIdempotent(ctx.llm, [product.id], adapter);
     return adapter;
 }
 //# sourceMappingURL=loomy-adapter.js.map

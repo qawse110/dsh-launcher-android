@@ -145,7 +145,20 @@ export async function getAccount(state, token, options = {}) {
     const product = options.product ?? CODEBUDDY;
     const url = `${product.endpoint}${LOGIN_ACCOUNT_PATH}?state=${encodeURIComponent(state)}`;
     const headers = {
-        [HTTP_HEADER_DOMAIN]: token.domain,
+        // ⚠️ `||` 而非裸 `token.domain`：token 由 `parseTokenData` → `readStringField`
+        // 产出，该函数在字段缺失/类型不符时返回**空串**（不是 `undefined`），裸用会
+        // 让 X-Domain 以空值发出。这与 `buddy-adapter.ts` 的 chat 头、`buddy.ts` 的
+        // `credentialRequestHeaders` 是同一形态（PR!19 修了那两处，这是第三处）。
+        //
+        // 兜底取 `product.apiDomain` 而非常量 `API_DOMAIN`：本请求的 URL 是
+        // `` `${product.endpoint}${LOGIN_ACCOUNT_PATH}` ``，X-Domain 必须与产品端点一致。
+        //
+        // ⚠️ **非空时仍以服务端下发的 `token.domain` 为准**（故不写成产品优先）：
+        // 这里是登录流程，该值是服务端**本次刚下发**的权威值，不是跨产品迁移后
+        // 会过期的历史快照 —— 与 adapter 那处的方向差异是有意的，差异只在「兜底值
+        // 取谁」，判据一致（空串必回退）。回归用例见 `tests/unit/buddy-oauth.spec.ts`
+        // 的「token.domain 为空串时…」与「token.domain 非空时…」两条。
+        [HTTP_HEADER_DOMAIN]: token.domain || product.apiDomain,
         Authorization: `Bearer ${token.accessToken}`,
         [HTTP_HEADER_NO_USER_ID]: 'true',
         [HTTP_HEADER_NO_ENTERPRISE_ID]: 'true',

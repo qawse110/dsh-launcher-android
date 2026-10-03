@@ -21,16 +21,129 @@
  * OpenAI 协议层的通用逻辑（消息序列化、SSE 消费、错误归类）复用
  * `src/openai-compat.ts`；加密端点的响应信封由 `src/qoder-envelope.ts` 剥离。
  */
-import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm';
+import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 import { providerCatalogVisible } from './account-pool.js';
-import { settingsNamespaceFor } from './settings-compat.js';
 import { isQoderExpired } from './qoder.js';
 import { QoderEncryptedInfer } from './qoder-wasm.js';
 import { unwrapQoderEnvelopeStream } from './qoder-envelope.js';
 import { QODER } from './qoder-product.js';
-import { collectImages, consumeOpenAiSse, errorDetail, httpErrorCode, isTransportError, serializeMessages, } from './openai-compat.js';
+import { projectRequestImage } from './image-budget.js';
+import { registerAdapterIdempotent, } from './llm-register-compat.js';
+import { collectImages, consumeOpenAiSse, errorDetail, httpErrorCode, isTransportError, ModelQueuedError, serializeMessages, } from './openai-compat.js';
+import { BILLING_BUSINESS_CODE, QUEUE_BUSINESS_CODE, QUEUE_MAX_ATTEMPTS, QUEUE_MAX_DELAY_MS, isBillingBusinessCode, isQueueBusinessCode, looksLikeBillingError, nextUtc8DayStartMs, parseQueueError, queueDelayMs, } from './model-queue.js';
+const parseQoderQueueError = parseQueueError;
+const qoderQueueDelayMs = queueDelayMs;
+/**
+ * ⚠️ **向后兼容的再导出**：排队解析的实现已移到 `src/model-queue.ts`
+ * （因为 SSE 消费器也要用，而它不能被本模块反向 import —— 会成环）。
+ * 这里保留同名导出，避免既有调用方与测试失效。
+ */
+export { BILLING_BUSINESS_CODE as QODER_BILLING_CODE, QUEUE_BUSINESS_CODE as QODER_QUEUE_CODE, QUEUE_MAX_ATTEMPTS as QODER_QUEUE_MAX_ATTEMPTS, QUEUE_MAX_DELAY_MS as QODER_QUEUE_MAX_DELAY_MS, isBillingBusinessCode, isQueueBusinessCode, looksLikeBillingError, nextUtc8DayStartMs, parseQueueError as parseQoderQueueError, queueDelayMs as qoderQueueDelayMs, };
+/**
+ * 判断一个错误是否为**额度受限**（`QUOTA_EXCEEDED`）。
+ *
+ * ⚠️ 必须同时认 `code` **与** `message`：
+ * - `code`：`openai-compat` 抛的 `LlmError(…, 'QUOTA_EXCEEDED')`（主判据）；
+ * - `message`：兜底 —— 若哪天错误从别的路径冒出来（如未被包装的原始文本），
+ *   文案里仍带 `Billing daily count exceeded`，可据此识别。
+ *
+ * ⚠️ 用 `code` 判据**而不是**重新解析错误文本：`ModelQueuedError` 已证明
+ * 「在适配器里重解析一遍」会与上游判定漂移（同一份判据两处实现必然不同步）。
+ */
+function isQuotaExceededError(error) {
+    if (error instanceof LlmError) {
+        if (error.code === 'QUOTA_EXCEEDED' || error.code === 'QUOTA')
+            return true;
+    }
+    if (error instanceof Error) {
+        // 仅在**没有**更精确的 code 时用文案兜底（避免把正常文本误判）
+        if (!(error instanceof LlmError))
+            return looksLikeBillingError(error.message);
+    }
+    return false;
+}
 /** 本适配器注册的 provider 路由名（历史常量，等价于 `QODER.id`）。 */
 export const PROVIDER = 'qoder';
+/**
+ * 思考档位 id → 中文展示名。
+ *
+ * ⚠️ **必须与官方 IDE 一致**，取证是 asar 里的 i18n 表
+ * （`settings.efforts`，`scripts/probe-qoder-effort-i18n2.mjs` 可取）：
+ * ```
+ * none:关闭思考  minimal:最小  low:低  medium:中  high:高  xhigh:极高  max:最大
+ * ```
+ * 用户截图里的「关闭思考 / 低 / 中 / 极高 / 最大」正是这套。
+ *
+ * ⚠️ DSH 的档位选择器**直接渲染 `efforts[].name`**（不本地化），
+ * 所以这里给中文就是中文界面 —— 与 Qoder IDE 逐字一致。
+ * ⚠️ `minimal` 当前目录未下发，但白名单 `Qj` 里有，保留以备上游启用。
+ */
+const QODER_EFFORT_NAMES = {
+    none: '关闭思考',
+    minimal: '最小',
+    low: '低',
+    medium: '中',
+    high: '高',
+    xhigh: '极高',
+    max: '最大',
+};
+/**
+ * 该模型在 UI 上可选的思考档位（复刻客户端 `gU()` 的行为）。
+ *
+ * 三条口径：
+ * 1. `efforts` 原样取用（目录顺序保持 —— 官方客户端也按对象键序渲染）；
+ * 2. `supportsDisable` 为真时**追加** `none`（即「关闭思考」）；
+ *    客户端 `gU()`：`… || e.includes('none') ? e : [...e, 'none']`。
+ * 3. 两者皆无 → 返回空数组，调用方**不声明 `reasoning`**
+ *    （UI 显示「当前模型未提供推理等级」，对应 IDE 的「不支持」）。
+ *
+ * ⚠️ **`qmodel` / `qmodel_latest` 这类「有 `disabled` 但无 `efforts`」的模型
+ * 会得到 `['none']`** —— 即只提供「关闭思考」一项。这是**远端事实**
+ * （用户 2026-09-28 确认「上面两个没有思考档位就是关闭的意思」），
+ * **不要**给它们补默认档位。
+ */
+export function qoderEffortsFor(model) {
+    const efforts = [...(model.efforts ?? [])];
+    if (model.supportsDisable === true && !efforts.includes('none'))
+        efforts.push('none');
+    return efforts;
+}
+/**
+ * 排队总时长上限（毫秒），可用 `DSH_QODER_QUEUE_TIMEOUT_MS` 覆盖。
+ *
+ * ⚠️ **不能用 `parseInt(…) || 默认值`**：`0` 是**合法**配置（表示「不等，立即
+ * 判超时」，单测就靠它验证该开关），而 `0` 是 falsy，会被 `||` 静默换成 30 分钟
+ * —— 那会让这个开关在「想关掉排队等待」时**恰好失效**。故显式判 `undefined`。
+ */
+function resolveQueueTimeoutMs() {
+    const raw = process.env.DSH_QODER_QUEUE_TIMEOUT_MS;
+    if (raw === undefined || raw.length === 0)
+        return 30 * 60_000;
+    const parsed = Number.parseInt(raw, 10);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 30 * 60_000;
+}
+/**
+ * 读 `AbortSignal.aborted`（**刻意做成函数**）。
+ *
+ * 为什么不能内联 `signal?.aborted === true`：TS 会在 `await` 之前的一次
+ * early-throw 之后把该表达式**静态窄化**为字面量 `false`，于是「等待期间被
+ * 中止」这第二次检查会被判为「无重叠的比较」而**编译报错** —— 那个报错本身
+ * 是假阳性（`aborted` 是随时间的可变状态）。经函数读取即可保留真实语义，
+ * 也把「这里为什么再查一次」的意图写清楚。
+ */
+function isAborted(signal) {
+    return signal?.aborted === true;
+}
+/**
+ * 从 SSE 层抛出的 {@link ModelQueuedError} 里取出排队信息。
+ *
+ * `ModelQueuedError.queueInfo` 是已经解析好的 `QueueInfo`，但类型放宽成了
+ * `Record<string, unknown>`（共享模块不该暴露 provider 私有类型）。
+ * 这里原样取回 —— **不要再解析一次**（那会与已解析的结果产生两套口径）。
+ */
+function queueInfoOf(error) {
+    return error.queueInfo;
+}
 /**
  * 把 DSH 的工具 schema 映射成加密端点认的 `tools[]`。
  *
@@ -72,6 +185,72 @@ function qoderContentText(content) {
     return '';
 }
 /**
+ * 把 wire 消息的 content 数组**逐字段搬运**成多模态 parts。
+ *
+ * ## 为什么必须保留数组（真实缺陷，用户报障）
+ *
+ * 「给 qodercn 的 qwen3.8-flash 发送图片，模型说没读到图片」。
+ *
+ * 根因**不在** `chat_context.imageUrls` —— 客户端官方实现 `Hyc()` 就把那个字段
+ * **恒置 `null`**（obf 产物原文：`function Hyc(A,e,t){return{text:A,features:[],
+ * extra:{…},chatPrompt:"",imageUrls:null}}`），我们那行是忠实复刻。
+ * 图片的正确通道是 **`messages[].content` 的多模态数组**：客户端 `eQc()` 把
+ * `{type:'base64',media_type,data}` 转成 `{type:'image_url',image_url:{url}}`，
+ * `bJc()` 再转成 `{type:'input_image',image_url:…}` 后发出。
+ *
+ * 而上游 `serializeMessages`（`src/openai-compat.ts`）**已经**把图片正确转成了
+ * `{type:'image_url',image_url:{url:'data:…'}}` 放进 content 数组 ——
+ * 是 `buildQoderHistory` 用 `qoderContentText()` 把它压成纯文本吃掉的。
+ *
+ * ⚠️ 这是本文件第三个同型缺陷（前两个：`tools` 不下发、工具历史丢
+ * `tool_calls`）—— 都是「序列化层没保留多模态结构」。改动时务必三者一起想。
+ *
+ * ⚠️ **只保留协议认识的两个键**（与 `buildQoderInferPayload` 的「逐字段搬运」
+ * 同一原则）：不要把 DSH 的内部字段（`id` / `source` / `attachment` 等）
+ * 原样发给上游。
+ *
+ * @returns 规范化后的 parts；**无图或全部畸形**时返回 undefined（调用方据此
+ *          决定是否降级为字符串，以免把纯文本消息也改成数组形态）。
+ */
+function qoderContentParts(content) {
+    if (!Array.isArray(content))
+        return undefined;
+    const parts = [];
+    let hasImage = false;
+    for (const raw of content) {
+        if (typeof raw !== 'object' || raw === null)
+            continue;
+        const block = raw;
+        if (block.type === 'text') {
+            const text = String(block.text ?? '');
+            if (text.length > 0)
+                parts.push({ type: 'text', text });
+            continue;
+        }
+        if (block.type === 'image_url') {
+            // ⚠️ 只搬 `url`：`image_url` 里可能还有 `detail` 等字段，客户端 `bJc()`
+            // 只在存在时透传 `detail`，这里与它对齐（缺省不写该键）。
+            const url = block.image_url?.url;
+            if (typeof url !== 'string' || url.length === 0)
+                continue;
+            const detail = block.image_url.detail;
+            parts.push({
+                type: 'image_url',
+                image_url: {
+                    url,
+                    ...(typeof detail === 'string' && detail.length > 0 ? { detail } : {}),
+                },
+            });
+            hasImage = true;
+            continue;
+        }
+        // 其余类型（如 Anthropic 风格的 `image`、`tool_result` 内层块）不由本函数处理：
+        // 它们要么已被 `serializeMessages` 转成 image_url，要么不属于推理载荷。
+    }
+    // 无图时返回 undefined，让调用方继续用字符串形态（上游对字符串兼容性最好）。
+    return hasImage ? parts : undefined;
+}
+/**
  * 把 `serializeMessages` 的 wire 消息转成加密端点的 `messages[]`。
  *
  * ## 真实缺陷（本次修复）
@@ -97,14 +276,24 @@ export function buildQoderHistory(messages) {
     for (const message of messages) {
         if (typeof message.role !== 'string')
             continue;
-        const content = qoderContentText(message.content);
+        // ⚠️ 含图消息必须保留 content **数组**（见 `qoderContentParts` 的缺陷说明）；
+        // 纯文本仍走字符串，保持与既有形态和上游兼容性逐字节一致。
+        const parts = qoderContentParts(message.content);
+        const content = parts === undefined ? qoderContentText(message.content) : parts;
         const toolCalls = Array.isArray(message.tool_calls) && message.tool_calls.length > 0
             ? message.tool_calls
             : undefined;
         const toolCallId = typeof message.tool_call_id === 'string' ? message.tool_call_id : undefined;
         // 三者皆空的消息没有承载意义（如只有 reasoning 的帧），跳过以免发出
         // 「空 assistant」这种会让上游困惑的条目。
-        if (content.length === 0 && toolCalls === undefined && toolCallId === undefined)
+        //
+        // ⚠️ 判空必须把**图片**算作内容：`parts` 为非空数组（含 image_url）时
+        // 即便 `qoderContentText` 结果为空串也不能丢弃 —— 否则「只发一张图、
+        // 不带文字」的消息会被整条吃掉（用户报障场景之一）。
+        const isEmpty = parts === undefined
+            ? content.length === 0
+            : content.length === 0;
+        if (isEmpty && toolCalls === undefined && toolCallId === undefined)
             continue;
         history.push({
             role: message.role,
@@ -144,6 +333,28 @@ export class QoderAdapter extends LlmAdapter {
         this.product = options.product ?? QODER;
         this.fetchImpl = options.fetchImpl ?? fetch;
         this.fallbackIndex = new Map((this.product.fallbackModels ?? []).map((model) => [model.id, model]));
+    }
+    /**
+     * 可中止的休眠；信号中止时立即 resolve（不抛错，由调用方检查 signal）。
+     *
+     * ⚠️ **必须响应 `signal`**：排队等待最长可达 30 分钟，用户中途取消会话时
+     * 不能让 generator 卡在 `setTimeout` 里 —— 那会表现为「点了停止但没反应」。
+     */
+    async sleep(ms, signal) {
+        if (this.options.sleep !== undefined) {
+            await this.options.sleep(ms, signal);
+            return;
+        }
+        if (ms <= 0 || signal?.aborted === true)
+            return;
+        await new Promise((resolve) => {
+            const onAbort = () => { clearTimeout(timer); resolve(); };
+            const timer = setTimeout(() => {
+                signal?.removeEventListener('abort', onAbort);
+                resolve();
+            }, ms);
+            signal?.addEventListener('abort', onAbort, { once: true });
+        });
     }
     /**
      * 描述本适配器拥有的 provider 路由。
@@ -208,6 +419,15 @@ export class QoderAdapter extends LlmAdapter {
             inputModalities: this.inputModalitiesFor(model.id),
         }));
     }
+    /**
+     * 解析模型元信息。
+     *
+     * ⚠️ **`reasoning` 是「思考强度」选择器出现在模型菜单里的唯一入口**
+     * （composer 读 `resolveModel().reasoning`）。此前本适配器**只声明了
+     * `context`，从不声明 `reasoning`** → 中国版/国际版全都看不到档位选择器，
+     * 尽管目录早已下发 `thinking_config`（用户报障「qoder中国版可以设置思考档位，
+     * 我们应该按照他的设置给出可设置的档位选择」）。
+     */
     async resolveModel(provider, model, _signal) {
         const entry = this.fallbackIndex.get(model);
         const resolved = {
@@ -220,6 +440,25 @@ export class QoderAdapter extends LlmAdapter {
         // （宁可让 DSH 用默认值，也不要报一个假的窗口大小）。
         if (entry !== undefined)
             resolved.context = { contextWindow: entry.contextWindow };
+        // 思考档位：见 `qoderEffortsFor` 的三条口径（含「关闭思考」的追加规则）。
+        if (entry !== undefined) {
+            const efforts = qoderEffortsFor(entry);
+            if (efforts.length > 0) {
+                const fallback = entry.defaultEffort;
+                resolved.reasoning = {
+                    efforts: efforts.map((id) => ({
+                        id: ReasoningEffortId(id),
+                        name: QODER_EFFORT_NAMES[id] ?? id,
+                    })),
+                    // ⚠️ `defaultEffort` 必须落在 `efforts` 内 —— DSH 会直接拿它发请求，
+                    // 给一个不存在的档位会抛 `UNSUPPORTED_REASONING_EFFORT`
+                    // （同 `trae-adapter.ts` 的教训）。
+                    ...fallback !== undefined && efforts.includes(fallback)
+                        ? { defaultEffort: ReasoningEffortId(fallback) }
+                        : {},
+                };
+            }
+        }
         return resolved;
     }
     /**
@@ -256,18 +495,25 @@ export class QoderAdapter extends LlmAdapter {
             // 保留**空 Map**（而非降级为 undefined）：图片存在但全部读取失败时，
             // 空 Map 仍会让 userContentParts 产出 [image unavailable] 占位符。
             imageUrls = new Map();
+            const readImage = this.options.readImage;
             for (const [id, ref] of imageRefs) {
-                const image = await this.options.readImage(ref);
+                // ⚠️ 先试**请求版本**（缩放），拿不到才发原图 —— 见 projectRequestImage。
+                const projected = await projectRequestImage(ref, {
+                    readImageRequest: this.options.readImageRequest,
+                    pixelBudget: this.product.imagePixelBudget,
+                    maxBytes: this.product.imageMaxBytes,
+                });
+                const image = projected ?? await readImage(ref);
                 if (image === undefined)
                     continue;
                 imageUrls.set(id, `data:${image.mediaType};base64,${Buffer.from(image.data).toString('base64')}`);
             }
         }
         // 1. 获取凭据（过期则先静默续期）
-        let credential = await this.options.resolveCredential();
+        let credential = await this.options.resolveCredential(options.model);
         if (credential === undefined || isQoderExpired(credential)) {
             await this.options.refresh();
-            credential = await this.options.resolveCredential();
+            credential = await this.options.resolveCredential(options.model);
         }
         if (credential === undefined || credential.access_token.length === 0) {
             throw new LlmError('qoder: no usable credential; log in first', 'MISSING_CREDENTIAL');
@@ -288,7 +534,18 @@ export class QoderAdapter extends LlmAdapter {
         /** 最后一条 user 消息即本轮提问；其余作为历史。 */
         const userMessages = messages.filter((m) => m.role === 'user');
         const lastUser = userMessages.at(-1);
-        const userText = typeof lastUser?.content === 'string' ? lastUser.content : '';
+        // ⚠️ 带图消息的 content 是**多模态数组**（见 `qoderContentParts`），
+        // 只判 `typeof === 'string'` 会让 `chat_context.text` / `originalContent`
+        // 退化成空串 —— 那会让模型收到「一张没有配文的图」，与用户实际输入不符。
+        // 故两种形态都要取文本（数组时取其中的 text 块）。
+        const userText = typeof lastUser?.content === 'string'
+            ? lastUser.content
+            : (Array.isArray(lastUser?.content)
+                ? lastUser.content
+                    .filter((block) => block.type === 'text')
+                    .map((block) => String(block.text ?? ''))
+                    .join('')
+                : '');
         // ⚠️ 必须走 buildQoderHistory：早期内联的「只留 content 为字符串」过滤器
         // 会丢掉 assistant 的 tool_calls（content 为 null）与 tool 的 tool_call_id，
         // 使多步工具调用彻底坏掉（模型看不到自己调用过什么）。
@@ -339,26 +596,233 @@ export class QoderAdapter extends LlmAdapter {
         };
         // 3. 发送（⚠️ 头必须原样透传：Authorization 是 WASM 生成的
         //    `Bearer COSY.<载荷>.<签名>`，用普通 Bearer 覆盖会 403 Signature invalid）
-        let response = await this.sendEncrypted(await buildRequest(credential), options);
-        if (response.status === 401 || response.status === 403) {
-            await this.options.refresh();
-            const refreshed = await this.options.resolveCredential();
-            if (refreshed === undefined || refreshed.access_token.length === 0) {
-                throw new LlmError('qoder: credential expired and refresh failed', 'AUTH', { status: response.status });
-            }
-            credential = await this.ensureUid(refreshed);
+        //
+        // ## 三种 403 的语义**互不相同**，必须分开处理
+        //
+        // | 形态 | 判据 | 处理 |
+        // |---|---|---|
+        // | **排队** | 业务码 `10605`（`model_queued`） | 按服务端给的延迟**内部等待后重试**（见下） |
+        // | 重复请求 | 业务码（客户端 `_TA="duplicate_request"`） | 不刷新凭据，直接重发一次 |
+        // | 认证失败 | 业务码 `105`（`auth_error`）或 401 | 续期凭据后重试（**唯一**该走 refresh 的情形） |
+        //
+        // ⚠️ **真实缺陷**（用户报障，2026-09-27）：旧实现把**所有** 401/403 都当认证
+        // 失败 → 排队时白白续期一次，再落到 harness 的 5 次通用退避（500/1000/2000/
+        // 4000/8000 ≈ 共 15.5 秒）—— 而服务端明确要求等 30 秒，于是**永远等不到**；
+        // 中国版那条「等 2 秒就能成功」的瞬时排队也因走错路径而反复失败。
+        const queueDeadline = Date.now() + resolveQueueTimeoutMs();
+        let queueAttempts = 0;
+        let authRefreshed = false;
+        let duplicateRetried = false;
+        let response;
+        /**
+         * 已尝试过的账号 id（额度受限切号用）。
+         *
+         * ⚠️ 必须跨重试保留（不能在每次迭代里新建）：它是「**已试过哪些账号**」的
+         * 记录，用来保证每个账号最多试一次、试完才判定「全部受限」。每次迭代重置
+         * 会让切换在两个账号之间**无限来回**。
+         */
+        const triedAccounts = new Set();
+        /**
+         * **当前生效账号的 id**（会随额度受限切号而更新）。
+         *
+         * ⚠️ 是**局部可变**状态、而不是每次都问 `this.options.currentAccountId()`：
+         * 那个回调返回的是「池当前的默认账号」，一旦我们切到下一个账号它**不会跟着变**
+         * —— 若用它标记，切到 B 后失败时会**再标记一次 A**，而 B 从未被标记，
+         * 下次取号又把 B 选中，于是在 A/B 之间**反复空转**
+         *（写单测时实测到了：标记记录是 `['acct-A','acct-A']` 而非 `['acct-A','acct-B']`）。
+         */
+        let activeAccountId = this.options.currentAccountId?.();
+        if (activeAccountId !== undefined && activeAccountId.length > 0) {
+            triedAccounts.add(activeAccountId);
+        }
+        // 4. 剥掉加密端点的响应信封，交给统一的 OpenAI SSE 消费器。
+        //
+        // ⚠️ **必须放在重试循环内**：排队错误的**第二种**下发形态是
+        // **HTTP 200 + SSE 内嵌 `{code:"10605",…}` 帧**（真实缺陷，用户报障
+        // 2026-09-27 —— 第一版修复只覆盖了 HTTP 403 形态，于是这条路径被
+        // SSE 消费器归为 `SERVER` 直接抛给 harness，以 500…8000ms 快退避重试
+        // 5 次，而服务端要求等 30 秒，**永远等不到**）。
+        for (;;) {
             response = await this.sendEncrypted(await buildRequest(credential), options);
+            if (!response.ok && (response.status === 401 || response.status === 403)) {
+                // ⚠️ 必须**先读体再判断**，且 body 只能读一次 —— 排队信息就藏在
+                // `message` 那个 JSON 字符串里（见 `parseQoderQueueError`）。
+                const errorText = await response.text().catch(() => '');
+                const queueInfo = parseQoderQueueError(errorText);
+                if (queueInfo !== undefined) {
+                    await this.waitForQueue(queueInfo, ++queueAttempts, queueDeadline, options);
+                    continue;
+                }
+                // ⚠️ **额度受限也要切账号**（用户要求，2026-09-27）。
+                //
+                // 这条与 SSE 层那条**必须都有**：Qoder 的额度错误实测走 SSE 通道
+                // （HTTP 200），但若哪天服务端改成用 HTTP 状态码下发，只处理一条就会漏。
+                // 两处调用**同一个** `switchAccountOnQuota`，不会漂移。
+                if (isBillingBusinessCode(response.status) || looksLikeBillingError(errorText)) {
+                    const switched = await this.switchAccountOnQuota(options, triedAccounts, activeAccountId);
+                    if (switched !== undefined) {
+                        credential = switched.credential;
+                        activeAccountId = switched.accountId;
+                        authRefreshed = false; // 新账号可再续期一次
+                        continue;
+                    }
+                    throw new LlmError(`qoder: ${errorDetail(errorText)}`, 'QUOTA_EXCEEDED', { status: response.status });
+                }
+                // 非排队：认证失败才续期（且每次请求最多一次，避免刷爆 userinfo）。
+                if (!authRefreshed) {
+                    authRefreshed = true;
+                    await this.options.refresh();
+                    const refreshed = await this.options.resolveCredential(options.model);
+                    if (refreshed === undefined || refreshed.access_token.length === 0) {
+                        throw new LlmError('qoder: credential expired and refresh failed', 'AUTH', { status: response.status });
+                    }
+                    credential = await this.ensureUid(refreshed);
+                    continue;
+                }
+                throw new LlmError(`qoder: ${errorDetail(errorText)}`, httpErrorCode(response.status), { status: response.status });
+            }
+            // 重复请求（客户端 `duplicate_request`）：凭据没问题，重发一次即可。
+            if (!response.ok && response.status === 409 && !duplicateRetried) {
+                duplicateRetried = true;
+                continue;
+            }
+            if (!response.ok) {
+                const errorText = await response.text().catch(() => '');
+                throw new LlmError(`qoder: ${errorDetail(errorText)}`, httpErrorCode(response.status), { status: response.status });
+            }
+            // ⚠️ 消费 SSE 时**捕获流内排队错误**，走与 HTTP 层**完全相同**的等待逻辑。
+            // `consumeOpenAiSse` 是生成器：无法「try 一次再重试」，故这里手动迭代，
+            // 捕获到排队就等待后重发整条请求（排队期间未产出任何 chunk，可安全重放）。
+            const inner = consumeOpenAiSse(unwrapQoderEnvelopeStream(response, 'qoder'), { signal: options.signal }, {
+                label: 'qoder',
+                firstTokenTimeoutMs: resolveFirstTokenTimeoutMs(),
+                chunkTimeoutMs: resolveChunkTimeoutMs(),
+                ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
+            });
+            const iterator = inner[Symbol.asyncIterator]();
+            let queued = false;
+            for (;;) {
+                let step;
+                try {
+                    step = await iterator.next();
+                }
+                catch (error) {
+                    if (error instanceof ModelQueuedError) {
+                        await this.waitForQueue(queueInfoOf(error), ++queueAttempts, queueDeadline, options);
+                        queued = true;
+                        break;
+                    }
+                    // ⚠️ **额度受限（110）要标记 + 切账号**（用户要求，2026-09-27）。
+                    //
+                    // ⚠️ 必须**在这里**捕获（SSE 层）而不只在 HTTP 层：Qoder 的额度错误
+                    // 实测以 **HTTP 200 + SSE 内嵌帧** 下发（与排队同通道），
+                    // 只在 HTTP 层处理会漏掉真实链路。
+                    if (isQuotaExceededError(error)) {
+                        const switched = await this.switchAccountOnQuota(options, triedAccounts, activeAccountId);
+                        if (switched !== undefined) {
+                            credential = switched.credential;
+                            activeAccountId = switched.accountId;
+                            queued = true; // 复用「回到循环顶部重发」的语义
+                            break;
+                        }
+                        throw error; // 无可用账号 → 如实抛出（已含额度语义）
+                    }
+                    throw error;
+                }
+                if (step.done === true)
+                    break;
+                yield step.value;
+            }
+            if (queued)
+                continue;
+            return;
         }
-        if (!response.ok) {
-            const errorText = await response.text().catch(() => '');
-            throw new LlmError(`qoder: ${errorDetail(errorText)}`, httpErrorCode(response.status), { status: response.status });
+    }
+    /**
+     * 额度受限时：**标记当前账号该模型受限到 UTC+8 当日 24:00，然后切下一个账号**。
+     *
+     * ## 用户要求（2026-09-27）
+     *
+     * > qoder 碰到当日额度受限应该像 workbuddy/codebuddy 一样，设置一个模型受限时间
+     * > （他们是返回错误中带时间，qoder 和 qodercn 需要自己设置当日 24:00 受限）
+     * > 然后切换账号池中的下一个可用模型
+     *
+     * ## ⚠️ 与 buddy/CodeArts 的**关键差异**
+     *
+     * 它们的错误文案里**带重置时间**（`parseRateLimitError` 从中解析）；
+     * Qoder **不带** —— 故这里用 {@link nextUtc8DayStartMs} **自己算**
+     * 「UTC+8 当日 24:00」。**不能**复用 `parseRateLimitError`：它会因解析不到
+     * 时间而退回「1 小时后」（`Date.now() + 3_600_000`），那对**按自然日**结算的
+     * 额度是错的 —— 会让标记过早失效，用户 1 小时后再撞一次同样的墙。
+     *
+     * @param activeAccountId - **当前正在使用的**账号 id（见下）。
+     * @returns 新凭据；无可用账号时 `undefined`（调用方如实抛出原错误）。
+     */
+    async switchAccountOnQuota(options, tried, activeAccountId) {
+        const pool = this.options.accountPool;
+        if (pool === undefined)
+            return undefined;
+        // ① 记录「本账号 + 本模型」受限到 UTC+8 当日 24:00。
+        //
+        // ⚠️ 只标记**该模型**（不标记账号全部模型）：额度是「模型 + 账号」维度的，
+        // 该账号在别的模型上仍可能可用（`modelRateLimits` 的既有语义即如此）。
+        //
+        // ⚠️ 用的是调用方传入的 `activeAccountId`，**不是** `this.options.currentAccountId()`：
+        // 后者是「会话启动时/池当前的默认账号」，一旦我们切换到下一个账号，它**不会
+        // 跟着变** —— 若用它标记，切到 B 后失败时会**再标记一次 A**，而 B 从未被标记，
+        // 下次取号又把 B 选中，导致在 A/B 之间**反复空转**（写单测时实测到了：
+        // 标记记录是 `['acct-A','acct-A']` 而非 `['acct-A','acct-B']`）。
+        if (activeAccountId !== undefined && activeAccountId.length > 0) {
+            await pool.updateModelRateLimit(activeAccountId, options.model, nextUtc8DayStartMs());
+            tried.add(activeAccountId);
         }
-        // 4. 剥掉加密端点的响应信封，交给统一的 OpenAI SSE 消费器
-        yield* consumeOpenAiSse(unwrapQoderEnvelopeStream(response, 'qoder'), { signal: options.signal }, {
-            label: 'qoder',
-            firstTokenTimeoutMs: resolveFirstTokenTimeoutMs(),
-            chunkTimeoutMs: resolveChunkTimeoutMs(),
-        });
+        // ② 取下一个可用账号。
+        //
+        // ⚠️ 必须传 `tried`：池按「限流重置时间最早到期」排序，**刚失败的账号可能
+        // 仍排第一**，不排除就会拿回同一个、命中下面的检查而立即放弃切换。
+        // （与 buddy 的注释同因，见 `buddy-adapter.ts` 的 1200 行附近。）
+        const next = await pool.getAvailableAccount(this.product.id, options.model, tried);
+        if (next === null || tried.has(next.entry.id))
+            return undefined;
+        tried.add(next.entry.id);
+        const credential = next.credential;
+        // 切号后必须重新过一遍 uid 补齐（每个账号的 uid 不同，缺了会签名无效）。
+        return { credential: await this.ensureUid(credential), accountId: next.entry.id };
+    }
+    /**
+     * 排队等待（HTTP 层与 SSE 层**共用**）。
+     *
+     * 两处形态必须走同一套判据，否则会再次出现「只修了一条路径」的缺陷。
+     */
+    async waitForQueue(queueInfo, attempts, deadline, options) {
+        // ⚠️ **先判时间、再判次数**：时间上限是硬约束（用户可调），次数上限只是
+        // 防御性兜底。反过来写会让「180 次空转」在绝大多数情况下先生效，
+        // 使 `DSH_QODER_QUEUE_TIMEOUT_MS` **形同虚设**（写用例时实测到了）。
+        //
+        // ⚠️ 用 `>=` 而不是 `>`：上限为 **0** 是合法配置（「不等，立即判超时」），
+        // 而同一毫秒内 `Date.now() > now + 0` 为 **false**，会让它**先等一次**才
+        // 超时 —— 那与「0 = 不等待」的语义不符（单测专门守这一点）。
+        if (Date.now() >= deadline) {
+            throw new LlmError('qoder: 排队等待超时', 'QUEUE');
+        }
+        if (attempts > QUEUE_MAX_ATTEMPTS) {
+            throw new LlmError(`qoder: 排队重试超过上限（${QUEUE_MAX_ATTEMPTS} 次）`, 'QUEUE');
+        }
+        if (options.signal?.aborted === true) {
+            throw new LlmError('qoder: 排队等待期间请求已取消', 'QUEUE');
+        }
+        const waitMs = qoderQueueDelayMs(queueInfo);
+        // ⚠️ 拿不到服务端延迟时**不忙等**：用保守的短退避，避免瞬间烧掉机会
+        // （客户端 W7c() 此时会退回 ltA() 指数退避）。
+        await this.sleep(waitMs ?? 1_000, options.signal);
+        // ⚠️ 这次检查**不是**上一次的重复：它检测的是「**等待期间**被中止」。
+        // `AbortSignal.aborted` 是随时间的可变状态，但 TS 会静态窄化成字面量
+        // `false` 而报「无重叠」—— 故经**不透明函数**读取，避免静态收窄掩盖
+        // 这个真实场景（`await` 之后状态可能已变）。
+        if (isAborted(options.signal)) {
+            throw new LlmError('qoder: 排队等待期间请求已取消', 'QUEUE');
+        }
+        // ⚠️ 排队**不刷新凭据**、不换账号：它与认证和额度都无关。
     }
     /**
      * 确保凭据带 **`uid`**（加密推理必需），必要时经注入钩子补齐。
@@ -478,22 +942,15 @@ export function qoderDisplayName(model, now = new Date()) {
 /**
  * 在 `ctx.llm` 上注册 Qoder provider 路由与适配器。
  *
- * 路由名与配置页展示名由产品配置驱动，得到 `qoder`。`settingsNs` 经
- * `settingsNamespaceFor()` 解析：老契约（≤0.1.6）下是 `llm-qoder`；
- * 0.1.7-rc.1 起 settings 命名空间只能是 profile 条目 id，故解析为本插件条目 id。
+ * 路由名与展示名由产品配置驱动，得到 `qoder`。
+ *
+ * ⚠️ 刻意**不**向 DSH 声明可配置 provider（`registerConfigurableProviders`）——
+ * 详见 `llm-register-compat.ts` 模块头。
  */
 export function registerQoderLlm(ctx, options) {
     const product = options.product ?? QODER;
-    ctx.llm.registerConfigurableProviders([
-        {
-            provider: product.id,
-            displayName: product.displayName,
-            settingsNs: settingsNamespaceFor(ctx, `llm-${product.id}`),
-            settingsPath: [],
-        },
-    ]);
     const adapter = new QoderAdapter(options);
-    ctx.llm.registerAdapter([product.id], adapter);
+    registerAdapterIdempotent(ctx.llm, [product.id], adapter);
     // 返回实例：Jet Hub「显示列表」需要 `listAllModels()`（不受黑名单影响、
     // 带最终展示名/倍率）。`ctx.llm` 不透传自定义方法，须由调用方持有引用。
     return adapter;

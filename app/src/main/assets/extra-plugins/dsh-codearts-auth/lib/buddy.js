@@ -154,10 +154,19 @@ export function isExpired(credential) {
 export function isRefreshable(credential) {
     return credential.refresh_token.length > 0;
 }
-/** 构造基础请求头（X-Domain + User-Agent + 可选企业头）。 */
+/**
+ * 构造基础请求头（X-Domain + User-Agent + 可选企业头）。
+ *
+ * ⚠️ `X-Domain` 用 `||` 而非 `??`：本函数是「凭据级」基础头，调用方
+ * `buddy-oauth.ts`（`refreshToken` / `fetchModels`）随后会按当前产品覆盖 domain
+ * 与 UA，故它只需把**空串**兜回默认域名，不承担「以产品为准」的判定。
+ * 凭据的 domain 经 `parseTokenData` → `readStringField` 读取，**字段缺失时是
+ * 空串而不是 undefined** —— 用 `??` 会让 X-Domain 以空值发出（真实缺陷，已用
+ * 单测复现）。判定与 `src/credits.ts` 的 `checkinHeaders` 保持同一方向。
+ */
 export function credentialRequestHeaders(credential) {
     const headers = {
-        [HTTP_HEADER_DOMAIN]: credential.domain ?? API_DOMAIN,
+        [HTTP_HEADER_DOMAIN]: credential.domain || API_DOMAIN,
         'User-Agent': BUDDY_USER_AGENT,
     };
     if (credential.enterprise_id !== undefined && credential.enterprise_id.length > 0) {

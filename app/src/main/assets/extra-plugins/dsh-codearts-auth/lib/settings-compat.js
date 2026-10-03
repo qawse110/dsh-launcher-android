@@ -11,8 +11,10 @@
  *   profile 的 `cordis.patch.yml`）。
  *
  * 因此旧写法 `settings.register(...)` 在 0.1.7 上恒为「服务不可用」，
- * 而 `registerConfigurableProviders` 的 `settingsNs` 也必须改成**本插件的
- * 条目 id**（官方适配器同做法：`ctx.fiber.entry?.options.id ?? NS`）。
+ * 而 provider 的 `settingsNs` 也必须改成**本插件的条目 id**（官方适配器同做法：
+ * `ctx.fiber.entry?.options.id ?? NS`）—— 2026-10-01 起本插件已不再向 DSH 声明
+ * 可配置 provider，故当前只有 {@link settingsNamespaceFor} 承载这条语义而没有调用方
+ * （见 `llm-register-compat.ts` 模块头）。
  */
 /**
  * 安全读取一个服务：替身 ctx（大量单测只 mock 了 `llm`）可能连 `get` 都没有。

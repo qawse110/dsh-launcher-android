@@ -268,9 +268,21 @@ export async function fetchLobsteraiCreditBalance(credential, product, fetcher =
             const record = item;
             const remaining = readNumber(record, 'creditsRemaining');
             const type = typeof record.type === 'string' ? record.type : '';
+            const label = typeof record.label === 'string' ? record.label : '';
             const expiresAt = typeof record.expiresAt === 'string' ? record.expiresAt : '';
+            // 到期时间归一化到 deductionEndTime（毫秒时间戳）：
+            // LobsterAI 的 expiresAt 实测是 ISO 8601（"2026-10-23T01:21:23"），
+            // Date.parse 原生支持；`replace(' ', 'T')` 兼容旧格式（空格分隔）。
+            // 归一化后前端 splitCreditsByExpiry / formatPackageTooltip 统一处理，
+            // 不需要按 provider 特判。
+            const expMs = expiresAt.length > 0
+                ? Date.parse(expiresAt.replace(' ', 'T'))
+                : Number.NaN;
             packages.push({
-                name: type.length > 0 ? type : '积分包',
+                // ⚠️ 包名用 `label`（实测"每日登录奖励"）而不是 `type`（"campaign"）：
+                // type 是机器分类码，label 才是人看的名字。label 缺失时回退 type，
+                // 再回退「积分包」（老用例锁死的形态）。
+                name: label.length > 0 ? label : (type.length > 0 ? type : '积分包'),
                 unit: 'credit',
                 remaining,
                 // LobsterAI 只下发剩余量，不区分「周期总额/已用」。
@@ -284,7 +296,31 @@ export async function fetchLobsteraiCreditBalance(credential, product, fetcher =
                 cycleStartTime: '',
                 cycleEndTime: '',
                 expiredTime: expiresAt,
+                ...(Number.isFinite(expMs) ? { deductionEndTime: expMs } : {}),
             });
+        }
+    }
+    // 面值推断（用户期望显示 100/100，而不是 100/0）：服务端**没有**面值字段
+    // （实测响应只有 creditsRemaining + expiresAt），但同组包的面值恒定 ——
+    // 「每日登录奖励」每天发 100，没用过的包剩余量就等于面值。
+    // 取「同组（label/type 相同）有效包的剩余量最大值」当面值：6 个没用过的包
+    // max=100 → 全部显示 100/100；被用过的包（92.73）也按同组面值 100 显示
+    // 92.73/100。⚠️ 只对有效包推断 —— 失效包可能当初面值不同，宁可显示 ?。
+    const faceValueByGroup = new Map();
+    for (const pkg of packages) {
+        if (!pkg.active)
+            continue;
+        const key = pkg.name;
+        const cur = faceValueByGroup.get(key) ?? 0;
+        if (pkg.remaining > cur)
+            faceValueByGroup.set(key, pkg.remaining);
+    }
+    for (const pkg of packages) {
+        const face = faceValueByGroup.get(pkg.name);
+        if (face !== undefined && face > 0) {
+            pkg.total = roundCredits(face);
+            if (pkg.used <= 0)
+                pkg.used = roundCredits(Math.max(0, face - pkg.remaining));
         }
     }
     // 负数一律 clamp 到 0（对齐 Go `client.go:303-308` 的 clamp）：服务端在

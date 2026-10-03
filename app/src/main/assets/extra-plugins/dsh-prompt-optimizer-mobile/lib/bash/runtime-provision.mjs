@@ -5,7 +5,7 @@
  */
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { sha256File, validateManifest, verifyRuntime } from "./runtime-layout.mjs";
 
 export const PROVISION_VERSION = "1";
@@ -34,75 +34,64 @@ export function candidateRuntimes(options) {
   return list.map((c) => ({ ...c, explicit: c.source === "env" || c.source === "bundled" }));
 }
 
-/**
- * 从 PATH 上的 git 反推运行时位置。
- * 必要性（实测）：本机 Git 在 D:/other/Git，不在 Program Files，标准路径扫描全部落空；
- * 而 git 本身在 PATH 上，可由 git --exec-path 推出 <GitRoot>，再找 <GitRoot>/bin/bash.exe。
- */
-export function discoverFromGit(spawn) {
-  const run = spawn || spawnSync;
-  let r;
-  try { r = run("git", ["--exec-path"], { encoding: "utf8", timeout: 15000 }); }
-  catch (e) { return null; }
-  if (!r || r.error || r.status !== 0) return null;
-  const execPath = String(r.stdout || "").trim().replaceAll("/", "\\");
-  if (!execPath) return null;
-  const parts = execPath.split("\\");
-  const idx = parts.lastIndexOf("mingw64");
-  if (idx <= 0) return null;
-  const root = parts.slice(0, idx).join("\\");
-  return {
-    source: "git-on-path",
-    root,
-    why: "PATH 上的 git 指向 " + root + "（非标准安装位置也能发现）",
-    candidates: [join(root, "bin", "bash.exe"), join(root, "usr", "bin", "bash.exe")]
-  };
+const CACHE_TTL_MS = 300000;
+let cache = null;
+export function clearBashRuntimeCache() { cache = null; }
+function fingerprint(path) { try { const s=statSync(path);return path+':'+s.mtimeMs+':'+s.size; } catch { return path+':missing'; } }
+function pathEnv(env) { return Object.entries(env).find(([k])=>k.toLowerCase()==='path')?.[1]||''; }
+function locate(path,env,platform) {
+  if(path.includes('/')||path.includes(String.fromCharCode(92)))return path;
+  for(const dir of pathEnv(env).split(platform==='win32'?';':':').filter(Boolean)){const p=join(dir.replace(/^"|"$/g,''),path);if(existsSync(p))return p;}return path;
 }
-
-export function probeRuntime(path, spawn) {
-  const run = spawn || spawnSync;
-  if (!path) return { ok: false, path: null, reason: "路径为空" };
-  const isBare = !path.includes("/") && !path.includes("\\");
-  if (!isBare && !existsSync(path)) return { ok: false, path, reason: "文件不存在" };
-  let r;
-  try { r = run(path, ["--version"], { encoding: "utf8", timeout: 20000 }); }
-  catch (e) { return { ok: false, path, reason: "启动异常：" + String(e && e.message || e).slice(0, 80) }; }
-  if (r.error) return { ok: false, path, reason: "无法启动：" + String(r.error.message).slice(0, 80) };
-  const first = String(r.stdout || "").split("\n")[0].trim();
-  if (r.status !== 0 || !/bash/i.test(first)) return { ok: false, path, reason: "不是可用的 bash（exit=" + r.status + "）" + (String(r.stderr || "").slice(0, 80) ? "：" + String(r.stderr).slice(0, 80) : "") };
-  return { ok: true, path, version: first };
+async function runProbe(command,args,o,limit) {
+  if(o.signal?.aborted)return{cancelled:true};
+  return new Promise(resolve=>{
+    let child,timer,reapTimer,finished=false,cancelled=false,timedOut=false,output='',error='';
+    const finish=r=>{if(finished)return;finished=true;clearTimeout(timer);clearTimeout(reapTimer);o.signal?.removeEventListener('abort',abort);resolve(r);};
+    const stop=()=>{try{child?.kill('SIGKILL');}catch{}
+      if (!reapTimer && !finished) reapTimer=setTimeout(()=>finish({cancelled,timedOut,cleanupUnconfirmed:true,error:new Error('probe-exit-not-confirmed')}),o.probeReapMs || 2000);};
+    const abort=()=>{cancelled=true;stop();};
+    try {
+      child=(o.spawn||spawn)(command,args,{env:o.env||process.env,cwd:o.cwd,stdio:['ignore','pipe','pipe'],windowsHide:true});
+      if(typeof child?.then==='function'){child.then(r=>finish(o.signal?.aborted?{cancelled:true}:r),e=>finish({error:e}));return;}
+      child.stdout?.on('data',b=>{output=(output+b.toString('utf8')).slice(-8192);});
+      child.stderr?.on('data',b=>{error=(error+b.toString('utf8')).slice(-8192);});
+      child.once('error',e=>finish({error:e}));
+      child.once('close',status=>finish({status,stdout:output,stderr:error,cancelled,timedOut}));
+      o.signal?.addEventListener('abort',abort,{once:true});if(o.signal?.aborted)abort();
+      timer=setTimeout(()=>{timedOut=true;stop();},limit);
+    }catch(e){finish({error:e});}
+  });
 }
-
-/** 解析出可用运行时；全部失败时给出面向用户的修复步骤。 */
-export function resolveBashRuntime(options) {
-  const o = options || {};
-  const candidates = candidateRuntimes(o);
-  const probes = [];
-  for (const c of candidates) {
-    const p = probeRuntime(c.path, o.spawn);
-    probes.push({ ...c, ...p });
-    if (p.ok) return { ok: true, path: p.path, version: p.version, source: c.source, why: c.why, probes };
-  }
-  const fromGit = discoverFromGit(o.spawn);
-  if (fromGit) {
-    for (const p of fromGit.candidates) {
-      const probe = probeRuntime(p, o.spawn);
-      probes.push({ source: fromGit.source, path: p, why: fromGit.why, ...probe });
-      if (probe.ok) return { ok: true, path: probe.path, version: probe.version, source: fromGit.source, why: fromGit.why, probes };
-    }
-  }
-  return {
-    ok: false,
-    path: null,
-    source: null,
-    probes,
-    repair: [
-      "本机没有找到可用的 Bash 运行时（已依次尝试：" + candidates.map((c) => c.source).join(" → ") + "）",
-      "方式一：安装 Git for Windows（含 Git Bash）后重试；安装后无需再配置，插件会自动发现",
-      "方式二：让插件自带运行时：把受控运行时解包到 <插件数据目录>/runtime/（含 usr/bin/bash.exe 与 manifest.json），插件会优先使用它",
-      "方式三：设置环境变量 DSH_BASH_PATH 指向 bash.exe（明确指定则优先使用）"
-    ]
-  };
+export async function probeRuntime(path,spawnFn,options={}) {
+  if(options.signal?.aborted)return{ok:false,cancelled:true,path};
+  if(!path)return{ok:false,path,reason:'empty-path'};
+  if((path.includes('/')||path.includes(String.fromCharCode(92)))&&!existsSync(path))return{ok:false,path,reason:'file-not-found'};
+  const r=await runProbe(path,['--version'],{...options,spawn:spawnFn||options.spawn},20000);
+  if(r.cleanupUnconfirmed)return{ok:false,cancelled:!!r.cancelled,cleanupUnconfirmed:true,path,reason:'probe-exit-not-confirmed'};
+  if(r.cancelled)return{ok:false,cancelled:true,path};
+  const first=String(r.stdout||'').split(String.fromCharCode(10))[0].trim();
+  return r.status===0&&/bash/i.test(first)?{ok:true,path,version:first}:{ok:false,path,reason:r.timedOut?'probe-timeout':String(r.error?.message||r.stderr||'not-bash').slice(0,200)};
+}
+export async function discoverFromGit(spawnFn,options={}) {
+  const r=await runProbe('git',['--exec-path'],{...options,spawn:spawnFn||options.spawn},15000);
+  if(r.cleanupUnconfirmed)return{cleanupUnconfirmed:true};
+  if(r.cancelled)return{cancelled:true};if(r.status!==0)return null;
+  const normalized=String(r.stdout||'').trim().split(String.fromCharCode(92)).join('/');const i=normalized.lastIndexOf('/mingw64/');if(i<0)return null;
+  const root=normalized.slice(0,i);return{source:'git-on-path',root,why:'git --exec-path',candidates:[join(root,'bin','bash.exe'),join(root,'usr','bin','bash.exe')]};
+}
+export async function resolveBashRuntime(options={}) {
+  const started=Date.now(),env=options.env||process.env,platform=options.platform||process.platform;
+  const candidates=candidateRuntimes({...options,env,platform}).map(c=>({...c,path:locate(c.path,env,platform)}));
+  const key=JSON.stringify({platform,candidates,PATH:pathEnv(env)}),prints=candidates.map(c=>fingerprint(c.path));
+  if(options.signal?.aborted)return{ok:false,cancelled:true,repair:['运行时探测已取消'],cacheHit:false};
+  if(cache&&cache.key===key&&Date.now()-cache.at<CACHE_TTL_MS&&JSON.stringify(prints)===JSON.stringify(cache.prints)&&fingerprint(cache.result.path)===cache.selected)return structuredClone({...cache.result,cacheHit:true,probeMs:0});
+  const probes=[];
+  const accept=(r,c)=>{const value={ok:true,path:r.path,version:r.version,source:c.source,why:c.why,probes};cache={key,at:Date.now(),prints,selected:fingerprint(value.path),result:structuredClone(value)};return{...value,cacheHit:false,probeMs:Date.now()-started};};
+  for(const c of candidates){const r=await probeRuntime(c.path,options.spawn,{...options,env});probes.push({...c,...r});if(r.cleanupUnconfirmed)return{ok:false,cleanupUnconfirmed:true,repair:['运行时探测未确认退出，停止后续候选探测；请核对进程收尾。'],probes};if(r.cancelled)return{ok:false,cancelled:true,repair:['运行时探测已取消'],probes};if(r.ok)return accept(r,c);}
+  const git=await discoverFromGit(options.spawn,{...options,env});if(git?.cleanupUnconfirmed)return{ok:false,cleanupUnconfirmed:true,repair:['git探测未确认退出，停止后续探测。'],probes};if(git?.cancelled)return{ok:false,cancelled:true,repair:['运行时探测已取消'],probes};
+  if(git)for(const path of git.candidates){const r=await probeRuntime(path,options.spawn,{...options,env});probes.push({...r,source:git.source});if(r.cleanupUnconfirmed)return{ok:false,cleanupUnconfirmed:true,repair:['运行时探测未确认退出，停止后续候选探测；请核对进程收尾。'],probes};if(r.cancelled)return{ok:false,cancelled:true,repair:['运行时探测已取消'],probes};if(r.ok)return accept(r,git);}
+  return{ok:false,path:null,probes,cacheHit:false,probeMs:Date.now()-started,repair:['没有找到可用 Bash；请安装 Git for Windows，或用 DSH_BASH_PATH 指定运行时。']};
 }
 
 /** 从发布包/自带 bundle 供给运行时：先校验清单，再复制到目标目录。 */

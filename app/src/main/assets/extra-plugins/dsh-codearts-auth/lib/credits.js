@@ -262,10 +262,14 @@ function parseCreditPackage(entry) {
     const unit = readString(entry, 'CapacityUnit') || readString(entry, 'OriginUnit');
     const status = entry.Status;
     const expiredTime = readString(entry, 'ExpiredTime');
-    // 失效判定：Status 显式为已过期，或存在已过去的 ExpiredTime
+    // 扣费截止时间（毫秒）。0 / 缺失 = 服务端未下发，按「未知」处理而非「已过期」。
+    const deductionEndTime = readNumber(entry, 'DeductionEndTime');
+    // 失效判定：Status 显式为已过期，或存在已过去的 ExpiredTime，
+    // 或扣费截止已过（实测有效包的该字段都在未来，故这条只会捞出真正作废的包）。
     const expiredAt = expiredTime.length > 0 ? Date.parse(expiredTime.replace(' ', 'T')) : Number.NaN;
     const active = status !== PACKAGE_STATUS_EXPIRED
-        && !(Number.isFinite(expiredAt) && Date.now() >= expiredAt);
+        && !(Number.isFinite(expiredAt) && Date.now() >= expiredAt)
+        && !(deductionEndTime > 0 && Date.now() >= deductionEndTime);
     return {
         name,
         unit,
@@ -276,6 +280,7 @@ function parseCreditPackage(entry) {
         cycleStartTime: readString(entry, 'CycleStartTime'),
         cycleEndTime: readString(entry, 'CycleEndTime'),
         expiredTime,
+        ...deductionEndTime > 0 ? { deductionEndTime } : {},
     };
 }
 /**

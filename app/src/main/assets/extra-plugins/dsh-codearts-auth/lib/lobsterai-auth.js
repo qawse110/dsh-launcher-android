@@ -17,13 +17,27 @@
  */
 import { Service } from '@deepseek-ai/cordis';
 import { credentialRef } from '@deepseek-ai/dsh-credentials';
-import { LOBSTERAI_REQUEST_TIMEOUT_MS, LobsteraiClientVersionResolver, applyLobsteraiRefresh, isLobsteraiExpired, isLobsteraiRefreshable, lobsteraiAnonymousHeaders, lobsteraiCredentialExpiresAtMs, lobsteraiModelsHeaders, lobsteraiRefreshBody, parseLobsteraiEnvelope, parseLobsteraiTokenPayload, } from './lobsterai.js';
+import { LOBSTERAI_REQUEST_TIMEOUT_MS, LobsteraiClientVersionResolver, applyLobsteraiRefresh, isLobsteraiExpired, isLobsteraiRefreshable, lobsteraiAnonymousHeaders, lobsteraiCredentialExpiresAtMs, lobsteraiDisplayNickname, lobsteraiModelsHeaders, lobsteraiRefreshBody, parseLobsteraiEnvelope, parseLobsteraiTokenPayload, } from './lobsterai.js';
 import { LOBSTERAI_REFRESH_PATH } from './lobsterai.js';
 import { buildLobsteraiModelsUrl, parseLobsteraiModels } from './lobsterai-adapter.js';
 import { LOBSTERAI } from './lobsterai-product.js';
 import { classifyLobsteraiError, isLobsteraiTerminalError } from './lobsterai-errors.js';
 import { exchangeLobsteraiAuthCode, runLobsteraiLoginFlow, startLobsteraiLoginFlow, } from './lobsterai-oauth.js';
 import { RefreshScheduler } from './refresh.js';
+import { refreshAccountWithReconcile, syncAccountExpiry, } from './expiry-sync.js';
+/**
+ * LobsterAI 凭据 → 账号池有效期所需的提取器（`refreshAll` 与按需续期共用一份）。
+ *
+ * ⚠️ `identityOf` 必须是 `access_token`：`AccountPool.findAccountIdByCredential`
+ * 对非 codearts 的 provider 比对的就是这个字段（见其 `identifierKey`），
+ * 传 ref 名会恒匹配失败且**静默无报错**。`LobsteraiCredential` 的字段名
+ * 本就是 `access_token`（`src/lobsterai.ts` 的结构注释即为此说明）。
+ */
+const LOBSTERAI_EXPIRY_ACCESSORS = {
+    expiresAtOf: lobsteraiCredentialExpiresAtMs,
+    refreshableOf: isLobsteraiRefreshable,
+    identityOf: (credential) => credential.access_token ?? '',
+};
 /**
  * LobsterAI 的默认凭据 ref。
  *
@@ -176,9 +190,9 @@ export class LobsteraiAuth extends Service {
             await flowOptions.pool.addAccount({
                 id: flowOptions.accountId,
                 provider: this.product.id,
-                nickname: credential?.nickname !== undefined && credential.nickname.length > 0
-                    ? credential.nickname
-                    : flowOptions.accountId,
+                // ⚠️ 用 `lobsteraiDisplayNickname`：服务端把**手机号本身**当昵称下发，
+                // 且只脱敏到「露末 4 位」，需归一化为末 2 位（用户要求 2026-09-27）。
+                nickname: lobsteraiDisplayNickname(credential, flowOptions.accountId),
                 enabled: true,
                 credentialRef: flowOptions.refName ?? this.credentialRefName,
                 createdAt: Date.now(),
@@ -214,9 +228,8 @@ export class LobsteraiAuth extends Service {
             await options.pool.addAccount({
                 id: options.accountId,
                 provider: this.product.id,
-                nickname: credential.nickname !== undefined && credential.nickname.length > 0
-                    ? credential.nickname
-                    : options.accountId,
+                // 同 `persistLogin`：手机号归一化为只露末 2 位。
+                nickname: lobsteraiDisplayNickname(credential, options.accountId),
                 enabled: true,
                 credentialRef: options.refName ?? this.credentialRefName,
                 createdAt: Date.now(),
@@ -302,8 +315,18 @@ export class LobsteraiAuth extends Service {
      *
      * 同样**不触碰** `refreshTokenInvalid` / `lastRefreshError` / 调度器：
      * 那些状态属于单凭据路径，被多账号操作污染会让 UI 显示错误的失效提示。
+     *
+     * ⚠️ **必须回写账号池的 `expiresAt`**（issue !IKIRTT 的真实缺陷）：
+     * UI 账号卡片的「有效期」读的正是池里的值，而不是凭据里 access_token 的真实
+     * `exp`。早期这里只 `credentials.set`，于是用户点「刷新」后凭据确实续好了、
+     * 界面却**一直显示「已过期」**，且没有任何自救手段（「重测」按钮的 refresh
+     * 是刻意的 no-op）。
+     *
+     * @param pool 账号池；提供时会把新 `expiresAt` / `refreshable` 写回。
+     * @param accountId 账号 id。**调用方已知时请显式传入** ——
+     *   否则只能按凭据内容反查（代价高，且反查会跳过已停用账号）。
      */
-    async refreshAccountCredential(refName) {
+    async refreshAccountCredential(refName, pool, accountId) {
         const ref = credentialRef(refName);
         const resolved = await this.ctx.credentials.resolve(ref);
         if (!resolved)
@@ -316,6 +339,71 @@ export class LobsteraiAuth extends Service {
         }
         const refreshed = await this.refreshCredential(credential);
         await this.ctx.credentials.set(ref, JSON.stringify(refreshed));
+        await syncAccountExpiry({
+            pool,
+            provider: this.product.id,
+            credential: refreshed,
+            accessors: LOBSTERAI_EXPIRY_ACCESSORS,
+            accountId,
+            tag: '[lobsterai]',
+            warn: (message) => this.ctx.logger?.warn?.(message),
+        });
+    }
+    /**
+     * 一次性修复**老账号**的展示名：把手机号掩码归一化为「只露末 2 位」。
+     *
+     * ## 为什么需要它（用户要求 2026-09-27）
+     *
+     * > lobsterai 的用户名字显示的手机号尾号漏出 4 位，现在也改为只漏出 2 位
+     *
+     * ⚠️ 那个 `130****1100` 是**服务端下发的 `user.nickname` 原值**，不是本插件
+     * 截取的（实测四个账号登录响应即为此形态）。故只改代码只影响新登录账号，
+     * 已登录的老账号昵称仍是露 4 位 —— 启动时主动补一次。
+     *
+     * 与 `RaccoonAuth.repairAccountNicknames` / `TraeAuth.repairAccountNicknames`
+     * 同一模式（都是「服务端下发的名字不适合直接展示」）。
+     *
+     * ## 契约
+     *
+     * - **幂等**：`lobsteraiDisplayNickname` 对已归一化的值算出同一结果，
+     *   故不触发写入（只在**确实变化**时落盘）。
+     * - **失败不阻塞**：逐账号 catch，异常只记 warn。
+     * - **纯本地**：不发任何网络请求（掩码只依赖凭据里的昵称）。
+     * - **不误伤真实昵称**：非手机号形态（如 `用户26815487395`）原样保留。
+     *
+     * @returns 被修复的账号 id 列表（供日志）
+     */
+    async repairAccountNicknames(pool) {
+        const repaired = [];
+        let entries;
+        try {
+            entries = await pool.listAccounts(this.product.id);
+        }
+        catch {
+            return repaired;
+        }
+        for (const entry of entries) {
+            try {
+                const resolved = await this.ctx.credentials.resolve(credentialRef(entry.credentialRef));
+                if (!resolved)
+                    continue;
+                const credential = parseCredential(resolved.value);
+                if (credential === undefined)
+                    continue;
+                const target = lobsteraiDisplayNickname(credential, entry.id);
+                // ⚠️ 只在**确实变化**时写账号池：`updateAccount` 是整体 replace，
+                // 每次启动都写会平白落盘一次。
+                if (target !== entry.nickname) {
+                    await pool.updateAccount(entry.id, { nickname: target });
+                    repaired.push(entry.id);
+                }
+            }
+            catch (error) {
+                this.ctx.logger?.warn?.(`[lobsterai] 修复账号 ${entry.id} 的显示名失败（不影响使用）：`
+                    + `${error instanceof Error ? error.message : String(error)}`);
+            }
+        }
+        return repaired;
     }
     /**
      * 对一份凭据执行一次续期并返回新凭据（不触碰存储）。
@@ -373,6 +461,12 @@ export class LobsteraiAuth extends Service {
      * 选号，不该让凭据烂掉 —— 否则用户重新启用时只能重新登录。
      * 详见 `BuddyAuth.refreshAll` 的注释（同一缺陷）。
      * 单账号失败不影响其他账号（与 `BuddyAuth.refreshAll` 同语义）。
+     *
+     * ⚠️ **lead-time 过滤**（issue !IKIRTT）：早先这里是**无条件全量续期** ——
+     * 定时器每 30 分钟就把每个账号的 refresh_token 轮换一次，与「凭据还剩多久」
+     * 无关。现复用单凭据时代 `REFRESH_LEAD_MS` 的语义：**距过期不足 1 小时才刷**。
+     * 跳过的账号仍会做一次**有效期对账**（见 `refreshAccountWithReconcile`），
+     * 因为「不刷」与「不回写池值」正是 UI 假过期的两个来源，必须分开处理。
      */
     async refreshAll(pool) {
         const accounts = await pool.listAccounts(this.product.id);
@@ -391,11 +485,17 @@ export class LobsteraiAuth extends Service {
                     await pool.updateAccount(entry.id, { refreshable: false });
                     continue;
                 }
-                const refreshed = await this.refreshCredential(credential);
-                await this.ctx.credentials.set(ref, JSON.stringify(refreshed));
-                await pool.updateAccount(entry.id, {
-                    expiresAt: lobsteraiCredentialExpiresAtMs(refreshed) ?? undefined,
-                    refreshable: isLobsteraiRefreshable(refreshed),
+                await refreshAccountWithReconcile({
+                    pool,
+                    provider: this.product.id,
+                    tag: '[lobsterai]',
+                    accountId: entry.id,
+                    credential,
+                    accessors: LOBSTERAI_EXPIRY_ACCESSORS,
+                    current: entry,
+                    refresh: (c) => this.refreshCredential(c),
+                    save: (c) => this.ctx.credentials.set(ref, JSON.stringify(c)),
+                    warn: (message) => this.ctx.logger?.warn?.(message),
                 });
             }
             catch (error) {

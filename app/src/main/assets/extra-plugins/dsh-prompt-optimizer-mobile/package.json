@@ -1,8 +1,8 @@
 {
   "name": "dsh-prompt-optimizer-mobile",
-  "version": "0.7.6-dshlauncher.1",
+  "version": "0.8.1-dshlauncher.1",
   "private": true,
-  "description": "提示词优化（dsh-launcher fork）。基于 WestFox-AwA/dsh-prompt-optimizer v0.7.6，由 dsh-launcher-android 维护移动端适配：本部署**默认启用**（仅显式 enabled:false 才关闭）、视口感知面板尺寸、窄屏断点、安全区、触控人体工学。上游原版默认不启用，本 fork 依部署需要翻转该默认值。",
+  "description": "提示词优化（dsh-launcher fork）。基于 WestFox-AwA/dsh-prompt-optimizer v0.8.1-stable，由 dsh-launcher-android 维护移动端适配：本部署**默认启用**（仅显式 enabled:false 才关闭）、视口感知面板尺寸、窄屏断点、安全区、触控人体工学。上游原版默认不启用，本 fork 依部署需要翻转该默认值。详见 FORK.md。",
   "type": "module",
   "main": "./lib/index.js",
   "exports": {
@@ -42,6 +42,7 @@
     "client": {
       "platform": "web",
       "inject": [
+        "react",
         "@deepseek-ai/dsh-client-ui-slots"
       ],
       "external": [

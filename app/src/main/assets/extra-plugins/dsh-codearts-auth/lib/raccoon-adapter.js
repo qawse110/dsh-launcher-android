@@ -18,14 +18,78 @@
  * 2. **`listAllModels()` 必须实现** —— 设置页要显示被关闭的模型及其倍率；
  *    缺了它会退化为裸 id（AGENTS.md 记录的真实缺陷）。
  */
-import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm';
+import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 import { providerCatalogVisible } from './account-pool.js';
-import { settingsNamespaceFor } from './settings-compat.js';
+import { RemoteCatalogGate } from './remote-catalog-gate.js';
 import { isRaccoonExpired } from './raccoon.js';
-import { RACCOON } from './raccoon-product.js';
+import { RACCOON, RACCOON_DEFAULT_EFFORT, RACCOON_EFFORT_NAMES, RACCOON_EFFORT_OFF, RACCOON_EFFORT_ON, RACCOON_REASONING_EFFORTS, } from './raccoon-product.js';
+import { projectRequestImage } from './image-budget.js';
+import { registerAdapterIdempotent, } from './llm-register-compat.js';
 import { collectImages, consumeOpenAiSse, errorDetail, httpErrorCode, isTransportError, serializeMessages, } from './openai-compat.js';
 /** 本适配器注册的 provider 路由名（等价于 `RACCOON.id`）。 */
 export const PROVIDER = 'raccoon';
+/**
+ * 把 DSH 的档位 id 映射成请求体的 `extra_body.thinking` 字段。
+ *
+ * ## 为什么是这个形态（实测确证，别改）
+ *
+ * 唯一**有效**的思考控制通道是 **`extra_body.thinking`**（Anthropic 风格对象），
+ * 服务端报错原文确认其枚举：``expected one of `adaptive`, `enabled`, `disabled` ``。
+ *
+ * 实测（判据为服务端上报的 `reasoning_tokens`）：
+ *
+ * | 请求 | 结果 |
+ * |---|---|
+ * | `extra_body.thinking={type:'disabled'}` | **6/6、8/8 全为 0** → 真关闭 |
+ * | `extra_body.thinking={type:'enabled'}` | 均值 218 ≈ 基线 222 → 与默认等价 |
+ *
+ * ⚠️ **`reasoning_effort` 虽然被服务端接受（8 个枚举值），但实测无效果** ——
+ * 8 轮配对实验里 `max - minimal` 正差 4 次 / 负差 4 次（纯随机），
+ * 且 `none` 不关闭思考（均值 301 vs `disabled` 的 0）。
+ * 故**不用它**表达档位，详见 `raccoon-product.ts` 的常量注释。
+ *
+ * ⚠️ **无效的写法**（都实测过）：`extra_body.enable_thinking`、
+ * 双层 `extra_body.extra_body.*`、把 `thinking` 放**顶层**（不在 `extra_body` 内）、
+ * `thinking.budget_tokens`（仅被格式校验）。
+ *
+ * ## 语义
+ *
+ * - 档位为 `off` → `{ thinking: { type: 'disabled' } }`（真的不产生思考内容）
+ * - 其余（含 `on`）→ `{ thinking: { type: 'enabled' } }`
+ *
+ * ⚠️ **不传档位时返回 `undefined`**（不发该字段），保持服务端默认行为 ——
+ * 实测默认就是开启，故与 `on` 等价，但**少发一个字段**更稳。
+ *
+ * @returns 要写进 `extra_body` 的对象；`undefined` 表示不发该字段。
+ */
+export function raccoonThinkingExtraBody(effort) {
+    if (effort === undefined || effort.length === 0)
+        return undefined;
+    // 只有明确的「关闭」才关；未知档位一律按开启处理（宁可多思考，不可静默关掉
+    // —— 用户看不到思考内容会以为模型坏了）。
+    const type = effort === RACCOON_EFFORT_OFF ? 'disabled' : 'enabled';
+    return { thinking: { type } };
+}
+/**
+ * 该模型在 UI 上可选的思考档位。
+ *
+ * ⚠️ **所有模型都返回同样两档** —— 实测 `extra_body.thinking` 是 **provider 级
+ * 方言**，与模型无关。故不做 per-model 分派（那会是凭空猜测）。
+ *
+ * ⚠️ `defaultEffort` 必须落在 `efforts` 内 —— DSH 会直接拿它发请求，
+ * 给一个不存在的档位会抛 `UNSUPPORTED_REASONING_EFFORT`。
+ */
+export function raccoonReasoningInfo() {
+    const efforts = RACCOON_REASONING_EFFORTS.map((id) => ({
+        id: ReasoningEffortId(id),
+        name: RACCOON_EFFORT_NAMES[id] ?? id,
+    }));
+    // ⚠️ 默认档必须确实在列表里（防御：常量被改乱时不至于抛错）
+    const defaultEffort = RACCOON_REASONING_EFFORTS.includes(RACCOON_DEFAULT_EFFORT)
+        ? ReasoningEffortId(RACCOON_DEFAULT_EFFORT)
+        : ReasoningEffortId(RACCOON_REASONING_EFFORTS[0] ?? RACCOON_EFFORT_ON);
+    return { efforts, defaultEffort };
+}
 /**
  * 只放行**安全正整数**。
  *
@@ -56,6 +120,8 @@ export class RaccoonAdapter extends LlmAdapter {
     fallbackIndex;
     /** 远端模型缓存；未拉取时为 undefined。 */
     remoteModels;
+    /** 目录加载闸门：并发去重 + 失败/空结果冷却（见 `remote-catalog-gate.ts`）。 */
+    catalogGate = new RemoteCatalogGate();
     constructor(options) {
         super();
         this.options = options;
@@ -84,25 +150,31 @@ export class RaccoonAdapter extends LlmAdapter {
         const source = this.remoteModels ?? this.product.fallbackModels.map(fallbackToRemote);
         return source.map((model) => ({ id: model.id, name: model.name }));
     }
-    /** 取（并缓存）远端模型目录；失败时回退兜底表。 */
+    /**
+     * 取远端模型目录；**失败时不把兜底表写进缓存**。
+     *
+     * ⚠ 原实现是 `this.remoteModels = fallback; return fallback` —— 把兜底表当成
+     * 「已加载」记下，于是一次瞬时失败会让该 provider **整个进程生命周期**都只剩
+     * 兜底模型（用户看不到自己的模型，且无从触发重试，只能重启）。
+     * 改为：只缓存**真实远端目录**，兜底表每次现算（纯本地、零成本），
+     * 并用 {@link RemoteCatalogGate} 的冷却挡住「每模型重试一次」的放大。
+     */
     async loadModels() {
         if (this.remoteModels !== undefined)
             return this.remoteModels;
-        if (this.options.fetchRemoteModels !== undefined) {
-            try {
-                const fetched = await this.options.fetchRemoteModels();
-                if (fetched.length > 0) {
-                    this.remoteModels = fetched;
-                    return fetched;
-                }
-            }
-            catch {
-                // 远端失败静默回退兜底表：模型目录是展示信息，不该让整个 provider 报错。
-            }
+        const fetchRemote = this.options.fetchRemoteModels;
+        if (fetchRemote !== undefined) {
+            await this.catalogGate.run(async () => {
+                const fetched = await fetchRemote();
+                if (fetched.length === 0)
+                    return false;
+                this.remoteModels = fetched;
+                return true;
+            });
+            if (this.remoteModels !== undefined)
+                return this.remoteModels;
         }
-        const fallback = this.product.fallbackModels.map(fallbackToRemote);
-        this.remoteModels = fallback;
-        return fallback;
+        return this.product.fallbackModels.map(fallbackToRemote);
     }
     inputModalitiesFor(model) {
         return model?.supportsImage === true ? ['text', 'image'] : ['text'];
@@ -147,6 +219,9 @@ export class RaccoonAdapter extends LlmAdapter {
         const maxTokens = positiveMaxTokens(entry?.maxTokens ?? fallback?.maxTokens);
         if (maxTokens !== undefined)
             resolved.defaultMaxTokens = maxTokens;
+        // 思考档位（两态：深度思考 / 关闭思考）。实测确证见 `raccoonReasoningInfo`。
+        // ⚠️ 所有模型一致 —— `extra_body.thinking` 是 provider 级方言，与模型无关。
+        resolved.reasoning = raccoonReasoningInfo();
         return resolved;
     }
     /**
@@ -182,18 +257,27 @@ export class RaccoonAdapter extends LlmAdapter {
             // 保留**空 Map**（而非降级为 undefined）：图片存在但全部读取失败时，
             // 空 Map 仍会让 userContentParts 产出 [image unavailable] 占位符。
             imageUrls = new Map();
+            const readImage = this.options.readImage;
             for (const [id, ref] of imageRefs) {
-                const image = await this.options.readImage(ref);
+                // ⚠️ 先试**请求版本**：这家网关按请求体字节设限（实测
+                // `HTTP_413: request body exceeds 10MB`），原图直发时两张大截图
+                // 就能把配额吃掉大半。拿不到（老宿主 / 拒绝投影 / 缺尺寸）就回退原图。
+                const projected = await projectRequestImage(ref, {
+                    readImageRequest: this.options.readImageRequest,
+                    pixelBudget: this.product.imagePixelBudget,
+                    maxBytes: this.product.imageMaxBytes,
+                });
+                const image = projected ?? await readImage(ref);
                 if (image === undefined)
                     continue;
                 imageUrls.set(id, `data:${image.mediaType};base64,${Buffer.from(image.data).toString('base64')}`);
             }
         }
         // 1. 取凭据（过期则先续期）
-        let credential = await this.options.resolveCredential();
+        let credential = await this.options.resolveCredential(options.model);
         if (credential === undefined || isRaccoonExpired(credential)) {
             await this.options.refresh();
-            credential = await this.options.resolveCredential();
+            credential = await this.options.resolveCredential(options.model);
         }
         if (credential === undefined || credential.access_token.length === 0) {
             throw new LlmError('raccoon: no usable credential; log in first', 'MISSING_CREDENTIAL');
@@ -208,6 +292,13 @@ export class RaccoonAdapter extends LlmAdapter {
         const wireMessages = options.system !== undefined && options.system.length > 0
             ? [{ role: 'system', content: options.system }, ...messages]
             : messages;
+        /**
+         * 思考档位 → `extra_body` 内容。
+         *
+         * ⚠️ 在 `buildBody` **之外**算一次：`buildBody` 会在重试时被多次调用，
+         * 每次重算虽无害但没必要。
+         */
+        const thinking = raccoonThinkingExtraBody(options.reasoningEffort);
         /** 构造请求体。 */
         const buildBody = () => JSON.stringify({
             model: options.model,
@@ -230,6 +321,9 @@ export class RaccoonAdapter extends LlmAdapter {
                     })),
                 }
                 : {},
+            // 思考档位（开 / 关）。⚠️ **必须在 `extra_body` 内** —— 实测放顶层会被忽略
+            //（连非法值都不报错）。不传档位时不发该字段，保持服务端默认（= 开）。
+            ...thinking !== undefined ? { extra_body: thinking } : {},
         });
         const headers = () => ({
             Accept: 'text/event-stream',
@@ -262,7 +356,7 @@ export class RaccoonAdapter extends LlmAdapter {
         // 401/403 时续期一次并重试（raccoon 有 refresh_token 轮换）。
         if (response.status === 401 || response.status === 403) {
             await this.options.refresh();
-            const refreshed = await this.options.resolveCredential();
+            const refreshed = await this.options.resolveCredential(options.model);
             if (refreshed === undefined || refreshed.access_token.length === 0) {
                 throw new LlmError('raccoon: credential expired and refresh failed', 'AUTH', { status: response.status });
             }
@@ -278,6 +372,7 @@ export class RaccoonAdapter extends LlmAdapter {
             label: 'raccoon',
             firstTokenTimeoutMs: resolveFirstTokenTimeoutMs(),
             chunkTimeoutMs: resolveChunkTimeoutMs(),
+            ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
         });
     }
 }
@@ -300,16 +395,8 @@ function resolveChunkTimeoutMs() {
  */
 export function registerRaccoonLlm(ctx, options) {
     const product = options.product ?? RACCOON;
-    ctx.llm.registerConfigurableProviders([
-        {
-            provider: product.id,
-            displayName: product.displayName,
-            settingsNs: settingsNamespaceFor(ctx, `llm-${product.id}`),
-            settingsPath: [],
-        },
-    ]);
     const adapter = new RaccoonAdapter(options);
-    ctx.llm.registerAdapter([product.id], adapter);
+    registerAdapterIdempotent(ctx.llm, [product.id], adapter);
     return adapter;
 }
 //# sourceMappingURL=raccoon-adapter.js.map

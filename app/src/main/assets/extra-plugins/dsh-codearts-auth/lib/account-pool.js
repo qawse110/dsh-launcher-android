@@ -1,5 +1,6 @@
 import { credentialRef } from '@deepseek-ai/dsh-credentials';
-import { createJetHubStore, sanitizeAccounts, sanitizeDisabledModels } from './jet-hub-store.js';
+import { createJetHubStore, mergeLegacyLoomyLock, sanitizeAccounts, sanitizeDisabledModels, sanitizePermanentLocks } from './jet-hub-store.js';
+import { createPermanentLockStore } from './permanent-lock-store.js';
 // 兼容既有的导入路径：命名空间名与黑名单类型原本定义在本模块。
 export { JET_HUB_NS } from './jet-hub-store.js';
 /**
@@ -43,40 +44,144 @@ export class AccountPool {
      */
     modelCache = {};
     /**
-     * Loomy「锁定永久积分」的**权威进程内副本**（与 {@link cache} 同理）。
+     * 「锁定永久积分」开关表的**权威进程内副本**（与 {@link cache} 同理）。
      *
-     * ⚠️ 这是**全局**开关（不分账号）。三处写入点都必须携带它，
-     * 否则会被整体写入抹掉 —— 与 `disabledModels` 当年踩过的坑同型。
+     * ⚠️ 每个 provider 一项（Loomy / CodeBuddy / WorkBuddy 各自独立），
+     * **只记录已锁定的**（缺键 = 未锁定）。
+     *
+     * ⚠️ 它的落盘位置与账号池**不是同一份文档**：住在
+     * `$DSH_HOME/jet-hub/permanent-locks.json`，因为 state.json 是同机多 profile
+     * 共享的文档，而另一条工作区里的旧版本代码全量重写它时**不会携带自己不认识
+     * 的键** —— 放那儿会被静默抹掉，解锁的后果是真把永久积分烧掉。
+     * 详见 `src/permanent-lock-store.ts` 的文件头。
      */
-    loomyPermanentLockedCache = false;
+    permanentLockCache = {};
+    /**
+     * 「本机 OpenAI 网关」开关的进程内副本。
+     *
+     * 缺键语义是**启用**（与 `jet-hub-store.ts` 的 `sanitizeGatewayEnabled`
+     * 同一方向）：老用户升级后网关行为与升级前完全一致，不会被静默关掉。
+     *
+     * ⚠️ 与 {@link permanentLockCache} 不同，它**不需要**独立文档：丢失本键
+     * 的唯一后果是回到默认启用，用户再关一次即可。
+     */
+    gatewayEnabledCache = true;
     /** 是否已完成首次载入。 */
     loaded = false;
+    /**
+     * 状态文档落盘的**串行链**（见 {@link queueStoreSave}）。
+     *
+     * ⚠ 它必须存在：内层重新读一次快照只能保证「读→改」这半原子，而
+     * `store.save()` 本身是异步的，两个写者的 `save` 可以乱序完成。
+     */
+    storeChain = Promise.resolve();
+    /** 锁定表的独立后端（权威落盘点）。 */
+    lockStore;
     constructor(ctx) {
         this.ctx = ctx;
         this.store = createJetHubStore(ctx);
+        this.lockStore = createPermanentLockStore(ctx);
         if (this.store.kind === 'memory') {
             this.ctx.logger?.warn?.('[jet-hub] 无可用持久化后端，账号列表与模型黑名单仅存在于内存中');
         }
     }
-    /** 首次访问时从后端载入账号列表与黑名单。 */
+    /** 首次访问时从后端载入账号列表、黑名单与锁定表。 */
     ensureLoaded() {
         if (this.loaded)
             return;
         this.loaded = true;
         const state = this.store.load();
-        if (state === undefined)
+        if (state !== undefined) {
+            this.cache = state.accounts;
+            // 黑名单是后来才加入的字段：老文档里没有它，缺失时保持空表
+            // （等价于"全部模型默认打开"），而不是报错或让整次载入失败。
+            this.modelCache = state.disabledModels;
+            // 网关开关同理：老文档没有该键 → 保持默认启用。
+            this.gatewayEnabledCache = state.gatewayEnabled !== false;
+        }
+        this.loadLocks(state);
+    }
+    /**
+     * 载入锁定表：独立文档是权威；它**不存在**时才从 state.json 的镜像字段迁移。
+     *
+     * ⚠️ 迁移判据必须是「文档不存在」而不是「表里没有某键」：表里的缺键语义是
+     * 「用户明确解锁了」，此时若还回看镜像字段那个陈旧的 `true`，就会出现
+     * **解不掉的开关** —— 比丢状态更难排查。
+     *
+     * ⚠️ 迁移出的内容立即固化到独立文档：否则每次冷启动都要重新读镜像，
+     * 而镜像随时可能被另一条工作区的旧代码改回旧值。
+     */
+    loadLocks(state) {
+        const read = this.lockStore.load();
+        if (read.exists) {
+            this.permanentLockCache = read.locks;
             return;
-        this.cache = state.accounts;
-        // 黑名单是后来才加入的字段：老文档里没有它，缺失时保持空表
-        // （等价于"全部模型默认打开"），而不是报错或让整次载入失败。
-        this.modelCache = state.disabledModels;
-        // 同理：锁定开关也是后加的字段，缺失即视为「解锁」（既有行为）。
-        this.loomyPermanentLockedCache = state.loomyPermanentLocked === true;
+        }
+        this.permanentLockCache = mergeLegacyLoomyLock({}, state?.loomyPermanentLocked);
+        if (Object.keys(this.permanentLockCache).length > 0) {
+            // 冷启动路径上的尽力而为：失败只意味着本次进程内生效，下一次仍会重新迁移。
+            void this.persistLocks().catch(error => {
+                this.ctx.logger?.warn?.(`[jet-hub] 锁定状态迁移未能落盘: ${String(error)}`);
+            });
+        }
     }
     /** 读取账号列表（进程内权威副本）。 */
     readAccounts() {
         this.ensureLoaded();
         return this.cache;
+    }
+    /**
+     * 串行化状态文档的落盘，并在**轮到本次时**重新取一次快照。
+     *
+     * ## 为什么 `removeAccount` 里的重读不够（真实缺陷，审查发现）
+     *
+     * `await this.writeAccounts(this.readAccounts().filter(...))` 只保证了
+     * 「读 → 改」之间没有 `await`（内存那半确实原子），但
+     * {@link writeAccounts} 内部的 `await this.store.save(...)` 是**异步**的
+     * （`SettingsStore.save` → `await this.scope.replace(...)`）。两个写者各自的
+     * `save` 可以**乱序完成**：后完成者带着它更早的快照覆盖磁盘 ⇒ 磁盘与
+     * `this.cache` 分叉。实测形态（探针复现真实 IO 交错）：
+     *
+     * - 并发 `removeAccount('a')` / `removeAccount('b')`（先发起的后完成）：
+     *   `cache=["keep"]` 而 `disk=["b","keep"]` ⇒ **已删除的账号在磁盘上复活**，
+     *   下次进程启动它又回来；
+     * - `removeAccount('victim')` 与 `addAccount(added)` 交错：
+     *   `cache=["added","keep"]` 而 `disk=["keep"]` ⇒ **新增账号被静默丢失**。
+     *
+     * ⚠ 仅 `SettingsStore` 这类**异步** `replace` 后端中招；`FileStore.save` 是
+     * 同步的 `writeFileSync` + `renameSync`（见 `src/jet-hub-store.ts`），整段
+     * RMW 本来就原子、免疫此竞态。故不能靠「换个后端」绕过，只能在
+     * `AccountPool` 这一层把写排队。
+     *
+     * ## 做法
+     *
+     * 把本次写挂到 {@link storeChain} 尾部，**在轮到它执行时**才从进程内权威副本
+     * 取快照，于是「取快照」与「写磁盘」之间隔着前面所有已排队的写。磁盘上因此
+     * 永远是「最后一次排队的写」的内容，与 `this.cache` / `this.modelCache` 收敛。
+     *
+     * ⚠ 三条数据**必须取自同一时刻**：账号、黑名单、锁定镜像字段共用一次快照，
+     * 否则会出现「同一份文档里两个字段自相矛盾」（与 {@link lockFields} 的约定一致）。
+     *
+     * ⚠ 失败**照常向调用方抛出**（与改造前的 `writeAccounts` 一致：登录成功后落盘
+     * 失败必须让 `account.create` 报错，不能静默假装成功）。同时用一条
+     * `.catch()` 派生量更新 {@link storeChain}，让**链本身不被一次失败打断**
+     * ——否则后续所有写都会跟着拒绝，账号池进入永不落盘状态。
+     */
+    queueStoreSave() {
+        if (this.store.kind === 'memory')
+            return Promise.resolve();
+        const next = this.storeChain.then(async () => {
+            await this.store.save({
+                accounts: this.cache,
+                disabledModels: this.modelCache,
+                ...this.lockFields(),
+                // ⚠️ 必须与账号、黑名单取自**同一时刻**的快照（见本方法的注释）：
+                // 分两次快照会让同一份文档里的字段互相矛盾。
+                gatewayEnabled: this.gatewayEnabledCache,
+            });
+        });
+        this.storeChain = next.catch(() => { });
+        return next;
     }
     /**
      * 持久化账号列表（同时更新进程内权威副本）。
@@ -91,11 +196,7 @@ export class AccountPool {
             this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，账号变更未落盘');
             return;
         }
-        await this.store.save({
-            accounts,
-            disabledModels: this.modelCache,
-            loomyPermanentLocked: this.loomyPermanentLockedCache,
-        });
+        await this.queueStoreSave();
     }
     /**
      * 读取某 provider 的模型黑名单（被关闭的模型 id 集合）。
@@ -120,6 +221,36 @@ export class AccountPool {
     listDisabledModels(provider) {
         this.ensureLoaded();
         return { ...(this.modelCache[provider] ?? {}) };
+    }
+    /**
+     * 「本机 OpenAI 网关」当前是否启用。
+     *
+     * 缺键语义为**启用**（老用户升级后行为不变），见
+     * {@link gatewayEnabledCache}。
+     */
+    gatewayEnabled() {
+        this.ensureLoaded();
+        return this.gatewayEnabledCache;
+    }
+    /**
+     * 打开/关闭本机 OpenAI 网关并落盘。
+     *
+     * ⚠️ 这里**只改状态**，不负责启停 HTTP server —— 真正的启停由
+     * `src/openai-gateway/runtime.ts` 在调用方做完持久化后接手。两者分开是为了
+     * 让「存开关」与「跑进程」各自可单测，且启停失败不会把已写入的开关回滚成
+     * 看似没生效的样子。
+     */
+    async setGatewayEnabled(enabled) {
+        this.ensureLoaded();
+        if (this.gatewayEnabledCache === enabled)
+            return;
+        this.gatewayEnabledCache = enabled;
+        this.loaded = true;
+        if (this.store.kind === 'memory') {
+            this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，网关开关仅本次会话有效');
+            return;
+        }
+        await this.queueStoreSave();
     }
     /**
      * 打开/关闭某个模型。
@@ -168,6 +299,104 @@ export class AccountPool {
         await this.writeModels(next);
     }
     /**
+     * 批量**打开**一批模型（Jet Hub 模型列表里**按分组**的「本组全开」）。
+     *
+     * ## 与 {@link clearDisabledModels} 的区别是**范围**（勿混）
+     *
+     * 后者清空该 provider 的**全部**键，并刻意顺带清掉「已下线模型」的历史死键；
+     * 本方法**只删传入的 id**。分组开关必须用本方法 —— 用「清空」会把用户特意
+     * 关着的其它组一起打开（那正是分组开关要避免的事）。
+     *
+     * ⚠️ **无实际变更不落盘**：传进来的 id 若本来就不在黑名单里（例如该组已经
+     * 全开），删不掉任何键，此时不该产生一次文档重写与目录广播 ——
+     * 与 {@link setModelsDisabled} 的「空列表不落盘」是同一条精神。
+     */
+    async clearModelsDisabled(provider, modelIds) {
+        if (modelIds.length === 0)
+            return;
+        // 同 setModelsDisabled：写路径必须自己保证已载入，否则会拿未载入的空表
+        // 去判「有没有变更」，进而漏掉磁盘上真实存在的关闭项。
+        this.ensureLoaded();
+        const perProvider = this.modelCache[provider];
+        if (perProvider === undefined)
+            return;
+        const nextPerProvider = { ...perProvider };
+        let changed = false;
+        for (const id of modelIds) {
+            if (nextPerProvider[id] === true) {
+                delete nextPerProvider[id];
+                changed = true;
+            }
+        }
+        if (!changed)
+            return;
+        const next = { ...this.modelCache };
+        // 与 setModelDisabled 同约定：该 provider 一个关闭项都不剩时删掉整个键，
+        // 配置文件不随开关操作膨胀。
+        if (Object.keys(nextPerProvider).length === 0)
+            delete next[provider];
+        else
+            next[provider] = nextPerProvider;
+        await this.writeModels(next);
+    }
+    /**
+     * 批量启用/停用某 provider 的**全部**账号（Jet Hub 左侧供应商一键开关）。
+     *
+     * ## 为什么需要批量方法
+     *
+     * 供应商级开关的语义是「关闭该供应商」= 关掉它的全部模型（黑名单）+
+     * 停用它的全部账号。前者复用 {@link setModelsDisabled}，后者没有现成路径 ——
+     * 逐账号调 {@link updateAccount} 会写 N 次完整文档（且每次都可能与其它
+     * provider 的改动互相覆盖），故这里一次落盘。
+     *
+     * ## 与「账号级开关」的区别（勿混）
+     *
+     * 账号级开关（账号卡片上的「停用/启用」）只动**单个**账号，且带
+     * 「是否连带关闭该 provider 模型」的询问（见前端 `toggleAccount`）。
+     * 本方法只动 `enabled`，**不碰模型黑名单**、不做任何询问 ——
+     * 模型那侧由调用方（`provider.setEnabled` 端点）按固定顺序显式处理。
+     *
+     * ## 语义要点
+     *
+     * - **只改本 provider 的账号**：账号存在一个全局数组里（各 provider 混排），
+     *   与 {@link reorderAccounts} 的隔离约定一致，绝不波及其它 provider。
+     * - **幂等且无变更不落盘**：全部已是目标状态时直接返回 0，不产生无意义的
+     *   文档重写（与 {@link setModelsDisabled} 的「空列表不落盘」同精神）。
+     * - ⚠️ **返回「实际变更数」而非「命中数」**：调用方用它给用户提示
+     *   （如「已停用 2 个账号」）。若返回命中数，全部本就停用时也会报「已停用 2 个」，
+     *   用户会以为发生了他没预料到的改动。
+     *
+     * @param provider - provider id（`this.product.id`，不要写死字面量）
+     * @param enabled - 目标状态：true 启用 / false 停用
+     * @returns 实际被改变的账号数
+     */
+    async setAccountsEnabled(provider, enabled) {
+        // ⚠️ 必须先确保已载入：本类只在**读**方法里调 `ensureLoaded()`，若首次访问
+        // 就是写操作，`this.cache` 还是初始空数组 —— 这里虽然会按 provider 过滤后
+        // 才写，但 `writeAccounts` 是**整体替换**，未载入时写回等于把磁盘上其它
+        // provider 的账号全部抹掉（与 setModelsDisabled 的教训同型，后果更严重）。
+        this.ensureLoaded();
+        const accounts = this.cache;
+        let changed = 0;
+        const next = accounts.map((entry) => {
+            if (entry.provider !== provider)
+                return entry;
+            // 只把「显式 boolean」与目标比较：老文档里 enabled 可能缺失，
+            // 缺失语义等同启用（与适配器 `enabled !== false` 的判定保持一致）。
+            const current = entry.enabled !== false;
+            if (current === enabled)
+                return entry;
+            changed++;
+            return { ...entry, enabled };
+        });
+        // 无实际变更不落盘：避免一次「没有任何改动」的开关操作产生文档重写。
+        if (changed === 0)
+            return 0;
+        await this.writeAccounts(next);
+        this.ctx.logger?.info?.(`[jet-hub] 已${enabled ? '启用' : '停用'} ${provider} 的 ${changed} 个账号`);
+        return changed;
+    }
+    /**
      * 清空某 provider 的全部关闭项（Jet Hub 模型列表的「打开全部」）。
      *
      * ⚠️ **刻意不看模型目录**：直接删掉该 provider 在黑名单里的**全部**键，
@@ -195,41 +424,93 @@ export class AccountPool {
             this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，模型黑名单变更未落盘');
             return;
         }
-        // 与 writeAccounts 对称：整体写入必须携带账号列表，否则会被清空。
-        await this.store.save({
-            accounts: this.cache,
-            disabledModels,
-            loomyPermanentLocked: this.loomyPermanentLockedCache,
-        });
+        // 与 writeAccounts 对称：整体写入必须携带账号列表，否则会被清空 ——
+        // 快照由 queueStoreSave 在轮到本次时统一取（三份数据同源）。
+        await this.queueStoreSave();
     }
     /**
-     * Loomy「锁定永久积分」是否开启。
+     * 状态文档里那份**镜像字段**（`loomyPermanentLocked`）。
      *
-     * 锁定后选号**只允许消耗今日赠送额度**，永久积分不参与 ——
-     * 只剩永久积分的账号在锁定期间等同于不可用（用户语义）。
+     * ⚠️ 它只是镜像，权威表在独立文档（见 {@link persistLocks}）。仍继续同源写出
+     * 有两个理由：① 同机其它 profile 里的**旧版本代码**只认这个字段（它读它、
+     * 也原样写回它），保持一致才能让那一侧的 Loomy 面板显示正确的锁定态；
+     * ② 回退到老版本时用户不会看到「锁定悄悄失效」。
+     * 二者**取自同一次快照**，于是「同一份状态里两个字段自相矛盾」这种隐性分歧
+     * 从结构上就不可能出现。
      */
-    loomyPermanentLocked() {
-        this.ensureLoaded();
-        return this.loomyPermanentLockedCache;
+    lockFields() {
+        return { loomyPermanentLocked: this.permanentLockCache.loomy === true };
     }
     /**
-     * 设置 Loomy「锁定永久积分」开关（持久化）。
+     * 某 provider 的「锁定永久积分」是否开启。
      *
-     * ⚠️ **必须连同账号与黑名单一起写回**：两种后端都是整体写入，
-     * 只写本字段会把同一文档里的另外两份数据抹掉。
+     * 锁定后选号**只允许消耗会近期作废的积分**，永久积分不参与 ——
+     * 只剩永久积分的账号在锁定期间等同于不可用（用户语义：「没有临时积分后
+     * 找可用账号就是没有可用账号」）。
+     *
+     * ⚠️ 「什么算永久积分」各 provider 不同（Loomy 看服务端给的每日池；两个 buddy
+     * 看资源包的扣费截止距今是否满 15 天），但**开关本身是同一件事**，故共用本表。
      */
-    async setLoomyPermanentLocked(locked) {
+    permanentLocked(provider) {
         this.ensureLoaded();
-        this.loomyPermanentLockedCache = locked;
-        if (this.store.kind === 'memory') {
-            this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，Loomy 永久积分锁定未落盘');
+        return this.permanentLockCache[provider] === true;
+    }
+    /**
+     * 设置某 provider 的「锁定永久积分」开关（持久化）。
+     *
+     * ⚠️ 解锁时**删除该键**而不是写 `false`（与模型黑名单同款约定）：表里只留
+     * 真正处于锁定态的 provider，`permanentLocked` 的判据因此始终是
+     * 「键存在且为 true 即锁定」。
+     */
+    async setPermanentLocked(provider, locked) {
+        if (provider.length === 0)
             return;
+        this.ensureLoaded();
+        const next = { ...this.permanentLockCache };
+        if (locked)
+            next[provider] = true;
+        else
+            delete next[provider];
+        this.permanentLockCache = next;
+        await this.persistLocks();
+    }
+    /**
+     * 落盘锁定表：先写**权威**（独立文档），再同步**镜像**（state.json）。
+     *
+     * ⚠️ 顺序与容错都是有意的：
+     * - 权威先落 —— 独立文档才是本 profile 选号的依据；镜像写失败只让另一条
+     *   工作区的面板显示旧值，不会让我们**误烧用户的永久积分**；
+     * - 镜像失败只 warn，不向上抛 —— 否则一次 settings 后端抖动会让面板上的
+     *   「锁定」按钮报错，而实际开关已经生效。
+     *
+     * 写镜像沿用「读 → 改 → 整体写回」的既有约定：必须连同账号与黑名单一起带，
+     * 否则那份文档里的另外两份数据会被抹掉。
+     */
+    async persistLocks() {
+        if (this.lockStore.kind === 'memory') {
+            this.ctx.logger?.warn?.('[jet-hub] 无法定位 DSH home，永久积分锁定仅存在于内存中');
         }
-        await this.store.save({
-            accounts: this.cache,
-            disabledModels: this.modelCache,
-            loomyPermanentLocked: locked,
+        else {
+            await this.lockStore.save({ ...this.permanentLockCache });
+        }
+        if (this.store.kind === 'memory')
+            return;
+        // 走同一条写队列，避免与账号/黑名单的写乱序覆盖（见 {@link queueStoreSave}）。
+        // ⚠ 这里**必须吞掉**异常（与改造前一致）：镜像写失败只让另一条工作区的面板
+        // 显示旧值，不该让面板上的「锁定」按钮报错 —— 权威文档已经落好了。
+        await this.queueStoreSave().catch(error => {
+            this.ctx.logger?.warn?.(`[jet-hub] 锁定镜像字段写入失败（独立文档已保存，不影响本侧选号）: ${String(error)}`);
         });
+    }
+    /** 锁定表的当前快照（备份导出用；权威来自独立文档）。 */
+    permanentLocksSnapshot() {
+        this.ensureLoaded();
+        return { ...this.permanentLockCache };
+    }
+    /** 全部处于锁定态的 provider（供设置页一次性读取）。 */
+    listPermanentLocked() {
+        this.ensureLoaded();
+        return Object.keys(this.permanentLockCache).filter(p => this.permanentLockCache[p] === true);
     }
     /** 列出某个 provider 的所有账号（含状态信息） */
     async listAccounts(provider) {
@@ -309,15 +590,19 @@ export class AccountPool {
     }
     /** 删除账号（同时清理凭据） */
     async removeAccount(id) {
-        const accounts = this.readAccounts();
-        const entry = accounts.find(a => a.id === id);
+        const entry = this.readAccounts().find(a => a.id === id);
         if (!entry)
             return;
         try {
             await this.ctx.credentials.unset(credentialRef(entry.credentialRef));
         }
         catch { /* 凭据可能已被删除 */ }
-        await this.writeAccounts(accounts.filter(a => a.id !== id));
+        // ⚠ **必须重新读一次**（真实缺陷，审查发现）：`credentials.unset` 会挂起若干
+        // 微任务/IO，期间并发的 `addAccount` 已经把新条目写进 `this.cache` 与磁盘。
+        // 若此时拿 `await` **之前**的快照做 filter 再整体写回，那个新账号会被静默丢失
+        // —— 而 `account.create`（登录成功即 addAccount）与 `account.delete` 天然可并发。
+        // 重新读之后到 `writeAccounts` 之间没有 `await`，因而这一段是原子的。
+        await this.writeAccounts(this.readAccounts().filter(a => a.id !== id));
     }
     /**
      * 重排某 provider 下账号的顺序（Jet Hub 拖拽排序）。
@@ -418,6 +703,46 @@ export class AccountPool {
         catch {
             return undefined;
         }
+    }
+    /**
+     * 按凭据里的**任意身份字段**查找同 provider 的已有账号。
+     *
+     * ## 与 {@link findAccountIdByCredential} 的区别
+     *
+     * 那个是**限流记录归属**专用，写死了「codearts 用 access_key_id、
+     * 其余用 access_token」两套字段名，且**只看已启用账号**。
+     * 本方法是**通用去重**用：调用方给字段名与值，且**不看 `enabled`** ——
+     * 停用的账号同样占着一个条目的位置，重复添加它仍是重复。
+     *
+     * ## 为什么必须容忍「字段缺失」
+     *
+     * 早期登录的凭据里可能**没有**该字段（例如 zcode 的 `user_id` 是
+     * 2026-10-02 才补上的）。此时**跳过该条目**（视为「无法判断」），
+     * 而不是把它当成「不匹配」或直接报错 —— 前者会漏判，
+     * 后者会让老用户根本添加不了账号。
+     *
+     * @param provider - provider id（如 `zcode`）。
+     * @param field - 凭据里用作身份判据的字段名（如 `user_id`）。
+     * @param identity - 要比对的值（空串直接返回 `''`，调用方据空串放弃去重）。
+     * @returns 匹配到的账号 id；无匹配返回空串。
+     */
+    async findAccountIdByIdentityField(provider, field, identity) {
+        if (identity.length === 0)
+            return '';
+        for (const entry of this.readAccounts()) {
+            if (entry.provider !== provider)
+                continue;
+            const resolved = await this.resolveCredentialByRef(entry.credentialRef);
+            if (resolved === undefined)
+                continue;
+            const value = resolved[field];
+            // ⚠ 缺失该字段 ⇒ 无法判断，**跳过**（不是「不匹配」）。
+            if (typeof value !== 'string' || value.length === 0)
+                continue;
+            if (value === identity)
+                return entry.id;
+        }
+        return '';
     }
     /** 按 id 查找账号条目（含已停用账号）。 */
     findAccount(id) {
@@ -670,11 +995,76 @@ export class AccountPool {
         return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
     }
     /**
-     * 读取当前完整状态快照（账号列表 + 模型黑名单）。
+     * 设置/清除某 opencode 账号的出口代理。
+     *
+     * ⚠️ **空串是合法输入**（用户显式清除代理 → 回到「与其它无代理账号共享
+     * 本机出口」），故这里**不能**用 `if (!proxy) return` 早退，否则「清除」
+     * 按钮点了会静默无效。清除时**删键**而不是写空串，避免下游把空串误当成
+     * 「配了一个空地址」。
+     *
+     * 与 `updateModelRateLimit` 同款：在**最新快照**上做局部合并后整体写回，
+     * 避免与并发的账号操作互相覆盖。
+     */
+    async setOpencodeProxy(accountId, proxy) {
+        const accounts = this.readAccounts();
+        const idx = accounts.findIndex(a => a.id === accountId);
+        if (idx === -1) {
+            this.ctx.logger?.warn?.(`[jet-hub] setOpencodeProxy: 账号 ${accountId} 不在账号列表中`);
+            return;
+        }
+        const next = [...accounts];
+        const entry = { ...next[idx] };
+        if (proxy.trim().length === 0)
+            delete entry.opencodeProxy;
+        else
+            entry.opencodeProxy = proxy;
+        next[idx] = entry;
+        await this.writeAccounts(next);
+        this.ctx.logger?.info?.(`[jet-hub] 账号 ${accountId} 代理 → ${proxy.trim().length === 0 ? '直连' : proxy}`);
+    }
+    /** 读取某 opencode 账号的代理（未设置时为空串）。 */
+    opencodeProxyFor(accountId) {
+        const entry = this.readAccounts().find(a => a.id === accountId);
+        return entry?.opencodeProxy ?? '';
+    }
+    /**
+     * 记录 opencode 指纹轮换代次。
+     *
+     * ⚠️ 只接受**比现值更大**的代次：乱序/重复回调把代次写回小值会让用户
+     * 以为已轮换、实际指纹没换（TRAE 同款判据，见 `updateTraeCheckinDeviceGeneration`）。
+     */
+    async updateOpencodeFingerprintGeneration(accountId, generation) {
+        if (!Number.isFinite(generation) || generation <= 0)
+            return;
+        const accounts = this.readAccounts();
+        const idx = accounts.findIndex(a => a.id === accountId);
+        if (idx === -1) {
+            this.ctx.logger?.warn?.(`[jet-hub] updateOpencodeFingerprintGeneration: 账号 ${accountId} 不在账号列表中`);
+            return;
+        }
+        const current = accounts[idx].opencodeFingerprintGeneration ?? 0;
+        if (generation <= current)
+            return;
+        const next = [...accounts];
+        next[idx] = { ...next[idx], opencodeFingerprintGeneration: generation };
+        await this.writeAccounts(next);
+        this.ctx.logger?.info?.(`[jet-hub] 账号 ${accountId} 指纹代次 → ${generation}`);
+    }
+    /** 读取 opencode 指纹代次（未设置时为 0）。 */
+    opencodeFingerprintGenerationFor(accountId) {
+        const entry = this.readAccounts().find(a => a.id === accountId);
+        const value = entry?.opencodeFingerprintGeneration;
+        return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
+    }
+    /**
+     * 读取当前完整状态快照（账号列表 + 模型黑名单 + Loomy 镜像字段）。
      *
      * 供备份导出使用：返回的副本与进程内权威副本解耦，调用方修改返回值
      * 不会污染池的运行时状态。`disabledModels` 是嵌套结构，必须深拷贝
      * （浅拷贝会让内层 provider 表仍共享引用）。
+     *
+     * ⚠️ 这里**不含**锁定表本体（它住在独立文档里），备份导出要走
+     * {@link permanentLocksSnapshot}。
      */
     getStateSnapshot() {
         this.ensureLoaded();
@@ -685,7 +1075,7 @@ export class AccountPool {
         return {
             accounts: [...this.cache],
             disabledModels,
-            loomyPermanentLocked: this.loomyPermanentLockedCache,
+            ...this.lockFields(),
         };
     }
     /**
@@ -700,25 +1090,20 @@ export class AccountPool {
      * 账号条目与显式 `true` 的黑名单项，坏条目直接丢弃而不是写进池里
      * 反复触发选号失败。
      */
-    async replaceAll(accounts, disabledModels, loomyPermanentLocked) {
+    async replaceAll(accounts, disabledModels, permanentLocks) {
         const next = sanitizeAccounts(accounts);
         this.cache = next;
         this.modelCache = sanitizeDisabledModels(disabledModels);
         // 备份文件可能来自不含该字段的旧版本：`undefined` 时**保持当前值**，
-        // 而不是重置为 false —— 否则导入一份老备份会静默解锁用户的永久积分。
-        if (loomyPermanentLocked !== undefined) {
-            this.loomyPermanentLockedCache = loomyPermanentLocked === true;
+        // 而不是重置为空表 —— 否则导入一份老备份会静默解锁用户的永久积分。
+        // 给出表时**整体替换**（备份就是完整状态快照），并同样过滤脏值。
+        if (permanentLocks !== undefined) {
+            this.permanentLockCache = sanitizePermanentLocks(permanentLocks);
         }
         this.loaded = true;
-        if (this.store.kind === 'memory') {
-            this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，备份导入仅存在于内存中');
-            return;
-        }
-        await this.store.save({
-            accounts: next,
-            disabledModels: this.modelCache,
-            loomyPermanentLocked: this.loomyPermanentLockedCache,
-        });
+        // 一次落盘三件事：锁定表进**独立文档**，账号与黑名单进 state.json，
+        // 同时把 Loomy 的镜像字段同步过去（persistLocks 内部就是这套顺序）。
+        await this.persistLocks();
     }
 }
 /**
