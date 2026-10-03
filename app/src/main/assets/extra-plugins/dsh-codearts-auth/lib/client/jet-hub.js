@@ -678,7 +678,161 @@ var STYLES = `
 .dim-jh-badgeFail { font-size: 10px; line-height: 14px; color: var(--dsw-alias-state-error-primary); }
 .dim-jh-badgeFoot { font-size: 10px; line-height: 14px; color: var(--dsw-alias-label-tertiary); }
 
+
+/* ══════════════════════════════════════════════════════════════════════
+   dsh-launcher 移动端适配（新增层，本文件唯一一段本地样式扩展）
+   ──────────────────────────────────────────────────────────────────────
+   背景：本插件的配置界面在 Android WebView 窄屏（360 CSS px）下按桌面尺度
+   排布会出问题。适配层用真机 DOM 度量逐轮驱动，非静态推断。
+
+   实测环境：Sharp 803SH / Android 11 / 1080x2280 / density 480 => DPR 3
+            => CSS 视口 360 x 686～760（验收要求的 360-420 区间下限，最严苛）
+
+   桌面原状与窄屏故障：
+     1) .dim-jh-layout 是 flex 两栏 + .dim-jh-rail 固定 228px，360px 下右侧
+        只剩约 130px，内容被挤到溢出。
+     2) .dim-jh-accountActions 是 flex-wrap: nowrap，行内 5 个按钮必然横向溢出。
+     3) .dim-jh-btn 高约 26px、.dim-jh-iconBtn 宽 26px，低于触控可用下限。
+     4) .dim-jh-header / .dim-jh-panel 的 padding 按桌面给（24px），窄屏浪费。
+     5) 无任何安全区处理，刘海与底部手势条会盖住页头/底部操作。
+
+   真机度量驱动发现的两个隐藏坑（仅看代码看不出来）：
+     A) flex 子项默认 min-width: auto —— .dim-jh-rail 虽是 overflow-x: auto 的
+        横向条，却不肯收缩，把 .dim-jh-layout 与 .dim-jh-page 整体撑宽
+        （实测 page scrollWidth=393 vs clientWidth=320，溢出 73px）。
+        同理 .dim-jh-brand（flex 列 + brandDesc 的 nowrap）撑破 .dim-jh-header。
+        ⇒ 必须给这些 flex 子项显式 min-width: 0。
+     B) 只给 .dim-jh-page 加 padding 时计算值仍为 0px（被既有布局吃掉），
+        ⇒ 用选择器双写 .dim-jh-page.dim-jh-page 提升特异性。
+
+   ⚠️ 本文件整体是一个 JS 模板字符串 —— 本段注释里**不能出现反引号**，
+      否则会提前终止字符串（源码上方已记过这次构建失败的成因）。
+   ⚠️ 本段整体放在样式表**末尾**：靠后的规则在同等特异性下覆盖前面的写法。
+   ══════════════════════════════════════════════════════════════════════ */
+
+
+/* ② 中等窄屏（<=720）：收紧桌面尺度的留白，并抬触控目标到 40px */
+@media (max-width: 720px) {
+  .dim-jh-header { padding-top: 12px; padding-bottom: 12px; gap: 8px; }
+  .dim-jh-panel { padding: 14px; }
+  .dim-jh-brandName { font-size: 16px; }
+  .dim-jh-brandDesc { font-size: 12px; }
+  .dim-jh-btn { min-height: 40px; padding-top: 8px; padding-bottom: 8px; }
+  .dim-jh-iconBtn { min-width: 40px; min-height: 40px; }
+}
+
+/* ③ 手机竖屏（<=560）：两栏改上下堆叠 —— 本适配的核心一条 */
+@media (max-width: 560px) {
+  .dim-jh-page { max-width: 100%; width: 100%; overflow-x: hidden; }
+  .dim-jh-layout { flex-direction: column; overflow: visible; min-width: 0; max-width: 100%; width: 100%; }
+
+  /* 左侧导航成横向可滚 tab 条：固定高度、横向可滑、不换行 */
+  .dim-jh-rail {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    box-sizing: border-box;
+    flex: none;
+    display: flex;
+    flex-direction: row;
+    flex-wrap: nowrap;
+    align-items: stretch;
+    gap: 6px;
+    padding: 6px 8px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    border-right: 0;
+    border-bottom: 1px solid var(--dsw-alias-border-default, #e5e5e5);
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .dim-jh-rail::-webkit-scrollbar { width: 0; height: 0; display: none; }
+
+  /* rail 内的分组在横向模式下不再各自成列 */
+  .dim-jh-railGroup { display: flex; flex-direction: row; flex-wrap: nowrap; gap: 6px; }
+  .dim-jh-railGroup + .dim-jh-railGroup { margin-top: 0; }
+  /* 分组小标题在横向 tab 条里没有位置（它原本是纵向列表的分隔） */
+  .dim-jh-railGroupTitle { display: none; }
+
+  /* provider 按钮：压成「图标 + 标签」的紧凑 tab，且不被压缩 */
+  .dim-jh-provider {
+    width: auto;
+    flex: 0 0 auto;
+    min-width: 0;
+    min-height: 40px;
+    grid-template-columns: 22px minmax(0, 1fr);
+    gap: 6px;
+    padding: 6px 10px;
+    white-space: nowrap;
+  }
+  .dim-jh-providerIcon { width: 22px; height: 22px; }
+  .dim-jh-providerLabel { white-space: nowrap; }
+
+  /* 面板占满整宽，杜绝溢出 */
+  .dim-jh-panel {
+    min-width: 0;
+    width: 100%;
+    max-width: 100%;
+    box-sizing: border-box;
+    padding: 12px;
+    overflow-x: hidden;
+  }
+
+  /* 页头：brand 允许收缩（否则 nowrap 的副标题撑破容器），按钮组可换行 */
+  .dim-jh-header {
+    min-width: 0;
+    max-width: 100%;
+    box-sizing: border-box;
+    flex-wrap: wrap;
+    padding-top: 10px;
+    padding-bottom: 10px;
+  }
+  .dim-jh-brand { min-width: 0; flex: 1 1 auto; overflow: hidden; }
+  .dim-jh-brandName { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .dim-jh-brandDesc { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+  .dim-jh-headerActions { flex: 1 1 auto; min-width: 0; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+
+  /* 账号卡：操作按钮换行并均分，杜绝横向溢出（原为 flex-wrap: nowrap） */
+  .dim-jh-accountCard { min-width: 0; max-width: 100%; box-sizing: border-box; padding: 12px; }
+  .dim-jh-accountActions { flex-wrap: wrap; justify-content: stretch; gap: 8px; }
+  .dim-jh-accountActions > .dim-jh-btn { flex: 1 1 auto; min-width: 88px; justify-content: center; text-align: center; }
+  .dim-jh-metaRow { grid-template-columns: 46px minmax(0, 1fr); }
+  .dim-jh-accountName { font-size: 13px; }
+
+  /* 弹层/模态：不超出视口 */
+  .dim-jh-modal { max-width: calc(100vw - 16px); max-height: calc(100vh - 16px); box-sizing: border-box; }
+  .dim-jh-panelHead { margin-bottom: 12px; }
+
+  /* 横排内容兜底：长串（额度/限流说明）不撑破容器 */
+  .dim-jh-creditPackages, .dim-jh-rateLimits { overflow-wrap: anywhere; }
+
+  /* ④ Zcode provider 卡（portal 注入宿主模型设置页的 provider 编辑区）
+     与上面同源：卡片不溢出、折叠头可点、按钮够大 */
+  .dim-jh-zcSection { max-width: 100%; }
+  .dim-jh-zcSummary {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    min-height: 40px;
+    cursor: pointer;
+  }
+  .dim-jh-zcSummaryRight { margin-left: auto; }
+  .dim-jh-zcPoolTotals { flex-wrap: wrap; }
+  .dim-jh-zcActions { flex-wrap: wrap; justify-content: stretch; gap: 8px; }
+  .dim-jh-zcActions > .dim-jh-zcBtn, .dim-jh-zcActions > .dim-jh-btn {
+    flex: 1 1 auto;
+    min-width: 96px;
+    min-height: 40px;
+    justify-content: center;
+  }
+  .dim-jh-zcBtn { min-height: 40px; }
+  .dim-jh-zcMetaRow { grid-template-columns: minmax(0, 1fr); }
+  .dim-jh-zcBody { padding-top: 8px; gap: 8px; }
+}
+
 `;
+
 var injected = false;
 function installJetHubStyles() {
   if (injected) return () => {
@@ -686,6 +840,7 @@ function installJetHubStyles() {
   injected = true;
   const style = document.createElement("style");
   style.textContent = STYLES;
+
   document.head.appendChild(style);
   return () => {
     style.remove();
