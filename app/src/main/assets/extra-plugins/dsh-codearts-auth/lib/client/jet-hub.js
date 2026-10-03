@@ -755,18 +755,24 @@ var STYLES = `
   .dim-jh-railGroupTitle { display: none; }
 
   /* provider 按钮：压成「图标 + 标签」的紧凑 tab，且不被压缩 */
-  .dim-jh-provider {
+  .dim-jh-providerRow .dim-jh-provider, .dim-jh-rail .dim-jh-provider {
     width: auto;
     flex: 0 0 auto;
     min-width: 0;
     min-height: 40px;
-    grid-template-columns: 22px minmax(0, 1fr);
+    /* 用户反馈「提供商选择按钮过窄」：原 22px 图标列 + 无最小宽，
+       窄屏下被压到只剩图标宽、图标互相重叠、文字标签全部不可见。
+       ⚠️ 选择器必须带 .dim-jh-providerRow 前缀（特异性 2）：原样式表里有一条
+          .dim-jh-providerRow .dim-jh-provider 的 min-width: 0，单类选择器压不过它 ——
+          真机实测写单类时 min-width 不生效，渲染出来仍是 22px。 */
+    min-width: 104px;
+    grid-template-columns: 24px minmax(0, 1fr);
     gap: 6px;
     padding: 6px 10px;
     white-space: nowrap;
   }
-  .dim-jh-providerIcon { width: 22px; height: 22px; }
-  .dim-jh-providerLabel { white-space: nowrap; }
+  .dim-jh-providerIcon { width: 24px; height: 24px; }
+  .dim-jh-providerLabel { min-width: 0; white-space: nowrap; overflow: hidden; }
 
   /* 面板占满整宽，杜绝溢出 */
   .dim-jh-panel {
@@ -790,7 +796,30 @@ var STYLES = `
   .dim-jh-brand { min-width: 0; flex: 1 1 auto; overflow: hidden; }
   .dim-jh-brandName { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .dim-jh-brandDesc { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
-  .dim-jh-headerActions { flex: 1 1 auto; min-width: 0; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+  .dim-jh-headerActions {
+    /* 用户要求：这几个按键做成一条横向可滑的栏，而不是折行平铺。
+       关键在 flex-basis 100% —— 父级 .dim-jh-header 是 flex-wrap: wrap，
+       若这里用 flex:1 1 auto，它会与 brand 争同一行、并可能分到
+       「刚好装下全部按钮」的宽度，于是 overflow-x 永不触发、也滑不动。
+       占满整行后才是真正的满宽条带：行内按钮 nowrap 且不收缩，
+       超出部分交给 overflow-x: auto，手指左右滑即可触达全部按钮。
+       （真机探针实测：w=272 scrollW=391 clientW=272 scrollable=true） */
+    flex: 1 1 100%;
+    min-width: 0;
+    max-width: 100%;
+    box-sizing: border-box;
+    flex-wrap: nowrap;
+    justify-content: flex-start;
+    gap: 8px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    padding-bottom: 2px;
+  }
+  .dim-jh-headerActions::-webkit-scrollbar { width: 0; height: 0; display: none; }
+  /* 按钮本身不收缩、不折行：宽度由内容决定，靠横滑触达 */
+  .dim-jh-headerActions > .dim-jh-btn { flex: 0 0 auto; white-space: nowrap; }
 
   /* 账号卡：操作按钮换行并均分，杜绝横向溢出（原为 flex-wrap: nowrap） */
   .dim-jh-accountCard { min-width: 0; max-width: 100%; box-sizing: border-box; padding: 12px; }
