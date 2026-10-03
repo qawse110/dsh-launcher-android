@@ -19,7 +19,12 @@
 // 与宿主控制 API 的约定（见 lib/control-api.js）：**写操作必须带 `x-po06: 1`**
 // —— 自定义头会触发 CORS 预检，而服务端从不回 CORS 头 ⇒ 跨站写在预检阶段就被浏览器拦掉。
 window.__ModuleLoader__.load({
-  id: '@dsh-external/dsh-arbiter-wf',
+  // dsh-launcher 修正：本副本沿用包名 dsh-prompt-optimizer-mobile（见 package.json 的 name），
+  // 而上游 v0.8.1 把包名改成了 @dsh-external/dsh-arbiter-wf、注册 id 随之改变。
+  // client-modules 期望的注册名取自 package.json 的 name（见其 resolveMeta → packageName），
+  // 两者不一致时浏览器报：loaded without registering "dsh-prompt-optimizer-mobile"。
+  // 故这里把注册 id 对齐包名。
+  id: 'dsh-prompt-optimizer-mobile',
   factory: (require) => {
     var module = { exports: {} }
     var exports = module.exports
@@ -3281,7 +3286,24 @@ const useStatus = (sessionId) => usePoll(React.useCallback(
         if (!isLive()) return null
         const id = NS + ':' + key
         if (typeof mounts[id] === 'function') { try { mounts[id]() } catch (e) { /* noop */ } mounts[id] = null }
-        const register = () => ctx.slots.register({ name: slot, key }, Component)
+        // dsh-launcher 补丁：keyed 座位按 (key, priority) 唯一。宿主在 priority 0 注册了同名 key
+        // （非 Windows 平台自带 bash 工具卡片），本插件若也在 priority 0 注册同一个 key 就抛：
+        //   Uncaught Error: keyed slot "tool.call.toolview" already has an entry for key "bash"
+        //   at priority 0 (registered by mf) — register at a different priority to shadow it
+        // 上游只在**服务端**按 hostProvidesBash 让位，客户端这一侧漏了（v0.8.1 仍未修）。
+        // 两条都做：① 用非 0 priority 从根上避开冲突（提示本身给的正解）；
+        //          ② 仍保留 try/catch 兜底，**只吞这一种冲突**，其它错误照常抛出。
+        //
+        // ⚠ 该保护在上一轮升级到上游 v0.8.1 时**丢失**（上游重写了 mountKeyed，把 try/catch
+        //   连同 id/order 参数一起改掉了）。真机复现：浏览器控制台报上面那条 Uncaught Error。
+        const register = () => {
+          try {
+            return ctx.slots.register({ name: slot, key, priority: 1 }, Component)
+          } catch (e) {
+            if (/already has an entry/.test(String(e && e.message))) return null
+            throw e
+          }
+        }
         mounts[id] = (typeof ctx.slots.inject === 'function') ? ctx.slots.inject(slot, register) : register()
         own(() => { if (typeof mounts[id] === 'function') { try { mounts[id]() } catch (e) { /* noop */ } } })
         return mounts[id]

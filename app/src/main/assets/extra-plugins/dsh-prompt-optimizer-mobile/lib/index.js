@@ -173,7 +173,8 @@ const WIRE_LOG_PATH = join(DSH_HOME, 'po06-wire.jsonl')
  * 本机 0.1.6 侧不受影响：v3 对用户消息的 kind 不设白名单（只要求非空字符串），
  * 而"绝不自我触发"那道闸是**正向白名单**（只认 `kind === 'user'`，见 `wire.js`），不依赖这个名字。
  */
-const PRODUCER_KIND = 'plugin:@dsh-external/dsh-arbiter-wf'
+// dsh-launcher 修正：自报 kind 用本副本的包名（宿主只要求非空字符串，见上方注释）。
+const PRODUCER_KIND = 'plugin:dsh-prompt-optimizer-mobile'
 
 /** 追加一条生产接线记录。**尽力而为**：台账写不进去也绝不打断会话。 */
 function appendWireLog(rec) {
@@ -1382,7 +1383,10 @@ async function decideEnableFor(agentId) {
   return { ...decision, probe }
 }
 
-export const name = '@dsh-external/dsh-arbiter-wf'
+// dsh-launcher 修正：cordis 插件名必须与 package.json 的 name 一致。
+// 上游 v0.8.1 把包名改成了 @dsh-external/dsh-arbiter-wf，而本副本沿用 dsh-prompt-optimizer-mobile
+// （profile bundles 与 cordis.patch.yml 都按这个名字登记），故这里对齐。
+export const name = 'dsh-prompt-optimizer-mobile'
 /** 版本号从**随包发行的 package.json** 读，不写死（写死就会漂——本项目栽过这类跟头）。 */
 const PKG_VERSION = (() => {
   try { return JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json'), 'utf8')).version } catch { return null }
@@ -1812,7 +1816,9 @@ export function apply(ctx, config) {
         if (!live) return
         try {
           const cm = scope.clientModules || scope.get('clientModules')
-          const name = '@dsh-external/dsh-arbiter-wf'
+          // dsh-launcher 修正：pkgMeta 的键基于**包名**（见 client-modules 的 sourceKey），
+          // 用上游包名会匹配不到本副本的条目，dirty/rebuilt 都落空 ⇒ 客户端模块不会重建。
+          const name = 'dsh-prompt-optimizer-mobile'
           if (!cm?.pkgMeta || !cm?.dirty || typeof cm.flush !== 'function') return
           for (const key of cm.pkgMeta.keys()) {
             if (key === name || String(key).endsWith('\0' + name)) cm.pkgMeta.delete(key)
