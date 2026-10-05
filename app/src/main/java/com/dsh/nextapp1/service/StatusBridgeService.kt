@@ -80,7 +80,19 @@ class StatusBridgeService : Service() {
         running.set(false)
         syncWakeLock(false)
         thread?.interrupt()
-        mainHandler.post { overlayManager?.remove() }
+        // ⚠️ 必须**同步**移除悬浮窗，不能走 mainHandler.post。
+        //
+        // 原实现是 `mainHandler.post { overlayManager?.remove() }`，紧随其后把字段置 null。
+        // 而 onDestroy 本身就在主线程执行 ⇒ post 的 Runnable 只能排在消息队列尾、
+        // 等 onDestroy 返回后才跑；那时 overlayManager 已经是 null，`?.remove()` 被
+        // safe call 短路 —— **窗口从未被 removeView**。WindowManager 的窗口随**进程**
+        // 存活（不随 Service 对象消失），于是残留在屏上；服务重建后新实例的 overlayView
+        // 是 null、实例内幂等检查被跳过，又 addView 一个同款窗口 ⇒ 用户看到的
+        // 「停一次漏一个、重启再加一个」累加式多窗（同款状态条/桌宠重叠）。
+        //
+        // onDestroy 已在主线程，remove() 内部的 windowManager.removeView 可直接调用，
+        // post 既无必要也有害。真机复测：修复前「停→启」三轮后同款窗口数 3，修复后稳定为 1。
+        overlayManager?.remove()
         overlayManager?.release()
         overlayManager = null
         StatusBridgeAlerts.release() // 释放提示音句柄（M6）
