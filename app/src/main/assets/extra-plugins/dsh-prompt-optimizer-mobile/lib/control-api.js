@@ -381,16 +381,21 @@ export function createControlHandler({ home, stateDir, ledgerPath, version = nul
         return send(200, {
           ok: true, version, home: H,
           advisorCollaboration: typeof advisorStageStatus==='function' ? (()=>{try{return advisorStageStatus(qsid || null)}catch{return {ok:false,reason:'stage-status-unavailable'}}})() : null,
-          enabled: intent.settings.enabled === true,
+          // dsh-launcher：默认值已翻转为「未配置 = 启用，只有显式 enabled:false 才关闭」，
+          // 故这里的 enabled 必须反映**同一个口径**，否则界面会显示"未启用"而闸门实际放行，
+          // 用户看到的仍是「开关是灰的」—— 那正是本轮要修掉的现象。
+          enabled: normalizeRollout(intent.rollout).defaulted === true
+            ? (intent.settings.enabled === false ? false : true)
+            : intent.settings.enabled === true,
           rollout: normalizeRollout(intent.rollout).mode,
           // 诊断：`rollout` 是**回落来的 off**（配置里没写/写错）还是**用户显式写的 off**——
           // 这两种在界面上必须能分开，否则"什么都没发生"永远无从归因（用户 2026-09-22 要求查清
           // `gate:rollout-off`）。见 rollout.js 的 normalizeRollout/decideEnabled。
           rolloutDefaulted: normalizeRollout(intent.rollout).defaulted === true,
           rolloutNote: normalizeRollout(intent.rollout).defaulted === true
-            ? (intent.settings.enabled === true
-              ? '配置里没有（或写错了）rollout：已按 "all" 处理（因为你显式写了 enabled:true）'
-              : '配置里没有（或写错了）rollout，且没有显式 enabled:true ⇒ 保守不启用')
+            ? (intent.settings.enabled === false
+              ? '配置里没有 rollout，且显式写了 enabled:false ⇒ 已关闭'
+              : '配置里没有（或写错了）rollout：本部署默认启用，已按 "all" 处理')
             : null,
           // ⚠ 上面那个 `enabled` 是**配置里的意图**，不是**闸门实际放行的结论**。两者可能不同
           //   （例：配置写了 enabled:true，但 rollout 显式 off / 旧插件仍在装配 ⇒ 闸门不放行）。
