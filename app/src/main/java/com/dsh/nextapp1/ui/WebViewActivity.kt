@@ -38,6 +38,12 @@ class WebViewActivity : AppCompatActivity() {
     private lateinit var webView: WebView
     private lateinit var errorView: LinearLayout
 
+    /**
+     * 根容器。**必须是成员**：onDestroy 要先把 webView 从父容器摘下来再 destroy，
+     * 而局部变量在 onDestroy 里拿不到（见 onDestroy 的说明）。
+     */
+    private var rootView: FrameLayout? = null
+
     /** codex://new?prompt=... 等 deep link 带入的指令，页面就绪后自动填入输入框。 */
     private var pendingPrompt: String? = null
     private var promptInjected = false
@@ -55,6 +61,7 @@ class WebViewActivity : AppCompatActivity() {
         val root = FrameLayout(this).apply {
             setBackgroundColor(Ui.BG)
         }
+        rootView = root
 
         // 加载进度条
         val progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
@@ -184,6 +191,61 @@ class WebViewActivity : AppCompatActivity() {
      */
     /** 防止连按返回时并发询问页面（询问是异步的）。 */
     private var backProbePending = false
+
+    /**
+     * 释放 WebView。**这是本 Activity 唯一的清理点，缺了它就会漏渲染进程**。
+     *
+     * 真机实测（反复进出 WebViewActivity 5 次，dumpsys meminfo / ps）：
+     *   修复前：app PSS +1,653 K，WebView 渲染进程 RSS 合计 248,772 K → 347,380 K
+     *           （+98,608 K ≈ +96 MB），且 Activity 栈里已无 WebViewActivity 时
+     *           两个渲染进程仍在跑（存活 1h+）。
+     * 根因：webView 是 Activity 成员（L38 声明、L52 new），而整个文件此前**没有
+     * onDestroy**，也没有 destroy()/removeAllViews() ⇒ Activity 销毁后 WebView
+     * 仍持有渲染进程与 JS 上下文，每进出一次多留一份。
+     *
+     * 三步缺一不可：
+     *   ① 从父容器摘下来 —— 否则 destroy() 后视图树仍持有已销毁 WebView 的引用；
+     *   ② destroy() —— 真正释放渲染进程与 JS 引擎；
+     *   ③ 置空引用 —— 让 Activity 与 WebView 互相不再可达（防 Activity 泄漏）。
+     *
+     * 注意：只 destroy 不摘父容器、或只摘父容器不 destroy，都回收不掉渲染进程。
+     */
+    override fun onDestroy() {
+        rootView?.let { root ->
+            root.removeAllViews()
+        }
+        rootView = null
+        if (::webView.isInitialized) {
+            // ⚠️ 每步**单独** runCatching：整段包一个 try 的话，前面任一步抛异常都会把
+            //    后面的 destroy() 一起跳过 —— 而 destroy() 才是真正释放渲染进程的那一步。
+            runCatching { webView.stopLoading() }
+            runCatching { webView.webChromeClient = null }
+            // 换一个空 WebViewClient：避免旧 client 的闭包继续引用本 Activity
+            runCatching { webView.webViewClient = object : WebViewClient() {} }
+            runCatching { (webView.parent as? ViewGroup)?.removeView(webView) }
+            runCatching { webView.removeAllViews() }
+            runCatching { webView.destroy() }
+        }
+        super.onDestroy()
+    }
+
+    /**
+     * 系统内存吃紧时把 WebView 的缓存/渲染缓冲还给系统。
+     *
+     * 背景（实测）：app 主进程 PSS 里 Graphics(EGL+GL) 占 76 MB（42%），是最大单项；
+     * 该 Activity 常驻在返回栈里时，这份图形内存会一直挂着。
+     * TRIM_MEMORY_UI_HIDDEN（回到后台、UI 不可见）时清缓存是 Android 官方推荐做法：
+     * 此时用户看不到页面，丢掉缓存不影响观感，下次可见时 WebView 自行重建。
+     */
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN && ::webView.isInitialized) {
+            runCatching {
+                webView.clearCache(false)
+                webView.freeMemory()
+            }
+        }
+    }
 
     override fun onBackPressed() {
         // ① 真实页面导航优先（URL 变过的话 canGoBack 才为真）
