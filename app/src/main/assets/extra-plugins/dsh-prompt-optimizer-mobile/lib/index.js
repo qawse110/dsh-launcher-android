@@ -1954,7 +1954,8 @@ export function apply(ctx, config) {
     return {
       configPath: ENABLE_CONFIG_PATH,
       configExists: existsSync(ENABLE_CONFIG_PATH),
-      intent: { ok: i.ok, ours: i.ours, reason: i.reason, enabled: i.settings.enabled, rolloutMode: i.rollout.mode },
+      // dsh-launcher：未配置时 rollout 为 null，直接读 .mode 会抛 TypeError 让插件挂不上。
+      intent: { ok: i.ok, ours: i.ours, reason: i.reason, enabled: i.settings.enabled, rolloutMode: i.rollout == null ? null : i.rollout.mode },
       note: '未判定期间一律不启用（保守）；判定按 agent 懒触发',
     }
   })()
