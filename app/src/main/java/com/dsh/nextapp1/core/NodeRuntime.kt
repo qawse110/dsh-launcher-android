@@ -30,13 +30,40 @@ object NodeRuntime {
         "node/termux-node-aarch64.tar.gz" // 原始打包名
     )
     private const val DIR = "node"
+    private const val TAG = "NodeRuntime"
+
+    /**
+     * Termux 打包的 node 把 **RUNPATH 编译死**成官方前缀 `/data/data/com.termux/files/usr/lib`。
+     * 本环境把前缀搬迁到了应用私有目录，该路径根本不存在 ⇒ 动态链接器找不到 libz.so.1、
+     * libcares.so 等，进程在启动阶段就以
+     * `CANNOT LINK EXECUTABLE ...: library "libz.so.1" not found` 退出（PTC 的 code run
+     * 表现为 worker-exit）。同时 `files/node` 是 `files/termux` 的**兄弟目录**，
+     * 不在 [PrefixPatcher] 扫的 `termux/usr` 里，所以从未被前缀适配覆盖——这正是本缺陷的根因。
+     *
+     * 修法：把每个 ELF 里的官方 lib 路径**等长**改写成 `$ORIGIN/../lib`。
+     * - 等长（官方前缀 35 字符 = 目标串补 `:` 到 35），字节偏移全不变，不破坏 ELF；
+     * - `$ORIGIN` 由 bionic 解析为「本可执行文件所在目录」，因此整套 node 自包含、
+     *   可整体搬移、不依赖外部导出的 LD_LIBRARY_PATH（这正是「不靠临时变量」的要求）；
+     * - 尾部填充的 `:` 是 PATH 语义里的空条目，等价于额外一个当前目录，bionic 实测忽略。
+     *
+     * 注意 bionic 的 `DT_RUNPATH` **不传递**（与 glibc 不同）：node 依赖 libicuuc，
+     * 而 libicuuc 又依赖 libicudata。只改 node 自身不够，必须**整棵树**都改
+     * （实测 node/lib 下 20 个 ELF 各自也带官方 RUNPATH）。故这里递归处理所有 ELF。
+     */
+    private const val OFFICIAL_LIB = "/data/data/com.termux/files/usr/lib"   // 35
+    private const val ORIGIN_LIB = "\$ORIGIN/../lib"                          // 15
 
     @Synchronized
     fun ensureExtracted(context: Context): File {
         val dir = File(context.filesDir, DIR)
         // marker 命中还不够：bin/node 必须真实存在（文件被清理/误删后自动重解压，
         // 而不是让下游 install-dsh.mjs 以含混的 node: not found 失败）。
-        if (MarkerStore.has(context, "node") && File(dir, "bin/node").isFile) return dir
+        if (MarkerStore.has(context, "node") && File(dir, "bin/node").isFile) {
+            // 存量设备自愈：老版本解压出来的 node 仍是官方 RUNPATH（PTC 直接起不来）。
+            // 幂等且极廉价（无官方串即空转），故每次都校核，而不是只靠一次性 marker。
+            ensureRunpathsPatched(dir)
+            return dir
+        }
 
         dir.mkdirs()
         // 清理历史残留：旧版本/异常中断可能留下只读目录（W^X 取消写权限）
@@ -59,6 +86,8 @@ object NodeRuntime {
             // 目录视为可搜索即可（无需可写）
             dir.setReadable(true, false)
             dir.setExecutable(true, false)
+            // ★ 必须在 makeUnwritable 之前改 RUNPATH：等长改写需要写权限
+            ensureRunpathsPatched(dir)
             // Android W^X：被 exec 的文件/目录必须对进程不可写
             makeUnwritable(dir)
             // tmp 目录需要保持可写（node 运行时 TMPDIR）
@@ -137,6 +166,149 @@ object NodeRuntime {
             }
         }
         throw RuntimeException("无法加载 Node 运行时 asset", lastErr)
+    }
+
+    /**
+     * 把 [dir] 下所有 ELF 里的官方 lib 路径等长改写成 `$ORIGIN/../lib`。
+     *
+     * 幂等：改完后已无官方串，再次调用零改动（实测第二遍 patched=0、md5 不变）。
+     * 失败容忍：单个文件出错只记日志，不让整套 node 解压失败。
+     *
+     * W^X 注意：安装后的 node 树是**只读**的（[makeUnwritable]），而等长改写必须可写。
+     * 因此这里对命中的文件先临时 `setWritable(true)`，改完立即恢复 `setWritable(false)`，
+     * 保证既不破坏 W^X 策略、又能在存量设备上就地自愈。
+     *
+     * @return 实际改写的文件数（供日志与测试断言）。
+     */
+    internal fun ensureRunpathsPatched(dir: File): Int {
+        val old = OFFICIAL_LIB.toByteArray(Charsets.ISO_8859_1)
+        // 以 ':' 补足到原长度：PATH 语义下空条目等价于 CWD，bionic 实测无副作用。
+        val pad = ":".repeat(OFFICIAL_LIB.length - ORIGIN_LIB.length)
+        val new = (ORIGIN_LIB + pad).toByteArray(Charsets.ISO_8859_1)
+        if (old.size != new.size) {
+            android.util.Log.e(TAG, "node runpath patch length mismatch: ${old.size} != ${new.size}")
+            return 0
+        }
+        var patched = 0
+        var failed = 0
+        walkFiles(dir) { f ->
+            try {
+                val bytes = java.nio.file.Files.readAllBytes(f.toPath())
+                if (containsBytes(bytes, old)) {
+                    if (writeReplacing(f, replaceBytes(bytes, old, new))) patched++ else failed++
+                }
+            } catch (t: Throwable) {
+                failed++
+                android.util.Log.w(TAG, "runpath patch failed for ${f.name}: ${t.message}")
+            }
+        }
+        if (patched > 0 || failed > 0) {
+            android.util.Log.i(TAG, "node runpath patched=$patched failed=$failed under $dir")
+        }
+        return patched
+    }
+
+    /**
+     * 就地替换 [f] 的内容，返回值表示是否成功。
+     *
+     * 真机上必须用 **临时文件 + rename**，不能直接原地写，原因有二：
+     * 1. `bin/node` 往往正是**当前正在运行的 DSH 进程**，对正在执行的文件原地写会
+     *    返回 `ETXTBSY`（实测踩到，导致 23 个文件只改掉 22 个）；
+     * 2. Android W^X 下安装后的文件与目录都是只读的（`dr-xr-xr-x`），而这两者都需要
+     *    临时放开写位，且必须在结束时**恢复只读**，否则后续 `exec` 会因 W^X 被拒。
+     *
+     * rename 在同一目录内是原子的：正在执行的进程继续用旧 inode，新进程看到新内容。
+     */
+    private fun writeReplacing(f: File, bytes: ByteArray): Boolean {
+        val path = f.toPath()
+        val dir = f.parentFile ?: return false
+        val wasWritable = f.canWrite()
+        val dirWasWritable = dir.canWrite()
+        var tmp: File? = null
+        try {
+            if (!dirWasWritable) dir.setWritable(true, false)
+            val perms = runCatching { java.nio.file.Files.getPosixFilePermissions(path) }.getOrNull()
+            if (!wasWritable) f.setWritable(true, false)
+            tmp = File.createTempFile(".${f.name}.", ".dshnew", dir)
+            java.nio.file.Files.write(tmp.toPath(), bytes)
+            // 保留原权限位（可执行位丢失会让 node 无法启动）
+            if (perms != null) {
+                runCatching { java.nio.file.Files.setPosixFilePermissions(tmp.toPath(), perms) }
+            } else {
+                tmp.setExecutable(f.canExecute(), false)
+            }
+            runCatching {
+                java.nio.file.Files.move(
+                    tmp.toPath(), path,
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                    java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                )
+            }.getOrElse {
+                java.nio.file.Files.move(
+                    tmp.toPath(), path,
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                )
+            }
+            tmp = null
+            return true
+        } catch (t: Throwable) {
+            android.util.Log.w(TAG, "write failed for ${f.name}: ${t.message}")
+            return false
+        } finally {
+            tmp?.delete()
+            // 恢复 W^X：被 exec 的文件与目录必须对进程不可写
+            runCatching { if (!wasWritable) f.setWritable(false, false) }
+            runCatching { if (!dirWasWritable) dir.setWritable(false, false) }
+        }
+    }
+
+    /** 递归遍历真实文件（跳过符号链接与可写的 tmp 目录），供 RUNPATH 改写使用。 */
+    private fun walkFiles(dir: File, action: (File) -> Unit) {
+        val entries = dir.listFiles() ?: return
+        for (f in entries) {
+            if (java.nio.file.Files.isSymbolicLink(f.toPath())) continue
+            if (f.isDirectory) {
+                if (f.name == "tmp") continue   // 运行时可写目录，不含 ELF
+                walkFiles(f, action)
+            } else if (f.isFile) {
+                action(f)
+            }
+        }
+    }
+
+    /** 纯字节子串查找（与 PrefixPatcher 同语义，避免 String 编解码开销）。 */
+    private fun containsBytes(hay: ByteArray, needle: ByteArray): Boolean =
+        indexOfBytes(hay, needle, 0) >= 0
+
+    private fun indexOfBytes(hay: ByteArray, needle: ByteArray, from: Int): Int {
+        if (needle.isEmpty() || hay.size - from < needle.size) return -1
+        val first = needle[0]
+        val limit = hay.size - needle.size
+        outer@ for (i in from.coerceAtLeast(0)..limit) {
+            if (hay[i] != first) continue
+            for (j in 1 until needle.size) {
+                if (hay[i + j] != needle[j]) continue@outer
+            }
+            return i
+        }
+        return -1
+    }
+
+    /** 字节级全量替换（等长场景，单次线性扫描）。 */
+    private fun replaceBytes(input: ByteArray, old: ByteArray, new: ByteArray): ByteArray {
+        val first = indexOfBytes(input, old, 0)
+        if (first < 0) return input
+        val out = java.io.ByteArrayOutputStream(input.size)
+        var cursor = 0
+        var hit = first
+        while (hit >= 0) {
+            out.write(input, cursor, hit - cursor)
+            out.write(new, 0, new.size)
+            cursor = hit + old.size
+            hit = indexOfBytes(input, old, cursor)
+        }
+        out.write(input, cursor, input.size - cursor)
+        return out.toByteArray()
     }
 
     /** 递归取消写权限，满足 Android W^X：保留父目录可读可执行、文件可读可执行。 */
