@@ -16,6 +16,19 @@ internal object PackageKit {
 
     private const val TOOLS_MARKER_VERSION = "4"
 
+    /**
+     * 「裸环境 git 可用」冒烟检查（不依赖任何外部注入的 `GIT_*` 变量）。
+     *
+     * 这正是用户在终端里直接敲 git 时的状态，也是本缺陷最初的表现面：
+     * - `git --exec-path` 只打印路径、**即使目录不存在也返回 0**，光看它检测不出问题；
+     * - 必须再断言 `$(git --exec-path)` 真的是个目录（官方前缀 `/data/data/com.termux/...`
+     *   在本环境根本不存在），并跑一条读取类命令确认不再报 gitconfig 权限错误。
+     *
+     * 真机实测：未修时本检查失败（`test -d` 为假），修好后三项全过。
+     */
+    private const val GIT_BARE_ENV_CHECK =
+        "command -v git >/dev/null 2>&1 && test -d \"${'$'}(git --exec-path)\" && git config --list >/dev/null 2>&1"
+
     /** Harness 附加工具是否已安装就绪。 */
     fun ready(context: Context): Boolean =
         MarkerStore.get(context, "harness-tools") == TOOLS_MARKER_VERSION
@@ -34,6 +47,15 @@ internal object PackageKit {
             ProfileWriter.writeLinuxProfile(usr)
             ProfileWriter.writeInputRc(usr)
             ProfileWriter.writeTpkgScript(context, usr)
+
+            // 存量设备自愈（不重装、不解压）：v4.9.x 的 mtime 增量 patch 漏改了
+            // apt 装的 git/rg/wget 等（deb 载荷保留包内旧时间戳被误判为「旧文件」），
+            // 导致裸终端 git 直接不可用。这里在工具就绪判定之前先补一次，
+            // 否则 ready() 为 true 会直接短路返回、缺口永远留着。
+            if (!BootstrapInstaller.ensurePrefixPatched(context, progress)) {
+                progress("WARN: 内置 Termux 路径适配仍有残留，git 等工具可能异常")
+            }
+
             if (ready(context)) return true
             val bash = TermuxRuntime.bashPath(context).absolutePath
             // 环境基底统一由 Proc → TermuxEnv 提供，此处不再本地拼接（P0-1/P1-1）
@@ -60,9 +82,10 @@ internal object PackageKit {
                     // 运行时翻译脚本 shebang 的官方前缀（postinst/pip 入口依赖）
                     if (!File(usr, "lib/libtermux-exec-ld-preload.so").isFile) add("termux-exec")
                 }
-                // P2-5 增量 patch 基线：安装窗口开始时间。之后所有新落盘文件
-                // （pkg/tpkg/apt-get -f）mtime 必然 >= 该值，patch 只扫这些文件
-                val patchBaseline = System.currentTimeMillis()
+                // P2-5 的 mtime 增量基线已移除：apt/dpkg 解包保留 deb 包内原始 mtime，
+                // 任何「包内时间戳早于安装窗口」的载荷都会被误判为旧文件而漏 patch
+                // （真机实测 git/rg/wget 全中招）。全树扫描实测仅 ~0.6s/128MB，
+                // 用这点开销换「不可能漏改」是划算的。见 PrefixPatcher 类注释。
                 val installRc = if (missing.isNotEmpty()) {
                     runBash(context, bash, "pkg install -o Acquire::Retries=3 -y --no-install-recommends ${missing.joinToString(" ")}", env, progress, timeoutSec = 1200)
                 } else {
@@ -80,19 +103,33 @@ internal object PackageKit {
                     )
                 }
 
-                // 新装的包（二进制 + maintainer 脚本）仍带官方路径；统一增量 patch
-                // （只扫基线之后的新文件），再让 dpkg 重新 configure。
-                progress("适配新装包路径并完成 dpkg 配置（增量 patch）…")
-                PrefixPatcher.patchAll(usr, patchBaseline)
-                PrefixPatcher.patchTextOfficialDirs(usr, patchBaseline)
-                MarkerStore.put(context, "prefix-patch-ts", System.currentTimeMillis().toString())
+                // 新装的包（二进制 + maintainer 脚本）仍带官方路径；全量 patch 并审计。
+                progress("适配新装包路径（全量 patch + 审计）…")
+                val outcome = PrefixPatcher.patchEverything(usr)
+                val audit = outcome.audit
+                if (audit.clean) {
+                    MarkerStore.put(context, "prefix-patch-rev", BootstrapInstaller.PATCH_REVISION)
+                    progress(
+                        "路径适配通过审计：重写 ${outcome.binary.patched} 个二进制 / " +
+                            "${outcome.text.patched} 个文本文件（扫描 ${audit.scanned} 个文件）"
+                    )
+                } else {
+                    // 宁可显式失败也不要静默放过：残留会让裸环境工具链半死不活
+                    progress(
+                        "WARN: 路径适配审计未通过，仍有 ${audit.mustFix.size} 个核心前缀残留 + " +
+                            "${audit.textFixNeeded.size} 个文本残留（示例：${
+                                audit.mustFix.take(3).joinToString { it.path }
+                            }）"
+                    )
+                }
                 val cfgRc = runBash(context, bash, "dpkg --configure -a", env, progress, timeoutSec = 600)
                 if (cfgRc != 0) {
                     progress("WARN: dpkg --configure -a 返回 $cfgRc，再试 apt-get -f install…")
                     runBash(context, bash, "apt-get install -o Acquire::Retries=3 -y -f --no-install-recommends", env, progress, timeoutSec = 1200)
                 }
 
-                val readyNow = runBash(context, bash, requiredCheck, env, progress, timeoutSec = 120) == 0
+                val readyNow = runBash(context, bash, requiredCheck, env, progress, timeoutSec = 120) == 0 &&
+                    runBash(context, bash, GIT_BARE_ENV_CHECK, env, progress, timeoutSec = 60) == 0
                 val extra = buildList {
                     add("git"); add("ripgrep"); add("file"); add("curl"); add("less")
                     if (File(usr, "bin/wget").isFile) add("wget")

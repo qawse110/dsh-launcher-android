@@ -38,6 +38,11 @@ jobs:
         # 防止再次出现「六处手工硬编码、两侧静默不一致」的历史问题。
         run: node tools/check-plugin-manifest.mjs
 
+      - name: 前缀适配工具自测
+        # 锁住 verify/repair 脚本的语义：能查出官方前缀残留、不把镜像路径误报、
+        # 等长替换不改长度/权限位、幂等不二次嵌套。CI 无真机 PREFIX，故用 fixture。
+        run: node tools/verify-prefix-patch.test.mjs
+
       - name: Assemble debug（编译门禁）
         run: chmod +x gradlew && ./gradlew :app:assembleDebug --no-daemon
 

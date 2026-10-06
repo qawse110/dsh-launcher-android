@@ -17,8 +17,73 @@ internal object BootstrapInstaller {
     private const val ASSET = "termux-bootstrap.zip"
     private const val MARKER_VERSION = "6"
 
+    /**
+     * 前缀 patch 的**独立**版本号（与 [MARKER_VERSION] 解耦）。
+     *
+     * 为什么不复用 `termux` marker：`isMarked()==false` 会走 [cleanupDir] **删掉整个 usr
+     * 重装**。为修一个补丁缺口而触发全量重装，代价与数据风险都不可接受。所以存量设备的
+     * 「原地重打补丁」用这个独立 marker 表达（见 [ensurePrefixPatched]）。
+     *
+     * 版本历史：
+     * - 1：v5.0.0 起。修 v4.9.x 的 mtime 增量漏 patch（apt 载荷保留包内旧时间戳，
+     *      被误判为「旧文件」跳过，git 全家 36 文件从未改写，裸终端 git 不可用）。
+     */
+    internal const val PATCH_REVISION = "1"
+
     fun isMarked(context: Context): Boolean =
         MarkerStore.get(context, "termux") == MARKER_VERSION
+
+    /**
+     * 存量设备自愈 + 后续安装的持续保障：环境已就绪但可能带着历史漏 patch 的文件
+     * （例如 apt 装的 git/rg/wget）。
+     *
+     * 与 [ensure] 的区别：**不做解压、不清理目录、不动用户数据**，只对现有 usr 重跑一遍
+     * 完整 patch + 审计。幂等，可在启动路径安全调用。
+     *
+     * ## 为什么不能只用「一次性 marker」判据
+     *
+     * 若只判断 `marker != PATCH_REVISION` 就返回，则会漏掉**修好之后**新装的包：
+     * 用户在终端里 `apt install` 任何东西，落盘载荷又带着官方前缀，而 marker 已经是
+     * 最新版 ⇒ 永远不再复检。这正是本缺陷「同类问题不再发生」要求的反面。
+     *
+     * 因此改用 **dpkg 安装活动作为触发信号**：dpkg/apt 每次安装都会改写
+     * `var/lib/dpkg/info/`（至少新增一个 `<pkg>.list`），该目录 mtime 随之变化。
+     * 目录 mtime 是真实的「安装发生时刻」（与载荷自身被保留的包内时间戳不同，
+     * 这正是旧方案出错的地方）。据此即可用极低成本判断「自上次校核以来有没有装过东西」。
+     *
+     * @return 审计是否干净；false 表示全树仍有无法自动改写的核心前缀残留（应上报日志）。
+     */
+    @Synchronized
+    fun ensurePrefixPatched(context: Context, progress: (String) -> Unit = {}): Boolean {
+        val usr = TermuxRuntime.prefix(context)
+        if (!usr.isDirectory) return false
+
+        val marker = MarkerStore.get(context, "prefix-patch-rev")
+        val dpkgInfo = File(usr, "var/lib/dpkg/info")
+        val dpkgStamp = dpkgInfo.lastModified().toString()
+        val recordedStamp = MarkerStore.get(context, "prefix-patch-dpkg-ts")
+        if (marker == PATCH_REVISION && recordedStamp == dpkgStamp) return true
+
+        val reason = if (marker != PATCH_REVISION) "修复历史漏 patch" else "检测到新装包"
+        progress("校核内置 Termux 路径适配（$reason）…")
+        val outcome = PrefixPatcher.patchEverything(usr)
+        val audit = outcome.audit
+        if (audit.clean) {
+            MarkerStore.put(context, "prefix-patch-rev", PATCH_REVISION)
+            MarkerStore.put(context, "prefix-patch-dpkg-ts", dpkgStamp)
+            progress(
+                "路径适配已校核：重写 ${outcome.binary.patched} 个二进制 / " +
+                    "${outcome.text.patched} 个文本文件"
+            )
+        } else {
+            android.util.Log.w(
+                "TermuxRuntime",
+                "prefix patch incomplete: mustFix=${audit.mustFix.map { it.path }.take(10)}"
+            )
+            progress("WARN: 仍有 ${audit.mustFix.size} 个文件未完成路径改写")
+        }
+        return audit.clean
+    }
 
     /**
      * 解压并准备 Termux 环境（同步，可能耗时 10~60 秒）。
@@ -76,10 +141,12 @@ internal object BootstrapInstaller {
             createPrefixShortcut(context)
             createOfficialMirror(context)
             progress("适配 Termux 官方硬编码路径（${PrefixPatcher.OFFICIAL_PREFIX} → ${PrefixPatcher.SHORT_PREFIX}）…")
-            PrefixPatcher.patchAll(usr)
-            PrefixPatcher.patchTextOfficialDirs(usr)
-            // 全量 patch 完成，落增量基线（后续 PackageKit 只扫基线后的新文件）
-            MarkerStore.put(context, "prefix-patch-ts", System.currentTimeMillis().toString())
+            // 全量 patch + 审计（不再有 mtime 基线，见 PrefixPatcher 类注释）
+            val outcome = PrefixPatcher.patchEverything(usr)
+            if (!outcome.audit.clean) {
+                android.util.Log.w("TermuxRuntime", "首装后 prefix 审计未通过：${outcome.audit}")
+            }
+            MarkerStore.put(context, "prefix-patch-rev", PATCH_REVISION)
             ProfileWriter.writeAll(context, usr)
 
             // 可写业务目录：home / tmp / var（apt/dpkg 需要 var 可写）
