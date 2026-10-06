@@ -98,13 +98,21 @@ class PrefixPatcherTest {
         assertTrue(once.contains("${usr.absolutePath}/var/cache/apt"))
     }
 
-    /** 同一文件里既有官方 files 根、又有官方 apt cache：两者都要改（旧实现是 else-if，会漏一个）。 */
+    /**
+     * 同一文件里既有官方 files 根、又有官方 apt cache：两者都要改（旧实现是 else-if，会漏一个）。
+     *
+     * 断言**改写后的完整内容**，而不是 `assertFalse(contains(旧路径))`：镜像结果
+     * `${dataDir}/data/data/com.termux/files/home` 本身就以旧路径作后缀，用 contains
+     * 判定会恒为真、永远失败——这正是本模块最容易踩的镜像子串陷阱（CI 曾因此红过）。
+     */
     @Test fun `文本 patch 同时改 files 根与 apt cache`() {
         val f = write("etc/a.conf", "H=/data/data/com.termux/files/home\nC=/data/data/com.termux/cache/apt\n")
         PrefixPatcher.patchTextOfficialDirs(usr)
-        val t = f.readText()
-        assertFalse(t.contains("/data/data/com.termux/files/home"))
-        assertFalse(t.contains("/data/data/com.termux/cache/apt"))
+        val dataDir = usr.parentFile!!.parentFile!!.parentFile!!.absolutePath
+        assertEquals(
+            "H=$dataDir/data/data/com.termux/files/home\nC=${usr.absolutePath}/var/cache/apt\n",
+            f.readText(),
+        )
     }
 
     /** 二进制里的 files/home 无法等长替换，应被归为「披露但不阻断」，不能当成门禁失败。 */
