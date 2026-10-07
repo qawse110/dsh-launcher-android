@@ -33,25 +33,44 @@ object NodeRuntime {
     private const val TAG = "NodeRuntime"
 
     /**
-     * Termux 打包的 node 把 **RUNPATH 编译死**成官方前缀 `/data/data/com.termux/files/usr/lib`。
-     * 本环境把前缀搬迁到了应用私有目录，该路径根本不存在 ⇒ 动态链接器找不到 libz.so.1、
-     * libcares.so 等，进程在启动阶段就以
-     * `CANNOT LINK EXECUTABLE ...: library "libz.so.1" not found` 退出（PTC 的 code run
-     * 表现为 worker-exit）。同时 `files/node` 是 `files/termux` 的**兄弟目录**，
-     * 不在 [PrefixPatcher] 扫的 `termux/usr` 里，所以从未被前缀适配覆盖——这正是本缺陷的根因。
+     * Termux 打包的 node 把**官方前缀编译死**在二进制里，而本环境该路径不存在。
+     * 这会在两处先后爆出来（PTC 的 code run 都表现为 worker-exit）：
      *
-     * 修法：把每个 ELF 里的官方 lib 路径**等长**改写成 `$ORIGIN/../lib`。
-     * - 等长（官方前缀 35 字符 = 目标串补 `:` 到 35），字节偏移全不变，不破坏 ELF；
-     * - `$ORIGIN` 由 bionic 解析为「本可执行文件所在目录」，因此整套 node 自包含、
-     *   可整体搬移、不依赖外部导出的 LD_LIBRARY_PATH（这正是「不靠临时变量」的要求）；
-     * - 尾部填充的 `:` 是 PATH 语义里的空条目，等价于额外一个当前目录，bionic 实测忽略。
+     * 1. **动态链接期**：RUNPATH = `/data/data/com.termux/files/usr/lib` ⇒ 找不到
+     *    libz.so.1/libcares.so，进程在跑任何用户代码前就退出：
+     *    `CANNOT LINK EXECUTABLE ...: library "libz.so.1" not found`。
+     * 2. **OpenSSL 初始化期**：libcrypto.so.3 编译进
+     *    `OPENSSLDIR = /data/data/com.termux/files/usr/etc/tls` ⇒ 读不到 openssl.cnf：
+     *    `OpenSSL configuration error: ... fopen(.../etc/tls/openssl.cnf, rb)` 退出码 13。
      *
-     * 注意 bionic 的 `DT_RUNPATH` **不传递**（与 glibc 不同）：node 依赖 libicuuc，
-     * 而 libicuuc 又依赖 libicudata。只改 node 自身不够，必须**整棵树**都改
-     * （实测 node/lib 下 20 个 ELF 各自也带官方 RUNPATH）。故这里递归处理所有 ELF。
+     * 根因同源：`files/node` 是 `files/termux` 的**兄弟目录**，不在 [PrefixPatcher]
+     * 扫描的 `termux/usr` 内，所以从未被前缀适配覆盖。DSH 主进程恰好带着
+     * LD_LIBRARY_PATH / OPENSSL_CONF 掩盖了这两点，而 PTC 的 worker 会重设环境，
+     * 于是暴露。
+     *
+     * ## 修法（两步等长替换，顺序不可颠倒）
+     *
+     * **步骤 1**：`…/usr/lib`（35 字符）→ `$ORIGIN/../lib`＋`':'` 补足 35。
+     * - `$ORIGIN` 由 bionic 解析为「本可执行文件所在目录」，整套 node 因此自包含、
+     *   可整体搬移、**不依赖 LD_LIBRARY_PATH**；
+     * - 必须整棵树都改：bionic 的 `DT_RUNPATH` **不传递**（与 glibc 不同），
+     *   node→libicuuc→libicudata 这条链要求每一层都能自己找到库
+     *   （实测 node/lib 下 20+ 个 .so 各自也带官方 RUNPATH）；
+     * - 必须用 `':'` 填充而非 NUL：NUL 会让 node 内嵌的 JSON 构建配置变成非法
+     *   JSON，`-e` 直接 SyntaxError。`':'` 空段实测不会把 CWD 引入搜索路径。
+     *
+     * **步骤 2**：其余 `…/files/usr`（31 字符）→ 短前缀 `/data/user/0/<pkg>/t`（同为 31）。
+     * 这一步修的是 RUNPATH 之外的**配置/数据路径**，最关键的是 `OPENSSLDIR`
+     * （`…/usr/etc/tls` → `/data/user/0/<pkg>/t/etc/tls`，该 openssl.cnf 真实存在且可读），
+     * 顺带覆盖 `usr/bin/bash`、`usr/tmp` 等。步骤 1 必须先做：否则 lib 路径会被本步
+     * 改写成 `t/lib`，而 `t/lib` 缺少 libcares/libsqlite3/libicu*（node 自带的那份才全）。
+     *
+     * 两步都是**等长**替换（35→35、31→31），字节偏移全不变，不破坏 ELF。
      */
     private const val OFFICIAL_LIB = "/data/data/com.termux/files/usr/lib"   // 35
-    private const val ORIGIN_LIB = "\$ORIGIN/../lib"                          // 15
+    private const val ORIGIN_LIB = "\$ORIGIN/../lib"                          // 15 (+20 补 ':')
+    private const val OFFICIAL_USR = PrefixPatcher.OFFICIAL_PREFIX            // 31
+    private const val SHORT_USR = PrefixPatcher.SHORT_PREFIX                  // 31
 
     @Synchronized
     fun ensureExtracted(context: Context): File {
@@ -181,29 +200,51 @@ object NodeRuntime {
      * @return 实际改写的文件数（供日志与测试断言）。
      */
     internal fun ensureRunpathsPatched(dir: File): Int {
-        val old = OFFICIAL_LIB.toByteArray(Charsets.ISO_8859_1)
-        // 以 ':' 补足到原长度：PATH 语义下空条目等价于 CWD，bionic 实测无副作用。
-        val pad = ":".repeat(OFFICIAL_LIB.length - ORIGIN_LIB.length)
-        val new = (ORIGIN_LIB + pad).toByteArray(Charsets.ISO_8859_1)
-        if (old.size != new.size) {
-            android.util.Log.e(TAG, "node runpath patch length mismatch: ${old.size} != ${new.size}")
+        // 等长前提：两步替换长度必须严格相等，否则拒绝执行（宁可不动也不能写坏 ELF）
+        val libPad = ":".repeat(OFFICIAL_LIB.length - ORIGIN_LIB.length)
+        val originLib = ORIGIN_LIB + libPad
+        if (OFFICIAL_LIB.length != originLib.length || OFFICIAL_USR.length != SHORT_USR.length) {
+            android.util.Log.e(
+                TAG,
+                "node prefix patch length mismatch: lib ${OFFICIAL_LIB.length}->${originLib.length}, " +
+                    "usr ${OFFICIAL_USR.length}->${SHORT_USR.length}",
+            )
+            return 0
+        }
+        // 步骤 1 必须先行（见上方 KDoc）：先把 …/usr/lib 改成 $ORIGIN/../lib，
+        // 否则步骤 2 会把它改写成 t/lib，而 t/lib 缺少 node 自带的那几个库。
+        val pass1 = replaceAll(dir, OFFICIAL_LIB, originLib)
+        // 步骤 2：其余官方 usr 路径 → 短前缀（修 OPENSSLDIR / etc/tls / bin/sh / tmp 等）
+        val pass2 = replaceAll(dir, OFFICIAL_USR, SHORT_USR)
+        val patched = pass1 + pass2
+        if (patched > 0) {
+            android.util.Log.i(TAG, "node prefix patched files=$patched (lib=$pass1 usr=$pass2) under $dir")
+        }
+        return patched
+    }
+
+    /** 把 [dir] 下所有文件的 [old] 等长替换为 [new]（长度必须相等）；返回改写的文件数。 */
+    private fun replaceAll(dir: File, old: String, new: String): Int {
+        val oldB = old.toByteArray(Charsets.ISO_8859_1)
+        val newB = new.toByteArray(Charsets.ISO_8859_1)
+        if (oldB.size != newB.size) {
+            android.util.Log.e(TAG, "refuse unequal replace: $old -> $new")
             return 0
         }
         var patched = 0
-        var failed = 0
         walkFiles(dir) { f ->
             try {
                 val bytes = java.nio.file.Files.readAllBytes(f.toPath())
-                if (containsBytes(bytes, old)) {
-                    if (writeReplacing(f, replaceBytes(bytes, old, new))) patched++ else failed++
+                if (containsBytes(bytes, oldB)) {
+                    if (writeReplacing(f, replaceBytes(bytes, oldB, newB))) {
+                        patched++
+                    } else {
+                        android.util.Log.w(TAG, "write failed for ${f.name}")
+                    }
                 }
             } catch (t: Throwable) {
-                failed++
-                android.util.Log.w(TAG, "runpath patch failed for ${f.name}: ${t.message}")
+                android.util.Log.w(TAG, "prefix patch failed for ${f.name}: ${t.message}")
             }
-        }
-        if (patched > 0 || failed > 0) {
-            android.util.Log.i(TAG, "node runpath patched=$patched failed=$failed under $dir")
         }
         return patched
     }

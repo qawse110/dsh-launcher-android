@@ -122,4 +122,70 @@ class NodeRuntimeTest {
         assertEquals("填充后必须与官方串等长", official.length, (origin + pad).length)
         assertEquals(35, official.length)
     }
+
+    // ---------- 步骤 2：OPENSSLDIR 等非 lib 的官方路径（PTC 报 OpenSSL configuration error） ----------
+
+    /** libcrypto.so.3 编译进 OPENSSLDIR=…/usr/etc/tls，读不到 openssl.cnf 会让 node 退出码 13。 */
+    @Test fun `OPENSSLDIR 被等长改写为短前缀`() {
+        val opensslDir = "/data/data/com.termux/files/usr/etc/tls"
+        val f = bin((opensslDir + "\u0000").toByteArray(Charsets.ISO_8859_1), "lib/libcrypto.so.3")
+        val sizeBefore = f.length()
+
+        NodeRuntime.ensureRunpathsPatched(dir)
+
+        assertEquals("等长替换不得改变长度", sizeBefore, f.length())
+        val text = String(f.readBytes(), Charsets.ISO_8859_1)
+        assertTrue("应指向短前缀下的 etc/tls", text.contains(PrefixPatcher.SHORT_PREFIX + "/etc/tls"))
+        assertTrue("不得残留官方 usr 前缀", !text.contains("/data/data/com.termux/files/usr"))
+    }
+
+    /**
+     * 顺序不变式：`…/usr/lib` 必须先变成 `$ORIGIN/../lib`，再执行 usr→短前缀。
+     *
+     * 若顺序颠倒，lib 路径会被步骤 2 改写成 `t/lib`，而 t/lib 缺少 node 自带的
+     * libcares/libsqlite3/libicu*（node/lib 那份才全）⇒ 动态链接再次失败。
+     */
+    @Test fun `步骤顺序：lib 先变 ORIGIN，不会被 usr 步骤改写成 t_lib`() {
+        bin(("/data/data/com.termux/files/usr/lib" + "\u0000").toByteArray(Charsets.ISO_8859_1))
+
+        NodeRuntime.ensureRunpathsPatched(dir)
+
+        val text = String(File(dir, "bin/node").readBytes(), Charsets.ISO_8859_1)
+        assertTrue("应为 \$ORIGIN/../lib", text.contains(origin))
+        assertTrue(
+            "不得被步骤 2 改写成短前缀 lib（那会丢库）",
+            !text.contains(PrefixPatcher.SHORT_PREFIX + "/lib"),
+        )
+    }
+
+    /** 一个文件同时含 lib 与 etc 两处官方路径时，两处都要改，且只算一次改写。 */
+    @Test fun `同文件含 lib 与 etc 两处官方路径都被改写`() {
+        val body = "RUNPATH=/data/data/com.termux/files/usr/lib" + "\u0000" +
+            "OPENSSLDIR=/data/data/com.termux/files/usr/etc/tls" + "\u0000"
+        val f = bin(body.toByteArray(Charsets.ISO_8859_1))
+
+        NodeRuntime.ensureRunpathsPatched(dir)
+
+        val text = String(f.readBytes(), Charsets.ISO_8859_1)
+        assertTrue("lib 应改 ORIGIN", text.contains(origin))
+        assertTrue("etc/tls 应改短前缀", text.contains(PrefixPatcher.SHORT_PREFIX + "/etc/tls"))
+        assertTrue("不得残留官方前缀", !text.contains("/data/data/com.termux/files/usr"))
+    }
+
+    /** 两步都改完后，全树不应再有任何官方 usr 前缀残留（audit 口径）。 */
+    @Test fun `整树无官方 usr 前缀残留`() {
+        bin(("/data/data/com.termux/files/usr/lib" + "\u0000").toByteArray(Charsets.ISO_8859_1), "bin/node")
+        bin(("/data/data/com.termux/files/usr/etc/tls" + "\u0000").toByteArray(Charsets.ISO_8859_1), "lib/libcrypto.so.3")
+        bin(("/data/data/com.termux/files/usr/bin/sh" + "\u0000").toByteArray(Charsets.ISO_8859_1), "lib/libssl.so.3")
+
+        NodeRuntime.ensureRunpathsPatched(dir)
+
+        var leftovers = 0
+        dir.walkTopDown().filter { it.isFile }.forEach { f ->
+            if (String(f.readBytes(), Charsets.ISO_8859_1).contains("/data/data/com.termux/files/usr")) {
+                leftovers++
+            }
+        }
+        assertEquals("处理后不应再有官方 usr 前缀残留", 0, leftovers)
+    }
 }
