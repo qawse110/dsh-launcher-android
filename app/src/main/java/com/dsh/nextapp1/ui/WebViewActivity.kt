@@ -203,7 +203,10 @@ class WebViewActivity : AppCompatActivity() {
                 val msg = resultMsg ?: return false
                 // 多窗口关闭时 window.open 会导航当前页而不是失败 ——
                 // 拒绝打开，让 window.open 变成 no-op，绝不牺牲用户界面。
-                if (!webView.settings.supportMultipleWindows) return false
+                // ⚠️ 这个方法名没有 get 前缀（Android 的 getter 就叫 supportMultipleWindows()），
+                //    Kotlin 不会合成属性，必须带括号调用，否则编译报
+                //    "Function invocation 'supportMultipleWindows()' expected"。
+                if (!webView.settings.supportMultipleWindows()) return false
                 return runCatching { openPopupWebView(msg) }
                     .onFailure { AppLog.e(TAG, "onCreateWindow failed: " + it.message) }
                     .getOrDefault(false)

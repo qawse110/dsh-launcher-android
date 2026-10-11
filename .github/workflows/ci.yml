@@ -46,22 +46,6 @@ jobs:
       - name: Assemble debug（编译门禁）
         run: chmod +x gradlew && ./gradlew :app:assembleDebug --no-daemon
 
-      - name: 诊断：把失败输出变成注解（临时）
-        if: failure()
-        run: |
-          set +e
-          echo "=== retry with errors as annotations ==="
-          chmod +x gradlew
-          ./gradlew :app:assembleDebug --no-daemon --console=plain 2>&1 | tee /tmp/gradle.log
-          echo "--- error-ish lines ---"
-          grep -nE "^(e|w): |error:|Err:|Unresolved|Execution failed|What went wrong|Caused by|> Task .* FAILED|FAILURE:" /tmp/gradle.log | head -40 | while IFS= read -r line; do
-            echo "::error::$(printf '%s' "$line" | tr -d '\r' | head -c 800)"
-          done
-          echo "--- last 25 lines ---"
-          tail -25 /tmp/gradle.log | while IFS= read -r line; do
-            echo "::notice::$(printf '%s' "$line" | tr -d '\r' | head -c 800)"
-          done
-
       - name: Unit tests（P2-2 单测门禁）
         run: ./gradlew :app:testDebugUnitTest --no-daemon
 
