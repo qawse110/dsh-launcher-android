@@ -209,6 +209,7 @@ function onClient(client) {
     pend: new Map(),
     sess: new Set(),
     ctrl: null,
+    guiId: null, // 认领到的用户 GUI 页 targetId，认领后钉住（见 isUserPage）
   };
 
   function teardown() {
@@ -266,7 +267,17 @@ function onClient(client) {
 
   /** 用户的 dsh GUI 页。**任何情况下都不许拿它当 opener。** */
   function isUserPage(target) {
-    return String(target.url || "").includes(":3080");
+    if (!target) return false;
+    // 按 url 认领（首次见到 :3080 就记住 targetId），认领后**钉住 id**。
+    // 为什么不能只看 url：GUI 页可能被重定向 / 用户自己在页面里跳到别处 /
+    // 落到错误页，那时 url 不再是 :3080。若只认 url，它会被误判成 agent 页，
+    // 于是被 pickOpener 拿去当 opener（window.open 会把它导航走）或被
+    // closeTarget 关掉 —— 这两件事都违反「不牺牲用户界面」。
+    if (String(target.url || "").includes(":3080")) {
+      st.guiId = target.targetId;
+      return true;
+    }
+    return st.guiId !== null && target.targetId === st.guiId;
   }
 
   /**

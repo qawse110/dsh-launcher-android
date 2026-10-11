@@ -371,6 +371,24 @@ async function main() {
   const guiStill = (r.result.targetInfos || []).find((t) => t.targetId === guiTargetId);
   check("PUT /json/new 之后用户 GUI 仍在原处", guiStill && guiStill.url === GUI_URL, guiStill && guiStill.url);
 
+  // 关键回归：GUI 页被导航到别处后（重定向/用户自己跳走/错误页），
+  // 不能因为 url 不再是 :3080 就被误当成 agent 页拿去当 opener。
+  const guiRec = targets.find((t) => t.targetId === guiTargetId);
+  guiRec.url = "about:blank";
+  const beforeNav = upstreamMethods.length;
+  r = await call("Target.createTarget", { url: "about:blank" });
+  check(
+    "GUI 被导航走后 createTarget 仍被拒（身份钉住 targetId，不靠 url）",
+    !!r.error && /multi-window|setSupportMultipleWindows/i.test(r.error.message),
+    r.error && r.error.message,
+  );
+  check(
+    "该次仍未被转发给上游",
+    !upstreamMethods.slice(beforeNav).includes("Target.createTarget"),
+    JSON.stringify(upstreamMethods.slice(beforeNav)),
+  );
+  guiRec.url = GUI_URL; // 还原，供后续断言
+
   ws.close();
   relay.child.kill("SIGKILL");
   children.delete(relay.child);
