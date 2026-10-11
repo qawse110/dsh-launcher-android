@@ -86,16 +86,29 @@ object DshFlow {
         "install-dsh.mjs", "routing-suite.mjs",
         "fs-register.mjs", "fs-loader.mjs", "fs-promises-compat.mjs", "stub-dsh.mjs",
         "plugin-manifest.json", "dsh-pin.json",
+        // WebView CDP 桥（assets → files，与其它脚本同一条同步真源）。
+        RELAY_SCRIPT,
     )
 
     /** 需整目录同步的 assets 子目录（新增目录只加这里一处）。 */
     val ASSET_DIRS = listOf("install", "stub", "extra-plugins", "optional-plugins")
+
+    /** WebView CDP 桥脚本名（assets 下的文件名 = files 下的文件名）。 */
+    const val RELAY_SCRIPT = "webview-cdp-relay.mjs"
+
+    /** 桥的 TCP 监听端口；ego 侧的 EGO_LINUX_CDP_URL 指向它。 */
+    const val RELAY_PORT = 41999
+
+    /** 桥的日志文件名。 */
+    const val RELAY_LOG = "webview-relay.log"
 
     /** 模板资产读取失败时的兜底内联模板（内容与 tpl 保持一致）。 */
     private val DEFAULT_WEB_LAUNCHER_TPL = """
         #!/data/user/0/com.dsh.nextapp1/t/usr/bin/bash
         @EXPORTS@
         cd "@HOME@" || exit 1
+        nohup @RELAY_CMD@ > "@RELAY_LOG@" 2>&1 &
+        echo DSH_RELAY_PID=${'$'}!
         nohup @NODE_CMD@ > "@LOG_FILE@" 2>&1 &
         echo DSH_WEB_PID=${'$'}!
         """.trimIndent()
@@ -610,6 +623,9 @@ object DshFlow {
         val launcher = webLauncherFile(ctx)
         launcher.parentFile?.mkdirs()
         val nodeCmd = "${nodeDir.absolutePath}/bin/node --expose-internals --import ${ctx.filesDir.absolutePath}/fs-register.mjs ${cli.absolutePath} web"
+        // 桥用普通 node 启动：它只做 socket 转发与 CDP 语义垫，不经 fs-register
+        // （那个 loader 是给 dsh 的 link() 兼容用的）。
+        val relayCmd = "${nodeDir.absolutePath}/bin/node ${ctx.filesDir.absolutePath}/${RELAY_SCRIPT}"
         val tpl = runCatching { ctx.assets.open(WEB_LAUNCHER_TPL).use { it.readBytes().toString(Charsets.UTF_8) } }
             .getOrElse {
                 onLog("WARN: 启动脚本模板缺失，回退内置模板")
@@ -625,6 +641,9 @@ object DshFlow {
                 .replace("@HOME@", ctx.filesDir.absolutePath)
                 .replace("@NODE_CMD@", nodeCmd)
                 .replace("@LOG_FILE@", File(FileLog.dir(ctx), WEB_LOG).absolutePath)
+                .replace("@RELAY_CMD@", relayCmd)
+                .replace("@RELAY_LOG@", File(FileLog.dir(ctx), RELAY_LOG).absolutePath)
+                .replace("@RELAY_PORT@", RELAY_PORT.toString())
         )
         launcher.setExecutable(true)
         // 唯一解释器：内置 Termux bash

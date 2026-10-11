@@ -7,6 +7,11 @@
 @EXPORTS@
 # 应用进程默认 cwd=/（不可写）：显式 cd 到可写 HOME（dsh 状态目录 files/.dsh 也在这里）
 cd "@HOME@" || exit 1
+# WebView CDP 桥：把应用自己的 System WebView 暴露成 ego-browser 的浏览器端点。
+# 必须先于 dsh 起来：ego 插件从导出块里的 EGO_LINUX_CDP_URL 拿中继地址。
+# 桥按需解析 WebView 的抽象 socket，所以此刻还没有 WebView 也没关系。
+nohup @RELAY_CMD@ > "@RELAY_LOG@" 2>&1 &
+echo DSH_RELAY_PID=$!
 # 内置 Termux bash 必带 nohup，直接后台化
 nohup @NODE_CMD@ > "@LOG_FILE@" 2>&1 &
 echo DSH_WEB_PID=$!

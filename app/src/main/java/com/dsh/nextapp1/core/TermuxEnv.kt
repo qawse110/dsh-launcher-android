@@ -77,6 +77,23 @@ object TermuxEnv {
             // 整棵树累积收益更大。目录落在 files/tmp 下（可重建，属于可丢弃缓存）。
             add("NODE_COMPILE_CACHE" to File(ctx.filesDir, "tmp/node-compile-cache").absolutePath)
             add("PREFIX" to usr)
+            // ── ego-browser 的浏览器后端：本应用的 System WebView ──────────────
+            // 设备上没有任何 Chrome/Chromium 可执行文件（全盘 find 命中 0），唯一可用的
+            // Chromium 能力就是本应用自己的 WebView。它通过同进程的抽象 socket 提供
+            // 完整 CDP（见 assets/webview-cdp-relay.mjs 文件头）。
+            //
+            // EGO_LINUX_CDP_URL 让 vendored ego 运行时的 ensureBrowser() 直接短路——
+            // 它压根不会去 resolveBinary()/spawn()，所以「没有浏览器二进制」这件事
+            // 在运行期不再成立，ego_doctor 也不再报 none found。
+            add("EGO_LINUX_CDP_URL" to "ws://127.0.0.1:" + DshFlow.RELAY_PORT + "/devtools/browser")
+            add("EGO_LINUX_WEBVIEW_RELAY_PORT" to DshFlow.RELAY_PORT.toString())
+            // 宿主已实现多窗口（WebViewActivity.onCreateWindow）。置 1 后中继才允许在
+            // 「只有用户 GUI 一个页」时用它当 opener —— 未开多窗口时 window.open 会把
+            // 当前页导航走（真机实测过），所以这个标志是安全前提，不是优化开关。
+            add("EGO_LINUX_WEBVIEW_MULTIWINDOW" to "1")
+            // 仅用于 ego_doctor 显示「browser binary」。运行期用不到（CDP URL 已短路），
+            // 指向中继脚本本身，让 doctor 报出一个真实存在的路径而不是 none found。
+            add("EGO_LINUX_CHROME" to File(ctx.filesDir, DshFlow.RELAY_SCRIPT).absolutePath)
             ldPreload(ctx)?.let { add(it) }
             add(
                 "PATH" to listOf(

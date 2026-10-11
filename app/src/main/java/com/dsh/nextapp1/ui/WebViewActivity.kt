@@ -5,6 +5,7 @@ import android.content.res.ColorStateList
 import android.graphics.Bitmap
 import android.graphics.Typeface
 import android.os.Bundle
+import android.os.Message
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -47,6 +48,25 @@ class WebViewActivity : AppCompatActivity() {
     /** codex://new?prompt=... 等 deep link 带入的指令，页面就绪后自动填入输入框。 */
     private var pendingPrompt: String? = null
     private var promptInjected = false
+
+    /**
+     * 多窗口（agent 新建页）容器与子 WebView 集合。
+     *
+     * 为什么需要多窗口：ego-browser 每个工具的第一步都是
+     * useSpace -> createTaskSpace -> Target.createTarget，而本机唯一可用的
+     * Chromium 能力就是本应用自己的 System WebView（设备上没有任何
+     * Chrome/Chromium 可执行文件）。实测该 WebView 的 Target.createTarget 恒返回
+     * "Not supported"，但**每个 WebView 实例都会在同一进程的 devtools socket 上
+     * 注册成独立的 page target** —— 所以「CDP 建页」可以等价成「window.open 一次」，
+     * 由这里的 onCreateWindow 真正造出第二个 WebView。
+     *
+     * ⚠️ 真机实测的关键安全约束：**未**开启多窗口时，window.open(url,"_blank")
+     * 不会被忽略，而是把**当前页**导航到该 url（本轮实测把用户的 dsh GUI 导航成了
+     * about:blank，已恢复）。所以 setSupportMultipleWindows(true) 与 onCreateWindow
+     * 必须同时成立，否则宁可不做。
+     */
+    private var popupLayer: FrameLayout? = null
+    private val popups = mutableListOf<WebView>()
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -166,6 +186,43 @@ class WebViewActivity : AppCompatActivity() {
             override fun onProgressChanged(view: WebView?, newProgress: Int) {
                 progressBar.progress = newProgress
             }
+
+            /**
+             * agent 要求新建页（CDP 的 Target.createTarget 被中继改写成页面侧
+             * window.open）时的落地实现：造一个真正独立的 WebView。
+             *
+             * 它是独立实例 ⇒ WebView 会把它注册成同一 devtools socket 上的另一个
+             * page target ⇒ ego 那边就看到了「新标签页」。
+             */
+            override fun onCreateWindow(
+                view: WebView?,
+                isDialog: Boolean,
+                isUserGesture: Boolean,
+                resultMsg: Message?
+            ): Boolean {
+                val msg = resultMsg ?: return false
+                // 多窗口关闭时 window.open 会导航当前页而不是失败 ——
+                // 拒绝打开，让 window.open 变成 no-op，绝不牺牲用户界面。
+                if (!webView.settings.supportMultipleWindows) return false
+                return runCatching { openPopupWebView(msg) }
+                    .onFailure { AppLog.e(TAG, "onCreateWindow failed: " + it.message) }
+                    .getOrDefault(false)
+            }
+
+            /** 新页被 window.close() 关掉时把子 WebView 收掉（否则会漏渲染进程）。 */
+            override fun onCloseWindow(window: WebView?) {
+                if (window == null) return
+                if (window === webView) return // 主界面不归这里管
+                runCatching { destroyPopup(window) }
+            }
+        }
+
+        webView.settings.apply {
+            // ⚠️ 两句都不能少：真机实测「未开多窗口」时 window.open(url,"_blank")
+            // 不会失败，而是把**当前页**导航到该 url（本轮实测把用户的 dsh GUI
+            // 导航成了 about:blank）。让 onCreateWindow 接住它，原页才不动。
+            javaScriptCanOpenWindowsAutomatically = true
+            setSupportMultipleWindows(true)
         }
 
         // dsh 0.1.5 起根路径受 browser-trust fence 保护（无凭据 401），
@@ -211,6 +268,10 @@ class WebViewActivity : AppCompatActivity() {
      * 注意：只 destroy 不摘父容器、或只摘父容器不 destroy，都回收不掉渲染进程。
      */
     override fun onDestroy() {
+        // 先收子 WebView：多窗口的 agent 页也是活的渲染进程，不收就会漏。
+        popups.toList().forEach { runCatching { destroyPopup(it) } }
+        popups.clear()
+        popupLayer = null
         rootView?.let { root ->
             root.removeAllViews()
         }
@@ -463,6 +524,87 @@ class WebViewActivity : AppCompatActivity() {
         webView.evaluateJavascript(js) { }
     }
 
+    /**
+     * 为 window.open 造一个真实的子 WebView，并把它交给 WebViewTransport。
+     *
+     * 关键点（真机/文档约束，不是可选项）：
+     *   · 必须真的 addView 到已 attach 的窗口上，否则该 WebView 不渲染、也不会注册成
+     *     devtools target —— ego 那边就看不到新页。
+     *   · 用户已确认「允许短暂可见」，所以直接铺满弹层；不做离屏/隐藏（ego 源码注释
+     *     记录过非前台窗口不渲染会让 document.elementFromPoint 返回 null，打断点选）。
+     *   · 子 WebView 自己也要有 WebChromeClient，否则它再开新页会被静默忽略。
+     */
+    private fun openPopupWebView(resultMsg: Message): Boolean {
+        val layer = popupLayer ?: FrameLayout(this).apply {
+            setBackgroundColor(Ui.BG)
+            layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        }.also {
+            popupLayer = it
+            rootView?.addView(it)
+        }
+
+        val child = WebView(this)
+        child.setBackgroundColor(Ui.BG)
+        child.settings.apply {
+            javaScriptEnabled = true
+            domStorageEnabled = true
+            allowFileAccess = true
+            mediaPlaybackRequiresUserGesture = false
+            cacheMode = WebSettings.LOAD_DEFAULT
+            javaScriptCanOpenWindowsAutomatically = true
+            setSupportMultipleWindows(true)
+        }
+        child.webViewClient = object : WebViewClient() {}
+        child.webChromeClient = object : WebChromeClient() {
+            override fun onCreateWindow(
+                view: WebView?,
+                isDialog: Boolean,
+                isUserGesture: Boolean,
+                msg: Message?
+            ): Boolean {
+                val m = msg ?: return false
+                return runCatching { openPopupWebView(m) }.getOrDefault(false)
+            }
+
+            override fun onCloseWindow(window: WebView?) {
+                if (window == null) return
+                runCatching { destroyPopup(window) }
+            }
+        }
+
+        layer.addView(child, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.MATCH_PARENT
+        ))
+        popups.add(child)
+
+        // 必须交回一个已 attach 的 WebView，新窗口才有渲染进程与 devtools target。
+        val transport = resultMsg.obj as? WebView.WebViewTransport ?: return false
+        transport.webView = child
+        resultMsg.sendToTarget()
+        AppLog.i(TAG, "popup WebView created (total=" + popups.size + ")")
+        return true
+    }
+
+    /** 销毁一个子 WebView；三步与主界面 onDestroy 同理（摘父容器 → destroy → 置空）。 */
+    private fun destroyPopup(window: WebView) {
+        if (!popups.remove(window)) return
+        runCatching { window.stopLoading() }
+        runCatching { window.webChromeClient = null }
+        runCatching { window.webViewClient = object : WebViewClient() {} }
+        runCatching { (window.parent as? ViewGroup)?.removeView(window) }
+        runCatching { window.removeAllViews() }
+        runCatching { window.destroy() }
+        if (popups.isEmpty()) {
+            popupLayer?.let { l -> runCatching { rootView?.removeView(l) } }
+            popupLayer = null
+        }
+        AppLog.i(TAG, "popup WebView destroyed (remaining=" + popups.size + ")")
+    }
+
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
     /**
@@ -497,6 +639,7 @@ class WebViewActivity : AppCompatActivity() {
     }
 
     companion object {
+        private const val TAG = "WebViewActivity"
         private const val TARGET_URL = "http://127.0.0.1:" + com.dsh.nextapp1.core.DshFlow.WEB_PORT
     }
 }
