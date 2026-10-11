@@ -81,18 +81,20 @@ Kotlin 展示面与 `install-dsh.mjs` 装配面都从它派生；一致性由 `n
 
 | 插件 | 来源 | 作用 |
 |---|---|---|
-| `dsh-web-mobile` | <https://github.com/mexiaosqwq/dsh-web-mobile> | 竖屏/窄屏 Web 适配（抽屉导航、全宽会话、安全区、触控人体工学） |
-| `dsh-prompt-optimizer-mobile` | <https://github.com/WestFox-AwA/dsh-prompt-optimizer> `v0.8.1-stable` 基线（见 [FORK.md](app/src/main/assets/extra-plugins/dsh-prompt-optimizer-mobile/FORK.md)） | 提示词优化（发送前用独立 AI 改写成命令）。**本部署默认启用**：未配置即启用，仅显式 `enabled:false` 才关闭（上游原版默认不启用，本部署依需要翻转） |
-| `dsh-codearts-auth` | <https://gitee.com/iJetLi/deepseek-harness-codearts> | CodeArts / Buddy / Qoder / Trae / Cline / Loomy 等多 Provider 登录与模型接入 |
+| `dsh-web-mobile` | <https://github.com/mexiaosqwq/dsh-web-mobile> `v3.0.5` | 竖屏/窄屏 Web 适配（抽屉导航、全宽会话、安全区、触控人体工学） |
+| `dsh-prompt-optimizer-mobile` | <https://github.com/WestFox-AwA/dsh-prompt-optimizer> `v0.8.3-stable` 基线（见 [FORK.md](app/src/main/assets/extra-plugins/dsh-prompt-optimizer-mobile/FORK.md)） | 提示词优化（发送前用独立 AI 改写成命令）。**本部署默认启用**：未配置即启用，仅显式 `enabled:false` 才关闭（上游原版默认不启用，本部署依需要翻转）；另保留移动端窄屏 UI 适配与包名对齐 |
+| `dsh-codearts-auth` | <https://gitee.com/iJetLi/deepseek-harness-codearts> tag `0.2.0-rc.5` 本地构建 | CodeArts / Buddy / Qoder / Trae / Cline / Loomy / Gemini 等多 Provider 登录与模型接入 |
 | `dsh-status-bridge` | **本仓库自研** | dsh 运行状态桥接到悬浮窗/通知（本地 HTTP，默认 :3190）。**与启动器 Kotlin 侧强耦合**：不装配则悬浮窗状态显示/TTS 播报链路失效（心跳 note 记为 `bridge-absent`，与「装了但掉线」区分开）。`/status` **需要 token**（每次启动轮换、写入 `files/status-bridge.json`，Kotlin 通过 `BridgeContract` 同源读取；不再回 CORS 头）；`lastText` 支持**逐段实时增长**（经 LLM 层 `llm/stream` waterfall 钩子对主请求做 tee，只取 `text-delta`，`reasoning`/`tool-call` 不外放） |
 | `dsh-android-links` | **本仓库自研** | 在 dsh HOME 创建 `sdcard → /storage/emulated/0` 符号链接，让工作区目录浏览器直达 SD 卡 |
-| `dsh-net-proxy` | 自 `prebuilt.tgz` 恢复 | 让 agent 自身的网络请求（web_search / web_fetch / 外部 API）走已配置的 HTTP(S) 代理 |
+| `dsh-net-proxy` | <https://github.com/mafeis/dsh-net-proxy> `v0.8.0` | 让 agent 自身的网络请求（web_search / web_fetch / 外部 API）走已配置的 HTTP(S) 代理 |
 | `dsh-provider-headers` | 自 `prebuilt.tgz` 恢复 | 在 Web 的模型设置页为自定义（llm-pi-ai）Provider 配置自定义请求头 |
 | `dsh-vision` | 自 `prebuilt.tgz` 恢复 | 给纯文本模型加上 `view_image` 工具：复用宿主 Provider 配置，或接自定义 OpenAI 兼容 VLM 端点 |
+| `@liustack/modsearch` | <https://github.com/liustack/modsearch> `v5.10.6`（npm 产物，整包同源） | 联网检索：把 `web_search`/`web_fetch` 的后端换成免密钥的 modsearch 引擎链（Firecrawl 免密钥、1,000 次/月），并新增 `x_search`、`read_page`。⚠ 运行时依赖 `commander`/`undici` 由**依赖桥接**供给（见下） |
+| `dsh-ego-browser` | <https://github.com/Fisfzy/dsh-ego-browser> `v0.8.6`（npm 产物，整包同源） | Agent 浏览器：30+ `ego_*` 工具 + 实时观察窗，底层内置 ego-lite 运行时。⚠ **运行期需一个可达的 Chrome/Chromium 二进制**（本机未装，见下） |
 
 ### 内置集合的构成
 
-内置集合**由用户逐项决定**（原先「仅内置三个」的约束已撤回），当前为 **8 个**。
+内置集合**由用户逐项决定**（原先「仅内置三个」的约束已撤回），当前为 **10 个**。
 装完即可用；源码在 `assets/extra-plugins/`，唯一真源见
 [`plugin-manifest.json`](app/src/main/assets/plugin-manifest.json)。
 
@@ -105,26 +107,74 @@ Kotlin 展示面与 `install-dsh.mjs` 装配面都从它派生；一致性由 `n
 | `dsh-llm-codebuddy` | CodeBuddy 中国区/国际版 LLM Provider（独立命名空间 `llm-codebuddy`，只新增 Provider） |
 | `@dsh-external/dsh-oh-we-need` | 推理风格 Skill（历史遗留，此前从未接入装配链） |
 
-> **⚠ 其中三项（`dsh-net-proxy` / `dsh-provider-headers` / `dsh-vision`）的来源需说明**：
+> **⚠ 其中两项（`dsh-provider-headers` / `dsh-vision`）的来源需说明**：
 > 它们原先只存在于 `prebuilt.tgz` 的 `third_party/`，而该供给链已在提交 `e3cf666` 移除，
 > 仓库里**从未有过**它们的独立副本（`git ls-files` 0 命中）。本次是从本地构建残留
 > `app/build/intermediates/.../prebuilt.tgz` 恢复源码后重新纳入的——
 > **该残留不在 git 中，其 sha256 与 git LFS 记录的指针也不一致**，
 > 因此无法断言这就是当年入库的那一版。恢复后已针对 dsh 0.1.7-rc.2 做过适配（见下）。
+>
+> `dsh-net-proxy` 已在后续一轮更新中**确认上游并整包同源**（`mafeis/dsh-net-proxy` `v0.8.0`，
+> 其 `lib/` 自入库以来从未被本地改动过，唯一差异是 0.2.0 适配时放开的 peer 范围）；
+> 该条不再属于「来源不明」之列。
+
+> **专项调研结论（`dsh-vision` / `dsh-provider-headers`，均无可更新的上游）**：
+> · `dsh-vision`：其上游身份可追溯但**版本落后**——候选仓库 `dsh-external/dsh-vision` 与
+>   `william-jin-cmu/dsh-vision` 实为同一仓库（前者 301 重定向到后者，`git ls-remote` 返回同一 SHA），
+>   该仓库**无 tag**，`main` 的包内版本为 `0.1.0`（未合并 PR 最高 `0.1.1`），而本仓副本是 `0.2.0`
+>   —— 本地比上游新，**不存在可同步的新版**。按名匹配穷举 305 个 `dsh-vision` 仓库后，
+>   无任何一个含本副本的双后端结构（`lib/backend.js` + `lib/client.js`）。
+> · `dsh-provider-headers`：**无可识别上游**。同名 npm 包（duanyunlun `0.1.2`）与各候选仓库的
+>   结构指纹均不匹配（本地用 `settings.section` 槽 + locale 命名空间 `providerHeaders` + `sendAttribution` 开关；
+>   候选用 `settings.models.provider-card` 槽 + `dsh.modelHeaders`）。与本仓文档记录的「源自构建残留」一致。
+> · 两项的排除均基于**按仓库名搜索 + 原始文件结构探测**；GitHub 代码搜索需鉴权（本机 401），
+>   故「存在一个改了名、但文件集完全相同的仓库」这一情形**未被证明排除**。
+> 结论：这两项本轮**未动**，来源风险与版本落后状态照旧成立。
 
 > `dsh-web-mobile` 是其前身插件改名后的**后继**（同一插件的新名），旧名已退役以免双份注册，
 > 本仓不再维护退役旧名的名录；插件自带的迁移说明见各插件 README。
 
-### 针对 dsh 0.1.7-rc.2 的适配（恢复的三项）
+### 针对 dsh 0.1.7-rc.2 的适配（恢复的两项）
 
 | 插件 | 上游写法 | 适配后 | 依据 |
 |---|---|---|---|
 | `dsh-provider-headers` | `require('@deepseek-ai/dsh-client-runtime/client').createSnapshotStore` | 改从 **`@deepseek-ai/dsh-client-store`** 取 | `dsh-client-runtime` 在 0.1.7-rc.2 全仓 **0 命中**（已不存在）；`createSnapshotStore` 现存于 `dsh-client-store`，签名一致，宿主自带的 `dsh-client-ui-sidebar/lib/client.js` 正是这么用的 |
 | `dsh-vision` | `import { settingsNamespace } from '@deepseek-ai/dsh-settings'` | **就地内联**该函数 | 0.1.7-rc.2 的导出面实测仅 `{SettingsConflictError, SettingsForms, SettingsForms as default, redactSecrets}`，该符号已移除；ESM 具名导入在链接期即抛错，try/catch 兜不住。原实现只是「校验后原值返回」，源码既已随 APK 分发，内联比启动期改写干净 |
-| `dsh-net-proxy` | — | 无需改动 | 依赖仅 `node:*` / `react` / `dsh-client-ui-primitives` / `schemastery`，均存在 |
 
-三者在真机上均通过 **ESM 链接测试**（`import()` 插件入口）：
-`dsh-net-proxy` → `name="net-proxy"`、`dsh-provider-headers`、`dsh-vision` → `apply` 均为 function。
+`dsh-net-proxy` 当时即无需改动（依赖仅 `node:*` / `react` / `dsh-client-ui-primitives` / `schemastery`，均存在）。
+
+这些插件在真机上均通过 **ESM 链接测试**（`import()` 插件入口）：入口的 `apply` 均为 function。
+
+### 本轮新增的两项（`modsearch` / `dsh-ego-browser`）
+
+两项均取自各自 **npm 官方 tarball**（`registry.npmmirror.com`，sha256 与本地副本逐字节一致：
+`modsearch` `ca631394…`、`dsh-ego-browser` `d7e8db48…`），**整包同源、未改任何字节**，
+因此不需要「就地适配」那一档处置。
+
+**兼容性事实（读 package.json 实测，非推断）**：`@liustack/modsearch` **未声明任何
+`@deepseek-ai/dsh*` peer**（只有 `commander`/`undici` 两个 dependencies），
+故 0.2.0-rc.2 的 `evaluatePluginCompatibility` 对它直接返回 `undefined`（不适用）；
+`dsh-ego-browser` 声明的 `dsh.engines.dsh` 为 `>=0.1.2-rc.1`，其 `peerDependencies` 全部是
+`>=0.1.2-rc.1` 的下界范围且均标 `optional`，`0.2.0-rc.2` 全部满足。
+用 **dsh 自带的那个判定函数**逐个核对，两者均返回 `undefined`（兼容）。
+
+**依赖桥接（`modsearch` 专有的隐性契约）**：该包的 `dsh/index.js` 以
+`process.execPath` 拉起自带 CLI `dist/main.js`，而 CLI 顶层 `import { Command } from "commander"`
+与 `from "undici"`。装配走的是 `link:`，pnpm **不会**为它按 `dependencies` 落盘；
+它靠的是 `install/deps.mjs` 把 `dsh-prefix` 的 pnpm store 软链进
+`files/plugins/node_modules` —— 实测解析到的实际版本是 **commander 15.0.0 / undici 8.11.2**
+（本包声明 `^13.1.0` / `^7.29.0`，均**跨大版本**）。已在本机真跑
+`modsearch doctor` 与 `modsearch search`（真实出网，Firecrawl 命中）验证这条链可用。
+若将来升级 dsh 后这两个包被移出 store，`modsearch` 的工具会在调用时报
+`Cannot find package 'commander'`，届时按同样方式补桥接即可。
+
+**`dsh-ego-browser` 的运行期前提**：它需要一个可达的 Chrome/Chromium 二进制
+（自动探测 PATH 与常见路径，也可在插件设置里填 `chromePath`，或用 `EGO_LINUX_CHROME`）。
+**本机当前未安装任何浏览器**（`pm list packages` 无 Chrome/Brave/Edge，文件系统亦无二进制），
+所以它在真机上的现状是：**插件能加载、`ego_*` 工具能注册与调用**，
+但实际驱动浏览器会如实回报「未找到浏览器二进制」。
+这属于**运行期外部前提**，不是装配/兼容性问题；`ego_doctor` 已把该状态列为一条
+`browser binary: (none found …)` 的明确输出，不会静默失败。
 
 ## dsh 版本适配
 

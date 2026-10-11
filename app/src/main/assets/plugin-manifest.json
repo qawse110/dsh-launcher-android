@@ -73,6 +73,24 @@
       "title": "图片理解",
       "desc": "给纯文本模型加上 view_image 工具：复用宿主 Provider 配置或自定义 OpenAI 兼容 VLM 端点。适配：settingsNamespace 就地内联（上游已在 0.1.7-rc.2 移除该导出）",
       "version": "0.2.0"
+    },
+    {
+      "dir": "modsearch",
+      "name": "@liustack/modsearch",
+      "id": "modsearch",
+      "title": "联网检索 ModSearch",
+      "desc": "把 web_search / web_fetch 的检索后端换成免密钥的 modsearch 引擎链（Firecrawl 免密钥、1,000 次/月），并新增 x_search（X 检索）与 read_page（精读网页）两个工具；引擎与密钥配置在 ~/.modsearch/config.json。取自上游 liustack/modsearch v5.10.6 的 npm 产物（整包同源，无本地改动：该包未声明任何 @deepseek-ai/dsh-* peer，0.2.0-rc.2 的兼容性前置校验对其不适用）。运行时依赖 commander / undici 由安装链的依赖桥接（dsh-prefix 的 .pnpm store 软链进 files/plugins/node_modules）提供，不再由 pnpm 按本包 dependencies 解析——桥接到的实际版本为 commander 15 / undici 8（本包声明为 ^13 / ^7），已真机跑通 modsearch doctor 与 modsearch search",
+      "version": "5.10.6",
+      "upstream": "https://github.com/liustack/modsearch"
+    },
+    {
+      "dir": "dsh-ego-browser",
+      "name": "dsh-ego-browser",
+      "id": "ego-browser",
+      "title": "Agent 浏览器",
+      "desc": "30+ ego_* 工具驱动的结构化浏览器自动化（ego_click / ego_snapshot / ego_fill / ego_script 等），配实时观察窗（SSE 投屏 + 直接鼠标交互 + 下载捕获 + 人机验证提示），底层跑本包内置的 ego-lite 运行时。取自上游 Fisfzy/dsh-ego-browser v0.8.6 的 npm 产物（整包同源，无本地改动：其声明的最低 dsh 为 >=0.1.2-rc.1，覆盖 targetDsh 0.2.0-rc.2）。⚠ 运行期前提：设备上需有一个可达的 Chrome/Chromium 二进制（插件会自动探测 PATH 与常见路径，也可在插件设置里填 chromePath）——本机当前未装任何浏览器，故工具可加载可调用但会如实回报「未找到浏览器二进制」，这不是装配问题",
+      "version": "0.8.6",
+      "upstream": "https://github.com/Fisfzy/dsh-ego-browser"
     }
   ],
   "$optionalComment": "optional 条目与 builtin 一样带 version（便于追溯副本对应哪一版）；本仓自研的桥接插件是本地实现、无上游仓库，故不带 upstream 字段——不编造出处。",

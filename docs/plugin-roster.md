@@ -47,11 +47,13 @@
 > `router-*` 预设名单与一份退役插件名录；前者只服务于恒不命中的分支且会误删
 > routing-suite 仍在用的预设，后者不驱动任何行为）。
 
-### 内置集合（8 个）
+### 内置集合（10 个）
 
 `dsh-web-mobile`、`dsh-prompt-optimizer-mobile`、`dsh-codearts-auth`（原有三个，未动）
 ＋ `dsh-status-bridge`、`dsh-android-links`（由 optional 移入 `assets/extra-plugins/`）
-＋ `dsh-net-proxy`、`dsh-provider-headers`、`dsh-vision`（自 `prebuilt.tgz` 残留恢复并适配）。
+＋ `dsh-net-proxy`、`dsh-provider-headers`、`dsh-vision`（自 `prebuilt.tgz` 残留恢复并适配）
+＋ `modsearch`（`@liustack/modsearch` v5.10.6）、`dsh-ego-browser`（v0.8.6）
+（后两项为 npm 官方产物整包同源，见 README「本轮新增的两项」）。
 
 ### 可选集合（2 个，未动）
 
