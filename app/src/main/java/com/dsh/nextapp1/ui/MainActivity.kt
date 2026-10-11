@@ -570,9 +570,11 @@ class MainActivity : AppCompatActivity() {
         })
 
         // 环境状态 chips
-        envChipsRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
+        // ★ 必须是真正的换行容器：横向 LinearLayout 不会换行，5 枚芯片在
+        //   「⚠ 授权」态下总宽超过可用宽（361dp 屏实测约 415dp），会被夹到父宽后
+        //   由 Gravity.CENTER 把超出量均分到左右 —— 左端落到负坐标，
+        //   在竖向 ScrollView 里既看不到也点不到（「Node」芯片整枚消失）。
+        envChipsRow = Ui.flowRowLayout(this).apply {
             setPadding(0, dp(14), 0, 0)
         }
         root.addView(envChipsRow)
@@ -604,7 +606,7 @@ class MainActivity : AppCompatActivity() {
         return ScrollView(this).apply { addView(root) }
     }
 
-    private lateinit var envChipsRow: LinearLayout
+    private lateinit var envChipsRow: Ui.FlowRowLayout
     private lateinit var helpBody: TextView
 
     /** 用户主动触发：强制查 npm 并显示结果。 */
@@ -833,9 +835,11 @@ class MainActivity : AppCompatActivity() {
 
         fun chip(label: String, color: Int, onClick: (() -> Unit)? = null) {
             val pill = Ui.pill(this, label, color).apply {
+                // 行内/行间间距统一由 FlowRowLayout 的 itemSpacing/lineSpacing 负责，
+                // 这里不再加 rightMargin（否则换行后行尾会多出一段空隙、左右不齐）。
                 layoutParams = LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
-                ).apply { rightMargin = dp(6) }
+                )
                 if (onClick != null) {
                     isClickable = true
                     setOnClickListener { onClick() }

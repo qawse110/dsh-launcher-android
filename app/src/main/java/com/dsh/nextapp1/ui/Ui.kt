@@ -6,7 +6,9 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
+import android.util.AttributeSet
 import android.view.View
+import android.view.ViewGroup
 import android.widget.LinearLayout
 import android.widget.TextView
 import com.google.android.material.button.MaterialButton
@@ -253,6 +255,181 @@ object Ui {
         chipSpacingHorizontal = dp(context, 8)
         chipSpacingVertical = dp(context, 4)
     }
+
+    /**
+     * 流式排版的**纯函数核心**：只做行划分与尺寸计算，不碰任何 View/Context，
+     * 因此可以在 JVM 单测里直接验证（见 `UiFlowRowTest`）。
+     *
+     * 换行规则：从左到右累加子控件占宽（含 [itemSpacing]），一旦「再加一个就
+     * 超过 [available]」且当前行非空，就另起一行。**任何情况下都不会让某一行
+     * 超过 available**（单个子控件本身就超宽时除外——那由调用方按可用宽封顶）。
+     */
+    object FlowPacker {
+
+        /** GONE 子控件的占位：不参与排版。 */
+        const val SKIP = Int.MIN_VALUE
+
+        /** 一行子控件的下标（按原始 child 顺序）。 */
+        class Packed(val rows: List<List<Int>>, val rowHeights: List<Int>, val widest: Int, val totalHeight: Int)
+
+        fun pack(
+            widths: List<Int>,
+            heights: List<Int>,
+            itemSpacing: Int,
+            lineSpacing: Int,
+            available: Int
+        ): Packed {
+            val rows = mutableListOf<List<Int>>()
+            val rowHeights = mutableListOf<Int>()
+            var current = mutableListOf<Int>()
+            var lineWidth = 0
+            var lineHeight = 0
+            var totalHeight = 0
+            var widest = 0
+
+            for (i in widths.indices) {
+                val w = widths[i]
+                if (w == SKIP) continue
+                val h = heights.getOrElse(i) { 0 }
+                val needed = if (current.isEmpty()) w else lineWidth + itemSpacing + w
+                if (current.isNotEmpty() && needed > available) {
+                    // 换行：先结算上一行
+                    rows.add(current)
+                    rowHeights.add(lineHeight)
+                    widest = maxOf(widest, lineWidth)
+                    totalHeight += lineHeight + lineSpacing
+                    current = mutableListOf()
+                    lineWidth = w
+                    lineHeight = h
+                } else {
+                    lineWidth = needed
+                    lineHeight = maxOf(lineHeight, h)
+                }
+                current.add(i)
+            }
+            if (current.isNotEmpty()) {
+                rows.add(current)
+                rowHeights.add(lineHeight)
+                widest = maxOf(widest, lineWidth)
+                totalHeight += lineHeight
+            }
+            return Packed(rows, rowHeights, widest, totalHeight)
+        }
+    }
+
+    /**
+     * 流式行容器：子控件按内容自然宽度排布，一行放不下就换到下一行。
+     *
+     * **为什么必须是真正的换行容器而不是 HORIZONTAL LinearLayout**：
+     * 横向 LinearLayout 永远不会换行，宽度超出父容器时它会被 resolveSizeAndState
+     * 夹到父宽（同时带上 MEASURED_STATE_TOO_SMALL），再叠加 Gravity.CENTER 就会把
+     * 超出部分**均分到左右两侧** —— 左侧那部分落到负坐标。放进竖向 ScrollView 后
+     * 横向不可滚动，负坐标的子控件既看不到也点不到（真机 361dp 宽、5 枚状态芯片
+     * 在「⚠ 授权」态下总宽 415dp，左端 x ≈ -47dp，整个「Node」芯片消失）。
+     * 这里换成 onMeasure 里自己按行摆放的容器：总宽超过可用宽就换行，
+     * 因此任何宽度下都不会横向溢出，也不会把子控件推出可点区域。
+     */
+    class FlowRowLayout @JvmOverloads constructor(
+        context: Context,
+        attrs: AttributeSet? = null,
+        defStyleAttr: Int = 0
+    ) : ViewGroup(context, attrs, defStyleAttr) {
+
+        /** 行内水平间距（px）。 */
+        var itemSpacing = 0
+
+        /** 行间垂直间距（px）。 */
+        var lineSpacing = 0
+
+        /** 已排版的行（onMeasure 算好，onLayout 直接用，保证两次遍历行划分一致）。 */
+        private val rows = mutableListOf<MutableList<View>>()
+
+        /** 每行的高度（含子控件上下外边距）。 */
+        private val rowHeights = mutableListOf<Int>()
+
+        // measureChildWithMargins 要求 MarginLayoutParams；默认实现返回的
+        // ViewGroup.LayoutParams 会 ClassCastException，故统一给带边距的类型。
+        override fun generateDefaultLayoutParams(): LayoutParams =
+            MarginLayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT)
+
+        override fun generateLayoutParams(attrs: AttributeSet?): LayoutParams =
+            MarginLayoutParams(context, attrs)
+
+        override fun generateLayoutParams(p: LayoutParams): LayoutParams = MarginLayoutParams(p)
+
+        override fun checkLayoutParams(p: LayoutParams): Boolean = p is MarginLayoutParams
+
+        override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+            val constrained = MeasureSpec.getMode(widthMeasureSpec) != MeasureSpec.UNSPECIFIED
+            val available = if (constrained) {
+                (MeasureSpec.getSize(widthMeasureSpec) - paddingLeft - paddingRight).coerceAtLeast(0)
+            } else {
+                Int.MAX_VALUE
+            }
+
+            // 先量出每个子控件的占宽/占高（含外边距），再交给纯函数排版核心决定行划分。
+            val widths = ArrayList<Int>(childCount)
+            val heights = ArrayList<Int>(childCount)
+            for (i in 0 until childCount) {
+                val child = getChildAt(i)
+                if (child.visibility == GONE) {
+                    widths.add(FlowPacker.SKIP)
+                    heights.add(0)
+                    continue
+                }
+                // 带 margins 的测量：子控件自带外边距时也能正确计入占宽/占高。
+                measureChildWithMargins(child, widthMeasureSpec, 0, heightMeasureSpec, 0)
+                val lp = child.layoutParams as? MarginLayoutParams
+                widths.add(child.measuredWidth + (lp?.leftMargin ?: 0) + (lp?.rightMargin ?: 0))
+                heights.add(child.measuredHeight + (lp?.topMargin ?: 0) + (lp?.bottomMargin ?: 0))
+            }
+
+            val pack = FlowPacker.pack(widths, heights, itemSpacing, lineSpacing, available)
+            rows.clear()
+            for (row in pack.rows) rows.add(row.map { getChildAt(it) }.toMutableList())
+            rowHeights.clear()
+            rowHeights.addAll(pack.rowHeights)
+
+            // 单个子控件比可用宽还宽时（极端字体/超长文案）按可用宽封顶，
+            // 不让它把整行撑破——子控件自身负责省略或换行。
+            val contentWidth = when {
+                pack.rows.isEmpty() -> 0
+                constrained -> pack.widest.coerceAtMost(available)
+                else -> pack.widest
+            }
+            setMeasuredDimension(
+                resolveSize(contentWidth + paddingLeft + paddingRight, widthMeasureSpec),
+                resolveSize(pack.totalHeight + paddingTop + paddingBottom, heightMeasureSpec)
+            )
+        }
+
+        override fun onLayout(changed: Boolean, l: Int, t: Int, r: Int, b: Int) {
+            var y = paddingTop
+            for ((index, row) in rows.withIndex()) {
+                var x = paddingLeft
+                for (child in row) {
+                    val lp = child.layoutParams as? MarginLayoutParams
+                    val left = lp?.leftMargin ?: 0
+                    val top = lp?.topMargin ?: 0
+                    x += left
+                    child.layout(x, y + top, x + child.measuredWidth, y + top + child.measuredHeight)
+                    x += child.measuredWidth + (lp?.rightMargin ?: 0) + itemSpacing
+                }
+                y += (rowHeights.getOrNull(index) ?: 0) + lineSpacing
+            }
+        }
+    }
+
+    /**
+     * 状态芯片行等「按内容自然宽度排布、放不下就换行」的场景。
+     * 与 [flowRow] 的区别：不要求子控件是 Chip（可用 Ui.pill 的 TextView 等），
+     * 且是真正的换行容器（见 [FlowRowLayout] 的说明）。
+     */
+    fun flowRowLayout(context: Context, itemSpacingDp: Int = 6, lineSpacingDp: Int = 6): FlowRowLayout =
+        FlowRowLayout(context).apply {
+            itemSpacing = dp(context, itemSpacingDp)
+            lineSpacing = dp(context, lineSpacingDp)
+        }
 
     /**
      * 等宽按钮网格：[columns] 列等分、行内等高对齐、末行补空位保持网格整齐。
