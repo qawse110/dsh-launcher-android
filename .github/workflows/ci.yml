@@ -49,6 +49,31 @@ jobs:
       - name: Unit tests（P2-2 单测门禁）
         run: ./gradlew :app:testDebugUnitTest --no-daemon
 
+      - name: 单测结果摘要（写进日志，便于无产物时核对）
+        # artifact 走 Azure Blob，某些网络下取不回；把每个测试类的
+        # tests/failures/errors 直接打进 job 日志，使「某类是否真的跑了、
+        # 是否全过」可从日志自证，不必依赖下载产物。
+        if: always()
+        run: |
+          set -e
+          dir=app/build/test-results/testDebugUnitTest
+          if [ ! -d "$dir" ]; then echo "no test-results dir"; exit 0; fi
+          total=0; failed=0
+          for f in "$dir"/TEST-*.xml; do
+            [ -e "$f" ] || continue
+            line=$(head -c 2000 "$f" | tr '\n' ' ' | sed -n 's/.*<testsuite \([^>]*\)>.*/\1/p')
+            # $line 是 <testsuite 的属性串（以 name=" 开头），末尾还有
+            # hostname="..."；不锚行首会贪婪匹配到 hostname 的值。
+            name=$(echo "$line" | sed -n 's/^name="\([^"]*\)".*/\1/p')
+            t=$(echo "$line" | sed -n 's/.*tests="\([0-9]*\)".*/\1/p')
+            fa=$(echo "$line" | sed -n 's/.*failures="\([0-9]*\)".*/\1/p')
+            er=$(echo "$line" | sed -n 's/.*errors="\([0-9]*\)".*/\1/p')
+            echo "TESTCLASS $name tests=$t failures=$fa errors=$er"
+            total=$((total + ${t:-0})); failed=$((failed + ${fa:-0} + ${er:-0}))
+          done
+          echo "TESTTOTAL tests=$total failures+errors=$failed"
+          if [ "$failed" -ne 0 ]; then echo "unit tests failed"; exit 1; fi
+
       - name: Upload test reports
         if: always()
         uses: actions/upload-artifact@v4
