@@ -380,8 +380,27 @@ object Ui {
                 // 带 margins 的测量：子控件自带外边距时也能正确计入占宽/占高。
                 measureChildWithMargins(child, widthMeasureSpec, 0, heightMeasureSpec, 0)
                 val lp = child.layoutParams as? MarginLayoutParams
-                widths.add(child.measuredWidth + (lp?.leftMargin ?: 0) + (lp?.rightMargin ?: 0))
-                heights.add(child.measuredHeight + (lp?.topMargin ?: 0) + (lp?.bottomMargin ?: 0))
+                val hMargins = (lp?.leftMargin ?: 0) + (lp?.rightMargin ?: 0)
+                val vMargins = (lp?.topMargin ?: 0) + (lp?.bottomMargin ?: 0)
+
+                // 固定尺寸（如 width=500px）的子控件不会受父级 AT_MOST 约束，会原样溢出。
+                // 这里对「本身就比可用宽还宽」的子控件按可用宽重测一次，使
+                // 「任何子控件都不越出内容区」成为**无条件**不变式（文案控件会自行省略）。
+                if (constrained && available > 0 && child.measuredWidth + hMargins > available) {
+                    val childWidth = (available - hMargins).coerceAtLeast(0)
+                    val childHeightSpec = getChildMeasureSpec(
+                        heightMeasureSpec,
+                        paddingTop + paddingBottom + vMargins,
+                        lp?.height ?: LayoutParams.WRAP_CONTENT
+                    )
+                    child.measure(
+                        MeasureSpec.makeMeasureSpec(childWidth, MeasureSpec.EXACTLY),
+                        childHeightSpec
+                    )
+                }
+
+                widths.add(child.measuredWidth + hMargins)
+                heights.add(child.measuredHeight + vMargins)
             }
 
             val pack = FlowPacker.pack(widths, heights, itemSpacing, lineSpacing, available)
