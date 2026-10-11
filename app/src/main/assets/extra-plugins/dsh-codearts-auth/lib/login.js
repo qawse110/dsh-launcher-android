@@ -101,8 +101,26 @@ export async function pollForCredential(ticketId, secret, options = {}) {
     }
     throw new Error('CodeArts login timed out');
 }
-/** 使用平台默认打开器打开 URL；永不抛出异常。 */
+/**
+ * 使用平台默认打开器打开 URL；永不抛出异常。
+ *
+ * ⚠️ **「永不抛出」必须靠 `'error'` 监听器兑现**（真实缺陷，2026-10-03）。
+ *
+ * `spawn` 的失败（`ENOENT` / `EACCES`）是以**异步 `'error'` 事件**上报的，
+ * 外层 `try/catch` **接不住**它。而 `ChildProcess` 是 EventEmitter ——
+ * `'error'` 没有监听器时会被 `throw` 成**未捕获异常**。
+ *
+ * POSIX 上这很容易踩：无桌面环境的 `open`（macOS）/ `xdg-open`（Linux）
+ * 常常不存在 ⇒ `ENOENT` ⇒ **直接把宿主进程带走**。
+ * （Windows 的 `cmd` 恒存在，所以只在 POSIX 上暴露 —— 典型的「本地测不出来」。）
+ *
+ * ⚠️ 用 `child.unref()` + 监听器，不能只 `unref` 就完事：前者让父进程
+ * 不因它挂起，后者补上缺失的监听器，二者缺一不可。
+ */
 export function openBrowser(url) {
+    const warn = (error) => {
+        console.error('[codearts-auth] failed to open browser; open manually:', url, error);
+    };
     const win = process.platform === 'win32';
     if (win) {
         // Windows 下 cmd /c start 会把 URL 中每个 '&' 当作命令分隔符，导致参数被截断
@@ -112,21 +130,23 @@ export function openBrowser(url) {
         const args = ['/c', 'start', '""', `"${url}"`];
         try {
             const child = spawn('cmd', args, { detached: true, stdio: 'ignore', windowsVerbatimArguments: true });
+            child.on('error', warn);
             child.unref();
             return;
         }
         catch (error) {
-            console.error('[codearts-auth] failed to open browser; open manually:', url, error);
+            warn(error);
             return;
         }
     }
     const cmd = process.platform === 'darwin' ? 'open' : 'xdg-open';
     try {
         const child = spawn(cmd, [url], { detached: true, stdio: 'ignore' });
+        child.on('error', warn);
         child.unref();
     }
     catch (error) {
-        console.error('[codearts-auth] failed to open browser; open manually:', url, error);
+        warn(error);
     }
 }
 const CORS_HEADERS = {

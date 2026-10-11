@@ -1,8 +1,8 @@
 {
   "name": "dsh-prompt-optimizer-mobile",
-  "version": "0.8.1-stable",
+  "version": "0.8.3-stable",
   "private": true,
-  "description": "提示词优化。基于上游 WestFox-AwA/dsh-prompt-optimizer v0.8.1-stable，**本部署默认启用**：未配置即启用，仅显式 enabled:false 才关闭（上游原版默认不启用，本部署依需要翻转该默认值）。",
+  "description": "独立裁判层：把你的话编译成可执行约束（意图 / 质量口径 / 未决项 / 实现选项），治理工作区工具运行时（内置 bash 与 POSIX：取消、输出、资源收尾可靠），并在交付前由独立顾问做分项复核与覆盖核对。private 保持 true：只发 GitHub Release 附件，不发布到 npm；效果证据待后续跑分测试，本描述不作性能断言。",
   "type": "module",
   "main": "./lib/index.js",
   "exports": {
@@ -30,9 +30,7 @@
     "README.md",
     "HELP-0.6.md",
     "HELP-0.6.en.md",
-    "eval/HOLDOUT-v1.md",
-    "eval/HOLDOUT-v2.md",
-    "LICENSE"
+    "eval"
   ],
   "dsh": {
     "bundle": {
@@ -41,7 +39,7 @@
     "client": {
       "platform": "web",
       "inject": [
-        "react",
+        "@deepseek-ai/dsh-client-runtime",
         "@deepseek-ai/dsh-client-ui-slots"
       ],
       "external": [

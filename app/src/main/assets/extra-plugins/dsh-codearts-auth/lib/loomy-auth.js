@@ -240,7 +240,7 @@ export class LoomyAuth extends Service {
         this.lastRefreshError = undefined;
     }
     /**
-     * 探测指定 ref 的凭据有效性（账号卡片「刷新」按钮）。
+     * 探测指定 ref 的凭据有效性（RPC `account.refresh`）。
      *
      * ⚠️ 与 `refresh()` 的区别：`refresh()` 读写默认单凭据 ref，
      * 而账号卡片对应的是 `LOOMY_ACCOUNT_XXX`。用 `refresh()` 刷账号池里的

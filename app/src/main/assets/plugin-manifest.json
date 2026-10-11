@@ -13,7 +13,7 @@
       "id": "dsh-web-mobile",
       "title": "移动端适配",
       "desc": "竖屏/窄屏 Web 适配（抽屉导航、全宽会话、安全区、触控人体工学）",
-      "version": "3.0.4",
+      "version": "3.0.5",
       "upstream": "https://github.com/mexiaosqwq/dsh-web-mobile"
     },
     {
@@ -21,8 +21,8 @@
       "name": "dsh-prompt-optimizer-mobile",
       "id": "prompt-optimizer",
       "title": "提示词优化",
-      "desc": "发送前用独立 AI 把输入改写成命令。基于上游 WestFox-AwA/dsh-prompt-optimizer v0.8.1-stable，**本部署默认启用**（仅显式 enabled:false 才关闭；上游原版默认不启用）",
-      "version": "0.8.1-stable",
+      "desc": "发送前用独立 AI 把输入改写成命令。基于上游 WestFox-AwA/dsh-prompt-optimizer v0.8.3-stable，**本部署默认启用**（仅显式 enabled:false 才关闭；上游原版默认不启用），并保留移动端窄屏 UI 适配与包名对齐（详见该目录 FORK.md）",
+      "version": "0.8.3-stable",
       "upstream": "https://github.com/WestFox-AwA/dsh-prompt-optimizer"
     },
     {
@@ -30,8 +30,8 @@
       "name": "dsh-codearts-auth",
       "id": "codearts-auth",
       "title": "CodeArts 多 Provider",
-      "desc": "CodeArts/Buddy/Qoder/Trae/Cline/loomy/raccoon/zcode/opencode 等 Provider 登录、积分与模型接入。上游 tag 0.2.0-rc.2 构建（该仓库 tag 名与 package.json 的 version 不同步，后者仍写 0.1.0）",
-      "version": "0.1.0",
+      "desc": "CodeArts/Buddy/Qoder/Trae/Cline/loomy/raccoon/zcode/opencode/gemini 等 Provider 登录、积分与模型接入。源码取自上游 tag 0.2.0-rc.5 本地构建（该仓库 tag 名与 package.json 的 version 不同步，后者写 0.2.0-rc.3）",
+      "version": "0.2.0-rc.3",
       "upstream": "https://gitee.com/iJetLi/deepseek-harness-codearts"
     },
     {
@@ -55,8 +55,9 @@
       "name": "dsh-net-proxy",
       "id": "net-proxy",
       "title": "网络代理",
-      "desc": "让 agent 自身的网络请求（web_search / web_fetch / 外部 API）走已配置的 HTTP(S) 代理。自 prebuilt.tgz 恢复并适配 dsh 0.1.7-rc.2",
-      "version": "0.2.5"
+      "desc": "让 agent 自身的网络请求（web_search / web_fetch / 外部 API）走已配置的 HTTP(S) 代理。取自上游 mafeis/dsh-net-proxy v0.8.0（整包同源，无本地改动）",
+      "version": "0.8.0",
+      "upstream": "https://github.com/mafeis/dsh-net-proxy"
     },
     {
       "dir": "dsh-provider-headers",
@@ -91,6 +92,15 @@
       "desc": "30+ ego_* 工具驱动的结构化浏览器自动化（ego_click / ego_snapshot / ego_fill / ego_script 等），配实时观察窗（SSE 投屏 + 直接鼠标交互 + 下载捕获 + 人机验证提示），底层跑本包内置的 ego-lite 运行时。取自上游 Fisfzy/dsh-ego-browser v0.8.6 的 npm 产物（整包同源，无本地改动：其声明的最低 dsh 为 >=0.1.2-rc.1，覆盖 targetDsh 0.2.0-rc.2）。⚠ 运行期前提：设备上需有一个可达的 Chrome/Chromium 二进制（插件会自动探测 PATH 与常见路径，也可在插件设置里填 chromePath）——本机当前未装任何浏览器，故工具可加载可调用但会如实回报「未找到浏览器二进制」，这不是装配问题",
       "version": "0.8.6",
       "upstream": "https://github.com/Fisfzy/dsh-ego-browser"
+    },
+    {
+      "dir": "billion-context-dsh",
+      "name": "billion-context-dsh",
+      "id": "compaction-acp",
+      "title": "上下文压缩 ACP",
+      "desc": "Active Context Pruning：给模型 compress / decompress / search_context / acp_status 四个工具，由模型自己决定何时压缩、压缩什么（而非硬性截断），并附 /acp-prune 命令与压缩提示。取自上游 Tyan66666/billion-context-dsh v0.2.27 的 npm 产物（整包同源，无本地改动：其 dsh-* peer 逐个核对均覆盖 targetDsh 0.2.0-rc.2，故无需适配）。⚠ 该插件自带的 cordis.patch.yml 除插入自身外还会 **disable 宿主的 compaction-basic 行**（一个 realm 只能有一个 ctx.compaction 提供方），并在宿主面挂载 ACP 引擎；此前它是以 npm 依赖形式装进 profile 的，现改为随 APK 内置分发",
+      "version": "0.2.27",
+      "upstream": "https://github.com/Tyan66666/billion-context-dsh"
     }
   ],
   "$optionalComment": "optional 条目与 builtin 一样带 version（便于追溯副本对应哪一版）；本仓自研的桥接插件是本地实现、无上游仓库，故不带 upstream 字段——不编造出处。",

@@ -45,6 +45,7 @@
  * 一律**默认关闭**：将来新增渠道若忘记登记，最坏表现是「徽标显示积分」，
  * 而不是「显示一个不存在的订阅」。
  */
+import { normalizeCreditUnit } from './credits.js';
 import { QODER_PLAN_PACKAGE } from './qoder-credits.js';
 /**
  * 资源包名里出现这些词，即视为**订阅套餐**包。
@@ -128,7 +129,9 @@ export function badgePlanFor(provider, balance) {
         name: best.name,
         remaining: best.remaining,
         total: best.total,
-        unit: best.unit,
+        // ⚠️ 下发前归一：包上的 `unit` 是服务端原值（实测同账号内 `credit` 与
+        // `credits` 并存），原样下发会让客户端把同一份套餐拆成两组。见 `unitOf`。
+        unit: normalizeCreditUnit(best.unit),
         ...best.deductionEndTime === undefined ? {} : { deductionEndTime: best.deductionEndTime },
     };
 }
@@ -136,10 +139,17 @@ export function badgePlanFor(provider, balance) {
  * 取包列表里的单位（供套餐读数使用）。
  *
  * ⚠️ 与客户端 `credits-format.js` 的 `unitLabel` 同一取舍：**以首个声明了单位的
- * 包为准**。同一渠道的包单位一致（ZCode 全是 token，其余全是积分），混合单位
- * 只会出现在脏数据里 —— 那种情况下按首个取，至少不会在两次读数之间抖动。
+ * 包为准**。同一渠道的包单位语义一致（ZCode 全是 token，其余全是积分）。
+ *
+ * ⚠️ **但拼法会不一致**（真实缺陷，2026-10-03）：WorkBuddy 国际版实测同一个账号
+ * 的两个包就分别是 `CapacityUnit: 'credit'` 与 `'credits'`，另一个账号是
+ * `'credits'`。原值直接下发会让客户端把同一份套餐按两种拼法拆成两组
+ * （`planGroupsOf` 的键含单位）⇒ 「2 个账号合计」变成每个账号一行。
+ * 故这里**下发前先归一**（{@link normalizeCreditUnit}），客户端再做同样的归一，
+ * 两侧幂等。
  */
 function unitOf(packages) {
-    return packages.find((pkg) => typeof pkg.unit === 'string' && pkg.unit.length > 0)?.unit ?? '';
+    const raw = packages.find((pkg) => typeof pkg.unit === 'string' && pkg.unit.length > 0)?.unit ?? '';
+    return normalizeCreditUnit(raw);
 }
 //# sourceMappingURL=badge-subscription.js.map

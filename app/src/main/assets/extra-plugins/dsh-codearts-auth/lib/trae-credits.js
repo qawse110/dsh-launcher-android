@@ -264,7 +264,18 @@ export async function fetchTraeCreditBalance(credential, _product, fetcher = fet
         return null;
     const body = result.body;
     const packList = body.user_entitlement_pack_list;
-    if (!Array.isArray(packList) || packList.length === 0)
+    // ⚠️ **「字段缺失/不是数组」与「确认为空」必须分开**（2026-10-06 PR !68 审计）：
+    // 服务端不返回独立的总额字段，本函数的 `total` 完全由 `packList` 累加而来 ——
+    // 所以「空列表」在 TRAE 侧**确凿等于 0 余额**（全新账号 / 额度耗尽后服务端清空）。
+    //
+    // 早先把两种情况一并 `return null`，于是「锁定永久积分 + 账号真没钱」会走到
+    // 选号器的「查询失败」分支（`buddy-balance-selector.ts` 的 `fetchSource`），
+    // 最终报成「**无法确认是否有可用账号**…请检查凭据是否失效」—— 用户明明是没钱，
+    // 却被引导去查凭据。是与 qoder 110 / 排队 10605 同型的误报：
+    // 用「取不到」代替了对业务语义的判断。
+    //
+    // 现在只有结构异常才返回 null；确认为空则如实返回 0 余额对象（下方统一构造）。
+    if (!Array.isArray(packList))
         return null;
     const packages = [];
     let total = 0;

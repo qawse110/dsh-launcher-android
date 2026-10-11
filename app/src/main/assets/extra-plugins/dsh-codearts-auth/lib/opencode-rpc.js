@@ -29,7 +29,71 @@ import { randomBytes } from 'node:crypto';
 import { OPENCODE } from './opencode-product.js';
 import { newAccountFingerprint, nextFingerprintGeneration } from './opencode-auth.js';
 import { normalizeProxy } from './opencode.js';
-import { buildProxyDispatcher } from './opencode-proxy.js';
+import { proxyFetch } from './opencode-proxy.js';
+/**
+ * 把 fetch 抛出的错误整理成**带根因**的可读串。
+ *
+ * ## ⚠️ 为什么不能只取 `error.message`（issue IKK4BY 第 2 点）
+ *
+ * Node 的 `fetch` 在**任何**传输层失败时抛的 `TypeError` 其 `message` 恒为
+ * `'fetch failed'`，真正原因（`ECONNREFUSED` / `ENOTFOUND` / `UND_ERR_*` /
+ * TLS 握手失败 …）只挂在 `error.cause` 上。只取 message 的后果是**所有**故障
+ * 都退化成同一句无信息量的话 —— 本 issue 的报障正是这样：
+ * 「固定显示测试失败 fetch failed，耗时 0 到 1 毫秒」，用户与排障者都无从下手。
+ *
+ * 这里逐层展开 `cause`（fetch 的 cause 还可能再套一层），最多 3 层，
+ * 避免病态的自引用链把日志撑爆。
+ */
+export function describeFetchError(error) {
+    const parts = [];
+    let current = error;
+    /**
+     * ⚠️ **两个上限分工不同，不能只用一个 depth 计数**：
+     * - `TRAVERSE_CAP`：遍历次数硬上限，防自引用/环形 cause 死循环；
+     * - `MAX_PARTS`：真正进输出的条数上限，控制可读性。
+     *
+     * 若只用 `depth < 3` 同时兼任两者，「被跳过的无信息量层」会**白白吃掉输出预算**，
+     * 把真正的根因挤出窗口 —— 实测反例（自审时用真实实现跑出来的）：
+     *
+     *     outer → mid → fetch failed → connect ECONNREFUSED 127.0.0.1:45999
+     *     旧实现输出：`outer ← mid`（**根因丢了**）
+     *     新实现输出：`outer ← mid ← connect ECONNREFUSED …`（根因保住）
+     */
+    const TRAVERSE_CAP = 8;
+    const MAX_PARTS = 3;
+    for (let i = 0; i < TRAVERSE_CAP && current !== null && current !== undefined; i += 1) {
+        if (!(current instanceof Error)) {
+            if (parts.length < MAX_PARTS)
+                parts.push(String(current));
+            break;
+        }
+        // ⚠️ `code` 是 undici / Node 系统错误的关键判据（如 UND_ERR_INVALID_ARG），
+        // 它不在 message 里，必须显式带出。
+        const code = current.code;
+        const suffix = typeof code === 'string' && code.length > 0 && !current.message.includes(code)
+            ? ` (${code})`
+            : '';
+        /**
+         * 「无信息量」判据：`TypeError: fetch failed` 与空 message 都只是噪音，
+         * 但**只在后面还有 cause 可展开时**才跳过 —— 若它就是全部（没有 cause），
+         * 保留原样，免得报出一句空话。
+         *
+         * ⚠️ `hasMore` 必须用 `!= null`（同时覆盖 `undefined` 与 `null`）：
+         * 只判 `=== undefined` 时 `cause = null` 会走进「无 cause」分支，
+         * 输出带 `Error: ` 前缀的噪音（自审实测：`Error: fetch failed`）。
+         */
+        const hasMore = current.cause != null;
+        const noisy = (current.message === 'fetch failed' || current.message.length === 0) && hasMore;
+        if (!noisy && parts.length < MAX_PARTS)
+            parts.push(`${current.message}${suffix}`);
+        current = current.cause;
+    }
+    // ⚠️ 兜底也要覆盖「只收到空串」的情况：`new Error('')` 会产出 `['']`，
+    // 若直接 join 会得到空字符串，UI 上显示成「测试失败：」后面什么都没有。
+    if (parts.length === 0 || parts.every((part) => part.length === 0))
+        return String(error);
+    return parts.join(' ← ');
+}
 /**
  * key 形状：`sk-` 前缀 + 至少 20 位。
  *
@@ -156,10 +220,10 @@ export async function handleOpencodeRpc(ctx, pool, method, payload) {
                 const controller = new AbortController();
                 const timer = setTimeout(() => controller.abort(), TEST_TIMEOUT_MS);
                 try {
-                    const response = await fetch(EXIT_IP_URL, {
-                        signal: controller.signal,
-                        dispatcher: buildProxyDispatcher(normalized.proxy),
-                    });
+                    // ⚠️ 必须走 `proxyFetch`（与 dispatcher 同源的 fetch）：用全局
+                    // fetch 会在 Node 22/24 上恒抛 `UND_ERR_INVALID_ARG`，正是缺陷
+                    // IKK4BY 的现象。详见 `opencode-proxy.ts` 的 `proxyFetch`。
+                    const response = await proxyFetch(EXIT_IP_URL, { signal: controller.signal }, normalized.proxy);
                     if (!response.ok)
                         return fail(`测试失败：代理返回 HTTP ${response.status}`);
                     const body = (await response.json());
@@ -173,7 +237,12 @@ export async function handleOpencodeRpc(ctx, pool, method, payload) {
                     });
                 }
                 catch (error) {
-                    const message = error instanceof Error ? error.message : String(error);
+                    // ⚠️ **必须把 `cause` 带出来**（issue IKK4BY 第 2 点）：Node 的
+                    // fetch 失败时 `error.message` **恒为** `fetch failed`，真正原因
+                    // （DNS / 连接被拒 / TLS / 契约冲突 …）只挂在 `error.cause` 上。
+                    // 只取 message 会让所有故障都显示成一句无信息量的 `fetch failed`，
+                    // 用户与排障者都无从下手 —— 本 issue 的报障正是这个形态。
+                    const message = describeFetchError(error);
                     return fail(`测试失败：${controller.signal.aborted ? '连接超时' : message}`);
                 }
                 finally {

@@ -1,0 +1,438 @@
+/**
+ * Gemini (Cloud Code) 的 Google OAuth 授权流程。
+ *
+ * 骨架照 `src/login.ts` 的 `startOAuthFlow`（两步式：先监听、**立即**返回
+ * `loginUrl`，调用方自己去 await `result`），但**刻意去掉**了 CodeArts 那套
+ * PKCE / DPoP / 自定义 ticket —— 上游 Cloud Code 客户端用的是最朴素的
+ * authorization_code + client_secret。
+ *
+ * ## ⚠️ 三条上游硬约束（原版 oauth.go 实测踩过）
+ *
+ * 1. **token 端点强制校验客户端身份**：只发 `client_id` 会回
+ *    `invalid_request: client_secret is missing`，症状是「浏览器显示授权成功，
+ *    但面板里账号一直不出现」。所以 `exchange` / `refresh` 的表单**必须**带
+ *    `client_secret`。
+ * 2. **必须「先监听、再拼 URL」**：端口被占时会回退到别的端口，若先拼 URL
+ *    就会 `redirect_uri_mismatch`。
+ * 3. **`state` 必须校验**：回调里 `state` 不匹配一律 400 拒绝（防伪造回调）。
+ *
+ * ## 回调地址
+ *
+ * `http://localhost:<port>/oauth-callback` —— Google 对原生应用的 loopback
+ * 重定向（RFC 8252）允许**任意端口**，所以动态端口是合法的。
+ * 同时监听 `127.0.0.1` 与 `[::1]`：浏览器常把 `localhost` 解析成 IPv6。
+ */
+import { createServer } from 'node:http';
+import { randomBytes } from 'node:crypto';
+export const GEMINI_AUTH_ENDPOINT = 'https://accounts.google.com/o/oauth2/v2/auth';
+export const GEMINI_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
+export const GEMINI_USERINFO_ENDPOINT = 'https://www.googleapis.com/oauth2/v2/userinfo';
+export const GEMINI_REVOKE_ENDPOINT = 'https://oauth2.googleapis.com/revoke';
+/** 上游 Cloud Code 客户端的公开 client（env 可覆盖，用于自建凭据的场景）。 */
+export const GEMINI_DEFAULT_CLIENT_ID = '1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com';
+export const GEMINI_DEFAULT_CLIENT_SECRET = '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';
+/** 回调路径（与 client 注册值逐字一致，改了就 redirect_uri_mismatch）。 */
+export const GEMINI_CALLBACK_PATH = '/oauth-callback';
+/** 重定向 URI 里的主机名。⚠️ 必须是 `localhost` 而不是 `127.0.0.1`。 */
+const GEMINI_REDIRECT_HOST = 'localhost';
+/** 端口被占用时的兜底端口；默认走动态端口（0），与原版一致。 */
+export const GEMINI_DEFAULT_CALLBACK_PORT = 8845;
+/**
+ * 授权流程总预算。
+ *
+ * ⚠️ 用 **6 分钟**而不是照 `login.ts` 的 180 秒：原版 `oauth.go` 的
+ * `authFlowTimeout` 就是 6 分钟 —— Google 账号常带二次验证，3 分钟会把
+ * 正常用户掐掉（面板亮「授权失败」，其实人家只是慢）。
+ */
+export const GEMINI_AUTH_FLOW_TIMEOUT_MS = 360_000;
+/** 六项 scope 逐字照抄（`cloud-platform` 必需，后两项是 Cloud Code 自己的通道）。 */
+export const GEMINI_SCOPES = [
+    'openid',
+    'https://www.googleapis.com/auth/cloud-platform',
+    'https://www.googleapis.com/auth/userinfo.email',
+    'https://www.googleapis.com/auth/userinfo.profile',
+    'https://www.googleapis.com/auth/cclog',
+    'https://www.googleapis.com/auth/experimentsandconfigs',
+];
+/** 用户在浏览器里点了「取消」/拒绝授权。 */
+export class GeminiLoginCancelledError extends Error {
+    constructor(message = 'Google 授权已取消') {
+        super(message);
+        this.name = 'GeminiLoginCancelledError';
+    }
+}
+/** 授权窗口超时（没人来点）。 */
+export class GeminiLoginExpiredError extends Error {
+    constructor(message = 'Google 授权超时，请重新发起') {
+        super(message);
+        this.name = 'GeminiLoginExpiredError';
+    }
+}
+/** 生效的 client id（env 优先）。 */
+export function geminiClientId() {
+    const fromEnv = process.env.CMDC_PAK_GOOGLE_CLIENT_ID?.trim();
+    return fromEnv !== undefined && fromEnv !== '' ? fromEnv : GEMINI_DEFAULT_CLIENT_ID;
+}
+/** 生效的 client secret（env 优先）。 */
+export function geminiClientSecret() {
+    const fromEnv = process.env.CMDC_PAK_GOOGLE_CLIENT_SECRET?.trim();
+    return fromEnv !== undefined && fromEnv !== '' ? fromEnv : GEMINI_DEFAULT_CLIENT_SECRET;
+}
+/** 构造授权 URL（参数顺序无关紧要，Google 不校验）。 */
+export function buildGeminiAuthUrl(flow) {
+    const query = new URLSearchParams({
+        client_id: geminiClientId(),
+        response_type: 'code',
+        redirect_uri: flow.redirectUri,
+        scope: GEMINI_SCOPES.join(' '),
+        state: flow.state,
+        access_type: 'offline',
+        include_granted_scopes: 'true',
+        prompt: 'consent',
+    });
+    return `${GEMINI_AUTH_ENDPOINT}?${query.toString()}`;
+}
+/**
+ * 解析令牌端点的 JSON。
+ *
+ * 三种失败形态都要给**能定位问题**的文案（原版口径）：
+ * 解析不了 / `error` 字段 / 缺 `access_token`。
+ */
+export function parseGeminiTokenGrant(payload, previousRefreshToken) {
+    if (typeof payload !== 'object' || payload === null) {
+        throw new Error('令牌端点返回无法解析（非 JSON 对象）');
+    }
+    const record = payload;
+    const errorCode = typeof record.error === 'string' ? record.error : '';
+    if (errorCode !== '') {
+        const description = typeof record.error_description === 'string' ? record.error_description : '';
+        throw new Error(description === '' ? errorCode : `${errorCode}: ${description}`);
+    }
+    const accessToken = typeof record.access_token === 'string' ? record.access_token : '';
+    if (accessToken === '')
+        throw new Error('令牌端点未返回 access_token');
+    const rawRefresh = typeof record.refresh_token === 'string' ? record.refresh_token : '';
+    const refreshToken = rawRefresh !== '' ? rawRefresh : previousRefreshToken;
+    const rawTokenType = typeof record.token_type === 'string' ? record.token_type : '';
+    const expiresIn = typeof record.expires_in === 'number' && Number.isFinite(record.expires_in) && record.expires_in > 0
+        ? Math.floor(record.expires_in)
+        : 3600;
+    const grant = {
+        access_token: accessToken,
+        token_type: rawTokenType === '' ? 'Bearer' : rawTokenType,
+        expires_in: expiresIn,
+    };
+    if (refreshToken !== undefined && refreshToken !== '')
+        grant.refresh_token = refreshToken;
+    const scope = typeof record.scope === 'string' ? record.scope : '';
+    if (scope !== '')
+        grant.scope = scope;
+    const idToken = typeof record.id_token === 'string' ? record.id_token : '';
+    if (idToken !== '')
+        grant.id_token = idToken;
+    return grant;
+}
+/**
+ * 从 `id_token` 解出身份（`sub` / `email`）。
+ *
+ * ⚠️ **不验签**：该值只用于展示名与稳定标识，不作为鉴权依据（与
+ * `src/buddy.ts` 的 `jwtExpiresAtMs` 同口径）；令牌端点的响应本身已由 TLS 保护。
+ * 任何解析失败返回 `{}` 而不抛错 —— 身份不该让授权失败。
+ */
+export function geminiIdentityFromIdToken(idToken) {
+    if (typeof idToken !== 'string' || idToken === '')
+        return {};
+    const parts = idToken.split('.');
+    if (parts.length < 2)
+        return {};
+    let payload;
+    try {
+        payload = JSON.parse(Buffer.from(parts[1] ?? '', 'base64url').toString('utf8'));
+    }
+    catch {
+        return {};
+    }
+    if (typeof payload !== 'object' || payload === null)
+        return {};
+    const record = payload;
+    const out = {};
+    if (typeof record.sub === 'string' && record.sub !== '')
+        out.sub = record.sub;
+    if (typeof record.email === 'string' && record.email !== '')
+        out.email = record.email;
+    return out;
+}
+/** 由 `expires_in`（秒）算出 RFC3339 过期时刻。 */
+export function geminiExpiryFrom(expiresIn, nowMs = Date.now()) {
+    const seconds = expiresIn > 0 ? expiresIn : 3600;
+    return new Date(nowMs + seconds * 1000).toISOString();
+}
+/** 把令牌授予结果并成一条凭据（保留已有的 sub/email/project）。 */
+export function credentialFromGeminiGrant(grant, previous = {}, nowMs = Date.now()) {
+    const credential = {
+        access_token: grant.access_token,
+        token_type: grant.token_type,
+        expires_in: grant.expires_in,
+        expiry: geminiExpiryFrom(grant.expires_in, nowMs),
+    };
+    const refreshToken = grant.refresh_token ?? previous.refresh_token;
+    if (refreshToken !== undefined && refreshToken !== '')
+        credential.refresh_token = refreshToken;
+    const scope = grant.scope ?? previous.scope;
+    if (scope !== undefined && scope !== '')
+        credential.scope = scope;
+    // 身份优先取 `id_token`（与 `access_token` 同一次响应自带，零额外请求、
+    // 无失败面），退到既有凭据 —— 后者覆盖「续期响应不带 id_token」的形态。
+    const identity = grant.id_token === undefined ? {} : geminiIdentityFromIdToken(grant.id_token);
+    const sub = identity.sub ?? previous.sub;
+    if (sub !== undefined && sub !== '')
+        credential.sub = sub;
+    const email = identity.email ?? previous.email;
+    if (email !== undefined && email !== '')
+        credential.email = email;
+    if (previous.cloudaicompanionProject !== undefined && previous.cloudaicompanionProject !== '') {
+        credential.cloudaicompanionProject = previous.cloudaicompanionProject;
+    }
+    return credential;
+}
+/**
+ * POST 表单。
+ *
+ * ⚠️ **刻意不设 `User-Agent`**：上游的 `antigravity` 伪装只用在 Cloud Code 的
+ * 推理/配额端点；令牌与 userinfo 端点是标准 Google OAuth，原版抓包看到的就是
+ * Go 默认 UA。加伪装反而多一个可疑特征。
+ */
+async function postGeminiForm(endpoint, form, fetcher, signal) {
+    const body = new URLSearchParams(form).toString();
+    const init = {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body,
+    };
+    if (signal !== undefined)
+        init.signal = signal;
+    const response = await fetcher(endpoint, init);
+    const text = await response.text();
+    let parsed;
+    try {
+        parsed = JSON.parse(text);
+    }
+    catch {
+        throw new Error(`令牌端点返回无法解析（HTTP ${response.status}）`);
+    }
+    if (!response.ok) {
+        const record = typeof parsed === 'object' && parsed !== null ? parsed : {};
+        const code = typeof record.error === 'string' ? record.error : `HTTP ${response.status}`;
+        const description = typeof record.error_description === 'string' ? record.error_description : '';
+        throw new Error(description === '' ? code : `${code}: ${description}`);
+    }
+    return parsed;
+}
+/** 用授权码换令牌（**必须**带 client_secret，见文件头第 1 条）。 */
+export async function exchangeGeminiCode(code, redirectUri, options = {}) {
+    const fetcher = options.fetcher ?? fetch;
+    const payload = await postGeminiForm(GEMINI_TOKEN_ENDPOINT, {
+        client_id: geminiClientId(),
+        client_secret: geminiClientSecret(),
+        code,
+        grant_type: 'authorization_code',
+        redirect_uri: redirectUri,
+    }, fetcher, options.signal);
+    return parseGeminiTokenGrant(payload);
+}
+/**
+ * 用 refresh_token 续期。
+ *
+ * ⚠️ Google **偶尔会轮换 refresh_token**：响应里给了新的就必须回写，
+ * 否则下一次续期用的是已作废的旧值（表现为「昨天还好好的，今天突然要重新登录」）。
+ */
+export async function refreshGeminiCredential(refreshToken, options = {}) {
+    if (refreshToken === '')
+        throw new Error('没有 refresh_token，需要重新授权');
+    const fetcher = options.fetcher ?? fetch;
+    const payload = await postGeminiForm(GEMINI_TOKEN_ENDPOINT, {
+        client_id: geminiClientId(),
+        client_secret: geminiClientSecret(),
+        refresh_token: refreshToken,
+        grant_type: 'refresh_token',
+    }, fetcher, options.signal);
+    return parseGeminiTokenGrant(payload, refreshToken);
+}
+/**
+ * 拉账号身份（`id_token` 缺席时的**兜底**）。
+ *
+ * ⚠️ 用 `id`（= `sub`）当账号主键：邮箱用户可以随时改，`sub` 不会变。
+ * 失败**不抛错**（身份只是展示信息，不该让整个授权失败），但会通过
+ * `onFailure` 上报原因 —— 2026-10-03 用户报障「昵称退化成池 id」时这里
+ * 静默吞掉了一切异常，导致无从排查。
+ */
+export async function fetchGeminiUserInfo(accessToken, options = {}) {
+    const fetcher = options.fetcher ?? fetch;
+    const init = { headers: { Authorization: `Bearer ${accessToken}` } };
+    if (options.signal !== undefined)
+        init.signal = options.signal;
+    try {
+        const response = await fetcher(GEMINI_USERINFO_ENDPOINT, init);
+        if (!response.ok) {
+            options.onFailure?.(`userinfo 返回 HTTP ${response.status}`);
+            return {};
+        }
+        const payload = (await response.json());
+        if (typeof payload !== 'object' || payload === null)
+            return {};
+        const record = payload;
+        const out = {};
+        if (typeof record.id === 'string' && record.id !== '')
+            out.sub = record.id;
+        if (typeof record.email === 'string' && record.email !== '')
+            out.email = record.email;
+        return out;
+    }
+    catch (error) {
+        options.onFailure?.(error instanceof Error ? error.message : String(error));
+        return {};
+    }
+}
+/** 撤销令牌（退出登录时调用）。失败只记日志，不上抛。 */
+export async function revokeGeminiToken(token, options = {}) {
+    if (token === '')
+        return;
+    const fetcher = options.fetcher ?? fetch;
+    try {
+        await postGeminiForm(GEMINI_REVOKE_ENDPOINT, { token }, fetcher, options.signal);
+    }
+    catch {
+        // 撤销是尽力而为：令牌过期后 revoke 会 400，不值得打断登出。
+    }
+}
+/** 回调成功后展示的页面（原版逐字）。 */
+const GEMINI_CALLBACK_HTML = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>授权完成</title><style>body{font:15px/1.7 -apple-system,"Segoe UI",sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#0f1115;color:#e6e8eb}.b{text-align:center}.k{font-size:34px;margin-bottom:8px}</style></head><body><div class="b"><div class="k">✓</div><div>授权已完成，可以关闭此页回到面板。</div></div></body></html>`;
+/** 先占一个空闲端口再释放 —— 用于让 v4/v6 两个监听器落在**同一个**端口上。 */
+function pickFreePort() {
+    return new Promise((resolve, reject) => {
+        const probe = createServer();
+        probe.once('error', reject);
+        probe.listen(0, '127.0.0.1', () => {
+            const address = probe.address();
+            const port = typeof address === 'object' && address !== null ? address.port : 0;
+            probe.close(() => {
+                if (port > 0)
+                    resolve(port);
+                else
+                    reject(new Error('无法分配回调端口'));
+            });
+        });
+    });
+}
+async function listenCallback(handler, preferredPort) {
+    const attempt = (port) => {
+        const primary = createServer(handler);
+        return new Promise((resolve, reject) => {
+            primary.once('error', (error) => {
+                if (error.code === 'EADDRINUSE' && port !== 0) {
+                    // 首选端口被占：换一个空闲端口重试（**不能**先拼 URL，见文件头第 2 条）。
+                    void pickFreePort().then((next) => resolve(attempt(next)), reject);
+                    return;
+                }
+                reject(error);
+            });
+            primary.listen(port, '127.0.0.1', () => {
+                const address = primary.address();
+                const assigned = typeof address === 'object' && address !== null ? address.port : 0;
+                const secondary = createServer(handler);
+                secondary.once('error', () => {
+                    // IPv6 监听失败可容忍：`localhost` 解析到 v4 时仍然可用。
+                    resolve({ port: assigned, servers: [primary] });
+                });
+                secondary.listen(assigned, '::1', () => {
+                    resolve({ port: assigned, servers: [primary, secondary] });
+                });
+            });
+        });
+    };
+    return attempt(preferredPort);
+}
+/**
+ * 启动授权流程并**立即返回** `loginUrl`。
+ *
+ * 两步式的原因与 CodeArts 那边一样：浏览器只在用户点击后的短暂窗口内允许
+ * `window.open`，阻塞式流程会让调用方拿到 URL 时手势已过期。
+ */
+export async function startGeminiOAuthFlow(options = {}) {
+    const state = randomBytes(16).toString('hex');
+    let resolveCode = () => { };
+    let rejectCode = () => { };
+    const codePromise = new Promise((resolve, reject) => {
+        resolveCode = resolve;
+        rejectCode = reject;
+    });
+    const handler = (req, res) => {
+        const url = new URL(req.url ?? '/', `http://${GEMINI_REDIRECT_HOST}`);
+        if (url.pathname !== GEMINI_CALLBACK_PATH) {
+            res.writeHead(404).end('Not found');
+            return;
+        }
+        const failure = url.searchParams.get('error');
+        if (failure !== null && failure !== '') {
+            const description = url.searchParams.get('error_description') ?? '';
+            res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' }).end(`授权被拒绝: ${failure}`);
+            rejectCode(new GeminiLoginCancelledError(description === '' ? failure : `${failure}: ${description}`));
+            return;
+        }
+        if (url.searchParams.get('state') !== state) {
+            res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' }).end('state 校验失败');
+            rejectCode(new Error('state 校验失败，可能是伪造的回调'));
+            return;
+        }
+        const code = url.searchParams.get('code');
+        if (code === null || code === '') {
+            res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' }).end('缺少 authorization code');
+            rejectCode(new Error('回调缺少 authorization code'));
+            return;
+        }
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }).end(GEMINI_CALLBACK_HTML);
+        resolveCode(code);
+    };
+    const preferred = options.callbackPort ?? 0;
+    const { port, servers } = await listenCallback(handler, preferred);
+    const redirectUri = `http://${GEMINI_REDIRECT_HOST}:${port}${GEMINI_CALLBACK_PATH}`;
+    const loginUrl = buildGeminiAuthUrl({ state, redirectUri });
+    let closed = false;
+    const close = async () => {
+        if (closed)
+            return;
+        closed = true;
+        await Promise.all(servers.map((server) => new Promise((resolve) => server.close(() => resolve()))));
+    };
+    const fetcher = options.fetcher ?? fetch;
+    const timeoutMs = options.timeoutMs ?? GEMINI_AUTH_FLOW_TIMEOUT_MS;
+    const result = Promise.race([
+        codePromise,
+        new Promise((_, reject) => {
+            const timer = setTimeout(() => reject(new GeminiLoginExpiredError()), timeoutMs);
+            timer.unref?.();
+        }),
+    ]).then(async (code) => {
+        const grant = await exchangeGeminiCode(code, redirectUri, { fetcher });
+        // `credentialFromGeminiGrant` 已从 `id_token` 解出 sub/email（授权 URL 带
+        // `openid`，令牌响应必然带 id_token）—— 正常情况下这里**不再发 userinfo**。
+        const credential = credentialFromGeminiGrant(grant);
+        if (credential.sub !== undefined && credential.email !== undefined)
+            return credential;
+        // 兜底：id_token 缺席或解不出身份时才补一次 userinfo。
+        const user = await fetchGeminiUserInfo(credential.access_token, {
+            fetcher,
+            onFailure: options.onIdentityFailure,
+        });
+        if (credential.sub === undefined && user.sub !== undefined)
+            credential.sub = user.sub;
+        if (credential.email === undefined && user.email !== undefined)
+            credential.email = user.email;
+        return credential;
+    });
+    // 先挂空处理器：结果可能在调用方 await 之前就落定（用户授权极快或立刻超时），
+    // 那一段窗口里 Node 会把它当成未处理拒绝并打印告警。
+    result.catch(() => { }).finally(() => { void close(); });
+    return { loginUrl, result, close };
+}
+//# sourceMappingURL=gemini-oauth.js.map

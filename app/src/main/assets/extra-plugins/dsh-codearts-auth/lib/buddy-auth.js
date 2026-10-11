@@ -370,16 +370,38 @@ export class BuddyAuth extends Service {
         // 优先账号池
         if (pool) {
             const available = await pool.getAvailableAccount(this.product.id, '');
-            if (available)
-                return fetchModels(available.credential, this.fetchImpl, undefined, this.product);
+            if (available) {
+                return fetchModels(available.credential, this.fetchImpl, undefined, this.product, this.lastCatalogOutcome);
+            }
         }
         const resolved = await this.ctx.credentials.resolve(credentialRef(this.credentialRefName));
-        if (!resolved)
+        if (!resolved) {
+            // 无凭据 ⇒ 两个来源都没取到（否则残缺被判成完整）。
+            this.markCatalogIncomplete();
             return [];
+        }
         const credential = parseCredential(resolved.value);
-        if (!credential)
+        if (!credential) {
+            this.markCatalogIncomplete();
             return [];
-        return fetchModels(credential, this.fetchImpl, undefined, this.product);
+        }
+        return fetchModels(credential, this.fetchImpl, undefined, this.product, this.lastCatalogOutcome);
+    }
+    /**
+     * 最近一次 {@link fetchModels} 的各来源成败（issue IKJVTF，审计 I3）。
+     *
+     * ⚠️ 由 `src/index.ts` 在**构造时**注入一个空对象，此后 `fetchModels`
+     * 每轮原地写入；适配器的 `catalogComplete` 回调读它。用出参对象而非改
+     * `fetchModels` 的返回类型 —— 该签名被既有调用方与单测按「返回数组」使用。
+     */
+    lastCatalogOutcome;
+    /** 把两个来源都标成「没取到」（无凭据等早退分支用）。 */
+    markCatalogIncomplete() {
+        const outcome = this.lastCatalogOutcome;
+        if (outcome === undefined)
+            return;
+        outcome.scopedOk = false;
+        outcome.configOk = false;
     }
     /** 注入的 fetch（测试用）；默认为全局 fetch。 */
     get fetchImpl() {
@@ -412,7 +434,7 @@ export function createPoolRefresh(pool, productId, auth) {
     return async () => {
         const available = await pool.getAvailableAccount(productId, '');
         // ⚠️ 必须传 `pool` + `entry.id`（issue !IKIRTT）：这条是**发消息途中**按需续期
-        // 的路径（比账号卡片点「刷新」触发得频繁得多），不回写有效期就会让 UI 继续
+        // 的路径（比 RPC `account.refresh` 触发得频繁得多），不回写有效期就会让 UI 继续
         // 挂着「已过期」—— 早先七个 provider 的 `refreshAccountCredential` 没有
         // 回写能力时这里也无从传起，现在补全。
         if (available) {

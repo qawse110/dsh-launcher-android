@@ -23,7 +23,7 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials';
 import { isRaccoonExpired, isRaccoonRefreshable, raccoonCredentialExpiresAtMs, raccoonDisplayName, decodeJwtExpMs, } from './raccoon.js';
 import { claimRaccoonLoginReward, fetchRaccoonCreditBalance, fetchRaccoonOnboardingStatus, } from './raccoon-credits.js';
 import { fetchRaccoonUserInfo, refreshRaccoonCredential, } from './raccoon-oauth.js';
-import { RACCOON } from './raccoon-product.js';
+import { RACCOON, raccoonSupportsImage } from './raccoon-product.js';
 import { startRaccoonLoginFlow, } from './raccoon-login-page.js';
 import { syncAccountExpiry, } from './expiry-sync.js';
 /**
@@ -106,7 +106,12 @@ function normalizeRemoteModel(entry) {
         name: raccoonDisplayName(meta),
         contextWindow: readPositiveInt(params.context_window ?? entry.context_window),
         maxTokens: readPositiveInt(params.max_tokens),
-        supportsImage: tags.includes('vision') || tags.includes('image') || tags.includes('image-understanding'),
+        // ⚠️ **不能只看 tags**：`vision` 是客户端「Raccoon-Auto 选模」的偏好标签，
+        // 不是服务端能力契约（远端根本没有模态字段，已穷举证实）。`tags` 不含
+        // `vision` 的 `sn-deepseek-v4-1-flash` 实测能看图（5/5 读对随机数字），
+        // 只认 tags 会让它被 DSH 投影成文本占位符 —— 图片根本发不出去。
+        // 证据与取舍见 `raccoon-product.ts` 的 RACCOON_IMAGE_CAPABILITY_OVERRIDES。
+        supportsImage: raccoonSupportsImage(id, tags),
     };
 }
 /**
@@ -241,7 +246,7 @@ export class RaccoonAuth extends Service {
         }
     }
     /**
-     * 续期**指定 ref**（账号卡片「刷新」按钮 / 定时器）。
+     * 续期**指定 ref**（RPC `account.refresh` / 定时器）。
      *
      * ⚠️ 只读写传入的 ref，**不碰**默认单凭据 ref —— 账号池里的是
      * `RACCOON_ACCOUNT_XXX`，用 `refresh()` 会刷错凭据。

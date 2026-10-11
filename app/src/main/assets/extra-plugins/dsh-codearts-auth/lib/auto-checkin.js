@@ -64,6 +64,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { join } from 'node:path';
 import { QODER_BILLING_UTC_OFFSET_MS } from './model-queue.js';
 import { resolveJetHubHome } from './jet-hub-store.js';
+import { formatClaimGains } from './credits.js';
 import { ZCODE } from './zcode-product.js';
 /** 独立文档的文件名（与 state.json / ui-preferences.json 同目录）。 */
 export const AUTO_CHECKIN_FILE = 'auto-checkin.json';
@@ -213,7 +214,7 @@ export function createAutoCheckinStore(ctx) {
     return new FileAutoCheckinStore(join(home, 'jet-hub', AUTO_CHECKIN_FILE), ctx.logger);
 }
 function emptyTotals() {
-    return { providers: 0, claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0, coversToday: 0, skipped: 0, errors: 0 };
+    return { providers: 0, claimed: 0, totalCredit: 0, totalByUnit: { token: 0, credit: 0 }, alreadyClaimed: 0, inactive: 0, failed: 0, coversToday: 0, skipped: 0, errors: 0 };
 }
 /**
  * 「不支持每日签到」的判据：`credits.claimAll` 对 cline / raccoon / workbuddy
@@ -260,7 +261,12 @@ export function isAutoCheckinExcluded(provider) {
 export function describeRun(totals) {
     const parts = [];
     if (totals.claimed > 0) {
-        parts.push(`${totals.claimed} 个账号领取成功${totals.totalCredit > 0 ? `（+${totals.totalCredit} 积分）` : ''}`);
+        // ★ 按单位分别报（2026-10-04，真实缺陷）：原先写 `+${totals.totalCredit} 积分`，
+        //   而 `totalCredit` 是**跨单位求和** —— ZCode 的 1 亿 token 与 100 积分会被
+        //   加成 `100000100` 并标成「积分」。用户报障原文给的期望形态就是
+        //   `+100Mtoken, +100积分`（见 `credits.ts` 的 `formatClaimGains`）。
+        const amounts = formatClaimGains(totals.totalByUnit ?? { credit: totals.totalCredit });
+        parts.push(`${totals.claimed} 个账号领取成功${amounts === null ? '' : `（${amounts}）`}`);
     }
     if (totals.alreadyClaimed > 0)
         parts.push(`${totals.alreadyClaimed} 个今天已领`);
@@ -310,7 +316,12 @@ export function describeChannel(summary) {
     if (summary.claimed > 0) {
         // ⚠️ 「领到了但 +0 分」与「今天已领」必须能分辨：前者写成「已领」会和
         // alreadyClaimed 撞词，用户无法判断这次到底有没有动作。
-        parts.push(summary.totalCredit > 0 ? `${summary.claimed} 个 +${summary.totalCredit}` : `${summary.claimed} 个领取成功`);
+        //
+        // ★ 单位感知（2026-10-04）：原先写裸数字 `+${summary.totalCredit}`，
+        //   于是 ZCode 那行显示 `1 个 +100000000` —— 既看不出单位，量级也读不出来。
+        //   用户给的期望形态是 `+100Mtoken`（见 `credits.ts` 的 `formatClaimGains`）。
+        const amounts = formatClaimGains(summary.totalByUnit ?? { credit: summary.totalCredit });
+        parts.push(amounts === null ? `${summary.claimed} 个领取成功` : `${summary.claimed} 个 ${amounts}`);
     }
     if (summary.alreadyClaimed > 0)
         parts.push(`${summary.alreadyClaimed} 个今天已领`);
@@ -402,6 +413,11 @@ export function createAutoCheckin(deps) {
             }
             totals.claimed += summary.claimed;
             totals.totalCredit += summary.totalCredit;
+            // ★ 按单位累加（2026-10-04）：`totalByUnit` 缺省时回落到「全部按积分」，
+            //   兼容尚未上报该字段的旧宿主响应 —— 与 `coversToday` 的兜底同思路。
+            const byUnit = summary.totalByUnit ?? { credit: summary.totalCredit, token: 0 };
+            totals.totalByUnit.credit += Number(byUnit.credit) || 0;
+            totals.totalByUnit.token += Number(byUnit.token) || 0;
             totals.alreadyClaimed += summary.alreadyClaimed;
             totals.inactive += summary.inactive;
             totals.failed += summary.failed;

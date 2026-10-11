@@ -1,5 +1,5 @@
 import { credentialRef } from '@deepseek-ai/dsh-credentials';
-import { createJetHubStore, mergeLegacyLoomyLock, sanitizeAccounts, sanitizeDisabledModels, sanitizePermanentLocks } from './jet-hub-store.js';
+import { createJetHubStore, isValidResetAtMs, MAX_DATE_MS, mergeLegacyLoomyLock, sanitizeAccounts, sanitizeDisabledModels, sanitizePermanentLocks } from './jet-hub-store.js';
 import { createPermanentLockStore } from './permanent-lock-store.js';
 // 兼容既有的导入路径：命名空间名与黑名单类型原本定义在本模块。
 export { JET_HUB_NS } from './jet-hub-store.js';
@@ -10,6 +10,167 @@ export { JET_HUB_NS } from './jet-hub-store.js';
  * 没有黑名单；共享同一个冻结集合可以避免每次调用都分配一个新 Set。
  */
 const EMPTY_MODEL_SET = new Set();
+/**
+ * 判定「某 provider 的启用账号是否**全部**因目标模型处于限流期」。
+ *
+ * ## 为什么需要它
+ *
+ *
+ * 选号按 `modelRateLimits[modelId]` 过滤候选（见本类的 `getAvailableAccount`
+ * 与 `src/index.ts` 的 `pickBuddyCredential`）。当一个 provider 只有**一个**
+ * 启用账号、而它恰好被标记了该模型的限流时，候选集变成空集，调用链一路
+ * 返回 `undefined`，最终由适配器抛出「no usable credential; log in from the
+ * Jet Hub panel first」—— 而**凭据其实是好的、账号也是启用的**，用户被指去
+ * 重新登录，方向完全错。
+ *
+ * 本函数把这种情形**证明**出来：返回非 `undefined` 即表示「这批账号全都因
+ * 该模型受限」，调用方据此报带解禁时刻的明确错误。
+ *
+ * ⚠️ **判据必须窄**，两条边界都不能松：
+ * - 空 `modelId`（未知目标模型）直接返回 `undefined` —— 与选号侧约定一致
+ *   （空 modelId 不做限流过滤），否则会把「未登录」误报成「限流」。
+ *   这条**不是**冗余守卫：`updateModelRateLimit` 不校验 modelId，理论上可能
+ *   落下一个 `modelRateLimits['']` 脏键，没有它就会被当成真实限流上报；
+ * - 只要**任一**账号没有该模型的未过期标记，整体即不成立 —— 那种情况下
+ *   候选本就非空，轮不到本函数说话。
+ *
+ * ℹ️ 空 `accounts` 无需单独早退：循环不执行 → `earliest` 保持 `undefined`
+ * → 末尾守卫返回 `undefined`。（曾写过一条 `accounts.length === 0` 早退，
+ * 反向验证证明它**不可区分**、纯冗余，故删除。）
+ *
+ * @param accounts - 该 provider 的**启用**账号（调用方负责按 `enabled` 过滤）。
+ * @param modelId - 目标模型 id；空串表示不判定。
+ * @param now - 当前时刻（毫秒），供测试注入。
+ * @returns 最早的解禁时刻与账号数；不满足条件时为 `undefined`。
+ */
+export function allAccountsRateLimitedForModel(accounts, modelId, now = Date.now()) {
+    if (modelId.length === 0)
+        return undefined;
+    let earliest;
+    for (const account of accounts) {
+        const resetAt = account.modelRateLimits?.[modelId];
+        // 与选号侧同一判据：缺标记 / 0 / 已过期都算「不受限」→ 整体不成立。
+        if (resetAt === undefined || resetAt === 0 || now >= resetAt)
+            return undefined;
+        earliest = earliest === undefined ? resetAt : Math.min(earliest, resetAt);
+    }
+    return earliest === undefined ? undefined : { resetAtMs: earliest, accountCount: accounts.length };
+}
+/**
+ * 「限额账号自动沉底」的开关环境变量。
+ *
+ * 默认**开启**（用户 2026-10 的明确要求）。留这道逃生门是因为它改变了
+ * 账号顺序的语义：用户手拖出来的顺序会被系统改写。若有人依赖「首位账号
+ * 永远优先」的旧行为（例如想让某个额度充足的号一直扛），把它设为 `0` 即可
+ * 退回纯手动顺序。
+ */
+export const DSH_RATE_LIMIT_SINK = 'DSH_RATE_LIMIT_SINK';
+/**
+ * 当前是否启用「限额沉底」。
+ *
+ * ⚠️ **不能写成 `Boolean(env[...])` 之类的 falsy 判据**：本开关的**默认值是
+ * 开启**，而「未设置」与「显式关闭」必须区分开 —— `Boolean(undefined)` 与
+ * `Boolean('0')` 都为 false，会把默认开启变成默认关闭（与 Qoder 排队超时、
+ * `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 那几个坑同型）。
+ *
+ * 判据取「显式写了 `0` / `false` / `off` / `no` 才算关」，其余（含未设置、
+ * 空串、无法识别的值）一律按默认开启。
+ */
+export function rateLimitSinkEnabled(env = process.env) {
+    const raw = env[DSH_RATE_LIMIT_SINK];
+    if (typeof raw !== 'string')
+        return true;
+    const value = raw.trim().toLowerCase();
+    if (value.length === 0)
+        return true;
+    return !(value === '0' || value === 'false' || value === 'off' || value === 'no');
+}
+/**
+ * 把「目标账号」移动到本 provider 的**最末尾**（限额沉底）。
+ *
+ * ## 为什么需要它（用户报障的根因）
+ *
+ * 取号永远是「服务端顺序里**第一个**可用账号」（见 `getAvailableAccount`）。
+ * 于是只要 1 号账号没撞限额，**全部流量都压在它身上**；等它撞了限额，2 号才
+ * 顶上；而等 1 号解禁，它又**排在最前面被立刻捡回去**，2 号重新闲置。
+ *
+ * 后果正是用户报障的原话：*「每次都轮不完，等限额号好了因为排在前面又开始
+ * 用刚好的限额号了，后面的号的额度就白白过期了」* —— 每个账号的额度都有
+ * 使用期限（资源包的 `DeductionEndTime`），轮不到就真的作废。
+ *
+ * 故「限额即沉底」的真正价值**不在受限期间**（受限账号本来就被选号过滤掉），
+ * 而在**解禁之后**：它留在末尾，不会再抢回首位，后面的号因此轮到使用。
+ *
+ * ## 为什么必须持久化（不能只在内存里排）
+ *
+ * 沉底若不写盘，重启/刷新后顺序回到原位，解禁账号又会插回最前 —— 等于没做。
+ * 因此它写在**权威的服务端顺序**里（与用户拖拽的 `reorderAccounts` 同一份）。
+ *
+ * ## 槽位约定（与 `reorderAccounts` 完全一致）
+ *
+ * 账号存在**一个全局数组**里（各 provider 混排，靠 `provider` 字段区分）。
+ * 这里取「该 provider 原本占用的那些下标」，把新顺序（其余账号保持原相对
+ * 顺序、目标账号排到最后）填回这些下标 —— **其它 provider 的账号绝对位置
+ * 完全不变**。不这么做（例如整体挪到数组尾部）会让拖拽 buddy 顺带改变
+ * CodeArts 账号的位置，属于跨面板的意外副作用。
+ *
+ * @param accounts - 当前账号列表（服务端顺序）。
+ * @param accountId - 要沉底的账号 id。
+ * @returns 新数组；无需变更（账号不存在 / 已在本 provider 末位）时返回 `null`。
+ */
+export function sinkAccountToProviderEnd(accounts, accountId) {
+    const index = accounts.findIndex(a => a.id === accountId);
+    if (index === -1)
+        return null;
+    const entry = accounts[index];
+    // 该 provider 占用的下标（原序）与该 provider 内的当前顺序。
+    const slots = [];
+    const group = [];
+    accounts.forEach((a, i) => {
+        if (a.provider === entry.provider) {
+            slots.push(i);
+            group.push(a);
+        }
+    });
+    // ⚠️⚠️ **必须按「对象引用」定位，不能按 `id`**（真实缺陷，对抗审计实测证伪）：
+    //
+    // 池里**允许**存在两条同 id 的账号（`replaceAll` 导入一份手工编辑过的备份即可
+    // 造出，见其注释；`sanitizeAccounts` 只校验字段、不去重）。此时按 id 匹配的
+    // **`filter`** 会把**两条同 id 一起**滤掉：
+    //   - `group.findIndex(a => a.id === accountId)` 恒取**第一条**同 id（见下 ⚠️）；
+    //   - `group.filter(a => a.id !== accountId)` 会滤掉**两条**。
+    // ⇒ `nextGroup.length === group.length - 1` 而 `slots.length === group.length`，
+    // 下面的回填在最后一个槽位写入 `undefined`（`nextGroup[i]!` 的非空断言把它
+    // 静默放过）⇒ 池里出现空洞 ⇒ **该 provider 全部推理请求崩**
+    // （`getAvailableAccount` / `listAccounts` 抛 `Cannot read properties of undefined`），
+    // 且 `undefined` 经 `JSON.stringify` 变 `null`、重启后被 `sanitizeAccounts` 丢弃
+    // ⇒ **账号永久丢失**。
+    //
+    // 目标账号就是上面按 id 找到的 `entry` 这个对象本身，故按引用判等即可。
+    //
+    // ⚠️ **判别力说明（最终审计实测，别误读）**：**承重的是下面那个 `filter`** ——
+    // 单独把 `indexOf` 改回 `findIndex(a => a.id === ...)` **不可区分**（0 条测试变红），
+    // 因为同 id 时两者都命中**第一条**、而 `entry` 也是第一条。只有与 `filter` 一起
+    // 改回按 id 才会产生空洞。⇒ 回归用例真正锁的是 `filter` 那一侧；
+    // 本行按引用写是为**语义清晰**（「定位这一个对象」），不是独立的判别点。
+    const positionInGroup = group.indexOf(entry);
+    // 已在末位 → 无需变更，调用方据此省掉一次写盘。
+    if (positionInGroup === group.length - 1)
+        return null;
+    // 组内新顺序：其余账号保持相对顺序，目标账号排到最后。
+    // ⚠️ **这是 Critical 缺陷的承重点**：用引用判等；按 id 会连带移除另一条同 id
+    // 的账号（长度不变量被破坏 ⇒ 空洞 ⇒ provider 崩 + 重启丢账号）。
+    const nextGroup = group.filter(a => a !== entry);
+    nextGroup.push(entry);
+    const next = [...accounts];
+    // 长度不变式：组内账号数不变，故 slots 与 nextGroup 必然等长。
+    // 保留运行时兜底 —— 万一将来有人改动上面的筛选逻辑，宁可返回 null（不改顺序）
+    // 也不要写出空洞把整个 provider 弄崩。
+    if (nextGroup.length !== slots.length)
+        return null;
+    slots.forEach((slot, i) => { next[slot] = nextGroup[i]; });
+    return next;
+}
 /**
  * AccountPool —— 多账号管理核心
  *
@@ -44,6 +205,14 @@ export class AccountPool {
      */
     modelCache = {};
     /**
+     * 聚合「拒绝轮换」表的**权威进程内副本**（与 {@link cache} / {@link modelCache} 同理）。
+     *
+     * ⚠️ 与 {@link modelCache} **语义不同、不可合并**：黑名单是「关闭这个模型」（它从
+     * 模型选择器消失），本表是「这一条候选不参与该虚拟模型的轮换」（模型仍在目录里）。
+     * 详见 `AggregateRejectionMap` 的注释。
+     */
+    aggregateRejectionCache = {};
+    /**
      * 「锁定永久积分」开关表的**权威进程内副本**（与 {@link cache} 同理）。
      *
      * ⚠️ 每个 provider 一项（Loomy / CodeBuddy / WorkBuddy 各自独立），
@@ -66,6 +235,14 @@ export class AccountPool {
      * 的唯一后果是回到默认启用，用户再关一次即可。
      */
     gatewayEnabledCache = true;
+    /**
+     * 供应商自定义显示顺序（「供应商开关」弹窗拖拽排序）的进程内副本。
+     *
+     * ⚠️ 与 {@link gatewayEnabledCache} 同级、**不需要**独立文档：丢失本键的
+     * 唯一后果是顺序回到声明顺序，用户重新拖一次即可（纯展示偏好，可逆）。
+     * 数组语义见 `jet-hub-store.ts` 的 `JetHubState.providerOrder`。
+     */
+    providerOrderCache = [];
     /** 是否已完成首次载入。 */
     loaded = false;
     /**
@@ -77,6 +254,14 @@ export class AccountPool {
     storeChain = Promise.resolve();
     /** 锁定表的独立后端（权威落盘点）。 */
     lockStore;
+    /**
+     * 「账号入库」订阅者（Gitee issue IKJOZB）。
+     *
+     * ⚠️ 刻意**不落盘、不跨实例**：它的消费者是插件会话内的续期调度器，
+     * 而调度器按会话创建 —— 持久化订阅者既无意义，还会让「谁来订阅」变成
+     * 需要在启动时恢复的状态。
+     */
+    accountAddedListeners = new Set();
     constructor(ctx) {
         this.ctx = ctx;
         this.store = createJetHubStore(ctx);
@@ -92,12 +277,19 @@ export class AccountPool {
         this.loaded = true;
         const state = this.store.load();
         if (state !== undefined) {
+            // ⚠️ 这里的 `state.accounts` **已经过去重**：两种后端（SettingsStore /
+            // FileStore）的 `load()` 都经 `sanitizeAccounts`，而它按 id 去重。
+            // 故历史遗留的重复条目会在**下次载入时自愈**（只留第一条）。
             this.cache = state.accounts;
             // 黑名单是后来才加入的字段：老文档里没有它，缺失时保持空表
             // （等价于"全部模型默认打开"），而不是报错或让整次载入失败。
             this.modelCache = state.disabledModels;
+            // 聚合拒绝表同理：老文档没有该键 → 保持空表（没有任何拒绝）。
+            this.aggregateRejectionCache = state.aggregateRejections ?? {};
             // 网关开关同理：老文档没有该键 → 保持默认启用。
             this.gatewayEnabledCache = state.gatewayEnabled !== false;
+            // 供应商顺序同理：老文档没有该键 → 空数组（未自定义）。
+            this.providerOrderCache = state.providerOrder ?? [];
         }
         this.loadLocks(state);
     }
@@ -174,10 +366,13 @@ export class AccountPool {
             await this.store.save({
                 accounts: this.cache,
                 disabledModels: this.modelCache,
+                // 与上面两份同源快照（见本方法注释：分两次快照会让同一份文档里的字段互相矛盾）。
+                aggregateRejections: this.aggregateRejectionCache,
                 ...this.lockFields(),
                 // ⚠️ 必须与账号、黑名单取自**同一时刻**的快照（见本方法的注释）：
                 // 分两次快照会让同一份文档里的字段互相矛盾。
                 gatewayEnabled: this.gatewayEnabledCache,
+                providerOrder: this.providerOrderCache,
             });
         });
         this.storeChain = next.catch(() => { });
@@ -188,9 +383,49 @@ export class AccountPool {
      *
      * **必须连同黑名单一起写回**：两种后端都是整体写入，
      * 只写 `{ accounts }` 会把同一文档里的 `disabledModels` 抹掉。
+     *
+     * ## ⚠️⚠️ 这里是「同 id 去重」的**唯一收口点**（真实缺陷，独立审计实测证伪）
+     *
+     * 原先只把去重放在 `sanitizeAccounts`（归一化层）。但**并非所有写入路径都经过
+     * 归一化** —— 最典型的是 {@link addAccount}：它直接
+     * `writeAccounts([...readAccounts(), entry])`，**不调 `sanitizeAccounts`**。
+     * 而 `addAccount` 有 20+ 个调用点（各 `*-auth.ts` 的登录落库、`jet-hub-rpc.ts`
+     * 的 `account.create`、`opencode-rpc.ts`、`ensureDefaultAnonymousSlot`），
+     * 于是「池里两条同 id」仍可达。
+     *
+     * 后果**不是崩溃**（`sinkAccountToProviderEnd` 的长度不变式兜底会拦下空洞），
+     * 而是**沉底静默失效**：兜底返回 `null` ⇒ 顺序不变 ⇒ 限额号解禁后仍抢占首位 ⇒
+     * 用户报障的那个「额度轮不完、白白过期」**原样复现**。用静默失效换掉崩溃
+     * 只是把问题藏得更深。
+     *
+     * ⇒ 去重必须放在**唯一的写入收口点**（本方法）：无论调用方是否做过归一化，
+     * 落盘与进程内副本都不会含两条同 id。这是「按 id 唯一」这一不变式的
+     * **结构性保证**，而不是依赖每个调用方自觉。
+     *
+     * ⚠️ 保留**首次**出现的条目（与 `sanitizeAccounts` 同口径）。
+     * ⚠️ `sanitizeAccounts` 里的去重**仍然保留**：它是**入口**的清洗（坏条目、
+     * 脏限流标记），两者职责不同、互相不替代 —— 少了本层则 `addAccount` 漏网，
+     * 少了那层则脏数据进池。
      */
     async writeAccounts(accounts) {
-        this.cache = accounts;
+        // 按 id 去重（保留首次出现）。池里两条同 id 会让 `updateAccount` /
+        // `removeAccount` / 沉底全部只命中第一条，是幽灵账号与静默失效的根源。
+        const seen = new Set();
+        const deduped = [];
+        let dropped = 0;
+        for (const entry of accounts) {
+            if (seen.has(entry.id)) {
+                dropped++;
+                continue;
+            }
+            seen.add(entry.id);
+            deduped.push(entry);
+        }
+        if (dropped > 0) {
+            // 留痕：这条日志是排查「账号莫名少了一条」的唯一线索。
+            this.ctx.logger?.warn?.(`[jet-hub] 写入账号池时丢弃了 ${dropped} 条同 id 的重复条目（id 必须唯一）`);
+        }
+        this.cache = deduped;
         this.loaded = true;
         if (this.store.kind === 'memory') {
             this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，账号变更未落盘');
@@ -223,6 +458,126 @@ export class AccountPool {
         return { ...(this.modelCache[provider] ?? {}) };
     }
     /**
+     * 聚合「拒绝轮换」表的**只读快照**（供适配器与设置面板读取）。
+     *
+     * ⚠️ 返回**浅拷贝的顶层**（避免调用方改到内部缓存），但内层仍共享引用 ——
+     * 调用方**只读**即可；写入一律走 {@link setAggregateRejected}。
+     */
+    listAggregateRejections() {
+        this.ensureLoaded();
+        return this.aggregateRejectionCache;
+    }
+    /**
+     * 设置某条候选是否被拒绝参与该虚拟模型的轮换。
+     *
+     * 语义（与 {@link setModelDisabled} 对称）：
+     * - `rejected === true` → 写入；
+     * - `rejected === false` → **删除**该键（不留 `false` 噪音，与 sanitize 同口径）；
+     * - 空层逐级清理（realId 层空 → 删 provider 层；provider 层空 → 删虚拟模型层）。
+     */
+    async setAggregateRejected(canonicalId, provider, realId, rejected) {
+        this.ensureLoaded();
+        const next = { ...this.aggregateRejectionCache };
+        const perProvider = { ...(next[canonicalId] ?? {}) };
+        const perRealId = { ...(perProvider[provider] ?? {}) };
+        if (rejected)
+            perRealId[realId] = true;
+        else {
+            delete perRealId[realId];
+            // ⚠️⚠️ **「重新打开」必须一并清掉该渠道的「漂移兄弟键」**（真实缺陷，
+            //    独立审计实测证伪 —— D4 的降级会让拒绝**不可恢复**）。
+            //
+            // ## 为什么
+            // D4 规定：`(虚拟模型, 渠道)` 下有 `true` 记录、但那些 `realId` **都不在**
+            // 当前候选中（id 漂移）⇒ **降级为渠道级拒绝**（该渠道全部候选都被拒）。
+            // 而漂移的**旧键会一直留在表里** ⇒ 用户按降级 warn 的指引来面板
+            // 「重新打开」**当前**候选时，上面那行 `delete perRealId[realId]` 删的是
+            // **当前**键，**旧键仍在** ⇒ 降级判据依然成立 ⇒ **降级继续生效**：
+            //   - 面板用 `isRejected(表, 当前 realId)` 判断显示 ⇒ 显示「参与轮换」；
+            //   - 宿主实际**仍拒绝** ⇒ **显示与行为分叉**；
+            //   - 于是 warn 指引的那条恢复路径**走不通**（用户怎么点都没用）。
+            //
+            // ## 修法与判据
+            // 用户在面板上「重新打开」某条候选，其**意图**是「让这个渠道在这个模型下
+            // 重新参与轮换」。而 D4 的降级语义本就是**渠道级**的（要么整渠道拒、
+            // 要么整渠道参与）⇒ 故「打开一条」在该渠道处于降级态时，唯一自洽的结果
+            // 就是**整渠道恢复**。保留漂移旧键会让拒绝永远无法撤销，那不是规格要的
+            //（§5.2 与 `jet-hub-store.ts`：「拒绝 ≠ 关闭，可重新打开」）。
+            //
+            // ⚠️ 与 `clearAggregateRejected(canonicalId, provider)` 的区别：本分支只在
+            //    用户**显式打开某一条**时触发（且只清本渠道，不碰其它渠道）；
+            //    那个方法支持按虚拟模型/按渠道批量清（含从未拒绝过的）。语义不同故并存。
+            //
+            // ⚠️ 方向取「清整渠道层」而不是「只删漂移的那几个键」：后者要求这里知道
+            //    **当前候选表**（本层拿不到，它属于适配器），且「用户的意图是让整渠道
+            //    恢复」这一语义判断与删几个键无关 —— 见上方判据。
+            //
+            // ⚠️⚠️ **必须直接 `return`，不能让下面的写回把 `perRealId` 又挂回去**
+            //   （我自己第一版正是如此：`delete perProvider[provider]` 之后紧跟
+            //    `perProvider[provider] = perRealId` ⇒ **删除被自己覆盖**，
+            //    于是旧键仍在、降级不解除 —— 独立审计用真实池实测证伪了这一点）。
+            delete perProvider[provider];
+            if (Object.keys(perProvider).length === 0)
+                delete next[canonicalId];
+            else
+                next[canonicalId] = perProvider;
+            await this.writeAggregateRejections(next);
+            return;
+        }
+        if (Object.keys(perRealId).length === 0)
+            delete perProvider[provider];
+        else
+            perProvider[provider] = perRealId;
+        if (Object.keys(perProvider).length === 0)
+            delete next[canonicalId];
+        else
+            next[canonicalId] = perProvider;
+        await this.writeAggregateRejections(next);
+    }
+    /**
+     * 清空拒绝表（支持按虚拟模型或按渠道清）。
+     *
+     * - 都不传 ⇒ 清空**全部**；
+     * - 只传 `canonicalId` ⇒ 清空该虚拟模型的全部候选拒绝；
+     * - 只传 `provider` ⇒ 清空**所有**虚拟模型里该渠道的拒绝；
+     * - 两个都传 ⇒ 清空该虚拟模型里该渠道的拒绝。
+     *
+     * ⚠️ 与 {@link setAggregateRejected} 的 `false` 方向**不等价**：后者是「打开某一条」，
+     * 本方法是「清空一批」（即便某条从未被拒绝也无所谓）。
+     */
+    async clearAggregateRejected(canonicalId, provider) {
+        this.ensureLoaded();
+        if (canonicalId === undefined && provider === undefined) {
+            await this.writeAggregateRejections({});
+            return;
+        }
+        const next = {};
+        for (const [key, byProvider] of Object.entries(this.aggregateRejectionCache)) {
+            if (canonicalId !== undefined && key !== canonicalId) {
+                next[key] = byProvider;
+                continue;
+            }
+            const kept = {};
+            for (const [p, byRealId] of Object.entries(byProvider)) {
+                if (provider !== undefined && p !== provider)
+                    kept[p] = byRealId;
+            }
+            if (Object.keys(kept).length > 0)
+                next[key] = kept;
+        }
+        await this.writeAggregateRejections(next);
+    }
+    /** 落盘拒绝表（与 {@link writeModels} 对称）。 */
+    async writeAggregateRejections(rejections) {
+        this.aggregateRejectionCache = rejections;
+        this.loaded = true;
+        if (this.store.kind === 'memory') {
+            this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，聚合拒绝表变更未落盘');
+            return;
+        }
+        await this.queueStoreSave();
+    }
+    /**
      * 「本机 OpenAI 网关」当前是否启用。
      *
      * 缺键语义为**启用**（老用户升级后行为不变），见
@@ -248,6 +603,37 @@ export class AccountPool {
         this.loaded = true;
         if (this.store.kind === 'memory') {
             this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，网关开关仅本次会话有效');
+            return;
+        }
+        await this.queueStoreSave();
+    }
+    /**
+     * 读取供应商自定义显示顺序（进程内权威副本）。
+     *
+     * 空数组 = 用户尚未自定义（或老文档没有该键），展示侧按声明顺序渲染。
+     */
+    providerOrder() {
+        this.ensureLoaded();
+        return this.providerOrderCache;
+    }
+    /**
+     * 写入供应商自定义显示顺序并落盘。
+     *
+     * ⚠️ 入参**原样保存**、不在池里做 provider 合法性过滤：合法集合随插件版本
+     * 变化，在此过滤会让「新版本加入 provider → 被旧版本代码重写文档」场景下
+     * 的顺序无法保留。脏值防护由两层承担：RPC 层校验 `string[]`，
+     * store 层 `sanitizeProviderOrder` 去重/剔除非字符串。
+     */
+    async setProviderOrder(order) {
+        this.ensureLoaded();
+        const next = Array.isArray(order) ? [...order] : [];
+        if (this.providerOrderCache.length === next.length
+            && this.providerOrderCache.every((id, index) => id === next[index]))
+            return;
+        this.providerOrderCache = next;
+        this.loaded = true;
+        if (this.store.kind === 'memory') {
+            this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，供应商顺序仅本次会话有效');
             return;
         }
         await this.queueStoreSave();
@@ -512,7 +898,14 @@ export class AccountPool {
         this.ensureLoaded();
         return Object.keys(this.permanentLockCache).filter(p => this.permanentLockCache[p] === true);
     }
-    /** 列出某个 provider 的所有账号（含状态信息） */
+    /** 列出某个 provider 的所有账号（含状态信息）。
+     *
+     * 🔴 **视图排序（工单 08，2026-10-02）**：「任一模型限流中」的账号**沉到最后**
+     * （稳定序：未限流者保持手动拖拽序不变）。**只排序这个返回视图，不改磁盘顺序** ——
+     * 面板列表即时反映真实命中序（限流者沉底、解除后自动回原位），而"手动顺序=用户
+     * 拖拽意图"的成文契约不受影响。写时挪位（首版方案）因破坏该契约被废弃——
+     * 曾被上游行为契约测试抓出 4 条红，教训：改"展示顺序"别动"存储顺序"。
+     */
     async listAccounts(provider) {
         const filtered = this.readAccounts().filter(a => a.provider === provider);
         const results = [];
@@ -527,27 +920,83 @@ export class AccountPool {
             }
             results.push(status);
         }
-        return results;
+        // 稳定视图排序：可用在前、限流中沉底（Array.prototype.sort 在现代引擎是稳定的）。
+        const now = Date.now();
+        const isLimited = (a) => Object.values(a.modelRateLimits ?? {}).some(resetAtMs => resetAtMs > now);
+        return results.sort((a, b) => Number(isLimited(a)) - Number(isLimited(b)));
     }
     /** 列出所有 provider 的账号 */
     async listAllAccounts() {
         return this.readAccounts();
     }
     /**
-     * 清理「凭据域名与当前产品配置不符」的账号。
+     * 清理「凭据域名确证属于**其它**产品」的账号。
      *
      * 用途：WorkBuddy provider 从中国版（copilot.tencent.com）改造为国际版
-     * （www.workbuddy.ai）后，旧账号存的仍是中国版凭据 —— 它们的
-     * `token.domain` 指向旧端点，用新 endpoint 发请求必然失败（且会一直续期失败）。
+     * （www.workbuddy.ai）后，旧账号存的仍是中国版凭据 —— 它们的 `token.domain`
+     * 指向旧端点，用新 endpoint 发请求必然失败（且会一直续期失败）。
      * 这类条目已无修复价值，直接删除，让用户在 Jet Hub 重新登录。
      *
-     * 判据是**凭据里记录的 domain 与产品配置的 apiDomain 不一致**（而不是简单按
-     * provider 名删），这样只清理真正失配的条目，不会误删已在新端点登录的账号。
+     * ## ⚠️⚠️ 判据必须是「命中别的产品的域集合」，不是「不等于本产品的 apiDomain」
+     * （真实缺陷，独立审计实测证伪）
      *
+     * 原判据 `domain !== product.apiDomain` **语义不成立**：
+     *
+     * - 凭据里 `domain` 的语义是「**登录站点**」（token 的 `iss` 主机），不是请求
+     *   端点域名（`src/buddy-adapter.ts` 明文写着这一点，且 `X-Domain` 实际以
+     *   `this.product.apiDomain || credential.domain` 取值 —— 凭据的 `domain`
+     *   只是**兜底**）。故 `domain ≠ apiDomain` **不蕴含**「凭据发不到当前端点」。
+     * - 本机实测（20 个真实腾讯系账号）证明**同一 provider 的 `domain` 合法地存在
+     *   多种值**：buddy 的 `www.codebuddy.cn`（12 条）与 `copilot.tencent.com`（8 条）
+     *   —— 那 12 条一直是正常可用的。该判据在 buddy 上没出事，**只是因为上游恰好
+     *   没对 `CODEBUDDY` 调用本函数**；一旦推广会一次性删光它们。
+     * - 更严重的是它把「**未知**」当成「失配」：跨机导入、上游新增 realm 主机、
+     *   登录站改版，都会让一个**完全可用**的账号在下次启动时被静默删除
+     *   （本函数原先只留一行 `logger.info`）。
+     *
+     * ⇒ 现判据：`domain` **属于本产品的 `knownDomains`** ⇒ 保留；
+     * **命中其它产品的 `knownDomains`** ⇒ 确证失配，删除；
+     * **两边都不命中（未知域）** ⇒ **保守保留**（无法判定 ≠ 失配）。
+     *
+     * ⚠️ 产品未声明 `knownDomains` 时**一律保留**：没有域信息就无法判定失配，
+     * 删除的代价（用户重新登录 / 账号永久丢失）远大于保留一个可能失效的条目
+     * （它至多续期失败并在日志里可见）。
+     *
+     * @param product - 目标产品配置。
+     * @param foreignDomains - **其它**产品的已知域集合（用于确证失配）。
+     *   缺省为空集合 ⇒ 只保留、不删除（安全默认值）。
      * @returns 被删除的账号 id 列表（供调用方记日志）。
      */
-    async pruneAccountsWithForeignDomain(product) {
+    async pruneAccountsWithForeignDomain(product, foreignDomains = []) {
         const removed = [];
+        const own = new Set((product.knownDomains ?? []).map(d => d.toLowerCase()));
+        /**
+         * ⚠️ **产品未声明 `knownDomains` 时一律不删**（安全默认值）。
+         *
+         * 没有本产品的域信息就无法区分「本产品合法的其它 realm 主机」与「别的产品的域」
+         * —— 此时把 foreign 命中的账号删掉，等于回到旧判据那种「把未知当失配」的错误，
+         * 只是换了个方向。删除用户数据的代价（重新登录 / 账号永久丢失）远大于保留一个
+         * 可能失效的条目（它至多续期失败并在日志里可见）。
+         */
+        if (own.size === 0) {
+            // ⚠️ 留日志（不是静默 return）：忘了声明 `knownDomains` 会让本函数**完全不工作**，
+            // 而调用方只在 `removed.length > 0` 时记日志 ⇒ 那种情况下**一个字都没有**，
+            // 排障时会以为「清理跑过了、没问题」。
+            this.ctx.logger?.warn?.(`[jet-hub] pruneAccountsWithForeignDomain: 产品 ${product.id} 未声明 knownDomains，`
+                + '本次不做任何清理（无法判定失配）');
+            return removed;
+        }
+        const foreign = new Set(foreignDomains
+            // 本产品自己的域永远不算「别的产品的域」（同源产品共享登录站时避免自删）。
+            .filter(d => !own.has(d.toLowerCase()))
+            .map(d => d.toLowerCase()));
+        // ⚠️ 同上：`foreignDomains` 为空时本函数退化成「只保留、不删除」。调用方必须
+        // 传「其它产品的域集合」才能清理 —— 空集合是**合法但几乎无用**的调用，
+        // 留日志以免「以为清过了」。
+        if (foreign.size === 0) {
+            this.ctx.logger?.warn?.(`[jet-hub] pruneAccountsWithForeignDomain: 未提供其它产品的域集合，`
+                + `产品 ${product.id} 的失配账号不会被清理`);
+        }
         for (const entry of this.readAccounts()) {
             if (entry.provider !== product.id)
                 continue;
@@ -566,17 +1015,120 @@ export class AccountPool {
             // domain 为空表示历史凭据未记录域名，无法判定，保守保留。
             if (domain.length === 0)
                 continue;
-            if (domain !== product.apiDomain) {
+            const host = domain.toLowerCase();
+            // 本产品的合法域（含 API 域与登录站）⇒ 保留。
+            if (own.has(host))
+                continue;
+            // 确证属于别的产品 ⇒ 删除（这才是本函数真正要清的目标）。
+            if (foreign.has(host)) {
                 await this.removeAccount(entry.id);
                 removed.push(entry.id);
             }
+            // 未知域 ⇒ 保守保留（见方法注释：无法判定 ≠ 失配）。
         }
         return removed;
     }
     /** 添加新账号（登录成功后调用） */
     async addAccount(entry) {
         const accounts = [...this.readAccounts(), entry];
-        await this.writeAccounts(accounts);
+        try {
+            await this.writeAccounts(accounts);
+        }
+        finally {
+            // ⚠️ **必须放在 `finally` 里**（不是落盘之后一行）：`writeAccounts` 会先
+            // 更新进程内权威副本 `this.cache`、再 `await` 落盘，故落盘抛错时账号
+            // **已经是可用状态**（何况各 auth 的登录流程在调用本方法前就
+            // `credentials.set` 了凭据）。通知的用途是让续期调度器认识这个账号 ——
+            // 因一次磁盘失败就吞掉它，会得到「账号能用、但本会话不续期」，
+            // 正是 issue IKJOZB 的同一形态。
+            this.notifyAccountAdded(entry);
+        }
+    }
+    /**
+     * 注册「账号入库」回调（Gitee issue IKJOZB）。
+     *
+     * ## 为什么需要这个出口
+     *
+     * 续期调度器原先只在**插件启动那一刻**按「池是否非空」决定是否武装，而
+     * 冷启动时池为空是正常态（新用户、刚清过存储）—— 此后登录的账号在本会话内
+     * **永远不会被主动续期**。修法之一是「账号入库时补武装」，于是需要有人告诉
+     * 调度器「池刚变了」。
+     *
+     * ⚠️ **收口点必须是这里**，不能逐个登录流程接线：`pool.addAccount` 在全仓库
+     * 有十几处调用点（12 个 provider 的 auth、opencode 的账号槽与匿名槽、RPC 的
+     * 导入/恢复分支）。逐处接线必然漏掉某一处，而漏掉的那一处会**静默**地不续期。
+     *
+     * @param listener 回调；**抛错会被吞掉并记 warn**（订阅者不得让登录失败）。
+     * @returns 取消订阅函数。
+     */
+    onAccountAdded(listener) {
+        this.accountAddedListeners.add(listener);
+        return () => { this.accountAddedListeners.delete(listener); };
+    }
+    /**
+     * 逐个调用入库订阅者；**任何异常都只记日志**。
+     *
+     * ⚠️ 不能让订阅者的异常冒到 `addAccount` 的调用者：那条路径是「登录成功」，
+     * 一个写坏的订阅者不该让用户看到「登录失败」（凭据其实已经存好了）。
+     */
+    notifyAccountAdded(entry) {
+        for (const listener of [...this.accountAddedListeners]) {
+            try {
+                listener(entry);
+            }
+            catch (error) {
+                this.ctx.logger?.warn?.(`[jet-hub] 账号入库通知的订阅者抛错（已忽略）：`
+                    + `${error instanceof Error ? error.message : String(error)}`);
+            }
+        }
+    }
+    /**
+     * **只追加**账号（合并导入用）：已有的 id 一律跳过，返回**实际新增**的 id。
+     *
+     * ⚠️ 与 {@link replaceAll} 的差别是本质的，不要互相替换：
+     * - 只调用 `writeAccounts`（账号 + 黑名单整体写回，但黑名单取**当前**值），
+     *   因此**不改**模型黑名单，也**不触碰**锁定表（它住在独立文档里）；
+     * - 绝不删除或覆盖任何现有账号 —— 判重按 `id`，这是账号的唯一键；
+     * - 入参同样经 `sanitizeAccounts` 归一化：数据来自用户提供的文件，
+     *   坏条目丢弃而不是写进池里反复触发选号失败。
+     *
+     * ⚠️ **文件内部重复的 id 去重已下沉到 `sanitizeAccounts`**（该函数按 id 去重，
+     * 全部入口共用）。本方法只需再比一次「与**池里已有**的 id 是否冲突」。
+     * 备份文件可能被手工编辑过，重复条目会在池里留下两条同 id 的账号 ——
+     * 那不只是「删不掉、改不动」的幽灵账号：沉底函数按 id 匹配会写出
+     * `undefined` 空洞，使整个 provider 崩溃并在重启后永久丢账号
+     * （详见 `sanitizeAccounts` 与 `sinkAccountToProviderEnd` 的注释）。
+     */
+    async mergeAccounts(accounts) {
+        const current = this.readAccounts();
+        const existing = new Set(current.map(entry => entry.id));
+        const added = [];
+        for (const entry of sanitizeAccounts(accounts)) {
+            if (existing.has(entry.id))
+                continue;
+            existing.add(entry.id);
+            added.push(entry);
+        }
+        if (added.length === 0)
+            return [];
+        try {
+            await this.writeAccounts([...current, ...added]);
+        }
+        finally {
+            // ⚠️ **必须逐个通知「账号入库」订阅者**（Gitee issue IKJOZB 的收口点）：
+            // 订阅方（`src/index.ts`）据此补武装续期调度器、并清掉 aggregate 的临期折算
+            // 与候选序缓存。少了这一步，合并导入的新账号在**最长 60 秒**内对 aggregate
+            // 路由不可见（缓存过期前一直用旧候选序），而文档把 `addAccount` 称作唯一
+            // 收口点 —— 新增一条绕过它的写入路径就等于制造第二套判据。
+            // ⚠️ 与 `addAccount` 同款放在 `finally` 里：`writeAccounts` 先更新进程内
+            // 权威副本、再 `await` 落盘，故落盘抛错时账号**已经是可用状态**（凭据在
+            // `importBackup` 里更早就 `credentials.set` 了）。因一次磁盘失败就吞掉通知，
+            // 会得到「账号能用、但本会话不续期」，正是 issue IKJOZB 的同一形态。
+            // （`notifyAccountAdded` 内部已逐订阅者吞异常。）
+            for (const entry of added)
+                this.notifyAccountAdded(entry);
+        }
+        return added.map(entry => entry.id);
     }
     /** 更新账号部分字段 */
     async updateAccount(id, patch) {
@@ -922,12 +1474,82 @@ export class AccountPool {
         return null;
     }
     /**
+     * 取某 provider **全部启用账号**的凭据（按手动顺序）。
+     *
+     * ## ⚠️ 为什么需要它（真实缺陷，用户报障 2026-10-07）
+     *
+     * 用户质疑：「workbuddy 中一个号是 1 天到期，为什么我们统计是 2000 多天，
+     * **只用了第一个账号吗**？」—— **他猜对了**。
+     *
+     * 聚合的临期折算原先走 {@link getAvailableAccount}，那个方法只返回**一个**
+     * 账号（手动序第一个可用的）。于是「渠道最早什么时候作废」只反映了那**一个**
+     * 账号 —— 而用户把「1 天到期」的号拖到后面时，它的临期额度在**排序**里被完全忽略，
+     * 结果是「按临期排序」把这个渠道排到后面，尽管它有一个快作废的号。
+     *
+     * ⚠️ 与 {@link getAvailableAccount} 的**分工**：那个方法服务于「实际发请求用哪个
+     * 账号」（手动顺序优先，渠道内部换号由适配器负责）；本方法只服务于**观测**
+     *（「这个渠道整体的临期额度大概什么时候作废」），**不改变选号行为**。
+     *
+     * ⚠️ 与 `getAvailableAccount` 一致：**跳过凭据损坏的账号**（记日志、继续），
+     * 而不是整批失败 —— 一个坏账号不该让整个渠道被判成不可用。
+     *
+     * @param provider - 渠道 id
+     * @param modelId - 真实模型 id（用于限流过滤；空串则跳过限流维度）
+     * @returns 凭据数组（可能为空 = 没有可用账号）
+     */
+    async listAvailableCredentials(provider, modelId) {
+        const candidates = this.readAccounts()
+            .filter(a => a.provider === provider && a.enabled)
+            .filter(a => {
+            // 与 `getAvailableAccount` 同一判据：空 modelId 跳过限流过滤。
+            if (modelId.length === 0)
+                return true;
+            if (!a.modelRateLimits)
+                return true;
+            const resetAt = a.modelRateLimits[modelId];
+            return resetAt === undefined || resetAt === 0 || Date.now() >= resetAt;
+        });
+        const out = [];
+        for (const entry of candidates) {
+            try {
+                const resolved = await this.ctx.credentials.resolve(credentialRef(entry.credentialRef));
+                // ⚠️ 与 `getAvailableAccount` 同判据：`resolve` 可能返回 undefined（凭据未配置）。
+                if (!resolved) {
+                    this.ctx.logger?.warn?.(`[jet-hub] ${provider} 账号 ${entry.id} 凭据未配置（跳过）`);
+                    continue;
+                }
+                out.push({ entry, credential: JSON.parse(resolved.value) });
+            }
+            catch (error) {
+                // ⚠️ 单个账号的凭据坏掉只跳过它（与 `getAvailableAccount` 同取向）——
+                //    否则一个坏账号会让整个渠道的临期折算失败、被判成「查不到」。
+                this.ctx.logger?.warn?.(`[jet-hub] ${provider} 账号 ${entry.id} 的凭据不可用（临期折算跳过它）：`
+                    + `${error instanceof Error ? error.message : String(error)}`);
+            }
+        }
+        return out;
+    }
+    /**
      * 更新某账号某模型的重置时间。
      *
      * 关键：基于**读取到的最新账号列表**做局部合并，再把整个列表写回。
      * settings scope 的 get() 返回的是服务内部快照，可能滞后于磁盘；
      * 但 replace() 是整体替换，因此这里每次都在最新快照上合并，
      * 避免"写 A 的限流 → 读旧快照 → 写 B 的限流"把 A 的记录抹掉。
+     *
+     * ⚠️ **只接受比现值更大的解禁时刻**（与
+     * {@link updateTraeCheckinDeviceGeneration} 同一约定）：
+     *
+     * 各 provider 的限流解析都有「解析不出时长 → 退回一个兜底值」的末端，而那个兜底
+     * 通常是**短**的（cline 是 1 小时，而真实等待可能是 19 小时 39 分）。于是同一个
+     * (账号, 模型) 上先写入的**真值**会被后写入的**兜底**覆盖 ——
+     * cline「倒计时结束了还是失败，显示又 60 分钟」正是这样无限循环的。
+     *
+     * 并发场景最容易踩：同一 provider 的两个请求，一个拿到可解析的报文（写 19h39m），
+     * 另一个拿到被 CDN 包成 HTML 的 429（写 1h），**后写的赢**。
+     *
+     * ⇒ 这里取「更长者」。真值被丢掉的风险不用担心：所有调用方写入的都是**未来**
+     * 时刻，而过期的标记由 {@link sweepExpiredRateLimits} 清理。
      */
     async updateModelRateLimit(accountId, modelId, resetAtMs) {
         const accounts = this.readAccounts();
@@ -936,12 +1558,78 @@ export class AccountPool {
             this.ctx.logger?.warn?.(`[jet-hub] updateModelRateLimit: 账号 ${accountId} 不在账号列表中（已知: ${accounts.map(a => a.id).join(', ') || '空'}）`);
             return;
         }
-        const next = [...accounts];
-        const entry = { ...next[idx] };
-        entry.modelRateLimits = { ...entry.modelRateLimits, [modelId]: resetAtMs };
-        next[idx] = entry;
+        // ⚠️⚠️ **判据走共享谓词 `isValidResetAtMs`**（真实缺陷，独立审计实测证伪）：
+        //
+        // 原先这里只拒 `!Number.isFinite(resetAtMs)` —— 它**放过超出 `Date` 范围的
+        // 有限数**（如 `1e308`）。那种值写进池后，下次同一个 (账号, 模型) 再撞限流时
+        // 会走到下面的 `new Date(current).toISOString()` 并抛
+        // **`RangeError: Invalid time value`**，而 17 个 `updateModelRateLimit` 调用点里
+        // 有 16 个没有 try ⇒ 异常直接冒到推理路径与「重测」路径。
+        //
+        // 可达输入是**手工编辑过的备份文件**（`modelRateLimits: {"glm-5.2": 1e308}`）：
+        // 读取侧（`sanitizeModelRateLimits`）原先也只判「有限正数」，两处**都漏了这一格**。
+        // 现两侧共用同一个谓词，从结构上不可能再分叉。
+        //
+        // 无效时刻必须**直接拒绝**，不能当「很短的解禁时刻」处理：写进去之后所有比较
+        // 都恒为 false（该模型被永久限流、sweep 也清不掉）。
+        if (!isValidResetAtMs(resetAtMs)) {
+            this.ctx.logger?.warn?.(`[jet-hub] updateModelRateLimit: 账号 ${accountId} 模型 ${modelId} 收到无效的解禁时刻 `
+                + `${String(resetAtMs)}（须为 0 < v ≤ ${MAX_DATE_MS} 的有限毫秒时间戳），已忽略`);
+            return;
+        }
+        const current = accounts[idx].modelRateLimits?.[modelId];
+        // ⚠️ 判据用 `>=`：相等时无需写盘（省一次 IO），语义上也无差别。
+        // ⚠️ 现值也走同一谓词：**池里可能存在历史遗留的坏值**（本次修复前导入的
+        //    `1e308` 已经躺在磁盘上）—— 此时 `isValidResetAtMs(current)` 为 false，
+        //    于是 `markerUnchanged` 为 false、新值覆盖它（**自愈**），
+        //    且下面那条日志不会对坏值调 `new Date()`（否则照样抛 RangeError）。
+        const currentValid = isValidResetAtMs(current);
+        const markerUnchanged = currentValid && current >= resetAtMs;
+        if (markerUnchanged) {
+            this.ctx.logger?.info?.(`[jet-hub] updateModelRateLimit: 账号 ${accountId} 模型 ${modelId} 已有更长的限流标记 `
+                + `(${new Date(current).toISOString()} ≥ ${new Date(resetAtMs).toISOString()})，本次不覆盖`);
+        }
+        // 限流标记与「沉底」在同一次写盘里完成（两者都是「这个号撞限额了」的后果）。
+        let next = [...accounts];
+        if (!markerUnchanged) {
+            const entry = { ...next[idx] };
+            entry.modelRateLimits = { ...entry.modelRateLimits, [modelId]: resetAtMs };
+            next[idx] = entry;
+        }
+        /**
+         * ⚠️ **沉底必须与「本次是否覆盖标记」无关**：走到这一段就说明该账号此刻
+         * 确实在限额中（否则调用方不会来报限流）。已有更长标记时标记不用改，但
+         * 账号仍然受限、仍然该沉底 —— 若只在覆盖分支里沉底，同一账号第二次撞限流
+         * 就不会沉底，行为变得难以解释。
+         *
+         * ⚠️⚠️ **但必须确认「写完之后它真的处于受限态」**：调用方可能传来一个
+         * **已经过去**的解禁时刻（实测存在：`trae-model-id-selection.spec.ts` 就用
+         * `Date.now() - 1000` 构造「标记已过期」的场景，另有 provider 的兜底值可能
+         * 落在过去）。那种情况下账号此刻是**可用**的，把它沉底就是错的 ——
+         * 用户会看到一个完全正常的号莫名掉到末尾，且 `getAvailableAccount`
+         * （已判它可用）与顺序（判它受限）互相矛盾。
+         *
+         * 判据取**生效后的标记**（现值与新值中的较长者）是否仍在未来。取较长者是因为
+         * 上面刚决定「保留更长的现值」—— 生效的就是那个值。
+         * ⚠️ 现值同样必须经 `isValidResetAtMs` 过滤：池里可能有历史遗留的坏值
+         * （如 `1e308`），拿它参与比较会得到无意义的结果。
+         */
+        const effectiveResetAt = currentValid && current > resetAtMs ? current : resetAtMs;
+        const stillLimited = effectiveResetAt > Date.now();
+        let sank = false;
+        if (rateLimitSinkEnabled() && stillLimited) {
+            const reordered = sinkAccountToProviderEnd(next, accountId);
+            if (reordered !== null) {
+                next = reordered;
+                sank = true;
+            }
+        }
+        // 两件事都没变化时不写盘（避免每次限流都产生一次无意义的整体重写）。
+        if (markerUnchanged && !sank)
+            return;
         await this.writeAccounts(next);
-        this.ctx.logger?.info?.(`[jet-hub] 已记录限流: 账号 ${accountId} 模型 ${modelId} 重置于 ${new Date(resetAtMs).toISOString()}`);
+        this.ctx.logger?.info?.(`[jet-hub] 已记录限流: 账号 ${accountId} 模型 ${modelId} 重置于 ${new Date(resetAtMs).toISOString()}`
+            + (sank ? '（已沉到本 provider 末尾，解禁后不再抢占首位）' : ''));
     }
     /** 清理已过期的重置时间记录 */
     async sweepExpiredRateLimits() {
@@ -1089,9 +1777,42 @@ export class AccountPool {
      * `sanitizeAccounts` / `sanitizeDisabledModels` 归一化：只保留可用的
      * 账号条目与显式 `true` 的黑名单项，坏条目直接丢弃而不是写进池里
      * 反复触发选号失败。
+     *
+     * ⚠️ **同 id 去重由 `sanitizeAccounts` 承担**（不要在这里再补一套 ——
+     * 那会形成「一文件两套同义判据」，本项目已有该形态的事故史）。去重缺失的
+     * 后果是沉底写出 `undefined` 空洞、整个 provider 崩 + 重启丢账号，
+     * 详见 `sanitizeAccounts` 的注释。另：`writeAccounts` 也有一层收口去重
+     * （覆盖不经归一化的写入路径）。
+     *
+     * ⚠️⚠️ **必须逐个通知「账号入库」订阅者**（同族未修缺陷，独立审计实测证伪）：
+     * `mergeAccounts` 已补上这一步（见其注释），而本方法是**备份导入的默认模式**
+     * （`replace`）—— 它整体换掉整个账号池，影响面**比 merge 更大**，却同样绕过了
+     * `notifyAccountAdded` 收口点。后果与 merge 那条完全同型：导入后的账号在
+     * **最长 60 秒**内对 aggregate 路由不可见（临期折算与候选序缓存未清），
+     * 报 `MISSING_CREDENTIAL | …没有任何可用候选`。
+     *
+     * 通知时机：放在 `persistLocks()` **之后**，且只在它成功时通知 —— 与
+     * `mergeAccounts` 的 `finally` 语义略有不同（那里 `writeAccounts` 先更新
+     * 进程内副本再落盘，故落盘失败账号也已可用）；这里 `this.cache` 在上面就已赋值，
+     * 故落盘失败时账号同样可用，**也应当通知**。故同样用 `try/finally`。
      */
     async replaceAll(accounts, disabledModels, permanentLocks) {
         const next = sanitizeAccounts(accounts);
+        /**
+         * ⚠️ **去重留痕**（真实缺口，最终审计实测证伪）：本方法**不调 `writeAccounts`**
+         * （它直接赋值 `this.cache` + `persistLocks()`），故 `writeAccounts` 里那条
+         * 「丢弃了 N 条同 id 重复条目」的告警在**备份导入的默认模式（`replace`）下不会触发**
+         * —— 而 `replace` 恰恰是最可能遇到手工编辑备份（含重复 id）的路径。
+         *
+         * 后果：`accountsImported` 报的是**载荷条目数**（如 2），池里只有 1 个，
+         * 且**零 warning** 解释差额 —— 与「账号自己没了、日志里什么都没有」的
+         * 报障形态同型。故这里按同样的口径补一条。
+         */
+        const dedupedCount = new Set(next.map(entry => entry.id)).size;
+        const dropped = accounts.length - dedupedCount;
+        if (dropped > 0) {
+            this.ctx.logger?.warn?.(`[jet-hub] replaceAll 丢弃了 ${dropped} 条同 id / 坏条目（入参 ${accounts.length} 条，落地 ${dedupedCount} 条）`);
+        }
         this.cache = next;
         this.modelCache = sanitizeDisabledModels(disabledModels);
         // 备份文件可能来自不含该字段的旧版本：`undefined` 时**保持当前值**，
@@ -1101,9 +1822,17 @@ export class AccountPool {
             this.permanentLockCache = sanitizePermanentLocks(permanentLocks);
         }
         this.loaded = true;
-        // 一次落盘三件事：锁定表进**独立文档**，账号与黑名单进 state.json，
-        // 同时把 Loomy 的镜像字段同步过去（persistLocks 内部就是这套顺序）。
-        await this.persistLocks();
+        try {
+            // 一次落盘三件事：锁定表进**独立文档**，账号与黑名单进 state.json，
+            // 同时把 Loomy 的镜像字段同步过去（persistLocks 内部就是这套顺序）。
+            await this.persistLocks();
+        }
+        finally {
+            // ⚠️ 与 `mergeAccounts` 同款：`this.cache` 已更新（账号已可用），
+            // 故落盘失败也要通知 —— 否则「账号能用、但本会话不续期 / 对聚合不可见」。
+            for (const entry of next)
+                this.notifyAccountAdded(entry);
+        }
     }
 }
 /**

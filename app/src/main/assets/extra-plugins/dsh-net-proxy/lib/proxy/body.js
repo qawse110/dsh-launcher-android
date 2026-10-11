@@ -17,22 +17,40 @@ import { createDecoder } from "./parse.js";
  *
  * @param {ReadableStreamDefaultController} controller
  * @param {string} ce content-encoding（小写）
+ * @param {object} [taps] 流量日志旁路（纯旁观，不改变流语义）：
+ *   - taps.onWire(chunk)  线上原始字节（压缩后，即真实网络流量口径）
+ *   - taps.onPlain(chunk) 解压后明文字节（仅用于预览采样）
  */
-export function makeBodyController(controller, ce) {
+export function makeBodyController(controller, ce, taps) {
   const dec = createDecoder(ce);
   let decDoneResolve = null;
   const decDone = new Promise((r) => (decDoneResolve = r));
   let closed = false;
   const close = () => { if (closed) return; closed = true; try { controller.close(); } catch {} decDoneResolve(); };
   if (dec) {
-    dec.on("data", (c) => { try { controller.enqueue(new Uint8Array(c)); } catch {} });
+    dec.on("data", (c) => {
+      if (taps && taps.onPlain) { try { taps.onPlain(c); } catch {} }
+      try { controller.enqueue(new Uint8Array(c)); } catch {}
+    });
     dec.on("end", close);
     dec.on("error", (e) => { try { controller.error(e); } catch {} decDoneResolve(); });
   }
   // dec 写入用 drain 背压，避免过大解压缓冲；无解码直接 enqueue。
+  // 背压等待须与 close/error 竞速：dec 被 destroy 后 drain 永不触发，否则泵循环挂死。
   const write = (c) => new Promise((res) => {
-    if (dec) { if (!dec.write(c)) { dec.once("drain", () => res()); } else res(); }
-    else { try { controller.enqueue(new Uint8Array(c)); } catch {} res(); }
+    if (taps && taps.onWire) { try { taps.onWire(c); } catch {} }
+    if (dec) {
+      if (!dec.write(c)) {
+        const done = () => { dec.removeListener("close", done); dec.removeListener("error", done); res(); };
+        dec.once("close", done);
+        dec.once("error", done);
+        dec.once("drain", done);
+      } else res();
+    }
+    else {
+      if (taps && taps.onPlain) { try { taps.onPlain(c); } catch {} }
+      try { controller.enqueue(new Uint8Array(c)); } catch {} res();
+    }
   });
   const finish = () => { if (dec) { dec.end(); return decDone; } close(); return Promise.resolve(); };
   const destroy = () => { if (dec) { try { dec.destroy(); } catch {} } };

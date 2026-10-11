@@ -20,13 +20,14 @@ function ipv4ToInt(s) {
  *   - IPv4 CIDR `10.0.0.0/8`、`128.0.0.0/8`
  *   - `*`（全部命中）
  *   - `<local>`（回环/局域网，简化：回环即命中）
+ *   - IPv6 字面量 `::1` / `[::1]` / `[::1]:443`（URL.hostname 自带方括号，须对齐比较）
  */
 export function isNoProxy(rawUrl, noProxy) {
   if (!Array.isArray(noProxy) || noProxy.length === 0) return false;
   let host, port = null;
   try {
     const u = new URL(rawUrl);
-    host = u.hostname.toLowerCase();
+    host = u.hostname.toLowerCase(); // 注意：IPv6 形如 "[::1]"（带方括号）
     port = u.port ? Number(u.port) : (u.protocol === "https:" ? 443 : 80);
   } catch {
     host = String(rawUrl).toLowerCase();
@@ -34,20 +35,37 @@ export function isNoProxy(rawUrl, noProxy) {
   const hostNoBrackets = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
   for (const raw of noProxy) {
     if (!raw) continue;
-    const e = String(raw).trim().toLowerCase();
+    let e = String(raw).trim().toLowerCase();
     if (!e) continue;
     if (e === "*") return true;
     if (e === "<local>") {
       if (host === "localhost" || host.endsWith(".localhost") || host === "::1" || host === "[::1]" || hostNoBrackets.startsWith("127.")) return true;
       continue;
     }
-    // host:port
+    // 拆出条目里的 host 与可选端口。IPv6 字面量含多个冒号，不能按 "host:port" 简单切分：
+    //   "::1" → host "::1"；"[::1]:443" → host "::1" port 443；"example.com:443" → host+port。
     let onlyHost = e;
-    if (port != null && /:\d+$/.test(e)) {
+    let ePort = null;
+    if (e.startsWith("[")) {
+      const close = e.indexOf("]");
+      if (close !== -1) {
+        onlyHost = e.slice(1, close);
+        const rest = e.slice(close + 1);
+        if (rest.startsWith(":")) ePort = Number(rest.slice(1));
+      }
+    } else if ((e.match(/:/g) || []).length === 1 && /:\d+$/.test(e)) {
       const ci = e.lastIndexOf(":");
-      const ePort = Number(e.slice(ci + 1));
-      if (ePort !== port) continue; // 端口不匹配，不算命中
+      ePort = Number(e.slice(ci + 1));
       onlyHost = e.slice(0, ci);
+    } else {
+      onlyHost = e;
+    }
+    // 前导点形式 ".example.com"：等价于 "example.com"（匹配本域 + 全部子域）。
+    // 此前不剥点，endsWith(".."+"example.com") 永不命中，条目被静默忽略。
+    if (onlyHost.startsWith(".")) onlyHost = onlyHost.slice(1);
+    if (ePort != null) {
+      if (port != null && ePort !== port) continue; // 端口不匹配，不算命中
+      if (port == null) continue;
     }
     // CIDR
     if (onlyHost.includes("/")) {
@@ -65,7 +83,17 @@ export function isNoProxy(rawUrl, noProxy) {
       continue;
     }
     if (onlyHost === "*") return true;
-    if (host === onlyHost || host.endsWith("." + onlyHost)) return true;
+    // ".*" 前缀通配（Windows ProxyOverride 风格）与 "*.foo.com" 形式（等价 "foo.com" 后缀匹配）
+    if (onlyHost.startsWith("*")) onlyHost = onlyHost.slice(1);
+    if (onlyHost.startsWith(".")) onlyHost = onlyHost.slice(1); // 前导点剥离在上面 "*" 之后才发生，这里补一次
+    if (onlyHost.endsWith(".*")) {
+      const prefix = onlyHost.slice(0, -1); // 保留尾点："192.168."
+      if (host.startsWith(prefix) || hostNoBrackets.startsWith(prefix)) return true;
+      continue;
+    }
+    // 精确/后缀：host 与去括号形式都参与比较（"[::1]" 与 "::1" 等价）
+    if (host === onlyHost || hostNoBrackets === onlyHost) return true;
+    if (host.endsWith("." + onlyHost) || hostNoBrackets.endsWith("." + onlyHost)) return true;
   }
   return false;
 }

@@ -1,11 +1,16 @@
 import { createServer } from 'node:http';
+import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { loadOrCreateApiKey } from './auth.js';
 import { resolveGatewayConfig } from './config.js';
+import { markGatewayChannel } from './channel.js';
 import { toGenerateOptions, OpenAiGatewayError, parseModelRoute, normalizeReasoningEffort, normalizeMaxTokens } from './messages.js';
-import { collectGatewayModelIds, collectGatewayModels, toOpenAiModels } from './models.js';
+import { collectGatewayEffortViews, collectGatewayModelIds, collectGatewayModels, toGatewayModelIds, toOpenAiModels } from './models.js';
+import { effortResolutions } from './effort-view.js';
+import { CANONICAL_REASONING_EFFORTS } from '../reasoning-ladder.js';
 import { findCaseInsensitiveSuggestion, looksLikeMissingModel } from './model-errors.js';
+import { collectResponsesResult, responsesMaxOutputTokens, responsesReasoningEffort, toResponsesGenerateOptions, toResponsesSse, } from './responses.js';
 import { collectOpenAiCompletion, failureToOpenAiError, toOpenAiSse } from './stream.js';
 const BODY_LIMIT = 16 * 1024 * 1024;
 const defaultLogger = {
@@ -80,7 +85,53 @@ export function createOpenAiGateway(options) {
         const groups = await collectGatewayModels(options.llm, (provider, error) => {
             logger.warn(`[openai-gateway] ${provider} 模型目录读取失败，已从 /v1/models 跳过：${describe(error)}`);
         });
-        jsonResponse(response, 200, { object: 'list', data: toOpenAiModels(groups) });
+        // 档位视图是**附加信息**：某个模型解析不出来就只是它没有该字段，
+        // 绝不能让整份目录跟着失败（同理，见 collectGatewayEffortViews 的注释）。
+        const effortViews = await collectGatewayEffortViews(options.llm, groups, (provider, error) => {
+            logger.warn(`[openai-gateway] ${provider}：${describe(error)}`);
+        });
+        jsonResponse(response, 200, { object: 'list', data: toOpenAiModels(groups, effortViews) });
+    };
+    /**
+     * `GET /v1/reasoning-efforts`：**思考档位对照表**（本网关特有的只读端点）。
+     *
+     * ## 为什么需要它（真实缺陷）
+     *
+     * 各 provider 的档位 id 是上游 wire 值（`light` / `extra_high` / `xhigh` / `on`），
+     * 而走 OpenAI 协议的客户端只有固定 8 档词汇。客户端**无法表达**那些私有 id，
+     * 用户只能照 DSH 界面上显示的名字（Max / Extra / Extra High）猜着填，
+     * 猜错就是 400。翻译层让「猜错也不会失败」，本端点让「不必猜」：
+     * 每个模型的 `openai_efforts` 就是可以直接抄进客户端的那一组，
+     * `resolutions` 则把 8 个规范名逐一的结局说清（原样 / 就近 / 无法表达 / 不下发）。
+     *
+     * ⚠️ `/v1/models` 里也带同一份视图（`reasoning` 字段）。两处**必须同源**：
+     * 这里给人和脚本查，那里给会自动扫目录的工具查；各算一遍必然漂移。
+     */
+    const handleReasoningEfforts = async (response) => {
+        const groups = await collectGatewayModels(options.llm, (provider, error) => {
+            logger.warn(`[openai-gateway] ${provider} 模型目录读取失败，已从 /v1/reasoning-efforts 跳过：${describe(error)}`);
+        });
+        const effortViews = await collectGatewayEffortViews(options.llm, groups, (provider, error) => {
+            logger.warn(`[openai-gateway] ${provider}：${describe(error)}`);
+        });
+        jsonResponse(response, 200, {
+            object: 'list',
+            // 客户端能说出口的全部档位名（由弱到强）。CC Switch 的档位多选器就是这 8 个。
+            canonical: [...CANONICAL_REASONING_EFFORTS],
+            data: toGatewayModelIds(groups, effortViews).map((model) => {
+                const reasoning = model.reasoning;
+                const declared = reasoning?.efforts.map((effort) => effort.id) ?? [];
+                return {
+                    id: model.id,
+                    efforts: reasoning?.efforts ?? [],
+                    ...reasoning?.default === undefined ? {} : { default: reasoning.default },
+                    // 可以直接抄进 OpenAI 客户端的规范名；`efforts` 为空时它也为空
+                    // （该模型不声明档位 → 网关不下发任何档位，按模型默认走）。
+                    openai_efforts: reasoning?.openai_efforts ?? [],
+                    resolutions: effortResolutions(declared),
+                };
+            }),
+        });
     };
     /**
      * 解析模型元信息。失败按「模型不可解析」回 404，而不是笼统的 502 ——
@@ -132,39 +183,91 @@ export function createOpenAiGateway(options) {
         }
         return modelIdsHint;
     };
-    const handleChat = async (request, response) => {
+    /**
+     * 两个端点共用的「请求生命周期」外壳：绑定取消、统一错误翻译。
+     *
+     * ⚠️ **必须共用**：`/v1/chat/completions` 与 `/v1/responses` 的错误出口若各写
+     * 一遍，迟早出现「同一个错误在一个 URL 上回 404、在另一个上回 502」——
+     * 而 502 会被客户端当可重试故障白耗额度，这正是当初引入 404 翻译要修的问题。
+     */
+    const withRequest = async (request, response, run) => {
         const controller = new AbortController();
         active.add(controller);
         const abort = () => controller.abort();
-        request.once('aborted', abort);
-        response.once('close', () => {
+        const onClose = () => {
             if (!response.writableEnded)
                 controller.abort();
-        });
+        };
+        request.once('aborted', abort);
+        response.once('close', onClose);
         try {
-            const body = await readJson(request, controller.signal);
+            await run(controller.signal);
+        }
+        catch (error) {
+            if (!response.headersSent && !response.destroyed) {
+                const converted = failureToOpenAiError(error);
+                jsonResponse(response, converted.status, converted.body);
+            }
+        }
+        finally {
+            request.removeListener('aborted', abort);
+            response.removeListener('close', onClose);
+            active.delete(controller);
+        }
+    };
+    /** SSE 响应头（两个端点的流式出口一致）。 */
+    const writeSseHead = (response) => {
+        response.writeHead(200, {
+            'content-type': 'text/event-stream; charset=utf-8',
+            'cache-control': 'no-cache, no-transform',
+            connection: 'keep-alive',
+            'access-control-allow-origin': '*',
+        });
+    };
+    /**
+     * 档位被「翻译」或「丢弃」时记一条日志。
+     *
+     * ⚠️ 两种情况必须分开记，且**级别不同**：
+     *
+     * - `translated`（客户端给的是通用名、模型用的是私有 id，已就近下发）用 `info`：
+     *   加了翻译层之后这是**正常路径**（CC Switch 给 TRAE 的 `low` 每一轮都会被翻译），
+     *   用 warn 会把日志刷满，反而掩盖真正的异常；
+     * - `unexpressible`（模型根本没有这一族的档位，本次不下发）用 `warn`：
+     *   用户的设置确实没生效，这是需要被看见的事。
+     *
+     * 两件事都不回给客户端（OpenAI 协议里没有承载它的位置），故日志 + 对照表端点
+     * （`GET /v1/reasoning-efforts`）是它们唯一的出口。
+     */
+    const logEffortNotice = (route, notice) => {
+        const target = `${route.provider}/${route.model}`;
+        if (notice.outcome === 'translated') {
+            logger.info(`[openai-gateway] ${target}：思考档位 ${notice.requested} 不是该模型声明的 id，`
+                + `已按强度就近下发 ${notice.applied}`);
+            return;
+        }
+        logger.warn(`[openai-gateway] ${target}：思考档位 ${notice.requested} 无法表达`
+            + '（该模型没有这一族的档位），本次不下发该参数、按模型默认走');
+    };
+    const handleChat = async (request, response) => {
+        await withRequest(request, response, async (signal) => {
+            const body = await readJson(request, signal);
             const route = parseModelRoute(body.model);
-            const modelInfo = await resolveModelInfo(route, controller.signal);
-            const reasoningEffort = normalizeReasoningEffort(body.reasoning_effort, modelInfo, route.provider, route.model);
+            const modelInfo = await resolveModelInfo(route, signal);
+            const reasoningEffort = normalizeReasoningEffort(body.reasoning_effort, modelInfo, route.provider, route.model, (notice) => logEffortNotice(route, notice));
             const requestedMaxTokens = body.max_completion_tokens ?? body.max_tokens;
             const maxTokens = typeof requestedMaxTokens === 'number'
                 ? normalizeMaxTokens(requestedMaxTokens, route.provider, route.model)
                 : undefined;
-            const generate = await toGenerateOptions(body, controller.signal, reasoningEffort, maxTokens, {
+            const generate = await toGenerateOptions(body, signal, reasoningEffort, maxTokens, {
                 bridge: options.attachments,
                 limits: options.imageLimits,
             });
-            const stream = options.llm.stream(generate);
+            const stream = options.llm.stream(markGatewayChannel(generate));
             const fullId = `${route.provider}/${route.model}`;
             if (body.stream === true) {
-                response.writeHead(200, {
-                    'content-type': 'text/event-stream; charset=utf-8',
-                    'cache-control': 'no-cache, no-transform',
-                    connection: 'keep-alive',
-                    'access-control-allow-origin': '*',
-                });
+                writeSseHead(response);
                 for await (const event of toOpenAiSse(stream, undefined, fullId, makeSuggestion(fullId))) {
-                    if (controller.signal.aborted || response.destroyed)
+                    if (signal.aborted || response.destroyed)
                         break;
                     response.write(event);
                 }
@@ -175,17 +278,56 @@ export function createOpenAiGateway(options) {
                 const result = await collectOpenAiCompletion(stream, undefined, fullId, makeSuggestion(fullId));
                 jsonResponse(response, 200, result);
             }
-        }
-        catch (error) {
-            if (!response.headersSent && !response.destroyed) {
-                const converted = failureToOpenAiError(error);
-                jsonResponse(response, converted.status, converted.body);
+        });
+    };
+    /**
+     * `POST /v1/responses`（OpenAI Responses API）。
+     *
+     * 与 `handleChat` 的差别**只在协议外壳**：模型路由、思考档位归一化、输出预算
+     * 钳制（`normalizeMaxTokens`）、纠错建议、取消与错误翻译全部同源 —— 换了个
+     * URL 就换了套行为是最难排查的一类缺陷。
+     */
+    const handleResponses = async (request, response) => {
+        await withRequest(request, response, async (signal) => {
+            const body = await readJson(request, signal);
+            const route = parseModelRoute(body.model);
+            const modelInfo = await resolveModelInfo(route, signal);
+            const reasoningEffort = normalizeReasoningEffort(responsesReasoningEffort(body), modelInfo, route.provider, route.model, (notice) => logEffortNotice(route, notice));
+            const requestedMaxTokens = responsesMaxOutputTokens(body);
+            const maxTokens = requestedMaxTokens === undefined
+                ? undefined
+                : normalizeMaxTokens(requestedMaxTokens, route.provider, route.model);
+            const generate = await toResponsesGenerateOptions(body, signal, reasoningEffort, maxTokens, {
+                bridge: options.attachments,
+                limits: options.imageLimits,
+            }, (dropped) => {
+                // ⚠️ 丢弃是**有意**的降级（拒绝会让 Codex 这类客户端的整轮对话直接失败，
+                // 见 responses.ts 文件头「工具」一节），但绝不能连日志都没有 ——
+                // 否则「模型看不到某个工具」这件事在事后无从解释。
+                logger.warn(`[openai-gateway] /v1/responses：工具类型 ${dropped.type}`
+                    + `${dropped.name === undefined ? '' : `（${dropped.name}）`}`
+                    + ' 无法用 DSH 的 ToolSchema 表达，已从本次请求丢弃');
+            });
+            const stream = options.llm.stream(markGatewayChannel(generate));
+            const fullId = `${route.provider}/${route.model}`;
+            // 响应 id 由网关生成：本网关**无状态**，这个 id 只用于客户端关联，
+            // 不能拿它回来查（`GET /v1/responses/{id}` 一律 404）。
+            const responseId = `resp_${randomUUID().replaceAll('-', '')}`;
+            if (body.stream === true) {
+                writeSseHead(response);
+                for await (const event of toResponsesSse(stream, responseId, fullId, body, makeSuggestion(fullId))) {
+                    if (signal.aborted || response.destroyed)
+                        break;
+                    response.write(event);
+                }
+                if (!response.writableEnded)
+                    response.end();
             }
-        }
-        finally {
-            request.removeListener('aborted', abort);
-            active.delete(controller);
-        }
+            else {
+                const result = await collectResponsesResult(stream, responseId, fullId, body, makeSuggestion(fullId));
+                jsonResponse(response, 200, result);
+            }
+        });
     };
     const requestHandler = (request, response) => {
         if (request.method === 'OPTIONS') {
@@ -206,12 +348,18 @@ export function createOpenAiGateway(options) {
             void handleModels(response).catch(error => jsonResponse(response, 502, { error: { message: String(error), type: 'server_error', code: 'model_list_failed' } }));
             return;
         }
-        if (path === '/v1/chat/completions' && request.method === 'POST') {
+        // 本网关特有的只读端点：思考档位对照表（见 handleReasoningEfforts 的理由）。
+        // ⚠️ 路径不放在 `/v1/models/…` 之下：客户端会把那些路径当模型 ID 解析。
+        if (path === '/v1/reasoning-efforts' && request.method === 'GET') {
+            void handleReasoningEfforts(response).catch(error => jsonResponse(response, 502, { error: { message: String(error), type: 'server_error', code: 'model_list_failed' } }));
+            return;
+        }
+        if ((path === '/v1/chat/completions' || path === '/v1/responses') && request.method === 'POST') {
             if (!request.headers['content-type']?.toLowerCase().startsWith('application/json')) {
                 jsonResponse(response, 415, { error: { message: 'Content-Type must be application/json', type: 'invalid_request_error', code: 'invalid_content_type' } });
                 return;
             }
-            void handleChat(request, response);
+            void (path === '/v1/responses' ? handleResponses(request, response) : handleChat(request, response));
             return;
         }
         jsonResponse(response, 404, { error: { message: 'Not found', type: 'invalid_request_error', code: 'not_found' } });

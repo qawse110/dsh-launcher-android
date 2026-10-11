@@ -4,25 +4,27 @@
  * ## 与其它 provider 的共同点
  *
  * 「读凭据 → 直发远端」—— 这一点与 CodeArts / Buddy / Qoder 等**相同**。
- * 用户装好官方 ZCode 客户端并登录一次即可，不需要任何实例常驻。
+ * 用户在 Jet Hub 面板点「添加账号」走插件自己的授权流即可，**不需要安装任何客户端**。
  *
  * ## 与其它 provider 的差异（全部实测）
  *
  * | 维度 | ZCode | 对照 |
  * |---|---|---|
- * | 凭据来源 | 解密磁盘 `~/.zcode/v2/credentials.json`（AES-256-GCM） | 浏览器登录拿 token |
+ * | 凭据来源 | **只有插件自己的 OAuth 流程**（⚠ 2026-10-05 起**不再**读取本机 ZCode 客户端数据，见 `zcode.ts` 文件头） | 浏览器登录拿 token |
  * | 协议 | **Anthropic Messages**（非 OpenAI） | 其余多为 OpenAI 兼容 |
  * | 验证前置 | **按需**产出阿里云 captcha（索要时才产，稳态一次约 0.4–0.5 秒） | 无 |
- * | 请求体准入 | **必须带官方身份块 + 首轮日期块**（否则 3012） | 无 |
+ * | 请求体准入 | **必须带官方身份块**（否则 405 + `3012`） | 无 |
  * | 续期 | 无（静态凭据） | 多数有 refresh_token |
  *
  * ## 三个必须真的做到的点
  *
  * 1. **`system` 必须带官方身份块** —— 缺了上游回 `3012 unusual activity`
- *    （实测矩阵见 `zcode-identity.ts`）。且这是**请求体内容**层面的判据，
- *    与 HTTP 头、运行时无关。
- * 2. **首轮 user 消息要带 `<system-reminder>` 日期块** —— 桥侧源码称之为
- *    「3012 的最后一个开关」。
+ *    （HTTP **405**；实测矩阵见 `zcode-identity.ts`）。且这是**请求体内容**层面的判据，
+ *    与 HTTP 头、运行时、请求频率、多轮历史、`tools` 都无关
+ *    （2026-10-03 逐项排除，见 README 的「3012」章节）。
+ * 2. **首轮 user 消息带 `<system-reminder>` 日期块** —— 官方如此，照发。
+ *    ⚠ **但它不是 3012 的判据**（去掉照样 200）；桥侧源码当年称它是
+ *    「3012 的最后一个开关」，2026-10-03 实测已推翻。
  * 3. **`tools` 必须真的下发**（转成 Anthropic 的扁平 `input_schema` 形态）——
  *    Qoder 与 TRAE 都因漏发而让模型在正文里臆造 XML 工具调用、harness
  *    认不出 → 任务终止。
@@ -52,10 +54,11 @@
 import { EMPTY_RESPONSE_CODE, LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 import { providerCatalogVisible } from './account-pool.js';
 import { RemoteCatalogGate } from './remote-catalog-gate.js';
+import { broadcastCatalogChanged } from './catalog-broadcast.js';
 import { collectImages, serializeMessages } from './openai-compat.js';
 import { projectRequestImage } from './image-budget.js';
 import { ZCODE } from './zcode-product.js';
-import { ZCODE_PLAN_MESSAGES_URL, buildZcodeHeaders, } from './zcode-upstream.js';
+import { buildChannelRequest, describeChannels, resolveChannelFor, shouldFallbackToOtherChannel, } from './zcode-transport.js';
 import { buildZcodeSystemBlocks, withContextPrefix, } from './zcode-identity.js';
 import { consumeAnthropicSse, toAnthropicMessages, toAnthropicTools, } from './zcode-anthropic.js';
 import { ZcodeCaptchaBrowser, ZCODE_CAPTCHA_FALLBACK, } from './zcode-captcha.js';
@@ -63,6 +66,7 @@ import { GateAbortedError, ModelGate } from './model-gate.js';
 import { nextUtc8DayStartMs } from './model-queue.js';
 import { registerAdapterIdempotent, } from './llm-register-compat.js';
 import { captchaRequirementKey, clearCaptchaRequirement, isCaptchaKnownRequired, noteCaptchaRequired, noteKnownRequiredHit, noteProbeFirst, } from './captcha-requirement.js';
+import { describeZcodeRequestShape, formatZcodeDiagnostic, formatZcodeEdgePageHint, formatZcodeUnusualActivityMessage, hasZcodeUnusualActivity, looksLikeZcodeHtmlPage, noteZcodeRequestFailed, noteZcodeRequestOk, noteZcodeRequestSent, readZcodeBusinessCodeFromBody, } from './zcode-diagnostics.js';
 /** 本适配器注册的 provider 路由名（等价于 `ZCODE.id`）。 */
 export const PROVIDER = 'zcode';
 /**
@@ -110,6 +114,37 @@ function fallbackToRemote(model) {
 function positiveMaxTokens(value) {
     return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }
+/**
+ * 每次重试的空闲超时**增量**（毫秒）—— 逐字对齐官方 `zcode.cjs` 的 `RRs = 3e4`。
+ *
+ * 官方算法：`gzr({ baseTimeoutMs, retryNumber }) => baseTimeoutMs + retryNumber * RRs`。
+ * 它治的正是 IKJOVB 那个死循环的**后半段**：上游偶发变慢时，重试若仍用同一
+ * 阈值，会「次次都被同一道线打死」；逐次放宽给上游喘息空间。
+ */
+const ZCODE_STREAM_IDLE_RETRY_STEP_MS = 30_000;
+/**
+ * 解析「流式读取空闲超时」，可用 `DSH_ZCODE_SSE_IDLE_TIMEOUT_MS` 覆盖。
+ *
+ * ⚠ **每次 `stream()` 调用时读取**（与 buddy/cline/trae/qoder 同一约定），
+ * 单测靠它注入短超时。
+ *
+ * ⚠ 不能写成 `parseInt(…) || 默认值`：`0` 是合法值（显式关闭空闲超时），
+ * 而 `0` 是 falsy 会被 `||` 静默换回 10 分钟。故用 `??` + 显式比较。
+ */
+function resolveStreamIdleTimeoutMs(product, retryNumber = 0) {
+    const raw = Number(process.env.DSH_ZCODE_SSE_IDLE_TIMEOUT_MS);
+    const base = Number.isFinite(raw)
+        ? raw
+        : product.streamIdleTimeoutMs;
+    if (base <= 0)
+        return base;
+    return base + Math.max(0, Math.floor(retryNumber)) * ZCODE_STREAM_IDLE_RETRY_STEP_MS;
+}
+/** 解析「整轮墙钟上限」，可用 `DSH_ZCODE_REQUEST_TIMEOUT_MS` 覆盖。 */
+function resolveRequestTimeoutMs(product) {
+    const raw = Number(process.env.DSH_ZCODE_REQUEST_TIMEOUT_MS);
+    return Number.isFinite(raw) ? raw : product.requestTimeoutMs;
+}
 /** ZCode 模型适配器。 */
 export class ZcodeAdapter extends LlmAdapter {
     options;
@@ -119,7 +154,7 @@ export class ZcodeAdapter extends LlmAdapter {
     fallbackIndex;
     remoteModels;
     /** 目录加载闸门：并发去重 + 失败/空结果冷却（见 `remote-catalog-gate.ts`）。 */
-    catalogGate = new RemoteCatalogGate();
+    catalogGate;
     /** 自建的常驻浏览器（仅当调用方没注入 `mintCaptcha` 时用）。 */
     captchaBrowser;
     /** captcha 配置缓存（配置很少变，但与凭据一样**不长期缓存**）。 */
@@ -147,6 +182,8 @@ export class ZcodeAdapter extends LlmAdapter {
         });
         this.sleepImpl = options.sleep ?? defaultAdapterSleep;
         this.nowImpl = options.now ?? (() => Date.now());
+        // 目录落地后通知客户端重读（issue IKJVTF 的缺陷①）。
+        this.catalogGate = new RemoteCatalogGate(options.onCatalogLoaded === undefined ? {} : { onLoaded: options.onCatalogLoaded });
     }
     /**
      * 描述本适配器拥有的 provider 路由。
@@ -363,10 +400,22 @@ export class ZcodeAdapter extends LlmAdapter {
      * `step/start` **同一毫秒** —— 那是 `dsh-session` 的 `openTurnClosers()`
      * 在 repair 时**合成**的（它「复用最后一个真实事件的时间戳」），
      * 真相是这个 turn **从未结束**。排查时别被它误导。
+     *
+     * ## ⚠⚠️ 但它**不是**推理时限（真实缺陷 IKJOVB）
+     *
+     * 本方法起的是**整轮墙钟**，只兜「captcha 卡死 / 上游彻底静默」。
+     * 「模型长时间大思考」**必须**由**空闲超时**（`streamIdleTimeoutMs`，
+     * 每帧续期）来判，否则会出现用户报障的死循环：
+     * 思考满 180s → abort → `TIMEOUT`（在 harness 可重试集合内）→ 重试
+     * → 又大思考 → 又撞满 ⇒ 永远出不来。
+     *
+     * ⚠ 官方 ZCode 的对应事实：`resources/glm/zcode.cjs` 默认配置里
+     * `modelStream.idleTimeoutMs = 600_000` 而 `network.timeout = 180_000`
+     * —— **180s 是普通 API 请求的值，不是推理链路的**。旧实现误抄了后者。
      */
     async *stream(options) {
         const controller = new AbortController();
-        const timeoutMs = this.product.requestTimeoutMs;
+        const timeoutMs = resolveRequestTimeoutMs(this.product);
         const timer = setTimeout(() => controller.abort(), timeoutMs);
         timer.unref?.();
         // 把调用方的 signal（harness 的用户中断）串进来，作用于**整轮**。
@@ -482,10 +531,48 @@ export class ZcodeAdapter extends LlmAdapter {
          * 见 {@link ZcodeAdapter.switchAccountOnQuota}。
          */
         const tried = new Set();
+        /**
+         * ⚠⚠ **取凭据必须排在读 `currentAccountId()` 之前**（2026-10-06 真实故障）。
+         *
+         * `currentAccountId()` 读的是 `index.ts` 里 `activeZcodeAccountId` 那个 Map，
+         * 而它**只在 `resolveCredential` 内部被写入**。原先这里顺序是反的：
+         *
+         * ```ts
+         * let activeAccountId = this.options.currentAccountId?.()   // ← 先读（此刻是空的）
+         * let credential = await this.resolveCredentialOrThrow(options)  // ← 后写
+         * ```
+         *
+         * 冷启动（进程刚起 / 该 provider 首次被调用）时 Map 是空的 ⇒
+         * `activeAccountId === undefined` ⇒ {@link ZcodeAdapter.switchAccountOnQuota}
+         * 里那个守卫整段跳过：**既不标记失败账号、也不把它放进 `tried`** ⇒
+         * 池按用户手动顺序返回的第一个候选**正是刚失败的那个** ⇒
+         * 这次「切号」切回同一账号、同一份凭据，**白发一发**。
+         *
+         * ⚠ **代价不是「慢一发」，而是「池里最后一个账号永远取不到」**
+         * （2026-10-06 复审实测；三账号池 A/B 额度用尽、C 可用）：
+         *
+         * | 池 | 修复前 | 修复后 |
+         * |---|---|---|
+         * | 2 账号（A 用尽、B 可用） | `[A, A, B]` 成功 | `[A, B]` 成功 |
+         * | **3 账号（A、B 用尽、C 可用）** | **`[A, A, B]` ⇒ 抛 `QUOTA_EXCEEDED`，C 从未被尝试** | `[A, B, C]` 成功 |
+         *
+         * 受 `quotaSwitchMax === 2` 限制，一次请求最多 3 发；空转那一发把切号预算
+         * 吃掉一格，池里**最后一个账号就再也够不着** —— 用户看到的是
+         * 「用完余额一个号就卡死了，不会切下一个号」。⇒ 这是**硬失败**，不是性能问题，
+         * 用户报障的措辞是准确的。
+         *
+         * ⚠ 既有用例全部传常量 `currentAccountId: () => 'acct-A'` ⇒ 天然绕过该缺陷
+         * （这正是它此前没被抓到的原因）。回归见
+         * `tests/unit/zcode-rotation-coldstart.spec.ts`：忠实复刻 `index.ts` 接线，
+         * 含 **3 账号池**（锁「最后一个账号必须被尝试到」）与 **接线契约** 两条 ——
+         * 后者是必需的：排除刚失败的账号有**三重冗余**（本行 + `switchAccountOnQuota`
+         * 里那次 add + 写进池的 `modelRateLimits`），**单点删除任一处行为断言仍全绿**，
+         * 故必须直接断言「首次切号时 `tried` 含失败账号、且标记已写下」。
+         */
+        let credential = await this.resolveCredentialOrThrow(options);
         let activeAccountId = this.options.currentAccountId?.();
         if (activeAccountId !== undefined && activeAccountId.length > 0)
             tried.add(activeAccountId);
-        let credential = await this.resolveCredentialOrThrow(options);
         /**
          * 2. 构造请求体（**Anthropic Messages 格式**）。
          *
@@ -496,8 +583,9 @@ export class ZcodeAdapter extends LlmAdapter {
          *
          * ⚠ 三个必须做对的点：
          *   - `system` 是顶层块数组，且第一块必须是官方 `cliPrefix`
-         *     （缺了回 3012）
-         *   - 首轮 user 消息要带 `<system-reminder>` 日期块
+         *     （**唯一**的 3012 判据；缺了回 405 + 3012）
+         *   - 首轮 user 消息带 `<system-reminder>` 日期块（官方如此，
+         *     但实测**不是** 3012 的判据 —— 见 `zcode-identity.ts` 头注释）
          *   - `tools` 是**扁平** `input_schema` 形态（不是 OpenAI 的嵌套 `function`）
          */
         const wire = serializeMessages(options.messages, imageUrls);
@@ -696,19 +784,57 @@ export class ZcodeAdapter extends LlmAdapter {
                      */
                     mintMs = Date.now() - mintStartedAt;
                 }
-                const headers = buildZcodeHeaders(credential, {
-                    authorization: `Bearer ${credential.zcode_jwt}`,
+                /**
+                 * ★ **按通道组装请求**（2026-10-03，ZCode 双通道）。
+                 *
+                 * 原来这里恒用 `ZCODE_PLAN_MESSAGES_URL` + `zcode_jwt`，即只有积分通道。
+                 * 现在按 {@link resolveChannelFor} 选腿：
+                 * - `start-plan`（积分，**优先**）：`zcode.z.ai` + `zcode_jwt` —— 与原行为逐字一致
+                 * - `coding-plan`（订阅）：`api.z.ai` + `coding_plan_key_*`
+                 *
+                 * ⚠ **captcha 头在 transport 之上叠加**：`buildChannelRequest` 只管端点与
+                 * 凭据，而 captcha 是**两条通道共用**的可选头（param 一次性，每轮重产）。
+                 * 这里保持"有 param 就带上"的既有语义。
+                 */
+                const requestChannel = resolveChannelFor(credential, options.model);
+                const channelRequest = buildChannelRequest(credential, requestChannel, JSON.stringify(body));
+                const headers = {
+                    ...channelRequest.headers,
                     ...(captchaParam === undefined
                         ? {}
                         : {
-                            captcha: {
-                                param: captchaParam,
-                                region: this.options.captchaRegion ?? 'cn',
-                            },
+                            'x-aliyun-captcha-verify-param': captchaParam,
+                            /**
+                             * ★ region 必须与**产 param 的那份配置**同源（同型缺陷，与 issue IKJNPS
+                             * 的领取路径一模一样，这里是第二个实例）。
+                             *
+                             * `this.captchaConfig` 由 `index.ts` 的 `resolveZcodeCaptchaConfig()`
+                             * 在 mint 回调里写入（`setCaptchaConfig`），而 mint **先于**组头发生
+                             * （上面那两行）⇒ 这里读到的一定是本次 param 用的那份。
+                             * ⚠ 别只留 `this.options.captchaRegion ?? 'cn'`：那个兜底常量只在
+                             *   cn 区账号上碰巧正确，非 cn 区（服务端下发 `sgp`）会让每一次
+                             *   3007 补产重发**必然**再撞一次同一个 `3007`（而重发只有一次机会）。
+                             */
+                            'x-aliyun-captcha-verify-region': this.captchaConfig?.region
+                                ?? this.options.captchaRegion
+                                ?? 'cn',
                         }),
-                });
+                };
                 const upstreamStartedAt = Date.now();
+                /**
+                 * ★ 记「已发出」（Gitee issue IKJI0Y 的可观测诊断）。
+                 *
+                 * ⚠ 必须在 `sendUpstream` **之前**记，且用 `upstreamStartedAt`：
+                 * 否则「距上一条 zcode 请求隔了多久」会把本次自己的排队/mint 等待
+                 * 算进去，算出一个没有排查价值的大数。
+                 *
+                 * ⚠ `activeAccountId` 是**局部可变状态**（切号后会变），与
+                 * `zcode-adapter.ts` 里额度切号那段是同一条纪律 —— 标记必须记在
+                 * 真正发出这条请求的账号上，否则切到 B 之后失败会把账记到 A 头上。
+                 */
+                noteZcodeRequestSent(activeAccountId, upstreamStartedAt);
                 response = await this.sendUpstream({
+                    url: channelRequest.url,
                     headers,
                     body,
                     signal: controller.signal,
@@ -723,6 +849,7 @@ export class ZcodeAdapter extends LlmAdapter {
                  */
                 const headersMs = Date.now() - upstreamStartedAt;
                 if (response.ok) {
+                    noteZcodeRequestOk(activeAccountId, Date.now());
                     if (captchaParam === undefined) {
                         // 不带也成功 ⇒ 上游当前不要验证，清掉记忆回到最省路径。
                         clearCaptchaRequirement(requirementKey);
@@ -733,6 +860,7 @@ export class ZcodeAdapter extends LlmAdapter {
                     break;
                 }
                 const text = await response.text().catch(() => '');
+                noteZcodeRequestFailed(activeAccountId);
                 // ① 额度用尽 / 无权益 → **换账号**（不是重试）
                 if (isZcodeQuotaExhausted(response.status, text)) {
                     if (quotaRound < this.product.quotaSwitchMax) {
@@ -753,6 +881,50 @@ export class ZcodeAdapter extends LlmAdapter {
                      * 错误被白退避重试 5 次（约 15.5 秒）—— qoder 那边记过同型缺陷。
                      */
                     throw new LlmError(`zcode: ${describeUpstreamError(response.status, text)}`, 'QUOTA_EXCEEDED', { status: response.status });
+                }
+                // ①′ ★ **额度/资源包用尽 ⇒ 换另一条通道重试一次**（2026-10-03）。
+                //
+                // 位置在①之后：① 已经**切过账号**或已耗尽切号轮次
+                // （`isZcodeQuotaExhausted` 覆盖的码比这里宽），这时换通道
+                // （换端点 + 换凭据）比直接报 QUOTA_EXCEEDED 更有价值 ——
+                // 积分通道的额度与订阅通道的额度是**两份独立的**。
+                //
+                // ⚠ 只认 429 + 1005/1113（见 `shouldFallbackToOtherChannel`）：
+                // 401/1002（凭据失效）与 3012（风控，重试会加重冷却惩罚）都不换。
+                // ⚠ 换腿前先确认**另一条通道真的可用**（`describeChannels`），
+                //   否则等于用一个没有凭据的端点再撞一次 401，把一次明确失败变成两次。
+                // ⚠ ⚠⚠ 换腿**不重产 captcha**：`captchaParam` 是**一次性**的，
+                //   上一发已被上游消费；重发必须**现产新的**。这里保守起见只在
+                //   `captchaParam === undefined`（上游当下不索要验证）时换腿 ——
+                //   带了 param 的那一发被拒属于另一类问题，走 ③ 的 3007 分支。
+                if (shouldFallbackToOtherChannel(response.status, text)
+                    && !switchedAccount
+                    && captchaParam === undefined
+                    && attempt < this.product.concurrencyRetryMax) {
+                    const current = requestChannel;
+                    const other = current === 'start-plan' ? 'coding-plan' : 'start-plan';
+                    const otherReady = describeChannels(credential).find((i) => i.channel === other)?.available === true;
+                    if (otherReady) {
+                        this.options.log?.(`zcode: ${current} 额度用尽（HTTP ${response.status}）⇒ 换 ${other} 重发一次`);
+                        const otherRequest = buildChannelRequest(credential, other, JSON.stringify(body));
+                        const otherResponse = await this.sendUpstream({
+                            url: otherRequest.url,
+                            headers: otherRequest.headers,
+                            body,
+                            signal: controller.signal,
+                            userSignal: options.signal,
+                            timeoutMs,
+                            model: options.model,
+                        });
+                        if (otherResponse.ok) {
+                            // 换腿成功 ⇒ 把它当作本轮的正式响应继续往下走（读流 / usage）
+                            response = otherResponse;
+                            break;
+                        }
+                        // 换腿也失败 ⇒ 落回原有错误处理（用**原**通道的 status/text，
+                        //   免得把「换腿失败」报成用户看到的那个错误）
+                        this.options.log?.(`zcode: 换 ${other} 仍失败（HTTP ${otherResponse.status}）⇒ 回到 ${current} 的错误处理`);
+                    }
                 }
                 // ② 并发限流 → 退避后再试（**不**换账号：换谁都一样撞）
                 //   ⚠ 「重试前必须带上新 param」这条一次性规则由上面的分支保证：
@@ -799,7 +971,42 @@ export class ZcodeAdapter extends LlmAdapter {
                     continue;
                 }
                 // ④ 其余错误：按既有映射如实抛出（3012 等不可重试类不变）
-                throw new LlmError(`zcode: ${describeUpstreamError(response.status, text)}`, httpErrorCodeForZcode(response.status, text), { status: response.status });
+                /**
+                 * ★ **只在 `3012` 上附诊断**（Gitee issue IKJI0Y）。
+                 *
+                 * ## 为什么只给 3012 加
+                 *
+                 * - `3012` 是**唯一一个用户既什么都做不了、又完全看不出原因**的错误：
+                 *   冷却惩罚不可逆 ⇒ 不可重试；而既有文案只有固定句 + 原始响应，
+                 *   连「是不是这个账号自身的问题」都无法回答。
+                 * - 其它码（`3009`/`1005`/`3007`）的文案**本身就说明了原因**，
+                 *   且都各自有单测钉住措辞 ⇒ 附加诊断只会让那些文案变脏。
+                 *
+                 * ## 形态取自「已构造好的 body」而不是常量
+                 *
+                 * `body.system` / `body.messages` 就是**即将发出去**的那份（重试与
+                 * 切号都复用同一份），故诊断到的是**线上形态**。真出现「身份块没进去」
+                 * 时它会显示 0 字符 —— 而不是显示常量里的 2898 把问题盖住。
+                 *
+                 * ⚠ 上面的 {@link noteZcodeRequestFailed} 已经把本次算作一次失败，
+                 * 故这里诊断到的「失败 N」含本次，这是有意的（用户看到的就是当次）。
+                 *
+                 * ⚠⚠ 判据必须用 {@link hasZcodeUnusualActivity}（**全仓唯一口径**），
+                 * **不能**用裸 `text.includes('3012')` —— 那是本仓库记录过的第三份
+                 * 未收窄的 3012 判据（`13012` / 边缘页里的 `<title>3012</title>` 都会命中）。
+                 * 危害虽仅止于「白跑一次诊断」（文案侧已短路，诊断被丢弃），
+                 * 但它违反「3012 判据必须走词边界 + 语义共现」这条铁律。
+                 */
+                const diagnostic = hasZcodeUnusualActivity(text)
+                    ? formatZcodeDiagnostic({
+                        accountId: activeAccountId,
+                        sentAt: upstreamStartedAt,
+                        status: response.status,
+                        shape: describeZcodeRequestShape(body.system, body.messages),
+                        now: Date.now(),
+                    })
+                    : undefined;
+                throw new LlmError(`zcode: ${describeUpstreamError(response.status, text, diagnostic)}`, httpErrorCodeForZcode(response.status, text), { status: response.status });
             }
             if (switchedAccount)
                 continue;
@@ -844,6 +1051,17 @@ export class ZcodeAdapter extends LlmAdapter {
              * ── SSE 消费 ──────────────────────────────────────────────────────
              *
              * ⚠ signal 必须传进 SSE 消费：它是「读挂起」时唯一能唤醒读取的东西。
+             *
+             * ⚠⚠️ `idleTimeoutMs` **每帧续期**（真实缺陷 IKJOVB）：它管的是「静默多久
+             * 算死」，**不是**整轮时长 —— 官方 ZCode 正是这么做的
+             * （`zcode.cjs`：`modelStream.idleTimeoutMs = 6e5`，`Promise.race([it.next(), …])`）。
+             * 不传它就会退回「整轮墙钟卡思考」的老形态。
+             *
+             * ⚠ `quotaRound` 即官方公式里的 `retryNumber`：每轮重发逐次放宽 30s
+             * （`baseTimeoutMs + retryNumber * 3e4`），避免上游偶发变慢时被同一阈值
+             * 反复打死。
+             * ⚠ 这里**不能**用内层的 `attempt` —— SSE 消费点在外层循环作用域内，
+             * `attempt` 不在作用域中（写错了会直接 `ReferenceError`）。
              */
             let emitted = false;
             const consumeStartedAt = Date.now();
@@ -852,6 +1070,7 @@ export class ZcodeAdapter extends LlmAdapter {
                     label: 'zcode',
                     model: options.model,
                     signal: controller.signal,
+                    idleTimeoutMs: resolveStreamIdleTimeoutMs(this.product, quotaRound),
                 })) {
                     emitted = true;
                     yield chunk;
@@ -911,8 +1130,8 @@ export class ZcodeAdapter extends LlmAdapter {
             credential = await this.options.resolveCredential(options.model);
         }
         if (credential === undefined) {
-            throw new LlmError('zcode: 没有可用的凭据 —— 请在 Jet Hub 的 ZCode 面板点「添加账号」完成登录' +
-                '（若已装官方 ZCode 客户端并登录过，本插件也会自动读取它的凭据）', 'MISSING_CREDENTIAL');
+            throw new LlmError('zcode: 没有可用的凭据 —— 请在 Jet Hub 的 ZCode 面板点「添加账号」完成登录'
+                + '（本插件只用它自己的授权流程，不会读取本机 ZCode 客户端的登录态）', 'MISSING_CREDENTIAL');
         }
         return credential;
     }
@@ -932,9 +1151,9 @@ export class ZcodeAdapter extends LlmAdapter {
      * 暴涨到 2500-3100ms。
      */
     async sendUpstream(input) {
-        const { headers, body, signal, userSignal, timeoutMs, model } = input;
+        const { url, headers, body, signal, userSignal, timeoutMs, model } = input;
         try {
-            return await this.gate.run(model, async () => await this.fetchImpl(ZCODE_PLAN_MESSAGES_URL, {
+            return await this.gate.run(model, async () => await this.fetchImpl(url, {
                 method: 'POST',
                 headers,
                 body: JSON.stringify(body),
@@ -1168,6 +1387,8 @@ export const ZCODE_FAST_EMPTY_MS = 3_000;
  * 且**不切账号**（换账号也一样撞，白白标记掉一个可用账号）。
  */
 export function isZcodeConcurrencyLimited(status, body) {
+    if (looksLikeZcodeHtmlPage(body))
+        return false;
     if (status !== 429) {
         // 少数情况下上游用 200/403 包裹限流体，故正文命中同样认。
         if (!body.includes(ZCODE_CONCURRENCY_CODE))
@@ -1185,8 +1406,18 @@ export function isZcodeConcurrencyLimited(status, body) {
  * ⚠ **必须排除 `3009`**：并发限流同样返回 429，但它「等一下就能过」，
  * 若被归到这里就会把账号错标成「当日用尽」（误伤一个完全可用的账号，
  * 与 `qoder` 那次「把 rate_limit 当成 billing」是同一类错误）。
+ *
+ * ⚠⚠⚠ **必须排除边缘/CDN 的 HTML 错误页**（真实缺陷，2026-10-07 实测）：
+ * 本函数下游会 `switchAccountOnQuota()` ⇒ **写 `modelRateLimits` 到次日 0 点**。
+ * 而 `body.includes('1005')` 是**裸子串**匹配，边缘页里出现 `1005` 完全正常
+ * （`<title>1005</title>`、`width:1005px`、某个 hash 值）——
+ * 实测 3 账号池边缘故障：连换两个号，两个**完全可用**的账号被封到次日，
+ * 而用户只是遇到了一次网络抖动。这比文案难看严重得多：**误封可用账号**。
+ * ⇒ HTML 判据必须在**分类之前**短路（判据见 {@link looksLikeZcodeHtmlPage}）。
  */
 export function isZcodeQuotaExhausted(status, body) {
+    if (looksLikeZcodeHtmlPage(body))
+        return false;
     if (isZcodeConcurrencyLimited(status, body))
         return false;
     if (body.includes('1113') || body.includes('余额不足'))
@@ -1212,6 +1443,12 @@ export function isZcodeQuotaExhausted(status, body) {
  */
 export function isZcodeCaptchaRejected(status, body) {
     void status;
+    // ⚠ HTML 边缘页必须豁免：否则边缘页里一个 `3007` 数字就会让适配器去
+    // **补产 captcha 并重发**（`stream()` 的分支 ③），而边缘拦截下重发必然
+    // 还是边缘页 —— 白烧一次浏览器验证（阿里云「同设备每小时 150 次」的
+    // 设备级配额），且把一次明确的网络故障变成一次慢吞吞的内部重试。
+    if (looksLikeZcodeHtmlPage(body))
+        return false;
     return body.includes('3007') || /captcha\s+verify\s+failed/i.test(body);
 }
 /**
@@ -1269,11 +1506,35 @@ export function withToolCacheBreakpoint(tools) {
 /**
  * 把上游错误翻成人能看懂的一句话。
  *
- * ⚠ 两个业务码要单独说清，因为它们的**处理方式完全不同**：
+ * ## 两个业务码要单独说清，因为它们的**处理方式完全不同**：
  * - `3007` = captcha 校验失败（**可重试**：换个新 param 即可）
  * - `3012` = 风控拦截（**不要重试**：有账号冷却惩罚，重复触发会升级封禁）
+ *
+ * ## `3012` 会附带一行**可观测诊断**（Gitee issue IKJI0Y）
+ *
+ * 3012 是唯一一个「用户什么都做不了、又完全看不出原因」的错误：冷却惩罚
+ * 不可逆，而既有文案只有固定句 + 原始响应。issue 的原话是
+ * 「目前唯一能确认的是身份块字符数这一项，而它恰好是正常的」——
+ * 即诊断信息缺到连**排除法**都做不了。
+ *
+ * ⇒ `diagnostic` 由调用方（`stream()`）组装，内容见
+ * {@link formatZcodeDiagnostic}：**只含账号序号、进程内计数、间隔、
+ * 实测身份块字符数、日期块有无**，**不含任何凭据**。
+ * 未提供时行为与原来逐字一致（单测直接调用本函数的用例不受影响）。
+ *
+ * ## ⚠ 非 JSON 且形如 HTML 时（边缘 CDN 错误页）
+ *
+ * 实测拿到的是 `text/html`，正文是阿里云 ESA 的错误页（issue IKJRM4），
+ * 原先走 `trimmed.slice(0, 200)` ⇒ 把 CSS 选择器当错误文案倒给用户。
+ * 现由 {@link looksLikeZcodeHtmlPage}（形态）+ {@link formatZcodeEdgePageHint}（文案）
+ * 处理，两者都在 `zcode-diagnostics.ts` —— 与领取侧 `zcode-upstream.ts`
+ * **共用同一份**，任何一侧改判据都必须同步另一侧。
+ *
+ * ⚠⚠ **判据侧与文案侧必须同时改**（PR #78 的教训）：该 PR 只换了文案侧的
+ * `suffix`，而下游 `isZcodeQuotaExhausted` / `httpErrorCodeForZcode` 一行没动 ——
+ * 边缘页里一个 `1005` 就会换号并把账号封到次日，而文案正写着「更换账号无效」。
  */
-export function describeUpstreamError(status, body) {
+export function describeUpstreamError(status, body, diagnostic) {
     const trimmed = body.trim();
     let code;
     let message;
@@ -1285,14 +1546,77 @@ export function describeUpstreamError(status, body) {
     catch {
         // 非 JSON：原样截断。
     }
-    const suffix = typeof message === 'string' && message.length > 0 ? message : trimmed.slice(0, 200);
+    /**
+     * ⚠ **非 JSON 且形如 HTML ⇒ 是边缘/CDN 页，不是业务错误**（2026-10-06 实测）。
+     *
+     * 背景：实测拿到 405 + `text/html`，正文是阿里云 ESA 的错误页
+     * （`<!doctypehtml>…<title>405</title>…`，含 `data-spm` 特征）。
+     * 原实现走 `trimmed.slice(0, 200)`兜底 ⇒ **把 CSS 选择器当错误文案倒给用户**：
+     *
+     *   HTTP 405：<!doctypehtml><html lang="zh-cn">…<style>a,body,div,h2,html,p{m
+     *
+     * 与会话日志里的报错**逐字一致**（`session-de28317b`，2026-10-07 00:10）。
+     *
+     * 为什么必须单独判：
+     * 1. HTML 页里没有任何业务信息，`slice(0,200)` 截出来的是 CSS/标签噪声，
+     *    用户读完不知道发生了什么；
+     * 2. 边缘拦截是**上游侧故障**（或路径被规则拦），与「额度」「凭据」
+     *    完全不同 —— 归错方向会让用户去充值/重新登录，白跑一趟；
+     * 3. 边缘页会随 CDN 配置变化，把前200 字符原样展示等于把**不稳定的内容**
+     *    写进错误文案，将来无法复现。
+     *
+     * ⇒ 单独识别并给出「上游/网络层」口径的提示；同时保留一个短前缀便于排查。
+     *
+     * ⚠⚠⚠ **判据复用 {@link looksLikeZcodeHtmlPage}**，且**必须在所有业务分支
+     * 之前短路**（PR #78 的教训，初版只换 suffix 造成两个真缺陷）：
+     *
+     * ① **401 自相矛盾**：`code === 1002 || status === 401` 分支会把 suffix 拼到
+     *    「凭据失效…删除该账号后重新添加登录」之后，于是同一条消息既让用户
+     *    删号重登、又说「更换账号无效」—— **互斥指令**。实测该分支
+     *    `calls=1, marks=[]`：删号纯属白跑，用户会真去删掉一个健康凭据。
+     * ② **业务码被页面里的数字劫持**：HTML 页里出现 `1005` / `3009` / `3007` /
+     *    `3012`（CSS 值、`<title>`、hash）时，下面每一条 `trimmed.includes(...)`
+     *    都会命中 ⇒ 报成「额度用尽 / 并发限流 / captcha 失败 / 风控」，
+     *    **与「更换账号无效」正面对撞**，且会把账号封到次日。
+     *
+     * ⇒ 边缘页**不是业务层错误**，它不该进入任何业务分支的前缀。
+     *
+     * ⚠⚠⚠ **但正文里的业务码/风控语义绝不短路**（2026-10-07 两轮实测打出的回归）：
+     * 上游确有**以标签开头、却不是边缘页**的报文：
+     *
+     * ```
+     * {"code":3012,...}                                        ← 合法 JSON，有权威码
+     * <h1>Error 3012</h1>upstream connect timeout              ← 非法 JSON，但正文带 3012
+     * <h1>Error 3012</h1> request has been blocked due to unusual activity.
+     * ```
+     *
+     * 无条件短路会把它们从「**别重试**」（有冷却惩罚）降级成「**稍后重试**」——
+     * 两个用户动作**完全相反**，且反复重试会把 30 分钟冷却推成 24 小时。
+     *
+     * ⇒ 判据必须与 {@link hasZcodeUnusualActivity} 的**优先级约定同轴**：
+     * **有权威业务码 ⇒ 只信码；无码但有风控语义 ⇒ 也不是页面**。
+     */
+    if (code === undefined
+        && !hasZcodeUnusualActivity(trimmed)
+        && looksLikeZcodeHtmlPage(trimmed)) {
+        return `HTTP ${status}：${formatZcodeEdgePageHint(trimmed, status)}`;
+    }
+    const suffix = typeof message === 'string' && message.length > 0
+        ? message
+        : trimmed.slice(0, 200);
     /**
      * ⚠ 两个**限流/额度**码要单独说清，因为用户该做的事完全不同：
      * - `3009` 并发限流：**等一下再试**（我们已经退避重试过，仍失败说明窗口更长）
      * - `1005` 额度用尽：等额度重置或**换账号**（重试无意义）
+     *
+     * 🔴 **并发文案的判定必须先于 1005 码分支**（2026-10-06 凌晨真实故障）：
+     * 上游会把并发限流的文案装进额度码下发——实测
+     * `429 + {"code":1005,"msg":"user concurrency limit exceeded"}`。按码先判
+     * 会报「额度用尽——请等待额度重置或更换账号」，而 msg 明说等一下就能过，
+     * **建议全错**。故：正文含并发文案 ⇒ 一律按并发报（无论 code 是 3009 还是 1005）。
      */
-    if (code === 3009 || trimmed.includes('3009')) {
-        return (`上游并发限流（3009 model concurrency limit exceeded）——` +
+    if (code === 3009 || trimmed.includes('3009') || isZcodeConcurrencyLimited(status, trimmed)) {
+        return (`上游并发限流（model concurrency limit exceeded）——` +
             `已按退避重试仍未通过，请稍后重试。原始响应：${suffix}`);
     }
     if (code === 1005 || trimmed.includes('1005')) {
@@ -1302,13 +1626,26 @@ export function describeUpstreamError(status, body) {
     if (code === 3007 || trimmed.includes('3007')) {
         return `阿里云 captcha 校验失败（3007）。请重试；若持续失败，检查浏览器是否可用。`;
     }
-    if (code === 3012 || trimmed.includes('3012')) {
-        return (`上游风控拦截（3012 unusual activity）。` +
-            `⚠ 该错误有账号冷却惩罚（30 分钟，反复触发会升级到 24 小时乃至停用），` +
-            `请勿连续重试。原始响应：${suffix}`);
+    if (hasZcodeUnusualActivity(trimmed)) {
+        /**
+         * ★ 文案走**共用实现**（Gitee issue IKJOQB）—— 判据与措辞都只在
+         * {@link formatZcodeUnusualActivityMessage} 里有一份。
+         *
+         * ⚠ 传的是**裸诊断**（`diagnostic`），不是 `本机诊断：…` 那种拼好的行 ——
+         * 前缀由共用函数自己加。
+         * ⚠ 不传 `subject` ⇒ 首句与历史输出**逐字一致**
+         * （`上游风控拦截（3012 unusual activity）。`），既有单测不受影响。
+         * ⚠ 判据用 `hasZcodeUnusualActivity`（**先信解析出的 `code`**，无码时才看
+         *   正文且要求风控语义共现）——原先的 `trimmed.includes('3012')` 会把
+         *   `13012` / `plan-3012-trust` 一并命中。
+         */
+        return formatZcodeUnusualActivityMessage({ diagnostic, rawResponse: suffix });
     }
     if (code === 1002 || status === 401) {
-        return `凭据失效（${status}）。请重新在官方 ZCode 客户端登录。${suffix}`;
+        // ⚠ 必须指向 Jet Hub 而不是官方客户端：凭据只有插件自己会写
+        //   （`~/.zcode/v2/credentials.json` 那条回退路已于 2026-10-05 删除），
+        //   让用户「去官方客户端重新登录」会把他引到一个**完全无效**的操作上。
+        return `凭据失效（${status}）。请在 Jet Hub 的 ZCode 面板删除该账号后重新添加登录。${suffix}`;
     }
     return `HTTP ${status}：${suffix}`;
 }
@@ -1321,19 +1658,77 @@ export function describeUpstreamError(status, body) {
  * | 上游 | 映射 | 会被重试吗 | 理由 |
  * |---|---|---|---|
  * | `3007` captcha | `RATE_LIMIT` | **是** | 换新 param 就能过，值得重试 |
+ * | **并发文案**（装在任意码里） | `RATE_LIMIT` | **是** | 等一下就能过（2026-10-06 事故） |
  * | `3012` 风控 | `PERMISSION` | **否** | 有账号冷却惩罚，重试会加重 |
  * | `1002`/401 | `AUTH` | 否 | 需用户重新登录 |
- * | `1113` 余额 | `QUOTA_EXCEEDED` | **否** | 确定性错误（要充值） |
+ * | `1113` 余额 / `1005` 额度 | `QUOTA_EXCEEDED` | **否** | 确定性错误（等重置/充值） |
  * | 其余 5xx | `SERVER` | 是 | 暂时性 |
+ *
+ * ## ⚠⚠ `3012` 的判据必须与文案侧**同一份**（真实缺陷，2026-10-05 审计打出）
+ *
+ * 此前本函数用裸 `trimmed.includes('3012')`，而同一个文件里
+ * {@link describeUpstreamError} 当时已改用收窄的 helper —— **只改了一半**。
+ * 后果：正文含 `13012` 的**瞬断 5xx** 被归成 `PERMISSION`，而
+ * `PERMISSION` **不在** harness 的 `DEFAULT_RETRYABLE_CODES` 里
+ * ⇒ 本该自愈的重试被**放弃**。实测：
+ *
+ * ```
+ * httpErrorCodeForZcode(500, 'upstream error 13012')      = PERMISSION  ← 错
+ * httpErrorCodeForZcode(503, 'backend 13012 unavailable') = PERMISSION  ← 错
+ * httpErrorCodeForZcode(503, 'backend unavailable')       = SERVER      ← 对
+ * ```
+ *
+ * ⇒ 改用 {@link hasZcodeUnusualActivity}：它**先信解析出的 `code`**
+ * （`{"code":3012}` 仍是 `PERMISSION`，故本函数的既有语义不变），
+ * 无码时才看正文且要求风控语义共现。
  */
 export function httpErrorCodeForZcode(status, body) {
     const trimmed = body.trim();
+    /**
+     * ⚠⚠⚠ **HTML 边缘页必须最先短路**（2026-10-07 实测，本函数是「只改了一半」
+     * 的**第二次复发** —— 上一轮是 3012，详见本函数头部注释）。
+     *
+     * 下面是**一串裸子串判据**（`3007` / `1113` / `余额不足` / `1005`），而边缘页里
+     * 出现这些数字是**完全正常**的（`<title>1005</title>`、`width:1005px`）。
+     * 实测危害：
+     *
+     * | 输入 | 未短路时 | 正确 |
+     * |---|---|---|
+     * | `500` + 含 `1005` 的边缘页 | `QUOTA_EXCEEDED`（**不可重试**） | `SERVER`（可退避重试 5 次）|
+     * | `429` + 含 `1005` 的边缘页 | `QUOTA_EXCEEDED`（不可重试） | `SERVER` |
+     * | `429` + 含 `3007` 的边缘页 | `RATE_LIMIT`（触发补产 captcha 重发）| `SERVER` |
+     *
+     * 第一行最严重：一个**本该被自动退避重试 5 次的瞬断 5xx**，因为错误页里有个
+     * `1005` 就被标成不可重试 ⇒ 用户只看到一次失败，故障期变成全面不可用。
+     *
+     * ⚠ 取 `SERVER` 的理由：它**在** harness 的 `DEFAULT_RETRYABLE_CODES` 里，
+     * 与文案「建议稍后重试」一致；而边缘故障本质是**暂时性**的。
+     *
+     * ⚠⚠ **但正文里的业务码/风控语义绝不短路**（2026-10-07 两轮实测打出的回归）：
+     * 本函数原先无条件短路，会把带业务码的报文（**不是**边缘页）
+     * 从 `PERMISSION`（**别重试**，有冷却惩罚）降级成 `SERVER`（**稍后重试**）
+     * ⇒ 反复重试会把 30 分钟冷却推成 24 小时。
+     *
+     * ⇒ 与 {@link describeUpstreamError} 的短路条件**保持同一句**（同源同批维护）：
+     * 「有权威码 ⇒ 只信码；无码但有风控语义 ⇒ 也不是页面」。
+     * ⚠ 这两处条件必须一致 —— 分叉就是又一次「只改了一半」。
+     */
+    if (readZcodeBusinessCodeFromBody(trimmed) === undefined
+        && !hasZcodeUnusualActivity(trimmed)
+        && looksLikeZcodeHtmlPage(trimmed))
+        return 'SERVER';
+    // 🔴 并发文案**先于**额度码判定：上游曾把并发限流装进 1005 码下发
+    // （429 + {"code":1005,"msg":"user concurrency limit exceeded"}，2026-10-06），
+    // 按码先判会让一个「等一下就能过」的瞬态错误被报成不可重试的「额度用尽」。
+    if (isZcodeConcurrencyLimited(status, trimmed))
+        return 'RATE_LIMIT';
     if (trimmed.includes('3007'))
         return 'RATE_LIMIT';
-    if (trimmed.includes('3012'))
+    if (hasZcodeUnusualActivity(trimmed))
         return 'PERMISSION';
-    if (trimmed.includes('1113') || trimmed.includes('余额不足'))
+    if (trimmed.includes('1113') || trimmed.includes('余额不足') || trimmed.includes('1005')) {
         return 'QUOTA_EXCEEDED';
+    }
     if (status === 401 || trimmed.includes('1002'))
         return 'AUTH';
     if (status === 429)
@@ -1353,7 +1748,12 @@ export function httpErrorCodeForZcode(status, body) {
  */
 export function registerZcodeLlm(ctx, options) {
     const product = options.product ?? ZCODE;
-    const adapter = new ZcodeAdapter(options);
+    const adapter = new ZcodeAdapter({
+        ...options,
+        // ⚠️ 注入**唯一**的广播实现（`src/catalog-broadcast.ts`），不要在这里
+        // 另写一份 emit —— 两份实现必然漂移（issue IKJVTF 的缺陷① 就是「十处全漏」）。
+        onCatalogLoaded: () => broadcastCatalogChanged(ctx),
+    });
     registerAdapterIdempotent(ctx.llm, [product.id], adapter);
     return adapter;
 }

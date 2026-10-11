@@ -91,6 +91,18 @@ export function buildOpencodePayload(input) {
         ...Number.isSafeInteger(input.maxTokens) && (input.maxTokens ?? 0) > 0
             ? { max_tokens: input.maxTokens }
             : {},
+        // ⚠️ 思考档位（issue IKJJ0V）。**声明了档位就必须真的发出去**，
+        // 否则选择器只是 UI 装饰 —— 用户选了「高」却拿不到任何效果。
+        //
+        // 参数名 `reasoning_effort` 由**实测**确定（2026-10-02）：给
+        // `ling-3.0-flash-fin-free` 传非法值时，错误信息变成 `[400] reasoning_…`
+        // （与基线的 `Endpoint is unavailable` 不同），说明 Zen 侧确实解析并校验它。
+        //
+        // ⚠️ `none`（关闭思考）照发：models.dev 的 `toggle` 形态就产出这一档，
+        // 上游靠它区分「关」与「最低档开」。
+        ...typeof input.reasoningEffort === 'string' && input.reasoningEffort.length > 0
+            ? { reasoning_effort: input.reasoningEffort }
+            : {},
     };
     return ensureFreeLaneShape(base);
 }

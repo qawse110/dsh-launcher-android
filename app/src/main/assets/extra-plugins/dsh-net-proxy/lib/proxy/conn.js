@@ -4,20 +4,35 @@ import { ProxyError, abortError } from "./errors.js";
 import { parseStatusLine } from "./parse.js";
 
 export const MAX_HEADER_LINE = 64 * 1024; // 单行头上限
+const MAX_CONNECT_HEADERS = 128; // CONNECT 响应头行数上限（防空行缺失时无限读）
 
-/** 连接到代理（可取消）。 */
-export function connectProxy(proxy, signal) {
+/** 连接到代理（可取消；timeoutMs 到点未连上则 ETIMEOUT，防止 TCP 黑洞挂死）。 */
+export function connectProxy(proxy, signal, timeoutMs = 0) {
   return new Promise((resolve, reject) => {
     const sock = net.connect({ host: proxy.host, port: proxy.port });
     sock.setNoDelay(true);
-    const onAbort = () => { try { sock.destroy(); } catch {} reject(abortError()); };
+    let settled = false;
+    let timer = null;
+    const finish = (err, val) => {
+      if (settled) return;
+      settled = true;
+      if (timer) { clearTimeout(timer); timer = null; }
+      if (signal) signal.removeEventListener("abort", onAbort);
+      err ? reject(err) : resolve(val);
+    };
+    const onAbort = () => { try { sock.destroy(); } catch {} finish(abortError()); };
     if (signal) {
-      if (signal.aborted) { sock.destroy(); return reject(abortError()); }
+      if (signal.aborted) { try { sock.destroy(); } catch {} return finish(abortError()); }
       signal.addEventListener("abort", onAbort, { once: true });
     }
-    const done = (err, val) => { if (signal) signal.removeEventListener("abort", onAbort); err ? reject(err) : resolve(val); };
-    sock.once("connect", () => done(null, sock));
-    sock.once("error", (e) => done(ProxyError("ECONNECT_PROXY", `proxy connect ${proxy.host}:${proxy.port} failed: ${e.message}`, e)));
+    if (Number(timeoutMs) > 0) {
+      timer = setTimeout(() => {
+        try { sock.destroy(); } catch {}
+        finish(ProxyError("ETIMEOUT", `proxy connect ${proxy.host}:${proxy.port} timeout after ${timeoutMs}ms`));
+      }, timeoutMs);
+    }
+    sock.once("connect", () => finish(null, sock));
+    sock.once("error", (e) => finish(ProxyError("ECONNECT_PROXY", `proxy connect ${proxy.host}:${proxy.port} failed: ${e.message}`, e)));
   });
 }
 
@@ -27,33 +42,89 @@ function proxyAuthHeader(proxy) {
 }
 
 /** HTTP 代理 CONNECT 隧道（HTTPS 目标）。成功返回 raw socket。 */
-export function httpConnect(proxy, targetHost, targetPort, signal) {
+export function httpConnect(proxy, targetHost, targetPort, signal, timeoutMs = 0) {
   return new Promise(async (resolve, reject) => {
     let sock;
-    try { sock = await connectProxy(proxy, signal); } catch (e) { return reject(e); }
+    try { sock = await connectProxy(proxy, signal, timeoutMs); } catch (e) { return reject(e); }
     const host = `${targetHost}:${targetPort}`;
+    // 握手阶段（connectProxy 只管 TCP）同样要有超时与取消：半开代理若永不回 CONNECT
+    // 响应，readLine 会无限挂起，且 abort 监听器已在 TCP 连上后被移除。
+    let timer = null;
+    const onAbort = () => { cleanup(); try { sock.destroy(); } catch {} reject(abortError()); };
+    const cleanup = () => {
+      if (timer) { clearTimeout(timer); timer = null; }
+      if (signal) signal.removeEventListener("abort", onAbort);
+    };
+    if (signal) {
+      if (signal.aborted) { try { sock.destroy(); } catch {} return reject(abortError()); }
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+    if (Number(timeoutMs) > 0) {
+      timer = setTimeout(() => {
+        cleanup(); // 超时也要解绑 abort 监听器，否则共享 signal 场景监听器按超时次数堆积
+        try { sock.destroy(); } catch {}
+        reject(ProxyError("ETIMEOUT", `CONNECT handshake to ${host} timeout after ${timeoutMs}ms`));
+      }, timeoutMs);
+    }
     const stream = new ByteStream(sock);
     sock.write(`CONNECT ${host} HTTP/1.1\r\nHost: ${host}\r\n${proxyAuthHeader(proxy)}\r\n`);
     try {
       const statusLine = await stream.readLine();
-      stream.detach();
       const status = parseStatusLine(statusLine);
-      if (status === 200) resolve(sock);
-      else { sock.destroy(); reject(ProxyError("ECONNECT_TARGET", `CONNECT to ${host} via proxy failed: HTTP ${status}`)); }
+      if (status !== 200) {
+        stream.detach();
+        sock.destroy();
+        cleanup();
+        return reject(ProxyError("ECONNECT_TARGET", `CONNECT to ${host} via proxy failed: HTTP ${status}`));
+      }
+      // 把剩余响应头读到空行为止再 detach：若只读状态行就放手，代理附带的
+      // 响应头（分包到达时）会漏进后续 TLS 流，破坏握手。
+      for (let n = 0; ; n++) {
+        if (n > MAX_CONNECT_HEADERS) {
+          stream.detach();
+          sock.destroy();
+          cleanup();
+          return reject(ProxyError("EHEADER", "CONNECT response has too many header lines"));
+        }
+        if ((await stream.readLine()) === "") break;
+      }
+      stream.detach();
+      cleanup();
+      resolve(sock);
     } catch (e) {
       stream.detach();
       sock.destroy();
+      cleanup();
       reject(e);
     }
   });
 }
 
 /** SOCKS5：协商（支持 RFC1929 用户名/密码）+ CONNECT。成功返回 raw socket。 */
-export function socksConnect(proxy, targetHost, targetPort, signal) {
+export function socksConnect(proxy, targetHost, targetPort, signal, timeoutMs = 0) {
   return new Promise(async (resolve, reject) => {
     let sock;
-    try { sock = await connectProxy(proxy, signal); } catch (e) { return reject(e); }
-    const fail = (msg) => { sock.destroy(); reject(ProxyError("ECONNECT_TARGET", msg)); };
+    try { sock = await connectProxy(proxy, signal, timeoutMs); } catch (e) { return reject(e); }
+    // 握手（方法协商/认证/CONNECT）同样要有超时与取消：服务端停在其中任何一步
+    // 都会让 readExactly 无限挂起。
+    let timer = null;
+    const onAbort = () => { cleanup(); try { sock.destroy(); } catch {} reject(abortError()); };
+    const cleanup = () => {
+      if (timer) { clearTimeout(timer); timer = null; }
+      if (signal) signal.removeEventListener("abort", onAbort);
+    };
+    if (signal) {
+      if (signal.aborted) { try { sock.destroy(); } catch {} return reject(abortError()); }
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+    if (Number(timeoutMs) > 0) {
+      timer = setTimeout(() => {
+        cleanup(); // 超时也要解绑 abort 监听器，否则共享 signal 场景监听器按超时次数堆积
+        try { sock.destroy(); } catch {}
+        reject(ProxyError("ETIMEOUT", `SOCKS5 handshake to ${targetHost}:${targetPort} timeout after ${timeoutMs}ms`));
+      }, timeoutMs);
+    }
+    const fail = (msg) => { cleanup(); sock.destroy(); reject(ProxyError("ECONNECT_TARGET", msg)); };
     try {
       const stream = new ByteStream(sock);
       // 方法协商：0x00 no-auth（若无凭据）/ 0x02 user/pass（若有凭据）
@@ -71,12 +142,22 @@ export function socksConnect(proxy, targetHost, targetPort, signal) {
         stream.detach();
         return fail(`SOCKS5: server requires auth (method ${verMethod[1]})`);
       }
-      // CONNECT：域名 → ATYP=0x03（IP 目标 → 0x01/0x04），为稳妥统一用域名形式
-      const hostBuf = Buffer.from(targetHost, "utf8");
-      const req = Buffer.alloc(4 + 1 + hostBuf.length + 2);
-      req[0] = 0x05; req[1] = 0x01; req[2] = 0x00; req[3] = 0x03; req[4] = hostBuf.length;
-      hostBuf.copy(req, 5);
-      req.writeUInt16BE(targetPort, 5 + hostBuf.length);
+      // CONNECT 目标地址：IPv4 字面量走 ATYP=0x01 二进制（协议正确、最兼容）；
+      // IPv6/域名统一走 ATYP=0x03 域名形式（主流 SOCKS5 服务端均可解析）。
+      let req;
+      if (net.isIPv4(targetHost)) {
+        const parts = targetHost.split(".").map(Number);
+        req = Buffer.alloc(4 + 4 + 2);
+        req[0] = 0x05; req[1] = 0x01; req[2] = 0x00; req[3] = 0x01;
+        for (let i = 0; i < 4; i++) req[4 + i] = parts[i] & 0xff;
+        req.writeUInt16BE(targetPort, 8);
+      } else {
+        const hostBuf = Buffer.from(targetHost, "utf8");
+        req = Buffer.alloc(4 + 1 + hostBuf.length + 2);
+        req[0] = 0x05; req[1] = 0x01; req[2] = 0x00; req[3] = 0x03; req[4] = hostBuf.length;
+        hostBuf.copy(req, 5);
+        req.writeUInt16BE(targetPort, 5 + hostBuf.length);
+      }
       sock.write(req);
       const head = await stream.readExactly(4);
       if (head[1] !== 0x00) { stream.detach(); return fail(`SOCKS5: connect to ${targetHost}:${targetPort} failed, code ${head[1]}`); }
@@ -85,8 +166,10 @@ export function socksConnect(proxy, targetHost, targetPort, signal) {
       const alen = atyp === 0x01 ? 4 : atyp === 0x04 ? 16 : 1;
       await stream.readExactly(alen + 2);
       stream.detach();
+      cleanup();
       resolve(sock);
     } catch (e) {
+      cleanup();
       sock.destroy();
       reject(e);
     }
@@ -111,10 +194,19 @@ export class ByteStream {
     this._onData = (c) => this._push(c);
     this._onEnd = () => { this.ended = true; this._flush(); };
     this._onErr = (e) => { this.error = e; this.ended = true; this._flush(); };
+    // destroy()（不带 error）只发 "close" 不发 "end"/"error"：若不接住，
+    // 等待中的 readLine/nextData 永不兑现（客户端断开时中继协程卡死）。
+    this._onClose = () => {
+      if (this.ended) return;
+      this.error = this.error || ProxyError("ECLOSED", "socket closed");
+      this.ended = true;
+      this._flush();
+    };
     this._onIdleClear = null;
     sock.on("data", this._onData);
     sock.on("end", this._onEnd);
     sock.on("error", this._onErr);
+    sock.on("close", this._onClose);
     if (idleMs > 0) {
       const onIdle = () => { try { sock.destroy(); } catch {} this.error = ProxyError("ETIMEOUT", "proxiedFetch: response idle timeout"); this.ended = true; this._flush(); };
       const reset = () => { if (this._idleTimer) clearTimeout(this._idleTimer); this._idleTimer = setTimeout(onIdle, idleMs); };
@@ -131,6 +223,7 @@ export class ByteStream {
     s.removeListener("data", this._onData);
     s.removeListener("end", this._onEnd);
     s.removeListener("error", this._onErr);
+    s.removeListener("close", this._onClose);
     if (this._onIdleClear) {
       s.removeListener("data", this._onIdleClear); // 若已绑过（idleMs>0 时绑定的是同名 reset，实则不同闭包）
       s.removeListener("end", this._onIdleClear);

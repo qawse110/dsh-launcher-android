@@ -163,7 +163,7 @@ export class MinimaxAuth extends Service {
         }
     }
     /**
-     * 续期**指定 ref**（账号卡片「刷新」按钮 / 定时器）。
+     * 续期**指定 ref**（RPC `account.refresh` / 定时器）。
      *
      * ⚠️ 只读写传入的 ref，**不碰**默认单凭据 ref。
      * ⚠️ **走共享实现 `refreshAccountWithReconcile`** —— 它保证「凭据仍有效」时

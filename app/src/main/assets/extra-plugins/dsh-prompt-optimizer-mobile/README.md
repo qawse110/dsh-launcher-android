@@ -1,4 +1,4 @@
-# dsh-arbiter-wf（**0.8.0-preview**）
+# dsh-arbiter-wf（**0.8.3-stable**）
 
 ## 0.8.0-preview：独立裁判层（改名首版）
 
@@ -42,12 +42,14 @@
   - 2026-10-01 真机缺陷：卡片优先取原始记录，而格式化只认归一字段 ⇒ 页脚恒显 `Σ — tok`；修在格式化入口，**已落盘的旧卡片刷新后也会显示数字**。
   - 仍然不折算、不估算：provider 没给合计就不替它加（只列分项）；整场没有上报用量（例如刚开始就到点）则如实显示 `Σ — tok`。
 
-这是本地开发版本，尚未 push 或发布。下面的下载链接仍指向已发布的 0.7.8。
+本版已发布。下面的下载链接指向本次发布。
 
-`@dsh-external/dsh-po06` · **0.7.8** · GitHub Release（**未发 npm**：`private: true`，只发附件）
-→ 下载：<https://github.com/WestFox-AwA/dsh-prompt-optimizer/releases/tag/v0.7.8>（附件含 `tgz` 与 `SHA256SUMS`）
+> 💬 中文用户交流：**QQ 群 1121399051**（最新消息、安装帮助、版本公告）。
 
-> **0.7.8 的一句话**：**档位终于真的分开了**——补充程度（700 / 1200 / 2000 字）与自主预算
+`@dsh-external/dsh-arbiter-wf` · **0.8.3-stable** · GitHub Release（**未发 npm**：`private: true`，只发附件）
+→ 下载：<https://github.com/WestFox-AwA/dsh-prompt-optimizer/releases/tag/v0.8.3-stable>（附件含 `tgz` 与 `SHA256SUMS`）
+
+> **0.7.8（历史版本）的一句话**：**档位终于真的分开了**——补充程度（700 / 1200 / 2000 字）与自主预算
 > （1 / 2 / 3 个问题）两个维度逐级递进；此前 `minimal` 从未被任何档位使用、且 standard 与 heavy 的
 > detail 相同，所以「重度」实际只等于「标准 + 多问 1 个」。同时**内部控制面信息不再写进工作模型的上下文**
 > （注入头部原先带「任务 `default` · 意图修订 N」，会被当成任务语义处理，现已移除）。
@@ -78,7 +80,7 @@
 > **人工验收就一遍**：见 `po06/HUMAN-TEST.md`（12 步 + 4 个反馈点）。前提：**档位不能是「关闭」**——关闭档按设计不拦截。
 
 > ⚠️ **版本号叫 stable 指的是"这一版对外定为正式版"，不是"能力已通过专业跑分"。**
-> - **内部自洽有证据**：**645 项测试 + 231 个变异守卫**全绿，含打包自足性与文档漂移门禁。
+> - **内部自洽有证据**：**1,003 项测试 + 234 个变异守卫**全绿，含打包自足性与文档漂移门禁。
 > - 📊 **作者实测观察（不是专业跑分）**：测试主要在 **DeepSeek-V4.1-Flash + PTC + PowerShell** 环境下进行。
 >   **目前没有做过专业的跑分测试**；但在常见的各类 one-shot 任务与长任务迭代中，
 >   **实际效果明显强于同环境、同提示词下的 DeepSeek-V4.1-Flash**；另据**少量项目**的统计，
@@ -125,8 +127,8 @@
 **① 从 Release 下载安装包**（两个附件：`tgz` + 校验和）：
 
 ```powershell
-# 直链（版本号换成你要的；0.7.8 是最新版）
-$v = '0.7.8'
+# 直链（版本号换成你要的；0.8.3-stable 是最新版）
+$v = '0.8.3-stable'
 $dir = "$env:USERPROFILE\Downloads"
 Invoke-WebRequest "https://github.com/WestFox-AwA/dsh-prompt-optimizer/releases/download/v$v/dsh-external-dsh-po06-$v.tgz" -OutFile "$dir\dsh-external-dsh-po06-$v.tgz"
 Invoke-WebRequest "https://github.com/WestFox-AwA/dsh-prompt-optimizer/releases/download/v$v/SHA256SUMS-$v.txt" -OutFile "$dir\SHA256SUMS-$v.txt"
@@ -144,14 +146,14 @@ Get-Content "$dir\SHA256SUMS-$v.txt"
 # 用发行版自带的 web 模板新建 profile（不含 0.5.x）
 dsh --profile po06beta --from-default-profile web --dump-config
 # 装本包（tgz 路径换成你下载到的位置）
-dsh plugin --profile po06beta add "$env:USERPROFILE\Downloads\dsh-external-dsh-po06-0.7.8.tgz"
+dsh plugin --profile po061 add "$env:USERPROFILE\Downloads\dsh-external-dsh-arbiter-wf-0.8.3-stable.tgz"
 ```
 
 **③（可选，但强烈建议）一条命令自检**"装好了、装的是这一份、会被装配"（**不调模型、不花钱**）：
 
 ```powershell
 # 需要仓库里的脚本；没克隆仓库就跳过这步，直接进 ④
-node <repo>\po06\scripts\check-install.mjs --profile po06beta --expect-version 0.7.8
+node <repo>\po06\scripts\check-install.mjs --profile po061 --expect-version 0.8.3-stable
 ```
 
 它会逐条回答：
@@ -229,8 +231,9 @@ node <repo>\po06\scripts\recap.mjs --home "$env:USERPROFILE\.dsh"
    所以判据不能写成"出处必须等于自己"——那会把合法继承全判成泄漏。
    指向**链之外**的会话 = 把别处的话当成你在这里说的 ⇒ **非零退出码**。
 
-> 读法的关键：**"你说过"的条目必须是你真说过的原话**——0.6 的契约要求逐字引文，
-> 对不上整份输出作废；而"机器补充"是它自己的判断，**不得被当成你的命令**。
+> 读法的关键：**"你说过"的条目必须是你真说过的原话**——契约要求逐字引文，
+> **对不上的那一条被丢掉并记账**（不是整份作废：其余条目照常产出，见 `lib/interpreter.js` 的逐条丢弃）；
+> 而"机器补充"是它自己的判断，**不得被当成你的命令**。
 > 这一页**只做事实整理，不做质量判定**：哪一版答案更好只能你自己读。
 
 ### 顺带能把「分叉继承」验掉（A7 的另一半）
@@ -273,8 +276,10 @@ node <repo>\po06\scripts\preflight-e001.mjs --stage S4 [--budget <n>]
 1. **原话保留，机器补充另附** —— 用户的话永远原样留在人类消息里；
    机器的解释以**带来源标签的分节**形式附在上下文里（`systemPrompt.context` → 宿主的 `form:'snapshot'` 聚合消息）。
    质量展开有地方放（「质量解释…不是新增命令」节），但不可能被读成用户的命令。
-2. **`user_requirement` 必须带逐字引文** —— 引文必须是用户原话的**字面子串**，对不上则整份输出作废。
+2. **`user_requirement` 必须带逐字引文** —— 引文必须是用户原话的**字面子串**，对不上则**只丢这一条**（记账进 `dropped`，其余条目照常）。
    这把「机器替用户发明要求」从信任问题变成**字符串比对问题**。
+   2026-10-06 追加**信息量下限**：引文不足正文的 1/3 且净增超过 20 字时，该条降级为机器理解、不写成用户要求
+   （拦的是"引一个词就写成一段要求"；措辞巧妙的扩写仍可能通过，扩写始终留在 `claims` 里可回查）。
 3. **检测到问题不等于可以动手** —— 只有 `fail` 能触发返工；
    基础设施故障与未知都不算；返工默认**只记录不发送**（三级投递 L0）。
 
@@ -307,7 +312,7 @@ node <repo>\po06\scripts\preflight-e001.mjs --stage S4 [--budget <n>]
 | **留出集 S1 真题**上的澄清与编译符合判据（不该问的不问、可查事实不丢回用户） | **EV-0059** |
 | **留出集 S3 真题**上的长任务/环境/取消判据（撤回回到原状、约束跨轮保持、infra 不算已验证） | **EV-0060** |
 
-**231 个变异跨 42 个源文件，全部被测试捕获。**
+**234 个变异跨 42 个源文件，全部被测试捕获。**
 
 > 变异检验中有一条**必须记住的纪律**：变异不仅要求"有测试变红"，
 > 还要求**指定的那条**测试变红（`expectFailIncludes`）。
@@ -368,8 +373,8 @@ node <repo>\po06\scripts\preflight-e001.mjs --stage S4 [--budget <n>]
 
 ```
 po06/
-  lib/         35 个模块（domain / 编译 / 解释 / 澄清 / 长任务 / 验证 / 反馈 / 迁移 / 灰度 / 装配闸门 / 评估计划 / 冒烟 / 宿主资源定位 / 只读工具 / 会话上下文 / 清痕 / **档位策略与领域维度** / **虚拟 POSIX 层**）
-  test/        48 套测试 + 变异检验（231 个变异）
+  lib/         54 个模块（domain / 编译 / 解释 / 澄清 / 长任务 / 验证 / 反馈 / 迁移 / 灰度 / 装配闸门 / 评估计划 / 冒烟 / 宿主资源定位 / 只读工具 / 会话上下文 / 清痕 / **档位策略与领域维度** / **虚拟 POSIX 层**）
+  test/        93 套测试 + 变异检验（234 个变异）
   eval/        HOLDOUT-v2.md（已封存，v1 的 18 题逐字节未改 + 追加 H-19/H-20）、HOLDOUT-v1.md（保留以备复核）、
                release-check.json、plan-E001.json、smoke-H-12.json
   scripts/     check-release.mjs（发版前自检）、plan-e001.mjs（留出评估计划与预算闸门）、

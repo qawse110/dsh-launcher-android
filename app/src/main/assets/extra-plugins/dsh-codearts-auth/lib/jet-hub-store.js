@@ -45,6 +45,7 @@ const jetHubSchema = Schema.object({
     disabledModels: Schema.dict(Schema.any()).default({}),
     loomyPermanentLocked: Schema.boolean().default(false),
     gatewayEnabled: Schema.boolean().default(true),
+    providerOrder: Schema.array(Schema.string()).default([]),
 });
 /**
  * 归一化「本机 OpenAI 网关」开关。
@@ -58,6 +59,28 @@ const jetHubSchema = Schema.object({
  */
 export function sanitizeGatewayEnabled(raw) {
     return raw !== false;
+}
+/**
+ * 归一化供应商自定义显示顺序（{@link JetHubState.providerOrder}）。
+ *
+ * 只保留非空字符串 id 并**去重**（保留首次出现位置）；非数组一律视为
+ * 「无自定义顺序」（空数组）。⚠️ 这里**不做** provider 合法性校验：
+ * 合法集合随插件版本变化，在此过滤会让「新版本加入 provider → 被旧版本
+ * 代码重写文档」场景下的顺序无法保留 —— 展示层对数组中不认识 / 缺失的
+ * id 自带稳定兜底，脏条目天然无害。
+ */
+export function sanitizeProviderOrder(raw) {
+    if (!Array.isArray(raw))
+        return [];
+    const seen = new Set();
+    const result = [];
+    for (const id of raw) {
+        if (typeof id !== 'string' || id.length === 0 || seen.has(id))
+            continue;
+        seen.add(id);
+        result.push(id);
+    }
+    return result;
 }
 /**
  * 归一化「锁定永久积分」开关表。
@@ -121,16 +144,88 @@ export function sanitizeDisabledModels(raw) {
     return result;
 }
 /**
+ * 归一化聚合 provider 的「拒绝轮换」表（见 {@link AggregateRejectionMap}）。
+ *
+ * 判据（照 {@link sanitizeDisabledModels} 的形态）：
+ *
+ * - 只有**显式 `true`** 算拒绝（`false` / `1` / `'true'` / `null` 都不算）——
+ *   宽松接受 truthy 会让 `'false'`（非空字符串）被当成拒绝，用户莫名其妙丢一个渠道；
+ * - **空层不保留**：不留 `{ m: {} }` / `{ m: { buddy: {} } }` 这类无意义噪音；
+ * - 任何畸形输入（含**数组** —— `typeof [] === 'object'`，只判 object 会让它通过）
+ *   退化为空表。
+ *
+ * ⚠️ 用 `Object.entries` 遍历**自有**键 ⇒ 原型链键（`constructor` 等）天然不会被
+ * 误当条目（与 `canonical-models.ts` 的 M9 是同一类风险；那里需要显式 `Object.hasOwn`，
+ * 这里由 `entries` 天然保证 —— 故**不要**改成 `for (const k in raw)`）。
+ */
+export function sanitizeAggregateRejections(raw) {
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw))
+        return {};
+    const result = {};
+    for (const [canonicalId, byProvider] of Object.entries(raw)) {
+        if (typeof byProvider !== 'object' || byProvider === null || Array.isArray(byProvider))
+            continue;
+        const perProvider = {};
+        for (const [provider, byRealId] of Object.entries(byProvider)) {
+            if (typeof byRealId !== 'object' || byRealId === null || Array.isArray(byRealId))
+                continue;
+            const perRealId = {};
+            for (const [realId, flag] of Object.entries(byRealId)) {
+                if (flag === true)
+                    perRealId[realId] = true;
+            }
+            // 空层不保留（与上面同因）。
+            if (Object.keys(perRealId).length > 0)
+                perProvider[provider] = perRealId;
+        }
+        if (Object.keys(perProvider).length > 0)
+            result[canonicalId] = perProvider;
+    }
+    return result;
+}
+/**
  * 归一化账号条目数组。
  *
  * 判据刻意保守：只保留同时具备 `id` / `provider` / `credentialRef` 三个非空
  * 字符串的条目 —— 缺任何一个都无法解析凭据，留着只会在选号时反复失败。
  * 其余字段按原样透传（`enabled` / `modelRateLimits` 等由下游各自判空）。
+ *
+ * ## ⚠️⚠️ 必须按 `id` 去重（真实缺陷，对抗审计实测证伪）
+ *
+ * `id` 是账号的**唯一键**：`updateAccount` / `removeAccount` / `reorderAccounts`
+ * 全都 `findIndex(a => a.id === id)`，只命中**第一条**。池里出现两条同 id 时，
+ * 第二条**永远改不动、删不掉**（幽灵账号）。
+ *
+ * 原先只有 `mergeAccounts` 内部去重，而 `replaceAll`（备份导入的**默认模式**）
+ * 不去重 ⇒ 一份手工编辑过的备份即可把两条同 id 写进池里。后果实测**远不止**
+ * 幽灵账号：沉底函数按 id 匹配会写出 `undefined` 空洞，使该 provider 的
+ * `getAvailableAccount` / `listAccounts` 全部抛错（整条推理链崩），且空洞经
+ * `JSON.stringify` 变 `null`、重启后被本函数丢弃 ⇒ **账号永久丢失**。
+ *
+ * ⚠️⚠️ **去重有「两层」，缺一不可**（第二层是独立审计实测证伪后补的）：
+ *
+ * 1. **本函数（归一化层）**：清洗**入口**数据 —— 后端载入、`replaceAll`、
+ *    `mergeAccounts` 都经它。
+ * 2. **`AccountPool.writeAccounts`（唯一写入收口点）**：`addAccount` 等路径
+ *    **不经过本函数**（它直接 `writeAccounts([...readAccounts(), entry])`），
+ *    而 `addAccount` 有 20+ 个调用点（各 `*-auth.ts` 登录落库、`account.create`、
+ *    `opencode-rpc`、`ensureDefaultAnonymousSlot`）⇒ 只靠本层，「池里两条同 id」
+ *    **仍可达**。
+ *
+ * ⚠️ 本层**不能**声称「写盘时自愈」：`updateAccount` / `setAccountsEnabled` /
+ * `clearModelRateLimits` / `updateModelRateLimit` / `setOpencodeProxy` 等
+ * 8 条写路径都**不调本函数**。真正让「历史遗留重复条目」自愈的是**载入路径**
+ * （两种后端的 `load()` 都经本函数），以及 `writeAccounts` 的收口去重。
+ *
+ * 保留**首次出现**的条目（与「先到先得」的直觉一致；重复条目的字段差异
+ * 不合并 —— 无法判断哪份更新，合并反而会造出谁都没写过的混合体）。
  */
 export function sanitizeAccounts(raw) {
     if (!Array.isArray(raw))
         return [];
     const accounts = [];
+    // 已见过的 id：重复条目直接丢弃（见上方注释）。
+    const seenIds = new Set();
     for (const entry of raw) {
         if (typeof entry !== 'object' || entry === null || Array.isArray(entry))
             continue;
@@ -141,15 +236,125 @@ export function sanitizeAccounts(raw) {
             continue;
         if (typeof candidate.credentialRef !== 'string' || candidate.credentialRef.length === 0)
             continue;
+        if (seenIds.has(candidate.id))
+            continue;
+        seenIds.add(candidate.id);
+        /**
+         * ⚠️ **限流标记必须先过滤再落定，且必须放在 `...candidate` 之后**
+         * （真实缺陷，对抗审计实测证伪）。
+         *
+         * 备份文件是用户可编辑的输入，而 `modelRateLimits` 原先**原样透传**。
+         * 非数字脏值（`'not-a-number'` / `null` / 负数）会让 UI 与宿主**判据分叉**：
+         *   - UI（`jet-hub.js`）：`v > Date.now()` ⇒ 对 `'not-a-number'` 为 `false`
+         *     ⇒ **不显示**「限额中」；
+         *   - 宿主（`getAvailableAccount`）：`now >= resetAt` 亦为 `false`
+         *     ⇒ 判为**受限**、选号时**排除**该账号。
+         * ⇒ 用户看到「这个号完全正常」，而宿主永远不用它 —— 正是本项目反复出现的
+         * 「显示与行为分叉」缺陷形态。
+         *
+         * 判据与 `updateModelRateLimit` 的写入守卫一致（只接受有限正数毫秒时间戳）。
+         *
+         * ⚠️ **展开顺序是这条修复的关键**：`{ ...candidate, modelRateLimits: <过滤后> }`
+         * —— 若写成 `{ ...candidate, ...sanitizeModelRateLimits(...) }` 且**放在
+         * `...candidate` 之前**，`candidate` 里的原始（脏的）`modelRateLimits` 会把
+         * 过滤结果**整个覆盖回去**，修复静默失效（本文件第一版正是如此，被新写的
+         * 用例当场抓红）。故这里显式写键名并置于展开之后。
+         */
+        const limits = sanitizeModelRateLimits(candidate.modelRateLimits);
         accounts.push({
             ...candidate,
             enabled: candidate.enabled !== false,
             refreshable: candidate.refreshable !== false,
             nickname: typeof candidate.nickname === 'string' ? candidate.nickname : candidate.id,
             createdAt: typeof candidate.createdAt === 'number' ? candidate.createdAt : Date.now(),
+            // 无有效项时写 `undefined`：`JSON.stringify` 会整个丢弃该键，
+            // 故落盘/传输形态与「从未有过标记」完全一致（不留 `{}` 噪音）。
+            modelRateLimits: limits,
         });
     }
     return accounts;
+}
+/**
+ * 判定一个「限流解禁时刻」是否为**可用的毫秒时间戳**。
+ *
+ * ## ⚠️⚠️ 这是读写两侧**共用的唯一谓词**（真实缺陷，独立审计实测证伪）
+ *
+ * 原先读取侧（{@link sanitizeAccounts} 的 `sanitizeModelRateLimits`）判据是
+ * 「有限正数」，而写入侧（`AccountPool.updateModelRateLimit`）只拒 `!Number.isFinite`
+ * —— 两处**并不同源**，且读取侧的上界**不够严**：
+ *
+ * `1e308` 是「有限正数」，能穿过过滤落进池；而它**超出 `Date` 的合法范围**
+ * （上界 ±8.64e15）。后果是下次该 (账号, 模型) 真撞限流时，
+ * `updateModelRateLimit` 里 `new Date(current).toISOString()` 抛
+ * **`RangeError: Invalid time value`** —— 而 17 个 `updateModelRateLimit` 调用点里
+ * **16 个没有 try**（llm-adapter ×3、各 adapter、account-probe ×3），异常直接冒到
+ * 推理路径与「重测」路径。
+ *
+ * 可达输入是**手工编辑过的备份文件**（正是本模块要防的那类输入）：
+ * `modelRateLimits: {"glm-5.2": 1e308}`。
+ *
+ * ⇒ 判据收敛到本函数一处，读写两侧都调它。**不要再各写一份**。
+ *
+ * 上界取 `8.64e15`（`Date` 的最大毫秒值，`8640000000000000`）：
+ * 超过它的值 `new Date(v).getTime()` 为 `NaN`，任何 `toISOString()` 都会抛。
+ *
+ * @param value 待判定的值（任意类型，非数字一律 false）。
+ * @returns 是否是「可安全交给 `new Date()` 的毫秒时间戳」。
+ */
+export function isValidResetAtMs(value) {
+    // 只认有限数字：`NaN` / `Infinity` / 字符串 / `null` 一律 false。
+    if (typeof value !== 'number' || !Number.isFinite(value))
+        return false;
+    // ⚠️ 必须 > 0：`0` 与负数在选号判据里等价于「不受限」（见 sanitizeModelRateLimits
+    // 的注释），且 UI 的 `hasAnyLimit` 只看键是否存在 —— 详见 D2 的取舍说明。
+    if (value <= 0)
+        return false;
+    // ⚠️ 上界：超出 Date 范围的有限数会让 `new Date(v).toISOString()` 抛 RangeError。
+    return value <= MAX_DATE_MS;
+}
+/** `Date` 可表示的最大毫秒值（±8.64e15）。 */
+export const MAX_DATE_MS = 8_640_000_000_000_000;
+/**
+ * 过滤 `modelRateLimits` 的脏值；无有效项时返回 `undefined`。
+ *
+ * 只保留 {@link isValidResetAtMs} 认可的条目（有限、正、且在 `Date` 范围内）。
+ *
+ * ⚠️ **不过滤已过期的时间戳**：过期标记由 `sweepExpiredRateLimits` 清理，
+ * 且 UI 需要看到它们（`hasAnyLimit` 靠它渲染「重置」按钮）。
+ *
+ * ## ⚠️ 为什么 `0` 也被丢弃（以及这条取舍的代价）
+ *
+ * **选号侧**：`getAvailableAccount` / `allAccountsRateLimitedForModel` /
+ * `listAvailableCredentials` 的判据都是
+ * `resetAt === undefined || resetAt === 0 || now >= resetAt` ⇒ `0` 与负数都等价于
+ * 「不受限」，故丢弃它们**不改变选号行为**。
+ *
+ * ⚠️ **但 UI 侧还有第二套判据**（`plugin-src/client/jet-hub.js` 的 `hasAnyLimit`
+ * = `Object.keys(modelRateLimits).length > 0`）—— 它**只看键是否存在**，用来决定
+ * 「重置 / 重测」按钮是否可点。若池里原本只有 `{m: 0}`，本函数把整个键写 `undefined`
+ * ⇒ `hasAnyLimit` 从 `true` 翻成 `false` ⇒ **用户无法再手动解禁**。
+ *
+ * 可达性：`0` 只可能来自**手工编辑的备份**（正常运行写入的都是
+ * `Date.now() + cooldown` 或 `nextUtc8DayStartMs()`，恒为正）。
+ * 取舍：保留 `0` 会让选号侧多一个「等价于不受限」的噪音键，但能保住 UI 的自救入口；
+ * 丢弃它则相反。**当前选择丢弃**（与「只留真实有效的标记」一致），
+ * 若将来收到「重置按钮变灰」的报障，改这里（`value >= 0`）**并同时**改 UI 判据，
+ * 不要只改一侧 —— 那是本项目「一文件两套同义判据」的事故形态。
+ */
+function sanitizeModelRateLimits(raw) {
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw))
+        return undefined;
+    const limits = {};
+    for (const [modelId, value] of Object.entries(raw)) {
+        // 模型 id 必须非空字符串（与选号侧 `modelId.length === 0` 跳过限流的约定一致）。
+        if (modelId.length === 0)
+            continue;
+        // ⚠️ 判据走共享谓词（读写同源），不要再内联 `isFinite && > 0`。
+        if (!isValidResetAtMs(value))
+            continue;
+        limits[modelId] = value;
+    }
+    return Object.keys(limits).length > 0 ? limits : undefined;
 }
 /** 老契约后端：数据仍在 settings 文档里（与 ≤0.1.6 完全一致）。 */
 class SettingsStore {
@@ -165,21 +370,37 @@ class SettingsStore {
         return {
             accounts: sanitizeAccounts(value.accounts),
             disabledModels: sanitizeDisabledModels(value.disabledModels),
+            // 老文档没这个键 → 空表（没有任何拒绝），与升级前行为一致。
+            aggregateRejections: sanitizeAggregateRejections(value.aggregateRejections),
             // 只是**镜像**（权威表在 permanent-locks.json）；老文档没这个键 → false。
             loomyPermanentLocked: value.loomyPermanentLocked === true,
             // 老文档没这个键 → 启用，与升级前行为一致。
             gatewayEnabled: sanitizeGatewayEnabled(value.gatewayEnabled),
+            // 老文档没这个键 → 空数组（未自定义），展示侧按声明顺序渲染。
+            providerOrder: sanitizeProviderOrder(value.providerOrder),
         };
     }
     async save(state) {
         await this.scope.replace({
             accounts: state.accounts,
             disabledModels: state.disabledModels,
+            // ⚠️⚠️ **必须带上拒绝表**（真实缺陷，对抗审计实测证伪）：
+            //    `replace` 是**整体替换**语义 —— 漏掉本键会让拒绝表**永不落盘**，
+            //    且**任何**账号/黑名单/网关/顺序写入都会顺带把它抹掉。
+            //    后果：用户明确拒绝的渠道在重启后**静默重新参与轮换**（用户无从察觉）。
+            //    探针实测（老契约后端）：落盘 section 键只有
+            //    `accounts,disabledModels,gatewayEnabled,loomyPermanentLocked,providerOrder`，
+            //    `aggregateRejections` 为 undefined，重启后读回 `{}`。
+            //    ⚠️ 与下面三个「接受丢失」的键**不同**：那三个丢失后果**可逆且用户可见**
+            //    （网关回默认、顺序回声明序），而拒绝表丢失是**静默误路由**。
+            aggregateRejections: state.aggregateRejections ?? {},
             // 镜像字段由 AccountPool 与独立文档**同源写出**：同机上只认这个字段的
             // 旧版本代码（其它 profile）读它、也会原样写回它，故两边不会脱节。
             loomyPermanentLocked: state.loomyPermanentLocked === true,
             // 开关丢失只会让网关回到默认启用（可逆），故接受老版本重写时丢掉本键。
             gatewayEnabled: state.gatewayEnabled !== false,
+            // 顺序丢失只会回到声明顺序（可逆，重拖一次即恢复），同理接受丢失。
+            providerOrder: state.providerOrder ?? [],
         });
     }
 }
@@ -225,7 +446,8 @@ class MemoryStore {
  *
  * 依据 `src/product.ts` 与各 `*-product.ts` 的 `id` 字段：
  * `codearts` / `buddy` / `workbuddy` / `lobsterai` / `qoder` / `qodercn`
- * / `trae` / `cline` / `loomy` / `raccoon` / `minimax` / `zcode`。
+ * / `trae` / `cline` / `loomy` / `raccoon` / `minimax` / `zcode`
+ * / `opencode` / `gemini`。
  */
 const REF_PREFIX_TO_PROVIDER = [
     ['CODEARTS', 'codearts'],
@@ -244,6 +466,13 @@ const REF_PREFIX_TO_PROVIDER = [
     // ⚠️ 第 13 个 provider（opencode，2026-10-01）—— 与上面 minimax 同款坑：
     // 漏加会让「恢复备份」认不出 opencode 账号（见上方注释 ②）。
     ['OPENCODE', 'opencode'],
+    // ⚠️ 第 14 个 provider（gemini，2026-10-03）—— 同款坑第 **三** 次。
+    // 漏加 = `GEMINI_ACCOUNT_*` 的账号在 `state.json` 缺失时静默消失
+    //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新授权）。
+    // 本表与客户端 `PROVIDERS` 的一致性由
+    // `tests/unit/jet-hub-store.spec.ts` 的「恢复表覆盖客户端 PROVIDERS 的全部
+    // provider（从真实清单派生）」用例锁死 —— 合并新增 provider 前**先跑它**。
+    ['GEMINI', 'gemini'],
 ];
 /** 账号凭据 ref 形态：`{PREFIX}_ACCOUNT_{HEX}`（前缀由单一真相源派生）。 */
 const ACCOUNT_REF_RE = new RegExp(
@@ -256,6 +485,27 @@ const ACCOUNT_REF_RE = new RegExp(
     .map(([prefix]) => prefix)
     .sort((a, b) => b.length - a.length)
     .join('|')})_ACCOUNT_([0-9A-Fa-f]{6,})$`);
+/**
+ * 由账号凭据 ref 反推 provider；不是账号 ref 形态时返回 `undefined`。
+ *
+ * 用途是**合并导入的「ref 占用」检查**（`src/backup.ts`）：备份里被采纳账号引用的
+ * ref 若已被本机**另一个**账号占用，回写它会静默覆盖本机凭据。调用方需要知道
+ * 该 ref 归属哪个 provider 才能判断「占用它的那条账号是不是同一个号」。
+ *
+ * ⚠️ 判据与 {@link accountFromCredentialRef} **同源**（同一个正则、同一张表）——
+ * 不要再写第二份「前缀 → provider」映射，本项目已有「一文件两套同义判据」的事故史。
+ * ⚠️ 单凭据回退 ref（`CODEARTS_ACCESS_TOKEN` / `BUDDY_ACCESS_TOKEN` 等）不含
+ * `_ACCOUNT_`，故返回 `undefined` —— 它们不是账号 ref，调用方应自行决定如何处理。
+ */
+export function providerOfAccountRef(ref) {
+    const match = ACCOUNT_REF_RE.exec(ref);
+    if (match === null)
+        return undefined;
+    const prefix = match[1];
+    if (prefix === undefined)
+        return undefined;
+    return REF_PREFIX_TO_PROVIDER.find(([candidate]) => candidate === prefix)?.[1];
+}
 /**
  * 从 `.credentials.yaml` 的 `refs:` 段提取 ref 名（**只取键名，不读值**）。
  *
@@ -333,10 +583,14 @@ class FileStore {
             return {
                 accounts: sanitizeAccounts(value.accounts),
                 disabledModels: sanitizeDisabledModels(value.disabledModels),
+                // 老文档没这个键 → 空表（没有任何拒绝），与升级前行为一致。
+                aggregateRejections: sanitizeAggregateRejections(value.aggregateRejections),
                 // 只是镜像（权威表在 permanent-locks.json）；老文档没这个键 → false。
                 loomyPermanentLocked: value.loomyPermanentLocked === true,
                 // 老文档没这个键 → 启用，与升级前行为一致。
                 gatewayEnabled: sanitizeGatewayEnabled(value.gatewayEnabled),
+                // 老文档没这个键 → 空数组（未自定义），展示侧按声明顺序渲染。
+                providerOrder: sanitizeProviderOrder(value.providerOrder),
             };
         }
         catch (error) {
@@ -378,10 +632,14 @@ class FileStore {
             const state = {
                 accounts,
                 disabledModels: {},
+                // 凭据文件里没有任何拒绝信息 → 空表（与全新安装一致）。
+                aggregateRejections: {},
                 // 凭据文件里没有任何锁定信息 → 镜像写 false（权威表另有其文档）。
                 loomyPermanentLocked: false,
                 // 恢复出的文档本来就不含任何开关信息 → 启用（与全新安装一致）。
                 gatewayEnabled: true,
+                // 凭据文件里也没有顺序信息 → 空数组（未自定义，与全新安装一致）。
+                providerOrder: [],
             };
             try {
                 this.write(state);
@@ -404,6 +662,14 @@ class FileStore {
  *
  * 优先级：`DSH_JET_HUB_STATE_DIR`（单测隔离用）→ `profileContext.home`
  * → `$DSH_HOME` → `~/.dsh`。与 `dsh-home-paths` 的 `resolveDshHome` 同序。
+ *
+ * ⚠️ `ctx` **必传**（2026-10-06 复审 !66 收紧）：本函数是**所有**插件状态文档
+ * （`state.json` / `permanent-locks.json` / `badge-preferences` / `auto-checkin` /
+ * `gemini-sigstore` / `dead-models`）的**唯一** home 解析入口，必须保证它们落在
+ * 同一目录。PR !66 曾把它放宽成可选、并在 `dead-model-store` 里传 `undefined` ——
+ * 那会**跳过优先级更高的 `profileContext.home`**，在 profile home 与 `$DSH_HOME`
+ * 不相等时把失效表写到另一个目录，造成「账号池在 A、失效表在 B」的分裂，
+ * 正是 `permanent-lock-store.ts:129-133` 明确警告过必须避免的情况。
  */
 export function resolveJetHubHome(ctx) {
     const override = process.env.DSH_JET_HUB_STATE_DIR;

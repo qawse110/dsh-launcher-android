@@ -168,16 +168,94 @@ const RACCOON_FALLBACK_MODELS = [
         name: 'GLM-5-3-Flash · x0.2→x0.1',
         contextWindow: 1_000_000,
         maxTokens: 100_000,
-        supportsImage: false,
+        // ⚠️ 远端 tags 不含 `vision`，但**实测能看图**（见 RACCOON_IMAGE_CAPABILITY_OVERRIDES）。
+        supportsImage: true,
     },
     {
         id: 'sn-deepseek-v4-1-flash',
         name: 'DeepSeek-V4.1-Flash · x0.25',
         contextWindow: 1_000_000,
         maxTokens: 100_000,
-        supportsImage: false,
+        // ⚠️ 同上：远端 tags 不含 `vision`，实测 5/5 读对随机数字。
+        supportsImage: true,
     },
 ];
+/**
+ * 远端 `tags` 缺 `vision`、但**实测能看图**的模型。
+ *
+ * ## ⚠️ 为什么需要它：`tags` 不是能力契约（真实缺陷，用户 2026-10-03 报障）
+ *
+ * 症状：给 `sn-deepseek-v4-1-flash` 发图，模型回「无法读取图片 / 不支持图片」。
+ *
+ * ### 根因链
+ *
+ * 1. 我们把「远端 `tags` 含 `vision`」当成了服务端能力声明；
+ * 2. `sn-deepseek-v4-1-flash` 的 `tags` 是
+ *    `["general","code","html","analysis","reasoning","auto"]` —— **没有** `vision`
+ *    （`display_description` 也只写「通用对话、代码开发、复杂分析」，不提图像识别）；
+ * 3. ⇒ `inputModalities` 播报 `['text']`；
+ * 4. ⇒ **DSH 在 `LlmRuntime` 里把图片替换成文本占位符**
+ *    （`dsh-llm/lib/index.js` 的 `projectImagesForTextModel`，产出
+ *    `[image omitted because this model accepts text only; attachment sha256:…]`）
+ *    —— **图片根本没发出去**；
+ * 5. ⇒ 用户看到模型说「读不到图片」，而端点其实完全正常。
+ *
+ * ### 决定性证据：带图实测 6/6 全部读对
+ *
+ * 同一张「随机 6 位数字」图（模型无法猜）打 `POST /api/web/llm/v2/chat/completions`：
+ *
+ * | 模型 | 远端 tags 含 vision | 实测读图 |
+ * |---|---|---|
+ * | `sn-deepseek-v4-1-flash` | ❌ | ✅ **5/5**（208063/942977/999889/123015/478368） |
+ * | `sn-glm-5-3-flash` | ❌ | ✅ 1/1 |
+ * | `sn-sensenova-6-8-flash` | ✅ | ✅ 2/2 |
+ * | `sn-sensenova-6-8-flash-lite` | ✅ | ✅ 1/1 |
+ * | `sn-kimi-k3` | ✅ | ✅ 1/1 |
+ * | `sn-glm-5-3` | ✅ | ⚠️ 1/3（**provider 侧节点不一致**，见下） |
+ *
+ * ### 为什么不能指望远端补字段
+ *
+ * 已穷举 9 个条目的**键并集**：顶层 14 个键、`params` **只有** `context_window`
+ * 与 `max_tokens`。用 `/modal|vision|image|img|multimodal|media|type|capab|support|input|output/i`
+ * 扫描，**命中 0 个**。⇒ 远端**从未下发**模态字段，`tags` 是唯一信号，而它被证伪。
+ *
+ * `tags` 的真实用途是**客户端「Raccoon-Auto 选模」的偏好标签**
+ * （`TASK_TAG_PATTERNS` 给消息打 vision 标记后，挑一个带 `vision` 的模型）——
+ * 它回答的是「该模型适不适合处理这类任务」，**不是**「能不能吃图」。
+ *
+ * ### 为什么用显式白名单，而不是「恒 true」
+ *
+ * 与 `buddy-adapter.ts` 的 `IMAGE_CAPABILITY_OVERRIDES` 同构：只覆盖**实测确认**的
+ * 个案，新增条目必须先有真实请求证据。若改成「该家恒支持」，将来上架纯文本模型时
+ * 会把图放行、让上游回一个更难懂的 400 —— 错误更晚、更难排查。
+ *
+ * ### ⚠️ 顺带发现：`sn-glm-5-3` 节点不一致（provider 侧缺陷，不归我们）
+ *
+ * 它 3 次里只对 1 次，两次回「当前模型不支持图片或视频输入」。错误体暴露网关有
+ * 3 个 fallback 组（`raccoon-4eb26a` / `raccoon-0c119c` / `raccoon-ecc5fd`），
+ * **部分节点是纯文本的**。它本来就带 `vision` 标签、我们一直在发图，
+ * **本次修复不改变它的行为**，故按「已知 provider 缺陷」记录而不特殊处理。
+ */
+export const RACCOON_IMAGE_CAPABILITY_OVERRIDES = new Set([
+    'sn-deepseek-v4-1-flash',
+    'sn-glm-5-3-flash',
+]);
+/**
+ * 远端目录条目的图片能力判定 —— **远端解析路径专用**。
+ *
+ * ⚠️ 兜底表路径（`fallbackToRemote`）不走本函数：它的真相源是
+ * `RACCOON_FALLBACK_MODELS[].supportsImage`（已按同一批实测证据修正为 `true`）。
+ * 两个真相源由 `tests/unit/raccoon-product.spec.ts` 的
+ * 「兜底表与远端判定必须一致」一条锁死 —— **别让它们悄悄分叉**。
+ *
+ * @param modelId 模型 id。
+ * @param tags 远端 `tags`（`normalizeRemoteModel` 已小写化；无标签时传空数组）。
+ */
+export function raccoonSupportsImage(modelId, tags) {
+    if (RACCOON_IMAGE_CAPABILITY_OVERRIDES.has(modelId))
+        return true;
+    return tags.includes('vision') || tags.includes('image') || tags.includes('image-understanding');
+}
 /** Raccoon Work provider 配置。 */
 export const RACCOON = {
     id: 'raccoon',

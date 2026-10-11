@@ -73,22 +73,46 @@ const TRAE_FALLBACK_MODELS = [
     { id: 'summary', name: 'Summary', contextWindow: 200_000, isHidden: true },
 ];
 /**
- * 要拉取的对话通道（顺序即优先级）。
+ * **可调用通道白名单**（顺序即优先级，详见 `TraeProduct.channels` 的注释）。
  *
- * 默认含三个实测可调用通道：
- * - `solo_agent`：**首位**，对应截图 Auto Mode 的模型列表（`function_configs`
- *   中 `function: "solo_agent"` 的 `config_info_list`）。包含最多的模型（约 66
- *   条），以及 `display_contact_config` 折扣信息、`reasoning_effort_config` 等
- *   完整配置。
- * - `solo_work_lite`：本项目既有通道，`glm-5-turbo` / `sagitta` 等在此通道可用。
- * - `solo_agent_remote`：补上 agent 专有模型（`glm-5.1` / `qwen-3.5` 等）。
+ * 内容来自逐通道实测（2026-10-04）：只放行在
+ * `/api/agent/v3/llm_utils_chat` 下真正可调用的 15 个 function。
+ * `chat` / `builder` / `inline_chat` 实测稳定被拒，**不得**放入；
+ * `ui_builder_v2` / `solo_builder` / `custom_agent_generation` / `utils`
+ * 目录恒空，放进来也无意义。
+ *
+ * 前三条是通用通道（官方 Auto Mode 用的就是它们），其余为专用通道：
+ * - `solo_agent`：**首位**，对应 Auto Mode 的模型列表，包含最多的模型
+ *   （实测 18 条）与 `display_contact_config` / `reasoning_effort_config`。
+ * - `solo_work_lite`：本项目既有通道。⚠️ 历史注释说 `glm-5-turbo` / `sagitta`
+ *   在此可用 —— 那两个模型**已从目录下架**（2026-10-04 实测不在任何通道里），
+ *   该说法是过期快照，不要据此断言。
+ * - `solo_agent_remote`：补上 agent 专有模型（`glm-5.1` / `kimi-k2.7-code` 等）。
  *
  * 可用 `DSH_TRAE_CHANNELS`（逗号分隔）覆盖。
  */
 export const TRAE_CHANNELS = resolveChannelList(process.env.DSH_TRAE_CHANNELS);
 /** 解析 `DSH_TRAE_CHANNELS`；空/非法时回退默认通道列表。 */
 function resolveChannelList(raw) {
-    const fallback = ['solo_agent', 'solo_work_lite', 'solo_agent_remote'];
+    const fallback = [
+        // ── 通用通道（顺序即优先级）──
+        'solo_agent',
+        'solo_work_lite',
+        'solo_agent_remote',
+        'solo_work_remote',
+        'solo_agent_lite',
+        // ── 专用通道（只有通用通道都不含某模型时才会命中）──
+        'chat_v3',
+        'builder_v3',
+        'solo_coder',
+        'solo_design_lite',
+        'solo_design_remote',
+        'git_ai',
+        'code_reviewer',
+        'code_review_summary',
+        'multimodal',
+        'system_diagnosis',
+    ];
     if (raw === undefined)
         return fallback;
     const parsed = raw.split(',').map((item) => item.trim()).filter((item) => item.length > 0);

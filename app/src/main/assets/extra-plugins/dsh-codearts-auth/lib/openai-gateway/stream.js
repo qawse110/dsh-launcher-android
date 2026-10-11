@@ -1,8 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import { OpenAiGatewayError } from './messages.js';
-import { normalizeUpstreamFailure } from './model-errors.js';
-/** 把「你可能是想用 X」拼到错误消息后面。 */
-async function withSuggestion(message, suggest) {
+import { normalizeUpstreamFailure, upstreamStatusOrFallback } from './model-errors.js';
+import { toOpenAiUsage } from './usage.js';
+/**
+ * 把「你可能是想用 X」拼到错误消息后面。
+ *
+ * ⚠️ 导出给 `responses.ts` 复用：两个端点的纠错建议必须逐字一致，
+ * 否则同一次误填在两个 URL 上会得到不同的提示。
+ */
+export async function withSuggestion(message, suggest) {
     if (suggest === undefined)
         return message;
     try {
@@ -23,13 +29,36 @@ function finishReason(reason) {
         case 'error': return 'error';
     }
 }
+/**
+ * DSH 的用量 → OpenAI Chat Completions 的 `usage`。
+ *
+ * ⚠️ 口径转换全部在 `usage.ts` 里（两个端点共用一份判断，见该文件头）。
+ * 这里只负责**改字段名**：`inputTokens`（已含缓存）→ `prompt_tokens`。
+ *
+ * ⚠️ 两个**私有**字段保留是**有意的向后兼容**，不是冗余：
+ * - `prompt_cache_hit_tokens` 是 DeepSeek 系的私有名，本仓库多个适配器
+ *   （`buddy-adapter.ts` / `openai-compat.ts` / `llm-adapter.ts` 等）在**读**它；
+ * - 顶层 `reasoning_tokens` 同理由旧版网关发出，删掉会让既有消费者读不到。
+ * 官方字段（`prompt_tokens_details.cached_tokens` /
+ * `completion_tokens_details.reasoning_tokens`）**必须同时给**：
+ * Codex 等标准客户端只认官方形态。
+ */
 function usageJson(usage) {
+    const normalized = toOpenAiUsage(usage);
     return {
-        prompt_tokens: usage.inputTokens,
-        completion_tokens: usage.outputTokens,
-        total_tokens: usage.totalTokens ?? usage.inputTokens + usage.outputTokens,
-        ...usage.reasoningTokens === undefined ? {} : { reasoning_tokens: usage.reasoningTokens },
-        ...usage.cacheReadTokens === undefined ? {} : { prompt_cache_hit_tokens: usage.cacheReadTokens },
+        prompt_tokens: normalized.inputTokens,
+        completion_tokens: normalized.outputTokens,
+        total_tokens: normalized.totalTokens,
+        // 官方明细：`cached_tokens` 是 `prompt_tokens` 的**子集**（见 `usage.ts`）。
+        prompt_tokens_details: { cached_tokens: normalized.cachedTokens },
+        ...normalized.reasoningTokens === undefined
+            ? {}
+            : {
+                reasoning_tokens: normalized.reasoningTokens,
+                completion_tokens_details: { reasoning_tokens: normalized.reasoningTokens },
+            },
+        // 私有兼容字段（见上方注释）：只在真有缓存命中时才发，避免凭空多出 0。
+        ...normalized.cachedTokens > 0 ? { prompt_cache_hit_tokens: normalized.cachedTokens } : {},
     };
 }
 function line(value) {
@@ -84,7 +113,16 @@ function consumeChunk(state, chunk) {
             return undefined;
         case 'finish':
             if (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted') {
-                return { error: { message: failureMessage(chunk.reason), type: 'server_error', code: chunk.reason.failure.code } };
+                // ⚠️ 把上游自带的状态码一并带出来（`LlmError` 把它放在 `failure.status`）：
+                // 少了它，下游只能退化成 502，模型名写错这种确定性失败会被客户端白重试。
+                return {
+                    error: {
+                        message: failureMessage(chunk.reason),
+                        type: 'server_error',
+                        code: chunk.reason.failure.code,
+                        status: chunk.reason.failure.status,
+                    },
+                };
             }
             state.finishReason = finishReason(chunk.reason);
             return { delta: {}, finish_reason: state.finishReason };
@@ -106,7 +144,10 @@ export async function* toOpenAiSse(chunks, requestId = `chatcmpl-${randomUUID()}
                 // 上游「模型不存在」以 502 离开网关时会被客户端当成可重试故障重试，
                 // 但它是确定性失败 —— 翻成 404 让客户端提示用户改配置。
                 const normalized = normalizeUpstreamFailure({
-                    status: 502,
+                    // 上游自带状态码（如 gemini 拒绝未知模型名时的 404）优先，否则才退化成 502。
+                    // ⚠️ 门禁（400–599）不能省：codearts 会用 `{ status: 200 }` 表示业务失败，
+                    // 原样透出会让「额度用尽」在客户端眼里读成成功。另两处出口已有同一门禁。
+                    status: upstreamStatusOrFallback(error.status),
                     type: typeof error.type === 'string' ? error.type : 'server_error',
                     code: typeof error.code === 'string' ? error.code : 'upstream_error',
                     message,
@@ -156,7 +197,10 @@ export async function collectOpenAiCompletion(chunks, requestId = `chatcmpl-${ra
         for await (const chunk of chunks) {
             const event = consumeChunk(state, chunk);
             if (event?.error) {
-                throw new OpenAiGatewayError(String(event.error.message), 502, 'server_error', String(event.error.code ?? 'upstream_error'));
+                const detail = event.error;
+                throw new OpenAiGatewayError(String(detail.message), 
+                // 上游自带状态码优先（模型名不存在 = 404），否则才当可重试的服务端故障。
+                upstreamStatusOrFallback(detail.status), 'server_error', String(detail.code ?? 'upstream_error'));
             }
         }
         if (state.finishReason === undefined) {
@@ -199,8 +243,12 @@ export function failureToOpenAiError(error) {
     if (error instanceof OpenAiGatewayError) {
         return { status: error.status, body: { error: { message: error.message, type: error.type, code: error.code } } };
     }
+    // ⚠️ `LlmError` 的 `status` **不是顶层属性**（实测 `'status' in e === false`），
+    // 它只落在 `e.failure.status`（`@deepseek-ai/dsh-llm` 的 `LlmFailure`）。
+    // 只读顶层等于没读 —— 上游声明的 404 会一路退化成 502 并被客户端反复重试。
     const value = error;
-    const status = typeof value?.status === 'number' && value.status >= 400 && value.status <= 599 ? value.status : 502;
+    const raw = typeof value?.status === 'number' ? value.status : value?.failure?.status;
+    const status = upstreamStatusOrFallback(raw);
     return {
         status,
         body: { error: {

@@ -51,8 +51,11 @@ export const BUDDY_BALANCE_ERROR_CACHE_TTL_MS = 5_000;
 /**
  * 余额缓存 + 选号器。
  *
- * 生命周期与 provider 的适配器注册一致（**CodeBuddy 与 WorkBuddy 各一个实例**），
- * 故不存在两站缓存互相串味的可能。
+ * 生命周期与 provider 的适配器注册一致（**每个 provider 各一个实例**），
+ * 故不存在跨站缓存互相串味的可能。
+ *
+ * ⚠️ 泛型参数见 {@link BuddySelectionDeps}；缺省仍是 buddy 系，
+ * 既有调用点（CodeBuddy / WorkBuddy）无需改动。
  */
 export class BuddyBalanceSelector {
     deps;
@@ -144,7 +147,17 @@ export class BuddyBalanceSelector {
         }
         let balance;
         try {
-            balance = await (this.deps.fetchBalance
+            // ⚠️ 缺省实现只适用于 buddy 系（凭据结构相同）。其它 provider 的
+            // `fetchBalance` 由 {@link FetchBalanceRule} 在**编译期**强制必填；
+            // 这里再加一道运行时防御 —— 万一有人用 `as` 绕过了类型，
+            // 宁可立刻抛一条能指认到原因的错，也不要发出 `undefined/...` 的畸形请求
+            // 让它变成一句无法归因的「余额查询失败」。
+            const injected = this.deps.fetchBalance;
+            if (injected === undefined && typeof this.deps.product.endpoint !== 'string') {
+                throw new Error(`${this.deps.product.id ?? 'provider'} 未注入 fetchBalance，`
+                    + '且产品配置没有 endpoint —— 选号器无法查询该 provider 的余额');
+            }
+            balance = await (injected
                 ?? ((cred, product) => fetchCreditBalance(cred, product, this.deps.fetcher ?? fetch)))(credential, this.deps.product);
         }
         catch (error) {

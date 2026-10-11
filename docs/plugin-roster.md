@@ -47,13 +47,20 @@
 > `router-*` 预设名单与一份退役插件名录；前者只服务于恒不命中的分支且会误删
 > routing-suite 仍在用的预设，后者不驱动任何行为）。
 
-### 内置集合（10 个）
+### 内置集合（11 个）
 
 `dsh-web-mobile`、`dsh-prompt-optimizer-mobile`、`dsh-codearts-auth`（原有三个，未动）
 ＋ `dsh-status-bridge`、`dsh-android-links`（由 optional 移入 `assets/extra-plugins/`）
 ＋ `dsh-net-proxy`、`dsh-provider-headers`、`dsh-vision`（自 `prebuilt.tgz` 残留恢复并适配）
 ＋ `modsearch`（`@liustack/modsearch` v5.10.6）、`dsh-ego-browser`（v0.8.6）
-（后两项为 npm 官方产物整包同源，见 README「本轮新增的两项」）。
+＋ `billion-context-dsh`（v0.2.27）
+（后三项为 npm 官方产物整包同源，见 README「本轮新增的三项」）。
+
+> `billion-context-dsh` 加入前**不是内置插件**，而是 profile 里的普通 npm 依赖
+> （`"billion-context-dsh": "^0.2.27"`）；本轮改为随 APK 内置分发（依赖规格已改写为 `link:`）。
+> 它自带的 `cordis.patch.yml` 会**同时 disable 宿主的 `compaction-basic` 行**——
+> 一个 realm 只能有一个 `ctx.compaction` 提供方，属插件自带行为。
+
 
 ### 可选集合（2 个，未动）
 
@@ -91,3 +98,64 @@
    是否也要纳入本轮决策由你定。
 
 **我按你逐项的结论执行，不自行增删。**给到「编号 + 保留/删除/降级」即可。
+
+---
+
+## F. 后续一轮：内置插件同步上游最新版（版本同步，集合不变）
+
+> A 段是**当时**的决策面（版本列已过时，保留作历史）。本节记录后续一轮
+> 「把有上游的内置插件更新到最新版」的结果：**内置集合仍是 8 个**（当时），
+> 只动源码与清单元数据，未增删插件、未调整 builtin/optional 归属、未升级 `targetDsh`。
+
+| # | dir | 上游 | 旧 → 新 | 合入方式 |
+|---|---|---|---|---|
+| 1 | `dsh-web-mobile` | mexiaosqwq/dsh-web-mobile | 3.0.4 → **3.0.5** | 整包替换（npm 产物；本地副本此前即与上游逐字节同源，无本地改动） |
+| 2 | `dsh-prompt-optimizer-mobile` | WestFox-AwA/dsh-prompt-optimizer | 0.8.1-stable → **0.8.3-stable** | 三方合并：上游 `po06/lib` 为基线，重放 3 组本地改动（见该目录 `FORK.md`） |
+| 3 | `dsh-codearts-auth` | gitee iJetLi/deepseek-harness-codearts | tag 0.2.0-rc.2 → **tag 0.2.0-rc.5**（本地构建） | 源码仓库需 `pnpm build:all`；再重放移动端 UI 适配层 |
+| 4 | `dsh-net-proxy` | mafeis/dsh-net-proxy | 0.2.5 → **0.8.0** | 整包替换（本地 `lib/` 自入库起从未被本地改动，仅 peer 范围曾放开，0.8.0 已自带覆盖 0.2.x 的范围） |
+
+**未动**：`dsh-status-bridge`、`dsh-android-links`（本仓自研，无上游）、
+`dsh-provider-headers`、`dsh-vision`（本仓无 upstream 字段，上游身份未确证，不擅自改）。
+
+### 各条的处置要点
+
+- **`dsh-prompt-optimizer-mobile`**：上游 0.8.3 把注入样式重构进 `buildUiCss()`，
+  本副本的 ⑧⑨ 两段窄屏 CSS 已随之**移入该数组**（与上游新增的「接管属主 + MutationObserver 自愈」共存）。
+  另有两处**不再重放**：bash 卡片让位（上游已自行引入 `KEYED_PRIORITY = -10`）、
+  `lib/bash/client.js` 与 `bash-tool-contract.mjs`（上游已把同一组件内联进 `client.js` 并删除这两个模块）。
+- **`dsh-codearts-auth`**：该仓库 tag 名与 `package.json` 的 version 不同步
+  （tag `0.2.0-rc.5` 的包内写 `0.2.0-rc.3`），故清单 `version` 记包内实际值、`desc` 注明来源 tag。
+  上游在 0.2.0-rc.5 中**已移除**一整套 ZCode 账号区样式（`.dim-jh-zcSection` 等，见源码注释），
+  故本地适配层中对应的一小节**一并删除**（不违背上游「别把那套样式加回来」的告警）。
+- **`dsh-net-proxy`**：0.8.0 新增 `relay.js` / `harness-proxy.js` / `system-proxy.js` / `traffic-log.js`
+  等模块（本地 0.2.5 是裁减版），依赖面新增 `@deepseek-ai/dsh-http-proxy`、
+  `dsh-client-ui-renderer`、`dsh-client-locale` —— 均已确认存在于运行时 `0.2.0-rc.2`。
+
+### 装配验证（真机，`--plugins-only` 全链路）
+
+    extra plugin dsh-web-mobile synced: 3.0.4 -> 3.0.5 (apk 300)
+    extra plugin dsh-prompt-optimizer-mobile synced: 0.8.1-stable -> 0.8.3-stable (apk 300)
+    extra plugin dsh-codearts-auth synced: 0.1.0 -> 0.2.0-rc.3 (apk 300)
+    extra plugin dsh-net-proxy synced: 0.2.5 -> 0.8.0 (apk 300)
+    builtin plugins assembled: 8 ok, 0 failed / 8 total
+    compat audit: 8 compatible, 0 incompatible / 8 total (dsh 0.2.0-rc.2)
+
+`files/plugin-status.json` 中 8 条均 `compatible: true`，无兼容性 WARN。
+另用 `dsh --profile web --dump-config`（走真实的 `prepareProfileEntries` 前置校验）
+复核：8 条插件行**均未被标 `disabled`**，stderr 0 行告警。
+
+### 来源可靠性（更新后）
+
+`dsh-net-proxy` 本轮已**确认上游并整包同源**，不再属于「来源不明」。
+
+`dsh-provider-headers` / `dsh-vision` 本轮**未动**，并做了一次专项来源调研，结论如下：
+
+| 插件 | 调研结论 | 依据 |
+|---|---|---|
+| `dsh-vision` | 上游身份可追溯但**版本落后于本地**，无可同步的新版 | `dsh-external/dsh-vision` 与 `william-jin-cmu/dsh-vision` 是同一仓库（301 重定向、`git ls-remote` 同 SHA）；该仓库**无 tag**，`main` 包内版本 `0.1.0`（未合并 PR 最高 `0.1.1`），本仓副本为 `0.2.0`。按名穷举 305 个 `dsh-vision` 仓库，无一含本副本的 `lib/backend.js` + `lib/client.js` 双后端结构 |
+| `dsh-provider-headers` | **无可识别上游** | 同名 npm 包（duanyunlun `0.1.2`）与各候选仓库指纹均不匹配：本地用 `settings.section` 槽 + locale 命名空间 `providerHeaders` + `sendAttribution` 开关；候选用 `settings.models.provider-card` 槽 + `dsh.modelHeaders`。与本文件「源自 `prebuilt.tgz` 残留」的记载一致 |
+
+> **证据强度如实标注**：上述排除基于**按仓库名搜索 + 原始文件结构探测**。
+> GitHub 代码搜索需鉴权（本机 `api.github.com/search/code` 返回 401，无 token），
+> 故「存在一个改了名、但文件集完全相同的仓库」这一情形**未被证明排除**。
+> 两插件来源风险与版本落后状态照旧成立，本轮未改其任何字节。

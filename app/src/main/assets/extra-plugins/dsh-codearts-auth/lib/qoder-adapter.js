@@ -30,7 +30,7 @@ import { QODER } from './qoder-product.js';
 import { projectRequestImage } from './image-budget.js';
 import { registerAdapterIdempotent, } from './llm-register-compat.js';
 import { collectImages, consumeOpenAiSse, errorDetail, httpErrorCode, isTransportError, ModelQueuedError, serializeMessages, } from './openai-compat.js';
-import { BILLING_BUSINESS_CODE, QUEUE_BUSINESS_CODE, QUEUE_MAX_ATTEMPTS, QUEUE_MAX_DELAY_MS, isBillingBusinessCode, isQueueBusinessCode, looksLikeBillingError, nextUtc8DayStartMs, parseQueueError, queueDelayMs, } from './model-queue.js';
+import { BILLING_BUSINESS_CODE, BILLING_BUSINESS_CODES, QUEUE_BUSINESS_CODE, QUEUE_MAX_ATTEMPTS, QUEUE_MAX_DELAY_MS, isBillingBusinessCode, isQueueBusinessCode, looksLikeBillingError, nextUtc8DayStartMs, parseQueueError, queueDelayMs, } from './model-queue.js';
 const parseQoderQueueError = parseQueueError;
 const qoderQueueDelayMs = queueDelayMs;
 /**
@@ -38,7 +38,10 @@ const qoderQueueDelayMs = queueDelayMs;
  * （因为 SSE 消费器也要用，而它不能被本模块反向 import —— 会成环）。
  * 这里保留同名导出，避免既有调用方与测试失效。
  */
-export { BILLING_BUSINESS_CODE as QODER_BILLING_CODE, QUEUE_BUSINESS_CODE as QODER_QUEUE_CODE, QUEUE_MAX_ATTEMPTS as QODER_QUEUE_MAX_ATTEMPTS, QUEUE_MAX_DELAY_MS as QODER_QUEUE_MAX_DELAY_MS, isBillingBusinessCode, isQueueBusinessCode, looksLikeBillingError, nextUtc8DayStartMs, parseQueueError as parseQoderQueueError, queueDelayMs as qoderQueueDelayMs, };
+export { BILLING_BUSINESS_CODE as QODER_BILLING_CODE, 
+// ⚠️ IKKJFH：额度类**码值集合**也公开（对外 API 面），
+// 与上面的单码值并存 —— 单码值只为兼容，判据请用集合。
+BILLING_BUSINESS_CODES as QODER_BILLING_CODES, QUEUE_BUSINESS_CODE as QODER_QUEUE_CODE, QUEUE_MAX_ATTEMPTS as QODER_QUEUE_MAX_ATTEMPTS, QUEUE_MAX_DELAY_MS as QODER_QUEUE_MAX_DELAY_MS, isBillingBusinessCode, isQueueBusinessCode, looksLikeBillingError, nextUtc8DayStartMs, parseQueueError as parseQoderQueueError, queueDelayMs as qoderQueueDelayMs, };
 /**
  * 判断一个错误是否为**额度受限**（`QUOTA_EXCEEDED`）。
  *

@@ -30,6 +30,7 @@
 import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 import { providerCatalogVisible } from './account-pool.js';
 import { RemoteCatalogGate } from './remote-catalog-gate.js';
+import { broadcastCatalogChanged } from './catalog-broadcast.js';
 import { httpErrorCode, collectImages } from './openai-compat.js';
 import { MINIMAX, MINIMAX_INFER_PATH } from './minimax-product.js';
 import { minimaxInferHeaders } from './minimax.js';
@@ -134,11 +135,13 @@ export class MinimaxAdapter extends LlmAdapter {
     product;
     remoteModels;
     /** 目录加载闸门：并发去重 + 失败/空结果冷却（见 `remote-catalog-gate.ts`）。 */
-    catalogGate = new RemoteCatalogGate();
+    catalogGate;
     constructor(options) {
         super();
         this.options = options;
         this.product = options.product ?? MINIMAX;
+        // 目录落地后通知客户端重读（issue IKJVTF 的缺陷①）。
+        this.catalogGate = new RemoteCatalogGate(options.onCatalogLoaded === undefined ? {} : { onLoaded: options.onCatalogLoaded });
     }
     providerInfo(provider) {
         const id = typeof provider === 'string' && provider.length > 0 ? provider : this.product.id;
@@ -358,7 +361,12 @@ export class MinimaxAdapter extends LlmAdapter {
 /** 在 `ctx.llm` 上注册 minimax provider 路由与适配器。 */
 export function registerMinimaxLlm(ctx, options) {
     const product = options.product ?? MINIMAX;
-    const adapter = new MinimaxAdapter(options);
+    const adapter = new MinimaxAdapter({
+        ...options,
+        // ⚠️ 注入**唯一**的广播实现（`src/catalog-broadcast.ts`），不要在这里
+        // 另写一份 emit —— 两份实现必然漂移（issue IKJVTF 的缺陷① 就是「十处全漏」）。
+        onCatalogLoaded: () => broadcastCatalogChanged(ctx),
+    });
     registerAdapterIdempotent(ctx.llm, [product.id], adapter);
     return adapter;
 }

@@ -42,6 +42,8 @@ import { lobsteraiProductById } from './lobsterai-product.js';
 import { qoderProductById } from './qoder-product.js';
 import { clineProductById } from './cline-product.js';
 import { zcodeProductById } from './zcode-product.js';
+import { GeminiAdapter } from './gemini-adapter.js';
+import { GEMINI, GEMINI_DEFAULT_PROJECT, GEMINI_SESSION_LANE_SMOKE } from './gemini.js';
 /**
  * TRAE 的 provider id。
  *
@@ -140,7 +142,7 @@ async function probeWithAdapter(entry, credential, modelId, timeoutMs) {
     // 3. 加了 trae 分支后**仍漏掉 qoder / qodercn / cline** → 三者同样落入
     //    else，被交给 CodeArtsAdapter 用华为云 HMAC 签名去发 Qoder / Cline
     //    凭据。它们的「重测 / 重置」按钮**确实会渲染**（`RATE_LIMIT_CAPABILITIES`
-    //    对未登记的 provider 默认视为有限流，只有 loomy 显式登记为 false），
+    //    对未登记的 provider 默认视为有限流，当时只有 loomy 显式登记为 false），
     //    且 Qoder 的额度受限**每次都会**写 `modelRateLimits`（按 UTC+8 当日
     //    24:00 标记），于是「点重测 → 拿到签名错误 → 标记也清不掉」成为稳定
     //    可复现的死循环；
@@ -156,9 +158,9 @@ async function probeWithAdapter(entry, credential, modelId, timeoutMs) {
     //
     // 命中者（除 `account-pool.ts` 的定义与 `account-probe.ts` 自身的回写）的每个
     // 适配器都必须在这里有分支：buddy（含 workbuddy）/ lobsterai / qoder（含
-    // qodercn）/ cline / zcode / trae / codearts。反例：loomy 的积分耗尽时静默
-    // 降级、**不写**标记，故它落 else 无害（`retestAccount` 取不到 modelId 时
-    // 根本不构造适配器）。新增 provider 时务必同步本分支，
+    // qodercn）/ cline / zcode / trae / codearts / **gemini**。反例：loomy 的
+    // 积分耗尽时静默降级、**不写**标记，故它落 else 无害（`retestAccount`
+    // 取不到 modelId 时根本不构造适配器）。新增 provider 时务必同步本分支，
     // 并补 `tests/unit/account-probe-adapter.spec.ts` 的对应用例。
     const buddyProduct = productById(entry.provider);
     const lobsteraiProduct = lobsteraiProductById(entry.provider);
@@ -231,6 +233,35 @@ async function probeWithAdapter(entry, credential, modelId, timeoutMs) {
             credentialRef: ref,
             resolveCredential: async () => credential,
             refresh: async () => { },
+        });
+    }
+    else if (entry.provider === GEMINI.id) {
+        // Gemini（Cloud Code Assist）→ GeminiAdapter。
+        //
+        // ⚠️ 与 zcode 同因：GeminiAdapter 的限流/额度路径**会写** `modelRateLimits`
+        //（见 `gemini-adapter.ts` 的 `updateModelRateLimit` 调用），故必须有分支。
+        // 落 else 会被交给**华为云 HMAC 签名**的 CodeArtsAdapter 去发 Google 凭据，
+        // 探测必然失败，而账号卡片上的「重测」永远清不掉那个标记。
+        //
+        // 探测只发一次最小纯文本请求，不涉及图片/工具，故除 product 与 lane 外
+        // 无需其它钩子。
+        //
+        // ⚠️ lane 必须是 `smoke`：原版实测冒烟路径与推理路径的 sessionId **不同**
+        //（同 prompt 同预算下取值不同，说明 lane 进了哈希）。不传会让探测流量与
+        // 真实推理混进同一个会话，污染会话归并与 thoughtSignature 回填。
+        //
+        // ⚠️ `project` **显式钉兜底串**，与上面「刻意不传 accountPool / fetchRemoteModels」
+        // 同一个理由：探测是**轻量存活检查**，要的是一次到推理端点的真请求。
+        // 若走自动探测，会先多打一次 `loadCodeAssist`，且 LCA 失败（限流/网络抖动）
+        // 会让探测报「项目号探测失败」而不是它真正要报的「账号仍受限」—— 反而掩盖
+        // 了用户点「重测」想知道的答案。探测**不写**任何东西（不传 persistProject）。
+        adapter = new GeminiAdapter({
+            credentialRef: ref,
+            resolveCredential: async () => credential,
+            refresh: async () => { },
+            sessionLane: GEMINI_SESSION_LANE_SMOKE,
+            project: GEMINI_DEFAULT_PROJECT,
+            product: GEMINI,
         });
     }
     else {
@@ -344,6 +375,74 @@ export async function retestAllAccounts(pool, provider, deps = {}) {
     return {
         accounts,
         clearedCount: accounts.reduce((sum, a) => sum + a.cleared.length, 0),
+    };
+}
+/**
+ * 挑一个「测试」要用的模型 id（纯函数，无 IO —— 便于单测覆盖优先级）。
+ *
+ * 优先级：调用方显式指定 > 已有的限流标记 > 全量目录第一个。
+ *
+ * ## 为什么标记优先于目录
+ *
+ * 用户点「测试」最常见的动机是「这个账号显示着限流标记，它到底恢复了没有」，
+ * 而那个标记指向的模型正是他关心的。取目录第一个（如 CodeBuddy 的
+ * `glm-5.2`）会测一个与标记无关的模型 —— 结果既不能清标记、也不能解释标记。
+ *
+ * ## 为什么没有目录时返回空串而不是猜一个
+ *
+ * 猜错的模型名会得到 404，把「账号不可用」与「模型名不对」两件事混成同一条
+ * 报错，用户据此会去做完全错误的动作（重新登录）。故调用方拿到空串时应
+ * **如实报错**，而不是发出去。
+ *
+ * @param catalogIds 该 provider 的全量模型目录（调用方按需读取，可为空数组）。
+ */
+export function pickTestModel(entry, catalogIds, requested) {
+    if (typeof requested === 'string' && requested !== '')
+        return requested;
+    const marked = Object.keys(entry.modelRateLimits ?? {})[0];
+    if (marked !== undefined)
+        return marked;
+    return catalogIds[0] ?? '';
+}
+/**
+ * 「测试」单个账号：**无条件**真发一次请求，且不做任何存储写入。
+ *
+ * ## 与 {@link retestAccount} 的区别（这是本函数存在的全部理由）
+ *
+ * `retestAccount` 的触发条件是 `Object.keys(entry.modelRateLimits ?? {})`：
+ * 账号没有限流标记时它在 `modelIds.length === 0` 处**提前返回，一次请求都不发**。
+ * 于是「这个账号到底还能不能用」在**没有历史 429** 时没有任何手动探活入口 ——
+ * 用户点「重测」看到瞬间返回，会以为按钮失灵（真实报障：
+ * 「重测按钮你确认过会发请求吗，为什么响应这么快？」）。
+ *
+ * `testAccount` 不看标记、不下发清除指令、不写回重置时刻：它只回答
+ * 「这一发请求成功了吗」。故它**不需要** `modelRateLimits` 存在，
+ * 也不改变任何存储状态 —— 这一点与重测是硬性区别，不可为了复用而合并。
+ *
+ * @param modelId 要测的模型 id，由 {@link pickTestModel} 决定。
+ */
+export async function testAccount(pool, accountId, modelId, deps = {}) {
+    const entry = pool.findAccount(accountId);
+    if (entry === undefined) {
+        return { accountId, modelId, ok: false, message: `账号 ${accountId} 不存在` };
+    }
+    const probe = deps.probe ?? makeDefaultProbe(pool, deps.timeoutMs ?? PROBE_TIMEOUT_MS);
+    let outcome;
+    try {
+        outcome = await probe(entry, modelId);
+    }
+    catch (error) {
+        // 探测函数本身抛错（凭据解析异常等）：如实回报，不冒泡成 handler-failed。
+        const reason = error instanceof Error ? error.message : String(error);
+        return { accountId, modelId, ok: false, message: `无法确认：${reason}` };
+    }
+    return {
+        accountId,
+        ...entry.nickname === undefined ? {} : { nickname: entry.nickname },
+        modelId: outcome.modelId,
+        ok: outcome.ok,
+        ...outcome.message === undefined ? {} : { message: outcome.message },
+        ...outcome.resetTimeMs === undefined ? {} : { resetTimeMs: outcome.resetTimeMs },
     };
 }
 /**

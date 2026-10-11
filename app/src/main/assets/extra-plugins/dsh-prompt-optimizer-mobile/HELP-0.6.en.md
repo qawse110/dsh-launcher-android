@@ -22,14 +22,34 @@ In a hurry? Click **Skip and send** any time while it is working.
 **Tier** (Off / Light / Standard / Heavy)
 
 - **Off** — no interception, no waiting, nothing injected (use it to switch the optimizer off for a while).
-- **Light** — quick and short.
-- **Standard** — **recommended**: fills what matters, medium length.
-- **Heavy** — spends more effort on edges and details; longer and slower.
+- **Light** — clarify the original meaning, including references, scope and conditions that could be misunderstood; identify necessary questions.
+- **Standard** — **recommended**: clarify the wording and fill the gaps that matter most, offering key useful suggestions.
+- **Heavy** — broadly develop positive additions, ideas and methods that serve the existing goal; expose uncertain premises and consequential tradeoffs.
+- All tiers preserve the original intent. They differ in purpose, not item counts, length quotas or a fixed workflow. Reasoning effort remains a separate setting; the compact protocol does not automatically lower Max.
 
 **Permission** (Review / Auto)
 
 - **Auto** — sends your message as soon as the reading is ready.
 - **Review** — shows you what will be injected first; you can **edit it directly**, then click *Confirm*. It **never auto-sends** — not even when the reading fails.
+
+**English mode** (Off / On, off by default)
+
+- When on, **this turn's task, the optimizer instructions and the assistance text are translated into English** before they reach
+  the model — the UI and the stored state stay Chinese (requirement text falls back to your original wording).
+- Code blocks, paths, URLs, JSON literals and **verbatim quoted phrases** are never translated; commands starting with `/` are not
+  translated either (allowlisted ones still go through interception).
+- **It does not ask for a response language on your behalf**: the language the model answers in is still decided by your own words.
+- Cost: one extra translation call per turn (cached), so it is off by default.
+
+**Built-in Bash is Windows-only** (the bundled runtime is a Windows MSYS2 build); on other platforms the model does not get this tool.
+
+**Reasoning boost** (experimental, off by default)
+
+- Lives at the very bottom, under "Experimental", behind a divider. When on, one generation can become several calls
+  (candidate selection / feedback loop / hybrid).
+- The "inference trace" panel only appears while it is on, and shows every call, its duration, and which candidate was adopted.
+- ⚠ **It is not established that this reliably improves capability, and it increases model working time substantially** —
+  enable cautiously, and compare the same task with it on and off.
 
 **Context** (turns 0–10 / full)
 
@@ -45,7 +65,7 @@ In a hurry? Click **Skip and send** any time while it is working.
 ## Bits of the UI
 
 - **Options** — one button in the input bar. It carries the current tier/permission summary; click it for all the settings above.
-- **Details** — the grey-green dot is the state (auto / record-only / disabled). *Details* opens the explainer-prompt editor (with undo and restore).
+- **Details** — the grey-green dot is the state (auto / record-only / disabled). *Details* opens the optimizer core editor (with undo and restore). It separates the full current-settings preview from the last actual request for this session, including characters and reasoning effort.
 - **`?`** — this page.
 - **Overlay** — the small window during interception. Drag it by its title bar, resize from the bottom-right corner, collapse it into a small ball and reopen it when needed.
 

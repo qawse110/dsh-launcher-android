@@ -48,6 +48,10 @@ export const CODEARTS_BENEFIT_FALLBACK = ['glm-5.3-flash', 'deepseek-v4.1-flash'
 const FETCH_TIMEOUT_MS = 10_000;
 /** 定时刷新远端模型列表的间隔（2 小时）。 */
 export const MODEL_REFRESH_INTERVAL_MS = 2 * 3_600_000;
+/** 两个来源是否**都**取到了。 */
+export function isRemoteCatalogComplete(outcome) {
+    return outcome.gatewayOk && outcome.builtinOk;
+}
 /** 模块级内存缓存：远端拉取或磁盘加载后填充；availableCodeArtsModels 优先读取。 */
 let memoryCache;
 /** benefit 模型 id 集合的内存缓存：远端拉取或磁盘加载后填充。 */
@@ -139,10 +143,24 @@ extraUnsignedHeaders) {
  * 同时把 gateway/config 下发的 benefit 模型 id 集合写入独立缓存
  * （见 {@link saveBenefitCache}），供 chat 请求判定是否带 `maas_type: benefit`。
  */
-export async function fetchCodeArtsRemoteModels(credential, fetcher = fetch) {
+export async function fetchCodeArtsRemoteModels(credential, fetcher = fetch, 
+/**
+ * 各来源成败的**出参**（issue IKJVTF，审计 I3）。
+ *
+ * ⚠️ 用出参而非改返回值：本函数的既有调用方与 10 条单测都按「返回数组」用，
+ * 改形状会波及它们；而完整性只对**适配器**有意义（它决定要不要永久缓存）。
+ * 不传即不关心完整性，行为逐字节不变。
+ */
+outcome) {
     const { access_key_id: ak, secret_access_key: sk, security_token: st } = credential;
-    if (!ak || !sk)
+    if (!ak || !sk) {
+        // 无凭据时**两个来源都没取到** —— 不能默认成 true（否则残缺被判成完整）。
+        if (outcome !== undefined) {
+            outcome.gatewayOk = false;
+            outcome.builtinOk = false;
+        }
         return [];
+    }
     const models = [];
     const seen = new Set();
     // 来自 gateway/config 的 benefit 模型 id —— 调用时必须带 maas_type: benefit。
@@ -156,21 +174,27 @@ export async function fetchCodeArtsRemoteModels(credential, fetcher = fetch) {
     // 决定我们发送的 id 的 benefit 属性。
     const benefitIds = [];
     // 1. opengw gateway/config — benefit 模型（glm-5.3-flash 等）
+    //
+    // ⚠️ 成功判据是「**请求成功且形状可识别**」，不是「解析出非空列表」：
+    // 上游把 benefit 模型全部下架时 `result.models: []` 是**合法**状态，
+    // 把它当失败会让冷却永不清理（与 Cline 的 `isClineRecommendedShape` 同口径）。
     const gatewayText = await fetchSignedGet(fetcher, OPENGW_GATEWAY_CONFIG_URL, ak, sk, st);
-    if (gatewayText !== undefined) {
-        const arr = extractJsonArray(gatewayText, ['result', 'models']);
-        if (arr !== undefined) {
-            for (const item of arr) {
-                if (typeof item === 'object' && item !== null) {
-                    const entry = item;
-                    const rawId = typeof entry['model_id'] === 'string' ? entry['model_id'] : '';
-                    const mi = parseModelInfo(entry, seen);
-                    if (mi) {
-                        // 仅当归一化未改写 id 时才记为 benefit（见上方说明）
-                        if (rawId.length > 0 && normalizeModelId(rawId) === rawId)
-                            benefitIds.push(mi.id);
-                        models.push(mi);
-                    }
+    const gatewayArr = gatewayText === undefined
+        ? undefined
+        : extractJsonArray(gatewayText, ['result', 'models']);
+    if (outcome !== undefined)
+        outcome.gatewayOk = gatewayArr !== undefined;
+    if (gatewayArr !== undefined) {
+        for (const item of gatewayArr) {
+            if (typeof item === 'object' && item !== null) {
+                const entry = item;
+                const rawId = typeof entry['model_id'] === 'string' ? entry['model_id'] : '';
+                const mi = parseModelInfo(entry, seen);
+                if (mi) {
+                    // 仅当归一化未改写 id 时才记为 benefit（见上方说明）
+                    if (rawId.length > 0 && normalizeModelId(rawId) === rawId)
+                        benefitIds.push(mi.id);
+                    models.push(mi);
                 }
             }
         }
@@ -183,15 +207,17 @@ export async function fetchCodeArtsRemoteModels(credential, fetcher = fetch) {
         'Agent-Type': 'PromptCenter',
         'X-Language': 'zh-cn',
     });
-    if (snapText !== undefined) {
-        const arr = extractJsonArray(snapText, ['builtinModels']);
-        if (arr !== undefined) {
-            for (const item of arr) {
-                if (typeof item === 'object' && item !== null) {
-                    const mi = parseModelInfo(item, seen);
-                    if (mi)
-                        models.push(mi);
-                }
+    const snapArr = snapText === undefined
+        ? undefined
+        : extractJsonArray(snapText, ['builtinModels']);
+    if (outcome !== undefined)
+        outcome.builtinOk = snapArr !== undefined;
+    if (snapArr !== undefined) {
+        for (const item of snapArr) {
+            if (typeof item === 'object' && item !== null) {
+                const mi = parseModelInfo(item, seen);
+                if (mi)
+                    models.push(mi);
             }
         }
     }

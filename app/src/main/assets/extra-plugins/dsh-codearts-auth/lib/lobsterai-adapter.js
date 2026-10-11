@@ -24,6 +24,7 @@ import { LlmAdapter, LlmError, ReasoningEffortId, } from '@deepseek-ai/dsh-llm';
 import { ToolCallId } from '@deepseek-ai/dsh-llm';
 import { providerCatalogVisible } from './account-pool.js';
 import { RemoteCatalogGate } from './remote-catalog-gate.js';
+import { broadcastCatalogChanged } from './catalog-broadcast.js';
 import { parseRateLimitError } from './llm-adapter.js';
 import { LOBSTERAI_CHAT_PATH, LOBSTERAI_MODELS_PATH, LOBSTERAI_REQUEST_TIMEOUT_MS, isLobsteraiExpired, lobsteraiChatHeaders, lobsteraiKeyfromBody, readNumberField, readStringField, } from './lobsterai.js';
 import { LOBSTERAI } from './lobsterai-product.js';
@@ -32,6 +33,7 @@ import { classifyLobsteraiError, classifyLobsteraiStreamError, recordsLobsteraiR
 import { normalizeHarnessMessages } from './message-shape.js';
 import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js';
 import { registerAdapterIdempotent, } from './llm-register-compat.js';
+import { reportLedgerAccount } from './token-ledger.js';
 /** 本适配器注册的 provider 路由名（历史常量，等价于 `LOBSTERAI.id`）。 */
 export const PROVIDER = 'lobsterai';
 /**
@@ -559,7 +561,7 @@ export class LobsteraiAdapter extends LlmAdapter {
      * 目录加载闸门：并发去重 + 失败/空结果冷却。
      * 依据见 `src/remote-catalog-gate.ts`（首屏「加载模型巨长」的实测归因）。
      */
-    catalogGate = new RemoteCatalogGate();
+    catalogGate;
     /** 远端下发的模型元数据（id → 条目），listModels/resolveModel 共用。 */
     remoteMeta = new Map();
     /** 产品级兜底模型索引（`product.fallbackModels` 的 id → 条目）。 */
@@ -569,6 +571,8 @@ export class LobsteraiAdapter extends LlmAdapter {
         this.options = options;
         this.product = options.product ?? LOBSTERAI;
         this.fetchImpl = options.fetchImpl ?? fetch;
+        // 目录落地后通知客户端重读（issue IKJVTF 的缺陷①）。
+        this.catalogGate = new RemoteCatalogGate(options.onCatalogLoaded === undefined ? {} : { onLoaded: options.onCatalogLoaded });
         this.fallbackIndex = new Map((this.product.fallbackModels ?? []).map((model) => [model.id, model]));
     }
     /**
@@ -820,6 +824,9 @@ export class LobsteraiAdapter extends LlmAdapter {
                     // 此时限流无法归属到具体账号，UI 上也显示不出标记。
                     console.warn('[lobsterai] 当前凭据未匹配到账号池条目，限流记录将被跳过');
                 }
+                // Token 账本（第 2 期）：回报「本笔请求解析出的账号」（空串不回报）。
+                if (currentAccountId !== '')
+                    reportLedgerAccount(this.product.id, currentAccountId);
             }
             catch (error) {
                 console.warn('[lobsterai] 账号匹配失败（不影响本次请求）:', error);
@@ -1506,7 +1513,12 @@ function displayNameFor(model) {
  */
 export function registerLobsteraiLlm(ctx, options) {
     const product = options.product ?? LOBSTERAI;
-    const adapter = new LobsteraiAdapter(options);
+    const adapter = new LobsteraiAdapter({
+        ...options,
+        // ⚠️ 注入**唯一**的广播实现（`src/catalog-broadcast.ts`），不要在这里
+        // 另写一份 emit —— 两份实现必然漂移（issue IKJVTF 的缺陷① 就是「十处全漏」）。
+        onCatalogLoaded: () => broadcastCatalogChanged(ctx),
+    });
     registerAdapterIdempotent(ctx.llm, [product.id], adapter);
     // 返回实例：Jet Hub「显示列表」需要 `listAllModels()`（不受黑名单影响、
     // 带最终展示名/倍率）。`ctx.llm` 不透传自定义方法，须由调用方持有引用。

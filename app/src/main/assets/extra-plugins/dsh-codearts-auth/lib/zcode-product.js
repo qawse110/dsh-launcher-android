@@ -127,21 +127,29 @@ export const ZCODE = {
      */
     defaultCredentialRef: 'ZCODE_CREDENTIAL',
     /**
-     * 单次推理请求的超时。
+     * **整轮墙钟**上限：15 分钟。
      *
-     * ⚠ 取值明显高于其它 provider（它们多为 120s）。理由：实测免费通道
-     * 单请求 **3-30 秒**（本机 GLM-5.3-Flash 实测 2.99 秒），长尾来自
-     * 上游限流重试 + 思考链；而多步 agent 的每一步都是一次独立请求。
-     * 给 180s 是为了包住长尾，不是为了让正常请求等那么久。
+     * ⚠⚠️ **不要按「推理该等多久」来定它**（真实缺陷 IKJOVB）。它只兜两件事：
+     * ① 上游**真静默**且空闲超时也失效的极端情况；② **captcha 卡死** ——
+     * `zcode-captcha.ts` 里存在**无上限的等待**（取页自旋、等 CDP WebSocket `open`），
+     * 早期实测把 `pageBusy` 卡死后整个 turn 永挂，只能靠这里兜。
      *
-     * ⚠ 它**覆盖整轮**：`stream()` 里定时器 abort 的那个 controller 同时传给 captcha
-     * 产出与上游 fetch（`zcode-captcha.ts` 自己那层超时只是其中更细的一环）。
-     * ⚠ 但 180s 这个**取值不依赖 mint 的耗时**：mint 只在上游索要验证时才发生，
-     * 稳态约 0.4–0.5 秒（中位 426ms / 平均 546ms），首次含 chromium 冷启动实测 4.2 秒；
-     * 「实测每次约 1.2 秒」是 origin 修正前「每次新建 page」的历史口径，已不作数。
-     * 这里包的是**推理长尾**（上游限流重试 + 思考链）；改这行的数字要另拿实测依据。
+     * ⚠ **180_000 是错的**（那是官方 `network.timeout`，属另一个字段，见接口注释）。
+     * 长思考该由 {@link streamIdleTimeoutMs} 管，本值可以给得很宽。
+     *
+     * ⚠ 实测 free 通道单请求 3–30 秒（本机 GLM-5.3-Flash 2.99 秒），mint 稳态
+     * 0.4–0.5 秒（中位 426ms / 均值 546ms）、含 chromium 冷启动首次 4.2 秒 ——
+     * 这些都在 15 分钟里，不构成约束。
      */
-    requestTimeoutMs: 180_000,
+    requestTimeoutMs: 15 * 60_000,
+    /**
+     * 流式读取空闲超时：**600_000ms（10 分钟）**，逐字对齐官方
+     * `modelStream.idleTimeoutMs = 6e5`（`zcode.cjs` 默认配置还原）。
+     *
+     * ⚠ 每收到一帧即续期，所以「持续大思考」可以跑满 10 分钟以上而不被判超时 ——
+     * 这正是官方 IDE 面对同一场景不报错的原因。
+     */
+    streamIdleTimeoutMs: 600_000,
     fallbackModels: ZCODE_FALLBACK_MODELS,
     appVersionFallback: ZCODE_APP_VERSION_FALLBACK,
     /**

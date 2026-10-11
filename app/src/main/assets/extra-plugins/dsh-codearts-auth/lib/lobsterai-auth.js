@@ -318,7 +318,7 @@ export class LobsteraiAuth extends Service {
      *
      * ⚠️ **必须回写账号池的 `expiresAt`**（issue !IKIRTT 的真实缺陷）：
      * UI 账号卡片的「有效期」读的正是池里的值，而不是凭据里 access_token 的真实
-     * `exp`。早期这里只 `credentials.set`，于是用户点「刷新」后凭据确实续好了、
+     * `exp`。早期这里只 `credentials.set`，于是调用 `account.refresh` 后凭据确实续好了、
      * 界面却**一直显示「已过期」**，且没有任何自救手段（「重测」按钮的 refresh
      * 是刻意的 no-op）。
      *

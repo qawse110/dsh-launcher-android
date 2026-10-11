@@ -93,9 +93,17 @@ const CODEBUDDY_FALLBACK_MODELS = [
         //
         // 档位沿用适配器静态表 REASONING_EFFORTS 的既有取值 [low,high,max]（该表有
         // 实测依据：三档会显著改变返回的 reasoning_content 长度）。注意上游
-        // /v3/config 声明的是 [low,high,xhigh]，与本表不一致；实测服务端对 low /
-        // medium / high / xhigh / max 一律返回 200（不报非法参数），无法据此判定
-        // 哪一组才真实生效，故不擅自改动既有行为，仅记录该分歧待后续验证。
+        // /v3/config 声明的是 [low,high,xhigh]，与本表不一致。
+        //
+        // ⚠️⚠️ 原注释写「实测服务端对 low/medium/high/xhigh/max 一律返回 200（不报
+        // 非法参数），无法据此判定哪一组才真实生效」—— **该结论已被推翻**
+        // （issue IKJQSH，2026-10-06 实测）：服务端**确实校验档位枚举**，拼错的
+        // `banana` 会回 HTTP 400（国际版 `code:11133` + `extError.code=model_param_invalid`；
+        // 中国版更明确：`code:11150` + `the reasoning effort value is not supported by
+        // the current model`）。故「不报非法参数」只对**合法值**成立，
+        // 判定合法性的正确手法是发一个**明确的非法值**作对照。
+        // ⚠️ 该模型本身尚未按新手法复测，故本表取值维持不变（不擅自改动既有行为）；
+        // 复测时须带上 `banana` 对照，否则「200」什么也证明不了。
         id: 'deepseek-v4-flash', name: 'Deepseek-V4-Flash', contextWindow: 1_000_000, supportsImages: true,
         reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 50_000,
     },
@@ -153,6 +161,8 @@ export const CODEBUDDY = {
     platform: 'ide',
     endpoint: 'https://copilot.tencent.com',
     apiDomain: 'copilot.tencent.com',
+    claimBase: 'https://www.workbuddy.cn',
+    webBase: 'https://www.workbuddy.cn',
     displayName: 'CodeBuddy (腾讯)',
     productCode: 'codebuddy',
     userAgent: 'CodeBuddyIDE/1.106.1',
@@ -163,6 +173,27 @@ export const CODEBUDDY = {
     cliVersion: '2.137.1',
     defaultCredentialRef: 'BUDDY_ACCESS_TOKEN',
     appendSessionParams: false,
+    // 合法登录站 / API 域：中国版登录站在 www.codebuddy.cn（`buddy.ts` 的
+    // WEBSITE_HOME），API 域是 copilot.tencent.com。两者都在本机真实凭据里出现过
+    // （12 条 `www.codebuddy.cn` + 8 条 `copilot.tencent.com`）。
+    //
+    // ⚠️⚠️ **`www.workbuddy.cn` 刻意不在这里**（虽然它是本产品的 `claimBase`）：
+    // 本字段的语义是「凭据里 `domain` 的合法值集合」，而 `domain` = token 的 `iss`
+    // 主机 = **登录站 / 认证 realm**。`www.workbuddy.cn` 是**成长中心网页站**
+    // （`claimBase` / `webBase`），**不签发 token**，因此永远不会作为 `iss` 出现在
+    // 凭据里 —— 把它登记进来属于**语义错位**。
+    //
+    // ⚠️ 更关键：`providerFromIssuer`（`plugin-src/client/backup-convert.js`）按
+    // 「host 含子串 `workbuddy`」分派，会把该域分派给 **workbuddy**；若这里也登记它，
+    // 两套判据对同一域给出**矛盾归属**（域表说 buddy、分派说 workbuddy）。
+    // 实测核对：登记它会让「knownDomains 归属 vs providerFromIssuer 归属」出现 1 处矛盾。
+    // ⇒ 两套判据必须同构：**只登记真正的 realm 主机**。
+    //
+    // ⚠️ 那「中国区旧 workbuddy 账号清不掉」怎么办？见 `knownDomains` 的注释：
+    // 未知域**保守保留**是刻意取舍（误留的代价远小于误删），且该域作为 realm
+    // **无任何实证**（本机 5 条 workbuddy 凭据的 `iss` 全是 `www.workbuddy.ai`）。
+    // 若将来拿到实证，正确修法是**同时**改分派判据与域表，不要只改一处。
+    knownDomains: ['copilot.tencent.com', 'www.codebuddy.cn', 'codebuddy.cn'],
     fallbackModels: CODEBUDDY_FALLBACK_MODELS,
 };
 /**
@@ -197,11 +228,41 @@ const WORKBUDDY_FALLBACK_MODELS = [
         id: 'hy3', name: 'Hy3', contextWindow: 192_000, supportsImages: true,
         reasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high', maxOutputTokens: 64_000,
     },
-    { id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['high'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000 },
+    {
+        // ⚠️ 档位取 5 档（issue IKJQSH）。本表是这两个模型的**唯一档位来源**：
+        // 国际版 `/v3/config` 对它们**不下发 supportedEfforts**，只给一个单值
+        // `reasoning: {effort:"high", summary:"auto"}`（即「固定 high、不提供选择」）。
+        // 而 `parseModelMeta`（src/buddy.ts:905）只认 `supportedEfforts` 数组与
+        // `defaultEffort`，**不认识 `effort`** —— 故远端这个表态会被静默忽略，
+        // 最终落到本表。写 `['high']` 意味着用户永远只有 high 可选，max 从未出现过。
+        //
+        // 实测（2026-10-06，真实登录态直打 www.workbuddy.ai，同一条长前缀提示）：
+        //   low/medium/high/xhigh/max 五档**全部 HTTP 200 且都有真实 reasoning_content**
+        //   （4093 / 8670 / 9023 / 4105 / 10559 字符）；拼错的 `banana` 被拒：
+        //   HTTP 400 `code:11133` / `extError.code=model_param_invalid`。
+        // ⇒ 服务端**确实校验档位枚举**，故这 5 档是「实测可行」而非推测。
+        // ⚠️ 这条同时推翻了本文件下方 deepseek-v4-flash 那条「服务端对各档一律返回 200、
+        // 无法判定哪组生效」的旧记录：非法值会 400，可据此判定。
+        // ⚠️ 强度序**不可**从思考长度反推：xhigh(4105) 实测比 low(4093) 还短。
+        //
+        // ⚠️ 若将来 scoped 端点（/console/enterprises/personal/models）恢复并为这两个
+        // 模型下发列表，`mergeRemoteModels` 会以 scoped 为准（只比 id、不逐字段补齐），
+        // 本表才真正退居「远端缺失时补位」—— 但仍应保持这 5 档：它是「远端没表态时
+        // 我们对外的承诺」。
+        id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash', contextWindow: 1_000_000, supportsImages: true,
+        reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000,
+    },
     {
         // 2026-09 补录：新加坡区的同代模型（-sg 后缀），远端下发且实测能看图。
+        // 档位依据同上：国际版 `/v3/config` 对它同样只给 `reasoning.effort:"high"`、
+        // 不下发列表，故本表是唯一来源。实测五档同样全部 200 且有思考输出
+        // （3833 / 3761 / 5020 / 6345 / 16947 字符），`banana` 同样被 400 拒绝。
+        //
+        // ⚠️ 与 CodeBuddy 的 `-sg` 不是一回事：中国版端点上该模型不存在
+        // （实测 `code:11102 service info not found`），故 CODEBUDDY 兜底表未收录它。
+        // 这里是国际版专属条目，不要照抄到 CODEBUDDY 那张表。
         id: 'deepseek-v4.1-flash-sg', name: 'Deepseek-V4.1-Flash', contextWindow: 1_000_000, supportsImages: true,
-        reasoningEfforts: ['high'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000,
+        reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000,
     },
     {
         id: 'gpt-6-astra', name: 'GPT-6-Astra', contextWindow: 1_000_000, supportsImages: true,
@@ -258,12 +319,30 @@ const WORKBUDDY_FALLBACK_MODELS = [
  *
  * 该产品**没有**每日签到积分接口（内核中只有 `/v2/billing/meter/get-dosage-notify`），
  * 因此 Jet Hub 不为其渲染「一键领取积分」按钮；积分领取在 CodeBuddy 侧完成。
+ *
+ * ⚠️ 下面的 `claimBase` / `webBase` 是**占位值**（为满足 `BuddyProduct` 的必填形状），
+ * 本产品**没有任何代码路径会读取它们** —— 原因有两层：
+ *
+ * 1. 成长任务的唯一入口是「一键领取积分」按钮，而该按钮由
+ *    `supportsCredits = supportsDailyCheckin(provider)` 门控，`workbuddy` 在能力表里
+ *    登记为 `dailyCheckin: false` ⇒ 按钮不渲染 ⇒ `runTasks: true` 传不进来；
+ * 2. **更根本的是**：contributor 在 !62 复审中实测确认 `www.workbuddy.ai` 后端
+ *    **根本没有成长中心**（无任务列表、无 claim 端点）。故这不是「等将来开放」，
+ *    而是「该产品没有这个功能」。`GROWTH_CAPABLE_PROVIDERS` 与客户端的
+ *    `GROWTH_TASK_PROVIDERS` 都已据此**移除** `workbuddy`。
+ *
+ * 两个字段保留是因为 `BuddyProduct` 把它们声明为必填；若将来类型放宽为可选，
+ * 这里可以删掉（`claimBaseOf` / `webBaseOf` 已能正确处理空值并给出可读错误）。
  */
 export const WORKBUDDY = {
     id: 'workbuddy',
     platform: 'workbuddy-ai',
     endpoint: 'https://www.workbuddy.ai',
     apiDomain: 'www.workbuddy.ai',
+    /** ⚠️ 占位值：本产品无成长中心，无任何读取点（见上方注释）。 */
+    claimBase: 'https://www.workbuddy.ai',
+    /** ⚠️ 占位值：本产品无成长中心，无任何读取点（见上方注释）。 */
+    webBase: 'https://www.workbuddy.ai',
     displayName: 'WorkBuddy (国际版)',
     productCode: 'workbuddy',
     // 默认档：国际版产品形态（无按模型命中时使用）。
@@ -285,6 +364,15 @@ export const WORKBUDDY = {
     defaultCredentialRef: 'WORKBUDDY_ACCESS_TOKEN',
     appendSessionParams: true,
     pluginVersion: '5.5.2',
+    // 国际版登录站与 API 域都是 www.workbuddy.ai（本机 5 条真实凭据的 iss 全是此值，
+    // 且本产品的 `apiDomain` 自引入起就从未是 `.cn`）。
+    // ⚠️ 这里列的是 `.ai` 的各 realm 主机形态。**没有 `.cn` 条目**：本机与 git 历史
+    // 均无 `.cn` 作为 WorkBuddy realm 的实证（`www.workbuddy.cn` 是中国区**成长中心**
+    // 站，见 `claimBase`，不是登录站）。
+    // ⚠️ 宁可多列本产品的合法域：`pruneAccountsWithForeignDomain` 只在**命中别的产品
+    // 的集合**时才删账号（见 `knownDomains` 的注释），故漏列会让跨机导入的账号被静默
+    // 删除；反之多列只会让一个本该清理的旧账号多留一会儿（它至多续期失败并在日志可见）。
+    knownDomains: ['www.workbuddy.ai', 'workbuddy.ai', 'auth.workbuddy.ai', 'api.workbuddy.ai'],
     fallbackModels: WORKBUDDY_FALLBACK_MODELS,
 };
 /** 全部产品配置，供按 id 查询与遍历注册使用。 */

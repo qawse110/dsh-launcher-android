@@ -28,7 +28,9 @@
  */
 import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 import { providerCatalogVisible } from './account-pool.js';
+import { clineExhaustedAdvice, clineRateLimitResetAt, parseClineRateLimitHint, recordsClineRateLimit, } from './cline-rate-limit.js';
 import { RemoteCatalogGate } from './remote-catalog-gate.js';
+import { broadcastCatalogChanged } from './catalog-broadcast.js';
 import { isClineExpired, clineHeaders } from './cline.js';
 import { clineDisplayName, hasClineRemoteModels, loadClineModels, } from './cline-models.js';
 import { CLINE, CLINE_CHAT_PATH, CLINE_DEFAULT_REASONING_EFFORT, CLINE_REASONING_EFFORTS, } from './cline-product.js';
@@ -132,6 +134,20 @@ export class ClineAdapter extends LlmAdapter {
     fetchImpl;
     /** 远端模型目录缓存（首次成功后填充）。 */
     remoteModels;
+    /**
+     * 已落缓存的目录是否**两个来源都取全**（issue IKJVTF）。
+     *
+     * ⚠️ **这是短路判据的第二半，绝不能省**：残缺目录**也**要落 `remoteModels`
+     * （展示需要 —— 目录服务抖动时用户的模型列表不该整个消失），但那时**不能**
+     * 短路，否则永远补不齐。修复前只判 `remoteModels !== undefined`，而残缺目录
+     * 同样赋值 ⇒ `RemoteCatalogGate` 的冷却（`retryAt`）**永远读不到**
+     * （`cooling()` 在生产里只有闸门自己那一处调用点，而它排在短路之后）
+     * ⇒ 那 466 条按量计费模型再也拉不回来，只能重启 DSH。
+     *
+     * 判据用「已完整」而非「已定义」：残缺时放行到闸门，由冷却控制重试节奏
+     * （30 秒一轮，不会打风暴）。
+     */
+    remoteComplete = false;
     /** 正在进行中的目录加载（避免并发重复请求）。 */
     loading;
     /**
@@ -153,13 +169,16 @@ export class ClineAdapter extends LlmAdapter {
      * `buildModelCatalog` 的「每模型一次 resolveModel」会把一次失败放大成 N 次。
      * 详见 `src/remote-catalog-gate.ts` 的实测依据。
      */
-    catalogGate = new RemoteCatalogGate();
+    catalogGate;
     constructor(options) {
         super();
         this.options = options;
         this.product = options.product ?? CLINE;
         this.fetchImpl = options.fetchImpl ?? fetch;
         this.loadModelsDev = options.loadModelsDev ?? makeClineModelsDevLoader({ fetcher: this.fetchImpl });
+        // 目录落地后通知客户端重读（issue IKJVTF 的缺陷①）。回调由接线层桥接
+        // （适配器拿不到 ctx），见 `ClineAdapterOptions.onCatalogLoaded`。
+        this.catalogGate = new RemoteCatalogGate(options.onCatalogLoaded === undefined ? {} : { onLoaded: options.onCatalogLoaded });
     }
     /**
      * 描述本适配器拥有的 provider 路由。
@@ -184,7 +203,7 @@ export class ClineAdapter extends LlmAdapter {
      *    模型（`cline-pass/*` 等）。
      *
      * ⚠️ **这是「支持图片的模型发不了图」的修复点**：修复前只看第 1 级，而它
-     * 全表只有 5 条 `cline-free/*` 条目 ⇒ `cline-pass/*` 等**全部**被播报成
+     * 全表只有寥寥几条 `cline-free/*` 条目 ⇒ `cline-pass/*` 等**全部**被播报成
      * 纯文本 ⇒ DSH 根本不把图片送进来。详见 `src/cline-models-dev.ts`。
      *
      * ⚠️ 没有结论时保守报 `text`（宁可少报能力，也不要报一个服务端不认的模态）
@@ -204,7 +223,13 @@ export class ClineAdapter extends LlmAdapter {
      * 不去重会打出多份重复的远端请求（两个端点各一次，乘以并发数）。
      */
     async ensureRemoteModels() {
-        if (this.remoteModels !== undefined)
+        // ⚠️⚠️ **短路判据是「已完整」，不是「已定义」**（issue IKJVTF 的核心修复点）。
+        //
+        // 残缺目录**也**落 `remoteModels`（展示需要），若这里只判 `!== undefined`
+        // 就再也不进闸门 ⇒ 闸门的冷却（`retryAt` / `cooling()`）**永远读不到**
+        // ⇒ 残缺目录永久固化，那 466 条按量计费模型只能靠重启 DSH 才能回来。
+        // 放行到闸门后，由闸门的 30 秒冷却控制重试节奏（不会打风暴）。
+        if (this.remoteComplete)
             return;
         await this.catalogGate.run(async () => {
             try {
@@ -221,9 +246,37 @@ export class ClineAdapter extends LlmAdapter {
                 // ⚠ **不能**用 `models.length === 0` 判断「没拿到目录」：`mergeClineModels`
                 // 会无条件把兜底表并进 `models`（展示需要），实测两个端点全挂时它仍是 5 条
                 // ⇒ 旧判据是死代码，冷却永不触发、兜底被永久当成远端结果缓存。
-                const gotRemote = remote !== undefined
+                //
+                // ⚠⚠ **`got` 与 `complete` 必须分开**（issue IKJVTF）：Cline 有**两个**
+                // 独立来源（`recommended-models` 给 free 集合、`/api/v1/models` 给 466 条
+                // 按量计费 id）。实测 `recommended-models` 成功、`/api/v1/models` 失败时：
+                // - 只看「任一来源非空」（旧实现）⇒ 残缺目录被当成「已加载」**永久缓存**；
+                // - 只看「两个都成功」⇒ 残缺时整个目录都不展示，用户的模型列表凭空消失。
+                // ⇒ 残缺**也展示、也广播**（`got`），但**不永久缓存、要留冷却重试**（`complete`）。
+                const got = remote !== undefined
                     ? hasClineRemoteModels(remote)
                     : models.length > 0;
+                // ⚠️ **完整与否由 `fetchClineRemoteModels` 显式给出**，不能拿
+                // `warnings.length === 0` 反推 —— 「主动跳过」（无凭据时的 `/models`）
+                // 与「取到了」在 warnings 上不可区分，那正是残缺被判成完整的另一条路径。
+                // 注入式加载器（单测）不传 `remote` 时退回 `complete = got`
+                //（那种形态下判不出残缺，与 `normalizeLoadResult` 的向后兼容口径一致）。
+                //
+                // ⚠️ 用 `=== true` 而非直接取值：万一有调用方（旧注入式替身）省了该字段，
+                // 保守按**不完整**处理 —— 方向是「宁可多试一次」。
+                // 反过来（把缺失当完整）会让残缺目录永久固化，那正是本 issue 的缺陷②。
+                const complete = remote === undefined ? got : remote.complete === true;
+                // ⚠️ **warnings 循环必须在 `if (!got)` 之前**（真实回退，审计发现）：
+                // 基线里它排在 `if (!gotRemote) return false` **之前**，而基线那两个端点
+                // 全挂时正是靠这两行日志给出现场证据（`[cline] 模型目录来源失败：models
+                // fetch failed`，issue IKJVTF 就引用了它）。放到后面会让「全挂」这一
+                // **最需要诊断**的场景变成静默。
+                for (const warning of warnings) {
+                    // eslint-disable-next-line no-console
+                    console.warn(`[cline] 模型目录来源失败：${warning}`);
+                }
+                if (!got)
+                    return { got: false, complete: false };
                 let merged = models;
                 if (models.length > 0) {
                     // ⚠️ **models.dev 是目录的第三个来源**（补缺的模型 + 可读名 + 上下文
@@ -232,23 +285,17 @@ export class ClineAdapter extends LlmAdapter {
                     // 它失败不影响目录本身（只记日志）。
                     merged = applyModelsDevCatalog(models, await this.ensureModelsDev());
                 }
-                // 目录部分失败时留下日志：静默降级会让用户看到「少了模型」却无从排查
-                // （两个端点独立容错，故这里只记 warning 不抛错）。
-                for (const warning of warnings) {
-                    // eslint-disable-next-line no-console
-                    console.warn(`[cline] 模型目录来源失败：${warning}`);
-                }
-                if (!gotRemote)
-                    return false;
+                // ⚠️ 残缺目录也落缓存（否则每次 `listModels` 都重拉两个端点），
+                // 但 `remoteComplete` 保持 false ⇒ 下次仍进闸门，由冷却控制重试。
                 this.remoteModels = merged;
-                return true;
-                return true;
+                this.remoteComplete = complete;
+                return { got: true, complete };
             }
             catch (error) {
                 // 拉取失败保持未定义，后续 listModels/resolveModel 仍回退静态兜底表。
                 // eslint-disable-next-line no-console
                 console.warn(`[cline] 模型目录拉取失败：${error instanceof Error ? error.message : String(error)}`);
-                return false;
+                return { got: false, complete: false };
             }
         });
     }
@@ -527,10 +574,32 @@ export class ClineAdapter extends LlmAdapter {
                 if (currentAccountId.length > 0)
                     tried.add(currentAccountId);
                 const maxRotate = CLINE_MAX_ROTATE - 1;
+                // ⚠️ 不再拼「最后一次失败的原样信息」：它会把上游英文整句复述进最终错误，
+                // 而 `clineExhaustedAdvice` 已把语义（限流 / 当日免费额度 / 额度耗尽）用
+                // 中文说清 —— 两遍叠加会让消息变成其它 provider 的两三倍长
+                // （用户 2026-10-03 报障「这个报告和其它的供应商比起来是不是太长了」）。
+                // 上游原文只在**没识别出语义**时由那个函数附上（见 src/cline-rate-limit.ts）。
+                /**
+                 * 记下「刚失败的那个账号被限流到什么时候」。
+                 *
+                 * ⚠️ 必须**在每次失败后**都调用（含循环结束后的最后一次）：原来的写法把
+                 * 标记放在**下一轮的开头**，于是「换号次数用尽而退出」时，**最后一个**
+                 * 账号永远不会被标记 —— 它下一次又会被 `getAvailableAccount` 选中、
+                 * 立刻再撞一次同样的墙（本机 cline 只有一个账号，故这条尤其致命）。
+                 */
+                let markedAccountId = '';
+                const markLimited = async () => {
+                    if (currentAccountId.length === 0)
+                        return;
+                    if (currentAccountId === markedAccountId)
+                        return;
+                    if (!recordsClineRateLimit(response.status, errorText))
+                        return;
+                    markedAccountId = currentAccountId;
+                    await this.options.accountPool?.updateModelRateLimit(currentAccountId, options.model, clineRateLimitResetAt(response, errorText, options.model));
+                };
                 for (let round = 0; round < maxRotate; round++) {
-                    if (currentAccountId.length > 0 && recordsClineRateLimit(response.status, errorText)) {
-                        await this.options.accountPool.updateModelRateLimit(currentAccountId, options.model, Date.now() + CLINE_RATE_LIMIT_FALLBACK_MS);
-                    }
+                    await markLimited();
                     const next = await this.options.accountPool.getAvailableAccount(this.product.id, options.model, tried);
                     if (next === null || next === undefined || tried.has(next.entry.id))
                         break;
@@ -550,7 +619,17 @@ export class ClineAdapter extends LlmAdapter {
                     if (!isClineRotatableFailure(response.status, errorText))
                         break;
                 }
-                throw new LlmError(`cline: 模型 ${options.model} 的所有账号均不可用（限流或额度耗尽），请稍后再试`, 'QUOTA_EXCEEDED');
+                // 循环退出前最后失败的那个账号（见 markLimited 的注释）。
+                await markLimited();
+                // 报文里能读到什么语义就说什么话：「当日免费额度」与「短时限流」的动作
+                // 完全不同，而两者**都是 429**，只能靠文案区分（见 cline-rate-limit.ts）。
+                const hint = parseClineRateLimitHint(errorText);
+                const advice = clineExhaustedAdvice(response.status, hint, recordsClineRateLimit(response.status, errorText)
+                    ? clineRateLimitResetAt(response, errorText, options.model)
+                    : undefined);
+                // ⚠️ 文案要短（用户报障「比其它供应商长」）：前缀只说「哪个模型、账号都用完了」，
+                // 其余全部交给 `clineExhaustedAdvice` —— 原始报文不再出现在这里。
+                throw new LlmError(`cline: 模型 ${options.model} 的所有账号均不可用 —— ${advice}`, 'QUOTA_EXCEEDED');
             }
             throw new LlmError(`cline: ${errorDetail(errorText)}`, httpErrorCode(response.status), { status: response.status });
         }
@@ -722,14 +801,16 @@ export class ClineAdapter extends LlmAdapter {
         }
     }
 }
-/** 限流标记的兜底时长（1 小时；与 buddy / lobsterai 同口径）。 */
-const CLINE_RATE_LIMIT_FALLBACK_MS = 3_600_000;
 /**
  * 该失败是否值得**换号重试**。
  *
  * 判据与 buddy 系一致：429（频率限制）与 402（额度耗尽）。
  * 其余错误（400 请求格式错、5xx 服务端故障）换号也无用 ——
  * 5xx 是所有账号共用的服务端问题，400 是请求本身的问题。
+ *
+ * ⚠️ 限流标记该写多长、以及给用户什么建议，都在 `src/cline-rate-limit.ts`
+ * （那里有 Cline 专属的等待时长解析：它把时长写在**英文句子**里，
+ * 既没有 `retry-after` 头、也没有绝对时刻）。
  */
 export function isClineRotatableFailure(status, body) {
     if (status === 429 || status === 402)
@@ -748,17 +829,6 @@ export const CLINE_CREDIT_MARKERS = [
     'credit', 'payment required', 'exceeded',
     '积分不足', '额度不足', '余额不足', '频率限制', '超出限制',
 ];
-/**
- * 该失败是否应**记为模型的限流标记**（让 UI 亮出「限额重置」徽章）。
- *
- * 只覆盖真正表达「这个模型/账号此刻不可用」的状态码：429 与 402。
- * 文案命中的 4xx（如 400 + 含 "credit" 的措辞）**不记徽章** ——
- * 徽章的含义必须是「受限」，而不是「这个账号出过错」
- * （与 `recordsLobsteraiRateLimit` 同约定）。
- */
-export function recordsClineRateLimit(status, _body) {
-    return status === 429 || status === 402;
-}
 /**
  * 该失败是否是**与凭据无关的访问限制**（地域封锁 / 模型未开通）。
  *
@@ -808,7 +878,12 @@ const CLINE_REGION_FORBIDDEN_MARKERS = [
  */
 export function registerClineLlm(ctx, options) {
     const product = options.product ?? CLINE;
-    const adapter = new ClineAdapter(options);
+    const adapter = new ClineAdapter({
+        ...options,
+        // ⚠️ 注入**唯一**的广播实现（`src/catalog-broadcast.ts`），不要在这里
+        // 另写一份 emit —— 两份实现必然漂移（issue IKJVTF 的缺陷① 就是「十处全漏」）。
+        onCatalogLoaded: () => broadcastCatalogChanged(ctx),
+    });
     registerAdapterIdempotent(ctx.llm, [product.id], adapter);
     // 返回实例：Jet Hub「显示列表」需要 `listAllModels()`（不受黑名单影响、
     // 带最终展示名）。`ctx.llm` 不透传自定义方法，须由调用方持有引用。

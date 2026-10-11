@@ -1,3 +1,4 @@
+import { effortView } from './effort-view.js';
 export function toOpenAiModelId(provider, model) {
     return `${provider}/${model}`;
 }
@@ -56,28 +57,89 @@ export async function collectGatewayModels(llm, onError) {
  * （见 lobsterai-adapter.ts:768-770）——宁可少报能力，也不要让用户发一张
  * 注定被上游拒绝的图。
  */
-export async function collectGatewayModelIds(llm, onError) {
+export async function collectGatewayModelIds(llm, onError, effortViews) {
     const groups = await collectGatewayModels(llm, onError);
-    return groups.flatMap(({ provider, models }) => models.map((model) => ({
-        id: toOpenAiModelId(provider, model.id),
-        name: model.name,
-        input: Array.isArray(model.inputModalities) && model.inputModalities.length > 0
-            ? [...model.inputModalities]
-            : ['text'],
+    return toGatewayModelIds(groups, effortViews);
+}
+/**
+ * 分组目录 → 扁平行（设置页/面板用）。
+ *
+ * ⚠️ 抽成**纯函数**是为了让「已经采集过分组与档位」的调用方直接复用，
+ * 而不是再走一遍 `collectGatewayModelIds` 把目录拉第二次
+ * （重复采集的症状是同一份清单里两次出现不同的档位）。
+ */
+export function toGatewayModelIds(groups, effortViews) {
+    return groups.flatMap(({ provider, models }) => models.map((model) => {
+        const id = toOpenAiModelId(provider, model.id);
+        const reasoning = effortViews?.get(id);
+        return {
+            id,
+            // ⚠️ 这两个字段**必须由这里给出**（见 `GatewayModelIdEntry` 的注释）：
+            // 前端没有别的地方能拿到权威拆分。
+            provider,
+            model: model.id,
+            name: model.name,
+            input: Array.isArray(model.inputModalities) && model.inputModalities.length > 0
+                ? [...model.inputModalities]
+                : ['text'],
+            ...reasoning === undefined ? {} : { reasoning },
+        };
+    }));
+}
+/**
+ * 逐个模型解析**档位视图**（key = `provider/model`）。
+ *
+ * ## 为什么要单独解析
+ *
+ * DSH 的 `LlmModelInfo`（`listModels` 的产物）**不带**档位，档位只在
+ * `resolveModelInfo` 的 `LlmResolvedModelInfo.reasoning` 里。而档位正是本网关
+ * 最需要公开的东西 —— 各 provider 的档位 id 私有（`light` / `extra_high` /
+ * `xhigh` / `on`），客户端不查就只能猜，猜错就是 400。
+ *
+ * ## 成本与容错
+ *
+ * 每个模型一次 `resolveModelInfo`：它读的是适配器**已缓存**的远端目录
+ * （`listModels` 刚拉过），故不产生额外网络请求；DSH 自己的 `buildModelCatalog`
+ * 也是「每个 provider listModels 后逐个 resolveModelInfo」的同一形状。
+ * 逐模型 catch：单个模型解析失败只是**它**没有档位字段，不影响整个目录。
+ */
+export async function collectGatewayEffortViews(llm, groups, onError) {
+    const views = new Map();
+    const resolve = llm?.resolveModelInfo;
+    // 宿主不提供该能力时**静默返回空表**：档位是附加信息，拿不到就不发字段，
+    // 不能让整份目录跟着失败。
+    if (typeof resolve !== 'function')
+        return views;
+    await Promise.all(groups.flatMap(({ provider, models }) => models.map(async (model) => {
+        try {
+            const info = await resolve.call(llm, provider, model.id);
+            const view = effortView(info?.reasoning?.efforts, info?.reasoning?.defaultEffort);
+            if (view !== undefined)
+                views.set(toOpenAiModelId(provider, model.id), view);
+        }
+        catch (error) {
+            onError?.(provider, new Error(`${model.id} 的档位解析失败（该模型不带档位字段，目录本身照常返回）：`
+                + `${error instanceof Error ? error.message : String(error)}`));
+        }
     })));
+    return views;
 }
 /** 将 DSH 的 provider 分组目录转换为 OpenAI models 响应中的 data 项。 */
-export function toOpenAiModels(groups) {
-    return groups.flatMap(({ provider, models }) => models.map((model) => ({
-        id: toOpenAiModelId(provider, model.id),
-        object: 'model',
-        created: 0,
-        owned_by: provider,
-        name: model.name,
-        ...model.description === undefined ? {} : { description: model.description },
-        ...model.contextWindow === undefined ? {} : { context_window: model.contextWindow },
-        ...model.maxTokens === undefined ? {} : { max_tokens: model.maxTokens },
-        ...model.inputModalities === undefined ? {} : { input: model.inputModalities },
-    })));
+export function toOpenAiModels(groups, effortViews) {
+    return groups.flatMap(({ provider, models }) => models.map((model) => {
+        const reasoning = effortViews?.get(toOpenAiModelId(provider, model.id));
+        return {
+            id: toOpenAiModelId(provider, model.id),
+            object: 'model',
+            created: 0,
+            owned_by: provider,
+            name: model.name,
+            ...model.description === undefined ? {} : { description: model.description },
+            ...model.contextWindow === undefined ? {} : { context_window: model.contextWindow },
+            ...model.maxTokens === undefined ? {} : { max_tokens: model.maxTokens },
+            ...model.inputModalities === undefined ? {} : { input: model.inputModalities },
+            ...reasoning === undefined ? {} : { reasoning },
+        };
+    }));
 }
 //# sourceMappingURL=models.js.map

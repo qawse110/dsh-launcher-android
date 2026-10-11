@@ -32,6 +32,7 @@
  * 会在后台刷新后自动补上。
  */
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { OPENCODE_MODELS_DEV_URL, OPENCODE_MODELS_DEV_TTL_MS } from './opencode-product.js';
@@ -52,6 +53,68 @@ const MEASURED_IMAGE_OVERRIDES = {
     'longcat-2.5-preview-free': { image: false, note: '2026-10-02 实测 500，models.dev 多报 image' },
 };
 const isFiniteNumber = (v) => typeof v === 'number' && Number.isFinite(v);
+/**
+ * 档位 id → 官方中文展示名。
+ *
+ * ⚠️ 沿用 Qoder 那份**官方 i18n**（`settings.efforts`，见 AGENTS.md §2.2），
+ * 因为 DSH 客户端**直接渲染** `efforts[].name`（不本地化、不查字典），
+ * 给英文就显示英文。
+ * ⚠️ `minimal` / `xhigh` 在那份表里没有 —— models.dev 确实会下发这两个值，
+ * 遇到时回退到 id 本身（**不猜中文**）：宁可显示 `minimal` 也不编一个错译。
+ */
+const EFFORT_NAMES = {
+    none: '关闭思考',
+    minimal: '最小',
+    low: '低',
+    medium: '中',
+    high: '高',
+    xhigh: '极高',
+    max: '最大',
+};
+/**
+ * 档位 id → 展示名（**无官方中文时回退到 id 本身**，不猜译名）。
+ *
+ * 导出给适配器用：`resolveModel()` 要给 `efforts[].name` 填中文，
+ * 而客户端**直接渲染**该字段。
+ */
+export function opencodeEffortName(id) {
+    return EFFORT_NAMES[id] ?? id;
+}
+/**
+ * 从 `reasoning_options` 提取思考档位。
+ *
+ * ## 三种形态的处置（issue IKJJ0V）
+ *
+ * - `type:'effort'` + `values` → **原序**产出，值就是上游认的 id。
+ * - `type:'toggle'`（只能开/关）→ 产出 `['none', 'low']` 两档：
+ *   `none`=关闭思考、`low`=开启（最低档即「开」）。这是与 Qoder 的
+ *   `supportsDisable` 独立维度等价的表达 —— 在本形态里「关」就是全部语义。
+ * - `type:'budget_tokens'`（预算制）→ **不声明**。DSH 的 `reasoning.efforts`
+ *   表达不了预算，编一档等于谎报能力。
+ *
+ * @returns 档位 id 数组；为空表示**不声明** `reasoning`（UI 不出现）。
+ */
+function normalizeEfforts(entry) {
+    if (!Array.isArray(entry.reasoning_options))
+        return [];
+    const out = [];
+    for (const raw of entry.reasoning_options) {
+        if (typeof raw !== 'object' || raw === null)
+            continue;
+        const option = raw;
+        if (option.type === 'effort' && Array.isArray(option.values)) {
+            for (const v of option.values) {
+                if (typeof v === 'string' && v.length > 0 && !out.includes(v))
+                    out.push(v);
+            }
+        }
+        else if (option.type === 'toggle' && !out.includes('none')) {
+            out.push('none', 'low');
+        }
+        // `budget_tokens` 刻意不处理（见上方说明）
+    }
+    return out;
+}
 /** 把 models.dev 的一个条目归一；不合法时返回 null。 */
 function normalizeEntry(id, raw) {
     if (typeof raw !== 'object' || raw === null)
@@ -68,13 +131,17 @@ function normalizeEntry(id, raw) {
     const override = MEASURED_IMAGE_OVERRIDES[id];
     if (override !== undefined)
         modalities = override.image ? ['text', 'image'] : ['text'];
+    const efforts = normalizeEfforts(entry);
     return {
         id,
         name: typeof entry.name === 'string' && entry.name.length > 0 ? entry.name : id,
         modalities,
         contextWindow: isFiniteNumber(entry.limit?.context) ? entry.limit.context : 0,
         maxOutputTokens: isFiniteNumber(entry.limit?.output) ? entry.limit.output : 0,
-        reasoning: entry.reasoning === true,
+        // ⚠️ `reasoning` 与 `efforts` 必须一致：只有真拿到档位才报「支持思考」。
+        // `reasoning: true` 但 `efforts: []` 会声明一个空选择器（UI 出现但无内容）。
+        reasoning: entry.reasoning === true && efforts.length > 0,
+        efforts,
         toolCall: entry.tool_call !== false,
         isFree: isFiniteNumber(entry.cost?.input) && entry.cost.input === 0
             && isFiniteNumber(entry.cost?.output) && entry.cost.output === 0,
@@ -100,7 +167,7 @@ async function ensureDiskLoaded() {
     try {
         const raw = await readFile(cacheFilePath(), 'utf8');
         const parsed = JSON.parse(raw);
-        if (parsed?.version === 1 && Array.isArray(parsed.entries) && parsed.entries.length > 0) {
+        if (parsed?.version === 2 && Array.isArray(parsed.entries) && parsed.entries.length > 0) {
             memory = parsed.entries;
             cacheFileAt = typeof parsed.at === 'number' ? parsed.at : 0;
         }
@@ -109,11 +176,52 @@ async function ensureDiskLoaded() {
         // 首次运行没有缓存文件是**正常**的（不是错误），走纯文本兜底。
     }
 }
+/**
+ * **同步**读磁盘缓存（模块加载时执行一次）。
+ *
+ * ## ⚠️⚠️ 为什么必须有这一步（真机报障 2026-10-02，根因）
+ *
+ * DSH 内核在 `prompt` 准入阶段校验图片：
+ * ```js
+ * const model = await this.ctx.llm.resolveModelInfo(current.provider, current.model)
+ * if (model.inputModalities !== void 0 && !model.inputModalities.includes("image"))
+ *   throw new RemoteError(..., "Model ... does not support image input.")
+ * ```
+ * （见 `dsh-api-session-controller/lib/index.js`）
+ *
+ * 那次校验**紧贴用户操作**发生，而能力表此前只靠 `ensureDiskLoaded()` 的
+ * **异步** `await readFile` 填充 ⇒ 冷启动后有一段窗口里
+ * `getOpencodeCapabilitiesSync()` 恒返回 `[]` ⇒ `inputModalities` 报 `['text']`
+ * ⇒ **网关发图被内核拒绝**，报「模型不支持图片输入」。
+ *
+ * 「后台刷新后广播 `llm/adapters-updated`」救不了：广播只触发 UI 重渲染，
+ * 不会重新走一次准入校验。
+ *
+ * ⇒ 模块加载时**同步**把磁盘缓存读进内存（缓存文件 ~19KB，`readFileSync`
+ * 代价可忽略），保证 `resolveModel` 第一次被调用就拿到完整能力表。
+ * 代价是插件加载多一次同步 IO，可接受。
+ */
+function loadDiskCacheSync() {
+    if (diskLoaded)
+        return;
+    diskLoaded = true;
+    try {
+        const raw = readFileSync(cacheFilePath(), 'utf8');
+        const parsed = JSON.parse(raw);
+        if (parsed?.version === 2 && Array.isArray(parsed.entries) && parsed.entries.length > 0) {
+            memory = parsed.entries;
+            cacheFileAt = typeof parsed.at === 'number' ? parsed.at : 0;
+        }
+    }
+    catch {
+        // 没有缓存文件是正常的（首次运行），后台会补齐。
+    }
+}
 async function writeDiskCache(entries) {
     try {
         const path = cacheFilePath();
         await mkdir(join(path, '..'), { recursive: true });
-        const payload = { version: 1, at: Date.now(), entries };
+        const payload = { version: 2, at: Date.now(), entries };
         await writeFile(path, JSON.stringify(payload), 'utf8');
     }
     catch {
@@ -189,14 +297,21 @@ let refreshingStartedAt = 0;
  * **同步**读当前已知的能力表。
  *
  * ⚠️ 刻意**不是** async：调用方在渲染路径上（listModels / resolveModel），
- * await 网络会卡住模型选择器（真机事故）。拿不到就返回空数组，
- * 调用方按「纯文本」兜底，后台刷新后自动补上。
+ * await 网络会卡住模型选择器（真机事故）。
+ *
+ * ⚠️⚠️ 首次调用会**同步**读磁盘缓存（`readFileSync`，~19KB）—— 不是网络 IO，
+ * 代价可忽略，却能保证 `resolveModel` 第一次被调用就拿到完整能力表。
+ * 少了这一步，内核的 `prompt` 准入校验会读到 `inputModalities: ['text']`
+ * 而拒绝图片（详见 {@link loadDiskCacheSync} 的事故记录）。
  */
 export function getOpencodeCapabilitiesSync() {
+    loadDiskCacheSync();
     return memory;
 }
 /** 首次调用：读磁盘缓存（非阻塞，fire-and-forget）。 */
 export function primeOpencodeCapabilities() {
+    // 同步读一次，让紧随其后的任何 resolveModel/listModels 都拿得到。
+    loadDiskCacheSync();
     void ensureDiskLoaded().then(() => {
         // 有缓存就直接用；没有则在后台补一次。
         if (memory.length === 0)

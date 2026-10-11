@@ -21,6 +21,7 @@
 import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 import { providerCatalogVisible } from './account-pool.js';
 import { RemoteCatalogGate } from './remote-catalog-gate.js';
+import { broadcastCatalogChanged } from './catalog-broadcast.js';
 import { isRaccoonExpired } from './raccoon.js';
 import { RACCOON, RACCOON_DEFAULT_EFFORT, RACCOON_EFFORT_NAMES, RACCOON_EFFORT_OFF, RACCOON_EFFORT_ON, RACCOON_REASONING_EFFORTS, } from './raccoon-product.js';
 import { projectRequestImage } from './image-budget.js';
@@ -111,6 +112,77 @@ function fallbackToRemote(model) {
         supportsImage: model.supportsImage,
     };
 }
+// ── 请求级账号轮换（2026-10-05，用户报障「余额用完一个号就卡死」）────────
+/** 单次用户请求最多尝试的账号数（含首号）。与 buddy 的全池遍历同语义，设上限只为防病态池。 */
+const RACCOON_MAX_ROTATE = 8;
+/** 额度耗尽的冷却兜底：raccoon 的额度错误没有可靠重置字段（与 trae 4008 同形），按日配额记 24h。 */
+const RACCOON_QUOTA_COOLDOWN_MS = 24 * 3_600_000;
+/** 429 限流冷却：1 小时（与 trae soft-rate 同档）。 */
+const RACCOON_RATE_LIMIT_COOLDOWN_MS = 3_600_000;
+/**
+ * 判定失败类别（文案 + 状态码双通道，与 `isRateLimited` 同构）。
+ *
+ * ## ⚠️ 401/403 **必须先判**（PR !71 审计）
+ *
+ * 早期实现把文案判定放在状态码之前，于是 `403 + "insufficient permissions to
+ * access this resource"` 被判成 `quota` ⇒ **给一个只是没权限的账号写 24 小时
+ * 冷却**。这与 {@link RaccoonFailureClass} 记的 2026-10-06「全池被封」事故
+ * **同型**（那次触发词是 `authorization_verify_error`，这次是
+ * `insufficient permissions`）：认证类只换号、绝不写标记，是那次事故换来的
+ * 不变式，不能被文案判据绕过。
+ *
+ * ⚠️ 顺序不能调换回去：把「先按文案判门禁、再解析」当通则会静默误伤 ——
+ * 401/403 与额度文案并存时（网关侧故障常在报文里带余额提示）必须以状态码为准。
+ *
+ * ⚠️ **本函数与 `classifyLoomyFailure`（`src/loomy-adapter.ts`）是同一张判据表的
+ * 两个实现，必须逐格同构**。真实教训（2026-10-06，**同型复发**）：本函数在
+ * `7b524ff` 收窄后 loomy 那份**未同步**，于是同一报文
+ * （`403 + insufficient permissions` / `403 + 积分不足` / `401 + 余额不足`）
+ * 在 loomy 上仍判 `quota` ⇒ **给无辜账号写 24h 冷却**，在 raccoon 上判 `auth`。
+ * 改动任一侧都必须同步另一侧，并跑 `tests/unit/loomy-adapter.spec.ts` 的
+ * 「与 raccoon 对拍」段（同一批真实报文喂两个分类器，分叉即红）。
+ */
+export function classifyRaccoonFailure(errorText, status) {
+    // 认证类先判：403 可能只是权限/授权问题，绝不能落到 quota 而被写 24h 冷却。
+    if (status === 401 || status === 403)
+        return 'auth';
+    const lower = errorText.toLowerCase();
+    const quotaText = lower.includes('14018')
+        || lower.includes('credits exhausted')
+        // ⚠️ `insufficient` 单独出现**过宽**（PR !71 审计实测误伤 5 类），必须与
+        // 邻近的「钱」义词共现才算额度：上下文窗口超长（"context window is
+        // insufficient for this model"）、数据不足等都与额度无关。
+        // 方向仍是「宁可漏判不可误伤」—— 漏判只是不换号，误判会封可用账号 24h。
+        || (lower.includes('insufficient')
+            && ['point', 'credit', 'balance', 'quota', 'token'].some((w) => lower.includes(w)))
+        || (lower.includes('积分') && (lower.includes('不足') || lower.includes('耗尽')))
+        || (lower.includes('额度') && (lower.includes('不足') || lower.includes('耗尽')))
+        || (lower.includes('余额') && (lower.includes('不足') || lower.includes('耗尽')))
+        || (lower.includes('quota') && (lower.includes('exceeded') || lower.includes('exhausted')));
+    if (quotaText || status === 402)
+        return 'quota';
+    if (status === 429)
+        return 'rate';
+    return 'other';
+}
+/**
+ * 该失败是否值得「换下一个账号」重试。
+ *
+ * 可换：额度耗尽、限流、认证（另一号的 token 可能有效）。
+ * 不可换：其余 4xx（400 参数错、404 路由错等）——换号无益，请求本身有问题，
+ * 换谁都会失败；按原错误抛，避免吞成「均不可用」。
+ */
+export function shouldRotateRaccoonAccount(errorText, status) {
+    return classifyRaccoonFailure(errorText, status) !== 'other';
+}
+/**
+ * 该类别是否要写冷却标记。
+ *
+ * ⚠️ `auth` 不在其中 —— 见 {@link RaccoonFailureClass} 的事故说明。
+ */
+export function recordsRaccoonRateLimit(cls) {
+    return cls === 'quota' || cls === 'rate';
+}
 /** Raccoon Work 模型适配器。 */
 export class RaccoonAdapter extends LlmAdapter {
     options;
@@ -121,13 +193,15 @@ export class RaccoonAdapter extends LlmAdapter {
     /** 远端模型缓存；未拉取时为 undefined。 */
     remoteModels;
     /** 目录加载闸门：并发去重 + 失败/空结果冷却（见 `remote-catalog-gate.ts`）。 */
-    catalogGate = new RemoteCatalogGate();
+    catalogGate;
     constructor(options) {
         super();
         this.options = options;
         this.product = options.product ?? RACCOON;
         this.fetchImpl = options.fetchImpl ?? fetch;
         this.fallbackIndex = new Map(this.product.fallbackModels.map((model) => [model.id, model]));
+        // 目录落地后通知客户端重读（issue IKJVTF 的缺陷①）。
+        this.catalogGate = new RemoteCatalogGate(options.onCatalogLoaded === undefined ? {} : { onLoaded: options.onCatalogLoaded });
     }
     /**
      * 描述本适配器拥有的 provider 路由。
@@ -282,6 +356,22 @@ export class RaccoonAdapter extends LlmAdapter {
         if (credential === undefined || credential.access_token.length === 0) {
             throw new LlmError('raccoon: no usable credential; log in first', 'MISSING_CREDENTIAL');
         }
+        /**
+         * 当前请求实际使用的账号 id（请求级轮换的记账键）。
+         *
+         * ⚠️ 语义与 buddy 的 `currentAccountId` 同款：凭据来自池时按
+         * `findAccountIdByCredential` 反查；来自单凭据兜底（池空/旧安装）时
+         * 保持空串——此时轮换自然失效（没有池就没有「下一个号」），行为与
+         * 旧版一致，不会误标。
+         */
+        let activeAccountId = '';
+        if (this.options.accountPool) {
+            try {
+                // 第二参是「凭据唯一标识」字段值（raccoon 用 access_token，与 buddy 系同键）。
+                activeAccountId = await this.options.accountPool.findAccountIdByCredential(this.product.id, credential.access_token) ?? '';
+            }
+            catch { /* 反查失败不阻断主路径：轮换退化为「不标记」 */ }
+        }
         const messages = serializeMessages(options.messages, imageUrls);
         /**
          * 前置 system 消息（若有）。
@@ -361,11 +451,102 @@ export class RaccoonAdapter extends LlmAdapter {
                 throw new LlmError('raccoon: credential expired and refresh failed', 'AUTH', { status: response.status });
             }
             credential = refreshed;
+            // ⚠️ **必须跟着重新反查账号 id**（PR !71 审计发现）：`resolveCredential`
+            // 是「池优先」的（`src/index.ts` 的 raccoon 分支先 `getAvailableAccount`
+            // 再回退单凭据 ref），而 `refresh()` 续期的是**默认单凭据 ref**。
+            // ⇒ 续期后取回的凭据**可能属于另一个账号**，但 `activeAccountId` 还停在
+            // 刷新前的那个号上。
+            // 后果（实测可复现）：A 的 token 过期 → 刷新后拿到 B 的凭据 → B 随后
+            // 返回额度耗尽，而冷却标记却**记在 A 头上** ⇒ 没耗尽的 A 被封 24h，
+            // 真该封的 B 下次仍被选中（本段要修的「卡死在一个号上」照旧）。
+            // 这与 AGENTS.md 记的 Qoder「标记用了会变的回调导致标错账号」同型。
+            if (this.options.accountPool) {
+                try {
+                    activeAccountId = await this.options.accountPool.findAccountIdByCredential(this.product.id, refreshed.access_token) ?? '';
+                }
+                catch { /* 反查失败不阻断主路径：轮换退化为「不标记」 */ }
+            }
             response = await send();
         }
         if (!response.ok) {
-            const errorText = await response.text().catch(() => '');
-            throw new LlmError(`raccoon: ${errorDetail(errorText)}`, httpErrorCode(response.status), { status: response.status });
+            let errorText = await response.text().catch(() => '');
+            let status = response.status;
+            /**
+             * 请求级账号轮换（2026-10-05，用户报障「余额用完一个号就卡死」）。
+             *
+             * ## 为什么必须有这一段
+             *
+             * `resolveCredential` 从池里取号按**手动顺序**（`getAvailableAccount`
+             * 的既有语义），失败类别不写标记时，下次请求取回的**仍是同一个号**。
+             * 首号余额耗尽（`14018 Credits exhausted`）→ 错误抛给 harness →
+             * 下次请求还是它 ⇒ 用户看到的是「卡死在一个号上」，池里其余账号
+             * 完好却永远轮不到。
+             *
+             * ## 语义对齐 buddy（本项目无感换号的基准实现）
+             *
+             * - **可换号**的失败类别：余额/额度耗尽（14018 / Credits / quota /
+             *   积分不足等）、限流（429）、认证（401/403——单号凭据失效时池里
+             *   可能有别的好号）；**非额度且非限流**（400 参数错等）换号无益，
+             *   按原错误抛（避免把「请求本身有问题」吞成「均不可用」）。
+             * - **每个账号只试一次**：`tried` 传给 `getAvailableAccount`——不排除
+             *   会拿回同一个号（池排序不因失败而变），换号形同虚设。
+             * - **只有配额 / 限流类才写冷却**（`recordsRaccoonRateLimit`）：
+             *   认证类（401/403）**只换号、绝不写标记** —— 详见
+             *   {@link RaccoonFailureClass} 记的 2026-10-06 全池被封事故。
+             * - **全部试完才报错**，且带**最后一次**的真实原因——笼统的
+             *   「所有账号均不可用」会丢掉服务端真正说的东西（buddy 上同款教训）。
+             * - **冷却时长按类别**：`quota` 记 24 小时（日配额；无可靠重置字段，
+             *   与 trae 4008 同形）、`rate` 记 1 小时。
+             */
+            let failureClass = classifyRaccoonFailure(errorText, status);
+            const accountPool = this.options.accountPool;
+            if (accountPool && failureClass !== 'other') {
+                const tried = new Set();
+                if (activeAccountId)
+                    tried.add(activeAccountId);
+                const markCurrentAccount = async () => {
+                    // 每次失败后立即记账，包括轮换预算用尽的最后一个账号。
+                    // 认证错误只换号，不写模型冷却。
+                    if (!activeAccountId || !recordsRaccoonRateLimit(failureClass))
+                        return;
+                    await accountPool.updateModelRateLimit(activeAccountId, options.model, Date.now() + (failureClass === 'rate'
+                        ? RACCOON_RATE_LIMIT_COOLDOWN_MS
+                        : RACCOON_QUOTA_COOLDOWN_MS));
+                };
+                await markCurrentAccount();
+                const maxRotate = RACCOON_MAX_ROTATE - 1;
+                for (let round = 0; round < maxRotate; round++) {
+                    const next = await accountPool.getAvailableAccount(this.product.id, options.model, tried);
+                    if (!next || tried.has(next.entry.id))
+                        break;
+                    tried.add(next.entry.id);
+                    credential = next.credential;
+                    activeAccountId = next.entry.id;
+                    response = await send();
+                    if (response.ok) {
+                        // ⚠️ 业务失败也可能以 HTTP 200 + SSE 内嵌错误帧返回（既有说明见下）。
+                        yield* consumeOpenAiSse(response, { signal: options.signal }, {
+                            label: 'raccoon',
+                            firstTokenTimeoutMs: resolveFirstTokenTimeoutMs(),
+                            chunkTimeoutMs: resolveChunkTimeoutMs(),
+                            ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
+                        });
+                        return;
+                    }
+                    errorText = await response.text().catch(() => '');
+                    status = response.status;
+                    failureClass = classifyRaccoonFailure(errorText, status);
+                    await markCurrentAccount();
+                    if (failureClass === 'other') {
+                        // 新账号失败但不是可换号类别：按原错误分类抛出（buddy 同款）。
+                        throw new LlmError(`raccoon: ${errorDetail(errorText)}`, httpErrorCode(status), { status });
+                    }
+                }
+                throw new LlmError(`raccoon: 模型 ${options.model} 所有账号均不可用（${errorDetail(errorText)}）`, failureClass === 'rate' ? 'RATE_LIMIT'
+                    : failureClass === 'auth' ? 'AUTH'
+                        : 'QUOTA_EXCEEDED', { status });
+            }
+            throw new LlmError(`raccoon: ${errorDetail(errorText)}`, httpErrorCode(status), { status });
         }
         // ⚠️ 业务失败也可能以 HTTP 200 + SSE 内嵌错误帧返回，由 consumeOpenAiSse 处理。
         yield* consumeOpenAiSse(response, { signal: options.signal }, {
@@ -395,7 +576,12 @@ function resolveChunkTimeoutMs() {
  */
 export function registerRaccoonLlm(ctx, options) {
     const product = options.product ?? RACCOON;
-    const adapter = new RaccoonAdapter(options);
+    const adapter = new RaccoonAdapter({
+        ...options,
+        // ⚠️ 注入**唯一**的广播实现（`src/catalog-broadcast.ts`），不要在这里
+        // 另写一份 emit —— 两份实现必然漂移（issue IKJVTF 的缺陷① 就是「十处全漏」）。
+        onCatalogLoaded: () => broadcastCatalogChanged(ctx),
+    });
     registerAdapterIdempotent(ctx.llm, [product.id], adapter);
     return adapter;
 }

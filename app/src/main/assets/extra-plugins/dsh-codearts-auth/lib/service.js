@@ -70,7 +70,9 @@ function parseCredential(value) {
  *   路径**的方法一并移除，避免留下会去读写已废弃 ref 的死代码。
  *
  * 续期有两条账号池路径，都**不触碰任何「单凭据状态」**：
- * - {@link refreshAccountCredential}：按 ref 刷**指定账号**（账号卡片的「刷新」按钮）；
+ * - {@link refreshAccountCredential}：按 ref 刷**指定账号**（由 RPC `account.refresh`
+ *   驱动 —— ⚠️ 该端点**没有面板入口**，账号卡片的按钮是 测试/重测/重置/停用/代理/
+ *   指纹/删除；调用方是仓库外的脚本/手工 RPC）；
  * - {@link refreshAll}：批量刷全部账号（`src/index.ts` 的定时调度器）。
  */
 export class CodeArtsAuth extends Service {
@@ -85,7 +87,7 @@ export class CodeArtsAuth extends Service {
      * 会并发消费**同一份** refresh_token ——
      * ① `src/index.ts` 每 30 分钟（含启动首轮）的 `refreshAll`；
      * ② 推理路径的按需续期（`llm-adapter.ts` 的「过期预判」与「401 兜底」）；
-     * ③ Jet Hub 账号卡片的「刷新」按钮（`account.refresh`）。
+     * ③ RPC `account.refresh`（⚠️ **无面板入口**，调用方是仓库外脚本）。
      * 而 DSH 本身还会并发发起多条模型请求（主回复 + 标题生成 + 上下文压缩），
      * 每条都可能独立走到 ②。华为 STS 在签发新凭据时**旧的那一份 refresh_token
      * 即失效**，于是并发下必然出现「1 个成功、其余全部 `invalid_grant`」，
@@ -216,8 +218,11 @@ export class CodeArtsAuth extends Service {
     /**
      * 按凭据 ref 续期**指定账号**的凭据。
      *
-     * 这是 Jet Hub 账号卡片「刷新」按钮与定时调度器走的路径，读写的是账号池条目
+     * 这是 RPC `account.refresh` 与定时调度器走的路径，读写的是账号池条目
      * 对应的 `CODEARTS_ACCOUNT_XXX`。
+     *
+     * ⚠️ `account.refresh` **没有面板入口**（issue IKJOZA 取证：36 处 `rpcCall(` 里没有它，
+     * `git log -S "rpcCall('account.refresh'"` 零命中），别照着旧注释去找「刷新」按钮。
      *
      * ⚠️ 早期这里的方法注释在对比一个 `refresh()` —— 那个方法读写固定单凭据 ref
      * `CODEARTS_ACCESS_TOKEN`，**已随单凭据模式一并移除**。当时用 `refresh()`
@@ -460,15 +465,30 @@ export class CodeArtsAuth extends Service {
         if (!this.active)
             return [];
         const credential = await this.firstUsableCredential(pool);
-        if (credential === undefined)
+        if (credential === undefined) {
+            // 无凭据 ⇒ 两个来源都没取到 ⇒ 不能判成「完整」（否则残缺目录永久固化）。
+            if (this.lastCatalogOutcome !== undefined) {
+                this.lastCatalogOutcome.gatewayOk = false;
+                this.lastCatalogOutcome.builtinOk = false;
+            }
             return [];
-        const models = await fetchCodeArtsRemoteModels(credential, this.fetchImpl);
+        }
+        const models = await fetchCodeArtsRemoteModels(credential, this.fetchImpl, this.lastCatalogOutcome);
         if (models.length > 0) {
             setMemoryCache(models);
             saveModelsCache(models);
         }
         return models;
     }
+    /**
+     * 最近一次 {@link refreshModels} 的各来源成败（issue IKJVTF，审计 I3）。
+     *
+     * ⚠️ 由 `src/index.ts` 在**构造时**注入一个空对象，此后 `refreshModels`
+     * 每轮原地写入 —— 适配器在 `fetchRemoteModels()` 返回后读它，即可判
+     * 「这次目录完不完整」。用「出参对象」而不是改 `refreshModels` 的返回类型：
+     * 该签名被既有调用方与单测按「返回数组」使用，改形状会波及它们。
+     */
+    lastCatalogOutcome;
     /**
      * 取账号池里第一个**凭据可解析且含 AK/SK** 的账号凭据。
      *

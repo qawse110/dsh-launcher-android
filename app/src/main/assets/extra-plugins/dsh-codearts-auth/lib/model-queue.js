@@ -67,11 +67,64 @@ export const QUEUE_BUSINESS_CODE = '10605';
  *   结果都一样（故**必须立即失败**，并把真实原因如实告诉用户）。
  *
  * 取证脚本：`scripts/probe-qoder-code-110b.mjs`（只读，打印上述客户端映射原文）。
+ *
+ * ## ⚠️ 它是**单码值**形态，判据请用 {@link isBillingBusinessCode}（IKKJFH）
+ *
+ * 保留这个导出仅为兼容：本仓 `qoder-adapter.ts` 把它以 `QODER_BILLING_CODE`
+ * 公开再导出（对外 API 面），删名会是破坏性变更。
+ * ⚠️ 它**只等于 `110`** —— 直接拿它比 `112` 会漏判（就是 IKKJFH 那个缺陷的成因）。
+ *
+ * @deprecated 判据请用 {@link isBillingBusinessCode} / {@link BILLING_BUSINESS_CODES}。
  */
 export const BILLING_BUSINESS_CODE = '110';
+/**
+ * **额度类**业务码集合（与排队码 `10605` 分属两类，语义不同）。
+ *
+ * ## 现场（2026-10-10 用户报障实测，Gitee issue IKKJFH）
+ *
+ * GUI 失败行原文：
+ * ```
+ * 本轮运行失败  qoder: {"pricingUrl":"https://qoder.com.cn/pricing?client=qoder"} (112/model_error)
+ * 模型请求重试已取消 (2/5)
+ * ```
+ * 后缀 `(112/model_error)` 由 `openai-compat` 的 `[code, type].join('/')` 拼出
+ * ⇒ 真实帧是 `{ code: 112, message: '{"pricingUrl":"…"}', type: 'model_error' }`。
+ *
+ * ## 为什么 `112` 与 `110` 同类（而不是 `SERVER`）
+ *
+ * payload 是**定价页链接** ⇒ 语义是「要付费/升级才能用」，与
+ * `110`（`Billing daily count exceeded`，当日额度耗尽）一样是**确定性**失败：
+ * 立刻重试、等 15 秒重试、等 30 分钟重试，结果都一样。
+ * 客户端把 `110` 归为 `billing_error` 一类（映射到不可重试的 `permission`）。
+ *
+ * ## ⚠️ 证据强度（如实标注，别当成客户端产物实证）
+ *
+ * `110` 当年的取证是**读客户端 obf 产物原文**（见上）。
+ * `112` **没有**那份证据：
+ *  · 本机未装 Qoder 客户端 ⇒ 无产物可读；
+ *  · 上游全历史搜 `pricingUrl` **零命中** ⇒ 也没有前人留下过取证。
+ * 现有依据是**报文语义**（定价页链接 = 付费才能用）＋**兄弟码同类**
+ * （`110` 已确证属额度类）。故判据写成「码值 + 文案」两条腿，
+ * 任一命中即归额度 —— 即便 `112` 的真身是别的「要付费」语义，
+ * 归 `QUOTA_EXCEEDED`（不可重试 + 提示去充值）也仍然是对的处置。
+ * 若维护者有客户端产物可核，欢迎修正码值语义。
+ *
+ * ## 它当初为什么落成 `SERVER`（本仓反复点名的形状）
+ *
+ * 三个判据全 false ⇒ 落 `SERVER` ⇒ 而 `SERVER` **在** harness 的
+ * `DEFAULT_RETRYABLE_CODES` 里 ⇒ **白退避 5 次**；且
+ * `qoder-adapter.isQuotaExceededError(SERVER) = false` ⇒ `switchAccountOnQuota`
+ * **永不被调用** ⇒ **既不换号、也不换 provider**。用户侧看到的就是
+ * 「重试 N/5」＋「等一段必然失败的退避，只好手动取消」。
+ *
+ * ⚠️⚠️ 这与 `110` 那次缺陷**完全同型**，只是换了码值 —— 由此得出判据：
+ * **只认固定码值这条路本身不够**，必须同时让文案兜底独立成立
+ * （见 {@link looksLikeBillingError} 对 `pricingUrl` 的识别）。
+ */
+export const BILLING_BUSINESS_CODES = ['110', '112'];
 /** 业务码是否命中**额度用尽**（兼容字符串与数字两种编码）。 */
 export function isBillingBusinessCode(code) {
-    return code === BILLING_BUSINESS_CODE || code === Number(BILLING_BUSINESS_CODE);
+    return BILLING_BUSINESS_CODES.some((c) => code === c || code === Number(c));
 }
 /**
  * Qoder 的计费日界时区（**固定 UTC+8**）。
@@ -118,9 +171,20 @@ export function nextUtc8DayStartMs(nowMs = Date.now()) {
  *
  * ⚠️ 关键词必须**窄**：`balance` / `quota` 之类泛词会误伤正常内容（如模型正文
  * 里恰好讨论「余额」）。故只认明确的英文错误短语。
+ *
+ * ⚠️ **2026-10-10 补 `pricingUrl`（Gitee issue IKKJFH）**：`112` 那次漏判证明
+ * 「只认码值」不够（见 {@link BILLING_BUSINESS_CODES}）。该码的 payload **没有**
+ * 任何 `billing daily count exceeded` 字样，只有
+ * `{"pricingUrl":"https://qoder.com.cn/pricing?client=qoder"}`
+ * —— 若只按码值修，下次服务端再换码值就又漏一次，所以这里必须同时认它。
+ *
+ * 为什么 `pricingUrl` 是**窄**词而不是泛词：它是 Qoder 额度类错误报文的**结构字段**，
+ * 不是自然语言。实测（IKKJFH 排查）`balance` / `quota` / 讨论 pricing 的正常正文
+ * 都不含这个键名 —— 故按**字段名**而非「定价」这个语义去认，不会误伤。
+ * 判据：**认结构字段，不认主题词**。
  */
 export function looksLikeBillingError(text) {
-    return /billing\s+daily\s+count\s+exceeded|daily\s+count\s+exceeded|billing_error/i.test(text);
+    return /billing\s+daily\s+count\s+exceeded|daily\s+count\s+exceeded|billing_error|"pricingUrl"\s*:/i.test(text);
 }
 /**
  * 单次排队等待的**封顶**（毫秒）。

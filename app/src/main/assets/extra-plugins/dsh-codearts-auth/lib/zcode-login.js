@@ -34,13 +34,11 @@
  * 自 2026-09-28 起稳定 500 / code 2007）—— token 由轮询直接返回，
  * 完全不经过它。
  *
- * ## 与「读官方客户端凭据」的关系
+ * ## 凭据的**唯一**来源
  *
- * 两条路**并存**，优先用插件自存：
- *   1. `ctx.credentials` 里的 `ZcodeCredential`（插件自己登录拿到的）
- *   2. 回退：解密官方客户端的 `~/.zcode/v2/credentials.json`
- *
- * 这样「装了官方客户端」的用户零操作即可用；「没装」的用户也能登录。
+ * 就是本文件这条授权流。此前还存在一条「回退：解密官方客户端的
+ * `~/.zcode/v2/credentials.json`」的旁路，它已于 2026-10-05 整体删除
+ * （理由见 `zcode.ts` 文件头）⇒ 现在**不读本机任何 ZCode 数据**。
  */
 import { randomBytes, randomUUID } from 'node:crypto';
 /** ZCode 平台 origin。 */
@@ -54,7 +52,19 @@ export const zcodeOauthCliPollUrl = (flowId) => `${ZCODE_ORIGIN}/api/v1/oauth/cl
  *
  * ⚠ 实测 `bigmodel`（对应 `Ne`）在授权 URL 上追加的是 `redirect=`；
  * 官方对 `zai` 追加的是 `redirect_uri=` —— 两者语义相同但参数名不同，
- * 故这里保留区分（虽然本插件目前只用 `bigmodel`）。
+ * 故这里保留区分。
+ *
+ * ## 两者的实际差异（2026-10-02 实测）
+ *
+ * | provider | 授权页 | 凭据落点 | 适用 |
+ * |---|---|---|---|
+ * | `bigmodel` | `bigmodel.cn/login?appId=zcode&redirect=…` | `data.bigmodel` | 智谱开放平台（国内） |
+ * | `zai` | `chat.z.ai/api/oauth/authorize?client_id=…&redirect_uri=…` | `data.zai` | z.ai（国际版） |
+ *
+ * 两者的 `init` 响应结构**完全一致**（`flow_id` / `poll_token` /
+ * `authorize_url` / `expires_at` / `poll_interval_sec`），差异只在
+ * ready 响应里第三方 token 落在哪个块 —— 故 `pollZcodeLogin` 对两者
+ * 都做了兼容（见那里的字段注释）。
  */
 export const ZCODE_LOGIN_PROVIDER = 'bigmodel';
 /** 一次登录尝试的失败原因（人类可读）。 */
@@ -211,24 +221,57 @@ export async function pollZcodeLogin(flow, fetchImpl = fetch, appVersion = '3.14
         return { kind: 'failed', message: `轮询响应状态无法识别：${String(status)}` };
     }
     /**
-     * ⚠ 三个字段**都必需**（官方断言 `!g || !f || !v` 即视为无效响应）：
-     * `token`（zcode JWT）、`bigmodel.access_token`、`user.user_id`。
+     * ⚠ `token`（zcode JWT）与 `user.user_id` **都必需**（官方断言 `!g || !f || !v`
+     * 即视为无效响应）。
+     *
+     * 第三方 access token 则**按登录 provider 取对应分支**：`zai` 登录回
+     * `data.zai`、`bigmodel` 登录回 `data.bigmodel`。
+     *
+     * 权威依据是官方 bundle 的 ready 解析器（`zcode.cjs` 的 `W7s`）——它只认
+     * `data.zai.access_token`，且把 `zai` 作为**通用**第三方凭据分支：
+     *
+     * ```js
+     * function W7s(e){ let t=KOe(e.user), n=KOe(e.zai)
+     *   if(typeof e.token!="string" || !t || typeof t.user_id!="string"
+     *      || !n || typeof n.access_token!="string") throw ...
+     *   return { status:"ready", token:e.token, user:{...}, zai:{access_token:n.access_token} } }
+     * ```
+     *
+     * 而 `bigmodel` 登录实测返回的是 `data.bigmodel`（本插件早期只走这一条，
+     * 故此前把它写死）。两者**不可互相替代**：只认 `bigmodel` 会让 `zai`
+     * 登录在「缺关键字段」处失败，只认 `zai` 会让 `bigmodel` 登录失败。
+     *
+     * ⚠ 这个字段**不参与推理**：适配器只用 `credential.zcode_jwt`
+     * 作 `Authorization`（见 `zcode-adapter.ts` 的 `Bearer ${credential.zcode_jwt}`），
+     * 第三方 token 仅作备用身份。故这里**放宽为「二者有其一」**，并把实际
+     * 拿到的那条存下来，而不是在缺失时拒绝整轮登录。
      */
     const zcodeJwt = typeof data.token === 'string' ? data.token : undefined;
-    const bigmodelAccessToken = typeof data.bigmodel?.access_token === 'string'
-        ? data.bigmodel.access_token
-        : typeof data.bigmodel?.accessToken === 'string'
-            ? data.bigmodel.accessToken
-            : undefined;
+    const pickToken = (block) => {
+        if (typeof block?.access_token === 'string')
+            return block.access_token;
+        if (typeof block?.accessToken === 'string')
+            return block.accessToken;
+        return undefined;
+    };
+    const bigmodelAccessToken = pickToken(data.bigmodel);
+    const zaiAccessToken = pickToken(data.zai);
     const userId = typeof data.user?.user_id === 'string'
         ? data.user.user_id
         : typeof data.user?.id === 'string'
             ? data.user.id
             : undefined;
-    if (zcodeJwt === undefined || bigmodelAccessToken === undefined || userId === undefined) {
-        return { kind: 'failed', message: '轮询响应缺关键字段（token / access_token / user_id）' };
+    if (zcodeJwt === undefined || userId === undefined) {
+        return { kind: 'failed', message: '轮询响应缺关键字段（token / user_id）' };
     }
-    const refreshRaw = data.bigmodel?.refresh_token ?? data.bigmodel?.refreshToken;
+    if (bigmodelAccessToken === undefined && zaiAccessToken === undefined) {
+        return {
+            kind: 'failed',
+            message: '轮询响应缺第三方 access_token（data.zai 与 data.bigmodel 均为空）',
+        };
+    }
+    const refreshRaw = data.bigmodel?.refresh_token ?? data.bigmodel?.refreshToken
+        ?? data.zai?.refresh_token ?? data.zai?.refreshToken;
     const displayName = typeof data.user?.name === 'string' && data.user.name.length > 0
         ? data.user.name
         : typeof data.user?.email === 'string' && data.user.email.length > 0
@@ -239,6 +282,7 @@ export async function pollZcodeLogin(flow, fetchImpl = fetch, appVersion = '3.14
         result: {
             zcodeJwt,
             bigmodelAccessToken,
+            zaiAccessToken,
             bigmodelRefreshToken: typeof refreshRaw === 'string' ? refreshRaw : undefined,
             userId,
             displayName,
@@ -257,7 +301,10 @@ export async function pollZcodeLogin(flow, fetchImpl = fetch, appVersion = '3.14
 export async function runZcodeLogin(options = {}) {
     const fetchImpl = options.fetchImpl ?? fetch;
     const timeoutMs = options.timeoutMs ?? 300_000;
-    const flow = await startZcodeLogin(fetchImpl, { appVersion: options.appVersion });
+    const flow = await startZcodeLogin(fetchImpl, {
+        appVersion: options.appVersion,
+        provider: options.provider,
+    });
     options.onAuthorizeUrl?.(flow.authorizeUrl);
     const intervalMs = options.pollIntervalMs ?? Math.max(1_000, flow.pollIntervalSec * 1_000);
     /**

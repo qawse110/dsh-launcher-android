@@ -257,7 +257,7 @@ export class ClineAuth extends Service {
      *
      * ⚠️ **必须回写账号池的 `expiresAt`**（issue !IKIRTT 的真实缺陷）：
      * UI 账号卡片读的正是池里的值。早期七个 provider 都只 `credentials.set`，
-     * 于是用户点「刷新」后凭据确实续好了，界面却**一直显示「已过期」**，
+     * 于是调用 `account.refresh` 后凭据确实续好了，界面却**一直显示「已过期」**，
      * 且「重测」按钮的 refresh 是刻意的 no-op —— 等于没有任何自救手段。
      * 只有 raccoon 记得回写，故它是当时唯一能自愈的面板。
      *

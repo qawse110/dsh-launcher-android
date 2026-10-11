@@ -91,10 +91,11 @@ Kotlin 展示面与 `install-dsh.mjs` 装配面都从它派生；一致性由 `n
 | `dsh-vision` | 自 `prebuilt.tgz` 恢复 | 给纯文本模型加上 `view_image` 工具：复用宿主 Provider 配置，或接自定义 OpenAI 兼容 VLM 端点 |
 | `@liustack/modsearch` | <https://github.com/liustack/modsearch> `v5.10.6`（npm 产物，整包同源） | 联网检索：把 `web_search`/`web_fetch` 的后端换成免密钥的 modsearch 引擎链（Firecrawl 免密钥、1,000 次/月），并新增 `x_search`、`read_page`。⚠ 运行时依赖 `commander`/`undici` 由**依赖桥接**供给（见下） |
 | `dsh-ego-browser` | <https://github.com/Fisfzy/dsh-ego-browser> `v0.8.6`（npm 产物，整包同源） | Agent 浏览器：30+ `ego_*` 工具 + 实时观察窗，底层内置 ego-lite 运行时。⚠ **运行期需一个可达的 Chrome/Chromium 二进制**（本机未装，见下） |
+| `billion-context-dsh` | <https://github.com/Tyan66666/billion-context-dsh> `v0.2.27`（npm 产物，整包同源） | 上下文压缩 ACP：给模型 `compress`/`decompress`/`search_context`/`acp_status` 四个工具，由模型自己决定何时压缩、压缩什么（而非硬性截断），另附 `/acp-prune` 命令与压缩提示。⚠ 其自带的 `cordis.patch.yml` 会**同时 disable 宿主的 `compaction-basic` 行**（一个 realm 只能有一个 `ctx.compaction` 提供方） |
 
 ### 内置集合的构成
 
-内置集合**由用户逐项决定**（原先「仅内置三个」的约束已撤回），当前为 **10 个**。
+内置集合**由用户逐项决定**（原先「仅内置三个」的约束已撤回），当前为 **11 个**。
 装完即可用；源码在 `assets/extra-plugins/`，唯一真源见
 [`plugin-manifest.json`](app/src/main/assets/plugin-manifest.json)。
 
@@ -145,18 +146,37 @@ Kotlin 展示面与 `install-dsh.mjs` 装配面都从它派生；一致性由 `n
 
 这些插件在真机上均通过 **ESM 链接测试**（`import()` 插件入口）：入口的 `apply` 均为 function。
 
-### 本轮新增的两项（`modsearch` / `dsh-ego-browser`）
+### 本轮新增的三项（`modsearch` / `dsh-ego-browser` / `billion-context-dsh`）
 
-两项均取自各自 **npm 官方 tarball**（`registry.npmmirror.com`，sha256 与本地副本逐字节一致：
-`modsearch` `ca631394…`、`dsh-ego-browser` `d7e8db48…`），**整包同源、未改任何字节**，
+三项均取自各自 **npm 官方 tarball**（`registry.npmmirror.com`），**整包同源、未改任何字节**，
 因此不需要「就地适配」那一档处置。
+`billion-context-dsh` 的本地副本与 tarball `diff -rq` 逐字节一致（仅删去 `dist/index.js.map`，
+与 modsearch / ego-browser / codearts 的既有惯例一致：不带 sourcemap 分发）。
 
 **兼容性事实（读 package.json 实测，非推断）**：`@liustack/modsearch` **未声明任何
 `@deepseek-ai/dsh*` peer**（只有 `commander`/`undici` 两个 dependencies），
 故 0.2.0-rc.2 的 `evaluatePluginCompatibility` 对它直接返回 `undefined`（不适用）；
 `dsh-ego-browser` 声明的 `dsh.engines.dsh` 为 `>=0.1.2-rc.1`，其 `peerDependencies` 全部是
 `>=0.1.2-rc.1` 的下界范围且均标 `optional`，`0.2.0-rc.2` 全部满足。
-用 **dsh 自带的那个判定函数**逐个核对，两者均返回 `undefined`（兼容）。
+用 **dsh 自带的那个判定函数**逐个核对，三者均返回 `undefined`（兼容）。
+
+**`billion-context-dsh` 的两个特殊点**（与另外两项不同）：
+
+1. **它此前不是内置插件，而是 profile 里的普通 npm 依赖**（`"billion-context-dsh": "^0.2.27"`）。
+   本轮改为随 APK 内置分发：`dsh plugin add` 已把依赖规格改写为
+   `link:…/files/plugins/billion-context-dsh`，`node_modules` 下是符号链接、`.pnpm` 里不再有
+   npm 解析副本（已核实无残留）。**这是「追加内置」，不是「改成可选」**——它仍在 `builtin` 数组里。
+2. **它的 `cordis.patch.yml` 会连带 disable 宿主的 `compaction-basic` 行**。原因：一个 realm 只能有一个
+   `ctx.compaction` 提供方，宿主的自动压缩后端与 ACP 引擎不能并存。已用 `--dump-config` 核实
+   宿主面 `compaction-basic` 确为 `disabled: true`、`compaction-acp` 挂宿主面且未禁用。
+   这是插件自带行为，非本仓改动。
+
+> ⚠ **实测发现的部署陷阱（本轮顺带发现，值得记录）**：设备在 23:23 被**重装过一次 APK**，
+> 那次重装把 `files/extra-plugins/` 覆盖成**该 APK 内置的旧版 assets**——上一轮更新过的
+> 4 个插件（web-mobile / prompt-optimizer / codearts / net-proxy）在设备端被**静默回退**到旧版
+> （仓库源码未受影响，仍是新版）。本次已按仓库重新同步并重跑装配，11 项全部为最新版。
+> 结论：**APK 重装会以 assets 覆盖 extra-plugins**；改完插件后若发生重装，需重新同步一次。
+
 
 **依赖桥接（`modsearch` 专有的隐性契约）**：该包的 `dsh/index.js` 以
 `process.execPath` 拉起自带 CLI `dist/main.js`，而 CLI 顶层 `import { Command } from "commander"`

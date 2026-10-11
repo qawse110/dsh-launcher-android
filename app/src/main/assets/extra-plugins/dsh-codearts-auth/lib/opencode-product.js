@@ -22,6 +22,9 @@
  * ⇒ 「换一台 PC」在协议层等价于「换一个 key 或换一个出口 IP」，
  * 指纹派生的作用是**防关联**与满足形状门禁，不是换配额桶。
  */
+// `retry-after` 的解析已收敛到 `src/retry-after.ts`（原先本文件与
+// `opencode-adapter.ts` 各有一份几乎逐字相同的私有实现）。
+import { retryAfterMsFromRecord } from './retry-after.js';
 export const OPENCODE = {
     id: 'opencode',
     // ⚠️ 必须与客户端 `PROVIDERS` 里的 label 逐字一致（rail 宽度算式依赖它，
@@ -111,22 +114,6 @@ export function isFreeOpencodeModel(id) {
 export function isReachableOpencodeModel(id) {
     return REACHABLE_IDS.has(id);
 }
-/** 从响应头解析 `retry-after`（支持秒数与 HTTP 日期）。 */
-function parseRetryAfterMs(headers) {
-    const raw = headers?.['retry-after'] ?? headers?.['Retry-After'];
-    if (raw === undefined || raw === null || raw === '')
-        return undefined;
-    // ⚠️ 只放行纯数字：Date.parse('900') 会得到一个 1970 年的时刻，
-    // 算出巨大的负数差从而被 Math.max(0, …) 抹成 0（「立即解除」）——
-    // 那会让额度刚用尽的账号马上被重选，形成无限空转。
-    const seconds = Number(raw);
-    if (Number.isFinite(seconds) && seconds >= 0)
-        return Math.ceil(seconds * 1000);
-    const at = Date.parse(raw);
-    if (Number.isFinite(at))
-        return Math.max(0, at - Date.now());
-    return undefined;
-}
 /** 从错误体里抽出人可读片段（禁止把整坨 JSON 抛给用户）。 */
 function readableDetail(body) {
     const text = body.trim();
@@ -155,7 +142,7 @@ function readableDetail(body) {
  * @param headers 响应头。
  */
 export function classifyOpencodeError(status, body, headers) {
-    const retryAfterMs = parseRetryAfterMs(headers);
+    const retryAfterMs = retryAfterMsFromRecord(headers);
     const detail = readableDetail(body);
     const lower = body.toLowerCase();
     // ⚠️ **顺序即优先级**：限流语义必须在 auth 之前判 —— 上游的额度错误

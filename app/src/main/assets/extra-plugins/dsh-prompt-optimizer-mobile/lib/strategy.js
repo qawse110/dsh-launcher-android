@@ -15,6 +15,9 @@
 // ⚠ 纪律：策略只能**收紧或放宽解释层的做法**，**不许**给解释层的单次输出设 token 上限（ADR-0085）。
 //   这里没有、也不许出现 maxTokens 一类字段。
 
+import { OPTIMIZER_TIERS, optimizerTier } from './optimizer-protocol.js'
+
+/** Legacy metadata retained for stored settings; v3 uses tier purpose, not quotas. */
 /** 三种解读模式。 */
 export const INTERPRET_MODES = Object.freeze(['single', 'parallel', 'branching'])
 /** 质量维度的三档：不给 / 可参考 / 至少 N 条。 */
@@ -85,41 +88,5 @@ export function renderDomainMenu() {
 //
 // 这些指令**加在系统提示词后面**，只改变"怎么想"，不改变"必须交 JSON"等硬契约。
 export function strategyInstructions(strategy) {
-  const s = strategy || DEFAULT_STRATEGY
-  const out = []
-  const depthLine = {
-    brief: '【思考深度】快速判断即可：这一轮要什么，一句话说清。',
-    normal: '【思考深度】先想清楚这一轮真正要什么，再写条目；不要把明显同义的东西拆成多条。',
-    deep: '【思考深度】**多想一层**：先把这句话可能的用意在脑子里过一遍（谁在什么处境、要达成什么、'
-      + '哪一步最容易做歪），再写条目。宁可少写几条、每条都站得住，也不要凑数。',
-  }[s.depth]
-  if (depthLine) out.push(depthLine)
-
-  if (s.mode === 'parallel') {
-    out.push('【并列解读】如果这句话有不止一种说得通的读法，**在同一条条目里并列写出来**'
-      + '（例如"X（若你要 A）/ X（若你要 B）"），不要替用户挑一个，也不要拆成互相矛盾的多条条目。')
-  } else if (s.mode === 'branching') {
-    out.push('【多假设】当原话**真的分叉**（有 2–' + Math.max(2, s.candidates)
-      + ' 种说得通、且会导致不同做法的读法）时，把它写成一条 `unknown`（`unknownClass:"user_preference"`、'
-      + '`blocksAction:true`），并用 `candidates` 字段**列出各候选**；每个候选写清"如果按这个理解，会做什么"。'
-      + '**没有分叉就不要造候选**——候选不是新增要求，只是把"我不知道你指哪个"说明白。')
-  }
-
-  const min = qualityDimsMin(s.qualityDims)
-  if (min > 0) {
-    out.push('【质量落到维度】用户用"精细/高级感/真实/帅气"这类**质量词**时，'
-      + '**至少给 ' + min + ' 条** `quality_interpretation`，每条 text 写成**该领域可肉眼判断的维度**'
-      + '，并给出**最低可接受线**（做到什么程度算够）；**不是复述那个形容词，也不是零件清单**。'
-      + 'rationale 里指明它来自原话的哪几个字。'
-      + '领域只能从上下文里读到的线索推断；**推不出领域就不要硬套**，把"这是哪个领域"写成 unknown。')
-  } else if (s.qualityDims === 'refer') {
-    out.push('【质量】质量词照常写成 `quality_interpretation`，能落到可检查的维度就落，落不了就如实描述原意。')
-  }
-  if (min > 0) {
-    out.push('【结构性分叉】如果存在"选错了后面全要返工"的结构性选择（例如依赖怎么引入、资源怎么组织、'
-      + '精度与性能怎么取舍），用 `implementation_option` 写成一条：**先写分叉是什么，再写推荐哪个、为什么、'
-      + '以及怎么替换**。信息不足时只指出分叉本身，让工作 AI 自己决定——这类选择比细节更早锁死结果。')
-  }
-  out.push('【条目上限】这一轮最多 ' + s.maxItems + ' 条；**少而准**优先，凑数会挤掉真正有用的条目。')
-  return out
+  return [OPTIMIZER_TIERS.zh[optimizerTier(strategy || DEFAULT_STRATEGY)]]
 }

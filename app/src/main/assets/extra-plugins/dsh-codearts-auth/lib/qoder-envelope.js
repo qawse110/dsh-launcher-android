@@ -44,6 +44,48 @@ function innerTextOf(payload) {
     return typeof envelope.body === 'string' ? envelope.body : JSON.stringify(envelope.body);
 }
 /**
+ * 按 **JSON 结构**给内层帧分类。
+ *
+ * ⚠️ 旧实现是**字符串嗅探**（`!inner.includes('"choices"')` 即判业务错误），
+ * 有两个方向相反的缺陷：
+ *   ① `body: null` 经 `JSON.stringify` 变成 `'null'` → 「不含 choices」
+ *      → **心跳帧被当成业务错误** ⇒ 模型正常回完内容却报失败（issue IKJOZ8）；
+ *   ② 错误文案里恰好含 `"choices"` 的帧会被当正常帧**静默透传**。
+ */
+function classifyInner(inner) {
+    const trimmed = inner.trim();
+    if (trimmed.length === 0)
+        return 'heartbeat';
+    // ⚠️ 保留旧的子串语义（含 `[DONE]` 即视为正常帧），避免回归
+    if (trimmed.includes('[DONE]'))
+        return 'chunk';
+    let parsed;
+    try {
+        parsed = JSON.parse(trimmed);
+    }
+    catch {
+        // 解析不了的原文：按业务错误处理（保持旧行为，如纯文本错误体）
+        return 'error';
+    }
+    // ⚠️ `typeof null === 'object'` —— 必须**先**判 null，否则下面会把它
+    // 当成普通对象、落到「无任何错误字段 ⇒ heartbeat」，而空对象同理。
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return 'heartbeat';
+    }
+    const obj = parsed;
+    // ⚠️ `choices: []` 也算正常帧（`stream_options.include_usage` 的末帧形态）
+    if (Array.isArray(obj.choices) || obj.usage !== undefined)
+        return 'chunk';
+    if (obj.code !== undefined
+        || obj.message !== undefined
+        || obj.error !== undefined
+        || obj.statusCodeValue !== undefined
+        || obj.type !== undefined) {
+        return 'error';
+    }
+    return 'heartbeat';
+}
+/**
  * 把信封 SSE 转成标准 OpenAI SSE。
  *
  * 逐帧处理 `data:` 行；非 `data:` 行（如 `event:finish`）原样保留，
@@ -96,9 +138,17 @@ export function unwrapQoderEnvelopeStream(response, label) {
                     controller.enqueue(encoder.encode(`data: ${payload}\n`));
                     continue;
                 }
-                // 业务错误：内层是错误 JSON 而非 choices → 转成标准 error 帧，
-                // 由 consumeOpenAiSse 统一抛错（保持单一错误出口）。
-                if (!inner.includes('"choices"') && !inner.includes('[DONE]')) {
+                // 心跳帧（`body: null` / 空串 / `{}`）→ **整帧跳过**（issue IKJOZ8）。
+                // 旧实现用「不含 `"choices"` 即业务错误」判它，会把上游的保活帧
+                // 打成 `{message:"null", type:"model_error"}` ⇒ 模型正常回完内容
+                // 却抛 `SERVER`（且 `SERVER` 可重试，白重发 5 次整轮对话）。
+                if (classifyInner(inner) === 'heartbeat')
+                    continue;
+                // 业务错误：**按 JSON 结构**判定（不再嗅探 `"choices"` 子串）。
+                // `classifyInner` 已把 `choices: []` / `usage`-only / `null` / `{}` 判为
+                // 正常或心跳，绝不会落到这里；只有显式带 `code`/`message`/`error`/
+                // `statusCodeValue`/`type`（或压根不是 JSON）的帧才算业务错误。
+                if (classifyInner(inner) === 'error') {
                     let code;
                     let message = inner;
                     try {
@@ -135,8 +185,12 @@ export function unwrapQoderEnvelopeStream(response, label) {
             const rest = buffer.trim();
             if (rest.length > 0) {
                 const inner = rest.startsWith('data:') ? innerTextOf(rest.slice(5).trim()) : null;
-                if (inner !== null)
+                // ⚠️ 心跳帧必须**丢弃**，不能原样透传（issue IKJOZ8 的 P6）：
+                // 透传后是 `data: null` → 消费器 `JSON.parse('null')` 得到 `null`
+                // → 读 `.error` 抛**未包装的 TypeError**，绕过全部错误归类。
+                if (inner !== null && classifyInner(inner) !== 'heartbeat') {
                     controller.enqueue(encoder.encode(`data: ${inner}\n`));
+                }
             }
         },
     });

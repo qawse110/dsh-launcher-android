@@ -853,14 +853,28 @@ export function parseTraeModelList(body) {
  * 候选始终只来自**列出了该模型的通道**，因此无论选中哪条，都不会路由到
  * 「未列出该模型」的通道（上游对那种请求回流内 4001）。
  *
- * 同时三条硬性过滤在合并时执行：
+ * 同时四条硬性过滤在合并时执行：
  *
+ * - **`function` 不在 `channelPriority`（可调用通道白名单）内**的整组跳过
  * - `usage` 非 `chat_completion` 的排除
  * - `config_switch === false`（上游已停用）排除
  * - `is_invisible_to_user === true`（官方隐藏）排除
  *
- * @param channelPriority 通道优先级（下标越小越优先）。不在其中的通道视为
- *   最低优先级。仅用于规则 2 的择优。
+ * ⚠️ **第一条是 Issue IKJOZ7 的修复点**：`channelPriority` 此前**只用于排序**
+ * （规则 2 的择优），不参与准入 —— 于是「目录声明了什么通道，就照着发什么通道」，
+ * 而 22 个 function 里有一半在本插件的推理端点下不可调用（实测 `chat` →
+ * `4023 the model is unknown`、`builder` → `4001 param is invalid`、
+ * `inline_chat` → `3003 model service is unavailable`）。用户选中那些模型必然
+ * 失败，且错误文案指向**模型**、极易被误判成「这个模型坏了」。
+ * 现在它**同时是白名单**：不在表内的通道**整个丢弃**（连同其独有模型）。
+ *
+ * ⚠️ **丢弃是刻意的取舍**：`glm-5.1` / `DeepSeek-V4-Flash` 等模型同时也在通用
+ * 通道（`solo_agent` 等）里，故它们**不受影响**；只有「仅在不可调用通道里出现」
+ * 的条目（如 `kimi-k2` 仅见于 `inline_chat`）会被剔除 —— 那正是必然失败的那批。
+ *
+ * @param channelPriority **可调用通道白名单**，下标越小优先级越高。同时承担
+ *   两个职责：不在表内的通道被丢弃；同一模型被多个表内通道列出时取更靠前者。
+ *   覆盖它会改变**准入集合**，不只是顺序。
  */
 export function parseTraeBatchModelList(body, channelPriority = TRAE_CHANNELS) {
     if (typeof body !== 'object' || body === null)
@@ -869,13 +883,8 @@ export function parseTraeBatchModelList(body, channelPriority = TRAE_CHANNELS) {
     const groups = record.function_configs ?? record.FunctionConfigs;
     if (!Array.isArray(groups))
         return [];
-    /** 通道优先级下标；未收录的通道返回 `MAX_SAFE_INTEGER`（最低）。 */
-    const rankOf = (channel) => {
-        if (channel === undefined)
-            return Number.MAX_SAFE_INTEGER;
-        const index = channelPriority.indexOf(channel);
-        return index < 0 ? Number.MAX_SAFE_INTEGER : index;
-    };
+    /** 通道优先级下标（同样即白名单成员资格；非成员返回 -1 由调用处丢弃）。 */
+    const rankOf = (channel) => channelPriority.indexOf(channel);
     const byId = new Map();
     /** 已选条目所在通道的优先级（仅用于规则 2 的择优）。 */
     const chosenRank = new Map();
@@ -884,13 +893,19 @@ export function parseTraeBatchModelList(body, channelPriority = TRAE_CHANNELS) {
             continue;
         const g = group;
         const channel = readStringField(g, 'function') || readStringField(g, 'Function');
+        // ⚠️ 白名单准入（Issue IKJOZ7）：未声明的通道、以及**不在白名单内的通道**
+        // 整组跳过 —— 后者的模型发出去必然被上游拒（判据见本函数注释的实测表）。
+        // 未声明 `function` 的组同样跳过：无通道可用时无法构造合法请求，
+        // 让它进目录只会变成一个「能选中但发不出去」的条目。
+        if (channel.length === 0 || rankOf(channel) < 0)
+            continue;
         const list = g.config_info_list ?? g.ConfigInfoList;
         if (!Array.isArray(list))
             continue;
         for (const item of list) {
             if (typeof item !== 'object' || item === null)
                 continue;
-            const model = parseTraeConfigEntry(item, channel.length > 0 ? channel : undefined);
+            const model = parseTraeConfigEntry(item, channel);
             if (model === undefined)
                 continue;
             // ⚠️ 硬性过滤：三条独立条件，缺一不可，不设外部开关。只在此处（batch 端点
@@ -911,7 +926,7 @@ export function parseTraeBatchModelList(body, channelPriority = TRAE_CHANNELS) {
             const incumbent = byId.get(model.id);
             if (incumbent === undefined) {
                 byId.set(model.id, model);
-                chosenRank.set(model.id, rankOf(model.function));
+                chosenRank.set(model.id, rankOf(channel));
                 continue;
             }
             // ⚠️ 规则 1 与 2，详见函数注释（issue IKI7WT/IKILR7）。
@@ -922,15 +937,16 @@ export function parseTraeBatchModelList(body, channelPriority = TRAE_CHANNELS) {
                 continue;
             // 规则 2：两侧都有档位时按通道优先级取更靠前者（档位与 function 同源）。
             if (incumbentHasEffort && candidateHasEffort) {
-                const current = chosenRank.get(model.id) ?? Number.MAX_SAFE_INTEGER;
-                // `current` 为 MAX 表示已选条目不在优先级表内 —— 此时不设限，
-                // 退回「后覆盖前」，避免引入与优先级表无关的行为差异。
-                if (current !== Number.MAX_SAFE_INTEGER && rankOf(model.function) >= current)
+                // ⚠️ 这里不再需要「已选条目不在优先级表内」的兜底分支（Issue IKJOZ7）：
+                // 白名单准入已在上面跳过非白名单通道，故 `chosenRank` 与 `rankOf` 恒为
+                // 0..n-1 的合法下标，不存在 `MAX_SAFE_INTEGER`。旧代码那套兜底是
+                // 「优先级表只用于排序」时代的产物，现在是**不可达**的。
+                if (rankOf(channel) >= (chosenRank.get(model.id) ?? 0))
                     continue;
             }
             // 规则 3：其余情形沿用既有的「后覆盖前」。
             byId.set(model.id, model);
-            chosenRank.set(model.id, rankOf(model.function));
+            chosenRank.set(model.id, rankOf(channel));
         }
     }
     return [...byId.values()];

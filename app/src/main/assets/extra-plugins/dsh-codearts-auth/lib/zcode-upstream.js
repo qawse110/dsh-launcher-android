@@ -32,10 +32,26 @@
  * 所以要领额度必须**先补两条事件**，再查 preview，再 claim。
  */
 import { ZCODE_APP_VERSION_FALLBACK } from './zcode.js';
+import { formatZcodeEdgePageHint, hasZcodeUnusualActivity, looksLikeZcodeHtmlPage, parseZcodeBusinessCode, } from './zcode-diagnostics.js';
 /** ZCode 平台 origin（官方默认）。 */
 export const ZCODE_ORIGIN = 'https://zcode.z.ai';
 /** 免费额度通道的 Anthropic 端点。 */
 export const ZCODE_PLAN_MESSAGES_URL = `${ZCODE_ORIGIN}/api/v1/zcode-plan/anthropic/v1/messages`;
+/**
+ * 按通道返回「Messages」端点。
+ *
+ * ⚠ **积分制（`start-plan`）无论账号是 bigmodel 还是 zai，都走 `zcode.z.ai`**
+ * —— 官方分派表（`resources/config/provider/zcode-builtin.json`）的规则 2/5
+ * 明确如此，2026-10-03 实测复核。**不要**因为账号是国际版就改域名。
+ *
+ * ⚠ 订阅制（`coding-plan`）才走 `api.z.ai`（官方规则 0/1，2026-10-03 实测
+ * `GET https://api.z.ai/api/anthropic/v1/models` 返回 200 + 11 个模型）。
+ */
+export function zcodeMessagesUrl(channel) {
+    if (channel === 'coding-plan')
+        return 'https://api.z.ai/api/anthropic/v1/messages';
+    return ZCODE_PLAN_MESSAGES_URL;
+}
 /** 额度余额端点（**需要 Authorization**）。 */
 export const ZCODE_BILLING_BALANCE_URL = `${ZCODE_ORIGIN}/api/v1/zcode-plan/billing/balance`;
 /** 可领活动预览端点（**不需要 Authorization**）。 */
@@ -77,7 +93,18 @@ export function buildZcodeHeaders(credential, options = {}) {
     }
     return headers;
 }
-/** 从数字字段安全取值（上游可能给 `null`）。 */
+/**
+ * 从数字字段安全取值（上游可能给 `null`）。
+ *
+ * ⚠⚠ **只认 `number`，不认数字字符串** —— 对**业务码**来说那是个真实缺陷
+ * （`{"code":"3012"}` 会被吃成 `undefined`，见 `claimZcodePlan` 里的说明），
+ * 现已改用 {@link parseZcodeBusinessCode}。
+ *
+ * ⚠ 本函数仍用于**额度数值 / priority / 上下文窗口**这些字段：它们若以字符串
+ * 下发，会静默退化成 `undefined`（`priority` → 0、`grantUnits` → 不显示额度）。
+ * 这属于**既有行为、不在本次改动范围**（改它会牵动 plan 排序与额度展示，
+ * 需单独的实发验证），故此处**如实标注限制而不擅自扩大改动**。
+ */
 function num(value) {
     return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
@@ -134,7 +161,8 @@ export async function fetchZcodeBalance(credential, fetchImpl = fetch) {
     if (data === undefined)
         return undefined;
     if (typeof data.displayMode === 'string' && data.displayMode === 'enterprise') {
-        return { enterprise: true, buckets: [], remaining: 0, total: 0 };
+        // ⚠ 企业版**不下发额度数字**，也就没有可领活动 ⇒ 不发 preview 请求。
+        return { enterprise: true, buckets: [], remaining: 0, total: 0, claimablePlans: [] };
     }
     const rawBuckets = Array.isArray(data.balances) ? data.balances : [];
     const buckets = [];
@@ -172,7 +200,54 @@ export async function fetchZcodeBalance(credential, fetchImpl = fetch) {
         total,
         expiresAt,
         planName: buckets[0]?.showName,
+        claimablePlans: await fetchClaimablePlans(credential, fetchImpl),
     };
+}
+/**
+ * 取「可领活动」摘要（**只读**，不消耗额度）。
+ *
+ * ## 为什么 balance 要带它（2026-10-03 实测）
+ *
+ * 同一账号：
+ * ```
+ * GET /billing/balance  → data.balances = []                          ← 0 个桶
+ * GET /billing/preview  → data.plans[0].plan_id = …start-plan-trust-1003
+ * ```
+ * ⇒ **每日赠送的 start-plan 额度不在 `balances` 桶里**，只在 `plans` 里。
+ * 只读 `balances` ⇒ 面板显示 0，而用户实际能领 1 亿 tokens。
+ *
+ * ⚠ **失败一律降级为空数组**，绝不影响 `balance` 本身 ——
+ *   余额是主体，preview 是补充。
+ *
+ * ⚠ 走**同一个** `preview` 端点与 `fetchZcodeClaimablePlans` 一致；
+ *   这里只是不解析成领取结果、只留展示要的三个字段（少一次字段耦合）。
+ */
+async function fetchClaimablePlans(credential, fetchImpl) {
+    try {
+        const appVersion = credential.app_version ?? ZCODE_APP_VERSION_FALLBACK;
+        const response = await fetchWithTimeout(fetchImpl, `${ZCODE_BILLING_PREVIEW_URL}?app_version=${encodeURIComponent(appVersion)}&platform=win32`, { method: 'GET', headers: buildZcodeHeaders(credential, { json: false }) }, 15_000);
+        if (!response.ok)
+            return [];
+        const parsed = await response.json();
+        const raw = Array.isArray(parsed.data?.plans) ? parsed.data.plans : [];
+        const out = [];
+        for (const item of raw) {
+            if (typeof item !== 'object' || item === null)
+                continue;
+            const planId = item['plan_id'];
+            if (typeof planId !== 'string' || planId.length === 0)
+                continue;
+            out.push({
+                planId,
+                ...(typeof item['name'] === 'string' ? { showName: item['name'] } : {}),
+                ...(typeof item['amount'] === 'number' ? { amount: item['amount'] } : {}),
+            });
+        }
+        return out;
+    }
+    catch {
+        return [];
+    }
 }
 /**
  * 补客户端活跃信号。
@@ -227,10 +302,22 @@ export async function fetchZcodeClaimablePlans(credential, fetchImpl = fetch) {
         const record = item;
         if (typeof record.plan_id !== 'string' || record.plan_id.length === 0)
             continue;
+        /**
+         * ★ 额度取自 `entitlements[]`（2026-10-03 实测）——
+         * plan 顶层**没有**额度字段，只有 `entitlements[0].grant_units`。
+         * 不读它 ⇒ `toClaimOutcome` 只能填 0 ⇒ 面板显示「+0 积分」。
+         */
+        const ents = Array.isArray(record.entitlements)
+            ? record.entitlements
+            : [];
+        const first = ents[0] ?? {};
+        const grantUnits = num(first.grant_units);
         plans.push({
             planId: record.plan_id,
             priority: num(record.priority) ?? 0,
             name: typeof record.name === 'string' ? record.name : undefined,
+            ...(grantUnits === undefined ? {} : { grantUnits }),
+            ...(typeof first.unit_type === 'string' ? { unitType: first.unit_type } : {}),
         });
     }
     // priority 降序（与官方/第三方实现一致：先领高优先级）。
@@ -276,17 +363,99 @@ export async function claimZcodePlan(credential, planId, captcha, fetchImpl = fe
             message: error instanceof Error ? error.message : String(error),
         };
     }
-    const text = await response.text().catch(() => '');
+    /**
+     * ★★ 读响应体与解析业务码（真实缺陷，2026-10-05 对抗性审计打出）。
+     *
+     * ## ① `code` 必须认**纯数字字符串**
+     *
+     * 原先用 `num(parsed.code)`，而 `num()` **只认 `number`** ⇒ 上游回
+     * `{"code":"3012","msg":"request has been blocked due to unusual activity."}`
+     * 时 `code` 变成 `undefined`，风控码**整条丢失** —— 用户看到的正是本 issue
+     * 要修的那句裸上游串（`…: request has been blocked due to unusual activity.`），
+     * 因为该 `msg` 里**不含数字**，连「扫正文」都救不回来。
+     * ⇒ 改用 `parseZcodeBusinessCode`（见 `zcode-diagnostics.ts`），
+     * 它是全仓库**唯一**的业务码解析口径。
+     *
+     * ## ② 读体必须被包住（`F4`：此前的「自身不抛」是错的）
+     *
+     * 原先写成 `await response.text().catch(() => '')` —— 若 `fetch` 返回了
+     * **非 Response**（如 `null`，自定义 fetch / 被包装过的实现可能出现），
+     * `response.text` 的**属性访问**就同步抛 `TypeError`，`.catch` 根本挂不上
+     * ⇒ 整条穿透给调用方。真实 `fetch` 不会回 `null`，故生产影响≈0，
+     * 但 `claimDailyWith` 依赖「这里不抛」来配平埋点计数，故仍把它兜住。
+     */
+    let text = '';
     let code;
     let message;
     try {
+        text = await response.text();
+    }
+    catch {
+        // 体流中断 / 响应对象异常 ⇒ 按「读不到正文」处理，不让它穿透。
+        text = '';
+    }
+    try {
         const parsed = JSON.parse(text);
-        code = num(parsed.code);
+        code = parseZcodeBusinessCode(parsed.code);
         message = typeof parsed.msg === 'string' ? parsed.msg
             : typeof parsed.message === 'string' ? parsed.message : undefined;
     }
     catch {
-        message = text.slice(0, 200);
+        /**
+         * ⚠⚠ **边缘/CDN 的 HTML 错误页不得当文案倒给用户**（2026-10-07 审计打出）：
+         * 原先这里是 `text.slice(0, 200)`，于是用户看到的「领取失败原因」是
+         * `<!doctypehtml><html lang="zh-cn">…<style>a,body,div,h2,html,p{m` ——
+         * 一坨 CSS 噪声，且随 CDN 配置变化，将来无法据此复盘。
+         *
+         * ⇒ 与推理侧 `describeUpstreamError` **共用同一份**判据与文案
+         * （`zcode-diagnostics.ts` 是唯一出处，两侧不得各写一份）。
+         */
+        message = looksLikeZcodeHtmlPage(text)
+            ? formatZcodeEdgePageHint(text, response.status)
+            : text.slice(0, 200);
+    }
+    /**
+     * ★★ **正文里的风控必须在这里（能看到完整正文的地方）归一成 `code`**
+     * （真实缺陷，2026-10-05 审计 N1）。
+     *
+     * ## 缺陷
+     *
+     * 上面那条 `message = text.slice(0, 200)` 是为**展示**做的截断，但下游的
+     * 判据（`isClaimUnusualActivity`）读的**正是 `message`** ⇒ 当网关正文的
+     * 噪声超过 200 字符、而风控短语落在截断点**之后**时，判据看到的是被截掉的串：
+     *
+     * ```
+     * 完整 body 长度=230，hasZcodeUnusualActivity(全body)=true
+     * → code=undefined，message 长度=200，含风控短语=false
+     * → claimRecognized=false   ← 真风控被降级成通用失败
+     * ```
+     *
+     * 症状**正是本 issue 的原症状**（用户只看到一句看不懂的失败）。
+     *
+     * ## 修法
+     *
+     * 判据移到**本层**：这里持有完整 `text`，判得准。命中即把 `code` 归一成
+     * `3012`，让下游统一走「有码 ⇒ 只信码」的路径 —— 与
+     * `parseZcodeBusinessCode` 同一思路（**在信息最全的地方归一，而不是在
+     * 已经丢过信息的下游猜**）。
+     *
+     * ⚠ **只在 `code` 缺失时兜底**：上游给了权威业务码就绝不覆盖
+     *   （`{"code":1005,"msg":"quota 3012 exceeded"}` 必须仍是 1005）。
+     * ⚠ 判据是 `hasZcodeUnusualActivity`（**语义短语为主**）——
+     *   它本身已排除 `13012` / 限流里的毫秒数等误判形态。
+     *
+     * ⚠⚠⚠ **边缘/CDN 的 HTML 错误页必须豁免**（2026-10-07 审计打出，
+     * 与推理侧 `zcode-adapter.ts` 修掉的是**同一个缺陷的领取侧**）：
+     * 实测 `<html><body>request has been blocked due to unusual activity.</body></html>`
+     * 既 `looksLikeZcodeHtmlPage` 为真、`hasZcodeUnusualActivity` 也为真 ⇒
+     * `code` 被归一成 `3012` ⇒ `zcode-auth.ts` 的 `isClaimUnusualActivity` 命中
+     * ⇒ **短路本账号剩余 plan**，文案写「冷却惩罚 30 分钟→24 小时→停用」。
+     *
+     * ⇒ 一次**边缘拦截**被报成「账号风控、别重试」，还跳过了本可领取的 plan ——
+     * 与「稍后重试」的用户动作**完全相反**。
+     */
+    if (code === undefined && !looksLikeZcodeHtmlPage(text) && hasZcodeUnusualActivity(text)) {
+        code = 3012;
     }
     // 1003 = 已领取过 —— **幂等成功，不是错误**。
     const alreadyClaimed = code === 1003;

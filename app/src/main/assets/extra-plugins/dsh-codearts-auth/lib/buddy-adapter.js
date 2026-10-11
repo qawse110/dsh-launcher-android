@@ -10,7 +10,8 @@
 import { attributionHeaders, CONTEXT_WINDOW_EXCEEDED_CODE, isContextWindowExceededError, LlmAdapter, LlmError, ReasoningEffortId, } from '@deepseek-ai/dsh-llm';
 import { providerCatalogVisible } from './account-pool.js';
 import { RemoteCatalogGate } from './remote-catalog-gate.js';
-import { RATE_LIMIT_FALLBACK_MS, isRateLimited, parseRateLimitError } from './llm-adapter.js';
+import { broadcastCatalogChanged } from './catalog-broadcast.js';
+import { RATE_LIMIT_FALLBACK_MS, isModelSaturationError, isRateLimited, parseRateLimitError, } from './llm-adapter.js';
 import { ToolCallId } from '@deepseek-ai/dsh-llm';
 import { HTTP_HEADER_DOMAIN, HTTP_HEADER_PRODUCT, HTTP_HEADER_PRODUCT_CODE, credentialExpiresAtMs, formatCreditsRate, } from './buddy.js';
 import { CODEBUDDY, resolveUserAgent } from './product.js';
@@ -18,6 +19,7 @@ import { normalizeHarnessMessages } from './message-shape.js';
 import { projectRequestImage } from './image-budget.js';
 import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js';
 import { registerAdapterIdempotent, } from './llm-register-compat.js';
+import { reportLedgerAccount } from './token-ledger.js';
 /**
  * CodeBuddy（中国版）的 chat completions 基址。
  *
@@ -63,6 +65,14 @@ const DEFAULT_MODELS = [
     'kimi-k2.6',
     'minimax-m3',
 ];
+/**
+ * 图片能力判定为「未知」时，距上次目录拉取至少要过这么久才值得重试。
+ *
+ * 用户 2026-10-06 定：失败后**至少 10 秒**才重新看一次模型列表。
+ * 上界取 30s（`REMOTE_CATALOG_COOLDOWN_MS`）—— 即比默认冷却短，
+ * 使「请稍后重试」这句话在十秒后真的兑现，而不是让用户等到 30 秒。
+ */
+const BUDDY_IMAGE_CAPABILITY_RETRY_MS = 10_000;
 /** 默认模型（deepseek-v4-flash，对齐 IDE 默认）。 */
 export const DEFAULT_MODEL = 'deepseek-v4-flash';
 /**
@@ -590,6 +600,49 @@ function resolveFirstTokenTimeoutMs() {
 function resolveChunkTimeoutMs() {
     return Number.parseInt(process.env.DSH_BUDDY_SSE_CHUNK_TIMEOUT_MS ?? '', 10) || 120_000;
 }
+/**
+ * 模型饱和（`14003`）的**内部重试**次数。
+ *
+ * ## 为什么饱和要自己重试，而额度限流（6004）不重试
+ *
+ * 两者的时间尺度完全不同：
+ * - **额度限流 6004**：确定性 —— 「这个账号今天/这小时用完了」，重试**必然**再撞，
+ *   只能等解禁或换账号；
+ * - **模型饱和 14003**：**瞬时**过载，服务端原话就是「模型繁忙，请稍后重试」，
+ *   且报文的 `actions` 里自带 `RETRY`。
+ *
+ * ⚠️ **重试必须留在本账号上**（不换号）：饱和是**模型级**的，池里 4 个独立账号
+ * 会撞同一堵墙 —— 实测 4 个不同腾讯 uid 在 20 秒内全部被同一个 14003 拒绝。
+ * 换号只会白烧掉「还有额度」的账号，正是本次要修的缺陷。
+ */
+const BUDDY_SATURATION_MAX_RETRIES = 2;
+/**
+ * 饱和重试的基准间隔（毫秒），按次数**线性**递增（2s → 4s）。
+ *
+ * ⚠️ 刻意取短：14003 那次失败**自身**就要跑 46~111 秒才返回，
+ * 退避再叠长间隔会让 UI 长时间停在「运行中」而无法区分「排队」与「卡死」。
+ * 这与 Qoder 排队那条「≥10 秒封顶」的取舍同因。
+ */
+const BUDDY_SATURATION_BASE_DELAY_MS = 2_000;
+/**
+ * 饱和重试的等待时长（毫秒）。
+ *
+ * ⚠️ 环境变量**不能**写成 `parseInt(…) || 默认值`：`0` 是合法值
+ * （表示「不等」，单测靠它把用例压到毫秒级），而 `0` 是 falsy 会被 `||`
+ * 静默换成 2000 —— 与 `QODER_QUEUE_MAX_DELAY_MS` 那次踩过的坑同型。
+ */
+function buddySaturationDelayMs(attempt) {
+    const raw = process.env.DSH_BUDDY_SATURATION_DELAY_MS;
+    const base = raw === undefined || raw === '' ? BUDDY_SATURATION_BASE_DELAY_MS : Number(raw);
+    const resolved = Number.isFinite(base) && base >= 0 ? base : BUDDY_SATURATION_BASE_DELAY_MS;
+    return resolved * (attempt + 1);
+}
+/** 等待指定毫秒数（可被单测用 `DSH_BUDDY_SATURATION_DELAY_MS=0` 短路）。 */
+function sleepMs(ms) {
+    if (ms <= 0)
+        return Promise.resolve();
+    return new Promise((resolve) => { setTimeout(resolve, ms); });
+}
 /** 判断是否为传输级错误。 */
 function isTransportError(error) {
     if (!(error instanceof Error))
@@ -657,6 +710,28 @@ function userContentParts(content, imageUrls) {
     }
     return hasImage && parts.length > 0 ? parts : undefined;
 }
+/**
+ * 远端条目是否**明确表态**接受图片输入。
+ *
+ * 用途：`reconcileWithFallback` 的白名单式重建会丢弃「不在编译期兜底表里」
+ * 的模型，而兜底表是快照、会随服务端上新而漂移。凡是远端**已经讲清楚了
+ * 图片能力**的条目，丢弃它就等于让「本地可能过期的快照」压过「服务端权威
+ * 数据」（issue IKJQ3M：`space-bunny` 即属此类）。
+ *
+ * ⚠️⚠️ **判据只能认 `supportsImages`，不能收「任一能力元数据」**（初版写宽了，
+ * 由自查与回归用例抓出）：实测「11102 service info not found」的模型
+ * （glm-4.6/4.7/5.0、minimax-m2.5、kimi-k2.5/k2.8-preview、hunyuan-* …）
+ * **同样带 `contextWindow` 与 `maxOutputTokens`**（见 `src/product.ts` 的
+ * `CODEBUDDY_FALLBACK_MODELS` 注释，正是因为它们不可调用才被排除）。
+ * 按「任一能力字段」放行会把它们请回模型选择器，用户选中后才报错 ——
+ * **那是比原 issue 更糟的新缺陷**。
+ *
+ * ⚠️ 也不能放宽成「远端返回的一律收下」：`parseModelsFromConfig` 会把内部别名
+ * （`default` 等）与未开放模型一并解析出来。
+ */
+function hasRemoteImageCapability(model) {
+    return model.supportsImages !== undefined;
+}
 /** 收集 user 消息中的图片附件引用（含工具结果内嵌图片），按 attachmentId 去重。 */
 function collectImages(content, refs) {
     for (const raw of content) {
@@ -685,10 +760,17 @@ export class BuddyAdapter extends LlmAdapter {
     /** 动态模型缓存（首次 listModels 成功后填充）。 */
     remoteModels;
     /**
+     * 已落缓存的目录是否**所有来源都取全**（issue IKJVTF，审计 I3）。
+     *
+     * ⚠️ **这是短路判据的第二半**：buddy 有两个目录端点，残缺目录也落
+     * `remoteModels`，故只判「已定义」会让残缺永久固化（见 `ensureRemoteModels`）。
+     */
+    remoteComplete = false;
+    /**
      * 目录加载闸门：并发去重 + 失败/空结果冷却。
      * 依据见 `src/remote-catalog-gate.ts`（首屏「加载模型巨长」的实测归因）。
      */
-    catalogGate = new RemoteCatalogGate();
+    catalogGate;
     /** 远端下发的模型元数据（id → 能力），listModels/resolveModel/stream 共用。 */
     remoteMeta = new Map();
     /** 远端下发的模型上下文窗口（/v3/config data.models[].maxInputTokens）。 */
@@ -707,6 +789,17 @@ export class BuddyAdapter extends LlmAdapter {
         this.product = options.product ?? CODEBUDDY;
         this.fetchImpl = options.fetchImpl ?? fetch;
         this.sessionId = options.sessionId ?? crypto.randomUUID().replace(/-/g, '');
+        // ⚠️ 闸门时钟可注入（**不是**测试专用开关）：`refreshCatalog` 的「距上次
+        // 拉取 ≥10 秒才重试」是一条**基于时间**的契约，而闸门的 `now` 默认取墙钟。
+        // 单测用 `vi.setSystemTime` 改全局时间会污染同文件其余用例（真实计时器
+        // 用例被挂起，实测变成时序敏感），而注入时钟可零副作用地验证该契约。
+        // ⚠️ `onLoaded` 与时钟/冷却**同处构造**：目录落地后通知客户端重读
+        // （issue IKJVTF 的缺陷①），回调由接线层桥接。
+        this.catalogGate = new RemoteCatalogGate({
+            ...options.now === undefined ? {} : { now: options.now },
+            ...options.catalogCooldownMs === undefined ? {} : { cooldownMs: options.catalogCooldownMs },
+            ...options.onCatalogLoaded === undefined ? {} : { onLoaded: options.onCatalogLoaded },
+        });
         const fallback = this.product.fallbackModels ?? [];
         this.productFallbackIndex = new Map(fallback.map((model) => [model.id, model]));
         this.productFallbackContextWindows = new Map(fallback
@@ -803,7 +896,15 @@ export class BuddyAdapter extends LlmAdapter {
     }
     async ensureRemoteModels() {
         const fetchRemote = this.options.fetchRemoteModels;
-        if (this.remoteModels !== undefined || fetchRemote === undefined)
+        if (fetchRemote === undefined)
+            return;
+        // ⚠️⚠️ **短路判据是「已完整」，不是「已定义」**（issue IKJVTF 复审，审计 I3）。
+        //
+        // buddy 是**双端点** provider（scoped + `/v3/config`，id 集合不同、必须取并集），
+        // 残缺目录**也**要落 `remoteModels`（展示需要），但那时**不能**短路 ——
+        // `RemoteCatalogGate` 的冷却在生产里只有闸门自己那一处调用点，而它排在
+        // 短路**之后** ⇒ 残缺一旦落缓存，冷却永远读不到、残缺永远补不齐。
+        if (this.remoteComplete)
             return;
         // 闸门：并发去重 + 失败/空结果冷却（详见 src/remote-catalog-gate.ts 的
         // 实测依据）。Buddy 的目录端点超时上限 60s，失败不冷却会让首屏在
@@ -821,8 +922,48 @@ export class BuddyAdapter extends LlmAdapter {
             this.remoteContextWindows = new Map(reconciled
                 .filter((model) => model.contextWindow !== undefined)
                 .map((model) => [model.id, model.contextWindow]));
-            return true;
+            // ⚠️ 完整性由接线层桥接的数据源上报（两来源各自的成败）。
+            // 拿不到判定时退回「完整」（= 旧行为），避免把「判不出」当成残缺
+            // 而让 provider 反复重拉。
+            this.remoteComplete = this.options.catalogComplete?.() ?? true;
+            return { got: true, complete: this.remoteComplete };
         });
+    }
+    /**
+     * 图片能力判定为「未知」时，把闸门冷却按**用户定的重试间隔**重新评估一次。
+     *
+     * ## 为什么需要它（issue IKJQ3M）
+     *
+     * 能力未知时贴图既不放行、也不谎报「不支持」（见 {@link inputModalitiesFor}），
+     * 用户看到的是「请稍后重试」。若目录的冷却期是 `RemoteCatalogGate` 默认的
+     * 30 秒，而用户 10 秒后就重试，他拿到的仍是「未知」—— 于是必须有一个
+     * **明确的、较短的**重试窗口，否则这条修复只是把误报换成了更慢的误报。
+     *
+     * ## 规则（用户 2026-10-06 定，**不要擅自改**）
+     *
+     * 距上次拉取**不足 10 秒** → 不重拉（本次直接返回）。
+     * 理由：目录端点超时上限 **60 秒**（`src/buddy.ts` 的 `REQUEST_TIMEOUT_MS`），
+     * 无节流的「贴图就重拉」会把每个模型的每次带图请求都放大成一次远端拉取
+     * —— 那正是 `RemoteCatalogGate` 当初要挡的放大，也是首屏「加载模型巨长」
+     * 的成因（见该文件头的实测记录）。
+     *
+     * ⚠️ **只放宽冷却、不清 `remoteModels`**：目录已成功时 `ensureRemoteModels`
+     * 本就直接返回，无需也不能重拉（重拉会把成功结果丢掉）。
+     *
+     * ⚠️ 冷却期整体仍以 `cooldownMs`（30s）为准 —— 放宽的是**图片门禁这一次**
+     * 的评估，不是把闸门的冷却期改短，故其他调用方仍受 30 秒保护。
+     */
+    async refreshCatalog() {
+        if (this.options.fetchRemoteModels === undefined)
+            return;
+        if (this.remoteModels !== undefined)
+            return;
+        const since = this.catalogGate.sinceLastAttemptMs();
+        if (since !== undefined && since < BUDDY_IMAGE_CAPABILITY_RETRY_MS)
+            return;
+        // 放宽本次冷却，让 ensureRemoteModels 里的 run() 真正发起一次拉取。
+        this.catalogGate.reset();
+        await this.ensureRemoteModels();
     }
     /**
      * 用产品兜底表校正远端结果。
@@ -847,6 +988,19 @@ export class BuddyAdapter extends LlmAdapter {
      * 判据用 `agentReferenced`（服务端自己的「可选」信号）而非猜测 id 后缀 ——
      * 后缀规则不统一（`-f` / `-x` / `-sg` / `-ioa` 含义各异），猜错会放进
      * 不可用的模型。未标记的内部别名（如 `default`）不会被误留。
+     *
+     * ⚠️⚠️ **第二条例外：远端明确表态接受图片（issue IKJQ3M）**。
+     *
+     * 只按 `agentReferenced` 判据仍然丢模型：实测 `space-bunny` 由 scoped 端点
+     * 下发并带**完整元数据**（`supportsImages: true` / `maxInputTokens: 1000000`
+     * / `maxOutputTokens: 128000` / `reasoning.supportedEfforts`），但**没有被任何
+     * agent 引用** ⇒ 白名单式重建把它连同能力声明一起丢掉 ⇒
+     * `inputModalitiesFor` 三级查找全落空 ⇒ 贴图误报 `does not accept image input`
+     * （而真实网关 5/5 实测能看图）。**这不是瞬时状态**：远端目录即使拉取成功
+     * 也照样误判，issue 里「重启即自愈」的结论只在恰好被 agent 引用时成立。
+     *
+     * ⇒ 「不在编译期快照里」与「服务端未声明可选」是**两回事**：远端既然已经
+     * 明确表态了图片能力，丢弃它才是缺陷本身。两条例外的判据不同、互不覆盖。
      */
     reconcileWithFallback(models) {
         const fallback = this.product.fallbackModels;
@@ -889,9 +1043,21 @@ export class BuddyAdapter extends LlmAdapter {
         //
         // 放在**末尾**：兜底表里的模型保持原有顺序与权威性，补充的变体排在后面，
         // 不打乱用户已熟悉的列表顺序。
+        //
+        // ⚠️ 两条追加判据是**并集**（issue IKJQ3M）：
+        //   ① `agentReferenced === true`：服务端说「对话里可选」；
+        //   ② 远端**明确表态**接受图片（`supportsImages !== undefined`）：
+        //      该模型正是本 issue 要解决的那类，丢弃它就会把「能看图的模型」
+        //      误杀（`space-bunny` 走 ① 之外仍会被丢掉 —— 它未被任何 agent 引用）。
+        // ⚠️ ② 刻意**只认 `supportsImages`**：加上 `contextWindow` / `maxOutputTokens`
+        // 会把实测「11102 不可调用」的模型一并放回选择器（见 hasRemoteImageCapability）。
+        // 两条都**不**放宽到「远端返回的一律收下」——那会让内部别名与未开放模型
+        // 重新出现在选择器里（正是当初引入白名单的原因）。
         const known = new Set(reconciled.map((model) => model.id));
         for (const model of models) {
-            if (model.agentReferenced !== true || known.has(model.id))
+            if (known.has(model.id))
+                continue;
+            if (model.agentReferenced !== true && !hasRemoteImageCapability(model))
                 continue;
             known.add(model.id);
             reconciled.push({ ...model });
@@ -921,15 +1087,68 @@ export class BuddyAdapter extends LlmAdapter {
         'glm-5.1',
     ]);
     /**
-     * 模型接受的输入模态：远端 supportsImages 优先，静态表兜底；
-     * {@link IMAGE_CAPABILITY_OVERRIDES} 中的模型强制为支持图片。
+     * 模型接受的输入模态，或 `undefined` = **能力未知**。
+     *
+     * ## 为什么要有第三态（issue IKJQ3M）
+     *
+     * 原实现恒返回 `readonly ('text'|'image')[]`，把两种**语义相反**的状态
+     * 压成同一个结果：
+     * - 远端明确说 `supportsImages: false`（**确认不支持**）；
+     * - 远端目录还没拉到 / 拉取失败（**暂时不知道**）。
+     *
+     * 两者都返回 `['text']`，后果有二，第二个更隐蔽：
+     * 1. 贴图被拒且文案写「model "x" does not accept image input」——
+     *    把「不知道」说成「不支持」，用户会去换模型、查文档，而真正的解法
+     *    只是等目录就绪（真实报障：`buddy/space-bunny` 贴图报不支持，
+     *    而真实网关 5/5 全对，纯红图答「红色」、双色图左右分别答对）。
+     * 2. `listModels` / `resolveModel` 把这个 `['text']` 报给宿主 DSH，
+     *    而 DSH 见到「不含 image」的声明会**静默把图片投影成占位文本**
+     *    （dsh-llm `lib/index.js` 的 `projectImagesForTextModel`）
+     *    ⇒ 图片既没进请求体、用户也拿不到任何原因。
+     *
+     * ✅ 因此「未知」必须**省略 `inputModalities` 字段**（宿主对 `undefined`
+     * 不做任何投影，见同文件 `detachedModalities`），而不是报 `['text']`。
+     *
+     * ⚠️ 方向是**宁可漏判不可误伤**：未知仍不放行图片（见 `stream` 的门禁），
+     * 只是不再谎报「不支持」。
      */
     inputModalitiesFor(model) {
+        // ⚠️ **判据必须逐级记录来源**：下面这条 `??` 链会把「远端明确 false」
+        // 与「全都没查到」压成同一个 `false`（两者都非真值），而这两种状态的
+        // 处理**恰好相反**（前者拒绝、后者只报「未知」）。故先用
+        // `imageCapabilityKnown` 把两者分开，再走同一条取值链。
+        const known = this.imageCapabilityKnown(model);
         const supportsImages = BuddyAdapter.IMAGE_CAPABILITY_OVERRIDES.has(model)
             || (this.remoteMeta.get(model)?.supportsImages
                 ?? this.productFallbackMeta.get(model)?.supportsImages
                 ?? IMAGE_MODELS.has(model));
-        return supportsImages ? ['text', 'image'] : ['text'];
+        if (supportsImages)
+            return ['text', 'image'];
+        return known ? ['text'] : undefined;
+    }
+    /**
+     * 该模型的图片能力是否**已被某个来源明确表态**（而不只是「没查到」）。
+     *
+     * ⚠️ 与 {@link inputModalitiesFor} 的**四个图片来源**必须逐级同源
+     * （`IMAGE_CAPABILITY_OVERRIDES` → `remoteMeta.supportsImages` →
+     * `productFallbackMeta.supportsImages` → `IMAGE_MODELS`）：
+     * 本函数判「有没有表态」，那条链判「表态成什么」。两处口径不一致时，
+     * 同一文件就会存在「一处说有、一处说无」的两套判据 —— 那正是本仓库反复
+     * 出静默缺陷的形态。
+     *
+     * ⚠️ **刻意不含 `reasoningEfforts` / `defaultReasoningEffort`**：那不是图片
+     * 能力。而目录准入侧的 `hasRemoteImageCapability` 也**只认 `supportsImages`** ——
+     * 三处都是「只认图片能力」，互不交叉，**不会**出现「只带思考档位的远端模型
+     * 被收进目录却判为图片未知」这类分叉（它的处置是保守的：不放行图片）。
+     */
+    imageCapabilityKnown(model) {
+        if (BuddyAdapter.IMAGE_CAPABILITY_OVERRIDES.has(model))
+            return true;
+        // 远端显式 false 同样是「表态」，必须算已知。
+        if (this.remoteMeta.get(model)?.supportsImages !== undefined)
+            return true;
+        return this.productFallbackMeta.get(model)?.supportsImages !== undefined
+            || IMAGE_MODELS.has(model);
     }
     /** 模型可选的思考等级：远端 supportedEfforts 优先，产品兜底表次之，通用静态表最后。 */
     effortsFor(model) {
@@ -992,8 +1211,19 @@ export class BuddyAdapter extends LlmAdapter {
             provider: this.product.id,
             id: model.id,
             name: displayNameFor(model, listed),
-            inputModalities: this.inputModalitiesFor(model.id),
+            ...this.imageModalitiesField(model.id),
         }));
+    }
+    /**
+     * 把 {@link inputModalitiesFor} 的结果摊成 `LlmModelInfo` 的可选字段。
+     *
+     * ⚠️ 必须**省略**而不是报 `['text']`：宿主契约明写
+     * 「absent means unknown」（dsh-llm `types.d.ts`），而 DSH 见到
+     * 「不含 image」的声明会按「确认是纯文本模型」把图片静默投影成占位文本。
+     */
+    imageModalitiesField(model) {
+        const modalities = this.inputModalitiesFor(model);
+        return modalities === undefined ? {} : { inputModalities: modalities };
     }
     /**
      * 静态兜底模型目录：优先用产品自带的 `fallbackModels`，否则用通用默认表。
@@ -1020,7 +1250,7 @@ export class BuddyAdapter extends LlmAdapter {
             provider,
             id: model,
             name: this.remoteMeta.get(model)?.name ?? this.productFallbackIndex.get(model)?.name ?? model,
-            inputModalities: this.inputModalitiesFor(model),
+            ...this.imageModalitiesField(model),
         };
         if (contextWindow !== undefined)
             resolved.context = { contextWindow };
@@ -1099,6 +1329,9 @@ export class BuddyAdapter extends LlmAdapter {
                     // 此时限流无法归属到具体账号，也就无法在 UI 上显示标记。
                     console.warn(`[${this.product.id}] 当前凭据未匹配到账号池条目，限流记录将被跳过`);
                 }
+                // Token 账本（第 2 期）：回报「本笔请求解析出的账号」（空串不回报）。
+                if (currentAccountId !== '')
+                    reportLedgerAccount(this.product.id, currentAccountId);
             }
             catch (error) {
                 console.warn(`[${this.product.id}] 账号匹配失败（不影响本次请求）:`, error);
@@ -1118,7 +1351,33 @@ export class BuddyAdapter extends LlmAdapter {
         }
         let imageUrls;
         if (imageRefs.size > 0) {
-            if (!this.inputModalitiesFor(options.model).includes('image')) {
+            // 能力未知时先给「重看一次目录」一次机会（受 10 秒间隔约束，
+            // 见 refreshCatalog）：目录若已恢复，这一轮就能正常发图，
+            // 用户根本看不到下面那句「请稍后重试」。
+            if (this.inputModalitiesFor(options.model) === undefined) {
+                await this.refreshCatalog();
+            }
+            const modalities = this.inputModalitiesFor(options.model);
+            if (modalities === undefined) {
+                // ⚠️ **能力未知 ≠ 不支持**（issue IKJQ3M）：目录没拉到就说「模型不支持
+                // 图片」，用户会去换模型、查文档，而真正的解法只是等目录就绪。
+                // 故用可区分的错误码与文案，别把「不知道」说成「不支持」。
+                //
+                // ⚠️⚠️ **不能用 `TRANSPORT`**（初版误选，被自己的回归用例抓出）：
+                // `DEFAULT_RETRYABLE_CODES` 实测是
+                // `['EMPTY_RESPONSE','RATE_LIMIT','SERVER','TIMEOUT','TRANSPORT']`
+                // —— `TRANSPORT` **就在里面**（dsh-llm `lib/index.js`）。于是这条
+                // 「请稍后重试」会被 harness 白重试 5 次（500/1000/2000/4000/8000 ms），
+                // 每次都重走一遍 `stream()` → `refreshCatalog()`，把一次用户报错放大成
+                // 6 次目录拉取 + 6 次凭据解析（目录端点超时上限 60s，用户还会看到 6 次闪动）。
+                //
+                // ⇒ 方向取反：这类「等一会儿就好」的错误**不该由 harness 自动重试**。
+                // `INVALID_REQUEST` 是仓库既有惯例（见本文件 `classifyHttpStatus`），
+                // 且不在可重试集合里；用户在目录恢复后自己重试即可 ——
+                // 那时 `refreshCatalog` 的 10 秒窗口通常已过，能直接发图。
+                throw new LlmError(`${this.product.id}: 模型 "${options.model}" 的能力列表尚未加载完成，暂时无法判断是否支持图片；请稍后重试。`, 'INVALID_REQUEST');
+            }
+            if (!modalities.includes('image')) {
                 throw new LlmError(`${this.product.id}: model "${options.model}" does not accept image input.`, 'UNSUPPORTED_CONTENT');
             }
             if (this.options.readImage === undefined) {
@@ -1364,6 +1623,58 @@ export class BuddyAdapter extends LlmAdapter {
         }
         if (!response.ok) {
             let errorText = await response.text().catch(() => '');
+            // ⚠️⚠️ **模型饱和必须**先于**限流分支判定**（真实缺陷，2026-10-05）
+            //
+            // `14003 model busy` **也是 HTTP 429**，而 `isRateLimited` 对 429
+            // **无条件返回 true** —— 若先走下面的限流分支，就会给每个账号写一条
+            // **1 小时**限流标记（报文里没有「将在…重置」，故取 `RATE_LIMIT_FALLBACK_MS`
+            // 兜底），把**整池**锁死。
+            //
+            // 用户报障正是这个：第一次用 `buddy/space-bunny` 就报
+            // 「模型 space-bunny 所有账号均受限」。
+            //
+            // 实测四条证据（`scripts/probe-buddy-*.mjs`，2026-10-05）：
+            // | 观测 | 结果 |
+            // |---|---|
+            // | 4 个**不同腾讯 uid** 的账号 | 20 秒内**全部**被写 `space-bunny` 标记 |
+            // | 标记解禁时刻 | 全 = 「写入 + 整 1 小时」= **兜底值**，非服务端给的 |
+            // | 4 MB 输入 | 稳定逼出 `429/14003`，报文自称「模型繁忙，请换模型」 |
+            // | 小请求 30 发 | 全 200，但耗时 841ms ~ 216s（上游**时变**背压） |
+            //
+            // 4 个互不相干的账号同时中招，账号级限流**无法解释** ⇒ 只能是模型级。
+            // 服务端报文自己就写着 `actions:["SWITCH_MODEL",…]`（**没有**换号选项）。
+            //
+            // ⚠️ 故正确动作是：**留在本账号退避重试**，绝不换号、绝不写标记 ——
+            // 与 zcode `3009` 并发限流的处置同型（那边注释：换账号也一样撞，
+            // 白白标记掉一个可用账号）。
+            if (isModelSaturationError(response.status, errorText)) {
+                for (let attempt = 0; attempt < BUDDY_SATURATION_MAX_RETRIES; attempt += 1) {
+                    const waitMs = buddySaturationDelayMs(attempt);
+                    console.warn(`[${this.product.id}] 模型 ${options.model} 请求量饱和（上游 14003 model busy），`
+                        + `${waitMs}ms 后**在本账号**重试（第 ${attempt + 1}/${BUDDY_SATURATION_MAX_RETRIES} 次）`
+                        + `—— 不换号、不写限流标记：饱和是模型级，池里其它账号会撞同一堵墙`);
+                    await sleepMs(waitMs);
+                    response = await this.send(credential, body, options);
+                    if (response.ok) {
+                        yield* this.consumeSse(response, options, currentAccountId);
+                        return;
+                    }
+                    errorText = await response.text().catch(() => '');
+                    // 重试后若已**不是**饱和（如变成额度限流 / 认证失败），
+                    // 立刻停手交给下面的既有分类逻辑 —— 那些语义各有各的正确动作。
+                    if (!isModelSaturationError(response.status, errorText))
+                        break;
+                }
+                // 退避重试用尽仍是饱和：如实报「模型繁忙」并给**唯一有效**的动作
+                // （换模型），而不是伪造成「账号额度受限」（那会让用户白等 1 小时）。
+                if (isModelSaturationError(response.status, errorText)) {
+                    throw new LlmError(`${this.product.id}: 模型 ${options.model} 当前请求量饱和`
+                        + `（上游 14003 model busy，报文原文：「模型繁忙，请换模型或稍后重试」），`
+                        + `已重试 ${BUDDY_SATURATION_MAX_RETRIES} 次仍未通过。`
+                        + `此为该**模型**整体繁忙，并非账号额度问题 —— 换账号无效，`
+                        + `请改用其它模型，或稍后重试（无需重新登录）。`, 'RATE_LIMIT', { status: response.status });
+                }
+            }
             // 限流处理：把当前账号在该模型上的重置时间记录下来，然后逐个尝试
             // 其余可用账号。每个失败账号都会被记录，只有真正试完全部候选才报
             // "所有账号均受限"——避免只试一个就下结论（那会让 UI 显示的限流
@@ -2102,7 +2413,12 @@ function positiveMaxTokens(value) {
  */
 export function registerBuddyLlm(ctx, options) {
     const product = options.product ?? CODEBUDDY;
-    const adapter = new BuddyAdapter(options);
+    const adapter = new BuddyAdapter({
+        ...options,
+        // ⚠️ 注入**唯一**的广播实现（`src/catalog-broadcast.ts`），不要在这里
+        // 另写一份 emit —— 两份实现必然漂移（issue IKJVTF 的缺陷① 就是「十处全漏」）。
+        onCatalogLoaded: () => broadcastCatalogChanged(ctx),
+    });
     registerAdapterIdempotent(ctx.llm, [product.id], adapter);
     // 返回实例：Jet Hub「显示列表」需要 `listAllModels()`（不受黑名单影响、
     // 带最终展示名/倍率）。`ctx.llm` 不透传自定义方法，须由调用方持有引用。

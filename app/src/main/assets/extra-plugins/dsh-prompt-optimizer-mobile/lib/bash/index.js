@@ -93,7 +93,7 @@ export function apply(ctx, config, dependencies = {}) {
   ensureMsysTmp(resolve(config.bundledRuntimeDir || defaultBundledRuntimeDir()))
   ctx.effect(() => ctx.tools.register({
     name: 'bash',
-    description: '执行 bash 命令（GNU bash / MSYS2，不是 PowerShell 也不是 cmd）；命令内用 POSIX 路径（盘符写作 /d/...），workdir 用宿主路径（D:/...）；需原样传参用 args 数组（成为 $1…$n，$0=dsh-bash）；非零退出不会自动重试或换后端。'
+    description: '执行 bash 命令（GNU bash / MSYS2，不是 PowerShell 也不是 cmd）；命令内用 POSIX 路径（盘符写作 /d/...），workdir 用宿主路径（D:/...）；需原样传参用 args 数组（成为 $1…$n，$0=dsh-bash）；非零退出不会自动重试或换后端。⚠ **本工具仅 Windows 可用**（随包分发的是 Windows 版 MSYS2 运行时）；非 Windows 平台上不会拿到这个工具。'
       // 2026-10-01 修：这里原先写着“跑 Windows 原生程序时 pwsh 通常更快更稳”——那是我自己写的
       // **未实测断言**，还把位置放错了（塞在 timeoutMs 参数说明里）。结果模型被推离 bash：
       // 本会话 pwsh 136 次 / bash 2 次。现在移到工具描述本体，按**命令性质**给判据，
@@ -156,16 +156,39 @@ export function apply(ctx, config, dependencies = {}) {
       const deadline = AbortSignal.timeout(timeoutMs)
       const fused = signal ? AbortSignal.any([signal, deadline]) : deadline
       let bashPath = config.bashPath
+      // 运行时来源要带下去给 HOME 用（见下）。显式 config.bashPath 标成 'explicit'：那不是我们的
+      // 运行时，它的 HOME 语义由指定者自己负责。
+      let runtimeSource = config.bashPath ? 'explicit' : null
       if (!bashPath) {
-        const resolved = await provision.resolveBashRuntime({ env: process.env, platform: process.platform, signal: fused,
-          bundledRuntimeDir: config.bundledRuntimeDir || fileURLToPath(new URL('../../runtime', import.meta.url)) })
+        const bundledRuntimeDir = config.bundledRuntimeDir || fileURLToPath(new URL('../../runtime', import.meta.url))
+        const resolved = await provision.resolveBashRuntime({ env: process.env, platform: process.platform, signal: fused, bundledRuntimeDir })
         if (!resolved.ok) return (resolved.repair || [resolved.reason || '运行时不可用']).join('\n')
         bashPath = resolved.path
+        runtimeSource = resolved.source
       }
       if (fused.aborted) return '调用已取消或在准备阶段达到截止时间，命令未执行。'
       const temp = wsmod.tempDirFor(workspace, 'tool-' + randomUUID())
       mkdirSync(temp.hostPath, { recursive: true })
       const env = { ...process.env }
+      // 自带 MSYS2 运行时在 win32 上必须**显式给 HOME**，否则运行时会自己兜底成 `/home/<账户>`，
+      // 而本插件的 MSYS 根是 `<plugin>/runtime` ⇒ 落点是 `<plugin>/runtime/home/<user>` ——
+      // **该目录不存在，也没有任何环节创建它**。后果不是「报错」而是**假阴性**：
+      // `git config --global --get …` 静默返回空（rc=1），写入报 `could not lock config file`；
+      // 同一台机器、同一个用户，插件内外看到的是两份不同的"全局配置"。
+      //
+      // 生效条件收紧到「自家 bundle + win32」，原因：MSYS2 才是本问题载体，而自带 bundle 在
+      // 运行时选型里排在 Git for Windows 之前（`runtime-provision.mjs` 的候选序），
+      // 所以只要包里带 `runtime/` 就必然走这个私有 root；Git for Windows / 系统 MSYS2 /
+      // `DSH_BASH_PATH` / `config.bashPath` 自己会把 HOME 映射到用户目录，一律不动。
+      //
+      // 传 Windows 形式即可：MSYS 会自己转成 POSIX（`C:\Users\x` ↔ `/cygdrive/c/Users/x`）。
+      // 有意要隔离 home 的场景用 `DSH_BASH_HOME` 显式指定（CHANGELOG 条目里有用法说明）。
+      if (process.platform === 'win32' && runtimeSource === 'bundled') {
+        env.HOME = process.env.DSH_BASH_HOME
+          || process.env.USERPROFILE
+          || (process.env.HOMEDRIVE && process.env.HOMEPATH ? process.env.HOMEDRIVE + process.env.HOMEPATH : '')
+          || homedir()
+      }
       const pathKey = Object.keys(env).find(key => key.toLowerCase() === 'path')
       const oldPath = pathKey ? env[pathKey] : ''
       for (const key of Object.keys(env)) if (key.toLowerCase() === 'path') delete env[key]

@@ -257,9 +257,27 @@ export class RefreshTokenExpiredError extends Error {
  * 与 User-Agent 两个身份标识。**必须**由调用方传入，否则 WorkBuddy 会发出
  * `X-Product-Code: codebuddy` 的请求。
  */
-export async function fetchModels(credential, fetcher = fetch, signal, product = CODEBUDDY) {
-    if (credential.access_token.length === 0)
+export async function fetchModels(credential, fetcher = fetch, signal, product = CODEBUDDY, 
+/**
+ * 各来源成败的**出参**（issue IKJVTF，审计 I3）。
+ *
+ * ⚠️ 用出参而非改返回值：既有调用方与单测都按「返回数组」用，改形状会波及它们；
+ * 完整性只对**适配器**有意义（它决定要不要永久缓存）。不传即行为不变。
+ *
+ * ⚠️ 本函数是**两个**端点的并集（scoped + `/v3/config`），且它自己的注释就写明
+ * 两集合 id 不同（`hy4-preview-f` 只在 config）—— 故「一个成功、一个失败」
+ * 是**常态**，不是异常。旧判据 `models.length > 0` 会把它当成完整 ⇒ 永久缓存
+ * ⇒ 那个免费变体的促销倍率（`creditsRate`）再也回不来（用户报障原话：
+ * 「hy4 preview 现在 ide 是免费我们还是 0.29」）。
+ */
+outcome) {
+    if (credential.access_token.length === 0) {
+        if (outcome !== undefined) {
+            outcome.scopedOk = false;
+            outcome.configOk = false;
+        }
         return [];
+    }
     const headers = {
         ...credentialAuthHeaders(credential),
         // credentialAuthHeaders 内置 CodeBuddy 的 UA/域名，这里按产品覆盖。
@@ -281,6 +299,8 @@ export async function fetchModels(credential, fetcher = fetch, signal, product =
     // 返回 500 或空列表），故失败时回退到 /v3/config，仍失败则由调用方回退
     // 静态目录。三层回退保证任何一层可用都能给出模型列表。
     const scoped = await requestScopedModels(credential, headers, fetcher, signal, product);
+    if (outcome !== undefined)
+        outcome.scopedOk = scoped !== undefined;
     if (scoped !== undefined) {
         // ⚠️ **两个端点下发的模型 id 集合不同，必须取并集。**
         //
@@ -297,6 +317,11 @@ export async function fetchModels(credential, fetcher = fetch, signal, product =
         // 它带更完整的元数据），同时取其促销表。任何失败都不影响模型列表 ——
         // 促销与补充模型都只是增强。
         const config = await requestConfig(headers, fetcher, signal, product);
+        // ⚠️ `requestConfig` 失败时**静默**返回空快照（它是「展示增强」），
+        // 故完整性必须由**它自己的** `ok` 字段上报，不能靠「快照是否为空」反推：
+        // 上游真的没有促销时 `promotions` 也是空的。
+        if (outcome !== undefined)
+            outcome.configOk = config.ok;
         const merged = mergeRemoteModels(scoped, config.models);
         return config.promotions.size === 0 ? merged : applyPromotions(merged, config.promotions);
     }
@@ -306,9 +331,14 @@ export async function fetchModels(credential, fetcher = fetch, signal, product =
         const { status, body } = await request('GET', url, headers, {
             fetcher, timeoutMs: REQUEST_TIMEOUT_MS, ...signal !== undefined ? { signal } : {},
         });
-        if (status !== 200)
+        if (status !== 200) {
+            // scoped 已失败、config 也失败 ⇒ 两者皆 false（调用方会回退静态目录）。
             return [];
-        return parseModelsFromConfig(body);
+        }
+        const models = parseModelsFromConfig(body);
+        if (outcome !== undefined)
+            outcome.configOk = true;
+        return models;
     }
     catch {
         return [];
@@ -326,6 +356,10 @@ function mergeRemoteModels(primary, extra) {
     const known = new Set(primary.map((model) => model.id));
     return [...primary, ...extra.filter((model) => !known.has(model.id))];
 }
+/** 两个来源是否**都**取到了。 */
+export function isBuddyCatalogComplete(outcome) {
+    return outcome.scopedOk && outcome.configOk;
+}
 /**
  * 取 `/v3/config` 的模型与促销表。
  *
@@ -333,7 +367,7 @@ function mergeRemoteModels(primary, extra) {
  * 任何失败都返回空快照 —— 它们是展示增强，不该让整个模型列表失败。
  */
 async function requestConfig(headers, fetcher, signal, product) {
-    const empty = { models: [], promotions: new Map() };
+    const empty = { models: [], promotions: new Map(), ok: false };
     try {
         const { status, body } = await request('GET', `${product.endpoint}${CONFIG_PATH}`, headers, {
             fetcher, timeoutMs: REQUEST_TIMEOUT_MS, ...signal !== undefined ? { signal } : {},
@@ -346,6 +380,7 @@ async function requestConfig(headers, fetcher, signal, product) {
         return {
             models: parseModelsFromConfig(body),
             promotions: parsePromotions(data),
+            ok: true,
         };
     }
     catch {

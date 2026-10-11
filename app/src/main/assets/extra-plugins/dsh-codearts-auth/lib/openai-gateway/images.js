@@ -14,6 +14,29 @@
  * DSH 侧 `ImageBlock` 是 `{ type: 'image', attachment: ImageAttachmentRef }`
  * —— **不是** OpenAI 的 data URL，这正是初版网关无法转发图片的原因。
  *
+ * ## ⚠️ 客户端可能**根本不发**图片（ZCode 的会话级行为，真机报障 2026-10-02）
+ *
+ * 现象：同一个 ZCode、同一张图，DSH Web 直连能识图、ZCode 走本网关却
+ * 「读不出图像数据」，而 ZCode 走 anthropic 端点又能识图 —— 看似协议问题，
+ * 实则**与协议无关**。
+ *
+ * 真实原因：ZCode 在**会话创建时**按当时的模型能力把图片定成两种形态之一，
+ * 之后**不随换模型重新评估**（源码依据见
+ * `ZCode-official/.../core/src/runtime/helpers/conversation.ts:193` 的
+ * `isPastedInlineImageAttachment`）：
+ * - `contentBlock.source.kind === 'inline'` → 真内联，发 `image_url`；
+ * - 否则退化成**文本占位符** `[Attached image/jpeg: <本地路径>]`。
+ *
+ * 而真正发请求的 `@ai-sdk/openai-compatible` 只在 `type: 'file'` 且
+ * `mediaType` 以 `image/` 开头时才产出 `image_url` ——
+ * 占了文本形态，网关就永远收不到图片。
+ *
+ * **复现/规避**：用声明了图片能力的模型（`GET /v1/models` 的 `input` 含
+ * `image`）**新开会话**；换模型不会让已有会话恢复内联发图。
+ *
+ * ⚠️ **不要**在这里兼容占位符形态 —— 那等于按客户端指定的任意路径读取本机
+ * 文件，API 一暴露到网络即成任意文件读取漏洞。
+ *
  * ## 只支持 data URL（用户决定）
  *
  * 外部 http(s) 图片**明确拒绝**而不是由网关去下载：那需要在网关里发起出站

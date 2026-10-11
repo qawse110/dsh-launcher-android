@@ -1,14 +1,22 @@
 /**
  * ZCode 认证/凭据服务（`ctx.zcodeAuth`）。
  *
+ * ## 凭据的**唯一**来源：插件自己的授权流
+ *
+ * 用户在 Jet Hub 面板点「添加账号」→ 走官方 CLI 设备授权流
+ * （`zcode-login.ts`）→ 凭据写进 `ctx.credentials`。
+ * **不读取本机 ZCode 客户端的任何数据**（2026-10-05 决策，理由见
+ * `zcode.ts` 文件头）。
+ *
  * ## 与其它 auth 服务的关键差异
  *
- * 其它 `ctx.xxxAuth` 管「浏览器登录 → 拿 token → 续期」。
- * ZCode **没有登录流程** —— 用户在官方 ZCode 客户端里登录一次，
- * 凭据就落在磁盘上（`~/.zcode/v2/credentials.json`，AES-256-GCM 加密）。
+ * 其它 `ctx.xxxAuth` 管「浏览器登录 → 拿 token → **续期**」。
+ * ZCode 的凭据是**静态**的（JWT 的 payload 里没有 `exp`）⇒ **不可续期**，
+ * 失效时上游回 401/1002，由适配器归为 AUTH 提示用户重新登录。
+ *
  * 本服务的职责是：
  *
- * 1. **读凭据**：解密磁盘凭据（`zcode.ts`）—— **不需要任何实例在跑**
+ * 1. **登录与存凭据**（`startLogin` / `login`），含顺带换取 coding-plan key
  * 2. **探活**：凭据是否可用（能不能拿到额度）
  * 3. **额度**：`billing/balance`
  * 4. **签到**：补激活上报 → preview → claim（每个 plan 单独 mint captcha）
@@ -29,9 +37,9 @@
  * 与其余 provider 一致：登录/状态/额度/签到全部在 Jet Hub 面板完成。
  */
 import { Service } from '@deepseek-ai/cordis';
-import { isUsableZcodeCredential, phoneFromUserId, readZcodeCredential, } from './zcode.js';
+import { isUsableZcodeCredential, phoneFromUserId, } from './zcode.js';
 import { ZCODE } from './zcode-product.js';
-import { ZcodeCaptchaBrowser, ZCODE_CAPTCHA_FALLBACK, validateCaptchaParam } from './zcode-captcha.js';
+import { ZcodeCaptchaBrowser, ZCODE_CAPTCHA_FALLBACK, validateCaptchaParam, } from './zcode-captcha.js';
 import { CaptchaPool, captchaPoolConfigFromEnv } from './captcha-pool.js';
 import { captchaRequirementObservability } from './captcha-requirement.js';
 import { CaptchaBackoff, captchaBackoffConfigFromEnv, captchaQueueEnabledFromEnv, CAPTCHA_CONFIG_TTL_MS } from './captcha-backoff.js';
@@ -42,6 +50,8 @@ import { captchaDemand, captchaSupplyStats, setCaptchaDemand } from './captcha-s
 import { SerialQueue } from './serial-queue.js';
 import { TtlCache } from './ttl-cache.js';
 import { generateDeviceMid, runZcodeLogin } from './zcode-login.js';
+import { fetchCodingPlanApiKey } from './zcode-transport.js';
+import { formatZcodeDiagnostic, formatZcodeUnusualActivityMessage, isZcodeUnusualActivityCode, mentionsZcodeUnusualActivity, noteZcodeRequestFailed, noteZcodeRequestOk, noteZcodeRequestSent, } from './zcode-diagnostics.js';
 import { claimZcodePlan, fetchZcodeBalance, fetchZcodeCaptchaConfig, fetchZcodeClaimablePlans, fetchZcodeModels, reportZcodeActivation, } from './zcode-upstream.js';
 /**
  * 内部载体（DSH Desktop 的 webview guest 产 param）是否**允许**参与产出。
@@ -59,11 +69,39 @@ export function internalCarrierEnabledFromEnv(env = process.env) {
     const raw = env['DSH_ZCODE_INTERNAL_CARRIER'];
     return raw === undefined || raw.trim().length === 0 ? true : raw.trim() !== '0';
 }
+/**
+ * 换取 coding-plan api-key 的**总超时**（毫秒）。
+ *
+ * ⚠ 它是 3 个只读 GET（`getCustomerInfo` → 列 `api_keys` → `copy`），
+ * 正常合计不到 1 秒。留 8 秒只为容忍慢网；**绝不能**因为它把「登录」
+ * 挂住 —— 登录完成后调用方还要接着轮询结果、发消息。
+ */
+const CODING_PLAN_KEY_TIMEOUT_MS = 8_000;
+/**
+ * 给一个 promise 加超时（超时以异常形式抛出，交给调用方记录）。
+ *
+ * ⚠ `Promise.race` 会给**每一个**输入都挂上处理器，故原 promise 之后才
+ * reject 也不会变成 unhandled rejection —— 不需要额外的 `.catch()`。
+ */
+async function withTimeout(work, ms) {
+    let timer;
+    try {
+        return await Promise.race([
+            work,
+            new Promise((_resolve, reject) => {
+                timer = setTimeout(() => reject(new Error(`超时（${String(ms)}ms）`)), ms);
+            }),
+        ]);
+    }
+    finally {
+        if (timer !== undefined)
+            clearTimeout(timer);
+    }
+}
 /** ZCode 认证服务。 */
 export class ZcodeAuth extends Service {
     product;
     fetchImpl;
-    readCredential;
     /** 注入的账号池（测试用；生产走 ctx.get）。 */
     injectedPool;
     /**
@@ -189,7 +227,6 @@ export class ZcodeAuth extends Service {
         super(ctx, options.serviceName ?? `${product.id}Auth`);
         this.product = product;
         this.fetchImpl = options.fetchImpl ?? fetch;
-        this.readCredential = options.readCredential ?? (() => readZcodeCredential());
         this.injectedPool = options.accountPool;
         this.captchaBackoff = new CaptchaBackoff({
             /**
@@ -219,31 +256,19 @@ export class ZcodeAuth extends Service {
         return this.product;
     }
     /**
-     * 读取当前凭据。
+     * 读取当前凭据（**唯一来源：插件自己存的那份**）。
      *
-     * ## 两个来源，插件自存优先
+     * ## ⚠ 不再有第二个来源（2026-10-05 用户决策）
      *
-     * 1. **插件自存**（`ctx.credentials` 的 `ZCODE_CREDENTIAL`）——
-     *    用户在 Jet Hub 里走插件内登录拿到的，**不需要官方客户端**。
-     * 2. **回退**：解密官方客户端的 `~/.zcode/v2/credentials.json` ——
-     *    让「已经装了官方客户端并登录过」的用户零操作即可用。
-     *
-     * ⚠ **每次调用都重新读**，不缓存 —— 用户刚登录完或刚在官方客户端
-     * 重新登录后，无需重启 DSH 即可生效。
+     * 旧实现会回退去解密官方客户端的 `~/.zcode/v2/credentials.json`
+     * （「装了 ZCode 就零操作可用」）。该能力**已整体删除**，理由见
+     * `src/zcode.ts` 文件头。⇒ 现在没有 ZCode 账号就是没有，
+     * UI 必须引导用户走 Jet Hub 里的登录，**不要**再暗示「装了客户端就能用」。
      *
      * 返回 `undefined` 表示「没有可用的 ZCode 登录态」。
      */
     async current() {
-        const stored = await this.readStoredCredential();
-        if (stored !== undefined)
-            return stored;
-        try {
-            return this.readCredential();
-        }
-        catch (error) {
-            this.lastError = error instanceof Error ? error.message : String(error);
-            return undefined;
-        }
+        return await this.readStoredCredential();
     }
     /**
      * 读插件自存的凭据（`ctx.credentials`）。
@@ -262,13 +287,10 @@ export class ZcodeAuth extends Service {
      * **全都读不到凭据**（它们都走本方法），表现为：
      * **能聊天（适配器读账号条目的 ref），但面板显示「未配置」、积分查不出**。
      *
-     * 这个缺口一度被「回退读官方凭据文件」掩盖 —— 装了官方客户端的机器上
-     * 现象会消失，只有**没装**的用户才会看到。
-     *
      * ⇒ 顺序：**账号池（用户的显式登录）> 单凭据 ref（回退）**。
      * 与适配器的解析顺序保持一致，避免「适配器能用而面板不能用」。
      *
-     * ⚠ 形状校验必须做：凭据存储里可能有**任何**字符串（用户手填、旧版本
+     * ⚠ **形状校验必须做**：凭据存储里可能有**任何**字符串（用户手填、旧版本
      * 残留）。`isUsableZcodeCredential` 保证后续代码拿到的是完整对象。
      */
     async readStoredCredential() {
@@ -320,211 +342,6 @@ export class ZcodeAuth extends Service {
         }
     }
     /**
-     * 该 ref 里**有没有存过任何东西**（不做形状校验）。
-     *
-     * ⚠ 与 {@link readCredentialFromRef} 的区别很关键：后者对「从未写入」和
-     * 「写进去了但 JSON 损坏 / 形状不全」**都返回 `undefined`**。若拿它当闸①
-     * 的判据，一个**已损坏但确实属于某个账号**的 ref 会被当成孤儿，被本机凭据
-     * 静默覆盖 —— 而那正是审查指出的「永久覆盖且无日志」缺陷。
-     *
-     * 这里用 `credentials.resolve` 的**存在性**（不看内容）区分两种情况，
-     * 让闸①对「有东西但坏了」**失败关闭**：调用方会 warn 让用户手动删除重登。
-     */
-    async hasStoredCredential(ref) {
-        try {
-            const resolved = await this.ctx.credentials.resolve(ref);
-            return resolved !== undefined && resolved !== null
-                && typeof resolved.value === 'string' && resolved.value.length > 0;
-        }
-        catch {
-            // resolve 抛错（存储损坏）⇒ 保守当作「有东西」，不覆盖。
-            return true;
-        }
-    }
-    /**
-     * 读**本机官方客户端**那份凭据（纯磁盘读取，不经账号池）。
-     *
-     * 供 ⑯「添加账号先复用本机已有账号」使用 —— 与 `current()` 的区别：
-     * `current()` 会**先读池**，池里任意一个可用账号都会让它短路，拿不到「磁盘上
-     * 官方客户端当前登录的是谁」。这里要的正是后者。
-     *
-     * 返回 `undefined` = 本机没有可用的官方凭据（用户没装客户端，或没登录过）。
-     */
-    async localCredential() {
-        try {
-            const credential = this.readCredential();
-            return credential !== undefined && isUsableZcodeCredential(credential) ? credential : undefined;
-        }
-        catch (error) {
-            this.lastError = error instanceof Error ? error.message : String(error);
-            return undefined;
-        }
-    }
-    /**
-     * 池里**缺凭据**的 zcode 账号中，挑第一个把本机官方凭据收编进去（最多一个）。
-     *
-     * ## 用途（⑯「点一次多一条」）
-     *
-     * `account.create` 在新建条目前先调它：若池里已经躺着一条**从未写入凭据**的
-     * 孤儿条目（用户上一次登录被进程重启打断的产物），就把本机凭据补进去复用，
-     * **而不是再加一条** —— 这正是用户报的「点了添加就多一个」。
-     *
-     * ## ⚠ 为什么只收编**一个**
-     *
-     * 孤儿条目可能有**多条**（每次被打断的登录留一条），但它们都**没有凭据**，
-     * 我们无从判断它们各自身份 —— 全填上同一份凭据会变成多条重复账号，各自
-     * 消耗同一份额度。只修第一条，其余交给用户用卡片上的「删除」按钮清理。
-     *
-     * 安全性由 {@link adoptOfficialCredential} 的**闸②**保证：若这份凭据的
-     * `user_id` 已被别的条目持有，则拒绝写入（防止跨账号覆盖）。
-     *
-     * @returns 被收编的账号 id；没有可收编的目标或闸②拦下则 `undefined`。
-     */
-    async adoptIntoOrphanAccount(pool) {
-        let candidates;
-        try {
-            candidates = pool.listAccountsByProvider(this.product.id);
-        }
-        catch {
-            return undefined;
-        }
-        for (const entry of candidates) {
-            // 只挑**真的**没有可用凭据的条目（能解析出凭据的条目绝不动）。
-            const own = await this.readCredentialFromRef(entry.credentialRef);
-            if (own !== undefined)
-                continue;
-            const adopted = await this.adoptOfficialCredential(entry.credentialRef, pool);
-            if (adopted === undefined)
-                continue;
-            // 回填昵称，让卡片上显示账号名而不是 `zcode-xxxxxxxx`。
-            const label = adopted.account_name ?? adopted.account_label;
-            if (typeof label === 'string' && label.trim().length > 0) {
-                await pool.updateAccount(entry.id, { nickname: `ZCode ${label.trim()}` }).catch(() => { });
-            }
-            return entry.id;
-        }
-        return undefined;
-    }
-    /**
-     * 把**本机官方客户端凭据**收编进指定账号的 ref（自愈 / 复用）。
-     *
-     * ## 解决的三个真实问题
-     *
-     * 1. **⑦「凭据未配置」**：用户点了「添加账号」，但后台登录 promise 被进程重启
-     *    打断 —— 条目已建、凭据从未写入（`startLogin` 的
-     *    `await this.ctx.credentials.set(...)` 没跑到）。此后该账号永远读不到凭据：
-     *    `refreshAll` 只探过期账号、适配器 `refresh` 又要求先能选到号，
-     *    互为前提、**无法自愈**。
-     * 2. **⑯ 点一次多一条**：本机明明已有一份可用凭据（官方客户端写的），
-     *    仍要新起一轮 OAuth、新建一条占位记录。
-     * 3. **`ide` 凭据无法去重**：见 `readZcodeCredential` 里补 `user_id` 的注释。
-     *
-     * ## ⚠⚠ 防「跨账号覆盖」的两道闸（这是本方法最重要的约束）
-     *
-     * `src/zcode-auth.ts` 记录过一个**真实的数据破坏缺陷**：旧 `refreshAll` 拿
-     * `current()`（= 池里第一个可用账号）去覆盖**每一个** ref，30 分钟一轮的定时器
-     * 会把账号 A 的凭据铺满整个池，抹掉其余账号。故本方法只在**两道闸都过**时才写：
-     *
-     * - 闸①：目标 ref **自己解析不出**凭据（`readCredentialFromRef` 为 `undefined`）。
-     *   能解析出就**原样返回**，绝不覆盖 —— 这是 `refreshAccountCredential` 的同款判据。
-     *   ⚠ **但「解析不出」必须再分成两种**（审查发现的缺陷）：真的从未写入 vs
-     *   写进去了但 JSON 损坏 / 形状不全。后者若被当成孤儿收编，就是**静默覆盖一份
-     *   可能还救得回来的凭据**。故这里用 `hasStoredCredential` 再判一次：
-     *   有内容但解析不出 ⇒ **失败关闭**（warn + 返回 `undefined`），让用户手动删除重登。
-     * - 闸②：本机凭据的 `user_id` **没有被池里其它账号持有**
-     *   （`findAccountIdByIdentityField` 查不到，或查到的就是目标自己）。
-     *   否则说明这份凭据是**别的账号**的，写进去就是重犯覆盖缺陷。
-     *   ⚠ `user_id` **缺失**时同样**失败关闭**：`findAccountIdByIdentityField` 会
-     *   跳过没有该字段的条目，去重判据直接失效，一次写入可能同时落进两个 ref。
-     *
-     * ## 为什么读 `readCredential()` 而不是 `current()`
-     *
-     * `current()` 会**先读池**（`readStoredCredential` → `readCredentialFromPool`）
-     * —— 那正是「A 的凭据」的来源。本方法要的是**磁盘上官方客户端那一份**，
-     * 只有 `readCredential()` 是纯磁盘读取（`readZcodeCredential`），故用它。
-     *
-     * @param refName - 目标账号的 credential ref 名。
-     * @param pool - 账号池（用于闸②的身份比对）。
-     * @returns 写入的凭据；任一闸不过则返回 `undefined`（调用方照旧走登录流程）。
-     */
-    async adoptOfficialCredential(refName, pool) {
-        const ref = refName;
-        // 闸①：该 ref 自己已有可用凭据 ⇒ 什么都不做（绝不覆盖）。
-        const own = await this.readCredentialFromRef(ref);
-        if (own !== undefined)
-            return undefined;
-        // 闸①′（审查发现的缺陷）：ref 里**有东西**但解析不出来 ⇒ 那是**损坏的凭据**，
-        // 不是孤儿条目。收编它就等于静默覆盖一份可能还救得回来的数据，故失败关闭。
-        if (await this.hasStoredCredential(ref)) {
-            this.lastError = `\`${refName}\` 里存有凭据但已损坏 / 字段不全，`
-                + '已跳过（不会覆盖它）。请在 Jet Hub 里删除该账号后重新添加。';
-            this.ctx.logger?.warn?.(`[jet-hub] zcode ${this.lastError}`);
-            return undefined;
-        }
-        // 读**磁盘上**的官方客户端凭据（不经账号池，见上面的说明）。
-        let official;
-        try {
-            official = this.readCredential();
-        }
-        catch (error) {
-            this.lastError = error instanceof Error ? error.message : String(error);
-            return undefined;
-        }
-        if (official === undefined || !isUsableZcodeCredential(official))
-            return undefined;
-        // 闸②：这份凭据的账号没被别的条目占用。
-        const userId = official.user_id;
-        if (pool !== undefined && typeof userId === 'string' && userId.length > 0) {
-            const holder = await pool.findAccountIdByIdentityField(this.product.id, 'user_id', userId);
-            if (holder.length > 0 && holder !== this.accountIdOf(refName, pool)) {
-                this.lastError = `本机官方凭据属于账号 ${holder}，不写入 ${refName}（防止跨账号覆盖）`;
-                return undefined;
-            }
-        }
-        else if (pool !== undefined && this.hasOtherZcodeAccounts(refName, pool)) {
-            /**
-             * ⚠ **闸②必须失败关闭**（审查发现的缺陷）：`user_id` 缺失时旧代码**整个跳过**
-             * 去重 —— 而 `findAccountIdByIdentityField` 本来就跳过没有该字段的条目，
-             * 于是在「老 ide 凭据 + 池里已有别的账号」这个组合下，同一份凭据会被
-             * 写进多个 ref，正是要防的跨账号覆盖。
-             *
-             * 只在**池里确实存在**其它 zcode 账号时收紧：池里只有这一个目标账号时，
-             * 「覆盖别人」在物理上不可能，此时放行以免把 ⑦ 的自愈能力也一起砍掉。
-             */
-            this.lastError = '本机官方凭据缺少 user_id，无法确认它是否属于别的账号，'
-                + `故不写入 ${refName}（防止跨账号覆盖）`;
-            this.ctx.logger?.warn?.(`[jet-hub] zcode ${this.lastError}`);
-            return undefined;
-        }
-        await this.ctx.credentials.set(ref, JSON.stringify(official));
-        return official;
-    }
-    /** 池里是否存在**除该 ref 所属账号以外**的其它 zcode 账号。 */
-    hasOtherZcodeAccounts(refName, pool) {
-        try {
-            const mine = this.accountIdOf(refName, pool);
-            return pool.listAccountsByProvider(this.product.id)
-                .some((entry) => entry.id !== mine || entry.credentialRef !== refName);
-        }
-        catch {
-            // 池异常 ⇒ 保守当作「有别的账号」（更安全：拦住写入）。
-            return true;
-        }
-    }
-    /** 由 ref 名反查它对应的账号 id（闸②用来放行「凭据就是自己的」这种情形）。 */
-    accountIdOf(refName, pool) {
-        try {
-            for (const entry of pool.listAccountsByProvider(this.product.id)) {
-                if (entry.credentialRef === refName)
-                    return entry.id;
-            }
-        }
-        catch {
-            // 池异常 ⇒ 当作查不到（更保守：闸② 会拦住写入）。
-        }
-        return undefined;
-    }
-    /**
      * 取账号池。
      *
      * ⚠ 用 `ctx.get` 而非构造注入：本服务可能在**账号池注册之前**被构造
@@ -553,8 +370,8 @@ export class ZcodeAuth extends Service {
         if (credential === undefined) {
             return {
                 available: false,
-                reason: '未找到可用的 ZCode 登录态。请在 Jet Hub 里点「添加账号」完成登录' +
-                    '（若已装官方 ZCode 客户端并登录过，本插件也会自动读取它的凭据）。',
+                reason: '未找到可用的 ZCode 登录态。请在 Jet Hub 里点「添加账号」完成登录'
+                    + '（本插件只用它自己的授权流程，不会读取本机 ZCode 客户端的登录态）。',
             };
         }
         try {
@@ -583,8 +400,9 @@ export class ZcodeAuth extends Service {
      *
      * ## 为什么这是「登录」而不是「读凭据」
      *
-     * 早期实现只是「确认磁盘上有一份官方客户端写的凭据」。那要求用户
-     * 先装并登录官方 ZCode 客户端 —— 与本插件「装完即用」的定位冲突。
+     * 早期实现**只有**「确认磁盘上有一份官方客户端写的凭据」这一条路，
+     * 那要求用户先装并登录官方 ZCode 客户端 —— 与本插件「装完即用」的
+     * 定位冲突。而现在**只剩**本方法这一条路（磁盘读取已于 2026-10-05 删除）。
      *
      * 实测确认官方 3.12.3+ 用的是**服务端中介的设备授权流**
      * （`/oauth/cli/init` → 浏览器授权 → `/oauth/cli/poll/{flow_id}`），
@@ -618,6 +436,7 @@ export class ZcodeAuth extends Service {
             const loginResult = await runZcodeLogin({
                 fetchImpl: this.fetchImpl,
                 appVersion: options.appVersion ?? this.product.appVersionFallback,
+                provider: options.provider,
                 onAuthorizeUrl: (url) => resolveUrl(url),
             });
             /** 登录成功后组装凭据，并生成**自用**的 device_mid（见下）。 */
@@ -643,7 +462,19 @@ export class ZcodeAuth extends Service {
                  * 同一账号重新登录会变（见 `zcode.ts` 的字段注释）。
                  */
                 ...loginResult.userId.length > 0 ? { user_id: loginResult.userId } : {},
-                bigmodel_access_token: loginResult.bigmodelAccessToken,
+                /**
+                 * 第三方 access token：按登录 provider 落在对应字段。
+                 *
+                 * ⚠ 两者**都可能是 `undefined`**（只会有其一），故用条件展开而不是
+                 * 直接赋值 —— 否则会给凭据写进 `bigmodel_access_token: undefined`
+                 * 这样的键。该字段只作**备用身份**，不参与推理（推理用 `zcode_jwt`）。
+                 */
+                ...loginResult.bigmodelAccessToken !== undefined
+                    ? { bigmodel_access_token: loginResult.bigmodelAccessToken }
+                    : {},
+                ...loginResult.zaiAccessToken !== undefined
+                    ? { zai_access_token: loginResult.zaiAccessToken }
+                    : {},
                 account_label: loginResult.displayName,
                 /**
                  * 账号名与脱敏手机号（供账号卡片展示，见 `src/zcode.ts` 的字段注释）。
@@ -662,8 +493,32 @@ export class ZcodeAuth extends Service {
                 app_version: options.appVersion ?? this.product.appVersionFallback,
                 source: 'plugin',
             };
-            await this.ctx.credentials.set(ref, JSON.stringify(credential));
-            return { refName: ref, credential };
+            /**
+             * ★ 登录成功后**顺手换** coding-plan 的 api-key（付费订阅腿）。
+             *
+             * ⚠ 这是 `fetchCodingPlanApiKey` 的**唯一调用点** —— 它此前建好却没人调，
+             * 导致该腿对纯插件登录用户永久不可用（见 `resolveCodingPlanKey` 的说明）。
+             *
+             * ## 字段按「拿到哪个 OAuth token」落位
+             *
+             * `zai` 渠道登录 ⇒ `zai_access_token` ⇒ 写 `coding_plan_key_zai`；
+             * `bigmodel` 渠道 ⇒ `bigmodel_access_token` ⇒ 写 `coding_plan_key_bigmodel`。
+             * 与 `zcode-transport.ts` 里 `zai ?? bigmodel` 的取值优先级一致。
+             *
+             * ⚠ **换不到不报错**：没买订阅是常态，那时 `start-plan`（免费积分）
+             * 照常可用。`resolveCodingPlanKey` 已把失败都吞成 `undefined`。
+             */
+            const codingPlanKey = await this.resolveCodingPlanKey(credential);
+            const withPlanKey = codingPlanKey === undefined
+                ? credential
+                : {
+                    ...credential,
+                    ...(credential.zai_access_token !== undefined
+                        ? { coding_plan_key_zai: codingPlanKey }
+                        : { coding_plan_key_bigmodel: codingPlanKey }),
+                };
+            await this.ctx.credentials.set(ref, JSON.stringify(withPlanKey));
+            return { refName: ref, credential: withPlanKey };
         })();
         /**
          * 若发起阶段就失败（网络/服务端拒绝），`onAuthorizeUrl` 永不触发，
@@ -683,6 +538,51 @@ export class ZcodeAuth extends Service {
         return { loginUrl, result };
     }
     /**
+     * 换取 coding-plan（**付费订阅**）通道的 api-key。
+     *
+     * ## 为什么需要这一步（真实断链，2026-10-05 修）
+     *
+     * `coding_plan_key_*` **不是登录时下发的** —— 官方用登录拿到的 OAuth
+     * access_token **现换**（逆向 `AccountProviderApiKeyResolver`，
+     * 见 `zcode-transport.ts` 的 `fetchCodingPlanApiKey`）。
+     *
+     * ⚠ 此前这条链是**断的**：`fetchCodingPlanApiKey` 建好了却**没有任何调用方**，
+     * 而两个 key 字段的**唯一**写入点是「从本机 ZCode 客户端读凭据」——
+     * 那条路已于同日删除 ⇒ **纯插件登录用户的 coding-plan 通道一直不可用**
+     * （表现为 `glm-5.3` / `glm-5.3-flash` 在通道表里 unavailable）。
+     *
+     * ⇒ 本方法把缺的那一环接上。原料是齐的：登录结果里**必然**带
+     * `zai_access_token` 或 `bigmodel_access_token`（`startLogin` 刚写进去）。
+     *
+     * ## 失败绝不牵连登录
+     *
+     * 换不到 key 只意味着「用户没买 coding-plan，或云上没有那个 key」
+     * （`reason` 会区分）—— `start-plan`（免费积分）**照常可用**。
+     * 故这里**只记日志、返回 `undefined`**，绝不抛。
+     *
+     * @returns api-key；换不到（没 token / 没订阅 / 超时 / 网络错）时 `undefined`。
+     */
+    async resolveCodingPlanKey(credential) {
+        // 没有 OAuth token 就不必发请求（`fetchCodingPlanApiKey` 自己也会回
+        // `no-oauth-token`，但这里提前短路，省掉三个无意义的函数调用与日志噪声）。
+        if (credential.zai_access_token === undefined && credential.bigmodel_access_token === undefined) {
+            return undefined;
+        }
+        try {
+            const result = await withTimeout(fetchCodingPlanApiKey(credential, this.fetchImpl), CODING_PLAN_KEY_TIMEOUT_MS);
+            if (result.key === undefined) {
+                this.ctx.logger?.warn?.(`[jet-hub] zcode coding-plan key 未换到（${result.reason ?? 'unknown'}）；`
+                    + 'start-plan 通道不受影响');
+                return undefined;
+            }
+            return result.key;
+        }
+        catch (error) {
+            this.ctx.logger?.warn?.(`[jet-hub] zcode coding-plan key 换取异常：${String(error)}；start-plan 通道不受影响`);
+            return undefined;
+        }
+    }
+    /**
      * 阻塞式登录（等待用户在浏览器完成授权）。
      *
      * ⚠ 与 `startLogin` 的区别：这个会**等到授权完成**才返回。
@@ -694,10 +594,7 @@ export class ZcodeAuth extends Service {
         return await started.result;
     }
     /**
-     * 把**当前可用凭据**（插件自存或官方文件）写进 `ctx.credentials`。
-     *
-     * 用途：把「官方客户端已登录」的状态**固化**成插件自存凭据，
-     * 使其后即便官方客户端被卸载也能继续用。
+     * 把**当前可用凭据**（插件自存）写进 `ctx.credentials`。
      *
      * ⚠ 若已有插件自存凭据，本方法会**覆盖**它 —— 调用方需自行确认
      * （Jet Hub 的「添加账号」在已有账号时不会走到这里）。
@@ -705,8 +602,7 @@ export class ZcodeAuth extends Service {
     async persistCurrent(refName) {
         const credential = await this.current();
         if (credential === undefined) {
-            throw new Error('ZCode 凭据不可用：请在 Jet Hub 里点「添加账号」完成登录' +
-                '（若已装官方 ZCode 客户端并登录过，本插件也会自动读取它的凭据）。');
+            throw new Error('ZCode 凭据不可用：请在 Jet Hub 里点「添加账号」完成登录。');
         }
         const ref = (refName ?? this.product.defaultCredentialRef);
         /**
@@ -909,18 +805,26 @@ export class ZcodeAuth extends Service {
      * ⚠ 载体链**禁用**（内部 param 被上游拒到阈值）时同样落注入的链 —— 归因纪律见
      *   `src/captcha-carrier.ts` 文件头。
      *
+     * ## ⚠ `config` 必须**原样透传**给注入链（真实缺陷，Gitee issue IKJNPS）
+     *
+     * 注入链（`zcode.mintCaptcha`）拿到的 config 决定 param 由**哪个 region** 签发，
+     * 而请求头里的 region 取自**同一份**（`claimDailyWith` 解析的那次）。
+     * 这里若「顺手再拉一次配置」或干脆不传，两跳之间（60 秒 TTL 里服务端换 region
+     * 也可能）就会漂成两份真相，稳定复现成 `3007` —— 而 param 与 region 不同源
+     * 时**重试多少次都没用**，它不是概率问题。
+     *
      * ## ★ 返回值带 `source`（评审 C4）
      * 领取端点 `/zcode-plan/billing/claim` **始终索要** captcha（实测：带非法与不带都
      * `400/3007`，且校验**前置于** plan 校验）⇒ 内部 param 在这条路径上被拒的概率
      * 比推理路径高得多，必须能归因。`claimDailyWith` 靠这个 `source` 决定
      * 「记一次 internalRejected + 当次换注入链重发一次」（见那里）。
      */
-    async mintClaimCaptcha(injected) {
+    async mintClaimCaptcha(injected, config) {
         if (injected === undefined) {
-            return { param: await this.mintWithChromium(), source: 'chromium' };
+            return { param: await this.mintWithChromium(config), source: 'chromium' };
         }
         if (!this.internalCarrierAvailable() || !captchaDemand()) {
-            return { param: await injected(), source: 'chromium' };
+            return { param: await injected(config), source: 'chromium' };
         }
         return await this.carrier.mint();
     }
@@ -986,7 +890,15 @@ export class ZcodeAuth extends Service {
         this.captchaPool ??= new CaptchaPool({
             mint: async (options) => {
                 try {
-                    this.captchaBrowser ??= new ZcodeCaptchaBrowser();
+                    /**
+                     * ⚠ `log` 接线：候选链落到系统 Edge 时会告警一次（issue IKJLB1）。
+                     * 之前是**静默**选中的，用户既不知道用了哪个浏览器、也不知道该去哪换。
+                     * 用 `warn` 而非 `error` —— captcha 只是领取路径的一环，失败由下面的
+                     * catch 正常上报，不该在正常降级时刷错误级日志。
+                     */
+                    this.captchaBrowser ??= new ZcodeCaptchaBrowser({
+                        log: (message) => { this.ctx.logger?.warn?.(message); },
+                    });
                     const outcome = await this.captchaBrowser.mintWithOutcome(this.captchaMintConfig ?? ZCODE_CAPTCHA_FALLBACK, options);
                     /**
                      * ★ **观测**（对齐官方 `mnn` 的上报口径）：
@@ -1077,8 +989,12 @@ export class ZcodeAuth extends Service {
      * 用**给定凭据**领取每日额度（Jet Hub 逐账号领取时用）。
      *
      * 与 {@link claimDaily} 的区别同 {@link fetchBalanceFor}。
+     *
+     * ⚠ `captchaRegion` **不要传**：省略即跟随「本次 mint 用的那份配置」
+     * （真实缺陷，Gitee issue IKJNPS —— 传兜底常量 `cn` 会让非 cn 区账号恒 `3007`）。
+     * 保留它只是为了在特殊场景显式覆盖，正常入口一律省略。
      */
-    async claimDailyFor(credential, mintCaptcha, captchaRegion = ZCODE_CAPTCHA_FALLBACK.region) {
+    async claimDailyFor(credential, mintCaptcha, captchaRegion) {
         return await this.claimDailyWith(credential, mintCaptcha, captchaRegion);
     }
     /**
@@ -1211,8 +1127,11 @@ export class ZcodeAuth extends Service {
      *
      * 服务端对「已领取过」回 `code:1003`。把它当失败会让定时任务
      * 反复误报 —— 这与 Buddy / Qoder 的幂等语义一致。
+     *
+     * ⚠ `captchaRegion` 与 {@link claimDailyFor} 同款：**省略即跟随配置**，别传兜底常量
+     * （真实缺陷，Gitee issue IKJNPS）。
      */
-    async claimDaily(mintCaptcha, captchaRegion = ZCODE_CAPTCHA_FALLBACK.region) {
+    async claimDaily(mintCaptcha, captchaRegion) {
         const credential = await this.current();
         if (credential === undefined) {
             return [{ kind: 'failed', code: -1, message: '未找到可用的 ZCode 登录态' }];
@@ -1244,6 +1163,21 @@ export class ZcodeAuth extends Service {
      * ⚠ 需求位是**进程级**的位，`finally` 漏写就是「client 无限定地产 param」的最坏形态
      *   （阿里云同设备每小时 150 次，见 `src/captcha-backoff.ts`）
      *   —— 故由 `tests/unit/zcode-carrier-auth.spec.ts` 的源码用例 + 行为用例双向锁死。
+     *
+     * ## ★★ region 与 param **必须来自同一份配置**（真实缺陷，Gitee issue IKJNPS）
+     *
+     * 阿里云验签把 param 与 `x-aliyun-captcha-verify-region` **成对**校验，
+     * 不一致即 `400 / 3007`。而 region 由**服务端**下发（`client/configs`，
+     * 本仓库作者所在账号是 `cn`，z.ai 国际渠道实测是 **`sgp`**），
+     * 把它写成本地兜底常量只会在 cn 区账号上「碰巧正确」。
+     *
+     * 修复前的形态是**两份真相**：`jet-hub-rpc.ts` 的注入回调自己
+     * `fetchCaptchaConfig()` 拿配置产 param，而 region 走本方法的**默认参数**
+     * `ZCODE_CAPTCHA_FALLBACK.region` ⇒ 非 cn 区账号 100% 领不到
+     * （用户报障：15/15 全部 3007；同账号改用配置里的 region 后立即成功 +100M）。
+     *
+     * ⇒ 这里解析**一次**配置，region 从它取、并把它传给注入回调：
+     * 「产 param 的那份」与「写 region 的那份」从此是**同一个对象**。
      */
     async claimDailyWith(credential, mintCaptcha, captchaRegion) {
         try {
@@ -1267,49 +1201,49 @@ export class ZcodeAuth extends Service {
             if (plans.length === 0) {
                 return [{ kind: 'already-claimed', message: '今日暂无可领额度（服务端按日刷新）' }];
             }
+            /**
+             * ★ 本次领取用的 captcha 配置 —— **param 与 region 的唯一真相源**。
+             *
+             * ⚠ 放在「没有可领 plan」判断**之后**：那条路不需要 param，
+             *   多发一次 `client/configs`（它有 60 秒 TTL，但首次仍是实打实一跳）
+             *   去换一份用不上的配置没有意义。
+             * ⚠ `fetchCaptchaConfig()` 会把网络异常**抛出来**（`TtlCache` 的语义是
+             *   「失败不缓存、向上抛」），这里必须兜住：配置只是「region/prefix/sceneId」，
+             *   拉不到就用兜底值继续，绝不该把整个领取变成一条看不懂的失败。
+             * ⚠ 同时落进 `captchaMintConfig`：`CaptchaCarrier` 那条 chromium 兜底腿
+             *   （`carrier` 字段注释）是读这个字段的 ⇒ 载体链产出的 param 与这里的
+             *   region 也同源，不必让它自己再拉一次。
+             */
+            const captchaConfig = await this.fetchCaptchaConfig().catch(() => undefined) ?? ZCODE_CAPTCHA_FALLBACK;
+            this.captchaMintConfig = captchaConfig;
+            const region = captchaRegion ?? captchaConfig.region;
+            /**
+             * ★★ 领取路径的诊断埋点与 `3012` 文案（Gitee issue IKJOQB）。
+             *
+             * 此前领取路径对 `3012` **既没有专门文案、也没有任何埋点** ——
+             * 用户看到裸上游串、看不到「请勿连续重试」（该错误有账号冷却惩罚）。
+             * 完整论证见 `toClaimOutcome` 的 `3012` 分支与
+             * {@link resolveClaimAccountId}；这里只记三件与**本方法**有关的事：
+             *
+             * ① 三笔账（sent/ok/failed）按账号记在**每一发**上（含 3007 换链的重发）；
+             * ② 账号标识取**池条目 id**，与推理路径合并同一份画像；
+             * ③ 命中 `3012` 必须**短路**（见下）。
+             */
+            const accountId = await this.resolveClaimAccountId(credential);
             const outcomes = [];
             for (const plan of plans) {
-                try {
-                    // ⚠ 每个 plan 单独 mint（captcha 一次性）：内部载体优先，等不到即那条 chromium 链。
-                    const minted = await this.mintClaimCaptcha(mintCaptcha);
-                    const outcome = await claimZcodePlan(credential, plan.planId, { param: minted.param, region: captchaRegion }, this.fetchImpl);
-                    /**
-                     * ★ **评审 C4：claim 接上 3007 降级链**（此前只有推理路径有，领取这条**最需要**它的路径反而没有）。
-                     *
-                     * ## 为什么领取上尤其严重
-                     * `/zcode-plan/billing/claim` **始终**索要 captcha，且校验**前置于** plan 校验
-                     * （实测：带非法 captcha 与不带 captcha 都回 `400/3007`）⇒ 内部 param 在这里
-                     * 被拒的概率比推理路径高得多。少了这段，用户看到的就是「一键领取直接失败」，
-                     * 而失败原因只有一个干巴巴的 `3007`。
-                     *
-                     * ## 三条纪律
-                     * 1. **只按 `minted.source === 'internal'` 归因**：chromium 的 param 被拒是
-                     *    「时效 / 设备信誉」问题（`CaptchaBackoff` 管的那本账），不许记到载体头上；
-                     * 2. **重发上限一次**：`retried` 标志在本 plan 循环内，重发后**无论成不成**都收工
-                     *    —— 再撞 `3007` 就如实失败。再试下去只是白扣设备级配额（阿里云同设备 150 次/小时），
-                     *    而且「已经换过 chromium 还是 3007」这件事**本身就是**给用户的诊断信息；
-                     * 3. **禁用计数走既有语义**：记一次 `internalRejected`，到阈值由
-                     *    `CaptchaCarrier` 判本次运行禁用（见 `noteInternalRejection`）。
-                     *    「窗口结束时推进」与「当场推进」等价 —— 计数是**累计**的，窗口边界不影响它。
-                     *
-                     * ⚠ 重发用**注入链**（`mintCaptcha`，即 `jet-hub-rpc.ts` 注入的那条：
-                     *   现取 captcha 配置 → `zcode.mintCaptcha`），不是 `carrier` 里那条腿 ——
-                     *   claim 的 param 一贯由注入链产出，兜底也该走同一条，别在领取路径上偷换来源。
-                     */
-                    if (outcome.code === 3007 && minted.source === 'internal') {
-                        this.carrier.noteInternalRejection();
-                        outcomes.push(await this.retryClaimWithInjectedChain(credential, plan.planId, mintCaptcha, captchaRegion));
-                        continue;
-                    }
-                    outcomes.push(toClaimOutcome(outcome, plan.planId));
-                }
-                catch (error) {
-                    outcomes.push({
-                        kind: 'failed',
-                        code: -1,
-                        message: `${plan.planId}: ${error instanceof Error ? error.message : String(error)}`,
-                    });
-                }
+                /**
+                 * ⚠ 单个 plan 的整段逻辑（mint → 首发 → 3007 换链重发 → 3012 短路判定）
+                 * 抽在 {@link claimOnePlan} 里：它自带 `try/catch`、且**返回「是否要继续
+                 * 下一个 plan」**。留在本方法里会让编排逻辑与单发逻辑混在一起，
+                 * 使本方法超出「单一职责」并撞上源码切片护栏（实测 9246 > 8000）。
+                 */
+                const step = await this.claimOnePlan({
+                    plan, credential, accountId, mintCaptcha, captchaConfig, region,
+                });
+                outcomes.push(step.outcome);
+                if (!step.continueWithNextPlan)
+                    break;
             }
             return outcomes;
         }
@@ -1338,6 +1272,146 @@ export class ZcodeAuth extends Service {
         }
     }
     /**
+     * 领取**单个 plan** 的完整一步：mint → 首发 → 3007 换链重发 → 判定是否短路。
+     *
+     * ## 为什么抽成独立方法
+     *
+     * 它自带 `try/catch`，并**返回「是否继续下一个 plan」** —— 这两个都是
+     * 「单发」的概念，不属于编排层。留在 {@link claimDailyWith} 的循环里会让
+     * 那个方法同时承担编排与单发两种职责，并撞上源码切片护栏
+     * （`tests/unit/zcode-close-chromium.spec.ts` 断言其源码切片 < 8000 字符；
+     * 混写时实测 9246）。
+     *
+     * ## ★★ 3012 短路**只在这里判断一次**（真实缺陷，2026-10-05）
+     *
+     * 首发的 `3007` 会触发换链重发，而**短路检查曾位于该换链之前**，
+     * 于是重发那一发**绕过**了短路。桩测实测（两个 plan，首发 3007 ⇒ 重发 3012）：
+     *
+     * ```
+     * claims=3 outcomes=2   → 被风控的账号继续发了下一个 plan 并成功领取
+     * ```
+     *
+     * 即「一次点击连续触发多次风控」这条**恰在最需要它的场景下失效** ——
+     * 上游先因 captcha 拒、再因风控拒，正说明它已在盯这个账号。
+     * ⇒ 现在换链的结果**写回 `outcome`**，再由**唯一一处** `isClaimUnusualActivity`
+     * 判定短路，首发与重发天然共用，结构上不可能再漏。
+     *
+     * @returns `outcome` 本条结果；`continueWithNextPlan` 为 `false` 时调用方须 `break`
+     *   （即命中 `3012` 风控 —— **不要再发下一个 plan**，那会加重冷却惩罚）。
+     */
+    async claimOnePlan(input) {
+        const { plan, credential, accountId, mintCaptcha, captchaConfig, region } = input;
+        try {
+            // ⚠ 每个 plan 单独 mint（captcha 一次性）：内部载体优先，等不到即那条 chromium 链。
+            const minted = await this.mintClaimCaptcha(mintCaptcha, captchaConfig);
+            /**
+             * ★ 「已发出」必须在 **mint 之后**记（真实缺陷，2026-10-05 自审发现）。
+             *
+             * `mintClaimCaptcha` 会**抛错**：注入链撞上退避冷却时会如实上抛
+             * （见 {@link retryClaimWithInjectedChain} 与 `mintCaptchaAfterRejection`）。
+             * 若把本行放在 mint **之前**，那次抛错就会留下**一次没有对应上游请求的
+             * `sent`**：① 失败计数少记（异常直接跳 `catch`）；②「距上条」的分母被一个
+             * **从未发出**的请求占用，下一次真实请求的间隔会算成「距那次失败」而不是
+             * 「距上一条真实请求」—— 正是 issue 要回答的「是否频率风控」被污染。
+             *
+             * ⚠ 与 {@link retryClaimWithInjectedChain} 的顺序**必须一致**（那里也是先
+             *   `await injected(...)` 再记 sent）—— 两处不一致就是同型缺陷写两遍。
+             * ⚠ `claimZcodePlan` 在**网络异常与读体异常**时**不抛**（内部都兜成
+             *   `ok:false` 的返回），故 `sent` 与 `ok`/`failed` 在此之后是**配平**的。
+             *   ⚠ 措辞别说成「自身绝不抛」：对抗性审计证伪过那个绝对断言 ——
+             *   若 `fetch` 返回**非 Response**（如 `null`），属性访问会同步抛
+             *   （真实 `fetch` 不会如此，生产影响≈0，且 `zcode-upstream.ts` 现已
+             *   把读体整段包住）。这里依赖的只是「网络/读体异常不抛」这条**较弱**前提。
+             */
+            const claimStartedAt = Date.now();
+            noteZcodeRequestSent(accountId, claimStartedAt);
+            let outcome = await claimZcodePlan(credential, plan.planId, { param: minted.param, region }, this.fetchImpl);
+            /** 本 plan 是否已走过「3007 换链重发」（只影响 3007 的文案措辞）。 */
+            let internalRetried = false;
+            /**
+             * 渲染诊断用的「本次出发时刻」。
+             *
+             * ⚠⚠ 重发后**必须换成重发的时刻** —— 若仍用首发的 `claimStartedAt`，
+             * `previousSentAt`（= 首发时刻）与诊断的 `sentAt` 又会相等 ⇒
+             * 「距上条」**再一次**变成 `0ms`（该缺陷的第二个实例，实测抓到过）。
+             */
+            let diagnosticSentAt = claimStartedAt;
+            if (outcome.ok) {
+                noteZcodeRequestOk(accountId, Date.now());
+            }
+            else {
+                noteZcodeRequestFailed(accountId);
+            }
+            /**
+             * ★ **评审 C4：claim 接上 3007 降级链**（此前只有推理路径有，领取这条**最需要**它的路径反而没有）。
+             *
+             * ## 为什么领取上尤其严重
+             * `/zcode-plan/billing/claim` **始终**索要 captcha，且校验**前置于** plan 校验
+             * （实测：带非法 captcha 与不带 captcha 都回 `400/3007`）⇒ 内部 param 在这里
+             * 被拒的概率比推理路径高得多。少了这段，用户看到的就是「一键领取直接失败」，
+             * 而失败原因只有一个干巴巴的 `3007`。
+             *
+             * ## 三条纪律
+             * 1. **只按 `minted.source === 'internal'` 归因**：chromium 的 param 被拒是
+             *    「时效 / 设备信誉」问题（`CaptchaBackoff` 管的那本账），不许记到载体头上；
+             *    而 `source === 'chromium'` 本身就说明**载体链本轮没参与**
+             *    （web 版 `supplied` 恒 0、或 env 关掉了），**没有第二条链可换** ——
+             *    「chromium 被拒也重试一次」只会白扣同设备每小时 150 次那份配额，
+             *    且换一个 chromium param 面对同一个服务端判定，期望收益极低；
+             * 2. **重发上限一次**：本方法一个 plan 只走一遍，重发后**无论成不成**都收工
+             *    —— 再撞 `3007` 就如实失败。再试只是白扣设备级配额（阿里云同设备 150 次/小时），
+             *    且「已经换过 chromium 还是 3007」**本身就是**给用户的诊断信息；
+             * 3. **禁用计数走既有语义**：记一次 `internalRejected`，到阈值由
+             *    `CaptchaCarrier` 判本次运行禁用（见 `noteInternalRejection`）。
+             *
+             * ⚠ 重发用**注入链**（`mintCaptcha`），不是 `carrier` 里那条腿 ——
+             *   claim 的 param 一贯由注入链产出，兜底也该走同一条。
+             * ⚠ 重发**沿用同一份配置**（`captchaConfig`）：换 param 不换配置，region
+             *   也就不变 —— 否则重发会亲手制造出「param 与 region 不同源」。
+             */
+            if (outcome.code === 3007 && minted.source === 'internal') {
+                this.carrier.noteInternalRejection();
+                internalRetried = true;
+                const retried = await this.retryClaimWithInjectedChain(credential, plan.planId, mintCaptcha, captchaConfig, region, { accountId });
+                // ★ 写回（不是直接返回）⇒ 下面的短路判定天然覆盖重发这一发。
+                outcome = retried.outcome;
+                diagnosticSentAt = retried.sentAt;
+            }
+            const mapped = toClaimOutcome(outcome, plan.planId, {
+                plan, accountId, sentAt: diagnosticSentAt, status: outcome.httpStatus, internalRetried,
+            });
+            /**
+             * ★★ 命中 `3012`（风控）⇒ **终止本账号的领取，不再发后续 plan**。
+             *
+             * `3012` 是**账号级**风控且有**冷却惩罚**（30 分钟起步，反复触发升级到
+             * 24 小时乃至停用）。而 `preview` 通常下发多个 plan ⇒ 不短路就是
+             * 「一次点击连续触发 N 次风控」，亲手把 30 分钟推成 24 小时。
+             *
+             * ⚠ 判断的是**换链之后**的 `outcome`，故首发与重发两条路径都被覆盖。
+             * ⚠ 与 `3007` 方向**相反**，别合并：`3007` 换个新 param 就能过；
+             *   `3012` 再发一次只会更糟。
+             * ⚠ 只跳过**剩余 plan**，不影响其它账号（RPC 的「一键领取」是逐账号循环）
+             *   —— issue 的实测正是「5 个走通、只有 1 个被拦」。
+             */
+            if (isClaimUnusualActivity(outcome)) {
+                this.carrierLog?.(`zcode: 账号 ${accountId ?? '-'} 被上游风控拦截（3012）⇒ 本账号停止领取 `
+                    + `（重试会加重冷却惩罚：30 分钟 → 24 小时 → 停用）`);
+                return { outcome: mapped, continueWithNextPlan: false };
+            }
+            return { outcome: mapped, continueWithNextPlan: true };
+        }
+        catch (error) {
+            return {
+                outcome: {
+                    kind: 'failed',
+                    code: -1,
+                    message: `${plan.planId}: ${error instanceof Error ? error.message : String(error)}`,
+                },
+                continueWithNextPlan: true,
+            };
+        }
+    }
+    /**
      * ★ 评审 C4 的那一次重发：用**注入链**产一个新 param 重发同一个 plan（上限一次）。
      *
      * ## 为什么单独抽一个方法（而不是塞进循环里）
@@ -1351,24 +1425,118 @@ export class ZcodeAuth extends Service {
      * 前者意味着**这台机器的设备信誉有问题**（上游把无感验证降级了），
      * 继续点只会更糟；后者可能只是这一发赶上了什么。`toClaimOutcome` 的
      * `internalRetried` 开关就是干这个的。
+     *
+     * ## ⚠ 重发**不重新取配置**（issue IKJNPS 的同一条纪律）
+     * 换的是 param，不是 region。config 与 `captchaRegion` 都由调用方
+     * （`claimDailyWith`）原样传进来 —— 保持「param 与 region 同源」这件事
+     * **贯穿整个领取窗口**，包括这一次重发。
+     *
+     * @param diagnostics 诊断现场（Gitee issue IKJOQB）—— 重发这一发**同样是
+     *   一次真实的上游请求**，`sent` / `ok` / `failed` 三笔账都要记到同一个账号上，
+     *   否则 issue 要的「本进程 成功 N/失败 M」会漏掉这一类失败。
+     *
+     *   ⚠⚠ **只传 `accountId`，`sentAt` 由本方法自己取**（不是沿用首发的）。
+     *   `noteZcodeRequestSent(id, sentAt)` 的 `sentAt` 语义是「**本次**出发时刻」，
+     *   而 `previousSentAt` 是「上一条」的分母。若把**首发**的时刻当作重发的
+     *   出发时刻传进来，`previousSentAt` 会被写成首发时刻 == 本次 ⇒
+     *   `formatZcodeDiagnostic` 算出 `距上条 0ms`，「距上一条请求隔多久」
+     *   这一项**永久失去信息量**（实测复现过，见下）。
+     *
+     *   ⚠ 这不是理论风险：把 `sentAt` 写成首发的值后，探针实测诊断行是
+     *   `… · 距上条 0ms · HTTP 405`，而正确值应是「首发到上一条真实请求」的间隔。
+     *   本仓库在推理侧为同一个坑写过专门用例
+     *   （`tests/unit/zcode-diagnostics.spec.ts` 的「距上条算的是**上一条**请求」），
+     *   这里若传首发时刻就是**同型缺陷的第二次实例**。
      */
-    async retryClaimWithInjectedChain(credential, planId, injected, captchaRegion) {
+    async retryClaimWithInjectedChain(credential, planId, injected, captchaConfig, captchaRegion, diagnostics) {
         if (injected === undefined) {
             // 走到这里必然有注入链（`claimDailyWith` 开头就为 undefined 早退了）；
             // 仍写成显式分支：真出现时如实失败，别给一个 undefined param 发出去。
             return {
-                kind: 'failed',
-                code: 3007,
-                message: `captcha 被拒且没有可用的备用产出链（${planId}），请重试`,
+                outcome: {
+                    planId,
+                    ok: false,
+                    code: 3007,
+                    message: 'captcha 被拒且没有可用的备用产出链，请重试',
+                },
+                sentAt: Date.now(),
             };
         }
         this.carrierLog?.('zcode: 领取时内部载体的 captcha 被拒（3007）⇒ 当次改用注入的浏览器链路重发一次');
-        const param = await injected();
+        const param = await injected(captchaConfig);
+        /**
+         * ⚠ 取**本发自己的**出发时刻（在真正发请求之前），理由见上面的 `@param`。
+         *   这也是它与首发之间真实间隔的来源 —— 注入链产 param 是秒级操作，
+         *   诊断里「距上条」因此会显示成首发到重发的真实间隔，而不是 0。
+         *
+         * ⚠⚠ 它**必须**回传给调用方拿去渲染诊断（返回值里的 `sentAt`）：
+         *   主循环若仍用**首发**的 `claimStartedAt` 做诊断，`previousSentAt`
+         *   （= 首发时刻）与诊断的 `sentAt` 又会相等 ⇒ 「距上条」**再一次**变成
+         *   `0ms`。这正是本缺陷的第二个实例，写用例时实测抓到了
+         *   （`expected '… 距上条 0ms …' not to contain '距上条 0ms'`）。
+         */
+        const retryStartedAt = Date.now();
+        noteZcodeRequestSent(diagnostics.accountId, retryStartedAt);
         const retried = await claimZcodePlan(credential, planId, { param, region: captchaRegion }, this.fetchImpl);
-        return toClaimOutcome(retried, planId, { internalRetried: true });
+        if (retried.ok) {
+            noteZcodeRequestOk(diagnostics.accountId, Date.now());
+        }
+        else {
+            noteZcodeRequestFailed(diagnostics.accountId);
+        }
+        /**
+         * ## ★★ 返回**原始上游结果 + 本发时刻**，不在这里映射（2026-10-05 重构）
+         *
+         * 初版在这里就调 `toClaimOutcome` 把结果映射好并让调用方**直接 push**，于是
+         * 重发那一发**绕过了**主循环的 `3012` 短路检查（对抗性审计打出的真实缺陷：
+         * 首发 `3007` ⇒ 重发撞 `3012` ⇒ 仍继续发下一个 plan，实测 `claims=3`）。
+         *
+         * ⇒ 现在只回原始结果，由主循环**统一**做映射与短路判断 ——
+         * 首发与重发**汇流到同一个判断点**，结构上不可能再漏。
+         */
+        return { outcome: retried, sentAt: retryStartedAt };
     }
     /**
-     * 账号卡片「刷新」按钮。
+     * 反查领取凭据对应的**账号池条目 id**（诊断画像的 key），供
+     * {@link claimDailyWith} 的 `noteZcodeRequest*` 埋点使用。
+     *
+     * ## 为什么必须与推理路径用同一个 key
+     *
+     * 推理侧用的是**池条目 id**（`index.ts` 的 `activeZcodeAccountId`）。
+     * 若领取侧另用 `user_id` / `credentialRef`，同一个账号会拿到两个序号，
+     * 诊断里的「本进程 成功 N/失败 M」被劈成两半 —— 而 issue 要回答的
+     * 「这个账号此前成功过几次 / 是否突然开始被拦」正靠这一项。
+     *
+     * ## ⚠ 用 `findAccountIdByIdentityField` 而**不是** `findAccountIdByCredential`
+     *
+     * 后者写死了「codearts 用 `access_key_id`、其余用 `access_token`」
+     * （见 `account-pool.ts` 的方法注释），而 zcode 凭据里**没有** `access_token`
+     * 字段（它用 `zcode_jwt` / `user_id`）⇒ 拿它查 zcode 恒回空串，
+     * 诊断会静默退化成「所有账号都是 #1」。
+     *
+     * ## 处处容错（非关键路径）
+     *
+     * 账号池可能未注册（headless / 单测）、`user_id` 可能缺失（老凭据）——
+     * 这些**都不该影响领取**，故整段吞异常并回 `undefined`：此时诊断退化成
+     * 「账号#1 + 只有领取路径的计数」，如实降级，绝不编造。
+     */
+    async resolveClaimAccountId(credential) {
+        const userId = credential.user_id;
+        if (typeof userId !== 'string' || userId.length === 0)
+            return undefined;
+        const pool = this.accountPool();
+        if (pool === undefined)
+            return undefined;
+        try {
+            const id = await pool.findAccountIdByIdentityField(this.product.id, 'user_id', userId);
+            return id.length > 0 ? id : undefined;
+        }
+        catch {
+            return undefined;
+        }
+    }
+    /**
+     * RPC `account.refresh`。
      *
      * ## ⚠⚠ 这里曾经有一个**数据破坏缺陷**（真实缺陷，2026-10-02）
      *
@@ -1418,15 +1586,14 @@ export class ZcodeAuth extends Service {
         /**
          * 该 ref 自己解析不出凭据（未配置/损坏/被清空）。
          *
-         * ## ⚠ 这里**刻意不做**「用磁盘凭据补上」的兜底（虽是旧行为）
+         * ## ⚠ 这里**刻意不做**「用别的凭据补上」的兜底
          *
          * 旧实现拿 `current()` 写进来，**副作用**是「该账号凭据损坏时会被
-         * 别的账号填上」—— 那正是本次数据破坏的成因。而「用**官方客户端磁盘
-         * 凭据**补上」听起来像合理的兜底，实际**不可实施**：
+         * 别的账号填上」—— 那正是本次数据破坏的成因。
          *
-         * 磁盘 `~/.zcode/v2/credentials.json` 是**单账号**格式，而池是**多账号**的
-         * —— 我们**无法判断**那份磁盘凭据属于池里的**哪一个**账号。
-         * 拿它去补任意一个条目，等于重犯同一个错误（只是换成「单体覆盖」）。
+         * 曾经还有个「用**本机磁盘凭据**补上」的兜底，它同样不可实施：
+         * 单账号的磁盘凭据 vs 多账号的池，我们**无法判断**它属于哪一个。
+         * 而那条路本身也已随 2026-10-05 的决策整体删除。
          *
          * ⇒ 如实报错，让用户重新登录该账号。这是**唯一**不会造成数据破坏的选项。
          */
@@ -1448,8 +1615,8 @@ export class ZcodeAuth extends Service {
      * 于是 30 分钟一轮的定时器会把账号 A 的凭据**铺满整个池**，
      * 抹掉其余账号的真实凭据（详见 {@link refreshAccountCredential} 的实测证据）。
      *
-     * 旧注释的本意是「用户在官方客户端重新登录后，新凭据能铺开到所有条目」——
-     * 那个前提在**多账号池**下是**错的**：磁盘凭据只对应**一个**账号。
+     * 旧注释的本意是「一份新凭据能铺开到所有条目」——
+     * 那个前提在**多账号池**下是**错的**：一份凭据只对应**一个**账号。
      *
      * ## 正确做法：逐账号、各写各的
      *
@@ -1613,12 +1780,24 @@ export function toClaimOutcome(outcome, planId, options = {}) {
             return { kind: 'already-claimed', message: `额度已领取过（${planId}）` };
         }
         /**
-         * ⚠ ZCode 的额度单位是 **token**，不是「积分」—— 而 `ClaimOutcome` 的
-         * `claimed` 分支强制要求 `credit: number` 与 `streakDays`。
-         * 这里填 0 并在文案里说明，避免把 token 数伪装成积分
-         * （那会让 Jet Hub 的汇总把 1 亿 token 显示成 1 亿积分）。
+         * ★ 填**真实额度**（2026-10-03）。
+         *
+         * 此前固定填 0（注释称「避免把 token 伪装成积分」），于是面板显示
+         * 「领取成功 +0 积分」而用户实际拿到 1 亿 token —— 真实报障。
+         * 额度取自 `plan.entitlements[0].grant_units`（实测 100000000）。
+         *
+         * ⚠ **单位照实传**：ZCode 下发 token，前端据此用 formatTokens
+         *   显示「Token 100.00M」而不是「1 亿积分」。
          */
-        return { kind: 'claimed', credit: 0, streakDays: 0, isStreakDay: false };
+        const grantUnits = options.plan?.grantUnits;
+        const unitType = options.plan?.unitType;
+        return {
+            kind: 'claimed',
+            credit: grantUnits ?? 0,
+            streakDays: 0,
+            isStreakDay: false,
+            ...(unitType === 'token' ? { unit: 'token' } : {}),
+        };
     }
     // 3007 = captcha 失败；给出可操作的提示而不是裸码。
     if (outcome.code === 3007) {
@@ -1631,6 +1810,75 @@ export function toClaimOutcome(outcome, planId, options = {}) {
                 : `captcha 校验失败（${planId}），请重试`,
         };
     }
+    /**
+     * ★★ `3012`（风控）必须单独成文案，**不能**落进下面的通用分支
+     * （Gitee issue IKJOQB 的**主诉**）。
+     *
+     * ## 修复前的用户可见形态（issue 原文，逐字）
+     *
+     * ```
+     * ZCode <账号已脱敏>：失败 — zcode-v3-start-plan-trust-1005:
+     * request has been blocked due to unusual activity.
+     * ```
+     *
+     * 这条文案有两个信息缺失，且**第二个有实际代价**：
+     * ① 看不出这是**风控**而非普通失败；
+     * ② **看不到冷却警告** —— 而「请勿连续重试」恰恰是用户最需要的一句
+     *   （issue 作者原话：「我就是不知道有冷却，看到裸文案后以为还有别的问题，
+     *   差点连续重试」）。
+     *
+     * ## 判据与文案都走**共用实现**
+     *
+     * 此前 `3012` 的文案在推理侧（`zcode-adapter.ts` 的 `describeUpstreamError`）
+     * 与领取侧（这里）**各写一份**，而只有前者带了冷却警告 —— 这就是漂移。
+     * ⇒ 判据（{@link isZcodeUnusualActivityCode} /
+     * {@link looksLikeZcodeUnusualActivity}）与文案
+     * （{@link formatZcodeUnusualActivityMessage}）现在都只在
+     * `zcode-diagnostics.ts` 里有一份，两处引用同一个。
+     *
+     * ⚠ **诊断附在这一条上**（issue 的第二个诉求）：`formatZcodeDiagnostic`
+     *   的三项（本次是池里第几个账号 / 该账号此前成功过几次 / 距上条请求隔多久）
+     *   正好回答「一直如此还是突然开始」「是否频率风控」。
+     *   ⚠ 诊断可为空（调用方没给 `accountId`）—— `formatZcodeDiagnostic` 本身
+     *   容忍 `undefined`，而 `formatZcodeUnusualActivityMessage` 在诊断为空时
+     *   **整段省略**，不会留下空壳「本机诊断：」。
+     */
+    if (isClaimUnusualActivity(outcome)) {
+        /**
+         * ⚠ **诊断只在调用方给了现场数据时才附**（判据取 `sentAt !== undefined`）。
+         *
+         * 为什么不无条件附：`toClaimOutcome` 是**公共纯映射函数**，既有若干
+         * 只传 `(outcome, planId)` 的调用点（单测、以及「只要文案不要现场」的场景）。
+         * 无条件附会凭空渲染出 `账号#1 · 距上条 —` —— 而那时我们**并不知道**
+         * 是哪个账号，`账号#1` 是**编造**的（`normalizeKey` 把所有未知账号归一成
+         * 同一个 `-` 桶），违反本模块「如实降级、不编造」的红线。
+         * ⇒ 用 `sentAt` 当「有现场」的标记：真实领取路径（`claimDailyWith`）**始终**传，
+         * 于是 issue 要的诊断一定在；纯映射调用点则保持干净。
+         */
+        const diagnostic = options.sentAt === undefined
+            ? undefined
+            : formatZcodeDiagnostic({
+                accountId: options.accountId,
+                sentAt: options.sentAt,
+                status: options.status ?? outcome.httpStatus ?? 405,
+                /**
+                 * ⚠ **不传 `shape`**：领取请求体只有 `{ plan_id }`，没有 `system` /
+                 * `messages`，照搬推理侧那套 `describeZcodeRequestShape` 会得到
+                 * 「身份块 0 字符」，**把一条正常请求误报成身份块缺失**。
+                 * ⇒ 只用与请求形态无关的那几项（见 `ZcodeDiagnosticInput.shape`）。
+                 */
+                now: Date.now(),
+            });
+        return {
+            kind: 'failed',
+            code: 3012,
+            message: formatZcodeUnusualActivityMessage({
+                subject: planId,
+                diagnostic,
+                rawResponse: outcome.message,
+            }),
+        };
+    }
     return {
         kind: 'failed',
         // ⚠ `code` 是 `failed` 分支的**必填**字段；上游没给码时用 -1 表示
@@ -1638,6 +1886,58 @@ export function toClaimOutcome(outcome, planId, options = {}) {
         code: outcome.code ?? -1,
         message: `${planId}: ${outcome.message ?? `HTTP ${outcome.httpStatus ?? '?'}`}`,
     };
+}
+/**
+ * 领取结果是否为**上游风控拦截**（`3012`）—— 领取路径的统一判据。
+ *
+ * ## ⚠⚠ 判据有**优先级**：`code` 明确时**只信 `code`**（真实缺陷，2026-10-05 自审发现）
+ *
+ * 初版写成「`code === 3012` **或** `message` 含 `3012`」—— 那个「或」是错的：
+ * 上游 `code` 一旦解析出来就是**权威**，此时再去扫 `message` 的自由文本只会引入误判。
+ * 实测被误判的三种真实形态：
+ *
+ * | `code` | `message` | 初版 | 现在 |
+ * |---|---|---|---|
+ * | `1005` 额度用尽 | `quota 3012 exceeded` | ❌ 报成风控 | ✅ 如实报额度 |
+ * | `1001` plan 不存在 | `plan plan-3012 not found` | ❌ 报成风控 | ✅ 如实报失败 |
+ * | `3007` captcha | `captcha verify failed` | ✅ | ✅ |
+ *
+ * ## 为什么误判的后果**很重**（不是文案问题）
+ *
+ * 领取路径据此**短路**（`claimDailyWith` 的 `break`）⇒ 一个「plan 名里恰好含
+ * `3012`」的普通失败会被当成风控，**跳过本账号本可领取的其余 plan**；
+ * 且真实业务码被改写成 `3012` —— 而 `1005`（等额度重置）与 `3012`
+ * （别重试，有冷却惩罚）的用户动作**完全相反**。
+ *
+ * ## 那什么时候才扫 `message`
+ *
+ * 只在 `code` **缺失**时。**而且要求风控语义共现**（真实缺陷，2026-10-05
+ * 对抗性审计打出）——
+ *
+ * | 形态（无码） | 仅词边界 `3012` | 现在（+语义共现） |
+ * |---|---|---|
+ * | `too many requests, retry after 3012 ms` | ❌ **误判成风控** | ✅ 不命中 |
+ * | `<h1>Error 3012</h1>upstream connect timeout` | ❌ **误判成风控** | ✅ 不命中 |
+ * | `request has been blocked due to unusual activity.` | 需配合码 | ✅ 命中 |
+ *
+ * ⚠ 误判的后果与「漏判」**同样重**，只是方向相反：`429 限流`是「稍后重试即可」，
+ * 被改写成「风控、**别重试**」—— 两者用户动作**完全相反**；且领取路径据此
+ * **短路**，跳过本可领取的 plan。审计实测该形态下 3 个 plan 只发了 1 发。
+ *
+ * ⚠ 故判据是 {@link mentionsZcodeUnusualActivity}（词边界 + 语义共现），
+ *   **不是**裸数字匹配。
+ *
+ * ⚠ 与推理侧的差异为何是合理的：`describeUpstreamError` 用
+ * 「先 3009、再 1005、再 3007、最后 3012」的**分支顺序**达成了同样的优先级；
+ * 而 `toClaimOutcome` 里 `3012` 特判在**通用分支之前**，没有那个顺序保护，
+ * 故必须靠这里显式的优先级。
+ */
+export function isClaimUnusualActivity(outcome) {
+    // ① `code` 明确 ⇒ 它是权威，不做任何文本猜测。
+    if (outcome.code !== undefined)
+        return isZcodeUnusualActivityCode(outcome.code);
+    // ② 无码 ⇒ 只能看正文，且**必须**要求风控语义共现（见上）。
+    return typeof outcome.message === 'string' && mentionsZcodeUnusualActivity(outcome.message);
 }
 /** 构造一个「不可用」的 `CheckinStatus`（字段全部显式给，满足契约）。 */
 export function emptyCheckinStatus(active, actionRequired = false) {
