@@ -379,11 +379,15 @@ function onClient(client) {
     //    · 但 **Page.close** 有效：页面真的消失，且宿主 WebChromeClient.onCloseWindow
     //      被触发、日志出现 "popup WebView destroyed"。
     //    所以这里改成「发了就走」，并按 有效度 从高到低依次尝试，不等任何回包。
-    const fire = (method, params) =>
-      internalCall(method, params).catch(() => {}); // 只求送出，不求确认
+    // ⚠️ 必须把 sessionId 传给 internalCall：Page.close / Runtime.evaluate 只有在
+    //    该页的 session 里发才有意义。早先这里的 fire 辅助只收 (method, params)，
+    //    把 sessionId 悄悄丢了 ⇒ Page.close 落到**浏览器级**（对整棵 target 树无效），
+    //    表现为关页静默失败、页面一直留着。现已修。
+    const fire = (method, params, sessionId) =>
+      internalCall(method, params, sessionId).catch(() => {}); // 只求送出，不求确认
     controlSession(targetId)
       .then((sessionId) => {
-        // ① 最强：Page.close（实测能触发宿主的 onCloseWindow → 真正 destroy 子 WebView）
+        // ① 最强：Page.close（在该页 session 里发，触发宿主的 onCloseWindow）
         fire("Page.close", {}, sessionId);
         // ② 兜底：让页面自己 window.close()
         fire("Runtime.evaluate", { expression: "window.close()", userGesture: true }, sessionId);
