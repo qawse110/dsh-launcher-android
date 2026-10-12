@@ -538,9 +538,12 @@ class WebViewActivity : AppCompatActivity() {
      *     用户的 dsh GUI 就被整屏盖住；而关页在这台设备上又不可靠（window.close() 不回包，
      *     Target.closeTarget 也被 WebView 忽略），于是 GUI **永久**不可见，只能重启应用。
      *     真机反馈原话：「启动多窗口方案时原 dsh webUI 也不可见了」。
-     *   · 放底层为什么仍可用：真机实测 /json/list 里 visible=false 的 WebView 也照样
-     *     注册成独立 page target 且尺寸正常。ego 要的是「target 存在 + viewport 尺寸正常」，
-     *     不是「人眼看得见」。所以放底层既保住 ego，又保住 GUI。
+     *   · 放底层为什么仍可用：真机在 /json/list 里见过 visible=false 的 target 仍然
+     *     注册良好、尺寸正常（1264x2640）；而中继判断「页面」时从不读 visible 字段。
+     *     即 ego 要的是「target 存在 + viewport 尺寸正常」，不是「人眼看得见」。
+     *     ⚠ 但「visible=false 时仍能 Runtime.evaluate」这一点尚未在真机上正面复现
+     *     （见 docs/ci-evidence/raw/gui-occlusion-defect.md 的「前提与风险」）。
+     *     故本修复以「不遮挡」为硬目标；若实测发现底层页取不到内容，退路见该文档。
      *   · 子 WebView 自己也要有 WebChromeClient，否则它再开新页会被静默忽略。
      */
     private fun openPopupWebView(resultMsg: Message): Boolean {
@@ -591,6 +594,16 @@ class WebViewActivity : AppCompatActivity() {
             FrameLayout.LayoutParams.MATCH_PARENT
         ))
         popups.add(child)
+
+        // 兜底：真机上 onCloseWindow 依赖页面的关闭回包，而 WebView 有时不回
+        // （见 gui-occlusion-defect.md）。弹层现在压在最底层、不遮挡 GUI，但子
+        // WebView 是活的渲染进程，不回收会一直占内存。这里给一个硬上限：
+        // 超出就销毁最旧的那个。ego 的 useSpace 复用已有页，正常不会触顶。
+        while (popups.size > MAX_POPUPS) {
+            val oldest = popups.firstOrNull() ?: break
+            runCatching { destroyPopup(oldest) }
+                .onFailure { popups.remove(oldest) }
+        }
 
         // 必须交回一个已 attach 的 WebView，新窗口才有渲染进程与 devtools target。
         val transport = resultMsg.obj as? WebView.WebViewTransport ?: return false
@@ -651,6 +664,9 @@ class WebViewActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "WebViewActivity"
+
+        /** 子 WebView 存活上限（回收兜底；正常远不会触顶）。 */
+        private const val MAX_POPUPS = 4
         private const val TARGET_URL = "http://127.0.0.1:" + com.dsh.nextapp1.core.DshFlow.WEB_PORT
     }
 }
