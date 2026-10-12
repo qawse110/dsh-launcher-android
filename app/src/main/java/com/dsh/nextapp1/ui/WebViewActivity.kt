@@ -541,9 +541,10 @@ class WebViewActivity : AppCompatActivity() {
      *   · 放底层为什么仍可用：真机在 /json/list 里见过 visible=false 的 target 仍然
      *     注册良好、尺寸正常（1264x2640）；而中继判断「页面」时从不读 visible 字段。
      *     即 ego 要的是「target 存在 + viewport 尺寸正常」，不是「人眼看得见」。
-     *     ⚠ 但「visible=false 时仍能 Runtime.evaluate」这一点尚未在真机上正面复现
-     *     （见 docs/ci-evidence/raw/gui-occlusion-defect.md 的「前提与风险」）。
-     *     故本修复以「不遮挡」为硬目标；若实测发现底层页取不到内容，退路见该文档。
+     *     ✅ 该前提已于 2026-10-12 在真机正面验证（新 APK + 本地内容服务器探针）：
+     *     被 GUI 覆盖的底层页仍能加载、执行 JS 并取回真实内容
+     *     （rawHasMark=true / hasMark=true），同时 GUI 全程 visible=true、url 未变。
+     *     证据见 docs/ci-evidence/raw/new-apk-verify.txt 第 3 节。
      *   · 子 WebView 自己也要有 WebChromeClient，否则它再开新页会被静默忽略。
      */
     private fun openPopupWebView(resultMsg: Message): Boolean {
