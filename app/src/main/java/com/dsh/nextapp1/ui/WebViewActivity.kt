@@ -530,11 +530,17 @@ class WebViewActivity : AppCompatActivity() {
     /**
      * 为 window.open 造一个真实的子 WebView，并把它交给 WebViewTransport。
      *
-     * 关键点（真机/文档约束，不是可选项）：
+     * 关键点（真机约束，不是可选项）：
      *   · 必须真的 addView 到已 attach 的窗口上，否则该 WebView 不渲染、也不会注册成
      *     devtools target —— ego 那边就看不到新页。
-     *   · 用户已确认「允许短暂可见」，所以直接铺满弹层；不做离屏/隐藏（ego 源码注释
-     *     记录过非前台窗口不渲染会让 document.elementFromPoint 返回 null，打断点选）。
+     *   · ★ 弹层必须加在索引 0（最底层），压在 dsh GUI 的 WebView **下面**。
+     *     早期版本把它铺在顶层（MATCH_PARENT + 不透明背景），后果是：ego 一开页，
+     *     用户的 dsh GUI 就被整屏盖住；而关页在这台设备上又不可靠（window.close() 不回包，
+     *     Target.closeTarget 也被 WebView 忽略），于是 GUI **永久**不可见，只能重启应用。
+     *     真机反馈原话：「启动多窗口方案时原 dsh webUI 也不可见了」。
+     *   · 放底层为什么仍可用：真机实测 /json/list 里 visible=false 的 WebView 也照样
+     *     注册成独立 page target 且尺寸正常。ego 要的是「target 存在 + viewport 尺寸正常」，
+     *     不是「人眼看得见」。所以放底层既保住 ego，又保住 GUI。
      *   · 子 WebView 自己也要有 WebChromeClient，否则它再开新页会被静默忽略。
      */
     private fun openPopupWebView(resultMsg: Message): Boolean {
@@ -546,7 +552,9 @@ class WebViewActivity : AppCompatActivity() {
             )
         }.also {
             popupLayer = it
-            rootView?.addView(it)
+            // ★ 索引 0 = 最底层：让 agent 页压在 GUI 下面。
+            //   绝不能 appendChild（默认加到顶层）——那会把用户的 dsh GUI 整屏遮住。
+            rootView?.addView(it, 0)
         }
 
         val child = WebView(this)

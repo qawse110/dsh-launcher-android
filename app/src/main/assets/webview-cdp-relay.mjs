@@ -373,17 +373,25 @@ function onClient(client) {
       await internalCall("Target.closeTarget", { targetId }).catch(() => {});
       return;
     }
-    try {
-      const sessionId = await controlSession(targetId);
-      await internalCall(
-        "Runtime.evaluate",
-        { expression: "window.close()", userGesture: true },
-        sessionId,
-      );
-      if (st.ctrl && st.ctrl.targetId === targetId) st.ctrl = null;
-    } catch {
-      await internalCall("Target.closeTarget", { targetId }).catch(() => {});
-    }
+    // ⚠️ 真机实测（新 APK，2026-10-12）：对子 WebView 关页时，
+    //    · window.close() / Target.closeTarget 经内部 session 发出去**收不到回包**
+    //      （早期实现在这里白等 internalCall 的 15s 超时，每次都卡）；
+    //    · 但 **Page.close** 有效：页面真的消失，且宿主 WebChromeClient.onCloseWindow
+    //      被触发、日志出现 "popup WebView destroyed"。
+    //    所以这里改成「发了就走」，并按 有效度 从高到低依次尝试，不等任何回包。
+    const fire = (method, params) =>
+      internalCall(method, params).catch(() => {}); // 只求送出，不求确认
+    controlSession(targetId)
+      .then((sessionId) => {
+        // ① 最强：Page.close（实测能触发宿主的 onCloseWindow → 真正 destroy 子 WebView）
+        fire("Page.close", {}, sessionId);
+        // ② 兜底：让页面自己 window.close()
+        fire("Runtime.evaluate", { expression: "window.close()", userGesture: true }, sessionId);
+      })
+      .catch(() => {})
+      // ③ 最后再交给原生（多半回 Not supported，失败也安全）
+      .then(() => fire("Target.closeTarget", { targetId }));
+    if (st.ctrl && st.ctrl.targetId === targetId) st.ctrl = null;
   }
 
   /* --- 客户端帧 --- */

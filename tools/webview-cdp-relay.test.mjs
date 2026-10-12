@@ -246,9 +246,16 @@ function handleRequest(conn, head, rest) {
 
 function startRelay(extraEnv) {
   const home = mkdtempSync(join(tmpdir(), "relay-home-"));
+  // ⚠️ 只继承必要的环境变量，**不要** ...process.env：真机调试常在 shell 里
+  //    export EGO_LINUX_*（EGO_LINUX_WEBVIEW_MULTIWINDOW=1 等），继承进来会让
+  //    「未开多窗口」那一档实际按多窗口跑，测试自己把自己判死。
+  const baseEnv = {};
+  for (const k of ["PATH", "NODE_OPTIONS", "TMPDIR", "SystemRoot"]) {
+    if (process.env[k] !== undefined) baseEnv[k] = process.env[k];
+  }
   const child = spawn(process.execPath, [RELAY], {
     env: {
-      ...process.env,
+      ...baseEnv,
       HOME: home,
       EGO_LINUX_WEBVIEW_SOCKET: SOCKET,
       EGO_LINUX_WEBVIEW_RELAY_PORT: String(RELAY_PORT),
@@ -395,6 +402,10 @@ async function main() {
 
   // ── 阶段二：声明已开多窗口 —— 必须真的造出新页，且用户页不动 ──────────
   console.log("\n[2] 宿主声明已开多窗口：createTarget 必须造出新 page 且不动用户页");
+  // 重置仿造上游的 target 集合：阶段一的 window.open 已经 push 过 NEW_TARGET，
+  // 且阶段一的回归把 GUI 的 url 临时改过。不重置的话这里拿不到「新页」。
+  targets.length = 0;
+  targets.push({ targetId: "GUI_TARGET", type: "page", url: GUI_URL, title: "DSH GUI" });
   relay = startRelay({ EGO_LINUX_WEBVIEW_MULTIWINDOW: "1" });
   if (!(await waitForRelay())) throw new Error("relay(2) did not start: " + relay.output());
 
