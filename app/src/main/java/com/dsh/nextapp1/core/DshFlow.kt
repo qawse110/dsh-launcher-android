@@ -603,6 +603,11 @@ object DshFlow {
         if (isPortListening(WEB_PORT)) {
             if (waitForWebReady(ctx, 5_000, onLog)) {
                 onLog(">> dsh web 已在运行 (http://127.0.0.1:$WEB_PORT)")
+                // ★ 早退分支也必须确认中继在跑：这条路径会跳过下面整段 launcher，
+                //   而中继正是由 launcher 启动的。若只在这里 return，那么「dsh web
+                //   已在运行」时中继缺失（例如它自行 exit(1) 后）就永远补不起来，
+                //   ego 会静默失效（RELAY_PORT 只有本文件写、Supervisor 只探 3080）。
+                ensureRelayRunning(ctx, nodeDir, onLog)
                 return true
             }
             onLog(">> 端口 $WEB_PORT 被残留进程占用但 web 无响应，清理后重新启动…")
@@ -709,6 +714,46 @@ object DshFlow {
      * Supervisor.reviveWebIfDue 与 startDshWeb 必须共用本函数——此前两处独立解析
      * （一处 null 崩溃 / 一处兜底），外置存储不可用时会崩溃或看门狗静默失效。
      */
+    /**
+     * 确保 WebView CDP 中继在跑（端口 [RELAY_PORT]）。
+     *
+     * 为什么需要它：中继由启动脚本启动，而 [startDshWeb] 在「3080 已在运行」时
+     * **提前 return**，整段 launcher 被跳过；[Supervisor] 又只探 3080。
+     * 于是中继一旦退出（它会在 server error / EADDRINUSE 时 exit(1)），
+     * 没有任何代码把它拉回来，ego-browser 就会静默失效。
+     *
+     * 幂等：端口已在监听则直接返回；启动失败只记日志，不影响 dsh web 本身。
+     */
+    fun ensureRelayRunning(ctx: Context, nodeDir: File, onLog: (String) -> Unit = {}) {
+        runCatching {
+            if (isPortListening(RELAY_PORT)) return
+            val script = File(ctx.filesDir, RELAY_SCRIPT)
+            if (!script.isFile) {
+                onLog("WARN: 中继脚本缺失（${script.absolutePath}），跳过")
+                return
+            }
+            val bash = TermuxRuntime.bashPath(ctx)
+            if (!bash.isFile) {
+                onLog("WARN: 内置 Termux 未就绪，跳过拉起中继")
+                return
+            }
+            val logFile = File(FileLog.dir(ctx), RELAY_LOG)
+            // 与启动脚本里 @RELAY_CMD@ 完全同构：普通 node + 继承 webProcessExports 的环境。
+            // 用 bash -lc 承载 export，再 nohup 后台化，保证脱离本进程生命周期。
+            val exports = TermuxEnv.webProcessExports(ctx, nodeDir)
+                .joinToString("") { (k, v) -> "export $k=$v\n" }
+            val cmd = exports +
+                "cd \"${ctx.filesDir.absolutePath}\" || exit 1\n" +
+                "nohup \"${nodeDir.absolutePath}/bin/node\" \"${script.absolutePath}\" >> \"${logFile.absolutePath}\" 2>&1 &\n" +
+                "echo DSH_RELAY_PID=\$!"
+            val p = ProcessBuilder(bash.absolutePath, "-lc", cmd)
+                .redirectErrorStream(true)
+                .start()
+            Thread { runCatching { p.inputStream.readBytes() } }
+            onLog(">> 已补起 WebView CDP 中继（端口 $RELAY_PORT）")
+        }.onFailure { onLog("WARN: 补起中继失败：${it.message}") }
+    }
+
     fun webLauncherFile(ctx: Context): File =
         File(ctx.getExternalFilesDir(null) ?: ctx.filesDir, "dsh-web.sh")
 
