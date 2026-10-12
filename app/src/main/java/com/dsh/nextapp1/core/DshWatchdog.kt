@@ -45,6 +45,17 @@ object DshWatchdog {
         if (isUp()) {
             // web 正常：归零 revive 失败退避计数，恢复基础冷却
             Supervisor.noteWebUp(context)
+            // ★ 但 web 正常**不等于** ego 可用：中继（RELAY_PORT=41999）是独立进程，
+            //   由启动脚本拉起，而它会在 server error / EADDRINUSE 时 exit(1)。
+            //   这条「3080 好、41999 没了」的路径此前直接 return，
+            //   叠加 reviveWebIfDue 只探 3080 ⇒ 中继一死就无人补起，ego 静默失效。
+            //   这里顺手补一道：web 健康时也检查中继，缺了就按需拉起（幂等）。
+            runCatching {
+                // NodeRuntime.ensureExtracted 幂等且廉价（marker 命中即返回，只做一次
+                // RUNPATH 校核），可以在这里安全调用；失败由外层 runCatching 吞掉。
+                val nodeDir = NodeRuntime.ensureExtracted(context)
+                DshFlow.ensureRelayRunning(context, nodeDir) { AppLog.i(TAG_WATCHDOG, it) }
+            }
             return
         }
         // 崩溃循环检测：连续多次拉起无效 + 临时窗口内 → 自动回滚重装上一版本
