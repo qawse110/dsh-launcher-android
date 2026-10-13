@@ -48,6 +48,8 @@ const INTERNAL_ID_BASE = 900000000;
 const CREATE_TIMEOUT_MS = Number(process.env.EGO_LINUX_WEBVIEW_CREATE_TIMEOUT_MS || 10000);
 const MAX_FRAME_BYTES = 64 * 1024 * 1024;
 const DBG = !!process.env.RELAY_DEBUG;
+// 用户 dsh web 的端口（用于认领 GUI 页）。与 DshFlow.WEB_PORT 对齐，可覆盖。
+const USER_PORT = Number(process.env.DSH_WEB_PORT || 0) || 3080;
 /**
  * 宿主是否已经实现多窗口（setSupportMultipleWindows + onCreateWindow）。
  *
@@ -185,6 +187,23 @@ function rewriteVersionBody(text) {
   return out;
 }
 
+/**
+ * ★ 隔离：/json/list 是 **HTTP** 路径，ego 的 listTabs 与很多客户端都用它枚举页。
+ * 它必须和 WS 里的 Target.getTargets 一样，只暴露中继自造的页——否则用户 GUI
+ * 的真 targetId 会从这里漏出去（本轮实测过：拿到 id 就能 attach + 注入 + 读 cookie）。
+ * keep 由调用方注入（它需要 st.agentIds，属于连接级状态）。
+ */
+function filterListBody(text, keep) {
+  try {
+    const arr = JSON.parse(text);
+    if (!Array.isArray(arr)) return text;
+    const kept = arr.filter((t) => keep(t && t.id));
+    return JSON.stringify(kept);
+  } catch {
+    return text;
+  }
+}
+
 /* ---------------------------------------------------------------- 连接 */
 
 function onClient(client) {
@@ -210,6 +229,8 @@ function onClient(client) {
     sess: new Set(),
     ctrl: null,
     guiId: null, // 认领到的用户 GUI 页 targetId，认领后钉住（见 isUserPage）
+    agentIds: new Set(), // 中继自造的页（window.open 产出）——**只有这些对客户端可见**
+    listWanted: false, // 本次 HTTP 请求是 /json/list（要过滤掉用户的页）
   };
 
   function teardown() {
@@ -278,6 +299,44 @@ function onClient(client) {
       return true;
     }
     return st.guiId !== null && target.targetId === st.guiId;
+  }
+
+  /**
+   * ★ 隔离核心：只有**中继自己造出来**的页对客户端（agent）可见。
+   *
+   * 为什么必须这么做：这个 CDP 端点背后是应用自己的 WebView，而它上面唯一那个
+   * 「真实的页」就是用户正在看的 dsh GUI。中继虽然替 agent 造了新的页，但
+   * Target.getTargets / /json/list **会把 GUI 的真 targetId 一并列出来**——
+   * 于是 agent 可以 attach 到 GUI，进而 Runtime.evaluate 读它的内容、注入键鼠、
+   * 甚至导航走它（本轮已实测复现：attach 成功 → 读到 title/cookie → 键盘注入成功）。
+   *
+   * 光靠「中继不主动导航 GUI」是不够的：能力一旦交出去，就用不用由 agent 决定。
+   * 所以这里把 GUI 从**所有**面向客户端的 target 视图里摘掉，并在 attach 处再挡一道。
+   * 用户界面因此对 agent 不存在，也就无所谓「被控制」。
+   */
+  function isAgentTarget(id) {
+    return id !== undefined && id !== null && st.agentIds.has(String(id));
+  }
+
+  /** 把 target 列表收窄到「中继自造的页」。t.targetId 与 /json/list 的 t.id 都适用。 */
+  function keepAgentTargets(list) {
+    if (!Array.isArray(list)) return list;
+    return list.filter((t) => isAgentTarget(t && (t.targetId !== undefined ? t.targetId : t.id)));
+  }
+
+  /** 认领用户 GUI 页（只记 id，不暴露）。 */
+  async function claimUserPage() {
+    try {
+      const pages = await internalPages();
+      const gui = pages.find((t) => String(t.url || "").includes(":" + USER_PORT));
+      if (gui) {
+        st.guiId = gui.targetId;
+        return gui.targetId;
+      }
+    } catch (e) {
+      if (DBG) process.stderr.write("DBG claimUserPage failed: " + String((e && e.message) || e) + "\n");
+    }
+    return null;
   }
 
   /**
@@ -353,7 +412,10 @@ function onClient(client) {
       const fresh = now.filter((t) => !known.has(t.targetId));
       if (fresh.length) {
         await restoreUserPage(guiId, guiUrl);
-        return fresh[fresh.length - 1];
+        const created = fresh[fresh.length - 1];
+        // ★ 只有中继造出来的页才对客户端可见（isAgentTarget）。
+        st.agentIds.add(String(created.targetId));
+        return created;
       }
       await sleep(120);
     }
@@ -409,6 +471,43 @@ function onClient(client) {
       let msg = null;
       try { msg = JSON.parse(frame.payload.toString("utf8")); } catch { msg = null; }
       if (msg && typeof msg.id === "number" && msg.id < INTERNAL_ID_BASE) {
+        // ★ 隔离：agent 只能 attach 到中继自己造出来的页。
+        // 竞态兜底——若此刻还没认领到 GUI，就先认领一次，避免「恰好没认领到
+        // 于是放行」。GUI 永不进 agentIds，所以它永远 attach 不上。
+        // ★ 隔离：这两条都会给 agent 打开「绕过 attach 闸门」的后门——
+        // setAutoAttach 让新 target 自动附带 session，exposeDevToolsProtocol
+        // 则把某个 target 的 devtools session 直接开出来。一律拒绝。
+        if (msg.method === "Target.setAutoAttach" || msg.method === "Target.exposeDevToolsProtocol") {
+          toClient(
+            serverFrame({
+              id: msg.id,
+              error: {
+                code: -32000,
+                message: "relay: " + msg.method + " is disabled (isolation is on).",
+              },
+            }),
+          );
+          return;
+        }
+        if (msg.method === "Target.attachToTarget") {
+          const tid = (msg.params || {}).targetId;
+          // 同步函数里不能 await：未认领时先异步补认领，本次按「非 agent 页」挡住。
+          if (st.guiId === null) void claimUserPage().catch(() => {});
+          if (!isAgentTarget(tid)) {
+            toClient(
+              serverFrame({
+                id: msg.id,
+                error: {
+                  code: -32000,
+                  message:
+                    "relay: refusing to attach to a non-agent target. The user's " +
+                    "dsh UI is not exposed to the agent (isolation is on).",
+                },
+              }),
+            );
+            return; // 不往上转发
+          }
+        }
         if (msg.method === "Target.createTarget") {
           const p = msg.params || {};
           const url = typeof p.url === "string" && p.url !== "" ? p.url : "about:blank";
@@ -456,6 +555,38 @@ function onClient(client) {
         // 本进程自己开的 session，它的事件归本进程：漏给客户端会把 harness 的
         // 事件缓冲淹掉（见 vendored transport.mjs 的同名注释）。
         if (msg.sessionId && st.sess.has(msg.sessionId)) return;
+        // ★ 隔离：面向客户端的 Target.getTargets 里，把不属于中继自造页的
+        // target 全部摘掉（用户 GUI 就此对 agent 不可见）。中继自己的调用
+        // 走上面的 INTERNAL_ID_BASE 分支并 return，不受影响。
+          // ★ 隔离（事件侧）：同一份「用户 GUI 不该外露」的规则也要管事件流。
+          // Target.targetCreated / targetInfoChanged 携带 targetInfo（含 targetId），
+          // 若原样放行，agent 靠订阅事件就能捡到用户页的 id，前面的列表过滤就白做了。
+          if (msg.method && /^Target\.(targetCreated|targetInfoChanged|targetDestroyed)$/.test(msg.method)) {
+            const info = msg.params && msg.params.targetInfo;
+            const tid = info && (info.targetId !== undefined ? info.targetId : info.id);
+            if (!isAgentTarget(tid)) {
+              if (DBG) process.stderr.write("DBG dropped " + msg.method + " for non-agent target\n");
+              return; // 直接吞掉，不下发
+            }
+          }
+          if (msg.method === "Target.attachedToTarget") {
+            const sid = msg.params && msg.params.sessionId;
+            // 只放行中继自己造出来的 session（理论上不会有其它来源）。
+            if (!(sid && st.sess.has(sid))) return;
+          }
+        if (msg.result && Array.isArray(msg.result.targetInfos)) {
+          const kept = keepAgentTargets(msg.result.targetInfos);
+          if (kept.length !== msg.result.targetInfos.length) {
+            if (DBG) process.stderr.write(
+              "DBG hid " + (msg.result.targetInfos.length - kept.length) +
+              " user target(s) from Target.getTargets\n");
+          }
+          msg.result.targetInfos = kept;
+          // ⚠ 必须**重新序列化**：只改 msg.result 而照发 frame.raw 不生效
+          // （frame.raw 是原始字节，上面的过滤会被完全忽略）。
+          toClient(serverFrame(msg));
+          return;
+        }
       }
     }
     toClient(frame.raw);
@@ -536,7 +667,14 @@ function onClient(client) {
     }
     const body = rest.subarray(0, want).toString("utf8");
     const extra = rest.subarray(want);
-    const out = Buffer.from(rewriteVersionBody(body), "utf8");
+      // /json/list 的体是 target 数组 → 只留中继自造的页；/json/version 只改写 ws url。
+      const newBody = st.listWanted
+        ? filterListBody(body, (id) => isAgentTarget(id))
+        : rewriteVersionBody(body);
+      if (st.listWanted && DBG) {
+        process.stderr.write("DBG /json/list " + body.length + " -> " + newBody.length + " bytes\n");
+      }
+      const out = Buffer.from(newBody, "utf8");
     const newHead = head.split("\r\n").map((line) =>
       line.toLowerCase().indexOf("content-length:") === 0
         ? "Content-Length:" + out.length
@@ -597,6 +735,21 @@ function onClient(client) {
         st.path = firstLine.slice(sp1 + 1, sp2);
       }
       st.rewritable = st.path !== null && st.path.indexOf("/json/version") === 0;
+      // ★ 隔离：/json/list 走 HTTP，也要按「只暴露 agent 页」过滤（见 filterListBody）。
+      st.listWanted = st.path !== null && st.path.indexOf("/json/list") === 0;
+
+      // ★ 隔离：HTTP 的 /json/close/<id> 与 /json/activate/<id> 也不能作用到用户的页。
+      // 只允许操作中继自造的 agent 页；对其它 id 一律本地拒绝（不转发）。
+      const jsonOp = /^\/json\/(close|activate)\/(.+)$/.exec(st.path || "");
+      if (jsonOp) {
+        const wantId = decodeURIComponent(jsonOp[2]);
+        if (!isAgentTarget(wantId)) {
+          respondJson("404 Not Found", { error: "relay: no such agent target" });
+          st.local = true;
+          return true;
+        }
+      }
+      st.rewritable = st.rewritable || st.listWanted;
 
       // HTTP 版新建页：本地处理，不转发（WebView 的 PUT /json/new 会返回 500）。
       if (

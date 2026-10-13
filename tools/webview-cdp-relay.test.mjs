@@ -349,9 +349,11 @@ async function main() {
 
   r = await call("Target.getTargets");
   const pages = (r.result.targetInfos || []).filter((t) => t.type === "page");
-  check("能列出 1 个页面（用户 GUI）", pages.length === 1 && pages[0].url === GUI_URL, JSON.stringify(pages));
-
-  const guiTargetId = pages[0].targetId;
+  // ★ 隔离：用户 GUI 不出现在客户端视图里（改前这里能拿到它的真 targetId，
+  // 拿到就能 attach + 注入 + 读 cookie —— 本轮实测复现过）。
+  check("客户端看不到任何页（用户 GUI 已被隔离）", pages.length === 0, JSON.stringify(pages));
+  // 真 GUI id 只从仿造上游（= 中继的内部视图）取，用来验证「即便知道 id 也进不去」。
+  const guiTargetId = targets.find((t) => t.url === GUI_URL).targetId;
   const beforeMethods = upstreamMethods.length;
   r = await call("Target.createTarget", { url: "about:blank" });
   check("未开多窗口时 createTarget 被拒绝（有 error）", !!r.error, JSON.stringify(r).slice(0, 160));
@@ -367,15 +369,14 @@ async function main() {
   );
 
   // 关键：用户页没有被导航走
-  r = await call("Target.getTargets");
-  const guiNow = (r.result.targetInfos || []).find((t) => t.targetId === guiTargetId);
+  // 关键：用户页没有被导航走（查仿造上游的真值，客户端已看不到它）
+  const guiNow = targets.find((t) => t.targetId === guiTargetId);
   check("用户 GUI 页 URL 未变（没被导航走）", guiNow && guiNow.url === GUI_URL, guiNow && guiNow.url);
 
   // 本地 PUT /json/new 也应被拒绝而不是砸坏用户页
   const newRes = await fetch("http://127.0.0.1:" + RELAY_PORT + "/json/new?url=about:blank", { method: "PUT" });
   check("PUT /json/new 被本地接住且返回失败（未毁用户页）", newRes.status === 500, String(newRes.status));
-  r = await call("Target.getTargets");
-  const guiStill = (r.result.targetInfos || []).find((t) => t.targetId === guiTargetId);
+  const guiStill = targets.find((t) => t.targetId === guiTargetId);
   check("PUT /json/new 之后用户 GUI 仍在原处", guiStill && guiStill.url === GUI_URL, guiStill && guiStill.url);
 
   // 关键回归：GUI 页被导航到别处后（重定向/用户自己跳走/错误页），
@@ -411,7 +412,8 @@ async function main() {
 
   ws = await connectClient();
   call = makeCaller(ws);
-  const guiBefore = (await call("Target.getTargets")).result.targetInfos.find((t) => t.url === GUI_URL);
+  // GUI 已对客户端隐藏 ⇒ 真值只能从仿造上游取（这也正是隔离的意义）。
+  const guiBefore = targets.find((t) => t.url === GUI_URL);
   const r2 = await call("Target.createTarget", { url: "https://example.com/" });
   check("createTarget 成功并回了一个 targetId", !!(r2.result && r2.result.targetId), JSON.stringify(r2).slice(0, 180));
   check(
@@ -421,9 +423,22 @@ async function main() {
   );
 
   const after = (await call("Target.getTargets")).result.targetInfos.filter((t) => t.type === "page");
-  check("页面数从 1 变成 2", after.length === 2, "n=" + after.length);
-  const guiAfter = after.find((t) => t.targetId === guiBefore.targetId);
+  const upstreamPages = targets.filter((t) => t.type === "page");
+  check("客户端只看到 agent 页（隔离后不暴露 GUI）", after.length === 1, "client n=" + after.length);
+  check("上游确实有 2 个页（GUI + agent）", upstreamPages.length === 2, "upstream n=" + upstreamPages.length);
+  const guiAfter = targets.find((t) => t.targetId === guiBefore.targetId);
   check("用户 GUI 页在新建后被保留且 URL 未变", guiAfter && guiAfter.url === GUI_URL, guiAfter && guiAfter.url);
+
+  // ★ 隔离断言：agent 页对客户端可见，用户的 GUI 仍然不可见。
+  const vis = (await call("Target.getTargets")).result.targetInfos.filter((t) => t.type === "page");
+  check("客户端只看到 agent 页（1 个），看不到用户 GUI", vis.length === 1 && vis[0].url !== GUI_URL, JSON.stringify(vis.map((t) => t.url)));
+  check("可见的那页就是刚新建的 agent 页", !!(vis[0] && vis[0].targetId === r2.result.targetId), String(vis[0] && vis[0].targetId));
+
+  // ★ 即便知道用户 GUI 的真 targetId，也必须 attach 不上。
+  const atGui = await call("Target.attachToTarget", { targetId: guiBefore.targetId, flatten: true });
+  check("attach 到用户 GUI 被拒绝（隔离生效）", !!atGui.error && /non-agent|isolation/i.test(atGui.error.message), JSON.stringify(atGui).slice(0, 180));
+  const atAgent = await call("Target.attachToTarget", { targetId: r2.result.targetId, flatten: true });
+  check("attach 到 agent 页仍然成功（agent 自己要能用）", !!(atAgent.result && atAgent.result.sessionId), JSON.stringify(atAgent).slice(0, 160));
 
   ws.close();
   relay.child.kill("SIGKILL");
