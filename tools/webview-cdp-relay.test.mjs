@@ -121,6 +121,7 @@ function parseFrames(buf) {
 
 /** 记录中继发给上游的每一条 CDP 请求（用来断言拦截生效）。 */
 const upstreamMethods = [];
+const upstreamHttpPaths = [];
 let sawExtensionsOffer = false;
 let sawExtensionsAcceptSent = false;
 
@@ -182,6 +183,7 @@ const upstream = net.createServer((conn) => {
 });
 
 function handleRequest(conn, head, rest) {
+  upstreamHttpPaths.push(head.split("\r\n")[0]);
 
     // 真机行为 2：只有客户端**提出** permessage-deflate 时 WebView 才接受它。
     if (/sec-websocket-extensions:\s*permessage-deflate/i.test(head)) sawExtensionsOffer = true;
@@ -200,7 +202,7 @@ function handleRequest(conn, head, rest) {
       );
       return;
     }
-    if (head.startsWith("GET /json/list")) {
+    if (head.startsWith("GET /json/list") || head.startsWith("GET /json ")) {
       const body = JSON.stringify(targets);
       conn.write(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=UTF-8\r\n" +
@@ -439,6 +441,29 @@ async function main() {
   check("attach 到用户 GUI 被拒绝（隔离生效）", !!atGui.error && /non-agent|isolation/i.test(atGui.error.message), JSON.stringify(atGui).slice(0, 180));
   const atAgent = await call("Target.attachToTarget", { targetId: r2.result.targetId, flatten: true });
   check("attach 到 agent 页仍然成功（agent 自己要能用）", !!(atAgent.result && atAgent.result.sessionId), JSON.stringify(atAgent).slice(0, 160));
+
+  // ★ 其余发现/直连类入口也必须被挡住。
+  const devPage = await fetch("http://127.0.0.1:" + RELAY_PORT + "/devtools/page/" + guiBefore.targetId);
+  check("/devtools/page/<用户GUI id> 直连被拒（404）", devPage.status === 404, String(devPage.status));
+  const beforeDev = upstreamHttpPaths.length;
+  // mock 对 /devtools/ 没有实现升级，所以这里只断言「中继没在本地拦它」；
+  // fetch 可能因 mock 未回完整响应而 reject，与中继的放行判定无关。
+  try { await fetch("http://127.0.0.1:" + RELAY_PORT + "/devtools/page/" + r2.result.targetId); } catch {}
+  await sleep(250);
+  check("/devtools/page/<agent id> 未被本地拦（已转发上游）",
+    upstreamHttpPaths.slice(beforeDev).some((p) => p.indexOf("/devtools/page/" + r2.result.targetId) >= 0),
+    JSON.stringify(upstreamHttpPaths.slice(beforeDev)));
+  // mock 没有实现裸 /json，fetch 可能抛错；这里只断言它被中继当成 list 处理（没透给上游）。
+  const beforeBare = upstreamHttpPaths.length;
+  try { await fetch("http://127.0.0.1:" + RELAY_PORT + "/json"); } catch {}
+  await sleep(250);
+  let bareBody2 = null;
+  try { bareBody2 = await (await fetch("http://127.0.0.1:" + RELAY_PORT + "/json")).json(); } catch {}
+  check("裸 /json（/json/list 的别名）也不透出用户 GUI",
+    Array.isArray(bareBody2) && bareBody2.every((t) => String(t.url || "").indexOf(":3080") < 0),
+    JSON.stringify(bareBody2).slice(0, 140));
+  const closeGui = await fetch("http://127.0.0.1:" + RELAY_PORT + "/json/close/" + guiBefore.targetId, { method: "GET" });
+  check("/json/close/<用户GUI id> 被拒（404）", closeGui.status === 404, String(closeGui.status));
 
   ws.close();
   relay.child.kill("SIGKILL");

@@ -191,7 +191,7 @@ function rewriteVersionBody(text) {
  * ★ 隔离：/json/list 是 **HTTP** 路径，ego 的 listTabs 与很多客户端都用它枚举页。
  * 它必须和 WS 里的 Target.getTargets 一样，只暴露中继自造的页——否则用户 GUI
  * 的真 targetId 会从这里漏出去（本轮实测过：拿到 id 就能 attach + 注入 + 读 cookie）。
- * keep 由调用方注入（它需要 st.agentIds，属于连接级状态）。
+ * keep 由调用方注入（它需要进程级的 gAgentIds 集合）。
  */
 function filterListBody(text, keep) {
   try {
@@ -203,6 +203,19 @@ function filterListBody(text, keep) {
     return text;
   }
 }
+
+/* ------------------------------------------------- 进程级隔离状态 */
+
+/**
+ * ★ 这些是**进程级**事实，绝不能挂在每连接的 st 上。
+ *
+ * 教训（本轮踩到）：target 属于整个 WebView 进程，而 st 是 onClient 里
+ * 每个连接新建的。把 agentIds/guiId 放进 st ⇒ 换一条 HTTP 连接（/json/list
+ * 与 WS 各是一条）就看到空集合，于是 agent 自己的页被自己的过滤器挡掉
+ * （表现为 /devtools/page/<agent id> 404、listTabs 空），而隔离判定也时对时错。
+ */
+const gAgentIds = new Set(); // 中继自造的页（只有这些对客户端可见）
+let gGuiId = null; // 认领到的用户 GUI targetId
 
 /* ---------------------------------------------------------------- 连接 */
 
@@ -228,8 +241,6 @@ function onClient(client) {
     pend: new Map(),
     sess: new Set(),
     ctrl: null,
-    guiId: null, // 认领到的用户 GUI 页 targetId，认领后钉住（见 isUserPage）
-    agentIds: new Set(), // 中继自造的页（window.open 产出）——**只有这些对客户端可见**
     listWanted: false, // 本次 HTTP 请求是 /json/list（要过滤掉用户的页）
   };
 
@@ -295,10 +306,10 @@ function onClient(client) {
     // 于是被 pickOpener 拿去当 opener（window.open 会把它导航走）或被
     // closeTarget 关掉 —— 这两件事都违反「不牺牲用户界面」。
     if (String(target.url || "").includes(":3080")) {
-      st.guiId = target.targetId;
+      gGuiId = target.targetId;
       return true;
     }
-    return st.guiId !== null && target.targetId === st.guiId;
+    return gGuiId !== null && target.targetId === gGuiId;
   }
 
   /**
@@ -315,7 +326,7 @@ function onClient(client) {
    * 用户界面因此对 agent 不存在，也就无所谓「被控制」。
    */
   function isAgentTarget(id) {
-    return id !== undefined && id !== null && st.agentIds.has(String(id));
+    return id !== undefined && id !== null && gAgentIds.has(String(id));
   }
 
   /** 把 target 列表收窄到「中继自造的页」。t.targetId 与 /json/list 的 t.id 都适用。 */
@@ -330,7 +341,7 @@ function onClient(client) {
       const pages = await internalPages();
       const gui = pages.find((t) => String(t.url || "").includes(":" + USER_PORT));
       if (gui) {
-        st.guiId = gui.targetId;
+        gGuiId = gui.targetId;
         return gui.targetId;
       }
     } catch (e) {
@@ -414,7 +425,7 @@ function onClient(client) {
         await restoreUserPage(guiId, guiUrl);
         const created = fresh[fresh.length - 1];
         // ★ 只有中继造出来的页才对客户端可见（isAgentTarget）。
-        st.agentIds.add(String(created.targetId));
+        gAgentIds.add(String(created.targetId));
         return created;
       }
       await sleep(120);
@@ -492,7 +503,7 @@ function onClient(client) {
         if (msg.method === "Target.attachToTarget") {
           const tid = (msg.params || {}).targetId;
           // 同步函数里不能 await：未认领时先异步补认领，本次按「非 agent 页」挡住。
-          if (st.guiId === null) void claimUserPage().catch(() => {});
+          if (gGuiId === null) void claimUserPage().catch(() => {});
           if (!isAgentTarget(tid)) {
             toClient(
               serverFrame({
@@ -737,6 +748,22 @@ function onClient(client) {
       st.rewritable = st.path !== null && st.path.indexOf("/json/version") === 0;
       // ★ 隔离：/json/list 走 HTTP，也要按「只暴露 agent 页」过滤（见 filterListBody）。
       st.listWanted = st.path !== null && st.path.indexOf("/json/list") === 0;
+      // ★ 隔离：/devtools/page/<id> 是**页面级** WS 端点。若放行到用户的 GUI id，
+      // agent 就能绕开 attach 闸门直连那个页（等于前面的过滤全白做）。
+      // 只允许中继自造的 agent 页；其它一律本地拒绝，不转发。
+      const pageWs = /^\/devtools\/page\/([^/?]+)/.exec(st.path || "");
+      if (pageWs) {
+        const wantId = decodeURIComponent(pageWs[1]);
+        if (!isAgentTarget(wantId)) {
+          respondJson("404 Not Found", {
+            error: "relay: no such agent target (the user UI is not exposed)",
+          });
+          st.local = true;
+          return true;
+        }
+      }
+      // ★ 隔离：裸 /json（等价于 /json/list）同样只暴露 agent 页。
+      if (st.path === "/json" || st.path.indexOf("/json?") === 0) st.listWanted = true;
 
       // ★ 隔离：HTTP 的 /json/close/<id> 与 /json/activate/<id> 也不能作用到用户的页。
       // 只允许操作中继自造的 agent 页；对其它 id 一律本地拒绝（不转发）。
