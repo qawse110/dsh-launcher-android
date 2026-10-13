@@ -465,6 +465,14 @@ async function main() {
   const closeGui = await fetch("http://127.0.0.1:" + RELAY_PORT + "/json/close/" + guiBefore.targetId, { method: "GET" });
   check("/json/close/<用户GUI id> 被拒（404）", closeGui.status === 404, String(closeGui.status));
 
+  // ★ 通用 default-deny：任何带 targetId 的方法指向用户的页都要被拒（不必逐个枚举）。
+  for (const m of ["Target.getTargetInfo", "Target.activateTarget", "Target.getWindowForTarget"]) {
+    const bad = await call(m, { targetId: guiBefore.targetId });
+    check(m + "(<用户GUI id>) 被拒", !!bad.error, JSON.stringify(bad).slice(0, 120));
+  }
+  const goodInfo = await call("Target.getTargetInfo", { targetId: r2.result.targetId });
+  check("同一方法对 agent 页放行（default-deny 不误伤）", !goodInfo.error, JSON.stringify(goodInfo).slice(0, 120));
+
   ws.close();
   relay.child.kill("SIGKILL");
   children.delete(relay.child);

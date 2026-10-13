@@ -500,6 +500,35 @@ function onClient(client) {
           );
           return;
         }
+        // ★★ 通用 default-deny：**任何**带 params.targetId 的方法，只要那个 id
+        // 不是中继自造的 agent 页，一律拒绝并说明原因。
+        //
+        // 为什么用「按参数判定」而不是逐个方法黑名单：CDP 里带 targetId 的方法
+        // 很多（getTargetInfo / activateTarget / getWindowForTarget /
+        // attachToBrowserTarget / closeTarget ...），黑名单漏一个就是一个洞，
+        // 而白名单式的按参数判定天然覆盖未知方法。
+        //
+        // 前提：agentIds 是**进程级**的 gAgentIds（不是每连接的 st），否则换一条
+        // 连接看到的就是空集合、连 agent 自己的页都会被挡（本轮踩过这个坑）。
+        {
+          const p = msg.params || {};
+          const tid = p.targetId !== undefined ? p.targetId : p.target;
+          if (tid !== undefined && tid !== null && !isAgentTarget(tid)) {
+            if (gGuiId === null) void claimUserPage().catch(() => {});
+            toClient(
+              serverFrame({
+                id: msg.id,
+                error: {
+                  code: -32000,
+                  message:
+                    "relay: " + msg.method + " targets a non-agent page; the user UI " +
+                    "is not exposed to the agent (isolation is on).",
+                },
+              }),
+            );
+            return; // 不往上转发
+          }
+        }
         if (msg.method === "Target.attachToTarget") {
           const tid = (msg.params || {}).targetId;
           // 同步函数里不能 await：未认领时先异步补认领，本次按「非 agent 页」挡住。
@@ -580,11 +609,15 @@ function onClient(client) {
               return; // 直接吞掉，不下发
             }
           }
-          if (msg.method === "Target.attachedToTarget") {
-            const sid = msg.params && msg.params.sessionId;
-            // 只放行中继自己造出来的 session（理论上不会有其它来源）。
-            if (!(sid && st.sess.has(sid))) return;
-          }
+          // （不再按 sessionId 过滤 Target.attachedToTarget：st.sess 是每连接的，
+          //   而客户端自己 attach 产生的 session 不在其中，按它过滤会误吞 agent 自己的
+          //   事件。中继从不 attach 用户的 GUI，所以这里没有 GUI 事件可漏。）
+        // ★ 隔离：单数 targetInfo（Target.getTargetInfo 等的返回）也要过同一道闸门。
+        if (msg.result && msg.result.targetInfo && !isAgentTarget(msg.result.targetInfo.targetId)) {
+          if (DBG) process.stderr.write("DBG hid singular targetInfo of a user target\n");
+          toClient(serverFrame({ id: msg.id, result: {} }));
+          return;
+        }
         if (msg.result && Array.isArray(msg.result.targetInfos)) {
           const kept = keepAgentTargets(msg.result.targetInfos);
           if (kept.length !== msg.result.targetInfos.length) {
