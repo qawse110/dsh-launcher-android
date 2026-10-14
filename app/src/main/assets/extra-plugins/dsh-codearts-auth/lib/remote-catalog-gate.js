@@ -13,14 +13,14 @@
  * - 返回空目录时同样不落缓存 ⇒ 同上。
  *
  * 而这些拉取的超时上限是 30–60 秒量级
- * （`src/buddy.ts:62` `REQUEST_TIMEOUT_MS = 60_000`、
- * `src/loomy.ts:45` `LOOMY_REQUEST_TIMEOUT_MS = 60_000`、
- * `src/raccoon.ts:55` `RACCOON_REQUEST_TIMEOUT_MS = 60_000` …），
+ * （`src/buddy.ts` `REQUEST_TIMEOUT_MS = 60_000`、
+ * `src/loomy.ts` `LOOMY_REQUEST_TIMEOUT_MS = 60_000`、
+ * `src/raccoon.ts` `RACCOON_REQUEST_TIMEOUT_MS = 60_000` …），
  * 未登录或离线时表现就是「首屏加载模型巨长」。
  *
  * 另有并发维度：`listModels` 与 `resolveModel` 会被 DSH **并发**调用
  * （`Promise.all`），不去重会打出多份重复请求。
- * `src/cline-adapter.ts:243` 早先已单独处理过这一条，本模块把它抽成共用件。
+ * `src/cline-adapter.ts` 早先已单独处理过这一条，本模块把它抽成共用件。
  *
  * ## 三道语义
  *
@@ -141,7 +141,7 @@ export class RemoteCatalogGate {
         // ⚠ **不能**写成 `this.inFlight = (async () => { … finally { this.inFlight = undefined } })()`：
         // 若 `run()` **同步抛错**，那个 IIFE 会在任何 `await` 之前整段同步跑完
         // （catch → finally 把 `inFlight` 置回 `undefined`），**然后**外层赋值又把
-        // `undefined` 覆盖成一个**已 settle** 的 Promise。此后 `:73` 的
+        // `undefined` 覆盖成一个**已 settle** 的 Promise。此后
         // `inFlight !== undefined` 永远先命中 ⇒ 该 provider 永久不再重拉，
         // 冷却到期也救不回。
         // ⇒ 先把任务落成局部量、await 之后再清，并只清「仍是自己那一个」。

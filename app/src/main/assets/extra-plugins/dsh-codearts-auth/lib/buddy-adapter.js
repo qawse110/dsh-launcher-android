@@ -8,7 +8,7 @@
  * 模型列表：静态默认（对齐 /v3/config craft agent models）+ 登录后的动态拉取
  */
 import { attributionHeaders, CONTEXT_WINDOW_EXCEEDED_CODE, isContextWindowExceededError, LlmAdapter, LlmError, ReasoningEffortId, } from '@deepseek-ai/dsh-llm';
-import { providerCatalogVisible } from './account-pool.js';
+import { createModelCatalog } from './model-catalog.js';
 import { RemoteCatalogGate } from './remote-catalog-gate.js';
 import { broadcastCatalogChanged } from './catalog-broadcast.js';
 import { RATE_LIMIT_FALLBACK_MS, isModelSaturationError, isRateLimited, parseRateLimitError, } from './llm-adapter.js';
@@ -17,9 +17,17 @@ import { HTTP_HEADER_DOMAIN, HTTP_HEADER_PRODUCT, HTTP_HEADER_PRODUCT_CODE, cred
 import { CODEBUDDY, resolveUserAgent } from './product.js';
 import { normalizeHarnessMessages } from './message-shape.js';
 import { projectRequestImage } from './image-budget.js';
-import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js';
+import { createBlankReasoningSuppressor, createDsmlMarkerNormalizer, createReasoningLoopDetector, fixDsmlMarkers, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js';
 import { registerAdapterIdempotent, } from './llm-register-compat.js';
 import { reportLedgerAccount } from './token-ledger.js';
+import { planSessionTitleThinking } from './session-title.js';
+// ⚠️ 腾讯系内容级风控的指纹改写 —— 与 **OpenAI 网关**共用同一份真相源
+// （`src/openai-gateway/tencent-fingerprint.ts`）。该模块**零 import**，
+// 故从 `src/` 反向引它不构成环。
+// 直连路径**必须**也走它：会话历史里的 `assistant` 正文实测会被拦
+// （400/11128），而「排查这个风控问题的会话」必然会把那句复述进正文 ——
+// 只在网关补 = 换一个入口又被拦。依据见那个文件的头。
+import { rewriteTencentContentFingerprints } from './openai-gateway/tencent-fingerprint.js';
 /**
  * CodeBuddy（中国版）的 chat completions 基址。
  *
@@ -174,10 +182,32 @@ function contentToText(content) {
  * - assistant 消息**始终**携带 `reasoning_content` 字段（推理模型缺失会 400）
  *   ——与 codearts 的 deepseek-v4 校验一致；
  * - 正文为空且带 tool_calls 时 `content` 必须为 `null`（对齐 openai_chat.rs）。
+ *
+ * ⚠️ 第三件事（2026-10-12 补）：**腾讯系内容级风控的指纹改写**。
+ * `system` 与 `assistant` 正文这两处要过 `rewriteTencentContentFingerprints`
+ * ——与 OpenAI 网关**同一份表、同一判据**（为什么两处都要、以及为什么
+ * `user` / `tool` / `reasoning_content` / `tool_calls.arguments` 都不要，
+ * 全部是实测结论，见 `src/openai-gateway/tencent-fingerprint.ts` 的文件头）。
+ * `provider` 形参就是为它加的：本函数服务 `buddy` / `workbuddy` 两个产品，
+ * 而这个函数**自己**该只对腾讯系生效 —— 非腾讯系必须逐字节不变。
  */
 /** 工具结果内嵌图片的载体文本（与官方 deepseek 适配器同名同义）。 */
 const TOOL_RESULT_IMAGE_TEXT = 'Attached image(s) from tool result:';
-function serializeMessages(messages, imageUrls) {
+/**
+ * 「wire 首条不是 system」时补在首位的最小 system 文本。
+ *
+ * 判据本身有**两个**来源（WorkBuddy 网关的 11128 硬要求 + space-bunny 的 11148），
+ * 依据写在 `stream()` 里那段注释。此处只说这条文本自身的两条约束：
+ *
+ * - 刻意取**中性且极短**：它只为满足上游对首条角色的要求，不该影响模型行为；
+ * - **必须不含任何腾讯风控指纹字面量** —— 否则这条兜底自己就会把会话送进 11128，
+ *   与 `openai-gateway/tencent-fingerprint.ts` 那层改写互相抵消。
+ *
+ * ⚠️ 与 `account-probe.ts` 的 `PROBE_SYSTEM` **同值但语义独立**（那里是探测用的
+ * system，这里是首条兜底）。两处各写各的，改一处不要顺手改另一处。
+ */
+const LEADING_SYSTEM_PLACEHOLDER = 'You are a helpful assistant.';
+function serializeMessages(messages, imageUrls, provider) {
     const wire = [];
     // 工具结果内嵌图片（read_image 等）不能并入 `role:'tool'` 消息：OpenAI 兼容
     // 协议要求每条 tool 消息紧跟其 assistant tool_call，中间插入任何消息都会 400。
@@ -230,7 +260,13 @@ function serializeMessages(messages, imageUrls) {
                 .filter((block) => typeof block === 'object' && block !== null && block.type === 'reasoning')
                 .map((block) => String(block.text))
                 .join('');
-            const text = contentToText(content);
+            // ⚠️ assistant **正文**要过腾讯系风控指纹改写（实测该位置 400/11128，
+            // 依据见 `openai-gateway/tencent-fingerprint.ts` 的表）。这是**存量自愈**：
+            // 坏的那句一旦进了历史就每轮原样重放，整个会话从此报废（换任何腾讯系模型
+            // 都一样）——2026-10-12 用户报 `step-5-preview` / `space-bunny` 同错即此。
+            // 与之相对，`reasoning_content` 与 `tool_calls.arguments` 实测**不拦**，
+            // 故下面两条**刻意不**改写（改了既换不来放行，又破坏回读证据）。
+            const text = rewriteTencentContentFingerprints(contentToText(content), provider);
             // 挂起的工具结果图片必须在 assistant 之前发出（对齐官方适配器）：
             // 否则它们会漂到这条 assistant 之后，与产生它们的工具调用脱节。
             flushToolImages();
@@ -245,7 +281,8 @@ function serializeMessages(messages, imageUrls) {
         }
         if (message.role === 'system') {
             flushToolImages();
-            wire.push({ role: 'system', content: contentToText(message.content) });
+            // system 是这条风控的**已知**位置（IKJNA1），与网关路径同一判据、同一份表。
+            wire.push({ role: 'system', content: rewriteTencentContentFingerprints(contentToText(message.content), provider) });
             continue;
         }
         // user 角色：工具结果搭载在 harness 用户消息中；展开为独立的 role:'tool' 消息。
@@ -369,7 +406,7 @@ function isContentRejection(body) {
  *   「每次都拿最先选中的坏账号去撞」；
  * - 太长则把「其实已恢复」的账号白白锁死（服务端策略可能随时间/额度状态解除）；
  * - 30 分钟也限制了误伤窗口：标记**只随时间到期失效**（`getAvailableAccount`
- *   的判据是 `Date.now() >= resetAt`，见 `src/account-pool.ts:578`），
+ *   的判据是 `Date.now() >= resetAt`，见 `src/account-pool.ts`），
  *   所以时长直接等于「这个账号在该模型上被藏起来多久」。
  *   ⚠️ 别指望 `sweepExpiredRateLimits` 来清 —— 它在生产代码里**没有任何调用方**
  *   （只有 `account-pool.spec.ts` 用），到期完全靠上面那个时间比较。
@@ -379,7 +416,8 @@ function isContentRejection(body) {
  * 别把它们合并成一个常量 —— 语义不同，将来调其中一个不该动另一个。
  *
  * ⚠️ UI 副作用（已知取舍）：复用的是 `modelRateLimits`，账号卡片因此显示
- * 「限额重置 · <模型> · 30 分钟后」（`plugin-src/client/jet-hub.js:412-418`），
+ * 「限额重置 · <模型> · 30 分钟后」（客户端渲染该行的判据见
+ * `plugin-src/client/jet-hub.js` 的 `dim-jh-rateLimitsLabel`），
  * 而不是「安全策略拦截」—— 该结构只有一个 `模型→时刻` 映射，不带原因字段。
  * 换来的是现成的三条解禁路径都能用它：时间到期、Jet Hub「重置」按钮
  * （`clearModelRateLimits`）、「重测」（`account-probe.ts` 真发一条最小消息，
@@ -409,7 +447,7 @@ const BUDDY_POLICY_BLOCK_COOLDOWN_MS = 30 * 60_000;
  * UI 还会为这两个码额外弹全局额度 Toast。
  *
  * 取 `PERMISSION_DENIED` 与本仓库既有惯例一致 —— `cline-adapter.ts` 的地域限制
- * 分支就用的这个码，并配有专门用例断言「错误码不是 AUTH」（`cline-adapter.spec.ts:479`）。
+ * 分支就用的这个码，并配有专门用例断言「错误码不是 AUTH」（`cline-adapter.spec.ts`）。
  * 它同时**不在** harness 的 `DEFAULT_RETRYABLE_CODES`
  * （`EMPTY_RESPONSE / RATE_LIMIT / SERVER / TIMEOUT / TRANSPORT`）里：
  * 「这个账号被策略拦了」是确定性结论，交给 harness 白退避 5 次毫无意义 ——
@@ -448,7 +486,7 @@ export function policyBlockResetAtMs(nowMs) {
  *
  * 它是账号池里**唯一**的「账号 × 模型暂时不可用」载体（`ProviderAccountEntry`
  * 只有 `模型id → 重置时间戳` 这一个映射，没有 reason / 级别字段），复用它的收益：
- * ① `getAvailableAccount` 的过滤天然生效（`account-pool.ts:577-578`）；
+ * ① `getAvailableAccount` 的过滤天然生效（`account-pool.ts`）；
  * ② UI 已有徽章与「重测 / 重置」两条人工解禁路径（`account-probe.ts`）。
  * 代价是徽章文案显示为「限额重置」而非「安全策略拦截」—— 已知取舍，见常量注释。
  *
@@ -771,6 +809,12 @@ export class BuddyAdapter extends LlmAdapter {
      * 依据见 `src/remote-catalog-gate.ts`（首屏「加载模型巨长」的实测归因）。
      */
     catalogGate;
+    /**
+     * ⚠️ **2026-10-08 Task 7c：三个方法收敛到共享骨架** `createModelCatalog`。
+     * 原先 `listModels` / `resolveModel` / `listAllModels` 各写一遍骨架，
+     * 现在只剩 `toCatalogEntry`（本家私有形状 + 三级 context 查找 + 同名消歧）。
+     */
+    catalog;
     /** 远端下发的模型元数据（id → 能力），listModels/resolveModel/stream 共用。 */
     remoteMeta = new Map();
     /** 远端下发的模型上下文窗口（/v3/config data.models[].maxInputTokens）。 */
@@ -805,13 +849,29 @@ export class BuddyAdapter extends LlmAdapter {
         this.productFallbackContextWindows = new Map(fallback
             .filter((model) => model.contextWindow !== undefined)
             .map((model) => [model.id, model.contextWindow]));
+        // ⚠️ 共享骨架（Task 7c）：门控 → 读目录 → 黑名单 → 回填 → 三态。
+        this.catalog = createModelCatalog({ accountPool: options.accountPool }, {
+            product: this.product,
+            loadCatalog: () => this.loadCatalogEntries(),
+            syncCatalog: () => this.syncCatalogEntries(),
+            // ⚠️ **本家是唯一真正使用「未知」语义的家**：`inputModalitiesFor` 用
+            // `imageCapabilityKnown` 区分「远端明确 false」与「全都没查到」，
+            // 后者**只报未知**（省略该字段）交给宿主判断。
+            // ⇒ **故意不提供** `unknownModelInputModalities`（其余 **12 家**都提供 `['text']`）。
+            // ⚠️ 家数实测为 12、且**不是**源码处数 10（`qoder-adapter.ts` 一处服务
+            //    两家）—— 两个口径都写错过一次。完整名单与复核方式见
+            //    `model-catalog.ts` 里该字段的表格，别在这里抄。
+            // ⚠️ 若给它写 `['text']`，DSH 会按「确认是纯文本模型」把图片**静默投影成
+            // 占位文本** ⇒ 图片能力被关掉（宿主契约：absent means unknown）。
+        });
     }
     /**
      * 该模型此刻是否**免费**（消耗 0 积分）。
      *
      * ## 为什么需要它
      *
-     * `pickBuddyCredential`（`src/index.ts`）只问「锁没锁 + 有没有临期积分」，
+     * 余额分档编排（`src/credential-resolver.ts` 的 buddy 分支 + 共享的
+     * `pickBuddyAccount`）只问「锁没锁 + 有没有临期积分」，
      * 从不问「这个模型要不要钱」。于是免费模型也会被「锁定永久积分 + 无临期积分」
      * 这道门拦下，报出「没有可用账号……已锁定永久积分，而所有账号的『N 天内到期』
      * 积分都已用尽」，而它**一分积分都不需要** —— 用户看到的是
@@ -1185,45 +1245,104 @@ export class BuddyAdapter extends LlmAdapter {
      * key（裸 id）补回 —— 那条路径拿不到展示名，只能退化成裸 id，**倍率随之丢失**
      * （用户报障：「关闭的就没有显示倍率」）。
      *
-     * ⚠️ 同名消歧必须基于**未过滤**的全量集合：`displayNameFor(model, source)`
-     * 而非 `listed`。用过滤后的集合会让「关掉其中一个同名模型」改变另一个的
-     * 变体标记，名字随开关跳变。
+     * ⚠️ **2026-10-08 Task 7c**：骨架（含上面这条理由）已上移到共享实现
+     * `src/model-catalog.ts`，此处只剩委托。
      */
     listAllModels() {
-        const source = this.remoteModels ?? this.staticFallbackModels();
-        return source.map((model) => ({ id: model.id, name: displayNameFor(model, source) }));
-    }
-    async listModels(_provider) {
-        // ⚠️ 门控放在 `ensureRemoteModels()` **之前**：没有已登录账号时连远端目录都
-        // 不必拉。返回空数组 → DSH 的 `buildModelCatalog` 把整个 provider 分组隐藏。
-        // ⚠️ 必须返回 `[]` 而**不能抛错**（抛错会被归入 catalog 的 `failures`）。
-        if (!await providerCatalogVisible(this.options.accountPool, this.product.id))
-            return [];
-        await this.ensureRemoteModels();
-        const source = this.remoteModels ?? this.staticFallbackModels();
-        // 用户在 Jet Hub 关闭的模型（黑名单制：不在表里即默认打开）。
-        // 按本适配器的产品 id 取表，CodeBuddy 与 WorkBuddy 的开关互不影响。
-        const disabled = this.options.accountPool?.disabledModelsFor(this.product.id);
-        const listed = disabled === undefined || disabled.size === 0
-            ? source
-            : source.filter((model) => !disabled.has(model.id));
-        return listed.map((model) => ({
-            provider: this.product.id,
-            id: model.id,
-            name: displayNameFor(model, listed),
-            ...this.imageModalitiesField(model.id),
-        }));
+        return this.catalog.listAllModels();
     }
     /**
-     * 把 {@link inputModalitiesFor} 的结果摊成 `LlmModelInfo` 的可选字段。
+     * 把本家条目转成共享骨架的中间结构。
      *
-     * ⚠️ 必须**省略**而不是报 `['text']`：宿主契约明写
-     * 「absent means unknown」（dsh-llm `types.d.ts`），而 DSH 见到
-     * 「不含 image」的声明会按「确认是纯文本模型」把图片静默投影成占位文本。
+     * ⚠️ **`all` 是「用于同名消歧的集合」，必须传未过滤的全量集合** ——
+     * 见 `displayNameFor` 的说明（用过滤后的集合会让「关掉其中一个同名模型」
+     * 改变另一个的变体标记，名字随开关跳变）。
+     *
+     * ⚠️ 本家三处**真实差异**（不要「顺手统一」）：
+     * 1. `contextWindow` 三级查找：远端 `maxInputTokens` → 产品兜底表 → 通用静态表
+     *    （对齐 Rust `context_limit_for_model` 的两级查找，多一层产品级）；
+     * 2. `maxOutputTokens` 二级查找（远端 → 产品兜底），**必须声明**：
+     *    不声明等于把这个值永久交给网关默认（实测网关默认仅 32000），
+     *    大文件写入/长回答会在 32000 处被截断成 `finish_reason:'length'`；
+     * 3. `reasoning` 的 `efforts` 取自 `effortsFor`（按模型/产品判据），
+     *    且 `defaultEffort` **必须落在 `efforts` 内**。
+     *
+     * ⚠️ `inputModalities` **缺席即「未知」**（本家是全仓唯一真正使用该语义的家）：
+     * `inputModalitiesFor` 用 `imageCapabilityKnown` 区分「远端明确 false」与
+     * 「全都没查到」，后者返回 `undefined` ⇒ 这里**省略该字段**交给宿主判断。
      */
-    imageModalitiesField(model) {
-        const modalities = this.inputModalitiesFor(model);
-        return modalities === undefined ? {} : { inputModalities: modalities };
+    toCatalogEntry(model, all) {
+        const contextWindow = this.remoteContextWindows.get(model.id)
+            ?? this.productFallbackContextWindows.get(model.id)
+            ?? CONTEXT_WINDOWS.get(model.id);
+        const maxOutputTokens = positiveMaxTokens(this.remoteMeta.get(model.id)?.maxOutputTokens
+            ?? this.productFallbackMeta.get(model.id)?.maxOutputTokens);
+        const efforts = this.effortsFor(model.id);
+        const remoteDefault = this.remoteMeta.get(model.id)?.defaultReasoningEffort
+            ?? this.productFallbackIndex.get(model.id)?.defaultReasoningEffort;
+        const modalities = this.inputModalitiesFor(model.id);
+        return {
+            id: model.id,
+            // ⚠️ 同名消歧用**未过滤**的 `all`（见上）。
+            name: displayNameFor(model, all),
+            // ⚠️ `resolveModel` 的 name 取自**元数据**（不是 `displayNameFor`）——
+            // 它不带倍率后缀，故显式提供 `bareName`。
+            bareName: this.remoteMeta.get(model.id)?.name
+                ?? this.productFallbackIndex.get(model.id)?.name
+                ?? model.name,
+            ...modalities !== undefined ? { inputModalities: modalities } : {},
+            ...contextWindow !== undefined ? { contextWindow } : {},
+            ...maxOutputTokens !== undefined ? { maxTokens: maxOutputTokens } : {},
+            ...efforts.length > 0
+                ? {
+                    reasoning: {
+                        efforts: efforts.map((id) => ({
+                            id: ReasoningEffortId(id),
+                            name: EFFORT_NAMES[id] ?? id,
+                        })),
+                        ...remoteDefault !== undefined && efforts.includes(remoteDefault)
+                            ? { defaultEffort: ReasoningEffortId(remoteDefault) }
+                            : {},
+                    },
+                }
+                : {},
+        };
+    }
+    /**
+     * 本家全部条目（**含 VL 等可见性判据**）—— 远端缓存 ?? 静态兜底表。
+     *
+     * ⚠️ 两条路径（`listModels` / `listAllModels`）都用**同一份未过滤集合**做
+     * 同名消歧：`listModels` 侧原先误用「已过滤」集合，与 `displayNameFor` 的
+     * 注释矛盾（用户 2026-10-08 裁定修正为未过滤 —— 一次**行为变更**：
+     * 关闭同名模型之一时，另一个的变体标记不再跳变）。
+     */
+    catalogEntries(source) {
+        return source.map((model) => this.toCatalogEntry(model, source));
+    }
+    async loadCatalogEntries() {
+        await this.ensureRemoteModels();
+        return this.catalogEntries(this.remoteModels ?? this.staticFallbackModels());
+    }
+    /**
+     * 同步视图（`listAllModels` 用）。
+     *
+     * ⚠️ **不能** `await ensureRemoteModels()`（同步契约）—— 读 `remoteModels`
+     * 缓存，未落地时回退静态兜底表（这正是原实现的语义）。
+     */
+    syncCatalogEntries() {
+        return this.catalogEntries(this.remoteModels ?? this.staticFallbackModels());
+    }
+    async listModels(_provider) {
+        return this.catalog.listModels(_provider);
+    }
+    /**
+     * 解析模型元信息。
+     *
+     * ⚠️ 原实现里的三处判据（context 三级查找 / maxOutputTokens / reasoning）
+     * 现已收敛到 `toCatalogEntry` —— 骨架的 `resolveModel` 只做回填与「不声明未知」。
+     */
+    async resolveModel(provider, model, signal) {
+        return this.catalog.resolveModel(provider, model, signal);
     }
     /**
      * 静态兜底模型目录：优先用产品自带的 `fallbackModels`，否则用通用默认表。
@@ -1238,56 +1357,6 @@ export class BuddyAdapter extends LlmAdapter {
             return productModels.map((model) => ({ id: model.id, name: model.name }));
         }
         return DEFAULT_MODELS.map((id) => ({ id, name: id }));
-    }
-    async resolveModel(provider, model, _signal) {
-        await this.ensureRemoteModels();
-        // 三级查找：远端 maxInputTokens → 产品兜底表 → 通用静态表
-        // （对齐 Rust context_limit_for_model 的两级查找，多一层产品级）。
-        const contextWindow = this.remoteContextWindows.get(model)
-            ?? this.productFallbackContextWindows.get(model)
-            ?? CONTEXT_WINDOWS.get(model);
-        const resolved = {
-            provider,
-            id: model,
-            name: this.remoteMeta.get(model)?.name ?? this.productFallbackIndex.get(model)?.name ?? model,
-            ...this.imageModalitiesField(model),
-        };
-        if (contextWindow !== undefined)
-            resolved.context = { contextWindow };
-        // 单次输出上限：远端 maxOutputTokens（实测 deepseek-v4.1-flash = 128000）
-        // 优先，产品兜底表次之。
-        //
-        // **为什么必须声明**：DSH 在 `resolveCallWithInfo` 里只在调用方未显式给值时
-        // 用 `defaultMaxTokens` 兜底，适配器不声明就等于把这个值永久交给网关默认
-        // （实测网关默认仅 32000 —— 见远端 `auto` 模型的 maxOutputTokens）。结果是
-        // 大文件写入 / 长回答在 32000 处被截断成 finish_reason:'length'，UI 报
-        // 「已达到输出 token 上限」。这与 codearts 适配器显式发 max_tokens 的做法
-        // （llm-adapter.ts）本应一致。
-        //
-        // 远端与兜底表都没有该模型的值时**保持 undefined**，交给网关默认值：
-        // 编造一个偏大的值会让服务端 400 拒绝（参考 codearts 131072 被拒的实测），
-        // 偏小则无谓截断用户输出。
-        const maxOutputTokens = positiveMaxTokens(this.remoteMeta.get(model)?.maxOutputTokens ?? this.productFallbackMeta.get(model)?.maxOutputTokens);
-        if (maxOutputTokens !== undefined)
-            resolved.defaultMaxTokens = maxOutputTokens;
-        // 思考等级：这是"思考强度"选择器出现在模型选择里的唯一入口——composer
-        // 读取 resolveModel().reasoning。无等级可选的模型不声明该字段，UI 显示
-        // "当前模型未提供推理等级"。
-        const efforts = this.effortsFor(model);
-        if (efforts.length > 0) {
-            const remoteDefault = this.remoteMeta.get(model)?.defaultReasoningEffort
-                ?? this.productFallbackIndex.get(model)?.defaultReasoningEffort;
-            resolved.reasoning = {
-                efforts: efforts.map((id) => ({
-                    id: ReasoningEffortId(id),
-                    name: EFFORT_NAMES[id] ?? id,
-                })),
-                ...remoteDefault !== undefined && efforts.includes(remoteDefault)
-                    ? { defaultEffort: ReasoningEffortId(remoteDefault) }
-                    : {},
-            };
-        }
-        return resolved;
     }
     /**
      * 兼容 0.1.1-rc.2：新版 LlmRuntime.prepareCall() 会调用
@@ -1412,9 +1481,38 @@ export class BuddyAdapter extends LlmAdapter {
                 imageUrls.set(id, `data:${image.mediaType};base64,${Buffer.from(image.data).toString('base64')}`);
             }
         }
-        const messages = serializeMessages(options.messages, imageUrls);
+        const messages = serializeMessages(options.messages, imageUrls, this.product.id);
         if (options.system !== undefined && options.system.length > 0) {
-            messages.unshift({ role: 'system', content: options.system });
+            // ⚠️ 这条是 `serializeMessages` 之外的**第四个**产出点：`options.system`
+            // 不经过那个函数，漏掉它等于「走 messages 的会话被救了、走 system 的会话照样被拦」。
+            messages.unshift({
+                role: 'system',
+                content: rewriteTencentContentFingerprints(options.system, this.product.id),
+            });
+        }
+        // ⚠️ wire 的**首条必须是 system**（2026-10-12 补测 + 本仓库既有约束）。
+        //
+        // 两个**独立**来源指向同一条要求，必须同时满足：
+        //
+        // ① WorkBuddy 网关**硬性要求** `messages[0]` 是 system，否则 400 + 11128
+        //    `first message is not system prompt`，且 `displayMsg` 把它伪装成「安全
+        //    策略拦截」（见 `account-probe.ts` 的 `PROBE_SYSTEM` 注释，内含
+        //    2026-09-25 双端点对照实测：WorkBuddy 无 system → 400/11128、有 system
+        //    → 200；CodeBuddy 两种都 200）。
+        // ② space-bunny 的 11148：仅当「首条是**带 tool_calls 的 assistant**」时报
+        //    `tool calls and tool results do not match`（`displayMsg.zh`=「工具记录不
+        //    完整，请新建任务」），step-5-preview 则宽容；把 system 补到前面两个都 200。
+        //
+        // ⚠️ 判据因此是 `!== 'system'`，**不是** `=== 'assistant'` —— 后者漏掉
+        // **user-first / tool-first** 的历史（实测存在：历史被压缩削头；以及 DSH 的
+        // 一次性调用只带 user 而不带 system，见 `GenerateOptions.system` 的注释），
+        // 那些在 WorkBuddy 上仍是同一个 11128。判据依赖「另一个产品碰巧不校验」同样是
+        // 错的 —— 与 `PROBE_SYSTEM` 那段「无条件给所有 provider 都带 system」的取舍一致。
+        //
+        // ⚠️ 补在 `options.system` unshift **之后**：真实 system 优先，只有连它都没有
+        // 时才需要这条兜底 ⇒ 不会重复插入。
+        if (messages.length > 0 && messages[0].role !== 'system') {
+            messages.unshift({ role: 'system', content: LEADING_SYSTEM_PLACEHOLDER });
         }
         const tools = options.tools?.map((tool) => ({
             type: 'function',
@@ -1450,11 +1548,9 @@ export class BuddyAdapter extends LlmAdapter {
         // 取值优先级：调用方显式给的 options.maxTokens（DSH 会先注入 resolveModel
         // 声明的 defaultMaxTokens）→ 远端 maxOutputTokens → 产品兜底表。
         // 三者皆无则不发该字段，保持网关默认（不编造，理由见 resolveModel）。
-        const maxTokens = positiveMaxTokens(options.maxTokens
+        const declaredMaxTokens = positiveMaxTokens(options.maxTokens
             ?? this.remoteMeta.get(options.model)?.maxOutputTokens
             ?? this.productFallbackMeta.get(options.model)?.maxOutputTokens);
-        if (maxTokens !== undefined)
-            bodyObj.max_tokens = maxTokens;
         // DeepSeek 思维链开关（逆向官方 codebuddy.js，对齐 workbuddy2api-panel
         // thinking.go）。**实测关键结论（2026-09，直连三站点对照）**：
         //   - 裸请求（无 reasoning_effort、无 thinking）→ reasoning_content 恒为 0；
@@ -1465,25 +1561,55 @@ export class BuddyAdapter extends LlmAdapter {
         // 为对齐官方客户端出站形态，并覆盖未来后端按它判定的情形）。
         // 三站点（workbuddy 国际/中国 UA、codebuddy）行为一致 → endpoint/UA 无关。
         const deepseek = isDeepSeekModel(options.model);
-        if (deepseek) {
-            bodyObj.thinking = { type: 'enabled' };
-        }
         // 思考强度：composer 选中的等级透传为 `reasoning_effort`（实测
         // low/high/max 会显著改变返回的 reasoning_content 长度，服务端真实生效）。
         // 只在该模型确实支持该等级时才发，否则服务端会因非法参数 400。
         const efforts = this.effortsFor(options.model);
-        if (options.reasoningEffort !== undefined && efforts.includes(options.reasoningEffort)) {
-            bodyObj.reasoning_effort = options.reasoningEffort;
+        const requestedEffort = options.reasoningEffort !== undefined && efforts.includes(options.reasoningEffort)
+            ? options.reasoningEffort
+            : undefined;
+        /**
+         * 会话自动命名（`purpose: 'session-title'`）的思考与预算决策。
+         *
+         * 见 `session-title.ts` 的模块头：DSH 用 **64 token** 发标题请求、
+         * 且**不传 `reasoningEffort`**，而宿主会把本模型的默认档注入进来
+         * （`effective = requested ?? reasoning.defaultEffort`）。若照常开思考，
+         * 实测 64 个 token 会被思考**全部吃满**、正文 0 字符、
+         * `finish_reason: 'length'` ⇒ `dsh-session-title-llm` 直接拒绝，
+         * 标题永远停在 fallback（issue IKKVDH）。
+         *
+         * 本家的关闭手段是**发裸请求**（`disableByOmission`）：实测
+         * 「无 `reasoning_effort`、无 `thinking` → `reasoning_content` 恒为 0」。
+         * ⚠️ 故下面**不能**再给 deepseek 系补默认档 —— 那正是缺陷的成因。
+         */
+        const plan = planSessionTitleThinking({
+            purpose: options.purpose,
+            requestedEffort: requestedEffort ?? (deepseek && efforts.length > 0
+                ? this.defaultEffortFor(options.model) ?? (efforts.includes('high') ? 'high' : efforts[0])
+                : undefined),
+            declaredEfforts: efforts,
+            maxTokens: declaredMaxTokens,
+            // ⚠️ 只有 deepseek 系实测「不发字段即关闭」；其余模型族（glm/kimi）
+            // 走各自 thinkingFormat，语义未实测，故不给它们这个豁免。
+            disableByOmission: deepseek,
+        });
+        if (plan.isTitle) {
+            // 标题请求：关得掉就不发任何思考字段（buddy 的 deepseek 系）；
+            // 关不掉（如 glm/kimi 无 `off` 档）则保留原档位并由 plan 抬预算兜底。
+            if (plan.effort !== undefined)
+                bodyObj.reasoning_effort = plan.effort;
         }
-        else if (deepseek && efforts.length > 0) {
-            // composer 未选档位（历史请求可能 `adapterDefaults: undefined`）或所选
-            // 档位不被支持时，必须补一个档位——否则请求体里只剩 thinking，上游仍按
-            // 不思考应答（实测）。回退顺序：声明默认档 → high（对齐官方客户端
-            // REASONING_SUPPLEMENTS.defaultEffort 与 thinking.go 的兜底）→ 最低支持档
-            // （绝不臆造模型未声明的档位，否则服务端 400）。
-            bodyObj.reasoning_effort = this.defaultEffortFor(options.model)
-                ?? (efforts.includes('high') ? 'high' : efforts[0]);
+        else {
+            if (deepseek) {
+                bodyObj.thinking = { type: 'enabled' };
+            }
+            if (plan.effort !== undefined) {
+                bodyObj.reasoning_effort = plan.effort;
+            }
         }
+        const maxTokens = plan.maxTokens;
+        if (maxTokens !== undefined)
+            bodyObj.max_tokens = maxTokens;
         const body = JSON.stringify(bodyObj);
         // 4. 发送请求（401/403 时刷新当前账号一次，仍失败则换号重试）
         let response = await this.send(credential, body, options);
@@ -1878,6 +2004,11 @@ export class BuddyAdapter extends LlmAdapter {
          * 整块丢掉（比循环本身更糟）。
          */
         const proseLoopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined;
+        /**
+         * DSML 标记归一化器（见 sse.ts `createDsmlMarkerNormalizer`）。
+         * ⚠️ **每个 `stream()` 调用一个实例**：待定缓冲是跨帧状态，共用会串流。
+         */
+        const dsmlFix = createDsmlMarkerNormalizer();
         let proseLoopDetected = false;
         // ⚠️ 此处**曾有** `proseHasThinkTag` 门禁变量，2026-09-27 **删除**。
         // 它逐帧匹配标签来决定收尾是否切分，而标签**必然跨帧**（上游可切成任意片段），
@@ -2006,8 +2137,16 @@ export class BuddyAdapter extends LlmAdapter {
                         // 现改为收尾**无条件**调用 `splitThinkTaggedContent`
                         // （无标签时返回 undefined，普通响应逐字节不变）。
                         if (!proseLoopDetected) {
-                            block.text += delta.content;
-                            yield { type: 'text-delta', index: block.index, text: delta.content };
+                            // ⚠️ **先归一化再累积**（2026-10-13）：step-5-preview 实测把
+                            //    `<｜DSML｜invoke…>` 写坏成 `<｜｜DSML｜｜`（全角双竖线，
+                            //    分词器保真度问题）⇒ 宿主解析器不认，工具调用整段当正文，
+                            //    模型「停住不动」。push() 流式安全（跨帧由待定缓冲拼齐，
+                            //    与 openai-compat.ts 的 consumeOpenAiSse 同款）。
+                            const fixedDelta = dsmlFix.push(delta.content);
+                            block.text += fixedDelta;
+                            if (fixedDelta.length > 0) {
+                                yield { type: 'text-delta', index: block.index, text: fixedDelta };
+                            }
                         }
                     }
                     if (delta?.reasoning_content) {
@@ -2176,6 +2315,18 @@ export class BuddyAdapter extends LlmAdapter {
                 },
             };
         }
+        // ── DSML 归一化收尾：下发待定缓冲 ──（与 openai-compat.ts 同款）
+        // 扣住的尾部在流结束时必须放行，block-end 才能带上它。
+        {
+            const tail = dsmlFix.flush();
+            if (tail.length > 0 && !proseLoopDetected) {
+                const tailBlock = blocks.find(candidate => candidate.kind === 'text');
+                if (tailBlock !== undefined) {
+                    tailBlock.text += tail;
+                    yield { type: 'text-delta', index: tailBlock.index, text: tail };
+                }
+            }
+        }
         if (textBlock !== undefined) {
             // ── think 标签归位（见 `splitThinkTaggedContent`）──
             // 标签**前**的内心独白 → reasoning 块；标签**后**的真正文 → 本 text 块。
@@ -2224,13 +2375,17 @@ export class BuddyAdapter extends LlmAdapter {
                 : textOut;
             // 行首 `course` / `课` 泄漏 token 清洗（见 `stripCourseLeak`）。
             const cleaned = stripCourseLeakIfEnabled(truncated);
+            // ⚠️ DSML 归一化**整串兜底**（幂等，与 openai-compat.ts 同款）：增量路径
+            //    已逐帧修过，这里再过一遍防御跨缓冲边界漏网；block-end 是权威覆盖，
+            //    发的必须是归一化后的文本，否则会把增量修好的又改回去。
+            const dsmlCleaned = fixDsmlMarkers(cleaned);
             // ⚠️ 归位后正文可能为空串（实测 seq=34768 形态）—— 空块会污染会话，
             // 且 DSH 的 `EMPTY_RESPONSE` 契约禁止产出空内容块。思考段已归位，
             // 故本响应仍有产出，不会被误判为零块。
-            if (cleaned !== '') {
+            if (dsmlCleaned !== '') {
                 blockCount += 1;
-                emittedProse = cleaned;
-                yield { type: 'block-end', index: textBlock.index, block: { type: 'text', text: cleaned } };
+                emittedProse = dsmlCleaned;
+                yield { type: 'block-end', index: textBlock.index, block: { type: 'text', text: dsmlCleaned } };
             }
         }
         const reasoningBlock = blocks.find(block => block.kind === 'reasoning');

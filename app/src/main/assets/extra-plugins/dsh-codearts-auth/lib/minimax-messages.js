@@ -55,7 +55,7 @@
  */
 import { ToolCallId } from '@deepseek-ai/dsh-llm';
 import { normalizeHarnessMessages } from './message-shape.js';
-import { resolveToolPairing } from './sse.js';
+import { createDsmlMarkerNormalizer, fixDsmlMarkers, resolveToolPairing } from './sse.js';
 /**
  * 构造 Anthropic Messages 请求体。
  *
@@ -432,6 +432,20 @@ export async function* consumeMinimaxSse(options) {
     let stopReason;
     let usage = { inputTokens: 0, outputTokens: 0 };
     let sawAnyChunk = false;
+    /** DSML 标记归一化器（见 sse.ts）；每个 SSE 消费一个实例。 */
+    const dsmlFix = createDsmlMarkerNormalizer();
+    /**
+     * 响应原文样本（前 500 字符）。
+     *
+     * ⚠️ **只为错误文案服务**：`data:` 行解析失败（网关 HTML / 非标准信封）时，
+     * 整个响应在错误里毫无痕迹 ⇒ 适配器的轮换判据只能得到 `other` ⇒ 换号静默失效。
+     */
+    let rawSample = '';
+    const sampleRaw = (text) => {
+        if (text === '' || rawSample.length >= 500)
+            return;
+        rawSample += text.slice(0, 500 - rawSample.length);
+    };
     /**
      * 处理一行 SSE。
      *
@@ -474,11 +488,34 @@ export async function* consumeMinimaxSse(options) {
         // ⚠️ 帧自带 `type`，优先用它（`event:` 行可能缺失或被代理吞掉）。
         const type = typeof frame.type === 'string' ? frame.type : eventName;
         if (type === 'error') {
-            const error = frame.error;
-            const message = typeof error === 'object' && error !== null
-                ? String(error.message ?? '未知错误')
-                : '未知错误';
-            throw new Error(`minimax: 流内错误：${message}`);
+            const nested = frame.error;
+            const record = typeof nested === 'object' && nested !== null
+                ? nested
+                : undefined;
+            /**
+             * ⚠️ 服务端在本家**混用两种信封**（2026-10-11 真机实测）：
+             *
+             * - Anthropic 形状：`{"type":"error","error":{"type":…,"message":…}}`
+             * - **自家信封**：`{"code":401,"message":"auth failed"}` —— 401 实测就是这个，
+             *   它**根本没有 `error` 对象**。
+             *
+             * 只认 `frame.error.message` 时自家信封退化成「未知错误」⇒ 额度信息整段丢失
+             * ⇒ 适配器判 `other` ⇒ **换号静默失效**（issue 要修的事在 200 路径上原样残留）。
+             * ⇒ message 回退读顶层；`type` 与 `code` 一并带进文案，后者是适配器的
+             *   确定性通道（实测自家信封的 `code` 与 HTTP 语义同值）。
+             */
+            const messageRaw = record?.message ?? frame.message;
+            const message = typeof messageRaw === 'string' && messageRaw !== '' ? messageRaw : '未知错误';
+            const kindRaw = record?.type ?? frame.type;
+            // ⚠️ `frame.type` 在本分支恒为 `'error'`（那是分支判据本身），别再重复播报。
+            const kind = typeof kindRaw === 'string' && kindRaw !== '' && kindRaw !== 'error'
+                ? `（${kindRaw}）`
+                : '';
+            const codeRaw = record?.code ?? frame.code;
+            const code = typeof codeRaw === 'number' || (typeof codeRaw === 'string' && codeRaw !== '')
+                ? `（code=${String(codeRaw)}）`
+                : '';
+            throw new Error(`minimax: 流内错误${kind}：${message}${code}`);
         }
         if (type === 'message_start') {
             const message = frame.message;
@@ -521,9 +558,13 @@ export async function* consumeMinimaxSse(options) {
             const d = delta;
             const state = blocks.get(index);
             if (d.type === 'text_delta' && typeof d.text === 'string') {
+                // ⚠️ **先归一化再累积**（2026-10-13，见 sse.ts 注释）。
+                const fixedText = dsmlFix.push(d.text);
                 if (state !== undefined)
-                    state.text += d.text;
-                yield { type: 'text-delta', index, text: d.text };
+                    state.text += fixedText;
+                if (fixedText.length > 0) {
+                    yield { type: 'text-delta', index, text: fixedText };
+                }
             }
             else if (d.type === 'thinking_delta' && typeof d.thinking === 'string') {
                 if (state !== undefined)
@@ -551,7 +592,13 @@ export async function* consumeMinimaxSse(options) {
                 return;
             let block;
             if (state.type === 'text') {
-                block = { type: 'text', text: state.text };
+                // ⚠️ 收尾下发待定缓冲 + **整串兜底**归一化（幂等，见 sse.ts）。
+                const tail = dsmlFix.flush();
+                if (tail.length > 0) {
+                    state.text += tail;
+                    yield { type: 'text-delta', index, text: tail };
+                }
+                block = { type: 'text', text: fixDsmlMarkers(state.text) };
             }
             else if (state.type === 'reasoning') {
                 block = { type: 'reasoning', text: state.text };
@@ -594,7 +641,9 @@ export async function* consumeMinimaxSse(options) {
                 }
                 break;
             }
-            buffer += decoder.decode(value, { stream: true });
+            const piece = decoder.decode(value, { stream: true });
+            sampleRaw(piece);
+            buffer += piece;
             // SSE 以空行分隔事件；按行处理，末尾不成行的部分留在 buffer 里。
             const lines = buffer.split('\n');
             buffer = lines.pop() ?? '';
@@ -603,12 +652,25 @@ export async function* consumeMinimaxSse(options) {
         }
     }
     finally {
+        /**
+         * ⚠️ **必须 cancel，不能只 releaseLock**（本仓既有约定，见 `sse.ts` 的
+         * `readWithIdleTimeout`）：请求级轮换会在「流内错误」时**提前离开**这条流，
+         * 只释放锁会把未读完的响应体留在连接上（一次请求最多 7 条）。
+         * 这是本家接上轮换后才出现的新累积（改动前 200 只被消费一次）。
+         */
+        await reader.cancel?.().catch(() => { });
         reader.releaseLock?.();
     }
     // ⚠️ 空响应必须报错：静默结束会让 harness 认为「模型正常回答但没内容」，
     // **不会重试**（与 Qoder/CodeArts 的既有约定一致）。
     if (!sawAnyChunk) {
-        throw new Error('minimax: 模型未返回任何内容块');
+        /**
+         * ⚠️ 把**响应原文样本**带上：网关 HTML / 非标准信封在这里只表现为「没有内容块」，
+         * 不带原文时适配器只能判 `other` ⇒ 换号静默失效，用户也看不到服务端说了什么。
+         * （`data:` 行解析失败时同样只有原文能提供线索。）
+         */
+        const sample = rawSample.trim();
+        throw new Error(`minimax: 模型未返回任何内容块${sample === '' ? '' : `（响应原文：${sample.slice(0, 500)}）`}`);
     }
     yield { type: 'usage', usage };
     yield { type: 'finish', reason: mapMinimaxStopReason(stopReason) };

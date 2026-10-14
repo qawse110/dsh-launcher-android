@@ -9,7 +9,7 @@
  * | `aggregate-core.ts` | 该文件定位是**纯逻辑**（哨兵 / 排序 / 倍率解析，模块头明写、零 import），而本模块要发网络请求 ⇒ 把 IO 混进纯函数模块，且 `aggregate-core.spec.ts` 这个纯函数单测会**被迫加载网络模块** |
  * | ✅ 本文件 | 单一职责；两个适配器都依赖它，方向正确 |
  *
- * ## ⚠️ 四个 `*Expiry` 是**搬移**进来的，不是复制
+ * ## ⚠️ 六个 `*Expiry` 是**搬移**进来的，不是复制
  *
  * 它们原先私有在 `auto-adapter.ts` 里（`private async buddyExpiry` 等）。Task 7
  * 把 `expiryOf` 改成委托本模块的 {@link createExpiryProbe} 后，若原处再留一份，
@@ -18,20 +18,32 @@
  * 不崩溃、单测能过，只是把「没做到」说成「做到了」）。
  * Task 3 已用同样手法处理过 `pickSoonestProvider` / `priceFactorFromName`。
  *
+ * ⚠️ 计数是**六**不是四（2026-10-08 更正）：Task 7 搬来时是四个
+ *（buddy / loomy / codeArts / zcode），2026-10-07 又补了 `lobsteraiExpiry` 与
+ * `traeExpiry`（用户质疑后核实加入）—— 旧注释一直没跟着改。
+ *
+ * ## ⚠️ 依赖方向（2026-10-08 起 import `provider-runtime.ts`）
+ *
+ * 本模块**只**依赖底座，不依赖任何聚合侧模块（见上表：依赖聚合适配器就是
+ * **层次颠倒**）。`provider-runtime.ts` 只 import `provider-registry.ts`（纯数据）
+ * 与 `account-pool.ts`（**仅类型**），**不** import 本文件 ⇒ **无环**。
+ * ⚠️ 别在这里 import `aggregate-adapter.ts` / `auto-adapter.ts`。
+ *
  * @module src/aggregate-expiry.ts
  */
 import { NEVER, UNUSABLE } from './aggregate-core.js';
 import { fetchCreditBalance } from './credits.js';
-import { CODEBUDDY, WORKBUDDY } from './product.js';
 import { LOOMY } from './loomy-product.js';
 import { fetchLoomyCreditDetail } from './loomy-credits.js';
 import { fetchCodeArtsAccountInfoDetailed } from './codearts-credits.js';
 import { fetchZcodeBalance } from './zcode-upstream.js';
 import { nextUtc8DayStartMs } from './model-queue.js';
-import { LOBSTERAI } from './lobsterai-product.js';
+import { exhaustedModelsOf, recoveredModelsOf } from './zcode-entitlements.js';
 import { fetchLobsteraiCreditBalance } from './lobsterai-credits.js';
-import { TRAE } from './trae-product.js';
 import { fetchTraeCreditBalance } from './trae-credits.js';
+import { fetchAccioBalanceDetailed } from './accio-credits.js';
+import { fetchSubscriptionSummary } from './officeace-auth.js';
+import { runtimeOf } from './provider-runtime.js';
 /**
  * 真实临期探针：**每个渠道折算成一个「最早失效时刻」**。
  *
@@ -68,7 +80,7 @@ import { fetchTraeCreditBalance } from './trae-credits.js';
  * 是误导（真实缺陷，PR !69 审计实测）。
  */
 /**
- * **已接入临期折算**的渠道 id（`createExpiryProbe` 的 `switch` 覆盖的那几家）。
+ * **已接入临期折算**的渠道 id。
  *
  * ## ⚠️ 为什么必须导出（审计轮次二实测证伪的缺陷）
  *
@@ -88,8 +100,44 @@ import { fetchTraeCreditBalance } from './trae-credits.js';
  * ⇒ 聚合目录只播报「**至少有一个已接入候选**」的虚拟模型；`auto` 不受影响
  *（它的池跨全部渠道，任一已接入渠道有账号就能路由）。
  *
- * ⚠️ **本清单必须与下方 `switch` 的分支保持一致** —— 有专门用例锁它们相等
- *（`aggregate-expiry.spec.ts` 的「清单与 switch 一致」条），新增渠道时两处都要改。
+ * ## ⚠️⚠️ 为什么它必须是**编译期常量**，不能从 runtime 派生（2026-10-08 设计复审）
+ *
+ * 本清单回答的是「**这个渠道接入了临期折算吗**」—— 那是一个**编译期事实**
+ *（本文件有没有为它写折算原语）。而 `ProviderRuntime.expiry` 回答的是另一个问题：
+ * 「**运行时该调哪个原语**」。两者**不是同一件事**，故不能互为派生源。
+ *
+ * 具体后果（**实测**，不是推断）：本清单在源码里有 **4 个**消费点 ——
+ * 3 处在 `aggregate-adapter.ts` 的过滤（探测过滤 / 候选过滤 / 虚拟模型过滤），
+ * 1 处是本文件的「未接入」短路。而**既有测试**里有两个大批量的构造点：
+ * **29 处**临期探针工厂调用、**86 处** `AggregateAdapter` 构造 —— 那些文件
+ * **一次都不调 `apply()`**（`aggregate-expiry` / `aggregate-wiring` /
+ * `zcode-expiry-exhausted` 三份的 `apply` 命中**都不是真实调用**：实测分别是
+ * 3 / 0 / 0 处，有命中的那份全是注释里的字）。
+ * ⚠️ **计数口径**（便于复核，2026-10-08 实测）：在 `tests/unit` 里 grep
+ * 「工厂名 + 左括号」共 36 处，减去 `expiry-runtime-parity.spec.ts` 自己的 7 处
+ * ⇒ **既有 29 处**；grep「`new` + `AggregateAdapter` + 左括号」共 86 处
+ *（全在既有文件）。⚠️ 本仓库的注释刻意**不写出左括号**，否则注释自己会被
+ * 下一次 grep 计进去（自指），数字就再也复核不出来。
+ * 而 runtime 注册只发生在 `apply()` ⇒ 派生版本在这些场景下**恒为空数组**，于是：
+ *
+ * | 后果 | 严重度 |
+ * |---|---|
+ * | `refreshCatalog` 把所有虚拟模型过滤掉 ⇒ **聚合 provider 的模型列表整个变空** | 致命 |
+ * | 上述 29 + 86 处构造点大面积变红 | 高 |
+ *
+ * ⚠️ **不要**把它说成「生产路径也会变空」—— 那是**没有证据**的推断，已实测证伪：
+ * `src/index.ts` 里聚合适配器确实在 runtime 注册**之前**创建（`registerAggregateLlm`
+ * 调用早于 `registerProviderRuntime` 那段循环），但 `catalog-prewarm` 的首次预热是
+ * `queueMicrotask` 排的，而 `apply()` 是**同步**函数 ⇒ 微任务在 `apply()` **整体
+ * 返回之后**才跑，那时注册（同步段内）早已完成。
+ * 实测（`node -e` 复现同一时序）：`sync-A → registration → sync-B → microtask → prewarm`。
+ * ⇒ 派生版本在**生产**启动窗口内其实是安全的；**决定性证据是上面那两组实测计数**
+ * （29 处探针 + 86 处适配器构造，全都不调 `apply()`），不是「生产会挂」。
+ *
+ * ⇒ 保持常量。它与 runtime 的一致性由
+ * `tests/unit/expiry-runtime-parity.spec.ts` 的「**清单 == runtime 里挂了
+ * `expiry` 域的渠道集合**」锁死（真跑 `apply()`）—— 那条锁的是真实会发生的漂移
+ *「有人加了 runtime 注册却忘了加清单」（或反之），**不是**同义反复。
  */
 export const WIRED_EXPIRY_PROVIDERS = Object.freeze([
     'buddy',
@@ -102,6 +150,16 @@ export const WIRED_EXPIRY_PROVIDERS = Object.freeze([
     //    实测这两家的 `CreditPackage` 与 buddy **同形**，都有 `deductionEndTime`。
     'lobsterai',
     'trae',
+    // ⚠️ accio（2026-10-13 合并审计发现「聚合里看不到它」后补）：用户明确要求
+    //    「聚合当中的 qwen3.8-flash 轮换列表里要有 accio」，而**决定候选表可见性的
+    //    是这张表、不是 `AGGREGATE_CHANNELS`** —— 漏加它 ⇒ 归一化补丁再对也没用
+    //    （模型层归并了，候选层却被这道闸门剔掉），症状**静默**。
+    'accio',
+    // ⚠️ officeace（2026-10-13 用户要求「加入聚合轮换」）：与 buddy 系**同形**
+    //    （订阅的每个积分桶都带 `expiresAt`），折算原语见 `officeaceExpiry`。
+    //    ⚠️ 与 accio 同款陷阱：**决定候选表可见性的是这张表、不是
+    //    `AGGREGATE_CHANNELS`** —— 只加后者 ⇒ 归一化再对也没用，症状静默。
+    'officeace',
 ]);
 /**
  * 临期折算结果的**缓存时长**（毫秒）。用户 2026-10-07 要求加缓存，TTL 由用户在
@@ -188,7 +246,7 @@ export function createExpiryProbe(pool, firstModelIdOf, options = {}) {
         // ⚠️ **未接入的渠道直接返回 `UNUSABLE`，不取号、不读目录**（第 3 轮审计实测）。
         //
         // 为什么要在最前面短路：本函数对**未接入**渠道最终也返回 `UNUSABLE`（走下方
-        // `switch` 的 `default`），但那时**已经**做了两件无意义的事：
+        // `credentialExpiry` 的「无 `expiry` 域」分支），但那时**已经**做了两件无意义的事：
         //   ① `await firstModelIdOf(provider)` —— 一次渠道目录读取；
         //   ② `await pool.getAvailableAccount(...)` —— 一次账号池查询。
         // 而 `candidatesFor` 的池包含**全部**渠道的候选 ⇒ 每次 `auto` 请求都会为**每个**
@@ -207,7 +265,23 @@ export function createExpiryProbe(pool, firstModelIdOf, options = {}) {
         //    写回时会被丢弃（否则陈旧值活过整个 TTL —— 见 `cacheAndReturn` 的长注释）。
         const startedAt = generation;
         // ⚠️ 类型是 `unknown[]`（各渠道凭据形状不同，由 `credentialExpiry` 分派时收窄）。
+        //
+        // ★ 2026-10-12：改为保留**账号条目 id**（`entry.id`）—— zcode 的按模型额度
+        //   标记必须写到**具体账号**上（`modelRateLimits` 是账号级字段），
+        //   而 `credential` 里没有账号 id（`device_mid` 是我们每次随机生成的，不可用）。
+        //   ⚠️ 旧回退路径（`legacySingleCredential`）拿不到 id，故那里显式填 `undefined`
+        //   —— 后果只是「那条路径下 zcode 写不了标记」，不影响折算值。
+        //
+        // ★ 2026-10-13：**同时保留 `credentialRef`** —— officeace 的余额入口只有拿到
+        //   它才走云侧直读（否则回落果办客户端的全局单 cookie ⇒ 多账号串号，
+        //   而聚合候选排序是**每账号**粒度 ⇒ 会选错人）。同样只在回退路径缺失。
         let credentials;
+        /**
+         * 该渠道目录的第一个模型 id（空串 = 目录读不到）。
+         *
+         * ⚠️ **必须提到 `try` 外面**：`catalogIds` 的降级分支要用它（2026-10-12）。
+         */
+        let probeModel = '';
         try {
             // ⚠️ `?? ''` 是**有意的**降级（注释随搬移丢失，Task 7 复审 M3 指出，现补回）：
             // 目录不可读 / 无可用模型时退回空串 —— 此时「有没有账号」这个判据**仍然成立**，
@@ -215,7 +289,7 @@ export function createExpiryProbe(pool, firstModelIdOf, options = {}) {
             // 过滤）。取舍方向：宁可少筛一层，也不可把整池判成不可用。
             // ⚠️ 反之**不要**在这里因为拿不到 modelId 就 return UNUSABLE —— 那会让
             // 「目录暂时读不到」被误报成「这个渠道没账号」。
-            const probeModel = await firstModelIdOf(provider) ?? '';
+            probeModel = await firstModelIdOf(provider) ?? '';
             // ⚠️⚠️ **取全部启用账号，而不是一个代表账号**（真实缺陷，用户报障 2026-10-07）。
             //
             // 用户质疑：「workbuddy 中一个号是 1 天到期，为什么我们统计是 2000 多天，
@@ -235,9 +309,53 @@ export function createExpiryProbe(pool, firstModelIdOf, options = {}) {
             //    `auto-adapter.spec.ts` —— 那份 spec 是**硬约束：必须零改动且全绿**
             //   （它是两处「搬移而非复制」重构的安全网）。
             //    ⚠️ 回退路径的语义是**降级**（少看几个账号），不是错误。
+            //
+            // ⚠️⚠️ **取号必须传空 `modelId`（跳过「按模型」过滤）** ——
+            //    真实缺陷（本机实测 2026-10-12）：原先传的是 `probeModel`，
+            //    而那会让本函数陷入**死锁**、且**整个渠道**从候选里消失：
+            //
+            // | 步骤 | 发生了什么 |
+            // |---|---|
+            // | ① | `probeModel = firstModelIdOf(provider)` = 目录**第一个**模型 |
+            // | ② | 某次折算把「该模型已尽」写进 `modelRateLimits[probeModel]` |
+            // | ③ | 下次折算取号 `listAvailableCredentials(provider, probeModel)` **按模型过滤** ⇒ 账号被筛空 |
+            // | ④ | `credentials.length === 0` ⇒ 返回 `UNUSABLE` ⇒ **折算根本没跑** |
+            // | ⑤ | 于是既清不掉标记、也写不了新标记 ⇒ 标记挂到次日 0 点 |
+            // | ⑥ | **整个 zcode 渠道**在这期间对 auto / aggregate 不可见 |
+            //
+            // ⚠️ 实测（`scripts/verify-zcode-mark-self-heal.mjs`）：
+            //    zcode 兜底目录顺序为 `[GLM-5.3-Flash, GLM-5.3]` ⇒ 只要
+            //    **被标记的是 `GLM-5.3-Flash`**（用户实际一直在用的那个模型，
+            //    真实会话日志 1359 次）就命中死锁。不是边角情形。
+            //
+            // ⇒ **折算问的是「这个渠道整体最早何时作废」，与「哪个模型」无关**
+            //   （判据只看各账号的资源包 / 余额到期时刻）。按模型过滤在这里
+            //   既**多余**（2026-10-07 起，派发前已由 `hasUsableAccountFor` /
+            //   `filterByModelAvailability` 按**真实模型**复核），又**有害**（上面的死锁）。
+            //   ⇒ 空串正是本仓库「不按模型过滤」的既有语义
+            //   （`getAvailableAccount` / `listAvailableCredentials` 对空 `modelId`
+            //    都有专门注释：跳过限流过滤、保持候选不变）。
+            //
+            // ⚠️ 这条也修正了**代码与注释的矛盾**：上面那句「取**全部**账号」
+            //    在原实现里并没有真的做到（被 `probeModel` 过滤掉了一部分）。
             credentials = typeof pool.listAvailableCredentials === 'function'
-                ? (await pool.listAvailableCredentials(provider, probeModel)).map((item) => item.credential)
-                : await legacySingleCredential(pool, provider, probeModel);
+                ? await pool.listAvailableCredentials(provider, '')
+                : // ⚠️ **回退路径刻意保留 `probeModel`**（与本函数主路径不同，理由如下）：
+                    //    ① 它只对**测试桩**可达（生产装配的 `AccountPool` 永远有
+                    //       `listAvailableCredentials`）；
+                    //    ② `auto-adapter.spec.ts` 有一条**明确禁止空 modelId** 的用例
+                    //       （「取代表账号时不得用空 modelId（会让限流过滤整体短路）」）——
+                    //       它守的是**另一个真实缺陷**（空 modelId 让账号池的限流过滤整体失效，
+                    //       于是 auto 会把请求发给一个正在限流的账号）。
+                    //    ⚠️ 残余风险**如实登记**：这条路径同样具备上面的死锁形态
+                    //       （`getAvailableAccount` 也按模型过滤）。它当前不可达，
+                    //       故不改它 —— 改它会与那条既有用例冲突，而那条用例守的缺陷
+                    //       在生产上是**可达**的（主路径传空串不影响它，因为主路径
+                    //       取的是全部账号、不经 `getAvailableAccount`）。
+                    (await legacySingleCredential(pool, provider, probeModel)).map((credential) => ({
+                        entry: { id: undefined },
+                        credential,
+                    }));
         }
         catch (error) {
             // ⚠️⚠️ **中止不得被吞成 `UNUSABLE`**（Global Constraints 的硬要求）。
@@ -285,11 +403,62 @@ export function createExpiryProbe(pool, firstModelIdOf, options = {}) {
         // 旧实现让该渠道进入排序，请求被发到一个额度未知（可能已用尽）的渠道。
         // 且该错误值还会被缓存 60 秒。
         let anyConverted = false;
-        for (const credential of credentials) {
+        /**
+         * ★ 该渠道的**全部目录模型 id**（zcode 的按模型判定用，2026-10-12）。
+         *
+         * ⚠️ **惰性求值**：只在实现方真的声明需要它时才去读目录
+         * （省下其余 6 家每轮一次多余的目录读取）。
+         * ⚠️ 未注入 `catalogIdsOf` 时退回「只有 probeModel 一个」——
+         * 让既有装配与几十处测试桩零改动即可工作（只是判定范围窄一个模型）。
+         */
+        let catalogIdsCache;
+        const catalogIds = async () => {
+            if (catalogIdsCache !== undefined)
+                return catalogIdsCache;
+            try {
+                const ids = await options.catalogIdsOf?.(provider);
+                catalogIdsCache = ids !== undefined && ids.length > 0
+                    ? ids
+                    // ⚠️ 未注入 `catalogIdsOf`（既有装配 / 几十处测试桩）时退回
+                    //    「只有 probeModel 一个」—— 判定范围窄一个模型，但**零改动可用**。
+                    //    ⚠️ `probeModel` 为空串时给**空数组**：空数组会让 zcode 的
+                    //    `exhaustedModelsOf` 一个模型都不判（**保守方向**：不写任何标记），
+                    //    而填 `['']` 会写一个键为空串的垃圾标记。
+                    : (probeModel.length > 0 ? [probeModel] : []);
+            }
+            catch {
+                // ⚠️ 目录读失败**不得**让折算失败：退回 probeModel 一个（判定范围变窄，
+                //    但折算值本身照常）。与 `firstModelIdOf` 的降级同一取向。
+                catalogIdsCache = probeModel.length > 0 ? [probeModel] : [];
+            }
+            return catalogIdsCache;
+        };
+        const markModelsExhausted = pool.markModelsExhaustedForExpiry?.bind(pool);
+        const clearModelsExhausted = pool.clearModelsExhaustedForExpiry?.bind(pool);
+        for (const item of credentials) {
             signal?.throwIfAborted();
+            const credential = item.credential;
             let value;
             try {
-                value = await credentialExpiry(provider, credential);
+                /**
+                 * ⚠️ `context` 对**另外 6 家**是纯粹的多余参数（它们忽略第二参）——
+                 * 这不是「只为 zcode 开洞」，而是本仓库既有的「可选能力由实现自己声明」
+                 * 模式（同 `ExpiryAccessors.refreshableOf` 的可选语义）。
+                 *
+                 * ⚠️ `catalogIds` 在这里**不求值**（传的是个函数）：只有 zcode 会调它，
+                 * 其余 6 家每轮因此**零额外目录读取**（那是本仓库反复强调的成本）。
+                 */
+                value = await credentialExpiry(provider, credential, {
+                    ...item.entry.id === undefined ? {} : { accountId: item.entry.id },
+                    // ⚠️ officeace 的余额查询**必须**拿到 ref 才走云侧直读（见该字段注释）；
+                    //    其余家忽略它。
+                    ...item.entry.credentialRef === undefined || item.entry.credentialRef.length === 0
+                        ? {}
+                        : { credentialRef: item.entry.credentialRef },
+                    catalogIds,
+                    ...markModelsExhausted === undefined ? {} : { markModelsExhausted },
+                    ...clearModelsExhausted === undefined ? {} : { clearModelsExhausted },
+                });
             }
             catch (error) {
                 // 中止仍必须逃逸（与上面的 `try` 同一口径）。
@@ -342,33 +511,55 @@ async function legacySingleCredential(pool, provider, probeModel) {
     return [available.credential];
 }
 /**
- * 单个账号的临期折算（按渠道分派）。
+ * 单个账号的临期折算（**按 provider 查能力注册表**）。
  *
  * ⚠️ 从 `createExpiryProbe` 里抽出来，是为了让「探全部账号」的循环保持简单，
- * 且**判据仍然只有一处**（不复制 switch）。
+ * 且**判据仍然只有一处**（不复制分派）。
+ *
+ * ## ⚠️ 2026-10-08 改：原先是一个 7-case `switch`
+ *
+ * 那个 `switch` 的**每个分支体都只是「调一个原语」**
+ *（`buddyExpiry` / `loomyExpiry` / `codeArtsExpiry` / `zcodeExpiry` /
+ * `lobsteraiExpiry` / `traeExpiry`），只有原语名与参数不同 —— 与
+ * `account.refresh` 的 13 个同构 case 完全同型。现在「**选哪个**原语」由
+ * 能力注册表回答（设计文档 §3.5.3）。
+ *
+ * ⚠️ **各家原语函数原样保留** —— 它们是**真实差异**（判据不同、量纲不同：
+ * loomy 是命名池、codearts 无到期概念、zcode 分桶按秒、buddy 系按资源包）。
+ * 本函数只负责「选哪个」，**不**抽象「原语内部做什么」（§3.6 的边界）。
+ *
+ * ⚠️ 层次方向：本模块**只**能依赖底座（见模块头）。`provider-runtime.ts` 不
+ * import 本文件、也不 import 聚合适配器，故无环 —— 但**别**在这里 import
+ * `aggregate-adapter.ts`。
  *
  * @returns 毫秒时间戳（越小越早作废）／`NEVER`（长期）／`UNUSABLE`（查不到）
  */
-async function credentialExpiry(provider, credential) {
-    switch (provider) {
-        case 'buddy':
-            return buddyExpiry(CODEBUDDY, credential);
-        case 'workbuddy':
-            return buddyExpiry(WORKBUDDY, credential);
-        case 'loomy':
-            return loomyExpiry(credential);
-        case 'codearts':
-            return codeArtsExpiry(credential);
-        case 'zcode':
-            return zcodeExpiry(credential);
-        // ⚠️ 这两家的包与 buddy 同形 ⇒ 走共享折算（判据只写一份，避免同族分叉）。
-        case 'lobsterai':
-            return lobsteraiExpiry(credential, LOBSTERAI);
-        case 'trae':
-            return traeExpiry(credential, TRAE);
-        default:
-            return UNUSABLE;
+async function credentialExpiry(provider, credential, context) {
+    const runtime = runtimeOf(provider);
+    if (runtime?.expiry === undefined) {
+        // ⚠️ 未接入 ⇒ `UNUSABLE`（**不是** NEVER）：返回 NEVER 会让一个我们对其
+        //    一无所知的渠道被排在候选**最前**并当选 —— 而它可能压根没有可用账号。
+        //    这与模块头的铁律同一条：「宁可少一个候选，不可把未知当可用」。
+        //
+        // ⚠️⚠️ 本分支**只对「清单内但 runtime 缺 `expiry` 域」的渠道可达**：
+        //    清单外的渠道在更早的「未接入」短路处就返回了。生产装配下这个组合被
+        //    `expiry-runtime-parity.spec.ts` 的不变式一挡住（清单 == runtime 里挂了
+        //    `expiry` 域的集合）⇒ 它是**防御性**的，锁的是「有人删了某家的注册、
+        //    却没同步改清单」这一类漂移。
+        //    ⚠️ 但它**不是**同义反复：`expiry-runtime-parity.spec.ts` 有一条
+        //    **行为**用例专门只注册 descriptor、不挂 `expiry` 域，断言这里回
+        //    `UNUSABLE` —— 把本行的 `UNUSABLE` 改成 `NEVER` 会让它变红并点名
+        //    （独立复审实测：此前该分支**零覆盖**，改坏了没有任何用例会红）。
+        //
+        // ⚠️ 这里**刻意不打日志**（2026-10-08 决定）：本函数在候选排序里**每个渠道
+        //    调一次**，而模块内**没有** logger（`createExpiryProbe` 只收
+        //    `pool` / `firstModelIdOf` / `options`，没有 `ctx`）—— 为一条被断言锁住的
+        //    防御性分支去穿一条 logger 通道，会把日志出口变成这个纯底座模块的新依赖。
+        //    真正的防线是上面那条不变式断言（真跑 `apply()`，漏注册一家即红并点名），
+        //    以及 `src/index.ts` 注册失败时已有的 info 日志。
+        return UNUSABLE;
     }
+    return runtime.expiry.credentialExpiry(credential, context);
 }
 /**
  * 该错误是否是「调用方中止」类。
@@ -424,11 +615,11 @@ export async function buddyExpiry(product, credential) {
  *
  * ⇒ 旧实现下，一个**余额已耗尽**的 buddy / workbuddy / lobsterai / trae 仍会被
  * auto 选中，请求随即以 `QUOTA_EXCEEDED` 失败 —— **与 PR #81 报障完全同型**，
- * 且 buddy / workbuddy 都在 `AUTO_PROVIDERS`（`auto-adapter.ts:84`）里。
+ * 且 buddy / workbuddy 都在 `AUTO_PROVIDERS`（`auto-adapter.ts`）里。
  *
  * ⚠️ 本仓库对「余额为 0」早有明确判据，旧实现与它**矛盾**：
- * `buddy-balance-rank.ts` 的 `buddyBalanceTier`（:195-203）在余额全为 0 时返回
- * `BUDDY_BALANCE_TIER.none`，而 `buddyTierUsable`（:210-212）明写
+ * `buddy-balance-rank.ts` 的 `buddyBalanceTier` 在余额全为 0 时返回
+ * `BUDDY_BALANCE_TIER.none`，而 `buddyTierUsable` 明写
  * **`none` 档不可用**。选号器判「不可用」、折算层判「可当选」= 同一语义两套判据
  *（AGENTS.md 首条红线）⇒ 现在两侧**同构**。
  *
@@ -442,7 +633,7 @@ export async function buddyExpiry(product, credential) {
  * ⚠️ 与 `zcodeExpiry` 的收窄是**同一手法**（「已拥有的余额 > 0」才可用；
  * 否则 `UNUSABLE`），两处口径一致 —— 别再让一家修好、另一家漏掉。
  *
- * ⚠️ 与 `buddy-balance-selector.ts:313-314` 那句「解锁时所有候选余额都是 0 仍返回
+ * ⚠️ 与 `buddy-balance-selector.ts` 那句「解锁时所有候选余额都是 0 仍返回
  * 第一个候选，让上游去报真正的失败原因」**不矛盾**：那句讲的是 **provider 内部**
  * 的选号（用户已指定该渠道，此时换号才有意义），本函数讲的是**跨渠道选型**
  * （余额 0 就该让给别的渠道，而不是把请求发过去必然失败）。
@@ -517,6 +708,119 @@ export async function loomyExpiry(credential) {
     return detail.permanent > 0 ? NEVER : UNUSABLE;
 }
 /**
+ * accio：与 **loomy 同形**（命名池、无逐包时间戳），但有一条更强的信息。
+ *
+ * ## 判据（2026-10-13 合并审计发现「聚合里看不到 accio」后补）
+ *
+ * | 情形 | 折算值 | 依据 |
+ * |---|---|---|
+ * | `每日积分 > 0` | **当日 24:00**（`nextUtc8DayStartMs()`） | 每日额度 24h 作废且**不累积** |
+ * | 只剩 `每月积分` / `推荐积分` | `NEVER`（长期，排最后但不剔除） | 上游**没有**下发它们的到期时间 |
+ * | 三类桶全为 0 | `UNUSABLE`（剔除） | 没有可烧的额度 |
+ * | 查询失败 / 未登录 | `UNUSABLE` | 读不到就不猜 |
+ *
+ * ## ⚠️ 为什么用 `nextUtc8DayStartMs()` 而不是 `quota.refreshCountdownSeconds`
+ *
+ * `accio-credits.ts` 的 `accioQuotaResetIso` 能用倒计时算出**精确**的重置时刻，
+ * 但那条路径的注释明确写着「`refreshCountdownSeconds` 只说**额度何时刷新**，
+ * 与『这批积分何时作废』在 Accio 上**未被实测为同一时刻**」——
+ * 故**刻意不写 `deductionEndTime`**（写进去就是编造）。
+ *
+ * ⇒ 本函数**尊重那个结论**：只在**有每日额度**时给一个「当日结束」的**保守上界**
+ *（与 loomy 的 `daily > 0 → 当日 24:00` 逐字同判据），**不**把倒计时当到期时间用。
+ * 语义上这是「临期优先」排序要的信息（今天就作废的排前面），而不是精确的作废时刻。
+ *
+ * ⚠️ **两家同形 ⇒ 判据必须逐格同构**（本仓库红线）：若将来 loomy 那一格改了
+ *（例如上游开始下发真实到期时间），**这里要一起改**。
+ */
+export async function accioExpiry(credential) {
+    let detail;
+    try {
+        detail = await fetchAccioBalanceDetailed(credential);
+    }
+    catch {
+        return UNUSABLE;
+    }
+    if (detail.balance === null)
+        return UNUSABLE;
+    const buckets = detail.balance.packages;
+    // ⚠️ 桶的判据与 `sharedPackageExpiry` 同口径（`active === true` 且 `remaining > 0`），
+    //    只是**不取** `deductionEndTime`（Accio 本来就不下发）。
+    const usable = buckets.filter((pkg) => pkg.active === true && typeof pkg.remaining === 'number' && pkg.remaining > 0);
+    if (usable.length === 0)
+        return UNUSABLE;
+    // 每日额度按展示名识别（`makeAccioPackage` 的 name 就是 `每日积分`）。
+    // ⚠️ 用**展示名**而不是下标：桶的顺序由 `ACCIO_CREDIT_BUCKETS` 固定，
+    //    但按名字判更耐重构（少一个桶时不会错位）。
+    const hasDaily = usable.some((pkg) => pkg.name === '每日积分');
+    return hasDaily ? nextUtc8DayStartMs() : NEVER;
+}
+/**
+ * officeace：与 **buddy 系同形**（订阅的每个积分桶都带 `expiresAt` ⇒ 归一化到
+ * `deductionEndTime`），故折算口径与 `sharedPackageExpiry` **逐格一致**。
+ *
+ * ## 为什么单独一条原语（而不是直接复用 `sharedPackageExpiry`）
+ *
+ * 那个共享实现吃的是 `fetchBalance: () => Promise<CreditBalance | null>`，而
+ * officeace 的余额入口是 {@link fetchSubscriptionSummary}：签名是
+ * `(staleHours, ref, credential, credentials)`，且返回的是
+ * `OfficeAceSubscriptionSummary`（不是 `CreditBalance`）—— 形状套不进那个泛型。
+ * 这与 `qoder` / `opencode` 被排除在共享骨架外的理由同源（「形态不匹配就如实
+ * 排除，不为凑齐 N 家而丢语义」）。
+ *
+ * ⚠️ **但判据必须与 `sharedPackageExpiry` 逐格同构**（本仓库红线）：
+ *
+ * | 情形 | 折算值 | 依据 |
+ * |---|---|---|
+ * | 有 `remaining > 0` 的有效桶，且**至少一个**给了到期时间 | 那些到期时间的**最小值** | 与 buddy 系同口径 |
+ * | 有 `remaining > 0` 的有效桶，但**都没给**到期时间 | `NEVER`（长期，排最后但不剔除） | 服务端没下发 ⇒ 不臆造 |
+ * | 一个 `remaining > 0` 的有效桶都没有 | `UNUSABLE`（剔除） | 没有可烧的额度 |
+ * | 查询失败 / 未登录 / 只拿到缓存 | `UNUSABLE` | 读不到就不猜 |
+ *
+ * ## ⚠️ 为什么要带 `ref`（2026-10-13）
+ *
+ * `fetchSubscriptionSummary` 传了 `ref` 才走**云侧 V11 直读**；不传会回落到
+ * 果办客户端的**全局单一 cookie**（只反映「当前登录在果办里的那一个账号」）
+ * ⇒ 多账号下所有账号都折算成同一个余额（实测两个账号都显示 6500）。
+ * 聚合的候选排序是**每账号**粒度，串号会让选号直接选错人。
+ *
+ * ⚠️ 未传 `ref` 时（老调用点）仍可工作，但只对单账号正确 —— 见
+ * `ProviderExpiryContext` 是否携带 ref。
+ */
+export async function officeaceExpiry(credential, ref) {
+    let summary;
+    try {
+        summary = await fetchSubscriptionSummary(48, ref, credential);
+    }
+    catch {
+        return UNUSABLE;
+    }
+    if (summary === undefined)
+        return UNUSABLE;
+    let earliest = NEVER;
+    // ⚠️ 与 `sharedPackageExpiry` 同因：`earliest` 的初值 `NEVER` 无法区分
+    //    「一个有效包都没有」（⇒ 剔除）与「有余额但不下发到期时间」（⇒ 长期）。
+    let hasAnyCredit = false;
+    for (const group of summary.creditGroups) {
+        // ⚠️ 判据与共享实现同口径（`active` 且 `remaining > 0`）。
+        //    officeace 的 `expired` 是独立布尔（不是 `active`），故这里取反。
+        if (group.expired === true)
+            continue;
+        if (!(typeof group.remaining === 'number' && group.remaining > 0))
+            continue;
+        hasAnyCredit = true;
+        // ⚠️ `expiresAt` 是 ISO 8601 字符串（与 STS 的 `expiration` 同形），
+        //    不是数值时间戳 —— 别顺手加 `> 1e12` 归一化（那是兄弟渠道的坑）。
+        const end = typeof group.expiresAt === 'string' ? Date.parse(group.expiresAt) : Number.NaN;
+        if (Number.isFinite(end) && end > 0 && end < earliest)
+            earliest = end;
+    }
+    // 有余额但都没给到期时间 ⇒ 长期（排最后，不剔除）。
+    if (hasAnyCredit)
+        return earliest;
+    return UNUSABLE;
+}
+/**
  * codearts：**积分账户的到期时间不可知 ⇒ 一律 `NEVER`（长期）**。
  *
  * ## ⚠️⚠️ 为什么不再算「当日 24:00」（真实缺陷，用户报障 2026-10-07）
@@ -561,7 +865,7 @@ export async function loomyExpiry(credential) {
  * **对本渠道该推理不成立**，实测三格反例。
  *
  * ⚠️ 下表第 2 列是**那个被拒的提议**会产生的后果（不是本函数现状 —— 本函数恒返回
- * `NEVER`，没有「当日」分支；「当日」是更早的旧实现，见上文 `:533-539` 的记载）：
+ * `NEVER`，没有「当日」分支；「当日」是更早的旧实现，见上文的实测三格）：
  *
  * | 账户形态 | `credit` | 被拒提议的后果 | 本函数（现状） |
  * |---|---|---|---|
@@ -610,7 +914,7 @@ export async function codeArtsExpiry(credential) {
  *
  * ## ⚠️ 但它**不需要**在本函数里补（这是本注释存在的唯一理由）
  *
- * benefit 耗尽**已经被记账**：`llm-adapter.ts:1290` 命中 `InferHub.4291.200` 时调
+ * benefit 耗尽**已经被记账**：`llm-adapter.ts` 命中 `InferHub.4291.200` 时调
  * `accountPool.updateModelRateLimit(currentAccountId, options.model, 次日 00:00)`，
  * 而账号池按 `entry.modelRateLimits[modelId]` 过滤候选
  *（`getAvailableAccount` / `listAvailableCredentials`）。
@@ -670,7 +974,7 @@ export async function codeArtsExpiry(credential) {
  * 的严格区分）。故判据是 **`balance.remaining > 0`**（有余额）而不是
  * 「有任何一个桶带有效到期时间」。
  */
-export async function zcodeExpiry(credential) {
+export async function zcodeExpiry(credential, context) {
     let balance;
     try {
         balance = await fetchZcodeBalance(credential);
@@ -690,7 +994,7 @@ export async function zcodeExpiry(credential) {
     // 完全同形**（都是 0 个桶 + `remaining: 0`），故按下面的判据会被算成 `UNUSABLE`
     // ⇒ **一个能正常推理的企业版账号被永久排除出 auto 候选**。
     //
-    // ⚠️ 上游在 `zcode-upstream.ts:257-259` 已就此**明文警告**：
+    // ⚠️ 上游在 `zcode-upstream.ts` 已就此**明文警告**：
     //    「企业版不下发额度数字、只给外部链接 —— 此时返回 `{enterprise:true,buckets:[]}`，
     //      **不要**显示成 0（**0 是「已用光」的语义**）」
     // 本函数违反的正是这句：把「不下发额度数字」当成了「余额为 0」。
@@ -698,8 +1002,108 @@ export async function zcodeExpiry(credential) {
     // ⇒ 判据必须**先**看 `enterprise` 标记（那是「不知道额度」的诚实标记），
     //   再谈余额。语义是「可用、但无临期额度可算」= `NEVER`（排最后但不剔除）——
     //   与 `codeArtsExpiry` 对「查到了但没有到期概念」的处理同一条原则。
+    //
+    // ⚠️ 企业版**没有桶** ⇒ 按模型判定那一段（下面）也没有任何可写的标记，
+    //    故这里的提前返回不影响按模型标记（那是「额度数字都不知道」的形态）。
     if (balance.enterprise === true)
         return NEVER;
+    /**
+     * ★★ **按模型写出「该模型在这个账号上已无额度」的持久标记**（2026-10-12）。
+     *
+     * ## 为什么在这里做（而不是在适配器里发请求前查一次）
+     *
+     * 这里是**唯一**已经拿到 `balance` 全部桶的地方，且它本来就在每次选型时跑
+     * （判定「这个渠道还能不能用」）。把判定挂在这里 ⇒ **零额外请求**
+     *（直接复用这次余额查询的结果），且 auto / aggregate 的**选型**阶段
+     * 立刻就能通过 `getAvailableAccount(provider, model)` 看到结论
+     * —— 不必等到真的发出那一发、被上游拒绝才知道。
+     *
+     * ## 判据表
+     *
+     * | 情形 | 折算值 | 写标记 |
+     * |---|---|---|
+     * | GLM-5.3 的 3M 烧光、Flash 的 5M 还在 | `remaining = 5M > 0` ⇒ **可用** | `['GLM-5.3']` |
+     * | 两个专属桶都烧光 | `UNUSABLE` | 两个都写 |
+     * | 专属桶烧光、但**通用赠送桶**还有余额 | **可用** | **不写**（通用桶覆盖它，上游仍能承接） |
+     * | 某模型没有任何桶覆盖（如 GLM-5.2） | 照常 | **不写**（证据不足，不本地判死） |
+     *
+     * ⚠️ **两侧大小写不同**（实测）：上游 `capabilities` 是 `glm-5.3`（小写），
+     * 而池过滤用的键是 DSH 目录的 `GLM-5.3`（大写）⇒ 把**目录那一套 id** 交给
+     * `exhaustedModelsOf`（它内部大小写不敏感地比对、并原样回传目录 id），
+     * 否则标记**永远不命中**且无任何报错。
+     *
+     * ⚠️ 写标记**绝不能**影响折算值：这是「观测 + 记账」，不是「折算依据」。
+     * 故它在 `try/catch` 里，失败**静默吞掉**（下面那条 catch）。
+     *
+     * ## ⚠️ 为什么是**静默**而不是「记日志」（别照着直觉改成打日志）
+     *
+     * 本模块是**纯底座**：`createExpiryProbe` 只收 `pool` / `firstModelIdOf` / `options`，
+     * **没有 `ctx`、也没有 logger**（同文件上方「刻意不打日志」那条注释记着同一约束）。
+     * 为一条失败路径去穿一条 logger 通道，会把日志出口变成这个纯底座模块的新依赖 ——
+     * 而那正是模块头禁止的层次方向。
+     *
+     * ⚠️ 代价是**如实承认**的：标记写失败（磁盘满 / 权限）在日志里**无痕**。
+     * 可观测性由**调用方**兜：`AccountPool.markModelsExhaustedForExpiry` 自己
+     * 在成功与账号不存在时都有 `ctx.logger`（那里拿得到 ctx），
+     * 且它落盘失败会向上抛 —— 被本 catch 静默的那一刻确实丢信息，
+     * 但**不影响正确性**（下一轮折算会重试写）。
+     */
+    if (context?.accountId !== undefined
+        && context.accountId.length > 0
+        && (context.markModelsExhausted !== undefined || context.clearModelsExhausted !== undefined)
+        && context.catalogIds !== undefined) {
+        try {
+            const catalogIds = await context.catalogIds();
+            /**
+             * ⚠️⚠️ **写与清必须成对**（真实缺陷 —— 单向门，2026-10-12）。
+             *
+             * 只写不清的话，用户**当天**烧光后去签到领到额度时，标记仍挂到次日 0 点
+             * ⇒「签到成功了但当天用不了」。实测确认签到路径**救不回来**
+             * （`credits.claimAll` 只清折算缓存、不清 `modelRateLimits`，
+             * 见 `scripts/verify-zcode-mark-after-claim.mjs`）⇒ 自愈只能在这里做：
+             * 本次折算**已经拿到新的余额报文**，正好能判「哪些模型恢复了」。
+             *
+             * ⚠️ 两个列表由 `exhaustedModelsOf` / `recoveredModelsOf` 给出，
+             * 它们**逐格互补**（同一个模型不会同时出现在两边），故两个调用无顺序依赖 ——
+             * 但仍按「先清后写」排列：万一将来判据漂移导致重叠，
+             * 先清后写的结果是「标记存在」（保守方向），反过来则是「标记消失」（危险方向）。
+             */
+            const recovered = recoveredModelsOf(balance.buckets, catalogIds);
+            if (recovered.length > 0 && context.clearModelsExhausted !== undefined) {
+                await context.clearModelsExhausted(context.accountId, recovered);
+            }
+            const exhausted = exhaustedModelsOf(balance.buckets, catalogIds);
+            if (exhausted.length > 0 && context.markModelsExhausted !== undefined) {
+                await context.markModelsExhausted(context.accountId, exhausted);
+            }
+        }
+        catch (error) {
+            /**
+             * ⚠️⚠️ **中止必须原样逃逸**（全局硬约束，对抗审计实测证伪 2026-10-12）。
+             *
+             * 初版这里是**裸的 `catch {}`** ⇒ `catalogIds()` 或 `markModelsExhausted`
+             * 抛出的 `AbortError` 被静默吞掉、折算照常返回一个值 ——
+             * 而本模块的铁律是「**abort 立刻抛 `AbortError`，绝不折算**」
+             *（同文件上方两处、以及 `credentials` 分支的 catch 都守这条）。
+             *
+             * ⚠️ 实测：`AbortError` 从 `catalogIds()` 抛出时探针**返回了值**而非抛出
+             *（审计的 `scratch` 探查复现；修后应改为抛出）。
+             *
+             * ⚠️ 判据只取 `isAbortError(error)`（**不是**两条）——
+             * `zcodeExpiry` 的签名里**没有 `signal`**（它只收 `credential` + `context`），
+             * 故 `signal?.throwIfAborted()` 在这里不可用；中止的**另一条**防线
+             *（「signal 已标记」）由调用方 `createExpiryProbe` 的循环负责
+             *（它每轮开头就 `signal?.throwIfAborted()`）。
+             * ⚠️ 如实登记：这是**唯一**一处判据少于同文件其它 catch 的地方，
+             * 原因是签名差异，不是遗漏。
+             */
+            if (isAbortError(error))
+                throw error;
+            // ⚠️ 其余失败**静默是刻意的**（本模块无 logger，见上方长注释）：
+            //    标记失败不得影响折算。别在这里补 `console`/logger ——
+            //    那会引入新依赖，或不一致的第二日志出口。
+        }
+    }
     let earliest = NEVER;
     for (const bucket of balance.buckets) {
         const remaining = bucket.availableUnits ?? bucket.remainingUnits ?? 0;

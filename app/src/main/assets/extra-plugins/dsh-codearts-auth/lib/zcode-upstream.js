@@ -32,7 +32,7 @@
  * 所以要领额度必须**先补两条事件**，再查 preview，再 claim。
  */
 import { ZCODE_APP_VERSION_FALLBACK } from './zcode.js';
-import { formatZcodeEdgePageHint, hasZcodeUnusualActivity, looksLikeZcodeHtmlPage, parseZcodeBusinessCode, } from './zcode-diagnostics.js';
+import { extractZcodeLogId, formatZcodeEdgePageHint, hasZcodeUnusualActivity, looksLikeZcodeHtmlPage, parseZcodeBusinessCode, } from './zcode-diagnostics.js';
 /** ZCode 平台 origin（官方默认）。 */
 export const ZCODE_ORIGIN = 'https://zcode.z.ai';
 /** 免费额度通道的 Anthropic 端点。 */
@@ -109,6 +109,26 @@ function num(value) {
     return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 /**
+ * 读一个桶的 `capabilities`（上游实测 `["model:glm-5.3"]`）。
+ *
+ * ⚠ **只收非空字符串**：上游可能在别的形态下给 `null` / 数字 / 空串，
+ * 让它们进数组会污染 `bucketCoversModel` 的前缀解析（`String(null)` 会得到
+ * `"null"` 这种看似合法的段）。
+ *
+ * ⚠ **全空时返回 `undefined`（而不是 `[]`）**：`undefined` 与 `[]` 在判据里
+ * **语义不同** —— 前者是「上游没说」，后者是「上游说它不覆盖任何模型」。
+ * 本仓库对这类「未知 vs 否定」的三态区分有明确规则（见 `inputModalities` 的
+ * 注释），且这里的错误方向代价很大：把 `undefined` 当成 `[]` 会让一个**仍有
+ * 余额的通用桶**被忽略，从而误封一个可用账号。
+ */
+function capabilitiesOf(record) {
+    const raw = record.capabilities;
+    if (!Array.isArray(raw))
+        return undefined;
+    const out = raw.filter((item) => typeof item === 'string' && item.length > 0);
+    return out.length > 0 ? out : undefined;
+}
+/**
  * `fetch` 的超时包装（外部输入必须有上限）。
  *
  * ⚠ **必须用调用方传进来的 `fetchImpl`**，不能直接用全局 `fetch`。
@@ -181,6 +201,12 @@ export async function fetchZcodeBalance(credential, fetchImpl = fetch) {
             remainingUnits: num(record.remaining_units),
             availableUnits: num(record.available_units),
             expiresAt: num(record.expires_at),
+            // ★ 模型归属（实测 `["model:glm-5.3"]`）—— 按模型判定靠它（见字段注释）。
+            ...(() => {
+                const capabilities = capabilitiesOf(record);
+                return capabilities === undefined ? {} : { capabilities };
+            })(),
+            ...typeof record.entitlement_id === 'string' ? { entitlementId: record.entitlement_id } : {},
         });
     }
     let remaining = 0;
@@ -460,6 +486,13 @@ export async function claimZcodePlan(credential, planId, captcha, fetchImpl = fe
     // 1003 = 已领取过 —— **幂等成功，不是错误**。
     const alreadyClaimed = code === 1003;
     const ok = response.ok && (code === 0 || alreadyClaimed);
+    /**
+     * ★ `logid` 在**持有 `response` 与完整 `text` 的这一层**提取（2026-10-12）——
+     * 与上面把风控归一成 `code` 同一条纪律：**在信息最全的地方取，
+     * 不要在已经丢过信息的下游猜**。下游（`zcode-auth.ts` 的 `toClaimOutcome`）
+     * 只拿得到 `message` 字符串，那里既没有 header、正文也可能已被截断。
+     */
+    const logId = extractZcodeLogId(text, response.headers);
     return {
         planId,
         code,
@@ -467,6 +500,7 @@ export async function claimZcodePlan(credential, planId, captcha, fetchImpl = fe
         alreadyClaimed,
         httpStatus: response.status,
         message: message ?? (ok ? undefined : `HTTP ${response.status}`),
+        ...logId === undefined ? {} : { logId },
     };
 }
 /**
@@ -499,7 +533,26 @@ export async function fetchZcodeCaptchaConfig(credential, fetchImpl = fetch) {
         if (typeof region !== 'string' || typeof prefix !== 'string' || typeof sceneId !== 'string') {
             return undefined;
         }
-        return { region, prefix, sceneId };
+        /**
+         * ★ 两个开关**只在真的是布尔时**才写进返回值 —— 与官方
+         * `getCaptchaConfig()` 的 `typeof r === 'boolean' ? { skipModelRequest: r } : {}`
+         * **逐字同口径**。
+         *
+         * ⚠ 不能写成 `enabled: captcha.enabled === true` 这类强制布尔化：
+         *   那会把「字段缺席（不知道）」压成 `false`，而 `requiresCaptchaUpfront`
+         *   靠**区分**二者来决定要不要在首发抖一个 param。
+         *   压平的方向恰好是危险侧：`enabled: false` 会一票否决、
+         *   `skipModelRequest: false` 会让它每请求白烧一个设备级配额。
+         */
+        return {
+            region,
+            prefix,
+            sceneId,
+            ...typeof captcha.enabled === 'boolean' ? { enabled: captcha.enabled } : {},
+            ...typeof captcha.skip_model_request === 'boolean'
+                ? { skipModelRequest: captcha.skip_model_request }
+                : {},
+        };
     }
     catch {
         return undefined;

@@ -54,7 +54,7 @@ export async function collectGatewayModels(llm, onError) {
  * ⚠️ `input` 原样透传**不归一化**：它决定用户能否给该模型发图片，而各 provider
  * 的能力声明才是权威（`/v1/models` 的 HTTP 路径同样直接输出它）。
  * 缺失时归一化为 `['text']`，与各适配器「不声明即按 text 保守处理」一致
- * （见 lobsterai-adapter.ts:768-770）——宁可少报能力，也不要让用户发一张
+ * （见 lobsterai-adapter.ts）——宁可少报能力，也不要让用户发一张
  * 注定被上游拒绝的图。
  */
 export async function collectGatewayModelIds(llm, onError, effortViews) {

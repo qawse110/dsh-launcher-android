@@ -962,11 +962,13 @@ export class ZcodeAuth extends Service {
         return {
             ...this.captchaStats,
             /**
-             * 「先探后取」的两个计数**读自进程级模块状态**（`captcha-requirement.ts`），
+             * 「先探后取」的**三个**计数**读自进程级模块状态**（`captcha-requirement.ts`），
              * 本类上不存副本 —— 复制一份必然漂移。
              *
              * ⚠ 顺序有讲究：必须排在 `...this.captchaStats` **之后**。前面那两项只是
              * 形状占位（恒为 0），反过来写就会被 0 盖掉，读数永远是 0。
+             * ⚠ 同一条纪律对新增的 `upfrontCaptchaCount` 也成立：上面的返回类型里
+             * 那三项同样只是占位，真值全部来自这一行展开。
              */
             ...captchaRequirementObservability(),
             failureStreak: this.captchaBackoff.failureStreak(),
@@ -1197,6 +1199,37 @@ export class ZcodeAuth extends Service {
              * ⚠ 「没有可领 plan」**不等于**「今天已领」——也可能是活动未投放。
              * 但两种情况下用户的动作都是「明天再来」，故归为 `already-claimed`
              * 并给出如实文案（与 Buddy / Qoder 的幂等语义一致）。
+             *
+             * ## ⚠⚠ 这一步**在任何 captcha 产出之前**（2026-10-12 用户报障澄清）
+             *
+             * 用户报「dsh **web** 版点一键领取**不弹 chromium**了（以前会弹）」，
+             * 而界面上同时显示「今日暂无领取额度」。**这两件事是同一件事**：
+             *
+             * ```
+             * setCaptchaDemand(true)
+             * plans = preview()                    ← 服务端回 plans=[]
+             * if (plans.length === 0) return …     ← ★ 在这里就返回了
+             * captchaConfig = fetchCaptchaConfig() ← 下面才开始 mint（★ 弹浏览器的是这一步）
+             * ```
+             *
+             * 浏览器是**惰性**创建的（`captchaPoolInstance()` 的 `captchaBrowser ??= new …`），
+             * 只在真的需要产 param 时才 `spawn`。preview 空 ⇒ 一次 mint 都不发生
+             * ⇒ 一台浏览器都不会起。**这不是 captcha 流程坏了，也不是重构改坏了。**
+             *
+             * ⚠ **实测取证**（本机，只发 GET、零额度）：5 个账号里
+             * **4 个 `preview.plans=0` 且 `balance.balances=0`**（从未登录成功/无权益），
+             * 唯一**启用**账号 `balance.plans=1`（`zcode-v3-start-plan-0817`，
+             * 两个桶各 3M/5M **`used_units` 全为 0**）、而 **`preview.plans=0`**。
+             * 该账号 `createdAt` = **今天 19:02**（`starts_at` 是 10-09、`ends_at` 10-13）
+             * ⇒ 典型的「**新登录账号、活动窗口还没开始投放当日份额**」，
+             * 与「今天已领过」在 wire 上**无法区分**（都只表现为 `plans=[]`）。
+             *
+             * ⚠ **判据与文案自 `90890d0`（2026-09-29 最初实现）起一字未改**
+             * （`git log -S'plans.length === 0'` 只命中那一次）⇒ **确认不是回归**。
+             *
+             * ⚠ 因此文案**刻意不说「今天已领取」**（那会是个谎：`used_units=0`
+             * 证明一次都没领过）。说的是「今日暂无可领额度（服务端按日刷新）」——
+             * 只陈述观测到的事实，并把「明天再来」这条正确动作给出来。
              */
             if (plans.length === 0) {
                 return [{ kind: 'already-claimed', message: '今日暂无可领额度（服务端按日刷新）' }];
@@ -1866,7 +1899,12 @@ export function toClaimOutcome(outcome, planId, options = {}) {
                  * `messages`，照搬推理侧那套 `describeZcodeRequestShape` 会得到
                  * 「身份块 0 字符」，**把一条正常请求误报成身份块缺失**。
                  * ⇒ 只用与请求形态无关的那几项（见 `ZcodeDiagnosticInput.shape`）。
+                 *
+                 * ★ `logId`（2026-10-12）：由 `claimZcodePlan` 在**持有 `response` 与
+                 * 完整正文**的那一层提取并带上来（那里才有 header 与未截断的体），
+                 * 本层只负责渲染 —— 与「在信息最全的地方归一」同一条纪律。
                  */
+                logId: outcome.logId,
                 now: Date.now(),
             });
         return {

@@ -27,6 +27,7 @@
  *   （注释标明「2026-08-06 从 `GET /api/models/available` 实测拉取」）；
  * - portal 基址：本次实测确认（见下）。
  */
+import { DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES } from './image-budget.js';
 /**
  * 上游 API 基址。
  *
@@ -144,6 +145,11 @@ export const LOBSTERAI = {
     userAgent: LOBSTERAI_USER_AGENT,
     clientCapabilities: LOBSTERAI_CLIENT_CAPABILITIES,
     defaultCredentialRef: 'LOBSTERAI_ACCESS_TOKEN',
+    // ⚠️ **必须显式赋值**：适配器把 `undefined` 一路传给 `requestImageTargetFor`，
+    // 而那个默认参数是 **2 MiB**（为腾讯系的图片 token 预算准备的）——
+    // LobsterAI 撞的是**请求体体积**（13 张 ≈50 MiB 就压出 `SERVER code=500`），
+    // 2 MiB 会让生效值翻倍。详见接口里 `imageMaxBytes` 的注释。
+    imageMaxBytes: DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES,
     fallbackModels: LOBSTERAI_FALLBACK_MODELS,
 };
 /** 全部 LobsterAI 产品配置（当前只有一个，保留数组以便将来扩展）。 */

@@ -17,7 +17,7 @@ import { pollMinimaxDeviceToken, refreshMinimaxCredential, startMinimaxDeviceAut
  * 过期信息提取器（供共享实现 `refreshAccountWithReconcile` 用）。
  *
  * ⚠️ `identityOf` 的语义是「**凭据内容**」（这里是 access_token）而**不是** ref 名
- * —— 传 ref 名会恒匹配失败且**静默无报错**（`src/expiry-sync.ts:67` 记录的坑）。
+ * —— 传 ref 名会恒匹配失败且**静默无报错**（`src/expiry-sync.ts` 记录的坑）。
  *
  * ⚠️ `refreshableOf` 提供时共享实现会据此写池里的 `refreshable`。
  * MiniMax **确实有** refresh 端点，故提供它是**诚实**的
@@ -34,7 +34,7 @@ export class MinimaxRefreshTokenExpiredError extends Error {
         super(message);
         // ⚠️ `name` **必须**是 `'RefreshTokenExpiredError'`（真实缺陷，2026-09-29 修正）。
         //
-        // `src/refresh.ts:23` 的终态判据是结构化比较：
+        // `src/refresh.ts` 的终态判据是结构化比较：
         //   `if (error.name === 'RefreshTokenExpiredError') return true`
         //   `return /refresh[_ ]?token/i.test(error.message)`
         //
@@ -45,9 +45,9 @@ export class MinimaxRefreshTokenExpiredError extends Error {
         // 文案一改即静默退化，极难排查。
         //
         // 八个既有 provider 的同类类**一律**用 `'RefreshTokenExpiredError'`
-        // （`cline-auth.ts:79`、`qoder-auth.ts:83`、`lobsterai-auth.ts:88`、
-        // `loomy-auth.ts:78`、`raccoon-auth.ts:79`、`trae-auth.ts:81`、
-        // `buddy-oauth.ts:335`、`oauth.ts:91`）—— 本 provider 不应破例。
+        // （`cline-auth.ts`、`qoder-auth.ts`、`lobsterai-auth.ts`、
+        // `loomy-auth.ts`、`raccoon-auth.ts`、`trae-auth.ts`、
+        // `buddy-oauth.ts`、`oauth.ts`）—— 本 provider 不应破例。
         // 之所以能跨模块这样判，是因为判据是**字符串**而非 `instanceof`
         //（各模块的同名类是不同 identity，`instanceof` 会穿透）。
         this.name = 'RefreshTokenExpiredError';
@@ -104,7 +104,7 @@ export class MinimaxAuth extends Service {
             signal: controller.signal,
             product: this.product,
         });
-        // 与 `cline-auth.ts:230-233` 同理：结果可能早于调用方 `await` 而落定，
+        // 与 `cline-auth.ts` 同理：结果可能早于调用方 `await` 而落定，
         // 先挂空处理器避免「未处理的拒绝」告警（错误仍会传给真正的消费者）。
         //
         // ⚠️ 本例**必然**会走到这里：`close()` → `controller.abort()` →
@@ -344,7 +344,7 @@ export class MinimaxAuth extends Service {
         if (pool !== undefined) {
             // ⚠ `getAvailableAccount` 返回 **`{ entry, credential }`**（两层），
             // **不是**「账号条目本身」—— 照抄既有 provider 的写法：
-            // `const available = await pool.getAvailableAccount(id, ''); available?.credential`
+            // `const available = await pool.getAvailableAccount<MinimaxCredential>(id, ''); available?.credential`
             const available = await pool.getAvailableAccount(this.product.id, '');
             if (available)
                 return available.credential;

@@ -33,13 +33,25 @@ const requiredUntilMs = new Map();
 let probeFirstCount = 0;
 let knownRequiredCount = 0;
 /**
+ * 「**首发就主动带**」的计数（2026-10-12 新增）。
+ *
+ * 与上面两个是**第三种**开局形态：上游通过 `skip_model_request: false`
+ * **明确说要验证**，于是我们不再白吃一发必然 `3007` 的先探，直接产 param 带上。
+ *
+ * ⚠ 必须**独立成一项**，不能并进 `knownRequiredCount`：那个的语义是
+ * 「**跨请求**靠 2 分钟记忆少探一次」，而本项是「靠**上游配置**少探一次」——
+ * 两者的证据来源、失效条件（一个 2 分钟 TTL、一个 60 秒 TTL 的配置）
+ * 完全不同，合并后排查时无法区分「记忆生效」还是「配置生效」。
+ */
+let upfrontCaptchaCount = 0;
+/**
  * 记忆键：captcha 需求是「账号 × 模型」维度的；真实的 key 格式见下面的
  * `captchaRequirementKey`，形如 `` `${accountId}|${model}` ``。
  * ⚠ 口径：描述**维度**时一律写「账号 × 模型」，`|` 只出现在这个真实 key 里。
  *
  * ⚠ 空/缺失的账号 id 归一成 `-`。这不是「消除」混淆、只是把混淆对象换成一个
- * 本仓库拿不出来的值：账号 id 在 Jet Hub RPC 创建路径上是 `src/jet-hub-rpc.ts:839`
- * 的 `${provider}-${shortId()}`（`shortId()` 为 8 位小写 hex，见同文件 `:158`），
+ * 本仓库拿不出来的值：账号 id 在 Jet Hub RPC 创建路径上是 `src/jet-hub-rpc.ts`
+ * 的 `${provider}-${shortId()}`（`shortId()` 为 8 位小写 hex，见 `jet-hub-rpc.ts` 的该助手），
  * 形如 `zcode-1a2b3c4d`，不会是单个 `-`，故冲突概率远低于直接拼字面量 `undefined`
  * （那会和「一个真的叫 `undefined` 的账号」共用同一条记忆）。
  */
@@ -81,14 +93,26 @@ export function noteProbeFirst() {
 export function noteKnownRequiredHit() {
     knownRequiredCount += 1;
 }
+/**
+ * 记一次「**首发就主动带**」：上游配置（`skip_model_request: false`）明确说
+ * 模型请求要验证，故这一发不等 `3007` 就直接产 param 带上。
+ *
+ * ⚠ 与 {@link noteProbeFirst} / {@link noteKnownRequiredHit} **互斥**：
+ * 三者是「同一个开局那一发」的三种形态，同一次请求只能记其中一个。
+ * 由 `zcode-adapter.ts` 内层循环的 `attempt === 0` 门控保证。
+ */
+export function noteUpfrontCaptcha() {
+    upfrontCaptchaCount += 1;
+}
 /** 观测出口。 */
 export function captchaRequirementObservability() {
-    return { probeFirstCount, knownRequiredCount };
+    return { probeFirstCount, knownRequiredCount, upfrontCaptchaCount };
 }
 /** 清空全部状态（与本文件单测 `tests/unit/captcha-requirement.spec.ts` 的 `beforeEach` 复位配套）。 */
 export function resetCaptchaRequirementMemory() {
     requiredUntilMs.clear();
     probeFirstCount = 0;
     knownRequiredCount = 0;
+    upfrontCaptchaCount = 0;
 }
 //# sourceMappingURL=captcha-requirement.js.map

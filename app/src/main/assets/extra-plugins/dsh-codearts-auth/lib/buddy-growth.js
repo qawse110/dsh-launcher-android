@@ -576,6 +576,15 @@ export async function claimAllGrowth(credential, product, fetcher = fetch, optio
  * 故这是本机唯一还能 API 化的积分相关动作（做任务本身必须客户端真操作）。
  * 幂等：重复调用只是多发一次对话，不重复计积分（活跃按天去重，服务端保证）。
  * 低频：串行 + 单账号单条，避免触发风控。
+ *
+ * ⚠️ **本文件是第三条直连腾讯端点的旁路，不经 `BuddyAdapter`，因此不过
+ * `tencent-fingerprint` 的内容级风控改写**（同一文件里另一处发 chat 的
+ * `fetchRealRequestId` 同理）。当前**安全**，因为两处的请求体都是**写死的短消息**
+ * （「你好」/「1+1等于几」），既不含风控指纹、也没有 assistant 历史。
+ * ⚠️ 但这条安全性**依赖「请求体写死」这个易碎前提**：一旦将来改成携带会话历史
+ * 或把用户内容拼进来，就必须同时接上 `rewriteTencentContentFingerprints`
+ * （见 `src/openai-gateway/tencent-fingerprint.ts`），否则会静默变成一个
+ * 未改写的入口 —— 而那种失败的表象是「整轮 400/11128」，极难归因。
  */
 export async function keepStreakActive(credential, product, fetcher = fetch) {
     const body = {
@@ -1791,7 +1800,7 @@ export async function runGrowthTaskCompletions(credential, product, fetcher = fe
          * ⚠️ 必须把失败原因**也放进 `results`**（用 `unfinished.message`，其中
          * 401/403 会说「凭据已失效」），不能只写在 `message` 里。
          *
-         * 下游 `collectBuddyGrowth`（`jet-hub-rpc.ts`）判僵尸账号的依据是
+         * 下游 `collectBuddyGrowth`（本文件）判僵尸账号的依据是
          * **逐项** `results.some(r => /凭据已失效/.test(r.message))`。此处若返回空
          * `results`，凭据失效就判不出来 ⇒ `expired=false` ⇒ 既不计 failed 也不写
          * error ⇒ 前端显示「本轮无 API 可达的任务（未领到积分）」，
@@ -2272,6 +2281,68 @@ export async function runGrowthTaskCompletions(credential, product, fetcher = fe
                 noActionableTasks
                     ? { message: `无 API 可达的待完成任务${uidHint}` }
                     : { ...(uidHint.length > 0 ? { message: uidHint.replace(/^；/, '') } : {}) }),
+    };
+}
+/**
+ * 单账号的成长中心任务执行，转成 RPC 明细。
+ *
+ * ## ⚠️ 为什么在**本文件**而不是 `jet-hub-rpc.ts`（2026-10-08 Task 4 搬迁）
+ *
+ * 它是 `credits.afterClaim` 的实现，而 `afterClaim` 由 `src/provider-credits.ts`
+ * 的能力表提供。留在 `jet-hub-rpc.ts` 会让那张表必须 import 它 ⇒
+ * `provider-credits.ts ⇄ jet-hub-rpc.ts` **循环 import**（后者已经 import 前者）。
+ * 搬到本文件后依赖是单向的：`jet-hub-rpc.ts` → `provider-credits.ts` → `buddy-growth.ts`。
+ *
+ * ⚠️ 搬迁是**逐字**的（函数体一行未改），只有 import 来源变了。
+ *
+ * 僵尸账号（凭据被外部删除 ⇒ 上游回 401/403）归 `error` 提示但**不计入 failed**：
+ * 它的处置是「重新登录」，与「任务真的推不动」完全不同。签到侧已把这类账号归
+ * `inactive`（`collectClaimResults` 的 `凭据未配置` 分支同义），成长侧须一致 ——
+ * 否则同一个僵尸条目在两处会给出互相矛盾的判定。
+ *
+ * @param budgetMs 透传给 `runGrowthTaskCompletions`；`undefined` 由其取缺省 10 分钟。
+ */
+export async function collectBuddyGrowth(credential, product, entry, budgetMs, roundDeadlineAt) {
+    // 整轮预算已耗尽 ⇒ 该账号**不再发起任何成长请求**。
+    //
+    // ⚠️ 签到侧已经跑完（afterClaim 在 claim 之后调用），所以这里返回的只是成长
+    // 明细，不影响该账号的签到判定。逐项标 `failed` 会让整条提示染黄，而这不是
+    // 任何账号的过错 —— 故用 `ok:true` + `error` 说明「本轮没轮到它」。
+    if (roundDeadlineAt !== undefined && Date.now() >= roundDeadlineAt) {
+        return {
+            accountId: entry.id, nickname: entry.nickname,
+            ok: true, completed: 0, clientOnly: 0, failed: 0,
+            claimedCount: 0, claimedCredit: 0, timedOut: true, tasks: [],
+            error: '本轮时间预算已用尽，未执行成长任务（再点一次即可继续）',
+        };
+    }
+    let report;
+    try {
+        report = await runGrowthTaskCompletions(credential, product, fetch, { budgetMs });
+    }
+    catch (error) {
+        return {
+            accountId: entry.id, nickname: entry.nickname,
+            ok: false, completed: 0, clientOnly: 0, failed: 0,
+            claimedCount: 0, claimedCredit: 0, timedOut: false, tasks: [],
+            error: error instanceof Error ? error.message : String(error),
+        };
+    }
+    // 凭据失效的判据：逐项 message 里出现「凭据已失效」。它与「任务失败」是
+    // 两回事 —— 前者要重新登录，后者是判据推不动。
+    const expired = report.results.some((r) => /凭据已失效/.test(r.message));
+    return {
+        accountId: entry.id, nickname: entry.nickname,
+        // 僵尸账号视作「无需再管」，不把整条提示染成失败。
+        ok: report.ok || expired,
+        completed: report.completed,
+        clientOnly: report.clientOnly,
+        failed: expired ? 0 : report.failed,
+        claimedCount: report.claimedCount,
+        claimedCredit: report.claimedCredit,
+        timedOut: report.timedOut,
+        tasks: report.results,
+        ...(expired ? { error: '凭据已失效，请在 Jet Hub 重新登录该账号' } : {}),
     };
 }
 //# sourceMappingURL=buddy-growth.js.map

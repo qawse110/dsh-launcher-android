@@ -346,7 +346,7 @@ let logger;
  * 而 `resolveJetHubHome` 的第二优先级是 `profileContext.home`、第三才是
  * `$DSH_HOME` ⇒ 传 `undefined` 会**跳过 profile home**，在 profile home 与
  * `$DSH_HOME` 不相等时把本文档写到**另一个目录**，造成
- * 「账号池在 A、失效表在 B」的分裂 —— 正是 `permanent-lock-store.ts:129-133`
+ * 「账号池在 A、失效表在 B」的分裂 —— 正是 `permanent-lock-store.ts`
  * 明确警告过、必须避免的那类问题。
  * ⚠️ 未注入时（只有单测会这样）退化用空对象：`resolveJetHubHome` 的
  * `readService` 接受 `unknown`，读不到 `profileContext` 就自然落到
@@ -591,14 +591,14 @@ function trackStream(provider, inner, modelId) {
  * **原始 stream** —— 完全绕过 Proxy 的 `stream` 拦截。而 dsh-llm 的两条运行时路径
  * **只走 prepareCall**：
  *
- * - `node_modules/@deepseek-ai/dsh-llm/lib/index.js:1597` → `adapterCall.stream(options)`
- * - 同文件 `:1667` → `dispatch = (options) => adapterCall.stream(options)`
+ * - `node_modules/@deepseek-ai/dsh-llm/lib/index.js` 的一处 → `adapterCall.stream(options)`
+ * - 同文件另一处 → `dispatch = (options) => adapterCall.stream(options)`
  *
  * ⇒ 只包 `stream` 时，**失效模型永远不会被记录**（实测确认）。
  *
  * ⚠️ **只包 `prepareCall` 本身也不够**：真实错误发生在 `call.stream(options)` 的
- * **迭代过程中**（dsh-llm `:1691` `iterator = dispatch(...)[Symbol.asyncIterator]()`，
- * `:1701` `iterator.next()`），不是 `prepareCall` 自己抛的。故必须包装
+ * **迭代过程中**（dsh-llm 的 `iterator = dispatch(...)[Symbol.asyncIterator]()`，
+ * `iterator.next()`），不是 `prepareCall` 自己抛的。故必须包装
  * **返回的那个 `call.stream`**。
  *
  * @param providers - 该适配器注册的 provider id 列表。

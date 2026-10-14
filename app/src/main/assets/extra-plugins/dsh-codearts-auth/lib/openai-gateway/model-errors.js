@@ -3,7 +3,8 @@
  *
  * ## 为什么是翻译而不是预检拦截
  *
- * `design.md:76` 明确要求「隐藏模型不出现在 /v1/models，但显式请求仍交给 DSH
+ * OpenAI 网关设计文档（`docs/superpowers/specs/2026-09-30-openai-gateway-design.md`
+ * 的「模型列表」一节）明确要求「隐藏模型不出现在 /v1/models，但显式请求仍交给 DSH
  * 路由处理」—— 有些 provider 支持目录之外的模型（远端新上线、被用户用黑名单
  * 隐藏的）。网关若在发请求前拿 `listModels` 做白名单拦截，会把这类**合法**请求
  * 一起挡掉。

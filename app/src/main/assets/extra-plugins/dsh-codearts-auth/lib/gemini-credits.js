@@ -20,7 +20,7 @@
  *
  * 而**同一个 token、同一组身份头**，只要请求体带上 `{"project":"aicode-consumers"}`
  * 就 200 —— 唯一的变量就是 `project`。同一账号的**推理**请求本来就在信封里带
- * `project`（`gemini-messages.ts:278`），所以只有配额这条链路会 403：
+ * `project`（`gemini-messages.ts`），所以只有配额这条链路会 403：
  * 面板显示「凭据已失效」，而「测试」按钮照样能发请求（用户 m07113 报障）。
  *
  * 字段名是 `project`，**不是** `cloudaicompanionProject` —— 后者会 400
@@ -215,7 +215,7 @@ function makeQuotaPackage(label, window) {
  * 两个窗口 → 插件统一的 {@link CreditBalance}。
  *
  * ⚠️ `total` 取两窗口剩余百分比的**平均**（面板顶部的汇总数字）——
- * 对照 `src/cline-credits.ts:110` 的 `toClineCreditBalance` 口径：
+ * 对照 `src/cline-credits.ts` 的 `toClineCreditBalance` 口径：
  * 它那里只有一个数字可用，这里有两个，取平均是最不误导的汇总
  * （取 min 会把「周窗口 99% / 5 小时窗口 20%」显示成 20%，
  * 让用户以为整条线快用完了）。

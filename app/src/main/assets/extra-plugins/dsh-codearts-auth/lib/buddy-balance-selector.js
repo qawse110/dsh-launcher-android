@@ -222,7 +222,7 @@ function failedEntry(id, error) {
     return { id, ok: false, error };
 }
 /**
- * 选号 + 取凭据的完整编排（供 `src/index.ts` 的两个 buddy provider 调用）。
+ * 选号 + 取凭据的完整编排（供 `src/index.ts` 的 buddy 系 provider 调用）。
  *
  * ## 为什么需要这一层
  *
@@ -238,6 +238,9 @@ function failedEntry(id, error) {
  *   从而**继续尝试池里的其余账号**（既有行为）。
  *
  * @param selector - 该 provider 专属的选号器（缓存不能跨站共用）。
+ *   ⚠️ 只要求 {@link BuddySelectorLike} 这个**结构**形状，不要求具体类 ——
+ *   具体类带 `private` 成员（名义类型），会让 `credential-resolver.ts` 的
+ *   测试替身无法传入。真实例天然满足该接口，既有调用点不受影响。
  * @param candidates - 已按 `enabled` + 模型限流过滤的候选。
  * @param options - 锁定标志与凭据解析器。
  */

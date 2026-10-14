@@ -15,8 +15,8 @@
  * | 明细 | 无 | `prompt_tokens_details.cached_tokens` 是上者的**子集**（不是并列项） |
  *
  * DSH 侧口径见 `src/types.ts` 的注释「输入 token（未命中缓存的部分）」，
- * 以及各适配器统一在做的那一步减法（`openai-compat.ts:892`、`buddy-adapter.ts:1988`、
- * `lobsterai-adapter.ts:1488`、`llm-adapter.ts:1797`、`gemini-messages.ts:455`）——
+ * 以及各适配器统一在做的那一步减法（`openai-compat.ts`、`buddy-adapter.ts`、
+ * `lobsterai-adapter.ts`、`llm-adapter.ts`、`gemini-messages.ts`）——
  * 它们把上游**含缓存**的 `prompt_tokens` 减成 DSH 的互斥口径。
  * 网关这一跳必须**减回去**，否则就是下面的缺陷。
  *
@@ -32,11 +32,18 @@
  * |---|---|---|---|---|
  * | raccoon 会话中 | 未命中 52129 + 命中 4096 | `total_tokens: 52787` | **5.56%** | 5.92% |
  * | raccoon 会话末 | 未命中 770 + 命中 207488 | `total_tokens: 1403` | **0.15%** | **21.92%** |
- * | trae 会话末 | 未命中 326134（trae 无缓存） | `total_tokens: 326742` | **34.39%** | 34.33% |
+ * | trae 会话末 | 未命中 326134（当时 trae 未报缓存） | `total_tokens: 326742` | **34.39%** | 34.33% |
  *
- * trae 之所以「正常」**不是它被修好了，而是它不报缓存** ——
- * `trae-adapter.ts` 的 `token_usage` 只读 `prompt_tokens` / `completion_tokens`，
- * 从不算 `cacheReadTokens`，于是旧的 `inputTokens + outputTokens` 恰好等于完整上下文。
+ * ⚠️ **上表 trae 那一行是「当时」的形态，2026-10-12 已变**（别再据此推断）：
+ * 当时 `trae-adapter.ts` 的 `token_usage` 只读 `prompt_tokens` / `completion_tokens`，
+ * 把上游**确实下发**的 `cache_read_input_tokens` 丢弃，因此它「不报缓存」——
+ * 那是**缺陷**，不是设计。该缺陷已修（见 `trae.ts` 的 `traeUsageFromTokenUsage`），
+ * trae 现在**会**报 `cacheReadTokens`。
+ *
+ * ⚠️ 但这**不改变本模块的结论**：trae 的 `prompt_tokens` 是**含缓存**的总量
+ * （同前缀两次实测：`prompt_tokens` 恒 4894，命中从 0 变 4864），
+ * 与其余开了前缀缓存的家同形 ⇒ 它现在同样需要 `toOpenAiUsage` 把命中量加回去。
+ * 换句话说：修复前它「恰好正确」是**巧合**，修复后才是**正确**。
  *
  * Codex 自己的判据（`agcodex_protocol::protocol::TokenUsage`，
  * 与 openai/codex 的 `tokens_in_context_window` 同源）：
@@ -60,7 +67,8 @@
  *
  * ⚠️ **受影响的是「所有开前缀缓存的 provider」**（raccoon / buddy / workbuddy /
  * lobsterai / qoder / qodercn / cline / loomy / opencode / minimax / zcode /
- * gemini / codearts），**只有 trae 因为不报缓存而幸免**。
+ * gemini / codearts）。trae 原先**看似幸免**，但那只是因为它当时把上游下发的
+ * 缓存字段丢了（见上）—— 缺陷已修，它现在同样需要本模块的「加回去」。
  *
  * ⚠️ 这是 `6f352ca`（Chat 出口）与 `c19917a`（Responses 出口）就带着的既有缺陷，
  * 不是第 7、8 轮引入的；只是**接入 Codex 用 Responses 端点之后才暴露** ——

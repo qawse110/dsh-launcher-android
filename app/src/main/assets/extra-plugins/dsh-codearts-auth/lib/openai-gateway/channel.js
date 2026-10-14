@@ -4,7 +4,7 @@
  * ## 为什么需要打标（而不是在适配器层区分）
  *
  * 网关（`src/openai-gateway/server.ts`）与 DSH 宿主对话调用的是**同一个**
- * `ctx.llm` 运行时（`openai-gateway/index.ts:64` 直接传 `ctx.llm`）——
+ * `ctx.llm` 运行时（`openai-gateway/index.ts` 直接传 `ctx.llm`）——
  * 适配器在流里根本看不到「调用方是谁」。唯一的区分点在**入口**：
  * 网关发请求前在 `GenerateOptions` 上挂一个模块级 `Symbol` 标记，
  * 记账包装层（`src/llm-register-compat.ts`）读到即判 `gateway`。

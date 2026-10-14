@@ -264,7 +264,10 @@ async function convertMessage(raw, provider, model, bridge, limits) {
         return createGatewayMessage('user', await partsFromContent(value.content, bridge, limits), { kind: 'user' });
     }
     if (role === 'assistant') {
-        const text = textFromContent(value.content);
+        // ⚠️ assistant **正文**也在腾讯系风控的扫描范围内（实测 400/11128，依据见
+        // ./tencent-fingerprint.ts 的表）。只改这一处文本；`tool_calls` 的
+        // `arguments` 实测不拦，故原样传递（改它会破坏「工具调用参数是要回读的证据」）。
+        const text = rewriteTencentContentFingerprints(textFromContent(value.content), provider);
         const content = text.length > 0 ? [{ type: 'text', text }] : [];
         if (value.tool_calls !== undefined)
             content.push(...convertToolCalls(value.tool_calls));

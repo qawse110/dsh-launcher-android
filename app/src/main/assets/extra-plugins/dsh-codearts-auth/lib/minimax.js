@@ -58,7 +58,7 @@ export function decodeJwtSub(token) {
  * 故 JWT 路径对真实凭据恒不命中。保留 JWT 分支只为兼容上游将来改发 JWT。
  *
  * ⚠️ **单位兼容**：`expires_at` 是**秒**时按秒换算（判据 `> 1e12` 视为毫秒），
- * 与既有 `src/buddy.ts:162` 的 `credentialExpiresAtMs` 同一约定。
+ * 与既有 `src/buddy.ts` 的 `credentialExpiresAtMs` 同一约定。
  * 不兼容会让秒级值被当成 1970 年 ⇒ **恒判已过期**、每次使用都触发无谓续期。
  */
 export function minimaxCredentialExpiresAtMs(credential) {

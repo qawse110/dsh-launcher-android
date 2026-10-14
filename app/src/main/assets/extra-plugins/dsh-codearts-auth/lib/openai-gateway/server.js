@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { loadOrCreateApiKey } from './auth.js';
-import { resolveGatewayConfig } from './config.js';
+import { gatewayHttpUrl, resolveGatewayConfig } from './config.js';
 import { markGatewayChannel } from './channel.js';
 import { toGenerateOptions, OpenAiGatewayError, parseModelRoute, normalizeReasoningEffort, normalizeMaxTokens } from './messages.js';
 import { collectGatewayEffortViews, collectGatewayModelIds, collectGatewayModels, toGatewayModelIds, toOpenAiModels } from './models.js';
@@ -12,7 +12,20 @@ import { CANONICAL_REASONING_EFFORTS } from '../reasoning-ladder.js';
 import { findCaseInsensitiveSuggestion, looksLikeMissingModel } from './model-errors.js';
 import { collectResponsesResult, responsesMaxOutputTokens, responsesReasoningEffort, toResponsesGenerateOptions, toResponsesSse, } from './responses.js';
 import { collectOpenAiCompletion, failureToOpenAiError, toOpenAiSse } from './stream.js';
-const BODY_LIMIT = 16 * 1024 * 1024;
+/**
+ * 请求体上限。
+ *
+ * ⚠️ **必须容得下自家图片声明所能产生的请求体**（Issue IKKUBJ）。原先的 16 MiB
+ * 与 `DEFAULT_IMAGE_LIMITS` 自相矛盾：那里允许一条消息带 200 MiB 图片（**原始**
+ * 字节），而 JSON 里图片以 base64 承载、膨胀 4/3 ⇒ 光图片就是 266.7 MiB。结果是
+ * 「单张图片 20 MiB」这句声明在真实链路上**永不可达** —— 实测连 12 MiB 的图片
+ * 都已经在读到 body 这一步就被拒，压根走不到图片体积校验。
+ *
+ * 300 MiB = 200 MiB 图片的 base64 形态（266.7 MiB）+ 约 35 MiB 余量给文本与
+ * tools。取值上限由 `DEFAULT_IMAGE_LIMITS` 反推，故**改图片声明时必须回来核对**
+ * —— `tests/unit/openai-gateway-server.spec.ts` 有一条纯算术用例锁住这个关系。
+ */
+export const BODY_LIMIT = 300 * 1024 * 1024;
 const defaultLogger = {
     info: (message) => console.info(message),
     warn: (message) => console.warn(message),
@@ -29,18 +42,32 @@ function jsonResponse(response, status, value) {
     });
     response.end(body);
 }
-function readJson(request, signal) {
+function readJson(request, signal, limit) {
     return new Promise((resolve, reject) => {
         const chunks = [];
         let size = 0;
+        let tooLarge = false;
         const abort = () => reject(new OpenAiGatewayError('request was aborted', 499, 'aborted', 'aborted'));
         signal.addEventListener('abort', abort, { once: true });
         request.on('data', (chunk) => {
+            // ⚠️ 判超限后**排空但不累积，且绝不销毁 socket**（Issue IKKUBJ）。
+            //
+            // 这里原先在 reject 之后销毁请求：socket 当场死掉，而这条 413 要等
+            // `withRequest` 的 catch 才写出，于是**永远发不出去** —— 客户端只看到连接
+            // 重置（RST）。后果远不止「一次请求失败」：Codex 这类每轮回传全量历史的
+            // 客户端，历史一旦越过上限就再也回不去，而它的自动压缩只看 token 不看字节，
+            // 于是永不触发，会话永久不可用。把「请求过大」伪装成「网络故障」会让排查
+            // 方向彻底跑偏（该 issue 报告的实际排查耗时以小时计）。
+            //
+            // `'data'` 监听器本身就使流处于 flowing 模式 ⇒ 超限后剩下的数据会被读走并
+            // 丢弃，客户端不会因背压卡在写入里（这正是那条 413 能送达的前提）。
+            if (tooLarge)
+                return;
             const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
             size += data.length;
-            if (size > BODY_LIMIT) {
-                reject(new OpenAiGatewayError('request body is too large', 413, 'invalid_request_error', 'request_too_large'));
-                request.destroy();
+            if (size > limit) {
+                tooLarge = true;
+                reject(new OpenAiGatewayError(`request body is too large: limit is ${limit} bytes`, 413, 'invalid_request_error', 'request_too_large'));
                 return;
             }
             chunks.push(data);
@@ -74,6 +101,7 @@ export function createOpenAiGateway(options) {
     // 读到它，用户才能配置外部客户端。
     const apiKey = loadOrCreateApiKey(getHome(options), env);
     const key = apiKey.value;
+    const bodyLimit = options.maxBodyBytes ?? BODY_LIMIT;
     const logger = options.logger ?? defaultLogger;
     let server;
     let boundPort = config.port;
@@ -250,7 +278,7 @@ export function createOpenAiGateway(options) {
     };
     const handleChat = async (request, response) => {
         await withRequest(request, response, async (signal) => {
-            const body = await readJson(request, signal);
+            const body = await readJson(request, signal, bodyLimit);
             const route = parseModelRoute(body.model);
             const modelInfo = await resolveModelInfo(route, signal);
             const reasoningEffort = normalizeReasoningEffort(body.reasoning_effort, modelInfo, route.provider, route.model, (notice) => logEffortNotice(route, notice));
@@ -289,7 +317,7 @@ export function createOpenAiGateway(options) {
      */
     const handleResponses = async (request, response) => {
         await withRequest(request, response, async (signal) => {
-            const body = await readJson(request, signal);
+            const body = await readJson(request, signal, bodyLimit);
             const route = parseModelRoute(body.model);
             const modelInfo = await resolveModelInfo(route, signal);
             const reasoningEffort = normalizeReasoningEffort(responsesReasoningEffort(body), modelInfo, route.provider, route.model, (notice) => logEffortNotice(route, notice));
@@ -369,6 +397,14 @@ export function createOpenAiGateway(options) {
             if (server !== undefined)
                 return;
             const current = createServer(requestHandler);
+            // ⚠️ **必须显式设置**（Issue IKKUBJ）：不设就落到 Node 默认的 5 秒，而那个
+            // 默认值对「人读着回复、隔几分钟再问一句」的用法完全不够 —— 服务端已发 FIN，
+            // 客户端再复用这条连接就是 Connection reset（实测响应头会写明
+            // `Keep-Alive: timeout=5`，是外部可观测的证据，用例据此断言）。
+            current.keepAliveTimeout = 120000;
+            // 必须 **>** keepAliveTimeout：它管「连接上收到完整请求头」的时限，
+            // 若更短，长连接会在 keep-alive 窗口内被提前掐断，症状与上一条相同。
+            current.headersTimeout = 130000;
             server = current;
             await new Promise((resolve, reject) => {
                 const onError = (error) => {
@@ -389,7 +425,7 @@ export function createOpenAiGateway(options) {
                 logger.error(`[openai-gateway] 启动失败 ${config.host}:${config.port}：${error instanceof Error ? error.message : String(error)}`);
                 throw error;
             });
-            logger.info(`[openai-gateway] 已监听 http://${config.host}:${boundPort}/v1`);
+            logger.info(`[openai-gateway] 已监听 ${gatewayHttpUrl(config.host, boundPort, '/v1')}`);
         },
         async close() {
             for (const controller of active)

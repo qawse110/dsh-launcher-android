@@ -44,11 +44,11 @@ const WORKBUDDY_UA_CN = 'WorkBuddy/5.5.2 WorkBuddy/5.5.2 CLI/5.5.2';
  *
  * 以下字段与既有常量重复，属**待删除的重复定义**（等后续参数化任务把
  * `src/buddy.ts` / `src/buddy-auth.ts` 改为从本模块取值后即可删除）：
- * - `platform: 'ide'`          ↔ `src/buddy.ts:24`  `PLATFORM`
- * - `productCode: 'codebuddy'` ↔ `src/buddy.ts:79`  `BUDDY_PRODUCT_CODE`
- * - `userAgent: 'CodeBuddyIDE/1.106.1'` ↔ `src/buddy.ts:77`  `BUDDY_USER_AGENT`
- * - `defaultCredentialRef: 'BUDDY_ACCESS_TOKEN'` ↔ `src/buddy-auth.ts:27`  `BUDDY_CREDENTIAL_REF`
- * - `endpoint`/`apiDomain`     ↔ `src/buddy.ts:20/86`  `API_ENDPOINT` / `API_DOMAIN`
+ * - `platform: 'ide'`          ↔ `src/buddy.ts`  `PLATFORM`
+ * - `productCode: 'codebuddy'` ↔ `src/buddy.ts`  `BUDDY_PRODUCT_CODE`
+ * - `userAgent: 'CodeBuddyIDE/1.106.1'` ↔ `src/buddy.ts`  `BUDDY_USER_AGENT`
+ * - `defaultCredentialRef: 'BUDDY_ACCESS_TOKEN'` ↔ `src/buddy-auth.ts`  `BUDDY_CREDENTIAL_REF`
+ * - `endpoint`/`apiDomain`     ↔ `src/buddy.ts`  `API_ENDPOINT` / `API_DOMAIN`
  *
  * 迁移完成前两处取值必须保持一致，改动需同步（见文件头「迁移关系」）。
  */
@@ -232,7 +232,7 @@ const WORKBUDDY_FALLBACK_MODELS = [
         // ⚠️ 档位取 5 档（issue IKJQSH）。本表是这两个模型的**唯一档位来源**：
         // 国际版 `/v3/config` 对它们**不下发 supportedEfforts**，只给一个单值
         // `reasoning: {effort:"high", summary:"auto"}`（即「固定 high、不提供选择」）。
-        // 而 `parseModelMeta`（src/buddy.ts:905）只认 `supportedEfforts` 数组与
+        // 而 `parseModelMeta`（src/buddy.ts）只认 `supportedEfforts` 数组与
         // `defaultEffort`，**不认识 `effort`** —— 故远端这个表态会被静默忽略，
         // 最终落到本表。写 `['high']` 意味着用户永远只有 high 可选，max 从未出现过。
         //
@@ -328,8 +328,13 @@ const WORKBUDDY_FALLBACK_MODELS = [
  *    登记为 `dailyCheckin: false` ⇒ 按钮不渲染 ⇒ `runTasks: true` 传不进来；
  * 2. **更根本的是**：contributor 在 !62 复审中实测确认 `www.workbuddy.ai` 后端
  *    **根本没有成长中心**（无任务列表、无 claim 端点）。故这不是「等将来开放」，
- *    而是「该产品没有这个功能」。`GROWTH_CAPABLE_PROVIDERS` 与客户端的
- *    `GROWTH_TASK_PROVIDERS` 都已据此**移除** `workbuddy`。
+ *    而是「该产品没有这个功能」。客户端 `GROWTH_TASK_PROVIDERS` 与宿主能力表
+ *    （`src/provider-credits.ts` 里**只有 buddy** 挂 `credits.afterClaim`）
+ *    都已据此**排除** `workbuddy`。
+ *
+ *    ⚠️ 2026-10-08（Task 4）：宿主侧原先另有一张手抄的 `GROWTH_CAPABLE_PROVIDERS`
+ *    集合，**已删除** —— 「哪家有成长中心」现在由「该家是否提供 `credits.afterClaim`」
+ *    回答（能力注册表说了算，不再有第二份可漂移的名单）。
  *
  * 两个字段保留是因为 `BuddyProduct` 把它们声明为必填；若将来类型放宽为可选，
  * 这里可以删掉（`claimBaseOf` / `webBaseOf` 已能正确处理空值并给出可读错误）。

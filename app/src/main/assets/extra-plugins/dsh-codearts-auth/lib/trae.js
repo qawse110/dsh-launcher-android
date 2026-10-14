@@ -1471,6 +1471,73 @@ export function buildOpenAIChunk(id, delta, finishReason, usage) {
 /** [DONE] 信号。 */
 export const OPENAI_DONE = 'data: [DONE]\n\n';
 /**
+ * SOLO `token_usage` 事件 → DSH `TokenUsage`（**互斥口径**）。
+ *
+ * ## 为什么必须单列一个函数
+ *
+ * 上游 `token_usage` 事件的**原始字段**（2026-10-12 实机直发实测，
+ * `deepseek-v4.1-flash` 与 `glm-5.2` 都验过）：
+ *
+ * ```json
+ * {"prompt_tokens":5144,"completion_tokens":32,"total_tokens":5176,
+ *  "cache_creation_input_tokens":0,"cache_read_input_tokens":5120,
+ *  "reasoning_tokens":30,"cluster":"normal_context"}
+ * ```
+ *
+ * ⚠️ **真实缺陷**（用户报障「trae 的缓存命中率一直是 0」）：早期实现只读
+ * `prompt_tokens` / `completion_tokens` / `reasoning_tokens`，把
+ * `cache_read_input_tokens` 与 `cache_creation_input_tokens` **整对丢弃**。
+ *
+ * 后果不是「少一个数字」：DSH 的 `dsh-token-meter` 投影层做的是
+ * `usage.cacheReadTokens ?? 0`（`usage-projection.js` 的 `bucketsFrom`），
+ * 字段缺席被归一成**数字 0** ⇒ 界面显示「缓存命中 0%」而非「—」——
+ * 这正是「一直是 0」这个症状的来源。本机 784 个真实会话的统计：
+ * trae 2397 条 `usage` 样本里带 `cacheReadTokens` 的是 **0 条**，
+ * 而其余十三家为 76%~100% ⇒ trae 是全机唯一的 0%。
+ *
+ * ## ⚠️ TRAE 的 `prompt_tokens` 是**含缓存**的总量（与 Anthropic 相反）
+ *
+ * 这是本函数做减法、而 `zcode-anthropic.ts` 不做减法的原因。判据是
+ * **同一前缀两次请求的对照实验**（实测 `glm-5.2`，同前缀连发两次）：
+ *
+ * | 次 | `prompt_tokens` | `cache_read_input_tokens` |
+ * |---|---|---|
+ * | 第 1 次（冷） | 4894 | 0 |
+ * | 第 2 次（复用） | **4894** | **4864** |
+ *
+ * 若 `prompt_tokens` 只含未命中部分，第 2 次的未命中应降到约 30 ——
+ * 它却纹丝不动地停在 4894，而命中量**单列**在 `cache_read_input_tokens`。
+ * ⇒ `prompt_tokens` 是「命中 + 未命中」的总输入，**必须减掉命中部分**，
+ * 否则把 DSH 的互斥口径当成含缓存口径，缓存命中率会显示偏小。
+ *
+ * ⚠️ `cache_creation_input_tokens`（缓存写入）**也是这一轮真实发出的输入**，
+ * 同样要从 `prompt_tokens` 里减出去，但它**不算命中**（不进 `cacheReadTokens`）
+ * —— 与 `openai-gateway/usage.ts` 的 `cacheWriteTokens` 约定一致。
+ *
+ * ⚠️ 减法要**钳到 0**：上游字段彼此矛盾时（第三方实现见过）宁可少算未命中，
+ * 也不能下发负数 —— `TokenUsage` 的计数字段在 DSH 侧是 `nonnegative`。
+ *
+ * @param raw `token_usage` 事件的 data 对象（`parseTraeSSELine` 原样存入的 `ev.usage`）
+ */
+export function traeUsageFromTokenUsage(raw) {
+    const num = (value) => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.trunc(value) : undefined;
+    const promptTokens = num(raw.prompt_tokens);
+    const cacheRead = num(raw.cache_read_input_tokens);
+    const cacheWrite = num(raw.cache_creation_input_tokens);
+    const completionTokens = num(raw.completion_tokens);
+    const reasoningTokens = num(raw.reasoning_tokens);
+    // 未命中 = 总输入 - 命中 - 写入；钳到 0（见函数注释的「宁可少算」）。
+    const billed = (promptTokens ?? 0) - (cacheRead ?? 0) - (cacheWrite ?? 0);
+    const inputTokens = Math.max(0, billed);
+    return {
+        inputTokens,
+        outputTokens: completionTokens ?? 0,
+        ...cacheRead !== undefined && cacheRead > 0 ? { cacheReadTokens: cacheRead } : {},
+        ...cacheWrite !== undefined && cacheWrite > 0 ? { cacheWriteTokens: cacheWrite } : {},
+        ...reasoningTokens !== undefined && reasoningTokens > 0 ? { reasoningTokens } : {},
+    };
+}
+/**
  * 聚合一个完整的 SOLO SSE 为 OpenAI 格式（非流式场景下一次性解析）。
  *
  * @param lines SOLO SSE 事件的行序列

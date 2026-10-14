@@ -391,7 +391,10 @@ async function toMessages(input, provider, model, bridge, limits) {
                 continue;
             }
             if (raw.role === 'assistant') {
-                const text = textFromContent(content);
+                // ⚠️ 与 Chat 路径 `convertMessage` 的 assistant 分支**同一判据**：assistant
+                // 正文也在腾讯系风控的扫描范围内（实测 400/11128，见 ./tencent-fingerprint.ts）。
+                // 漏掉这里等于「同一份历史在 `/v1/chat/completions` 放行、在 `/v1/responses` 被拦」。
+                const text = rewriteTencentContentFingerprints(textFromContent(content), provider);
                 pushAssistant(text.length > 0 ? [{ type: 'text', text }] : []);
                 continue;
             }

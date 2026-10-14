@@ -22,14 +22,15 @@
  * `src/openai-compat.ts`；加密端点的响应信封由 `src/qoder-envelope.ts` 剥离。
  */
 import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
-import { providerCatalogVisible } from './account-pool.js';
+import { createModelCatalog } from './model-catalog.js';
 import { isQoderExpired } from './qoder.js';
-import { QoderEncryptedInfer } from './qoder-wasm.js';
+import { describeWasmFailure, QoderEncryptedInfer } from './qoder-wasm.js';
 import { unwrapQoderEnvelopeStream } from './qoder-envelope.js';
 import { QODER } from './qoder-product.js';
 import { projectRequestImage } from './image-budget.js';
 import { registerAdapterIdempotent, } from './llm-register-compat.js';
 import { collectImages, consumeOpenAiSse, errorDetail, httpErrorCode, isTransportError, ModelQueuedError, serializeMessages, } from './openai-compat.js';
+import { planSessionTitleThinking } from './session-title.js';
 import { BILLING_BUSINESS_CODE, BILLING_BUSINESS_CODES, QUEUE_BUSINESS_CODE, QUEUE_MAX_ATTEMPTS, QUEUE_MAX_DELAY_MS, isBillingBusinessCode, isQueueBusinessCode, looksLikeBillingError, nextUtc8DayStartMs, parseQueueError, queueDelayMs, } from './model-queue.js';
 const parseQoderQueueError = parseQueueError;
 const qoderQueueDelayMs = queueDelayMs;
@@ -330,12 +331,27 @@ export class QoderAdapter extends LlmAdapter {
     fetchImpl;
     /** 产品级兜底模型索引（`product.fallbackModels` 的 id → 条目）。 */
     fallbackIndex;
+    /**
+     * ⚠️ **2026-10-08 Task 7b：三个方法收敛到共享骨架** `createModelCatalog`。
+     * 原先 `listModels` / `resolveModel` / `listAllModels` 各写一遍骨架，
+     * 现在只剩 `toCatalogEntry`（本家私有形状 + 静态表判据 + 倍率格式）。
+     */
+    catalog;
     constructor(options) {
         super();
         this.options = options;
         this.product = options.product ?? QODER;
         this.fetchImpl = options.fetchImpl ?? fetch;
         this.fallbackIndex = new Map((this.product.fallbackModels ?? []).map((model) => [model.id, model]));
+        // ⚠️ 共享骨架（Task 7b）：门控 → 读目录 → 黑名单 → 回填 → 三态。
+        // ⚠️ 本家恒用**本地兜底表**（不发网络请求）⇒ 两个取数回调是同一份。
+        this.catalog = createModelCatalog({ accountPool: options.accountPool }, {
+            product: this.product,
+            loadCatalog: () => this.catalogEntries(),
+            // ⚠️ 未知 id 保守报 ['text']（宁可少报能力，也不报服务端可能不认的模态）。
+            unknownModelInputModalities: () => ['text'],
+            syncCatalog: () => this.catalogEntries(),
+        });
     }
     /**
      * 可中止的休眠；信号中止时立即 resolve（不抛错，由调用方检查 signal）。
@@ -384,46 +400,50 @@ export class QoderAdapter extends LlmAdapter {
         return this.fallbackIndex.get(model)?.supportsImage === true ? ['text', 'image'] : ['text'];
     }
     /**
-     * 模型目录。
-     *
-     * **不发任何网络请求**：Qoder 的模型列表端点需要 WASM 签名
-     * （`qoder_auth_wasm`），本插件不实现，故恒用产品兜底表。
-     * 见设计文档 §2.6 与 `qoder-product.ts` 的 `fallbackModels` 说明。
-     */
-    /**
      * 完整模型目录（**不应用用户黑名单**），含最终展示名（倍率/免费标记）。
      *
      * 设置页必须渲染被关闭的模型（否则用户无法重新打开），而 `listModels` 会按
      * 黑名单过滤掉它们 —— RPC 层只能凭裸 id 补回，展示名与倍率随之丢失
      * （用户报障：「关闭的就没有显示倍率」）。详见 `model.list` 端点的注释。
+     *
+     * ⚠️ **2026-10-08 Task 7b**：骨架（含上面这条理由）已上移到共享实现
+     * `src/model-catalog.ts`，此处只剩委托。
+     *
+     * ⚠️ **2026-10-08 复审**：本方法上方原先还压着**一段无主的 JSDoc**
+     * （以「模型目录。」开头、讲「Qoder 的模型列表端点需要 WASM 签名」）——
+     * 它本来是某个已被删掉的方法的文档，删方法时留下了壳。
+     * 它与紧邻的本块连在一起看像「同一个方法有两套互相矛盾的文档」。
+     * 已删除；那段内容里仍然有效的部分（恒用产品兜底表、不发网络请求）
+     * 在下面 `toCatalogEntry` 的注释里。
      */
     listAllModels() {
-        return this.product.fallbackModels.map((model) => ({ id: model.id, name: qoderDisplayName(model) }));
-    }
-    async listModels(_provider) {
-        // ⚠️ 没有任何已登录账号时返回空数组 → DSH 的 `buildModelCatalog` 把整个
-        // provider 分组隐藏（它显式 `.filter(group => group.models.length > 0)`）。
-        // ⚠️ 必须返回 `[]` 而**不能抛错**（抛错会被归入 catalog 的 `failures`，
-        // 界面上反而多出一条 provider 报错）。
-        if (!await providerCatalogVisible(this.options.accountPool, this.product.id))
-            return [];
-        // 用户在 Jet Hub 关闭的模型（黑名单制：不在表里即默认打开）。
-        const disabled = this.options.accountPool?.disabledModelsFor(this.product.id);
-        const source = this.product.fallbackModels;
-        const listed = disabled === undefined || disabled.size === 0
-            ? source
-            : source.filter((model) => !disabled.has(model.id));
-        return listed.map((model) => ({
-            provider: this.product.id,
-            id: model.id,
-            // 倍率拼进 `name`（**不是** `description`）：composer 的模型切换菜单
-            // 只渲染 name，description 仅用于 /model 弹窗。见 qoderDisplayName。
-            name: qoderDisplayName(model),
-            inputModalities: this.inputModalitiesFor(model.id),
-        }));
+        return this.catalog.listAllModels();
     }
     /**
-     * 解析模型元信息。
+     * 把本家兜底表条目转成共享骨架的中间结构。
+     *
+     * ⚠️ 本家**恒用本地兜底表**（不发网络请求，见 `listModels` 的说明），
+     * 故 `loadCatalog` 与 `syncCatalog` 取同一份数据。
+     */
+    toCatalogEntry(model) {
+        const reasoning = this.reasoningForEntry(model);
+        return {
+            id: model.id,
+            name: qoderDisplayName(model),
+            // ⚠️ `resolveModel` 用**裸名**（与 trae/loomy/raccoon 一致）：
+            // 价格只属于选择列表语境。本家原本用 `entry.name`（兜底表的裸名）。
+            bareName: model.name,
+            // ⚠️ 模态判据按 **id** 查**静态表**（`inputModalitiesFor(model: string)` 的形态）
+            // —— 这是本家私有的判据，骨架不认识。
+            // ⚠️ 三态：本家恒返回数组（未声明时**保守报 `['text']`**，见原注释：
+            // 「宁可少报能力，也不要报一个服务端不认的模态」）⇒ 不会是 undefined。
+            inputModalities: model.supportsImage === true ? ['text', 'image'] : ['text'],
+            ...model.contextWindow > 0 ? { contextWindow: model.contextWindow } : {},
+            ...reasoning !== undefined ? { reasoning } : {},
+        };
+    }
+    /**
+     * 该条目的思考档位。
      *
      * ⚠️ **`reasoning` 是「思考强度」选择器出现在模型菜单里的唯一入口**
      * （composer 读 `resolveModel().reasoning`）。此前本适配器**只声明了
@@ -431,38 +451,40 @@ export class QoderAdapter extends LlmAdapter {
      * 尽管目录早已下发 `thinking_config`（用户报障「qoder中国版可以设置思考档位，
      * 我们应该按照他的设置给出可设置的档位选择」）。
      */
-    async resolveModel(provider, model, _signal) {
-        const entry = this.fallbackIndex.get(model);
-        const resolved = {
-            provider,
-            id: model,
-            name: entry?.name ?? model,
-            inputModalities: this.inputModalitiesFor(model),
-        };
-        // 上下文窗口：兜底表是**本地估计值**。未知模型不编造 context
-        // （宁可让 DSH 用默认值，也不要报一个假的窗口大小）。
-        if (entry !== undefined)
-            resolved.context = { contextWindow: entry.contextWindow };
+    reasoningForEntry(entry) {
         // 思考档位：见 `qoderEffortsFor` 的三条口径（含「关闭思考」的追加规则）。
-        if (entry !== undefined) {
-            const efforts = qoderEffortsFor(entry);
-            if (efforts.length > 0) {
-                const fallback = entry.defaultEffort;
-                resolved.reasoning = {
-                    efforts: efforts.map((id) => ({
-                        id: ReasoningEffortId(id),
-                        name: QODER_EFFORT_NAMES[id] ?? id,
-                    })),
-                    // ⚠️ `defaultEffort` 必须落在 `efforts` 内 —— DSH 会直接拿它发请求，
-                    // 给一个不存在的档位会抛 `UNSUPPORTED_REASONING_EFFORT`
-                    // （同 `trae-adapter.ts` 的教训）。
-                    ...fallback !== undefined && efforts.includes(fallback)
-                        ? { defaultEffort: ReasoningEffortId(fallback) }
-                        : {},
-                };
-            }
-        }
-        return resolved;
+        const efforts = qoderEffortsFor(entry);
+        if (efforts.length === 0)
+            return undefined;
+        const fallback = entry.defaultEffort;
+        return {
+            efforts: efforts.map((id) => ({
+                id: ReasoningEffortId(id),
+                name: QODER_EFFORT_NAMES[id] ?? id,
+            })),
+            // ⚠️ `defaultEffort` 必须落在 `efforts` 内 —— DSH 会直接拿它发请求，
+            // 给一个不存在的档位会抛 `UNSUPPORTED_REASONING_EFFORT`
+            // （同 `trae-adapter.ts` 的教训）。
+            ...fallback !== undefined && efforts.includes(fallback)
+                ? { defaultEffort: ReasoningEffortId(fallback) }
+                : {},
+        };
+    }
+    catalogEntries() {
+        return this.product.fallbackModels.map((model) => this.toCatalogEntry(model));
+    }
+    async listModels(_provider) {
+        return this.catalog.listModels(_provider);
+    }
+    /**
+     * 解析模型元信息。
+     *
+     * ⚠️ **`reasoning` 是「思考强度」选择器出现在模型菜单里的唯一入口**
+     * （composer 读 `resolveModel().reasoning`）—— 该判据现在由
+     * `toCatalogEntry` 提供（见 `reasoningForEntry`）。
+     */
+    async resolveModel(provider, model, signal) {
+        return this.catalog.resolveModel(provider, model, signal);
     }
     /**
      * 兼容 0.1.1-rc.2：新版 `LlmRuntime.prepareCall()` 会调用
@@ -558,44 +580,110 @@ export class QoderAdapter extends LlmAdapter {
         // （用户报障「qwen3.8-flash 执行任务出现任务调用 xml 泄露任务终止」）。
         const tools = buildQoderTools(options.tools);
         const fallback = this.fallbackIndex.get(options.model);
+        /**
+         * 会话自动命名（`purpose: 'session-title'`）的思考与预算决策（issue IKKVDH）。
+         *
+         * DSH 用 **64 token** 发标题请求且**不传 `reasoningEffort`**，而宿主会把
+         * `qoderEffortsFor` 声明的默认档注入进来。本家的关闭档是 `none`
+         * （由 `supportsDisable` 追加，见 `qoderEffortsFor`）⇒ 声明了它的模型
+         * 关得掉；未声明的模型只能抬预算兜底。
+         *
+         * ⚠️ 在 `buildRequest` **之外**算一次：它在 401 重试时会被再次调用，
+         * 每次重算虽无害但没必要（与 raccoon 的 `thinking` 同款理由）。
+         */
+        const titlePlan = planSessionTitleThinking({
+            purpose: options.purpose,
+            requestedEffort: options.reasoningEffort === undefined ? undefined : String(options.reasoningEffort),
+            declaredEfforts: fallback === undefined ? [] : qoderEffortsFor(fallback),
+            maxTokens: options.maxTokens,
+        });
         /** 用给定凭据构造一次加密请求（首次与 401 重试共用，避免两处漂移）。 */
         const buildRequest = async (c) => {
-            const client = await QoderEncryptedInfer.create({
-                user: {
-                    uid: c.uid,
-                    securityOauthToken: c.security_oauth_token ?? c.access_token,
-                },
-                machineId: c.machine_id,
-                metadata: { ...this.product.clientMetadata },
-                host: this.product.encryptedInferBase,
-            });
-            return client.prepareInfer({
-                modelKey: options.model,
-                userText,
-                ...(systemText !== undefined ? { systemText } : {}),
-                isReasoning: fallback?.supportsThinking ?? false,
-                history,
-                // 工具定义：这是模型**唯一**能学到函数 schema 的通道，
-                // 缺了它模型只能用正文 XML 臆造调用（真实缺陷）。
-                tools,
-                ...(options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}),
-                ...(options.reasoningEffort !== undefined ? { reasoningEffort: options.reasoningEffort } : {}),
-                ...(fallback?.supportsImage !== undefined ? { isVl: fallback.supportsImage } : {}),
-                // 官方 `model_config` 的 display_name / max_input_tokens 必须带上。
-                ...(fallback?.name !== undefined ? { displayName: fallback.name } : {}),
-                ...(fallback?.contextWindow !== undefined ? { maxInputTokens: fallback.contextWindow } : {}),
-                // ⚠️ **`business` 必填**，否则服务端把请求路由到错误的后端节点。
+            // 🔴 `client` 持有 wasm `QoderContext`，**本次构造用完必须释放**：
+            // 该类每次请求都新建实例，不释放则进程级共享的 wasm 堆只增不减，
+            // 长上下文会话最终以裸 `RuntimeError: unreachable` 暴毙
+            // （8/8 历史命中都在 Qoder 路由上；见 `src/qoder-wasm.ts` 文件头）。
+            // 用 `try/finally` 而非顺序调用：`create` / `prepareInfer` 抛错时同样要
+            // 释放，否则**异常路径**反倒成了泄漏最多的那条路。
+            let client;
+            try {
+                client = await QoderEncryptedInfer.create({
+                    user: {
+                        uid: c.uid,
+                        securityOauthToken: c.security_oauth_token ?? c.access_token,
+                    },
+                    machineId: c.machine_id,
+                    metadata: { ...this.product.clientMetadata },
+                    host: this.product.encryptedInferBase,
+                });
+                return client.prepareInfer({
+                    modelKey: options.model,
+                    userText,
+                    ...(systemText !== undefined ? { systemText } : {}),
+                    isReasoning: fallback?.supportsThinking ?? false,
+                    history,
+                    // 工具定义：这是模型**唯一**能学到函数 schema 的通道，
+                    // 缺了它模型只能用正文 XML 臆造调用（真实缺陷）。
+                    tools,
+                    /**
+                     * 会话自动命名（`purpose: 'session-title'`）的思考与预算决策（issue IKKVDH）。
+                     *
+                     * DSH 用 **64 token** 发标题请求且**不传 `reasoningEffort`**，而宿主会把
+                     * `qoderEffortsFor` 声明的默认档注入进来。本家的关闭档是 `none`
+                     * （由 `supportsDisable` 追加）⇒ 声明了它的模型关得掉；
+                     * 未声明的模型只能抬预算兜底。
+                     */
+                    ...(titlePlan.maxTokens !== undefined ? { maxTokens: titlePlan.maxTokens } : {}),
+                    ...(titlePlan.effort !== undefined ? { reasoningEffort: titlePlan.effort } : {}),
+                    ...(fallback?.supportsImage !== undefined ? { isVl: fallback.supportsImage } : {}),
+                    // 官方 `model_config` 的 display_name / max_input_tokens 必须带上。
+                    ...(fallback?.name !== undefined ? { displayName: fallback.name } : {}),
+                    ...(fallback?.contextWindow !== undefined ? { maxInputTokens: fallback.contextWindow } : {}),
+                    // ⚠️ **`business` 必填**，否则服务端把请求路由到错误的后端节点。
+                    //
+                    // 实测（2026-09-20）：不带 `business` 时 `qfmodel`（Qwen3.8-Flash）
+                    // 恒落到故障节点 `oa_qwen-plus-2025-04-28` 并返回
+                    // `[FAIL]node:... msg:Execution failed`；补上 `business` 后立即正常
+                    // （其余模型如 `qmodel_38max` 恰好不受影响，故早期排查易误判为
+                    // 「该模型服务端故障」）。`agent` / `sec_scan` 等取值都能通。
+                    //
+                    // 源码依据：`MPi(A) { return A === 'sec_scan' ? 'security' : 'default' }`
+                    // —— 服务端按 `business.type` 选路由池，缺字段会走异常分支。
+                    business: { type: 'agent' },
+                });
+            }
+            catch (error) {
+                // wasm trap（裸 `unreachable`）在 `qoder-wasm.ts` 的 glue 层已被改写；
+                // 这里再兜一次，覆盖 glue 之外的路径（如 `finally` 里的栈指针回退），
+                // 保证**任何**情况下都不会有裸 `unreachable` 冒到 UI。
+                // 非 trap 错误原样返回，行为逐字节不变。
+                throw describeWasmFailure(error);
+            }
+            finally {
+                // ⚠️⚠️ **释放失败绝不能顶替 `try` 块里的原始错误**（真实缺陷，2026-10-12 审计实测）。
                 //
-                // 实测（2026-09-20）：不带 `business` 时 `qfmodel`（Qwen3.8-Flash）
-                // 恒落到故障节点 `oa_qwen-plus-2025-04-28` 并返回
-                // `[FAIL]node:... msg:Execution failed`；补上 `business` 后立即正常
-                // （其余模型如 `qmodel_38max` 恰好不受影响，故早期排查易误判为
-                // 「该模型服务端故障」）。`agent` / `sec_scan` 等取值都能通。
+                // JS 语义：`finally` 里的 `throw` **无条件覆盖** `try` 里的 `throw`。
+                // 而 `dispose()` → `freePointer()` 的 catch 里**确实会 rethrow**
+                //（见 `qoder-wasm.ts` 的 `freePointer`）—— 它自己的注释就写了
+                //「堆耗尽时它同样会 trap」，即**恰在本修复要治理的那个场景下**会抛。
                 //
-                // 源码依据：`MPi(A) { return A === 'sec_scan' ? 'security' : 'default' }`
-                // —— 服务端按 `business.type` 选路由池，缺字段会走异常分支。
-                business: { type: 'agent' },
-            });
+                // 后果（实测）：上游的 401 / AUTH 等错误被改写成「WASM 堆耗尽」，
+                // 而且 `describeWasmFailure` 返回的是**裸 `Error`**（非 `HarnessError`）
+                // ⇒ 外层 `normalizeLlmFailure` 把它归成 `UNKNOWN` ⇒ **同时丢掉
+                // `SERVER` / `AUTH` 这些可重试性判据**（本仓「错误保真」红线的形态）。
+                //
+                // ⇒ 取舍与 `expiry-sync.ts` 的「回写失败只记日志、不上抛」同款：
+                //   释放是**清理动作**，它失败不该改变本次请求的结论。
+                //
+                // ⚠️ 本类**没有 logger 通道**（`QoderAdapterOptions` 里没有 `ctx`），
+                //    故此处**刻意静默**吞掉 —— 不为一条清理失败的日志去新开一条通道。
+                try {
+                    client?.dispose();
+                }
+                catch {
+                    // 见上：清理失败不上抛、不改写本次请求的结论。
+                }
+            }
         };
         // 3. 发送（⚠️ 头必须原样透传：Authorization 是 WASM 生成的
         //    `Bearer COSY.<载荷>.<签名>`，用普通 Bearer 覆盖会 403 Signature invalid）

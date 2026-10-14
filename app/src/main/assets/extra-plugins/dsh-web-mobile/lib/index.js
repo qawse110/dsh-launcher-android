@@ -102,6 +102,8 @@ function installReasoningEffortDefaults(ctx) {
         // Log the unreachable count only when it changes, so a stable profile does
         // not repeat the same line on every settings change.
         let lastUnresolved = -1;
+        // Same change-gating for the `auto` 档 count (see the log site below).
+        let lastAuto = -1;
         const run = () => {
             if (disposed || running)
                 return;
@@ -131,6 +133,17 @@ function installReasoningEffortDefaults(ctx) {
                 if (outcome.unresolved > 0 && outcome.unresolved !== lastUnresolved) {
                     settingsCtx.logger.warn(`dsh-web-mobile: ${outcome.unresolved} model(s) below the profile layer declare no reasoning levels and stay untouched`);
                 }
+                // The `auto` 档: a hand-declared model that says it takes no custom
+                // level (`compat.supportsReasoningEffort: false`, or `reasoningEfforts:
+                // false`) is deliberately left without one, so the composer keeps
+                // showing the provider default for it. Said once per state change, the
+                // way the unreachable count above is reported — otherwise a user who
+                // wonders why this one model has no 「推理等级」 control has nothing to
+                // read.
+                if (outcome.auto > 0 && outcome.auto !== lastAuto) {
+                    settingsCtx.logger.warn(`dsh-web-mobile: ${outcome.auto} model(s) declare no reasoning-effort support and stay at their own default (auto)`);
+                }
+                lastAuto = outcome.auto;
                 lastUnresolved = outcome.unresolved;
             })
                 .catch((error) => {
@@ -255,12 +268,24 @@ export function apply(ctx) {
                     });
                     return;
                 }
-                const result = await deleteSession({
-                    persistence: persistence,
-                    sessions: ctx.get('sessions'),
-                    agents: ctx.get('agents'),
-                    workspaceRegistry: ctx.get('workspaceRegistry'),
-                }, sessionId);
+                // The pure core reports structured failures, but a defect or an
+                // unexpected host rejection must still answer the client: this handler
+                // owns the response, so it may never reject with the socket open (the
+                // host's dispatcher would then answer a bare 400 with no body).
+                let result;
+                try {
+                    result = await deleteSession({
+                        persistence: persistence,
+                        sessions: ctx.get('sessions'),
+                        agents: ctx.get('agents'),
+                        workspaceRegistry: ctx.get('workspaceRegistry'),
+                    }, sessionId);
+                }
+                catch (error) {
+                    ctx.logger.warn(`dsh-web-mobile: session-delete threw for '${sessionId}': ${String(error)}`);
+                    respond(res, 500, { error: { code: 'delete-failed', message: 'session delete failed unexpectedly' } });
+                    return;
+                }
                 if (result.ok) {
                     respond(res, 200, { ok: true, deleted: result.deleted });
                     return;

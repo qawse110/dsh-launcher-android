@@ -32,7 +32,7 @@ import { LOOMY_AUTH_ERROR_CODE, LOOMY_REQUEST_TIMEOUT_MS, parseLoomyEnvelope, } 
  * 任务 key → 积分。
  *
  * 来源：Loomy 客户端 `electron/onboarding-service.js:18-27` 的 `TASK_POINTS`
- * （其单测 `:33-37` 断言各项之和 === 10000）。
+ * （其单测断言各项之和 === 10000）。
  * 顺序即执行顺序。
  */
 export const LOOMY_TASK_POINTS = Object.freeze({

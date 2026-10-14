@@ -26,7 +26,7 @@
  * 两步预检查都要做 —— 只看 `claimedToday` 会漏掉「活动有但今天不该领」的情形。
  */
 import { randomUUID } from 'node:crypto';
-import { LOBSTERAI_REQUEST_TIMEOUT_MS, parseLobsteraiEnvelope } from './lobsterai.js';
+import { LOBSTERAI_MAX_NUMERIC_FIELD, LOBSTERAI_REQUEST_TIMEOUT_MS, parseLobsteraiEnvelope } from './lobsterai.js';
 import { lobsteraiAuthHeaders } from './lobsterai.js';
 /** 活动槽位查询端点。 */
 export const LOBSTERAI_ACTIVITY_SLOT_PATH = '/api/client-activities/slot';
@@ -101,14 +101,51 @@ function describeNonJsonResponse(status, text) {
 function readBool(source, key) {
     return source[key] === true;
 }
-/** 从 JSON 安全读取数字（兼容字符串形态）。 */
-function readNumber(source, key) {
+/**
+ * 从 JSON 读取可解析为数字的值（兼容字符串形态）；**不可解析时返回
+ * `undefined`**，与「解析出来就是 0」严格区分。
+ *
+ * ⚠️ 本函数是**本文件内**「一个字段是不是数字」的判据源：`readNumber`（不可解析
+ * 时兜底 0）与余额判据的 `parsedTotal`（不可解析即视为「没下发」）都必须经它，
+ * 否则同一件事会出现两套同义判据（AGENTS.md 首条红线）——「服务端明确下发的 0」
+ * 与「字段缺失」正是被这种分叉压成同一个分支的。
+ *
+ * ⚠️⚠️ **它不是全仓唯一判据源**（2026-10-12 审计实测订正）：`src/lobsterai.ts`
+ * 的 `readNumberField` 是**同一 provider 的另一条路径**（供 `lobsterai-adapter.ts`
+ * 解析远端目录），两者是**同语义判据**。该处曾缺 `Number.isFinite` 造成分叉，
+ * 已同步补齐 —— **将来改这里必须同时改那里**。
+ *
+ * ## ⚠️⚠️ 上界（不是「有限」就够）
+ *
+ * `Number.isFinite` 只排除 `Infinity`/`NaN`，**不排除大到下游会溢出的值**：
+ * 下游 `roundCredits(v) = Math.round(v * 100) / 100` 里 `v * 100` 在
+ * `|v| > Number.MAX_VALUE / 100 ≈ 1.797e306` 时**自己就会溢出成 `Infinity`**。
+ * 实测：308 位数字串（≈9.99e307）与 JSON 合法字面量 `1e308` 都能通过
+ * `Number.isFinite`，却在 `roundCredits` 里变成 `Infinity`。
+ * ⇒ 故这里再加一道**上界**：超过 `LOBSTERAI_MAX_NUMERIC_FIELD` 即视为不可解析
+ *（积分是金额，这个上界比任何真实余额都大 9 个数量级以上，不会误伤）。
+ * ⚠️ 上界常量与 `src/lobsterai.ts` 的 `readNumberField` **共用同一个**
+ *（同语义判据不得分叉）。
+ */
+function parseNumericField(source, key) {
     const value = source[key];
-    if (typeof value === 'number' && Number.isFinite(value))
-        return value;
-    if (typeof value === 'string' && /^-?\d+(\.\d+)?$/.test(value.trim()))
-        return Number(value);
-    return 0;
+    if (typeof value === 'number') {
+        return Number.isFinite(value) && Math.abs(value) <= LOBSTERAI_MAX_NUMERIC_FIELD ? value : undefined;
+    }
+    if (typeof value === 'string' && /^-?\d+(\.\d+)?$/.test(value.trim())) {
+        // ⚠️⚠️ **字符串分支同样必须过这两道守卫**：正则只保证「长得像定点数字」，
+        // **不保证落在 double 范围内** —— 401 位纯数字串能通过正则，而
+        // `Number(...)` 得到 `Infinity`；308 位串则「有限但下游会溢出」。
+        // 数字分支与字符串分支必须**同口径**。
+        const parsed = Number(value);
+        if (Number.isFinite(parsed) && Math.abs(parsed) <= LOBSTERAI_MAX_NUMERIC_FIELD)
+            return parsed;
+    }
+    return undefined;
+}
+/** 从 JSON 安全读取数字（兼容字符串形态）；不可解析时取 0。 */
+function readNumber(source, key) {
+    return parseNumericField(source, key) ?? 0;
 }
 /** 从 JSON 安全读取非空数组。 */
 function readActions(source, key) {
@@ -326,10 +363,43 @@ export async function fetchLobsteraiCreditBalance(credential, product, fetcher =
     // 负数一律 clamp 到 0（对齐 Go `client.go:303-308` 的 clamp）：服务端在
     // 超额扣费/计量回滚等异常下可能下发负值，原样透出会让卡片显示「-12.5 积分」，
     // 既无意义又会误导用户以为欠费。
-    const total = roundCredits(Math.max(0, readNumber(envelope.data, 'totalCreditsRemaining')));
-    // totalCreditsRemaining 为 0 且拿不到明细 → 视为「查不到」而非「余额为 0」：
-    // 该字段缺失时 readNumber 返回 0，会把解析失败伪装成 0 积分。
-    if (total === 0 && packages.length === 0)
+    //
+    // ⚠️⚠️ **`total` 不能简单地用 `readNumber(...)` 兜底成 0**（真实缺陷，
+    // 2026-10-12 审计实测）：`readNumber` 对「不可解析」与「真的是 0」都回 0，
+    // 于是 `{totalCreditsRemaining: null}` / `"abc"` / 溢出成 `Infinity` 的超长串
+    // 会被**伪装成余额 0** —— 与 `hasTotal` 想守的是同一件事，只是发生在
+    // **有明细**的那条分支上（`hasTotal` 的 null 短路被 `packages.length > 0`
+    // 绕过了）。
+    //
+    // ⇒ 口径：
+    //   · 可解析 → 用它（照旧 clamp 负数）；
+    //   · 不可解析但**有明细** → 用明细里**有效包**的剩余量合计兜底
+    //     （那是服务端自己给的数据，自洽；比伪造一个 0 诚实）；
+    //   · 不可解析且**无明细** → 视为「查不到」（下面的 `return null`）。
+    const parsedTotal = parseNumericField(envelope.data, 'totalCreditsRemaining');
+    const packagesTotal = roundCredits(packages.reduce((sum, pkg) => sum + (pkg.active ? Math.max(0, pkg.remaining) : 0), 0));
+    const total = parsedTotal !== undefined
+        ? roundCredits(Math.max(0, parsedTotal))
+        : packagesTotal;
+    // 「字段在不在」是两回事（2026-10-10 彻查修正）：
+    //   · `totalCreditsRemaining` **存在**（服务端形状没变）但为 0 且无明细
+    //     ＝ 余额真的为空（每日登录奖励的包用完了）→ 如实返回 0，面板显示
+    //     「0 积分」，**不再伪装成「查询失败」**——原实现把这种情形也压成 null，
+    //     `collectCreditBalances` 的 null 兜底文案「余额查询失败」让用户误读成
+    //     账号失效（实测 5/6 账号被这句误导，而调用层当天 0 错误）。
+    //   · **字段缺失**＝响应形状变了 → 才视为「查不到」（原注释想防的
+    //     「解析失败伪装成 0 积分」由本条守住，`data:{}` 单测继续走 null）。
+    //
+    // ⚠️⚠️ **判据必须是「能不能解析成数字」，不能是「键存不存在」**
+    //（2026-10-12 订正）：`=== undefined` 只挡住「键缺失」，实测它会把
+    // `{totalCreditsRemaining: null}` / `{...: "abc"}` / 溢出成 `Infinity` 的
+    // 超长数字串**都**判成「服务端明确下发 0」⇒ 把**解析失败伪装成余额 0**
+    // —— 正是上面那条注释想防的事，只是换了个入口。
+    // ⚠️ 判据是 `parseNumericField`（「一个字段是不是数字」的判据源）。
+    //     ⚠️ 它**不是**全仓唯一：`src/lobsterai.ts` 的 `readNumberField` 是同一
+    //     provider 的另一条路径（供 `lobsterai-adapter.ts` 解析远端目录），
+    //     两处**必须同口径** —— 2026-10-12 的缺陷正是「只修了一份」造成的分叉。
+    if (parsedTotal === undefined && packages.length === 0)
         return null;
     // 失效包的余额同样 clamp：负值计入 expiredTotal 会让「另有 N 已失效」变成负数。
     const expiredTotal = roundCredits(packages.reduce((sum, pkg) => sum + (pkg.active ? 0 : Math.max(0, pkg.remaining)), 0));

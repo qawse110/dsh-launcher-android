@@ -13,7 +13,7 @@
       "id": "dsh-web-mobile",
       "title": "移动端适配",
       "desc": "竖屏/窄屏 Web 适配（抽屉导航、全宽会话、安全区、触控人体工学）",
-      "version": "3.0.5",
+      "version": "3.1.0",
       "upstream": "https://github.com/mexiaosqwq/dsh-web-mobile"
     },
     {
@@ -30,8 +30,8 @@
       "name": "dsh-codearts-auth",
       "id": "codearts-auth",
       "title": "CodeArts 多 Provider",
-      "desc": "CodeArts/Buddy/Qoder/Trae/Cline/loomy/raccoon/zcode/opencode/gemini 等 Provider 登录、积分与模型接入。源码取自上游 tag 0.2.0-rc.5 本地构建（该仓库 tag 名与 package.json 的 version 不同步，后者写 0.2.0-rc.3）",
-      "version": "0.2.0-rc.3",
+      "desc": "CodeArts/Buddy/Qoder/Trae/Cline/loomy/raccoon/zcode/opencode/gemini 等 Provider 登录、积分与模型接入。源码取自上游 tag 0.2.0-rc.10 本地构建（该仓库本版 tag 与包内 version 已同步，均为 0.2.0-rc.10）；已重放移动端窄屏 UI 适配层（上游仍未内置）",
+      "version": "0.2.0-rc.10",
       "upstream": "https://gitee.com/iJetLi/deepseek-harness-codearts"
     },
     {

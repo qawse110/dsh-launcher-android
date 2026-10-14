@@ -22,7 +22,7 @@
  */
 import { LlmAdapter, LlmError, ReasoningEffortId, } from '@deepseek-ai/dsh-llm';
 import { ToolCallId } from '@deepseek-ai/dsh-llm';
-import { providerCatalogVisible } from './account-pool.js';
+import { createModelCatalog } from './model-catalog.js';
 import { RemoteCatalogGate } from './remote-catalog-gate.js';
 import { broadcastCatalogChanged } from './catalog-broadcast.js';
 import { parseRateLimitError } from './llm-adapter.js';
@@ -31,9 +31,10 @@ import { LOBSTERAI } from './lobsterai-product.js';
 import { projectRequestImage } from './image-budget.js';
 import { classifyLobsteraiError, classifyLobsteraiStreamError, recordsLobsteraiRateLimit, shouldRotateLobsteraiAccount, } from './lobsterai-errors.js';
 import { normalizeHarnessMessages } from './message-shape.js';
-import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js';
+import { createBlankReasoningSuppressor, createDsmlMarkerNormalizer, createReasoningLoopDetector, fixDsmlMarkers, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js';
 import { registerAdapterIdempotent, } from './llm-register-compat.js';
 import { reportLedgerAccount } from './token-ledger.js';
+import { planSessionTitleThinking } from './session-title.js';
 /** 本适配器注册的 provider 路由名（历史常量，等价于 `LOBSTERAI.id`）。 */
 export const PROVIDER = 'lobsterai';
 /**
@@ -562,6 +563,12 @@ export class LobsteraiAdapter extends LlmAdapter {
      * 依据见 `src/remote-catalog-gate.ts`（首屏「加载模型巨长」的实测归因）。
      */
     catalogGate;
+    /**
+     * ⚠️ **2026-10-08 Task 7c：三个方法收敛到共享骨架** `createModelCatalog`。
+     * 原先 `listModels` / `resolveModel` / `listAllModels` 各写一遍骨架，
+     * 现在只剩 `toCatalogEntry`（本家私有形状 + wire/展示名分离的档位）。
+     */
+    catalog;
     /** 远端下发的模型元数据（id → 条目），listModels/resolveModel 共用。 */
     remoteMeta = new Map();
     /** 产品级兜底模型索引（`product.fallbackModels` 的 id → 条目）。 */
@@ -574,6 +581,15 @@ export class LobsteraiAdapter extends LlmAdapter {
         // 目录落地后通知客户端重读（issue IKJVTF 的缺陷①）。
         this.catalogGate = new RemoteCatalogGate(options.onCatalogLoaded === undefined ? {} : { onLoaded: options.onCatalogLoaded });
         this.fallbackIndex = new Map((this.product.fallbackModels ?? []).map((model) => [model.id, model]));
+        // ⚠️ 共享骨架（Task 7c）：门控 → 读目录 → 黑名单 → 回填 → 三态。
+        this.catalog = createModelCatalog({ accountPool: options.accountPool }, {
+            product: this.product,
+            loadCatalog: () => this.loadCatalogEntries(),
+            syncCatalog: () => this.syncCatalogEntries(),
+            // ⚠️ 未知 id 保守报 `['text']`（见 `inputModalitiesFor`：
+            // 「宁可少报能力，也不要报一个服务端不认的模态」）。
+            unknownModelInputModalities: () => ['text'],
+        });
     }
     /**
      * 描述本适配器拥有的 provider 路由。
@@ -689,57 +705,70 @@ export class LobsteraiAdapter extends LlmAdapter {
      * 设置页必须渲染被关闭的模型（否则用户无法重新打开），而 `listModels` 会按
      * 黑名单过滤掉它们 —— RPC 层只能凭裸 id 补回，展示名与倍率随之丢失
      * （用户报障：「关闭的就没有显示倍率」）。详见 `model.list` 端点的注释。
+     *
+     * ⚠️ **2026-10-08 Task 7c**：骨架（含上面这条理由）已上移到共享实现
+     * `src/model-catalog.ts`，此处只剩委托。
      */
     listAllModels() {
-        const source = this.remoteModels ?? this.staticFallbackModels();
-        return source.map((model) => ({ id: model.id, name: displayNameFor(model) }));
+        return this.catalog.listAllModels();
     }
-    async listModels(_provider) {
-        // ⚠️ 门控放在 `ensureRemoteModels()` **之前**：没有已登录账号时连远端目录都
-        // 不必拉。返回空数组 → DSH 的 `buildModelCatalog` 把整个 provider 分组隐藏。
-        // ⚠️ 必须返回 `[]` 而**不能抛错**（抛错会被归入 catalog 的 `failures`）。
-        if (!await providerCatalogVisible(this.options.accountPool, this.product.id))
-            return [];
-        await this.ensureRemoteModels();
-        const source = this.remoteModels ?? this.staticFallbackModels();
-        // 用户在 Jet Hub 关闭的模型（黑名单制：不在表里即默认打开）。
-        const disabled = this.options.accountPool?.disabledModelsFor(this.product.id);
-        const listed = disabled === undefined || disabled.size === 0
-            ? source
-            : source.filter((model) => !disabled.has(model.id));
-        return listed.map((model) => ({
-            provider: this.product.id,
+    /**
+     * 把本家条目转成共享骨架的中间结构。
+     *
+     * ⚠️ 本家三处**真实差异**：
+     * 1. `contextWindow` 远端权威值优先、兜底表估值次之（见 `contextWindowFor`）；
+     * 2. `maxTokens` **仅当远端声明时**才带（不编造默认值）；
+     * 3. `reasoning` 的 `id` 用 **wire 值 `openclawLevel`**、`name` 用**产品侧
+     *    `level`** —— 两者来源不同，是本家最容易搞错的地方（见 `reasoningFor`）。
+     */
+    toCatalogEntry(model) {
+        const contextWindow = this.contextWindowFor(model.id);
+        const maxTokens = this.remoteMeta.get(model.id)?.maxTokens;
+        const reasoning = this.reasoningFor(model.id);
+        return {
             id: model.id,
             // 倍率写进 name（**不是** description）：composer 的模型切换菜单只渲染
             // `name`，description 仅用于 /model 弹窗。见 displayNameFor 的说明。
             name: displayNameFor(model),
-            ...model.description !== undefined ? { description: model.description } : {},
-            // 远端 supportsImage 权威；未声明时保守报 text（见 inputModalitiesFor）。
+            // ⚠️ `resolveModel` 用**元数据里的 name**（不带倍率）⇒ 显式提供 `bareName`。
+            bareName: this.remoteMeta.get(model.id)?.name
+                ?? this.fallbackIndex.get(model.id)?.name
+                ?? model.name,
+            // ⚠️ 远端 `supportsImage` 权威；未声明时**保守报 `['text']`**（不是省略）
+            // —— 见 `inputModalitiesFor`：宁可少报能力，也不要报一个服务端不认的模态。
             inputModalities: this.inputModalitiesFor(model.id),
-        }));
-    }
-    async resolveModel(provider, model, _signal) {
-        await this.ensureRemoteModels();
-        const remoteName = this.remoteMeta.get(model)?.name;
-        const resolved = {
-            provider,
-            id: model,
-            name: remoteName ?? this.fallbackIndex.get(model)?.name ?? model,
-            inputModalities: this.inputModalitiesFor(model),
+            ...model.description !== undefined ? { description: model.description } : {},
+            ...contextWindow !== undefined ? { contextWindow } : {},
+            ...maxTokens !== undefined ? { maxTokens } : {},
+            ...reasoning !== undefined ? { reasoning } : {},
         };
-        // 上下文窗口：远端权威值优先，兜底表估值次之（见 contextWindowFor）。
-        const contextWindow = this.contextWindowFor(model);
-        if (contextWindow !== undefined)
-            resolved.context = { contextWindow };
-        // 单次输出上限：仅当远端声明时才带（不编造默认值）。
-        const maxTokens = this.remoteMeta.get(model)?.maxTokens;
-        if (maxTokens !== undefined)
-            resolved.defaultMaxTokens = maxTokens;
-        // 思考档位：远端 thinkingConfig 权威（见 reasoningFor 的 wire 值说明）。
-        const reasoning = this.reasoningFor(model);
-        if (reasoning !== undefined)
-            resolved.reasoning = reasoning;
-        return resolved;
+    }
+    async loadCatalogEntries() {
+        await this.ensureRemoteModels();
+        const source = this.remoteModels ?? this.staticFallbackModels();
+        return source.map((model) => this.toCatalogEntry(model));
+    }
+    /**
+     * 同步视图（`listAllModels` 用）。
+     *
+     * ⚠️ **不能** `await ensureRemoteModels()`（同步契约）—— 读 `remoteModels`
+     * 缓存，未落地时回退静态兜底表（这正是原实现的语义）。
+     */
+    syncCatalogEntries() {
+        const source = this.remoteModels ?? this.staticFallbackModels();
+        return source.map((model) => this.toCatalogEntry(model));
+    }
+    async listModels(_provider) {
+        return this.catalog.listModels(_provider);
+    }
+    /**
+     * 解析模型元信息。
+     *
+     * ⚠️ 原实现里的三处判据（context / maxTokens / reasoning）现已收敛到
+     * `toCatalogEntry`；骨架的 `resolveModel` 只做回填与「不声明未知」。
+     */
+    async resolveModel(provider, model, signal) {
+        return this.catalog.resolveModel(provider, model, signal);
     }
     /**
      * 兼容 0.1.1-rc.2：新版 `LlmRuntime.prepareCall()` 会调用
@@ -859,15 +888,35 @@ export class LobsteraiAdapter extends LlmAdapter {
         // 目标状态（字段缺席）已经达成，无需再写一段无效的归一化代码。
         if (options.temperature !== undefined)
             bodyObj.temperature = options.temperature;
-        if (options.maxTokens !== undefined)
-            bodyObj.max_tokens = options.maxTokens;
+        /**
+         * 会话自动命名（`purpose: 'session-title'`）的思考与预算决策（issue IKKVDH）。
+         *
+         * DSH 用 **64 token** 发标题请求且**不传 `reasoningEffort`**，而宿主会把
+         * 本模型的默认档注入进来。本家档位来自远端 `thinkingConfig.options[]`
+         * （产品侧 `level` 含 `off`，wire 值见 `openclawLevel`）⇒ 声明了 `off`
+         * 的模型**关得掉**；没声明的（无 `thinkingConfig`）则只能抬预算兜底。
+         *
+         * ⚠️ 判据用 **wire 值**（`openclawLevel`），因为下发的是它 ——
+         * 与 `reasoningFor` 里 `id` 的取值同源。
+         */
+        const titlePlan = planSessionTitleThinking({
+            purpose: options.purpose,
+            requestedEffort: options.reasoningEffort === undefined ? undefined : String(options.reasoningEffort),
+            declaredEfforts: (this.remoteMeta.get(options.model)?.thinkingConfig?.options ?? [])
+                .map((option) => option.openclawLevel),
+            maxTokens: options.maxTokens,
+        });
+        if (titlePlan.maxTokens !== undefined)
+            bodyObj.max_tokens = titlePlan.maxTokens;
         if (options.stop !== undefined && options.stop.length > 0)
             bodyObj.stop = options.stop;
         // 思考等级：仅在调用方显式传入时透传，不主动补档
         // （buddy 那套「deepseek 系必须补档否则不思考」是针对腾讯后端的实测，
         // 未在 LobsterAI 上验证，照搬会造成非法参数 400）。
-        if (options.reasoningEffort !== undefined) {
-            bodyObj.reasoning_effort = options.reasoningEffort;
+        //
+        // ⚠️ 标题请求改走 `titlePlan.effort`（该模型声明了 `off` 时就是它）。
+        if (titlePlan.effort !== undefined) {
+            bodyObj.reasoning_effort = titlePlan.effort;
         }
         // **不发 prompt_cache_key**：那是腾讯后端的前缀缓存机制，此处未实测支持。
         const body = JSON.stringify(bodyObj);
@@ -1070,6 +1119,8 @@ export class LobsteraiAdapter extends LlmAdapter {
          * 故正文守卫**只截断文本**，绝不 `reader.cancel()`、绝不改 finish reason。
          */
         const proseLoopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined;
+        /** DSML 标记归一化器（见 sse.ts）；**每流一实例**，待定缓冲是跨帧状态。 */
+        const dsmlFix = createDsmlMarkerNormalizer();
         let proseLoopDetected = false;
         // ⚠️ 此处**曾有** `proseHasThinkTag` 门禁变量，2026-09-27 **删除**。
         // 逐帧探测在跨帧时必然漏判（实测二分帧 7/11 漏）→ 收尾不切分 → 标签泄漏。
@@ -1195,8 +1246,13 @@ export class LobsteraiAdapter extends LlmAdapter {
                         // 跨帧必然漏判（实测二分帧 7/11 漏）→ 收尾不切分 → 标签泄漏。
                         // 改为收尾无条件调用 `splitThinkTaggedContent`。
                         if (!proseLoopDetected) {
-                            block.text += textDelta;
-                            yield { type: 'text-delta', index: block.index, text: textDelta };
+                            // ⚠️ **先归一化再累积**（2026-10-13，见 sse.ts 注释）：坏标记
+                            //    `<｜｜DSML｜｜` 若不修，宿主解析不了 ⇒ 工具调用当正文。
+                            const fixedDelta = dsmlFix.push(textDelta);
+                            block.text += fixedDelta;
+                            if (fixedDelta.length > 0) {
+                                yield { type: 'text-delta', index: block.index, text: fixedDelta };
+                            }
                         }
                     }
                     // 同样必须用 `typeof === 'string'`：`reasoning_content` 也会显式返回
@@ -1352,6 +1408,17 @@ export class LobsteraiAdapter extends LlmAdapter {
                 },
             };
         }
+        // ── DSML 归一化收尾：下发待定缓冲 ──（与 openai-compat.ts / buddy 同款）
+        {
+            const tail = dsmlFix.flush();
+            if (tail.length > 0 && !proseLoopDetected) {
+                const tailBlock = blocks.find(candidate => candidate.kind === 'text');
+                if (tailBlock !== undefined) {
+                    tailBlock.text += tail;
+                    yield { type: 'text-delta', index: tailBlock.index, text: tail };
+                }
+            }
+        }
         if (textBlock !== undefined) {
             // ── think 标签归位（见 `splitThinkTaggedContent`）──
             // 标签**前**的内心独白 → reasoning 块；标签**后**的真正文 → 本 text 块。
@@ -1399,7 +1466,9 @@ export class LobsteraiAdapter extends LlmAdapter {
                 ? textOut.slice(0, proseLoopGuard.cutAt)
                 : textOut;
             // 行首 `course` / `课` 泄漏 token 清洗（见 `stripCourseLeak`）。
-            const cleaned = stripCourseLeakIfEnabled(truncated);
+            // ⚠️ DSML 归一化**整串兜底**（幂等，与 openai-compat.ts 同款）：增量路径
+            //    已逐帧修过，这里再过一遍防御跨缓冲边界漏网；block-end 是权威覆盖。
+            const cleaned = fixDsmlMarkers(stripCourseLeakIfEnabled(truncated));
             // ⚠️ 归位后正文可能为空串 —— 空块会污染会话，且 DSH 的
             // `EMPTY_RESPONSE` 契约禁止产出空内容块。思考段已归位，故仍有产出。
             if (cleaned !== '') {

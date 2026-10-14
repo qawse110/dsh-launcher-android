@@ -71,8 +71,8 @@ export function pickSoonestProvider(entries) {
  * | `DeepSeek V4 Flash 0731 · x3.0` | 3.0 ✅ | 3.0 |
  *
  * `Spark X2.5` 这条路径**真实可达**：loomy 的 `splitLoomyRate` 在远端下发**不带
- * 倍率**的名称时原样返回原名（`loomy.ts:136/147`），而 `loomyDisplayName` 不追加
- * 分隔符，该原名会被 `loomy-adapter.ts:163` 直接写进目录名 ⇒ 就会把它当 2.5 倍，
+ * 倍率**的名称时原样返回原名（`loomy.ts`），而 `loomyDisplayName` 不追加
+ * 分隔符，该原名会被 `loomy-adapter.ts` 直接写进目录名 ⇒ 就会把它当 2.5 倍，
  * 于是「挑最便宜」反而**挑到了最贵的**（同池里 `· x0.8` 的模型排到了它后面）。
  *
  * ✅ 修法：要求倍率前有分隔符（`·` / `×` / `·x`），并按真实形态支持促销箭头
@@ -85,8 +85,8 @@ export function pickSoonestProvider(entries) {
 export function priceFactorFromName(name) {
     if (name.includes('免费'))
         return 0;
-    // ⚠️ 倍率标注的**真实形态**只有两种（`formatCreditsRate`，buddy.ts:701；
-    // `loomyDisplayName`，loomy.ts:157）：`… · x{n}` 与 `… ×{n}` —— 分隔符是
+    // ⚠️ 倍率标注的**真实形态**只有两种（`formatCreditsRate`，buddy.ts；
+    // `loomyDisplayName`，loomy.ts）：`… · x{n}` 与 `… ×{n}` —— 分隔符是
     // **间隔号 U+00B7** 或乘号。促销期为 `· x0.17→x0.50`，取箭头右侧（实际计费倍率）。
     const m = /·\s*[×x]?\s*(\d+(?:\.\d+)?)(?:\s*[→>]\s*[×x]?\s*(\d+(?:\.\d+)?))?\s*$/i
         .exec(name.trim());

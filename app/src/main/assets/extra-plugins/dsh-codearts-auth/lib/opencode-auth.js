@@ -83,14 +83,22 @@ export function listIdentitySlots(entries, userAgent) {
             ? undefined
             : normalizeProxy(entry.proxy);
         const anonymous = isAnonymousCredential(entry.apiKey);
-        // ⚠️ 指纹 identity：匿名槽用条目 id（api_key 全是 `public`，不可用）。
-        const identity = anonymous ? entry.id : entry.apiKey;
         slots.push({
             id: entry.id,
             kind: anonymous ? 'anonymous' : 'account',
             apiKey: entry.apiKey,
             proxy: normalized !== undefined && normalized.ok ? normalized.proxy : undefined,
-            fingerprint: entry.fingerprint ?? { projectId: deriveProjectId(identity, 0), generation: 0 },
+            // ⚠️ 缺指纹时走 **`poolEntrySnapshot`（唯一实现）**，不要在这里写第二份
+            //    `identity = anonymous ? entry.id : entry.apiKey` + `deriveProjectId`：
+            //    那个规则的唯一权威在 `poolEntrySnapshot`，两处各写一份会分叉，
+            //    而分叉的表现只是「多个匿名通道指纹相同」—— **不报错**。
+            //    这里的 `enabled: true` 是**冗余**的（上一层已 `continue` 掉停用的），
+            //    显式写出以免读者以为这里也会被过滤。
+            fingerprint: entry.fingerprint ?? poolEntrySnapshot({
+                id: entry.id,
+                apiKey: entry.apiKey,
+                enabled: true,
+            }).fingerprint,
             userAgent,
         });
     }
@@ -99,6 +107,50 @@ export function listIdentitySlots(entries, userAgent) {
 /** 该凭据是否为匿名通道（字面量 `public`）。 */
 export function isAnonymousCredential(apiKey) {
     return apiKey === OPENCODE.anonymousKey;
+}
+/**
+ * 规范化指纹代次：非有限值 / 非正数一律回落 **0**（= 用凭据派生的初始指纹）。
+ *
+ * ⚠️ **这是唯一实现**，账号池的读取方法与槽组装都必须调它。
+ * 两处各写一份 `?? 0` 会在「负数 / NaN」上分叉：`-1` 能过 `?? 0`
+ * （它不是 nullish），于是轮换按钮把代次写成负数时，一处当 0、一处当 -1，
+ * 产出的 project id 不同 ⇒ 同一账号在两条路径上指纹不一致。
+ */
+export function normalizeOpencodeGeneration(value) {
+    return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
+}
+/**
+ * 组装槽需要的**账号池条目投影**（`listIdentitySlots` 的输入单元）。
+ *
+ * ## 为什么必须抽成函数
+ *
+ * 这段派生有**两个调用方**：`apply()` 里注册真实适配器的接线块，与探测路径
+ * （重测按钮）。两处若各写一份 identity 选择 + `deriveProjectId`，就会成为
+ * 「同一语义两处实现」——而本仓库已有实测教训：**分叉的一侧没有用例挡**。
+ * 尤其是 identity 选择（匿名槽用条目 id、账号槽用 api_key），
+ * 写错只是让多个匿名通道拿到同一个指纹，**不报错**。
+ *
+ * @param source.id        池条目 id。
+ * @param source.apiKey    解析后的 API key。
+ * @param source.enabled   缺省 **true**。⚠️ 探测路径必须**依赖这个缺省**：
+ *   `listIdentitySlots` 会跳过 `enabled === false` 的条目，而探测的既定语义是
+ *   「停用账号也要能重测」（见 `account-probe.ts` 模块头的第 2 条设计）。
+ *   若探测也照抄池里的 `enabled`，停用账号的重测会退化成「没有可用通道」。
+ * @param source.proxy     池字段权威值（`opencodeProxy`）；空/缺省 = 直连。
+ * @param source.generation 池字段权威代次（`opencodeFingerprintGeneration`）。
+ */
+export function poolEntrySnapshot(source) {
+    const generation = normalizeOpencodeGeneration(source.generation);
+    // ⚠️ identity 选择：匿名槽的 api_key 全是 `public`，用它派生会让 N 条匿名
+    //    通道拿到**同一个指纹**（彼此无法区分）。故匿名槽改用**条目 id**。
+    const identity = isAnonymousCredential(source.apiKey) ? source.id : source.apiKey;
+    return {
+        id: source.id,
+        enabled: source.enabled ?? true,
+        apiKey: source.apiKey,
+        proxy: source.proxy,
+        fingerprint: { projectId: deriveProjectId(identity, generation), generation },
+    };
 }
 /**
  * 首次启用时保证至少有一个匿名通道（幂等）。

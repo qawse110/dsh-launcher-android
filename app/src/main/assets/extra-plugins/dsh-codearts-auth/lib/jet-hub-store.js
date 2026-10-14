@@ -447,7 +447,9 @@ class MemoryStore {
  * 依据 `src/product.ts` 与各 `*-product.ts` 的 `id` 字段：
  * `codearts` / `buddy` / `workbuddy` / `lobsterai` / `qoder` / `qodercn`
  * / `trae` / `cline` / `loomy` / `raccoon` / `minimax` / `zcode`
- * / `opencode` / `gemini`。
+ * / `opencode` / `gemini` / `officeace` / `accio`。
+ * ⚠️ 这行清单必须与**下面那张表的实际项数**一致（2026-10-13 合并审计：
+ *    此前它漏了 `officeace` —— 表里有、清单里没有，属注释失实）。
  */
 const REF_PREFIX_TO_PROVIDER = [
     ['CODEARTS', 'codearts'],
@@ -473,6 +475,15 @@ const REF_PREFIX_TO_PROVIDER = [
     // `tests/unit/jet-hub-store.spec.ts` 的「恢复表覆盖客户端 PROVIDERS 的全部
     // provider（从真实清单派生）」用例锁死 —— 合并新增 provider 前**先跑它**。
     ['GEMINI', 'gemini'],
+    // ⚠️ 第 15 个 provider（officeace，2026-10-12）—— 同款坑第 **四** 次。
+    // 漏加 = `OFFICEACE_ACCOUNT_*` 的账号在 `state.json` 缺失时静默消失
+    //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新登录）。
+    ['OFFICEACE', 'officeace'],
+    // ⚠️ 第 16 个 provider（accio，2026-10-13）—— 同款坑第 **五** 次
+    //（⚠️ 与 officeace **同一次合并**并入，两者各算一次复发）。
+    // 漏加 = `ACCIO_ACCOUNT_*` 的账号在 `state.json` 缺失时静默消失
+    //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新登录）。
+    ['ACCIO', 'accio'],
 ];
 /** 账号凭据 ref 形态：`{PREFIX}_ACCOUNT_{HEX}`（前缀由单一真相源派生）。 */
 const ACCOUNT_REF_RE = new RegExp(
@@ -669,7 +680,7 @@ class FileStore {
  * 同一目录。PR !66 曾把它放宽成可选、并在 `dead-model-store` 里传 `undefined` ——
  * 那会**跳过优先级更高的 `profileContext.home`**，在 profile home 与 `$DSH_HOME`
  * 不相等时把失效表写到另一个目录，造成「账号池在 A、失效表在 B」的分裂，
- * 正是 `permanent-lock-store.ts:129-133` 明确警告过必须避免的情况。
+ * 正是 `permanent-lock-store.ts` 明确警告过必须避免的情况。
  */
 export function resolveJetHubHome(ctx) {
     const override = process.env.DSH_JET_HUB_STATE_DIR;

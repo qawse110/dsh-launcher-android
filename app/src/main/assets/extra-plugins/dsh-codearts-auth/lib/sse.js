@@ -908,6 +908,100 @@ export function isCourseLeakStripEnabled() {
 export function stripCourseLeakIfEnabled(text) {
     return isCourseLeakStripEnabled() ? stripCourseLeak(text) : text;
 }
+// ────────────────────────── DSML 标记归一化 ──────────────────────────
+/**
+ * 对**完整字符串**做 DSML 工具调用标记归一化（幂等）。
+ *
+ * ## 为什么需要（2026-10-13 实测）
+ *
+ * DSH 的工具调用协议是模型写在正文里的文本标记（`<｜DSML｜invoke …>`，
+ * 竖线是 U+FF5C 全角竖线）。部分模型（实测 deepseek-v4.1-flash 经 OfficeAce
+ * MaaS、step-5-preview 经 CodeBuddy）会把它**写坏成双竖线** `<｜｜DSML｜｜` ——
+ * 宿主解析器不认，工具调用整段当正文显示，模型「停住不动」。
+ *
+ * 这是**分词器保真度**问题：全角双竖线常被合并成单个 token，模型难以精确
+ * 复现单根。适配器是唯一能在「进入宿主解析器之前」修正的层级。
+ *
+ * 规则（逐条对应实测的坏形态，幂等 —— 归一化后的文本再过一遍不变）：
+ * 1. `<｜{2,}DSML` → `<｜DSML`（开/闭标签左侧双竖线；`\/?` 兼容闭标签）
+ * 2. `DSML｜{2,}` → `DSML｜`（右侧双竖线）
+ */
+export function fixDsmlMarkers(text) {
+    // ⚠️⚠️ **`DSML` 后必须有分隔边界**（2026-10-13 审计修正）：不加这个前视时，
+    //    正文里只要出现 `<｜｜DSMLX …` 这种**以 DSML 开头的普通词**就会被
+    //    无声改掉一个竖线 —— 讨论 DSML 协议的助手、代码片段、日志转储都会中招。
+    //    方向遵循仓库元规则「**宁可漏判不可误伤**」：宁可放过一个真坏标记，
+    //    也不可篡改用户的合法正文。
+    //    合法边界 = 竖线 / 空白 / `>` / `/` / 字符串结尾。
+    //
+    // ⚠️⚠️⚠️ **前视必须包含「协议标签名首字母」**（2026-10-13 二次审计修正）：
+    //    原前视只列 `｜|\s|>|\/|$`，**漏了字母** ⇒ 实测形态
+    //    `<｜｜DSML｜｜invoke name="…">`（右侧双竖线后紧跟 `invoke` 的 `i`）
+    //    **一条都修不了**：第一段把 `<｜｜DSML` 修成 `<｜DSML`，第二段却因
+    //    `DSML｜｜` 后视遇到 `i` 而跳过 ⇒ 留下 `<｜DSML｜｜invoke` 这种半修
+    //    形态，比不修更糟（看起来修过、实际仍解析不了）。
+    //    本文件 `dsml.ts` 的 `normalizeDsmlText` 已同步加上同一前视
+    //    （两份判据必须同源，由 `dsml-label-forms.spec.ts` ⑦ 对拍锁死）。
+    //
+    //    合法边界的完整集合 = `｜` / 空白 / `>` / `/` / `$` **∪ 协议标签名的
+    //    首字母**（`t`ool_calls、`c`alls、`i`nvoke、`p`arameter、`t`hought）。
+    //    ⚠️ 不泛化成「任意字母」：那会让 `DSMLX` 这类以 DSML 开头的普通词
+    //    重新被误伤（正是本轮要守住的边界）。
+    //    ⚠️ `t` 同时是 `tool_calls` 与 `thought` 的首字母（字符类里去重即可）。
+    const AFTER = '(?=｜|\\s|>|\\/|$|[tcip])';
+    return text
+        .replace(new RegExp(`(<\\/?)｜{2,}DSML${AFTER}`, 'g'), '$1｜DSML')
+        .replace(new RegExp(`DSML｜{2,}${AFTER}`, 'g'), 'DSML｜');
+}
+/**
+ * {@link fixDsmlMarkers} 的**流式安全**版本。
+ *
+ * ## 为什么不能逐帧直接 `replace`
+ *
+ * 标记会被上游切成任意片段（`<｜` + `｜DSML｜` + `｜invoke…`），逐帧 replace
+ * 每帧都只见半截模式 —— 与 think 标签逐帧漏判是同一类坑（本文件上方
+ * `splitThinkTaggedContent` 的注释记录过实测：二分帧 7/11 种切法漏判）。
+ * 故这里持有**待定缓冲**：凡是可能构成模式前缀的尾部都扣住不发，等下一帧
+ * 拼齐再判。
+ *
+ * 代价：文本恰好以 `<`、`<｜`、`DSML｜` 等结尾时，最后几个字符会延迟到
+ * 下一帧（或 `flush()`）—— 对流式 UI 只是几字符的延迟，无正确性影响。
+ */
+export function createDsmlMarkerNormalizer() {
+    /** 待定缓冲（可能构成模式前缀的尾部）。 */
+    let pending = '';
+    /** 这些模式的**真前缀**都可能还差后续输入才算得清，必须扣住。 */
+    const PREFIX_PATTERNS = ['<｜｜DSML', '</｜｜DSML', 'DSML｜｜'];
+    /** 最长模式长度（决定扣住窗口上限）。 */
+    const MAX_PENDING = 9;
+    /** 计算应扣住的尾部长度（最长匹配优先）。 */
+    function holdBackLen(s) {
+        const max = Math.min(s.length, MAX_PENDING);
+        for (let len = max; len >= 1; len--) {
+            const tail = s.slice(-len);
+            if (PREFIX_PATTERNS.some((p) => p.startsWith(tail)))
+                return len;
+        }
+        return 0;
+    }
+    return {
+        /** 喂入一帧文本，返回可安全下发的部分（可能为空串）。 */
+        push(text) {
+            pending += text;
+            const fixed = fixDsmlMarkers(pending);
+            const hold = holdBackLen(fixed);
+            const out = hold > 0 ? fixed.slice(0, fixed.length - hold) : fixed;
+            pending = hold > 0 ? fixed.slice(fixed.length - hold) : '';
+            return out;
+        },
+        /** 流结束：下发全部剩余（再做一次完整归一化兜底）。 */
+        flush() {
+            const out = fixDsmlMarkers(pending);
+            pending = '';
+            return out;
+        },
+    };
+}
 /**
  * 清洗**历史消息**里已持久化的行首泄漏；**供各适配器的序列化前调用**。
  *

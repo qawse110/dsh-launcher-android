@@ -27,6 +27,7 @@
  *
  * 详细取证见 `docs/superpowers/specs/2026-09-25-cline-provider-design.md` §2。
  */
+import { DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES } from './image-budget.js';
 /**
  * 兜底模型目录（内嵌 `BUILTIN_MODEL_CATALOG.cline` 段 + 远端 `free` 数组实测）。
  *
@@ -159,6 +160,11 @@ export const CLINE = {
     },
     tokenPrefix: 'workos:',
     defaultCredentialRef: 'CLINE_ACCESS_TOKEN',
+    // ⚠️ **必须显式赋值**：适配器把 `undefined` 一路传给 `requestImageTargetFor`，
+    // 而那个默认参数是 **2 MiB**（为腾讯系的图片 token 预算准备的）——
+    // Cline 撞的是**请求体体积**，2 MiB 会让生效值翻倍。详见接口里
+    // `imageMaxBytes` 的注释与 `qoder-product.ts` 的同款说明。
+    imageMaxBytes: DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES,
     fallbackModels: CLINE_FALLBACK_MODELS,
 };
 /** 全部 Cline 产品配置（当前只有一个，保留数组以便将来扩展 staging）。 */

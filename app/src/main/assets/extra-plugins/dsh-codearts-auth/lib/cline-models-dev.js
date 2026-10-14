@@ -57,7 +57,18 @@ import { TtlCache } from './ttl-cache.js';
 /** 社区模型目录（公开、无需认证）。与参考实现的 `MODELS_DEV_URL` 同源。 */
 export const CLINE_MODELS_DEV_URL = 'https://models.dev/api.json';
 /** 单次目录请求超时（毫秒）。 */
-export const CLINE_MODELS_DEV_TIMEOUT_MS = 20_000;
+export const CLINE_MODELS_DEV_TIMEOUT_MS = 60_000;
+/**
+ * ⚠️ 20s → 60s（issue IKKZUG，2026-10-12）。
+ *
+ * 实测（本机 Windows 直连 models.dev 三次）：`20010ms 超时` / `20010ms 超时` /
+ * `1908ms 成功`。**成功只用 1.9 秒，失败的都是整段卡死** —— 说明这不是「慢」，
+ * 而是「要么很快、要么整段挂住」，20 秒在 5.39 MB 的目标上偏紧。
+ *
+ * 方向是安全的：本模块**失败只记日志、返回空表**（见 `ensureModelsDev`），
+ * 超时放宽只影响「多等一会儿」，不会让任何一次失败变成阻塞 —— 而收益是慢链路
+ * 从「必然失败」变成「大概率成功」。
+ */
 /**
  * 缓存有效期。
  *
@@ -155,7 +166,19 @@ export function applyModelsDevCatalog(models, dev) {
             name: entry.name ?? id,
             isFree: false,
             ...entry.contextWindow === undefined ? {} : { contextWindow: entry.contextWindow },
-            ...entry.supportsImage ? { supportsImage: true } : {},
+            // ⚠️⚠️ **必须原样落 `supportsImage`（含 `false`），不能只写 true**
+            // （issue IKKZUG）。原写法是
+            //   `...entry.supportsImage ? { supportsImage: true } : {}`
+            // ⇒ models.dev **明确说 false**（实测 `cline-pass/glm-5.3` 就是不带图的）
+            // 时字段**缺席**，在三态语义下被读成「**未知**」，而它其实是
+            // 「**确认不支持**」。两个方向都真实有害：宿主会按「未知」**放行**图片
+            // （发到不支持图的服务端），门禁文案也会说「能力尚未加载完成」——
+            // 与事实相反。
+            //
+            // ⚠️ 这条在**两态**下无害（两边都归 `['text']`），是三态改造**暴露**的。
+            // ⚠️ `ClineModelsDevEntry.supportsImage` 是**必填** boolean（不是可选），
+            // 所以这里不存在「dev 没给」的情形，无需再判 undefined。
+            supportsImage: entry.supportsImage,
         });
         pending.set(prefix, bucket);
     }
@@ -174,8 +197,14 @@ export function applyModelsDevCatalog(models, dev) {
                 ...model.contextWindow === undefined && entry.contextWindow !== undefined
                     ? { contextWindow: entry.contextWindow }
                     : {},
-                // ⚠️ `supportsImage` 只在**缺失**时补：本地兜底表显式 `false` 也照样赢。
-                ...model.supportsImage === undefined && entry.supportsImage ? { supportsImage: true } : {},
+                // ⚠️ `supportsImage` 只在**本地缺失**时采用 models.dev 的值：本地兜底表
+                // 显式 `false` 也照样赢（策展数据优先于社区目录，见模块头口径 2）。
+                //
+                // ⚠️⚠️ 但**必须原样采用，含 `false`**（issue IKKZUG）：原写法是
+                // `&& entry.supportsImage`，于是 dev 说 false 时字段仍**缺席**
+                // ⇒ 被读成「未知」。这与上面「补缺」分支是同一个缺陷的两个入口，
+                // 只修一个就会从另一个入口漏回去。
+                ...model.supportsImage === undefined ? { supportsImage: entry.supportsImage } : {},
             });
         const prefix = prefixOf(model.id);
         if (lastIndexOfPrefix.get(prefix) === index) {
@@ -200,18 +229,51 @@ export function applyModelsDevCatalog(models, dev) {
  */
 export function makeClineModelsDevLoader(options = {}) {
     const fetcher = options.fetcher ?? fetch;
+    /**
+     * 上次成功拿到的 ETag 与结果（供条件请求 + 304 回退）。
+     *
+     * ⚠️ **不能**指望 `TtlCache` 承担回退：它只缓存**本次** `load()` 的返回值，
+     * 而 304 分支必须**返回上一次的结果** —— 那时 `load()` 拿不到新 body。
+     * 故这两份状态由本闭包自己持有。
+     */
+    let lastEtag;
+    let lastResult;
     const cache = new TtlCache({
         ttlMs: options.ttlMs ?? CLINE_MODELS_DEV_TTL_MS,
         ...options.now === undefined ? {} : { now: options.now },
         load: async () => {
             const response = await fetcher(CLINE_MODELS_DEV_URL, {
                 method: 'GET',
-                headers: { Accept: 'application/json' },
+                headers: {
+                    Accept: 'application/json',
+                    // ⚠️ **必须显式声明**（issue IKKZUG）：服务端支持 Brotli，而
+                    // Node 原生 `fetch` **默认不带** `Accept-Encoding` ⇒ 每次都在下
+                    // **解压后 5.39 MB** 的明文。代价不只是慢，而是**极易撞上超时上限**
+                    // （成功那次只用 1.9 秒，失败的都是整段卡死）。
+                    'Accept-Encoding': 'br, gzip',
+                    // 条件请求：带上次的 ETag，命中就只回一个 304 而不重下 5.39MB。
+                    ...lastEtag === undefined ? {} : { 'If-None-Match': lastEtag },
+                },
                 signal: AbortSignal.timeout(CLINE_MODELS_DEV_TIMEOUT_MS),
             });
+            // ⚠️ 304 必须**回落成上次的结果**，绝不能当成「空目录」——
+            // 那会把所有模型的图片能力一次性打回纯文本（正是本模块要防的形态）。
+            if (response.status === 304) {
+                if (lastResult !== undefined)
+                    return lastResult;
+                // ⚠️ 没有上次结果却收到 304：协议上不该发生，但**不能**返回空表，
+                // 那正是「把没读到说成不支持」。抛错让调用方按「未就绪」处理。
+                throw new Error('models.dev 返回 304 但本地没有可回落的结果');
+            }
             if (!response.ok)
                 throw new Error(`models.dev HTTP ${response.status}`);
-            return parseClineModelsDev(await response.json());
+            const parsed = parseClineModelsDev(await response.json());
+            lastResult = parsed;
+            const etag = response.headers.get('etag');
+            // ⚠️ 服务端**撤掉** ETag 时必须清空，否则会一直带着一个失效的
+            // If-None-Match 请求（服务端不再回 304，白白多一个请求头）。
+            lastEtag = etag ?? undefined;
+            return parsed;
         },
     });
     return async () => await cache.get();

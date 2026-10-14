@@ -4,7 +4,7 @@
  * 登录走**浏览器回调式 OAuth**（见 `gemini-oauth.ts`：本地 `createServer` 起回调、
  * 立即返回 `loginUrl`），续期走 `refresh_token` grant。
  *
- * ## ⚠️ `refreshAll` 照 `src/service.ts:406`（codearts）范式，**不照** `minimax-auth.ts:281`
+ * ## ⚠️ `refreshAll` 照 `src/service.ts`（codearts）范式，**不照** `minimax-auth.ts`
  *
  * 旧范式第一行是 `if (!entry.refreshable) continue` —— 那让这个布尔变成一道
  * **单向门**：任何一次把它写成 false 的路径都会让该账号此后**永远不进循环**，
@@ -18,13 +18,13 @@ import { Service } from '@deepseek-ai/cordis';
 import { credentialRef } from '@deepseek-ai/dsh-credentials';
 import { refreshAccountWithReconcile, shouldRefreshNow, syncAccountExpiry, } from './expiry-sync.js';
 import { SerialQueue } from './serial-queue.js';
-import { GEMINI, geminiAccountLabel, geminiCredentialExpiresAtMs, isGeminiRefreshable, parseGeminiCredential, } from './gemini.js';
+import { GEMINI, GEMINI_OAUTH_TIMEOUT_MS, geminiAccountLabel, geminiCredentialExpiresAtMs, isGeminiRefreshable, parseGeminiCredential, } from './gemini.js';
 import { credentialFromGeminiGrant, fetchGeminiUserInfo, refreshGeminiCredential, startGeminiOAuthFlow, } from './gemini-oauth.js';
 /**
  * 过期信息提取器（供共享实现 `refreshAccountWithReconcile` 用）。
  *
  * ⚠️ `identityOf` 的语义是「**凭据内容**」（这里取 access_token）而**不是** ref 名
- * —— 传 ref 名会恒匹配失败且**静默无报错**（`src/expiry-sync.ts:67` 记录的坑）。
+ * —— 传 ref 名会恒匹配失败且**静默无报错**（`src/expiry-sync.ts` 记录的坑）。
  *
  * `refreshableOf` 是**诚实**的：Gemini 确实有 refresh 端点（`oauth2.googleapis.com/token`
  * 的 `refresh_token` grant），故提供它，让共享实现据此把池里的 `refreshable` 对账。
@@ -40,7 +40,7 @@ export class GeminiRefreshTokenExpiredError extends Error {
         super(message);
         // ⚠️ `name` **必须**是 `'RefreshTokenExpiredError'`（与其余九个 provider 一致）。
         //
-        // `src/refresh.ts:21` 的终态判据是结构化比较：
+        // `src/refresh.ts` 的终态判据是结构化比较：
         //   `if (error.name === 'RefreshTokenExpiredError') return true`
         //   `return /refresh[_ ]?token/i.test(error.message)`
         //
@@ -114,7 +114,7 @@ export class GeminiAuth extends Service {
                 this.ctx.logger?.warn?.(`[gemini] 登录时兜底拉取账号身份失败（不影响登录，但昵称可能退化成账号 id）：${reason}`);
             },
         });
-        // 与 `cline-auth.ts:230-233` 同理：结果可能早于调用方 `await` 而落定，
+        // 与 `cline-auth.ts` 同理：结果可能早于调用方 `await` 而落定，
         // 先挂空处理器避免「未处理的拒绝」告警（错误仍会传给真正的消费者）。
         started.result.catch(() => { });
         // 落盘交给调用方（RPC 的 `account.create` 分支要顺带回填 nickname/expiresAt/refreshable）。
@@ -136,7 +136,7 @@ export class GeminiAuth extends Service {
     async resolveDefaultCredential() {
         return await this.readCredential(this.credentialRefName);
     }
-    /** 续期默认单凭据（`refreshTargets` 的兜底路径）。 */
+    /** 续期默认单凭据（批量续期表的兜底路径）。 */
     async refresh() {
         const credential = await this.resolveDefaultCredential();
         if (credential === undefined) {
@@ -324,7 +324,16 @@ export class GeminiAuth extends Service {
                 // 缺身份时补一次 userinfo（只读 GET）。注意此处**不写日志失败**——
                 // 老账号的 access_token 可能早已过期，拿不到是常态，不值得刷告警。
                 if (geminiAccountLabel(credential) === undefined) {
-                    const info = await fetchGeminiUserInfo(credential.access_token, { fetcher: this.fetchImpl });
+                    // ⚠️ **必须传 `signal`**（与 `refreshCredential` 同族的缺陷）：
+                    // `fetchGeminiUserInfo` 只在 `options.signal !== undefined` 时才设置
+                    //（`src/gemini-oauth.ts` 的 `if (options.signal !== undefined) init.signal = options.signal`），
+                    // 不传则这次 GET **完全没有超时**，卡住时只能等 undici 默认
+                    // `headersTimeout`（实测 305 秒）。本方法是启动期的账号修复循环，
+                    // 一个挂住的账号会把后面所有账号的修复一起拖住。
+                    const info = await fetchGeminiUserInfo(credential.access_token, {
+                        fetcher: this.fetchImpl,
+                        signal: AbortSignal.timeout(GEMINI_OAUTH_TIMEOUT_MS),
+                    });
                     if (info.sub === undefined && info.email === undefined)
                         continue;
                     credential = { ...credential };
@@ -378,7 +387,21 @@ export class GeminiAuth extends Service {
             throw new GeminiRefreshTokenExpiredError('凭据缺少 refresh_token，请重新登录');
         }
         try {
-            const grant = await refreshGeminiCredential(refreshToken, { fetcher: this.fetchImpl });
+            // ⚠️ **必须传 `signal`**（真实缺陷，对抗审计实测）：`refreshGeminiCredential`
+            // 只在 `options.signal !== undefined` 时才把它交给 `postGeminiForm`
+            //（`src/gemini-oauth.ts` 的 `if (signal !== undefined) init.signal = signal`），
+            // 不传则这次 `fetch` **完全没有超时**，只能等 undici 默认的
+            // `headersTimeout`（实测 **305 秒**）。
+            //
+            // 为什么这在本改动下变得关键：自愈把「续期」搬到了**用户点一下就等**的
+            // 积分查询主路径，且逐账号 `await` —— 一个卡住的 gemini 续期会让整条
+            // 积分行（乃至账号卡片）最长 5 分钟无响应；而其余九家都带 30~60s 超时。
+            // 顺带修好了既有缺陷：`GEMINI_OAUTH_TIMEOUT_MS` 此前**零引用**（只有定义），
+            // 现由本处用上。
+            const grant = await refreshGeminiCredential(refreshToken, {
+                fetcher: this.fetchImpl,
+                signal: AbortSignal.timeout(GEMINI_OAUTH_TIMEOUT_MS),
+            });
             // `credentialFromGeminiGrant` 保留 sub/email/cloudaicompanionProject，
             // 并在 Google 轮换 refresh_token 时回写新值。
             return credentialFromGeminiGrant(grant, credential);

@@ -335,6 +335,108 @@ export function formatZcodeEdgePageHint(body, status) {
         + '此类问题**更换账号无效**，建议稍后重试；持续出现时请向 ZCode 官方确认服务状态。';
 }
 /**
+ * 从响应里取上游的 **`logid`**（排障凭据）—— 双来源，体优先、头兜底。
+ *
+ * ## 为什么这个函数必须存在（issue IKJI0Y 的原始记录）
+ *
+ * 笔记原话：「响应体还带 **`logid`** —— 向用户索取现场时**优先要它**
+ * （上游侧排障凭据）」。但**此前它从未被解析过**（全仓 grep `logid` 零命中），
+ * 于是用户报障时我们只能给出「账号#1 · 身份块 2898 字符 · HTTP 405」——
+ * **没有一样是上游能据以查日志的东西**，排障只能来回猜。
+ *
+ * ## 本机一手实测（`scripts/probe-zcode-logid-shape.mjs`，只发 GET、零额度）
+ *
+ * 四个端点（`client/configs` / `billing/preview` / `billing/balance` /
+ * `event/report`）全部**同时**带这两个，且值**逐字相同**：
+ *
+ * ```
+ * [header] x-request-id = 20261012145652694e8f48d3614ae49634
+ * [body]   logid        = 20261012145652694e8f48d3614ae49634
+ * ```
+ *
+ * ## 两个来源各自覆盖哪一类故障（**都不能省**）
+ *
+ * | 来源 | 覆盖 | 为什么另一条盖不住 |
+ * |---|---|---|
+ * | 响应体顶层 `logid` | **业务层错误**（`{"code":3012,…}`） | 主路，值是上游业务日志的 id |
+ * | HTTP 头 `x-request-id` | **边缘 / 网关的 HTML 页**（502 / 504 / 阿里云 ESA） | 那种响应**体里没有 `logid`**，而它正是另一类高频故障 |
+ *
+ * ⚠ **体优先于头**：两者同时存在时取体的值 —— 那是业务侧记账的 id。
+ *   （实测二者相同，故这条只在将来分叉时才有可观测差异；写成显式优先级
+ *   是为了「分叉时行为确定」，而不是依赖「它们恰好相等」。）
+ *
+ * ⚠ **取不到一律 `undefined`**，绝不编造、也不返回空壳：
+ *   空白值（`""` / `"   "`）与非字符串（数字 / 对象）**都不算现场** ——
+ *   后者若被 `String()` 化会渲染出 `logid [object Object]`，
+ *   比没有更糟（会让人以为拿到了凭据）。
+ */
+export function extractZcodeLogId(body, headers) {
+    // ① 响应体顶层 `logid`（业务错误主路）。
+    const fromBody = (() => {
+        if (typeof body !== 'string' || body.length === 0)
+            return undefined;
+        let parsed;
+        try {
+            parsed = JSON.parse(body);
+        }
+        catch {
+            return undefined;
+        }
+        if (typeof parsed !== 'object' || parsed === null)
+            return undefined;
+        return nonEmptyString(parsed.logid);
+    })();
+    if (fromBody !== undefined)
+        return fromBody;
+    // ② HTTP 头 `x-request-id`（边缘 HTML 页只有这条）。
+    return readHeaderCaseInsensitive(headers, 'x-request-id');
+}
+/**
+ * 归一一个「非空字符串」：非字符串 / 空白一律 `undefined`。
+ *
+ * ⚠ **必须判类型**，不能 `String(value)`：数字或对象会被 stringify 成
+ * `12345` / `[object Object]`，渲染进诊断行比没有更糟
+ * （会让人以为拿到了凭据）。
+ * ⚠ 空白串（`""` / `"   "`）也算「没有」—— 上游确实下发过空 logid。
+ */
+function nonEmptyString(value) {
+    if (typeof value !== 'string')
+        return undefined;
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+}
+/**
+ * 大小写不敏感地读一个头。
+ *
+ * ⚠ HTTP 头名**本就大小写不敏感**，而 `Response.headers.get()` 已处理好；
+ * 但单测与调用方可能传**普通对象**（`{ 'X-Request-Id': … }`），
+ * 那种情况必须自己遍历键 —— 写死小写键会**静默取不到**（本仓库记过
+ * 「判据静默恒不命中」那类缺陷）。
+ */
+function readHeaderCaseInsensitive(headers, name) {
+    if (headers === undefined)
+        return undefined;
+    // `Headers` 形态（有 `get`）：优先用它，它是权威的大小写无关实现。
+    const getter = headers.get;
+    if (typeof getter === 'function') {
+        try {
+            const viaGetter = nonEmptyString(getter.call(headers, name));
+            if (viaGetter !== undefined)
+                return viaGetter;
+        }
+        catch { /* 落到下面的对象遍历 */ }
+    }
+    const record = headers;
+    for (const [key, value] of Object.entries(record)) {
+        if (key.toLowerCase() !== name)
+            continue;
+        const found = nonEmptyString(value);
+        if (found !== undefined)
+            return found;
+    }
+    return undefined;
+}
+/**
  * 上游 `3012` 的**判据**之二：正文里以**独立词**出现 `3012`。
  *
  * ⚠⚠ **必须是词边界匹配，不能是 `body.includes('3012')`**（真实缺陷，
@@ -561,6 +663,14 @@ export function formatZcodeDiagnostic(input) {
         `距上条 ${gap}`,
         ...shapeParts,
         `HTTP ${input.status}`,
+        /**
+         * ⚠ `logid` 排在**最后**：它最长（32 位十六进制），
+         * 放前面会把「账号 / 计数 / 身份块」这些一眼要看的信息挤到屏幕外。
+         * ⚠ 只有在**真的有值**时才出现 —— 取不到时整项消失（不编造）。
+         */
+        ...input.logId === undefined || input.logId.length === 0
+            ? []
+            : [`logid ${input.logId}`],
     ].join(' · ');
 }
 /**

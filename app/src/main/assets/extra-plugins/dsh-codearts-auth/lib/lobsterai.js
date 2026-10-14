@@ -52,6 +52,22 @@ export const LOBSTERAI_LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
  * 而签到每次都要带它 —— 不缓存会让每次签到多一次跨域请求。
  */
 export const LOBSTERAI_VERSION_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
+/**
+ * `readNumberField` 接受的数值**上界**。
+ *
+ * ⚠️ 为什么不能只判 `Number.isFinite`（真实缺陷，2026-10-12 审计实测）：
+ * 那个判据只排除 `Infinity` / `NaN`，**不排除「有限但下游算不动」的值** ——
+ * 308 位数字串（≈9.99e307）与 JSON 合法字面量 `1e308` 都能通过它，却在
+ * `Math.round(v * 100) / 100` 这类下游运算里**自己溢出成 `Infinity`**。
+ *
+ * 本值取 `1e15`：LobsterAI 的目录字段是 `contextWindow` / `maxTokens` /
+ * `costMultiplier`（最大量级 1e6 上下），积分是金额 —— 这个上界比任何真实值
+ * 都大 9 个数量级以上，**不会误伤**，却把「大到会溢出」的一律归为不可解析。
+ *
+ * ⚠️ 与 `src/lobsterai-credits.ts` 的 `MAX_CREDIT_VALUE` **同值**（同语义判据
+ * 不得分叉）；若将来要调，**两处一起调**。
+ */
+export const LOBSTERAI_MAX_NUMERIC_FIELD = 1e15;
 // ── 手机号脱敏（账号展示名）──
 /**
  * 把手机号（完整或已脱敏）统一掩码为**只露末 2 位**的形态。
@@ -124,13 +140,35 @@ export function readStringField(source, key) {
         return String(value);
     return '';
 }
-/** 从 JSON 安全读取数字字段（兼容字符串形态的数字）。 */
+/**
+ * 从 JSON 安全读取数字字段（兼容字符串形态的数字）。
+ *
+ * ⚠️⚠️ **字符串分支必须过 `Number.isFinite`**（真实缺陷，2026-10-12 审计实测）：
+ * 正则 `/^-?\d+(\.\d+)?$/` 只保证「长得像定点数字」，**不保证落在 double
+ * 范围内** —— 401 位纯数字串能通过正则，而 `Number(...)` 得到 `Infinity`。
+ * 少了这一层，本函数会把溢出值当成合法数字返回 `Infinity`（数字分支早已有
+ * 这道守卫，两分支必须**同口径**）。
+ *
+ * ⚠️ 本函数与 `src/lobsterai-credits.ts` 的 `parseNumericField` 是**同语义判据**
+ * （都被 LobsterAI 这条链路使用：本文件供 `lobsterai-adapter.ts` 解析远端目录，
+ * 那个供积分余额解析）。**两处必须同口径** —— 2026-10-12 的缺陷正是「只修了一份」
+ * 造成的分叉（本文件当时仍缺守卫）。将来若再改，**两处一起改**。
+ *
+ * ⚠️ **上界与 `parseNumericField` 同值**：`Number.isFinite` 只排除
+ * `Infinity`/`NaN`，不排除「有限但下游算不动」的值（远端目录的
+ * `contextWindow` / `maxTokens` / `costMultiplier` 都会参与乘法）。
+ * 故同样卡在 `LOBSTERAI_MAX_NUMERIC_FIELD`。
+ */
 export function readNumberField(source, key) {
     const value = source[key];
-    if (typeof value === 'number' && Number.isFinite(value))
-        return value;
-    if (typeof value === 'string' && /^-?\d+(\.\d+)?$/.test(value.trim()))
-        return Number(value);
+    if (typeof value === 'number') {
+        return Number.isFinite(value) && Math.abs(value) <= LOBSTERAI_MAX_NUMERIC_FIELD ? value : undefined;
+    }
+    if (typeof value === 'string' && /^-?\d+(\.\d+)?$/.test(value.trim())) {
+        const parsed = Number(value);
+        if (Number.isFinite(parsed) && Math.abs(parsed) <= LOBSTERAI_MAX_NUMERIC_FIELD)
+            return parsed;
+    }
     return undefined;
 }
 /**

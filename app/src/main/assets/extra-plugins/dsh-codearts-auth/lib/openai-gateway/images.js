@@ -22,7 +22,7 @@
  *
  * 真实原因：ZCode 在**会话创建时**按当时的模型能力把图片定成两种形态之一，
  * 之后**不随换模型重新评估**（源码依据见
- * `ZCode-official/.../core/src/runtime/helpers/conversation.ts:193` 的
+ * `ZCode-official/.../core/src/runtime/helpers/conversation.ts` 的
  * `isPastedInlineImageAttachment`）：
  * - `contentBlock.source.kind === 'inline'` → 真内联，发 `image_url`；
  * - 否则退化成**文本占位符** `[Attached image/jpeg: <本地路径>]`。

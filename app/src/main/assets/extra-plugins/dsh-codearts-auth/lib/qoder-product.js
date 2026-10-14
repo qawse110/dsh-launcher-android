@@ -25,6 +25,7 @@
  * - `...\@qoder-ai\qoder-agent-sdk\dist\_worker\qoder-worker-runtime.obf.mjs`
  *   （字符串经 `_$d = base64 → XOR("tqrRVttEZQ4G")` 编码）
  */
+import { DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES } from './image-budget.js';
 /**
  * 模型目录（**实测数据**，2026-09-20）。
  *
@@ -174,6 +175,11 @@ export const QODER = {
     sashClientType: '10',
     userAgentPrefix: 'qoder',
     defaultCredentialRef: 'QODER_ACCESS_TOKEN',
+    // ⚠️ **必须显式赋值**：适配器把 `undefined` 一路传给 `requestImageTargetFor`，
+    // 而那个默认参数是 **2 MiB**（为腾讯系的图片 token 预算准备的）——
+    // qoder 撞的是**请求体体积**，2 MiB 会让 24 张达 64 MiB、**超过上游的 50 MiB 硬限**
+    // （`52428800 bytes`）。详见接口里 `imageMaxBytes` 的注释。
+    imageMaxBytes: DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES,
     fallbackModels: QODER_FALLBACK_MODELS,
 };
 /**
@@ -344,6 +350,9 @@ export const QODER_CN = {
     // E11：CN asar 的 sash 请求头 UA 恒为 `"Qoder"`，与国际版一致。
     userAgentPrefix: 'qoder',
     defaultCredentialRef: 'QODERCN_ACCESS_TOKEN',
+    // 与国际版同因（见国际版处注释）：两站**复用同一个 `QoderAdapter` 类**，
+    // 故字节目标必须一致 —— 只给国际版赋值会让两站在同一份适配器上分叉。
+    imageMaxBytes: DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES,
     fallbackModels: QODER_CN_FALLBACK_MODELS,
 };
 /**

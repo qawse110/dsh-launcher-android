@@ -647,7 +647,22 @@ export class AggregateAdapter extends LlmAdapter {
      *
      * ⚠️ 用字面量而非 import 各 `product.ts` 的常量：那要引入 12 个模块，显著加重本文件
      * 的依赖；而这些 id 是**稳定契约**（`index.ts` 的 `modelAdapters` 表同样用字面量）。
-     * 新增 provider 时**两处都要加**（与 `modelAdapters` 同一约定）。
+     * 新增 provider 时**两处都要加**。
+     *
+     * ## ⚠️ 本清单**有守卫**（2026-10-12 补）
+     *
+     * 原先本行写的是「（与 `modelAdapters` 同一约定）」—— 那句是**误导**：`modelAdapters`
+     * 当时已有两条守卫（源码文本抓多余键 + 行为抓漏键），而**本数组一条都没有**。
+     * 实测（对抗性审计）：从本数组删掉 `'gemini'` 后全量测试**依然全绿**，而线上后果是
+     * 该渠道的模型**永不进聚合目录**、用户看不到、`auto` 也不用，**无报错无日志**。
+     *
+     * 现由 `tests/unit/aggregate-adapter.spec.ts` 的
+     * 「★★ 聚合渠道白名单与 registry 对齐」守：它用 `listModels` 的**调用记录**反推本
+     * 数组（该常量是私有的，行为路径才拿得到），与 `PROVIDER_REGISTRY.filter(d => d.channel)`
+     * 做**集合**比对，漏一家即红并点名。
+     * ⚠️ 判据是**集合**不是有序：本数组与 registry 的尾部顺序**本来就不同**
+     *（本数组 `… gemini, zcode, opencode`，registry `… zcode, opencode, gemini`），
+     * 故不能要求有序相等；顺序本身在本数组内有语义，由下面的排列体现。
      */
     static AGGREGATE_CHANNELS = Object.freeze([
         'codearts',
@@ -664,6 +679,30 @@ export class AggregateAdapter extends LlmAdapter {
         'gemini',
         'zcode',
         'opencode',
+        // officeace（2026-10-12）：华为 MaaS 云端直连渠道，`channel: true`
+        // ⇒ 必须进聚合目录，否则它的模型**永不进聚合、静默不可见**。
+        // ⚠️⚠️ **但它目前仍被第二道闸门挡着**（2026-10-13 合并审计实测）：
+        //    `WIRED_EXPIRY_PROVIDERS` **不含** officeace ⇒ 本文件 4 处过滤会把它
+        //    从**候选表**里剔掉（模型层归并了也没用）。
+        //    与 accio 不同，officeace **有**逐包到期口径（`jet-hub-rpc.ts` 把
+        //    `group.expiresAt` 归一化成 `deductionEndTime`，与 buddy 系同形）
+        //    ⇒ 它是**可接而未接**。接它需要：给 `provider-expiry.ts` 加一条
+        //    `officeaceExpiry`（可复用 `sharedPackageExpiry`）+ 进白名单
+        //    （`expiry-runtime-parity.spec.ts` 锁两者一致，必须同改）。
+        //    ⚠️ 本轮**刻意只接了 accio**（用户明确要求的是 accio）；officeace 的
+        //    接入**未做**，此注释如实登记这个缺口，不要读成「它已经能进聚合了」。
+        'officeace',
+        // ⚠️⚠️ accio（阿里 Accio Work，2026-10-13）—— 两件事**都要**做，缺一即静默：
+        //    ① 加进本数组（进聚合目录）；
+        //    ② 加进 `aggregate-expiry.ts` 的 `WIRED_EXPIRY_PROVIDERS`（进**候选表**）。
+        //
+        //    ⚠️ **只做 ① 是无效接线**（2026-10-13 合并审计实测）：决定候选可见性的
+        //    是 `WIRED_EXPIRY_PROVIDERS` —— 本文件有 4 处按它过滤（探测/候选/虚拟模型/
+        //    价格）。当时 accio 的 `PRIMARY_CHANNEL` 与 `CANONICAL_OVERRIDES` 都配对了
+        //    （`canonicalKeyFor` 返回 `via: 'patch'` ⇒ 归并到 `qwen3-8-flash`），
+        //    但候选层被那道闸门剔掉 ⇒ **用户要的「轮换列表里要有 accio」并没有实现**，
+        //    且症状静默（无报错、无日志）。现两处都补齐。
+        'accio',
     ]);
     /**
      * 本插件注册的渠道 id（`aggregate` 与 `jet-hub-auto` 自身除外）。
@@ -694,7 +733,7 @@ export class AggregateAdapter extends LlmAdapter {
         for (const model of models) {
             if (disabled.has(model.key))
                 continue;
-            entries.push({ provider, id: model.key, name: this.nameOf(model), inputModalities: ['text', 'image'] });
+            entries.push({ provider, id: model.key, name: this.pickerNameOf(model), inputModalities: ['text', 'image'] });
         }
         return entries;
     }
@@ -710,7 +749,7 @@ export class AggregateAdapter extends LlmAdapter {
     listAllModels() {
         return [
             { id: AGGREGATE_AUTO_MODEL, name: this.autoModelInfo().name },
-            ...this.catalog.map((model) => ({ id: model.key, name: this.nameOf(model) })),
+            ...this.catalog.map((model) => ({ id: model.key, name: this.pickerNameOf(model) })),
         ];
     }
     /** `auto` 的元数据。 */
@@ -723,19 +762,94 @@ export class AggregateAdapter extends LlmAdapter {
             inputModalities: ['text', 'image'],
         };
     }
-    /** 虚拟模型的展示名。
+    /** 虚拟模型的展示名 —— **设置页与解析路径用**（不带倍率，见 {@link pickerNameOf}）。
      *
      * ⚠️ **不加「（单渠道）」之类的后缀**（与 brief 初版的 `nameOf` 不同）：
-     * 设计文档 §12.1（`2026-10-06-aggregate-provider-design.md:669-673`）把新 provider
+     * 设计文档 §12.1（`docs/superpowers/specs/2026-10-06-aggregate-provider-design.md`
+     * 的「关于 `auto-adapter.ts` 的三处名字」一节）把新 provider
      * 定成「目录展示规范名 + 运行期渠道后缀」**单一形态**，并逐字写死三处的名字都是
      * 规范名（`listModels` / `resolveModel` → `DeepSeek V4.1 Flash`；`prepareCall`
      * → `DeepSeek V4.1 Flash · buddy`）。加后缀会让选择器与服务端目录名不一致，
      * 且 `prepareCall` 会拼出 `…（单渠道） · buddy` 这类双重后缀。
      * 「有没有冗余渠道」是**设置页**的信息（§7.3：按厂商分组、组内按候选渠道数降序、
      * 展开看逐条候选），不该混进模型展示名。
+     *
+     * ⚠️ 本方法**保持无倍率**：`resolveModel` 与 `describeCatalog` 的返回值被三处
+     * 既有断言逐字钉住（`aggregate-adapter.spec.ts:88`、`aggregate-rejections.spec.ts:251`、
+     * `aggregate-catalog.spec.ts:21` 全是 `'DeepSeek V4.1 Flash'`），且 `describeCatalog`
+     * 的候选子列表**逐条**显示倍率（`candidateRowLabel`）—— 在模型名上再叠一次
+     * 会出现「两个倍率」的重复展示。倍率只加在**模型选择器**那一条路径上，
+     * 即 {@link pickerNameOf}。
      */
     nameOf(model) {
         return model.name;
+    }
+    /**
+     * **模型选择器**里的展示名 = 规范名 + 倍率后缀（如 `GLM-5.3-Flash · 最低 x0.06`）。
+     *
+     * ## 为什么需要它（用户报障 2026-10-08）
+     *
+     * 用户原话：「没倍率显示？」—— 切到聚合后，选择器里每条虚拟模型**都没有倍率**，
+     * 而同屏的普通渠道（`GLM-5.3-Flash · x0.06`）有。用户据此无法判断「聚合给我
+     * 挑的是不是便宜的那个」，而本功能的全部卖点正是「省钱烧临期」。
+     *
+     * 根因：`nameOf` 只回规范名，而倍率其实**早就算好了** ——
+     * `aggregate-catalog.ts` 的 `CandidateEntry.price` 就是 `priceFactorFromName(realName)`
+     * 的结果，只是从没被展示层用过。
+     *
+     * ## ⚠️⚠️ 为什么文案是「**最低** x…」而不是直接 `· x…`（真实缺陷，复审实测）
+     *
+     * 初版取全局最小 `price` 并直接拼成 `· x0.03`，其注释推理是「轮换的**第二**判据
+     * 是同临期档内倍率升序 ⇒ 最便宜候选最可能被选中」。**该推理在跨临期档时不成立**：
+     * `rankCandidates` 的第一判据是**临期升序**，倍率只在**同档内**才起作用。
+     * 复审实测（真实 `lib/aggregate-adapter.js` + 真实 `prepareCall`）：
+     *
+     * ```
+     * 候选：buddy x0.29（临期 100，最早） / codearts x0.03（临期 900）
+     * 选择器显示："DeepSeek V4.1 Flash · x0.03"   <-- 让用户以为会挑便宜的
+     * 实际发往  ：["buddy"]                         <-- 实际挑的是最贵的
+     * ```
+     *
+     * ⇒ 直接写 `x0.03` 会**误导用户**，与本 PR 自己在 `types.ts` 立下的判据
+     *（「往静态名里写死倍率就是编造」）同型：显示的价与实际会用的价不符。
+     *
+     * ⚠️ 修法**不是**「按临期最早那档取最便宜候选」：`CandidateEntry` 里**没有**
+     * `expiry`（临期是运行期由 `expiryProbe` 折算的，见 `aggregate-expiry.ts`），
+     * 而本方法被 `listModels` / `listAllModels` 调用、**契约要求同步**
+     *（`ModelCatalogSource` 的注释）⇒ 这里根本拿不到临期档。若为它改成异步或
+     * 触发一轮余额查询，代价远大于收益（选择器渲染路径不能打网络）。
+     * ⇒ 采用**如实表达下界**的口径：`最低 x0.03` 的语义是「这个虚拟模型下最便宜的
+     * 可路由候选」，它**不声称**本次会选它 —— 用户据此仍能判断「值不值得选这个
+     * 模型」，且不会被误导成「一定会用 0.03」。
+     *
+     * ⚠️ **不显示「区间」**（如 `x0.03–x0.29`）：那会变成最长行，而选择器是窄菜单
+     *（与 `buddy-adapter.ts` 的「不写 `（促销 …）`」同一取舍）。
+     *
+     * ## 三条不显示倍率的规则（都是既有约定）
+     *
+     * 1. **全部候选都无标注**（`Infinity`）⇒ 不加后缀。直接拼会渲染出
+     *    `xInfinity`，那是明显的渲染缺陷（`aggregate-panel-logic.js` 同款判据）。
+     * 2. **`0` 显示「免费」**（本仓库既有口径，见 `candidateRowLabel`）。
+     * 3. **解析不出就不猜**：宁可没有倍率，也不编一个（`buddy.ts` 同款理由：
+     *    编造倍率比不显示更糟）。
+     *
+     * ⚠️ 只用于 `listModels` / `listAllModels`（选择器与设置页「显示列表」）。
+     * **不得**用于 `resolveModel` / `describeCatalog` —— 见 {@link nameOf} 的注释。
+     */
+    pickerNameOf(model) {
+        const prices = model.candidates
+            // ⚠️ 只取**已接入临期折算**的候选（与 `describeCatalog` 的过滤同一口径）：
+            //    未接入的渠道经 `expiryProbe` 得 `UNUSABLE`、**永远不会被路由到**，
+            //    把它的价格显示出来等于替一个用不上的候选报价（规格 §9.2.1：
+            //    只广告可路由的东西）。
+            .filter((candidate) => WIRED_EXPIRY_PROVIDERS.includes(candidate.provider))
+            .map((candidate) => candidate.price)
+            .filter((price) => Number.isFinite(price));
+        if (prices.length === 0)
+            return model.name;
+        const best = Math.min(...prices);
+        // ⚠️ 「最低」二字不可省：见方法头那段实测 —— 省掉会让用户以为本次就用这个价。
+        return `${model.name} · 最低 ${best === 0 ? '免费' : `x${best}`}`;
     }
     /**
      * 解析某个虚拟模型的能力元数据。
@@ -973,7 +1087,7 @@ export class AggregateAdapter extends LlmAdapter {
         //（真实缺陷，对抗审计实测证伪，2026-10-07 —— 我自己上一版正是这么错的）。
         //
         // 机制：建池时每个候选的 `expiry` 初值是 `NEVER`（见上方 `pool.push({…, expiry: NEVER})`），
-        // 而 `rankCandidates`（`aggregate-core.ts:145`）**只剔除 `UNUSABLE`** ——
+        // 而 `rankCandidates`（`aggregate-core.ts`）**只剔除 `UNUSABLE`** ——
         // `NEVER` 是合法排序值（语义是「可用、只是不临期」）。于是「只把候选从
         // `usable` 里拿掉」时，它的 `expiry` 仍是 `NEVER` ⇒ **照样进入候选序**，
         // 只是排在最后 ⇒ 当前面的候选失败时**回落到它**（`targets` 是逐个尝试的）。
@@ -1009,9 +1123,14 @@ export class AggregateAdapter extends LlmAdapter {
                     // 该报错与「真的没登录」无法区分。
                     // ⚠️ 真实缺陷（Task 7 复审 M4）：本处是同一缺陷的**第二实例** ——
                     // `aggregate-expiry.ts` 已修，这里漏了。
+                    //
+                    // ⚠️⚠️ **判据必须与 `isAbortLike` 逐格同构（2026-10-12 审计实测补全）**：
+                    // 本处原先只认 `name === 'AbortError'`，于是同一份 499 报文在
+                    // `dispatch` 里归**中止**、在这里却被折算成 `UNUSABLE` ⇒ 用户取消后
+                    // 看到的是「当前没有任何可用候选」而不是中止（正是 M4 那个形态的
+                    // 新实例）。故改为直接复用共享判据，杜绝再次分叉。
                     signal?.throwIfAborted();
-                    if (error !== null && typeof error === 'object'
-                        && error.name === 'AbortError')
+                    if (isAbortLike(error, signal))
                         throw error;
                     expiry = UNUSABLE;
                 }
@@ -1062,7 +1181,7 @@ export class AggregateAdapter extends LlmAdapter {
      * ## ⚠️⚠️ 为什么返回**映射**而不是「过滤后的数组」（真实缺陷，对抗审计实测证伪）
      *
      * 我上一版返回「过滤后的数组」，调用方拿它去折算临期 —— 但**建池时每个候选的
-     * `expiry` 初值是 `NEVER`**，而 `rankCandidates`（`aggregate-core.ts:145`）
+     * `expiry` 初值是 `NEVER`**，而 `rankCandidates`（`aggregate-core.ts`）
      * **只剔除 `UNUSABLE`**（`NEVER` 是合法排序值：「可用、只是不临期」）。
      * ⇒ 被过滤掉的候选 `expiry` 仍是 `NEVER`，**照样进入候选序**、只是排最后；
      * 当前面的候选失败时**回落到它**（`targets` 逐个尝试）。
@@ -1077,8 +1196,8 @@ export class AggregateAdapter extends LlmAdapter {
      *
      * 各 provider 的「额度耗尽」是按 **modelId** 记账的：
      * `AccountPool.getAvailableAccount` / `listAvailableCredentials` 都按
-     * `entry.modelRateLimits[modelId]` 过滤候选（`account-pool.ts:1463-1469` /
-     * `:1546-1552`），而 codearts 的 benefit（免费额度）耗尽正是写进那里的
+     * `entry.modelRateLimits[modelId]` 过滤候选（`account-pool.ts`），
+     * 而 codearts 的 benefit（免费额度）耗尽正是写进那里的
      * （`llm-adapter.ts` 的三处 `updateModelRateLimit` 调用）。
      *
      * 但 `createExpiryProbe` 取号时用的模型键是**该渠道目录的第一个模型**
@@ -1101,7 +1220,7 @@ export class AggregateAdapter extends LlmAdapter {
      * ## 取舍
      *
      * - ⚠️ **只在池实现了 `getAvailableAccount` 时过滤**：它是既有 API，但大量单测桩
-     *   只实现了 `disabledModelsFor`（见 `:580` 的注释）。缺失时**跳过过滤**而不是
+     *   只实现了 `disabledModelsFor`（见 `{@link refreshCatalog}` 的注释）。缺失时**跳过过滤**而不是
      *   判成不可用 —— 宁可少筛一层，不可把整池误剔除（与 `aggregate-expiry.ts` 对
      *   `listAvailableCredentials` 缺失时的降级同一取向）。
      * - ⚠️ 查询失败（抛错）时**保留该候选**：一次池查询异常不该让渠道整体消失。
@@ -1174,9 +1293,13 @@ export class AggregateAdapter extends LlmAdapter {
             // 「候选渠道都不支持图片输入」这类**与中止无关**的误导性报错，且整轮不会中止。
             // 与本仓库口径相反：中止应**立刻**以 `AbortError` 结束
             //（`aggregate-core.ts` 的哨兵注释：「abort 立刻抛，绝不折算」）。
+            //
+            // ⚠️⚠️ **判据必须与 `isAbortLike` 逐格同构（2026-10-12 审计实测补全）**：
+            // 本处原先只认 `name === 'AbortError'`，同族分叉的**第三处**。
+            // 不修的话，同一份 499 报文在这里会被折算成 `{imageCapable:false}` ⇒
+            // 用户看到「候选渠道都不支持图片输入」这类与中止无关的误导性报错。
             signal?.throwIfAborted();
-            if (error !== null && typeof error === 'object'
-                && error.name === 'AbortError')
+            if (isAbortLike(error, signal))
                 throw error;
             // ⚠️ 走这里的结果**不入缓存**（见 `capabilityCache` 的注释）——否则一次瞬时
             //    失败会让该候选在整段 TTL 内恒被当成「无档位 / 不支持图片 / 无窗口」。
@@ -1559,7 +1682,7 @@ export class AggregateAdapter extends LlmAdapter {
                     //
                     // ⚠️ 严格的替代方案是**延迟 `block-start`**（缓冲到第一个 delta 一起发，
                     //    使「已开块」等价于「已吐内容」）—— 那确实是本仓库既有做法
-                    //   （`buddy-adapter.ts:2068` 的 `announced: '名字可用的那一刻才发'`），
+                    //   （`buddy-adapter.ts` 的 `announced: '名字可用的那一刻才发'`），
                     //    但它要改动**所有**候选的产出路径（含 tool-call 的 id/name 装配时机），
                     //    属于比本修复更大的改动面。留给后续任务，此处取安全的一刀切。
                     if (openedBlocks.size > 0) {
@@ -1794,10 +1917,17 @@ function abortError() {
  * 该错误是否是「调用方中止」类，而不是「这个候选坏了」类。
  *
  * ⚠️ 两者**必须分开**：中止时换候选会让用户在取消后仍继续跑（且最终抛出的
- * 可能是个误导性的上游错误）。判据取三条：
+ * 可能是个误导性的上游错误）。判据取四条：
  * - `signal.aborted` —— 最权威（调用方确实取消了）；
  * - `name === 'AbortError'` —— `throwIfAborted` / `timers/promises` 的形态；
- * - `code === 'ABORTED'` —— 某些适配器上报失败时的机器码。
+ * - `code === 'ABORTED'` —— 某些适配器上报失败时的机器码；
+ * - 🔴 `message` 含 `aborted request` / `HTTP_499` / `HTTP 499` —— **上游网关的
+ *   499 口径**（nginx「client closed request」＝ 连接在响应完成前被断开）。
+ *   实测（2026-10-11，本会话两次 + 工单 `raccoon-499/01` 取证）：raccoon 网关把
+ *   这类断开报成 `provider: client has aborted request HTTP_499` 的 **error 帧**，
+ *   三条旧判据全不命中 ⇒ 被归成「本轮运行失败」⇒ 消费者看到误导性的 provider
+ *   故障，而真相是「请求没跑完，重发即可」。归 aborted 的语义收益：终端不再
+ *   显示「运行失败」，且外层不把它当「候选坏了」去改道（重发是新请求，不是换候选）。
  */
 function isAbortLike(error, signal) {
     if (signal?.aborted === true)
@@ -1805,7 +1935,10 @@ function isAbortLike(error, signal) {
     if (error === null || typeof error !== 'object')
         return false;
     const candidate = error;
-    return candidate.name === 'AbortError' || candidate.code === 'ABORTED';
+    if (candidate.name === 'AbortError' || candidate.code === 'ABORTED')
+        return true;
+    const message = typeof candidate.message === 'string' ? candidate.message : '';
+    return /aborted request|HTTP_?499/i.test(message);
 }
 /** 在 `ctx.llm` 上注册聚合路由（幂等）。 */
 export function registerAggregateLlm(ctx, options) {
@@ -1827,9 +1960,9 @@ export function registerAggregateLlm(ctx, options) {
     // ⚠️ **注册后主动预热一次目录**（fire-and-forget，不阻塞注册）。
     //
     // 为什么必须预热：`listAllModels()` 被契约要求是**同步**方法，只能读上一次
-    // 推导结果；而 `provider.status`（`jet-hub-rpc.ts:3883`）会在**冷缓存**下直接
+    // 推导结果；而 `provider.status`（`jet-hub-rpc.ts`）会在**冷缓存**下直接
     // 调它并据条数算 `models.total`，判据是
-    // `closed = total > 0 && disabled === total`（同文件 `:3884-3903`）。
+    // `closed = total > 0 && disabled === total`（该分支即 `provider.status` 的 models.total 判据）。
     // 冷缓存时 `total` 只有 1（`auto`）⇒ 用户一关掉 `auto`，`disabled === total`
     // 即成立 ⇒ `aggregate` 被**误显示为「已关闭」**（掉进设置页的「已关闭」分组）。
     // 预热后 `this.catalog` 在**有已登录渠道时**非空（`refreshCatalog` 只在被调用时
@@ -1838,7 +1971,7 @@ export function registerAggregateLlm(ctx, options) {
     // `total` 仍为 1 —— 那种状态下聚合确实无模型可选，`closed` 的判定与事实相符。
     //
     // 成本可控：各家的 `listModels` 内部都有 `providerCatalogVisible` 门控
-    //（`buddy-adapter.ts:1303` 等，门控在 `ensureRemoteModels()` **之前**）——
+    //（`buddy-adapter.ts` 等，门控在 `ensureRemoteModels()` **之前**）——
     // 未登录的渠道直接返回空目录、不发网络请求；已登录渠道本就会被模型选择器
     // 触发同一批请求，预热只是提前一次，随后 60 秒内走 `AGGREGATE_CATALOG_TTL_MS`。
     //

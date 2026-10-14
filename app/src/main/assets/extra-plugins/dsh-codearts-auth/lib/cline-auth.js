@@ -42,7 +42,7 @@ export const CLINE_CREDENTIAL_REF = 'CLINE_ACCESS_TOKEN';
  * 续期被后端判定为终态（refresh_token 失效）时抛出的错误。
  *
  * 与其它 provider 的同名类**刻意是各自独立的类**：
- * `src/refresh.ts:21-25` 的 `isRefreshTokenExpired` 用 `error.name` 而非
+ * `src/refresh.ts` 的 `isRefreshTokenExpired` 用 `error.name` 而非
  * `instanceof` 作判据，正是因为这些类跨模块 identity 不同。
  * 故这里也必须保证 `name` 恰为 `RefreshTokenExpiredError`。
  */

@@ -15,17 +15,18 @@
  * 3. **图片两跳**：先 `projectRequestImage`（插件侧缩放，640,000 px），
  *    拿不到才 `readImage`（原图）。两者都拿不到**抛错**，绝不静默丢图。
  * 4. **`toolChoice` 恒 AUTO**：`@deepseek-ai/dsh-llm` 的 `GenerateOptions`
- *    **没有** `toolChoice` 字段（实测 `lib/types/types.d.ts:380-416`），
+ *    **没有** `toolChoice` 字段（实测 `lib/types/types.d.ts`），
  *    故不传；`translateGeminiRequest` 内部默认走 `AUTO`。
  */
 import { CONTEXT_WINDOW_EXCEEDED_CODE, isContextWindowExceededError, LlmAdapter, LlmError, ReasoningEffortId, } from '@deepseek-ai/dsh-llm';
-import { providerCatalogVisible } from './account-pool.js';
+import { createModelCatalog } from './model-catalog.js';
 import { collectImages, httpErrorCode } from './openai-compat.js';
 import { projectRequestImage } from './image-budget.js';
 import { registerAdapterIdempotent } from './llm-register-compat.js';
 import { reportLedgerAccount } from './token-ledger.js';
 import { GEMINI, GEMINI_ENDPOINTS, GEMINI_IDLE_TIMEOUT_MS, GEMINI_MAX_IMAGE_BYTES_INLINE, GEMINI_MAX_REQUEST_BODY_BYTES, GEMINI_SESSION_LANE_INFER, GEMINI_STREAM_PATH, GEMINI_UPSTREAM_FLASH, geminiCanonicalModelId, geminiFallbackEntries, geminiHeaders, geminiModelSpec, geminiReasoningInfo, isGeminiExpired, marshalAlphabetical, newGeminiRequestId, normalizeBase64, } from './gemini.js';
 import { consumeGeminiSse, translateGeminiRequest } from './gemini-messages.js';
+import { planSessionTitleThinking } from './session-title.js';
 import { persistGeminiProject, resolveGeminiProject } from './gemini-project.js';
 /** 最多换几个账号（含起始账号）。 */
 const GEMINI_MAX_ROTATE = 3;
@@ -145,10 +146,24 @@ function isGeminiContextOverflow(text) {
 export class GeminiAdapter extends LlmAdapter {
     options;
     product;
+    /**
+     * ⚠️ **2026-10-08 Task 7b：三个方法收敛到共享骨架** `createModelCatalog`。
+     * 原先 `listModels` / `resolveModel` / `listAllModels` 各写一遍骨架，
+     * 现在只剩 `toCatalogEntry`（本家私有形状 + 静态表判据）。
+     */
+    catalog;
     constructor(options) {
         super();
         this.options = options;
         this.product = options.product ?? GEMINI;
+        // ⚠️ 本家目录是**静态表**（无远端拉取）⇒ 两个取数回调是同一份。
+        this.catalog = createModelCatalog({ accountPool: options.accountPool }, {
+            product: this.product,
+            loadCatalog: () => this.catalogEntries(),
+            // ⚠️ 未知 id 保守报 ['text']（宁可少报能力，也不报服务端可能不认的模态）。
+            unknownModelInputModalities: () => ['text'],
+            syncCatalog: () => this.catalogEntries(),
+        });
     }
     providerInfo(provider) {
         const id = typeof provider === 'string' && provider.length > 0 ? provider : this.product.id;
@@ -166,61 +181,47 @@ export class GeminiAdapter extends LlmAdapter {
     /**
      * 完整目录（**不套黑名单**），供 Jet Hub「显示列表」用。
      *
-     * ⚠️ **必须同步返回数组，不能是 `async`**（`minimax-adapter.ts:218-242`
-     * 记录的同类缺陷：写成 async 会让 `jet-hub-rpc.ts:2041 [...all]` 与
-     * `:2125 all.map` 抛 `TypeError: all is not iterable`）。
+     * ⚠️ **必须同步返回数组，不能是 `async`**（`minimax-adapter.ts`
+     * 记录的同类缺陷：写成 async 会让 `jet-hub-rpc.ts` 的两个消费者（`[...all]` 与
+     * `all.map`）都抛 `TypeError: all is not iterable`）。
+     *
+     * ⚠️ **2026-10-08 Task 7b**：该同步契约（连同上面这条缺陷史）已在
+     * `src/model-catalog.ts` 的 `syncCatalog` 上统一持有；此处只剩委托。
      */
     listAllModels() {
-        return this.loadModels().map((model) => ({ id: model.id, name: model.name }));
+        return this.catalog.listAllModels();
     }
-    inputModalitiesFor(entry) {
-        return entry?.supportsImage === true ? ['text', 'image'] : ['text'];
+    /**
+     * 把本家私有条目转成共享骨架的中间结构。
+     *
+     * ⚠️ 本家目录是**静态表**（`geminiFallbackEntries()`，无远端拉取），
+     * 故 `loadCatalog` 与 `syncCatalog` 取同一份数据。
+     */
+    toCatalogEntry(entry) {
+        const reasoning = geminiReasoningInfo(entry);
+        const contextWindow = entry.contextWindow;
+        const maxTokens = entry.maxTokens;
+        return {
+            id: entry.id,
+            name: entry.name,
+            // ⚠️ 本家**不剥倍率**（`resolveModel` 也用 `name`）⇒ 不提供 `bareName`。
+            // ⚠️ 模态判据**内联在此**（Task 7b：原 `inputModalitiesFor` 已删除）——
+            // 它是本家私有的「该 entry 支不支持图片」，骨架不认识 `supportsImage`。
+            // ⚠️ 三态：本家静态表**总是**带 `supportsImage` 布尔 ⇒ 恒为数组，不会是 undefined。
+            inputModalities: entry.supportsImage === true ? ['text', 'image'] : ['text'],
+            ...contextWindow !== undefined && contextWindow > 0 ? { contextWindow } : {},
+            ...maxTokens !== undefined ? { maxTokens } : {},
+            ...reasoning !== undefined ? { reasoning } : {},
+        };
+    }
+    catalogEntries() {
+        return this.loadModels().map((entry) => this.toCatalogEntry(entry));
     }
     async listModels(_provider) {
-        // ⚠️ 无已登录账号时返回 `[]` → DSH 把整个 provider 分组隐藏。
-        // **必须返回空数组而不能抛错**（抛错会多一条 provider 报错）。
-        if (!await providerCatalogVisible(this.options.accountPool, this.product.id))
-            return [];
-        const all = this.loadModels();
-        const disabled = this.options.accountPool?.disabledModelsFor(this.product.id);
-        const listed = disabled === undefined || disabled.size === 0
-            ? all
-            : all.filter((model) => !disabled.has(model.id));
-        return listed.map((model) => ({
-            provider: this.product.id,
-            id: model.id,
-            name: model.name,
-            inputModalities: this.inputModalitiesFor(model),
-        }));
+        return this.catalog.listModels(_provider);
     }
-    async resolveModel(provider, model, _signal) {
-        const entry = this.loadModels().find((item) => item.id === model);
-        const resolved = {
-            provider,
-            id: model,
-            name: entry?.name ?? model,
-            inputModalities: this.inputModalitiesFor(entry),
-        };
-        // ⚠️ 未知模型不编造 context（宁可让 DSH 用默认值，也不报一个假窗口）
-        if (entry !== undefined && entry.contextWindow > 0) {
-            resolved.context = { contextWindow: entry.contextWindow };
-        }
-        // ⚠️ 远端/静态非法值必须过滤：0/负数/NaN 会让 DSH 抛
-        // `INVALID_MODEL_MAX_TOKENS`，**整轮对话起不来**（不是降级，是崩）。
-        // ⚠️ 先取局部变量再判：`entry.maxTokens` 是可选属性，
-        // `Number.isSafeInteger` 不做类型收窄，直接连写会报 TS18048。
-        const maxTokens = entry?.maxTokens;
-        if (maxTokens !== undefined && Number.isSafeInteger(maxTokens) && maxTokens > 0) {
-            resolved.defaultMaxTokens = maxTokens;
-        }
-        // ⚠️ 无档位的模型（例如用户手填的未知 id）⇒ `undefined` ⇒ **不声明**
-        //（空数组会让面板显示一个点不开的空下拉框）。
-        if (entry !== undefined) {
-            const reasoning = geminiReasoningInfo(entry);
-            if (reasoning !== undefined)
-                resolved.reasoning = reasoning;
-        }
-        return resolved;
+    async resolveModel(provider, model, signal) {
+        return this.catalog.resolveModel(provider, model, signal);
     }
     /** 兼容 0.1.1-rc.2 的 `prepareCall` shim（与其余适配器同款）。 */
     async prepareCall(provider, model, signal) {
@@ -239,7 +240,7 @@ export class GeminiAdapter extends LlmAdapter {
     /**
      * 收集并内联本次请求涉及的全部图片。
      *
-     * ⚠️ 两跳都失败时**必须抛错**（`buddy-adapter.ts:1239-1285` 的权威写法）：
+     * ⚠️ 两跳都失败时**必须抛错**（`buddy-adapter.ts` 的权威写法）：
      * 静默丢弃会表现为「图片凭空消失、模型答非所问」，是最难排查的一类问题。
      */
     async collectInlineImages(messages, entry, model) {
@@ -332,6 +333,27 @@ export class GeminiAdapter extends LlmAdapter {
             ? requested
             : undefined;
         const spec = geminiModelSpec(options.model, effort);
+        /**
+         * 会话自动命名（`purpose: 'session-title'`）的思考与预算决策（issue IKKVDH）。
+         *
+         * DSH 用 **64 token** 发标题请求且**不传 `reasoningEffort`**，而宿主会把
+         * 本模型的默认档注入进来。本家档位实测为 `['low','medium','high','tiered']`
+         * （**没有 `off`/`none`**），且 `gemini.ts` 的模块头明确写着
+         * 「关掉 `includeThoughts` 照样思考照样计费（假关）」⇒ 本家**关不掉**思考，
+         * 只能走抬预算兜底。
+         *
+         * ⚠️ 缺口尤其明显：`medium` 档的 `thinkingBudget` 实测为 **4000**，而标题
+         * 请求只给 **64** —— 思考预算本身是输出上限的 **62 倍**，必然被腰斩。
+         *
+         * ⚠️ `declaredEfforts` 与 `resolveModel` 的 `reasoningFor` **同源**
+         * （都取 `geminiReasoningInfo(entry)`），避免「UI 与请求」分叉。
+         */
+        const titlePlan = planSessionTitleThinking({
+            purpose: options.purpose,
+            requestedEffort: requested,
+            declaredEfforts: declared?.efforts.map((item) => String(item.id)) ?? [],
+            maxTokens: options.maxTokens,
+        });
         const images = await this.collectInlineImages(options.messages, entry, options.model);
         const sessionLane = this.options.sessionLane ?? GEMINI_SESSION_LANE_INFER;
         const sigStore = this.options.sigStore;
@@ -418,7 +440,9 @@ export class GeminiAdapter extends LlmAdapter {
                     ...options.system === undefined ? {} : { system: options.system },
                     ...options.tools === undefined ? {} : { tools: options.tools },
                     ...options.temperature === undefined ? {} : { temperature: options.temperature },
-                    ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
+                    // ⚠️ 标题请求走 `titlePlan.maxTokens`（关不掉思考时已抬到兜底下限）——
+                    // 它最终成为 `generationConfig.maxOutputTokens`（见 `gemini-messages.ts`）。
+                    ...titlePlan.maxTokens === undefined ? {} : { maxTokens: titlePlan.maxTokens },
                     ...this.options.sessionId === undefined ? {} : { sessionId: this.options.sessionId },
                     sessionLane,
                     sessionGeneration,

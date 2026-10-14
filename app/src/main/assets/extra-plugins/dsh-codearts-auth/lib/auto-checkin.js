@@ -65,7 +65,7 @@ import { join } from 'node:path';
 import { QODER_BILLING_UTC_OFFSET_MS } from './model-queue.js';
 import { resolveJetHubHome } from './jet-hub-store.js';
 import { formatClaimGains } from './credits.js';
-import { ZCODE } from './zcode-product.js';
+import { descriptorOf } from './provider-registry.js';
 /** 独立文档的文件名（与 state.json / ui-preferences.json 同目录）。 */
 export const AUTO_CHECKIN_FILE = 'auto-checkin.json';
 const SCHEMA = 'dsh-codearts-auth/auto-checkin/v1';
@@ -255,7 +255,11 @@ export function isUnsupportedCheckin(message) {
  *   浏览器弹出来是用户自己能理解的交互。
  */
 export function isAutoCheckinExcluded(provider) {
-    return provider === ZCODE.id;
+    // ⚠️ 2026-10-08 改：判据从**硬编码** `provider === ZCODE.id` 改为查
+    //    `PROVIDER_REGISTRY` 的 `autoCheckinExcluded` —— 原先改 registry 的该字段
+    //    **行为完全不变**（宿主侧另有一份副本），是「唯一真相源」名不副实的一处。
+    //    ⚠️ 用 `=== true` 而不是 truthy：该字段可选，省略 = 不排除。
+    return descriptorOf(provider)?.autoCheckinExcluded === true;
 }
 /** 把一轮结果拼成一句中文摘要（给状态灯提示与日志用）。 */
 export function describeRun(totals) {

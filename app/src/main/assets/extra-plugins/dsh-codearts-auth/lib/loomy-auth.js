@@ -51,7 +51,7 @@ export const LOOMY_CREDENTIAL_REF = 'LOOMY_ACCESS_TOKEN';
  * 凭据已被判定失效（且**无法续期**）时抛出的错误。
  *
  * ⚠️ `name` 必须恰为 `RefreshTokenExpiredError` ——
- * `src/refresh.ts:21-25` 的 `isRefreshTokenExpired` 用 `error.name` 而非
+ * `src/refresh.ts` 的 `isRefreshTokenExpired` 用 `error.name` 而非
  * `instanceof` 作判据（这些类跨模块 identity 不同）。
  */
 export class RefreshTokenExpiredError extends Error {

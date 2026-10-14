@@ -119,6 +119,15 @@ var STYLES = `
 /* Gemini Code Assist：内联 SVG 自带蓝紫渐变星形，白底容器中显示清晰。
    ⚠️ 本文件的样式整体是一个模板字符串 —— 注释里**不能出现反引号**（会提前终止）。 */
 .dim-jh-providerIcon.gemini { background: white; }
+/* Accio（阿里）：内联 SVG 自带品牌橙圆角方块 + 白色 A 字，白底容器中显示清晰。
+   ⚠️ 本文件的样式整体是一个模板字符串 —— 注释里**不能出现反引号**（会提前终止）。 */
+.dim-jh-providerIcon.accio { background: white; }
+/* OfficeAce（华为 MaaS / 果办）：内联 SVG **自带不透明红底 + 白字 OA**，
+   故容器用 transparent（与 zcode 同因：图标自己不透明，再叠白底是多余的）。
+   ⚠️ 这一条是 2026-10-13 合并审计补的 —— 此前 provider-icons.js 的注释
+      声称「样式见本文件」，而本文件**零命中 officeace**（注释失实且无守卫）。
+   ⚠️ 本文件的样式整体是一个模板字符串 —— 注释里**不能出现反引号**（会提前终止）。 */
+.dim-jh-providerIcon.officeace { background: transparent; }
 /* 聚合 provider：内联 SVG（三渠道汇聚），白底容器中显示清晰。
    ⚠️ 加这一条是必要的 —— 上面每家的 logoClass 都各自声明了背景，
       没有兜底规则，缺了会让聚合的图标容器**没有背景**（与其它行不一致）。 */
@@ -194,6 +203,18 @@ var STYLES = `
 .dim-jh-metaRow dd.dim-jh-creditValue { display: flex; flex-direction: row; align-items: baseline; gap: 6px; overflow: visible; }
 .dim-jh-creditTotal { font-size: 13px; font-weight: 600; color: #1677ff; font-variant-numeric: tabular-nums; }
 .dim-jh-creditPackages { font-size: 11px; color: var(--dsw-alias-label-tertiary, #8f959e); }
+/* 分桶说明（三档带色）：永久绿 / 长期黄 / 临期红 + 倒计时（用户 2026-10-12）。
+   ⚠️ 颜色语义与 credit-expiry.js 的 expirySplitParts 一一对应：
+     permanent（服务端没给到期时间，真·永久）→ ok 绿
+     longTerm（有到期时间但还早）              → warn 黄
+     expiring（窗口内，再不用就作废）          → error 红
+   ⚠️ 与 .dim-jh-badgeNotePart 同一套 tone 变量（深浅主题各自有定义）。 */
+.dim-jh-creditPoolPart { font-size: 11px; font-variant-numeric: tabular-nums; }
+.dim-jh-creditPoolPart[data-tone="ok"] { color: var(--dsw-alias-state-success-primary, #15803d); }
+.dim-jh-creditPoolPart[data-tone="warn"] { color: var(--dsw-alias-state-warn-primary, #b45309); }
+.dim-jh-creditPoolPart[data-tone="error"] { color: var(--dsw-alias-state-error-primary, #d93025); }
+.dim-jh-creditPoolPart[data-tone="muted"] { color: var(--dsw-alias-label-tertiary, #8f959e); }
+.dim-jh-creditPoolSep { font-size: 11px; color: var(--dsw-alias-label-tertiary, #8f959e); }
 /* 已失效额度：弱化的橙色提示，与主数值的蓝色明确区分 */
 .dim-jh-creditExpired { font-size: 11px; color: #b45309; }
 
@@ -914,6 +935,14 @@ var STYLES = `
 .dim-jh-badgeBtn { box-sizing: border-box; display: flex; align-items: center; gap: 5px; max-width: 216px; min-width: 0; padding: 2px 9px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 999px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-secondary); font: inherit; font-size: 11px; line-height: 1.5; cursor: pointer; white-space: nowrap; font-variant-numeric: tabular-nums; transition: background .15s ease, color .15s ease, border-color .15s ease; }
 .dim-jh-badgeBtn:hover { background: var(--dsw-alias-bg-layer-3); color: var(--dsw-alias-label-primary); }
 .dim-jh-badgeBtn[aria-expanded="true"] { background: var(--dsw-alias-bg-layer-3); color: var(--dsw-alias-label-primary); border-color: color-mix(in srgb, #1677ff 45%, var(--dsw-alias-border-l2)); }
+/* 聚合「待首次请求」占位胶囊（用户报障 2026-10-08：「也没胶囊了？」）。
+   ⚠️ 刻意与 .dim-jh-badgeBtn **外观一致但不共用类名**：那个类名带 cursor:pointer
+   与 :hover 反馈，而这里没有任何可点的东西（无历史 ⇒ 没有余额可展开）。
+   给一个点了没反应的按钮比没有按钮更糟。
+   ⚠️ 宽度口径与 .dim-jh-badgeBtn 同步（gap 5px / padding 2px 9px / 字号 11px）：
+   两者会在同一位置交替出现（首次请求成功后换成真胶囊），尺寸不一致会看到跳动。 */
+.dim-jh-badgePending { display: inline-flex; align-items: center; gap: 5px; max-width: 216px; min-width: 0; padding: 2px 9px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 999px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-tertiary); font-size: 11px; line-height: 1.5; white-space: nowrap; }
+.dim-jh-badgePending > span:last-child { overflow: hidden; text-overflow: ellipsis; }
 /* 三段式文本容器：渠道名 + 分隔符 + 读数。
    ⚠️ 必须是 flex 容器，两个文本子项才能各自独立收缩（这正是「数字不被截」的前提）。 */
 .dim-jh-badgeText { display: flex; align-items: center; min-width: 0; }
@@ -1037,6 +1066,18 @@ var STYLES = `
 .dim-jh-badgeRowHead { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; font-size: 11px; color: var(--dsw-alias-label-primary); }
 .dim-jh-badgeRowName { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dim-jh-badgeRowNote { font-size: 10px; line-height: 14px; color: var(--dsw-alias-label-tertiary); }
+/* 分桶说明的**逐段带色**（用户 2026-10-12：永久绿 / 长期黄 / 临期红 + 倒计时）。
+   ⚠️ 颜色语义与 credit-expiry.js 的 expirySplitParts 一一对应，改一处要改两处：
+     permanent（服务端没给到期时间，真·永久）→ ok 绿
+     longTerm（有到期时间但还早）              → warn 黄
+     expiring（窗口内，再不用就作废）          → error 红
+   ⚠️ 用 tone 变量而不是硬编码色值：深浅色主题各自有定义（与 .dim-jh-badgeDot 同源）。 */
+.dim-jh-badgeNotePart { font-variant-numeric: tabular-nums; }
+.dim-jh-badgeNotePart[data-tone="ok"] { color: var(--dsw-alias-state-success-primary, #15803d); }
+.dim-jh-badgeNotePart[data-tone="warn"] { color: var(--dsw-alias-state-warn-primary, #b45309); }
+.dim-jh-badgeNotePart[data-tone="error"] { color: var(--dsw-alias-state-error-primary, #d93025); }
+.dim-jh-badgeNotePart[data-tone="muted"] { color: var(--dsw-alias-label-tertiary); }
+.dim-jh-badgeNoteSep { color: var(--dsw-alias-label-tertiary); }
 /* 窗口：**一行**放下 名称 / 进度条 / 百分比 / 重置倒计时。
    ⚠️ 用户 2026-10-02 明确口径（附截图）：「像两边对齐，但进度条要一样长，文字部分
    左右分别对齐」⇒ 用**共享列宽的 grid**（不是整块居中、也不是每行各自 flex）：
@@ -1115,6 +1156,17 @@ var STYLES = `
 .dim-jh-aggToggleOff { color: var(--dsw-alias-label-tertiary); text-decoration: line-through; }
 .dim-jh-aggFooter { display: flex; flex-direction: column; gap: 2px; padding-top: 8px; border-top: 1px solid var(--dsw-alias-border-secondary); }
 .dim-jh-aggFooter p { margin: 0; font-size: 11px; line-height: 1.7; color: var(--dsw-alias-label-tertiary); }
+
+/* ── Accio：**没有**专属样式 ──
+   ⚠️ 2026-10-13 删除了原先的「专属积分区」整段（dim-jh-accioPanel /
+   accioHead / accioAccount* / accioCountdown / accioBuckets* 共 12 条）。
+   原因：用户报障「accio 的显示和别的 provider 没统一，例如 loomy 的」——
+   accio 原先另起一个独立区块，现改为与 loomy 同形（积分行直接进账号卡片，
+   三类桶由 formatNamedPoolLine 逐池列出、倒计时作为同一行内的附注）。
+   ⇒ 那 12 条样式已零引用，留着就是死代码（且会让人以为还有那个面板）。
+   ⚠️ 图标底色 .dim-jh-providerIcon.accio 在文件上方，**仍在用**，别一起删。
+   ⚠️ 本文件整体是模板字符串：注释里**绝不能出现反引号**（会提前闭合，
+   esbuild 的报错会指向注释行、看起来像 CSS 写错）。本条注释就曾踩过。 */
 
 /* ══════════════════════════════════════════════════════════════════════
    dsh-launcher 移动端适配（新增层，本文件唯一一段本地样式扩展）
@@ -1337,202 +1389,308 @@ function ensureJetHubStyles() {
 // plugin-src/client/jet-hub.js
 var React2 = __toESM(require("react"), 1);
 
+// src/provider-registry.ts
+var PROVIDER_REGISTRY = Object.freeze([
+  {
+    id: "codearts",
+    label: "CodeArts (华为云)",
+    displayName: "CodeArts (华为云)",
+    logoClass: "codearts",
+    credits: { balance: true, dailyCheckin: true },
+    settingsNamespace: "llm-codearts",
+    channel: true
+  },
+  {
+    id: "buddy",
+    label: "CodeBuddy (腾讯)",
+    displayName: "CodeBuddy (腾讯)",
+    logoClass: "buddy",
+    credits: { balance: true, dailyCheckin: true },
+    creditPackages: true,
+    permanentLock: true,
+    usesExpiryWindow: true,
+    settingsNamespace: "llm-buddy",
+    channel: true
+  },
+  {
+    id: "workbuddy",
+    label: "WorkBuddy (国际版)",
+    displayName: "WorkBuddy (国际版)",
+    logoClass: "workbuddy",
+    // ⚠️ 国际版后端**没有**签到接口（内核里只有 `get-dosage-notify` 用量通知）。
+    credits: { balance: true, dailyCheckin: false },
+    creditPackages: true,
+    permanentLock: true,
+    usesExpiryWindow: true,
+    settingsNamespace: "llm-workbuddy",
+    channel: true
+  },
+  {
+    id: "lobsterai",
+    label: "LobsterAI (有道)",
+    displayName: "LobsterAI (有道)",
+    logoClass: "lobsterai",
+    credits: { balance: true, dailyCheckin: true },
+    creditPackages: true,
+    permanentLock: true,
+    usesExpiryWindow: true,
+    settingsNamespace: "llm-lobsterai",
+    channel: true
+  },
+  {
+    id: "qoder",
+    label: "Qoder",
+    displayName: "Qoder",
+    logoClass: "qoder",
+    credits: { balance: true, dailyCheckin: true },
+    creditPackages: true,
+    settingsNamespace: "llm-qoder",
+    channel: true
+  },
+  {
+    id: "qodercn",
+    label: "Qoder (中国版)",
+    displayName: "Qoder (中国版)",
+    logoClass: "qodercn",
+    credits: { balance: true, dailyCheckin: true },
+    creditPackages: true,
+    settingsNamespace: "llm-qodercn",
+    channel: true
+  },
+  {
+    id: "trae",
+    label: "TRAE (字节)",
+    displayName: "TRAE (字节)",
+    logoClass: "trae",
+    credits: { balance: true, dailyCheckin: true },
+    creditPackages: true,
+    permanentLock: true,
+    usesExpiryWindow: true,
+    settingsNamespace: "llm-trae",
+    channel: true
+  },
+  {
+    id: "cline",
+    label: "Cline",
+    displayName: "Cline",
+    logoClass: "cline",
+    // ⚠️ 无签到：对整个 sidecar 二进制做字符串扫描，`checkin` / `campaign` 等
+    //    均无 Cline 业务端点命中。
+    // `subscriptionQuota` 是**本表唯一**具备该项的渠道（5 小时 / 周 / 月窗口）。
+    credits: { balance: true, dailyCheckin: false, subscriptionQuota: true },
+    settingsNamespace: "llm-cline",
+    channel: true
+  },
+  {
+    id: "loomy",
+    label: "Loomy (讯飞)",
+    displayName: "Loomy (讯飞)",
+    logoClass: "loomy",
+    credits: { balance: true, dailyCheckin: true, onboardingTasks: true },
+    // ⚠️ Loomy **不返回限流错误**：今日赠送额度用完后，服务端继续扣永久积分且
+    //    照常返回（静默降级）⇒「重测 / 重置」对它毫无意义（重测还会白烧积分）。
+    rateLimit: false,
+    permanentLock: true,
+    // ⚠️ 不在 usesExpiryWindow：它**没有窗口概念**，服务端直接给两个命名池。
+    settingsNamespace: "llm-loomy",
+    channel: true
+  },
+  {
+    id: "raccoon",
+    label: "Raccoon (商汤)",
+    displayName: "Raccoon (商汤)",
+    logoClass: "raccoon",
+    // ⚠️ 不登记 `dailyCheckin`，且**这不是遗漏**：实测「每日 300 积分」是服务端
+    //    按日自动发放的（账单 `biz_type: 'daily_grant'`），**没有可调用的签到端点**。
+    //    登记它会让用户每次点击都必然失败。
+    //    `onboardingTasks` 是 3000 分的**幂等一次性**桌面端登录奖励。
+    credits: { balance: true, onboardingTasks: true },
+    settingsNamespace: "llm-raccoon",
+    channel: true
+  },
+  {
+    id: "minimax",
+    label: "MiniMax Code",
+    displayName: "MiniMax Code",
+    logoClass: "minimax",
+    credits: { balance: true, dailyCheckin: true },
+    settingsNamespace: "llm-minimax",
+    channel: true
+  },
+  {
+    id: "zcode",
+    label: "ZCode (智谱)",
+    displayName: "ZCode (智谱)",
+    logoClass: "zcode",
+    // ⚠️ 量纲是 **token 而非积分** —— 能力矩阵回答的是「有没有这项能力」，
+    //    不是「量纲是否一致」；量纲差异在面板与 RPC 层如实标注。
+    credits: { balance: true, dailyCheckin: true },
+    autoCheckinExcluded: true,
+    settingsNamespace: "llm-zcode",
+    channel: true
+  },
+  {
+    id: "opencode",
+    label: "OpenCode",
+    displayName: "OpenCode",
+    logoClass: "opencode",
+    // ⚠️ `balance: true` 但语义**不是余额**而是「**通道可用性**」：Zen 没有公开的
+    //    余额 API（15 个候选路径全 404），故徽标展示我们真正测得到的东西
+    //    （每个通道当前是否可用、是否处于限额冷却），数据全来自本地、零网络请求。
+    //    早期登记为 false 曾把**整个徽标挡死**（组件第一件事就是判这个布尔）。
+    credits: { balance: true, dailyCheckin: false },
+    // ⚠️ 无 settingsNamespace：它不在老契约的 namespace 清单里。
+    channel: true
+  },
+  {
+    id: "gemini",
+    label: "Gemini Code Assist",
+    displayName: "Gemini Code Assist",
+    logoClass: "gemini",
+    // ⚠️ 不登记 dailyCheckin：Cloud Code 免费线是**纯配额制**，
+    //    没有可调用的签到/领取端点（签到是服务端按日自动发放的）。
+    credits: { balance: true, dailyCheckin: false },
+    // ⚠️ 与 loomy 同值但**理由不同**：它确实会回 429、适配器也确实写
+    //    `modelRateLimits`，但限流是**服务端配额窗口制** —— 本地标记清掉、
+    //    重测通过，配额本身一点没恢复，下一次请求立刻又是 429。
+    //    于是这组按钮只剩「白烧配额」与「把受限账号放回池里再撞一次」两种副作用。
+    rateLimit: false,
+    accountTest: true,
+    settingsNamespace: "llm-gemini",
+    channel: true
+  },
+  {
+    id: "officeace",
+    label: "OfficeAce",
+    displayName: "OfficeAce",
+    logoClass: "officeace",
+    // ⚠️ **有**积分余额：数据来自云侧 `GET /v1/subscription`（V11 签名直读，
+    //    与果办界面右上角同源同口径，2026-10-12 扣减实锤），**不依赖 OfficeAce 客户端**。
+    //
+    // ⚠️ `dailyCheckin: false` 但**该渠道确实有签到** —— 这里是**故意**不登记 true：
+    //    签到走的是云侧 `POST /v1/subscription/bonus/claim`，且果办客户端的实现是
+    //    「订阅页一挂载就自动领、**UI 上没有按钮**」（源码 `SubscriptionStateProvider`
+    //    用「年+月+日+时」去重，每小时最多一次）。
+    //    故本渠道的签到在**拉余额时自动完成**（见 `officeace-auth.ts` 的
+    //    `maybeClaimBonus`）—— 登记成 true 会让面板渲染一个手动签到按钮，
+    //    而它背后的 `credits.claim` RPC 对本渠道没有意义（真正的领取是自动的）。
+    //    ⚠️ 语义：该字段表达「是否存在**手动**签到入口」，不是「有没有签到收益」。
+    credits: { balance: true, dailyCheckin: false },
+    // ⚠️ 余额响应里每个积分包都带到期时间（订阅套餐包无固定到期 = 永久桶，
+    //    签到 / 活动包有明确到期）⇒ 可按 `deductionEndTime` 分「永久 / 长期 / 临期」三档。
+    creditPackages: true,
+    permanentLock: true,
+    usesExpiryWindow: true,
+    // ⚠️ `rateLimit: false` 的**真实理由**（2026-10-13 合并审计实测订正）：
+    //    本适配器**根本不写** `modelRateLimits`（`officeace-adapter.ts` 里
+    //    `modelRateLimits` / `updateModelRateLimit` / `markLimited` **零命中**，
+    //    `provider-runtime-wiring.spec.ts` 也把它登记为空数组）⇒
+    //    账号永远没有标记可清 ⇒ 两个按钮点下去**零请求、零清除**（恒惰性）。
+    //    ⚠️ 此前这里写的是「它确实会回 429、适配器也写 `modelRateLimits`，
+    //    但限流由华为云 MaaS 侧按账号配额管理」——**那句失实**（前半个分句是错的），
+    //    真实判据与 accio 同因（「根本没有这组按钮的作用对象」），
+    //    与 loomy / gemini 的「会写但清不掉」**不是同一回事**。
+    rateLimit: false,
+    settingsNamespace: "llm-officeace",
+    channel: true
+  },
+  {
+    id: "accio",
+    label: "Accio (阿里)",
+    displayName: "Accio (阿里)",
+    logoClass: "accio",
+    // ⚠️ 如实登记：Accio **没有签到端点** —— 每日 200 积分由**登录**触发服务端
+    //    发放（`DAILY_REWARD`，24h 有效、不累积），没有可调用的签到 API。
+    //    故 `dailyCheckin` 显式写 false（省略与 false 行为一致，但显式写让
+    //    「想过这件事」在代码里可见）。
+    //    ⚠️ **面板里也没有「刷新每日额度」入口**（2026-10-13 修订）：早先这里写过
+    //    「面板另有一个 accio 专属入口，本质是重新登录」，那条承诺**未兑现**。
+    //    重新登录**既有**账号需要宿主侧新增 RPC —— 现有的 `account.create` 每次都用
+    //    `${provider}-${shortId()}` 现造账号 id 与凭据 ref（`src/jet-hub-rpc.ts`），
+    //    拿它当重登录用会多出一条幽灵账号、而原账号额度一点没刷新；账号的 `region`
+    //    也没下发给客户端；`login.poll` 对已登录账号第一秒就返回 `done: true`。
+    //    ⇒ **该入口尚未实现**，客户端只做诚实展示（三类积分桶 + 重置倒计时 +
+    //    「删除该账号后重新登录」这条手动路径），不渲染任何点不动的控件。
+    credits: { balance: true, dailyCheckin: false },
+    // ⚠️ `rateLimit: false` —— 这里的判据是 registry 自己的落地问法：
+    //    「这个按钮点下去，能不能让用户**少**受限一次？」答否即 false。
+    //    accio 两条都不满足：
+    //    ① 适配器**不写** `modelRateLimits`（`provider-runtime-wiring.spec.ts`
+    //       的 `WRITE_SITE_FILES` 把它登记为空，并由一条用例**验证**它确实无写点）
+    //       ⇒ 账号永远没有标记可清；
+    //    ② `src/index.ts` 的 `probeById` 没有它的条目（该表被守卫锁成**恰好**
+    //       「会写标记的家」）⇒ 点「重测」时 `retestAccount` 走到
+    //       `modelIds.length === 0` 处**提前返回**：零请求、零清除。
+    //    两者叠加 ⇒ 面板级的「重测所有 / 重置所有」与卡片级的两个按钮**全部恒为
+    //    惰性**。那正是本仓库记录过的报障形态（「按钮响应这么快，是不是坏了」）。
+    //    ⚠️ 与 loomy / gemini **理由不同**（它们是真会限流、只是按钮管辖不到）：
+    //    accio 是**根本没有这组按钮的作用对象**。
+    //    ⚠️ 「省略 = true 以免老用户失去按钮」那条理由**不适用于全新 provider**：
+    //    accio 没有存量用户，没有「功能回退」可言。
+    //    ⇒ 将来接上请求级换号 + 冷却（届时必须同时进 `probeById` 与
+    //    `WRITES_RATE_LIMIT_PROVIDERS`）时，**本行要一起改回 true**。
+    rateLimit: false,
+    settingsNamespace: "llm-accio",
+    channel: true
+  },
+  {
+    id: "aggregate",
+    label: "聚合 (跨渠道)",
+    displayName: "聚合 (跨渠道)",
+    logoClass: "aggregate",
+    // ⚠️ 如实登记为 false：它**没有自己的账号与余额** —— 复用各渠道的账号，
+    //    积分与限流由各渠道自己管理。
+    // ⚠️ 这不影响用量徽标：徽标对聚合的处理是「重定向到实际选中的渠道」，
+    //    重定向发生在 `supportsCreditBalance` 门控**之前**。
+    credits: { balance: false, dailyCheckin: false },
+    channel: false
+  }
+]);
+function descriptorOf(id) {
+  return PROVIDER_REGISTRY.find((d) => d.id === id);
+}
+function creditCapabilitiesOf() {
+  const out = {};
+  for (const d of PROVIDER_REGISTRY) {
+    out[d.id] = Object.freeze({
+      balance: d.credits.balance,
+      // ⚠️ `dailyCheckin` 也是**可省略**字段（见 `CreditsCapability` 的注释：
+      //    raccoon 刻意不登记它），故按本函数「缺失即缺失」的规则一并条件拷贝
+      //    —— 这样「raccoon 没有签到端点」这件事在派生表里也是**可见的缺失**，
+      //    而不是一个与 `false` 无法区分的 `undefined`。
+      //    判据侧一律 `=== true`（`supportsDailyCheckin`），故行为不变。
+      ...d.credits.dailyCheckin === void 0 ? {} : { dailyCheckin: d.credits.dailyCheckin },
+      ...d.credits.onboardingTasks === void 0 ? {} : { onboardingTasks: d.credits.onboardingTasks },
+      ...d.credits.subscriptionQuota === void 0 ? {} : { subscriptionQuota: d.credits.subscriptionQuota }
+    });
+  }
+  return out;
+}
+
 // plugin-src/client/credits-capabilities.js
-var CREDITS_CAPABILITIES = Object.freeze({
-  codearts: Object.freeze({ balance: true, dailyCheckin: true }),
-  buddy: Object.freeze({ balance: true, dailyCheckin: true }),
-  workbuddy: Object.freeze({ balance: true, dailyCheckin: false }),
-  lobsterai: Object.freeze({ balance: true, dailyCheckin: true }),
-  // Qoder：余额（`sash/api/v2/me/usage`）+ 每日领取
-  // （`sash/api/v1/me/campaigns` → `POST …/{campaignId}/claim`，
-  // 2026-09-21 由 keylog 解密抓包解出）。
-  // 显式登记而非省略 —— 单测要求本表与 PROVIDERS 同步。
-  qoder: Object.freeze({ balance: true, dailyCheckin: true }),
-  // Qoder **中国版**（`qodercn`）：两项都有，与国际版同形。
-  //
-  // 依据（设计文档 E7/E10）：CN 的 `/sash/api/v2/me/usage` 与
-  // `/sash/api/v1/me/campaigns` 零凭据实测返回 `401 {"code":"TOKEN_INVALID",
-  // "message":"missing authorization token"}`，与国际版**逐字节同形**；
-  // CN asar 里同样是 `Fh = Object.freeze({ clientType: 10, … })`，
-  // 即桌面 app 身份这个值两站共用。
-  //
-  // ⚠️ 「端点存在」不等于「活动一定下发」—— 真实领取由
-  // `pnpm test:e2e:qodercn-credits` 验证。若将来确认 CN 无签到，改这里时
-  // 必须换成强证据（扫 CN asar 无 claim 端点），不要写「某次没看到」：
-  // 国际版正是凭一次 `campaigns:[]` 误判成「无签到」，而真相是那天已领
-  //（活动每日 10:00 UTC+8 刷新）。
-  qodercn: Object.freeze({ balance: true, dailyCheckin: true }),
-  // TRAE：余额与签到都有（`/trae/api/v2/pay/ide_user_ent_usage` +
-  // `checkin_credits/status` → `checkin_credits/claim`，见 `src/trae-credits.ts`）。
-  trae: Object.freeze({ balance: true, dailyCheckin: true }),
-  // Cline：**只有余额**，没有签到。
-  //
-  // 余额：`GET /api/v1/users/{accountId}/balance`
-  // （实测 `{data:{userId, balance:500000}, success:true}`，见 `src/cline-credits.ts`）。
-  //
-  // ⚠️ `dailyCheckin: false` 的依据是**对整个 sidecar 二进制做字符串扫描**：
-  // `checkin` / `check-in` / `daily` / `campaign` 均无任何 Cline 业务端点命中
-  // （`campaign` 的命中是 PostHog 的 UTM 参数与 feature-flag 事件属性；
-  // `daily` 是 YAML cron 别名与 Blob 导出频率枚举）。
-  // 这比「某次调用没看到」强，但仍不等于「永远不存在」—— 若将来 Cline 增加
-  // 签到，需按 Qoder 那次教训重新采集（见 AGENTS.md 的对应章节）。
-  //
-  // `subscriptionQuota`：**订阅额度窗口 + 请求记录**（官方端点，见
-  // `src/cline-quota.ts`）。这是**本表唯一**具备该项的渠道 —— 另外九家的
-  // 订阅计量形状未知（多为按积分余额计费，没有「5 小时 / 周 / 月窗口」这一层），
-  // 故不登记；未登记即不支持，面板也就不渲染按钮、不发请求。
-  cline: Object.freeze({ balance: true, dailyCheckin: false, subscriptionQuota: true }),
-  // Loomy（讯飞）：三项能力齐全，且是**唯一**有第三项（新手任务）的渠道。
-  //
-  // 余额：`GET /api/v1/points/records`（**只读**）—— 刻意不用 `first-login`，
-  //   那是写端点，在面板挂载这种高频路径上调用会意外触发签到。
-  // 每日签到：`POST /api/v1/points/first-login`。⚠️ 语义是「触发每日赠送额度」
-  //   而不是「+5000 积分」：实测 `dailyBalance = dailyQuota - dailyConsumed`
-  //   （4992 = 5000 - 8），消耗后不回补。
-  // 新手任务：`GET/POST /api/v1/onboarding/tasks*`，8 个任务合计 **10000 分**，
-  //   **一次性**（每号只能领一次），故必须与每日签到分开成一个独立按钮 ——
-  //   混进「一键签到」会导致每天对已领完的账号发 8 个必然 alreadyCompleted 的请求。
-  loomy: Object.freeze({ balance: true, dailyCheckin: true, onboardingTasks: true }),
-  // Raccoon Work（商汤小浣熊）：余额 + **一次性**登录奖励。
-  //
-  // 余额：`GET /api/web/points/v1/balance`（**只读**，实测返回
-  //   `{available_points, daily_points, reward_points, topup_points}`）。
-  //
-  // ⚠️ **不登记 `dailyCheckin`，且这不是遗漏** —— 实测「每日 300 积分」是
-  //   **服务端按日自动发放**的（账单里 `biz_type: 'daily_grant'`，
-  //   该账号 13:30 注册、13:31 即到账），**没有可调用的签到端点**。
-  //   把它实现成签到按钮会让用户每次点击都必然失败 ——
-  //   与 CodeArts 早期「对不支持的 provider 无条件发请求」是同一类缺陷。
-  //
-  // 登录奖励：`POST /api/web/desktop/v1/login/points/grant`，3000 分，
-  //   **幂等一次性**（已领过返回 `granted:false` 且账单里能看到上一次记录）。
-  //   语义与 Loomy 的新手任务同构，故登记为 `onboardingTasks` 而**不是**
-  //   `dailyCheckin` —— 后者会让用户以为每天都真的加了额度。
-  //   ⚠️ 该端点**需要** `X-Client-Platform` 头（值见 RaccoonProduct.clientPlatform）。
-  raccoon: Object.freeze({ balance: true, onboardingTasks: true }),
-  // MiniMax Code（中国版）：余额 + 每日签到**都有**（与 raccoon 不同）。
-  //
-  // 余额：`GET /minimax-cloud/api/v1/credit/details`（**只读**，实测返回
-  //   `{total_count, base_resp}`；⚠️ **空明细时 `details` 字段整个缺失**，
-  //   故解析必须容忍缺失 —— 见 `src/minimax-credits.ts` 的 `unwrapEnvelopeData`）。
-  //   ⚠️ 该端点是**平铺响应**（`total_count` 与 `base_resp` 同级、没有 `data` 键），
-  //   与签到端点的信封结构不同。
-  //
-  // 每日签到：`GET /minimax-cloud/api/v1/signin/status?timezone_id=<IANA>` +
-  //   `POST …/signin/claim?timezone_id=<IANA>`（body `{}`）。
-  //   ⚠️ **`timezone_id` 是 query 参数且必填** —— 实测放请求头会回
-  //   `1406010011 invalid timezone_id`，且**那也是 HTTP 200**（只看状态码会误判成功）。
-  //   ⚠️ **`points` 是总数，`bonus_points` 是其中的「额外」部分，不得相加**：
-  //   实测第 1 天 `points: 800` / `bonus_points: 400`，截图按钮即「签到得 800」
-  //   + 右上角「额外 400」角标。相加会虚高一倍（用户 2026-09-28 纠正）。
-  //   ⚠️ 幂等判据是响应体的 `claim_result`（`1`=真领取、`2`=已领过），
-  //   **不是 HTTP 状态码**（重复领取同样返回 200）。
-  minimax: Object.freeze({ balance: true, dailyCheckin: true }),
-  /**
-   * ZCode（智谱）：余额与每日领取**都有**。
-   *
-   * - **余额**：`GET /api/v1/zcode-plan/billing/balance`
-   *   （需 `Authorization: Bearer <zcodejwt>` + `X-Device-Mid`；实测返回
-   *   `{total_units, used_units, remaining_units, period}`）。
-   * - **每日领取**：`event/report`(补活跃信号) → `billing/preview` → `billing/claim`。
-   *   ⚠️ 领取**需要阿里云 captcha**（由本插件的常驻 chromium 产出）。
-   *
-   * ⚠️ 这里如实登记为 `balance: true, dailyCheckin: true`，**尽管 ZCode 的
-   * 额度单位是 token 而不是积分** —— 能力矩阵回答的是「有没有这项能力」，
-   * 不是「量纲是否一致」。量纲差异在面板与 RPC 层如实标注（见
-   * `src/jet-hub-rpc.ts` 里 zcode 的 balances 分支与
-   * `src/zcode-auth.ts` 的 `claimDaily`）。
-   */
-  zcode: Object.freeze({ balance: true, dailyCheckin: true }),
-  /**
-   * OpenCode：**显示**额度行，但语义不是「余额」而是「**通道可用性**」。
-   *
-   * ## 为什么不是 `balance: false`（2026-10-02 改，用户报障「只有 opencode 没有显示」）
-   *
-   * 我曾登记 `balance: false`，理由是「Zen 是按量计费的网关，没有可查询的
-   * 余额数字」。但那个登记**把整个徽标挡死了** —— 组件第一件事就是
-   * `supportsCreditBalance(provider)`，为 false 直接 `return null`，
-   * 用户看到的就是「opencode 没有用量」，而 Zen 明明有额度（余额耗尽会回
-   * `402 Insufficient account funds`）。
-   *
-   * ## 改后的口径
-   *
-   * Zen **没有公开的余额 API**（实测 15 个候选路径全 404，见
-   * `docs/superpowers/specs/2026-10-02-opencode-zen-endpoint-matrix.md`），
-   * 所以徽标展示**我们真正测得到的东西**：每个通道（账号槽 / 匿名通道）
-   * 当前是否可用、是否处于限额冷却。数据来自本地 `modelRateLimits`，
-   * **零网络请求**。宿主侧见 `jet-hub-rpc.ts` 的 `OPENCODE.id` 分支。
-   *
-   * ⚠️ 徽标会显示「N 通道」而非「N 积分」——这是**如实**的，不要改成
-   * 假装有余额数字（那会在用户充值后显示错误的数字）。
-   */
-  opencode: Object.freeze({ balance: true, dailyCheckin: false }),
-  /**
-   * Gemini Code Assist（Google Cloud Code 免费线）：**只有余额**，没有签到。
-   *
-   * - **余额**：`POST /v1internal:retrieveUserQuotaSummary`（**只读**），
-   *   返回 `{groups:[{displayName, buckets:[…]}]}`，我们只取两个桶：
-   *   `gemini-5h`（5 小时窗口）与 `gemini-weekly`（周窗口）。
-   *   ⚠️ 量纲是**剩余比例**（`remainingFraction`，0~1）而不是积分 ——
-   *   面板按百分比展示，与 ZCode 的 token 量纲同理，能力矩阵只回答
-   *   「有没有这项能力」，量纲差异在卡片上如实标注。
-   *
-   * - ⚠️ **不登记 `dailyCheckin`，且这不是遗漏** —— Cloud Code 免费线是
-   *   纯配额制，**没有可调用的签到/领取端点**。登记它会让用户每次点击都
-   *   必然失败（与 Raccoon 那条同因：签到是服务端按日自动发放的）。
-   *
-   * - ⚠️ 未授权时后端返回 `{balance: null, error: '尚未授权 Google 账号'}`，
-   *   卡片显示原因而不是 0 —— 与「配额真的用完了」是**两回事**。
-   */
-  gemini: Object.freeze({ balance: true, dailyCheckin: false }),
-  /**
-   * 聚合 provider（跨渠道临期优先）。
-   *
-   * ⚠️ **如实登记为 `false`**：它**没有自己的账号与余额** —— 它复用各渠道的账号，
-   * 积分与限流由各渠道自己管理（见 `aggregate-panel-logic.js` + `jet-hub.js` 的 `AggregatePanel` 的说明区）。
-   *
-   * ⚠️ 这一项**不影响**用量徽标能否工作：徽标对聚合的处理是「重定向到实际选中的
-   * 渠道」（P3），重定向发生在 `supportsCreditBalance` 门控**之前**，门控看到的
-   * `provider` 已是真实渠道。故这里填 `false` 是**诚实**的，不是「为了绕过门控」。
-   *
-   * ⚠️ 它也顺带保证聚合面板**不长出**「刷新积分 / 一键领取」按钮 ——
-   * 那两处的门控（`canLoadCredits` / `supportsCredits`）读同一张表。
-   */
-  aggregate: Object.freeze({ balance: false, dailyCheckin: false })
-});
-var RATE_LIMIT_CAPABILITIES = Object.freeze({
-  // Loomy（讯飞）：**不返回限流错误** —— 积分耗尽时静默降级为扣永久积分，
-  // 故「重测 / 重置」这组按钮对它无意义（重测还会白烧积分）。
-  loomy: Object.freeze({ rateLimit: false }),
-  // Gemini（Google Cloud Code）：**理由与 Loomy 不同** —— 它确实会回 429，
-  // `gemini-adapter.ts` 也确实会写 `modelRateLimits`（60s 冷却 / 401 时 300s）。
-  // 但它的限流是**服务端配额窗口制**（5 小时窗口 + 周窗口），不是「等一会儿
-  // 就好」的临时冷却：本地标记清掉、重测通过，配额本身一点没恢复，下一次
-  // 请求立刻又是 429。于是这组按钮对 Gemini 只剩副作用：
-  //   - 「重测」会对每个被标记的模型**真发一条消息**，白烧本就紧张的窗口配额，
-  //     且结论恒为「仍然受限」（判据见 `src/account-probe.ts` 的 `retestAccount`）；
-  //   - 「重置」只清本地标记，把账号重新放回可选用池，随即再撞 429 再写回来。
-  // 真正能改变状态的动作是**换账号**或**等窗口 resetTime**，两者都不在这组按钮里。
-  // 用户报障原文：「重测按钮你确认过会发请求吗，为什么响应这么快？可以移除吗」
-  // （响应快是因为当时该账号没有 `modelRateLimits` 标记，`retestAccount` 在
-  // `modelIds.length === 0` 处提前返回，一次请求都没发）。
-  gemini: Object.freeze({ rateLimit: false })
-});
+var CREDITS_CAPABILITIES = Object.freeze(creditCapabilitiesOf());
+var RATE_LIMIT_CAPABILITIES = Object.freeze(
+  Object.fromEntries(
+    PROVIDER_REGISTRY.filter((d) => d.rateLimit === false).map((d) => [d.id, Object.freeze({ rateLimit: false })])
+  )
+);
 function supportsRateLimit(provider) {
   return RATE_LIMIT_CAPABILITIES[provider]?.rateLimit !== false;
 }
-var ACCOUNT_TEST_CAPABILITIES = Object.freeze({
-  gemini: Object.freeze({ test: true })
-});
+var ACCOUNT_TEST_CAPABILITIES = Object.freeze(
+  Object.fromEntries(
+    PROVIDER_REGISTRY.filter((d) => d.accountTest === true).map((d) => [d.id, Object.freeze({ test: true })])
+  )
+);
 function supportsAccountTest(provider) {
   return ACCOUNT_TEST_CAPABILITIES[provider]?.test === true;
 }
 var PERMANENT_LOCK_EXPIRING_WINDOW_DAYS = 15;
 function supportsPermanentLock(provider) {
-  return provider === "loomy" || provider === "buddy" || provider === "workbuddy" || provider === "trae" || provider === "lobsterai";
+  return descriptorOf(provider)?.permanentLock === true;
 }
 function supportsCreditPackageList(provider) {
-  return provider === "buddy" || provider === "workbuddy" || provider === "lobsterai" || provider === "qoder" || provider === "qodercn" || provider === "trae";
+  return descriptorOf(provider)?.creditPackages === true;
 }
 function permanentLockCopy(provider, windowDays) {
   if (provider === "buddy" || provider === "workbuddy" || provider === "trae" || provider === "lobsterai") {
@@ -1911,17 +2069,27 @@ function splitCreditsByExpiry(packages, windowDays, now) {
   const windowMs = days * DAY_MS;
   const at = typeof now === "number" && Number.isFinite(now) ? now : Date.now();
   let expiring = 0;
+  let longTerm = 0;
   let permanent = 0;
+  let earliestExpiringAt = null;
   for (const pkg of packages) {
     if (!pkg || pkg.active !== true) continue;
     const remaining = Number(pkg.remaining);
     if (!Number.isFinite(remaining) || remaining <= 0) continue;
     const end = Number(pkg.deductionEndTime);
     const known = Number.isFinite(end) && end > 0;
-    if (known && end - at < windowMs) expiring += remaining;
-    else permanent += remaining;
+    if (!known) {
+      permanent += remaining;
+      continue;
+    }
+    if (end - at < windowMs) {
+      expiring += remaining;
+      if (end > at && (earliestExpiringAt === null || end < earliestExpiringAt)) earliestExpiringAt = end;
+    } else {
+      longTerm += remaining;
+    }
   }
-  return { expiring, permanent };
+  return { expiring, longTerm, permanent, earliestExpiringAt };
 }
 function expiryBucketLabel(pkg, windowDays, now) {
   const days = normalizeWindowDays2(windowDays);
@@ -1932,10 +2100,47 @@ function expiryBucketLabel(pkg, windowDays, now) {
 }
 function formatExpirySplitLine(split, format) {
   if (!split) return null;
-  const expiring = format(split.expiring);
-  const permanent = format(split.permanent);
-  if (expiring === null || permanent === null) return null;
-  return `长期 ${permanent} · 临时 ${expiring}`;
+  const parts = [];
+  const permanent = split.permanent > 0 ? format(split.permanent) : null;
+  const longTerm = split.longTerm > 0 ? format(split.longTerm) : null;
+  const expiring = split.expiring > 0 ? format(split.expiring) : null;
+  if (permanent !== null) parts.push(`永久 ${permanent}`);
+  if (longTerm !== null) parts.push(`长期 ${longTerm}`);
+  if (expiring !== null) parts.push(`临期 ${expiring}`);
+  return parts.length === 0 ? null : parts.join(" · ");
+}
+function expirySplitParts(split, format, now) {
+  if (!split) return [];
+  const parts = [];
+  const permanent = split.permanent > 0 ? format(split.permanent) : null;
+  const longTerm = split.longTerm > 0 ? format(split.longTerm) : null;
+  const expiring = split.expiring > 0 ? format(split.expiring) : null;
+  if (permanent !== null) parts.push({ key: "permanent", text: `永久 ${permanent}`, tone: "ok" });
+  if (longTerm !== null) parts.push({ key: "longTerm", text: `长期 ${longTerm}`, tone: "warn" });
+  if (expiring !== null) {
+    const at = split.earliestExpiringAt;
+    const countdown = typeof at === "number" && Number.isFinite(at) && at > 0 ? expiryCountdown(at, now) : "";
+    parts.push({
+      key: "expiring",
+      text: `临期 ${expiring}`,
+      tone: "error",
+      ...countdown.length > 0 ? { countdown } : {}
+    });
+  }
+  return parts;
+}
+function expiryCountdown(expiresAtMs, now) {
+  const at = Number(expiresAtMs);
+  if (!Number.isFinite(at) || at <= 0) return "";
+  const ref = typeof now === "number" && Number.isFinite(now) ? now : Date.now();
+  if (at <= ref) return "";
+  const minutes = Math.ceil((at - ref) / 6e4);
+  const days = Math.floor(minutes / 1440);
+  const hours = Math.floor(minutes % 1440 / 60);
+  const mins = minutes % 60;
+  if (days > 0) return `${days} 天 ${hours} 小时`;
+  if (hours > 0) return `${hours} 小时 ${mins} 分钟`;
+  return `${mins} 分钟`;
 }
 var DAILY_POOL_NAMES = ["每日赠送", "每日积分"];
 function findDailyPool(packages) {
@@ -1955,6 +2160,20 @@ function formatPoolSplitLine(packages, format, longTermLabel = "长期") {
   const restValue = format(restSum);
   if (dailyValue === null || restValue === null) return null;
   return `${longTermLabel} ${restValue} · 每日 ${dailyValue}`;
+}
+function formatNamedPoolLine(packages, format) {
+  if (!Array.isArray(packages)) return null;
+  const parts = [];
+  for (const pkg of packages) {
+    if (!pkg || pkg.active !== true) continue;
+    const name2 = typeof pkg.name === "string" ? pkg.name.trim() : "";
+    if (name2 === "") continue;
+    const value = format(Number(pkg.remaining) || 0);
+    if (value === null) return null;
+    const short = name2.endsWith("积分") ? name2.slice(0, -2) : name2;
+    parts.push(`${short} ${value}`);
+  }
+  return parts.length === 0 ? null : parts.join(" · ");
 }
 function packageExpiryMs(pkg) {
   const dedEnd = Number(pkg && pkg.deductionEndTime);
@@ -2027,12 +2246,14 @@ function allModelsDisabled(models) {
 }
 
 // plugin-src/client/new-account.js
+var PROVIDERS_ASKING_OPTIONS = Object.freeze(["zcode", "accio"]);
 function newAccountAsksChannel(provider) {
-  return provider === "zcode";
+  return PROVIDERS_ASKING_OPTIONS.includes(provider);
 }
-function buildCreateAccountPayload(provider, zcodeProvider) {
-  if (provider !== "zcode") return { provider };
-  return { provider, zcodeProvider };
+function buildCreateAccountPayload(provider, zcodeProvider, accioRegion) {
+  if (provider !== "zcode" && provider !== "accio") return { provider };
+  if (provider === "zcode") return { provider, zcodeProvider };
+  return { provider, accioRegion };
 }
 
 // plugin-src/client/model-bulk.js
@@ -2070,6 +2291,125 @@ function filterModels(models, options = {}) {
 function isFilterActive(options = {}) {
   const query = typeof options.query === "string" ? options.query.trim() : "";
   return query.length > 0 || normalizeStatusFilter(options.status) !== "all";
+}
+
+// src/openai-gateway/config.ts
+var INVISIBLE = /[\p{Cf}\p{Cc}\p{Cs}\p{Mn}\p{Me}\p{Zs}\p{Zl}\p{Zp}]/gu;
+function normalizeHostForCompare(host) {
+  let value = host.normalize("NFKC").replace(INVISIBLE, "");
+  const bracketed = /^\[([^\]]*)\](?::\d*)?$/.exec(value);
+  if (bracketed !== null) {
+    value = bracketed[1];
+  } else if (/^[^:]+:\d*$/.test(value)) {
+    value = value.slice(0, value.lastIndexOf(":"));
+  }
+  while (value.startsWith("[") && value.endsWith("]") && value.length > 2) {
+    value = value.slice(1, -1);
+  }
+  if (value.includes(":")) {
+    const zone = value.indexOf("%");
+    if (zone > 0) value = value.slice(0, zone);
+  }
+  return value;
+}
+function stripHostBrackets(host) {
+  let value = host.normalize("NFKC").replace(INVISIBLE, "");
+  const bracketed = /^\[([^\]]*)\](?::\d*)?$/.exec(value);
+  if (bracketed !== null) {
+    value = bracketed[1];
+  } else if (/^[^:]+:\d*$/.test(value)) {
+    value = value.slice(0, value.lastIndexOf(":"));
+  }
+  while (value.startsWith("[") && value.endsWith("]") && value.length > 2) {
+    value = value.slice(1, -1);
+  }
+  return value;
+}
+function formatGatewayHost(host) {
+  const value = stripHostBrackets(host);
+  const zone = value.includes(":") ? value.indexOf("%") : -1;
+  const bare = zone > 0 ? value.slice(0, zone) : value;
+  return bare.includes(":") ? `[${bare}]` : bare;
+}
+function gatewayHttpUrl(host, port, suffix = "") {
+  return `http://${formatGatewayHost(host)}:${port}${suffix}`;
+}
+function expandIpv6(value) {
+  const text = value.toLowerCase();
+  if (!/^[0-9a-f:.]+$/.test(text)) return void 0;
+  const halves = text.split("::");
+  if (halves.length > 2) return void 0;
+  const parse = (part) => {
+    if (part === "") return [];
+    const groups = part.split(":");
+    const out = [];
+    for (let index = 0; index < groups.length; index++) {
+      const group = groups[index];
+      if (group.includes(".")) {
+        if (index !== groups.length - 1) return void 0;
+        const octets = group.split(".");
+        if (octets.length !== 4) return void 0;
+        const nums = octets.map((octet) => /^\d{1,3}$/.test(octet) ? Number(octet) : Number.NaN);
+        if (nums.some((num) => !Number.isInteger(num) || num < 0 || num > 255)) return void 0;
+        out.push(nums[0] << 8 | nums[1], nums[2] << 8 | nums[3]);
+        continue;
+      }
+      if (!/^[0-9a-f]{1,4}$/.test(group)) return void 0;
+      out.push(Number.parseInt(group, 16));
+    }
+    return out;
+  };
+  const head = parse(halves[0]);
+  if (head === void 0) return void 0;
+  if (halves.length === 1) return head.length === 8 ? head : void 0;
+  const tail = parse(halves[1]);
+  if (tail === void 0) return void 0;
+  const missing = 8 - head.length - tail.length;
+  if (missing < 1) return void 0;
+  return [...head, ...Array.from({ length: missing }, () => 0), ...tail];
+}
+function parseIpv4(value) {
+  const text = value.endsWith(".") ? value.slice(0, -1) : value;
+  const parts = text.split(".");
+  if (parts.length === 0 || parts.length > 4) return void 0;
+  const nums = [];
+  for (const part of parts) {
+    if (part === "") return void 0;
+    let num;
+    if (/^0[xX][0-9a-fA-F]+$/.test(part)) {
+      num = Number.parseInt(part.slice(2), 16);
+    } else if (/^0[0-7]+$/.test(part)) {
+      num = Number.parseInt(part.slice(1), 8);
+    } else if (/^\d+$/.test(part)) {
+      num = Number(part);
+    } else {
+      return void 0;
+    }
+    if (!Number.isSafeInteger(num) || num < 0) return void 0;
+    nums.push(num);
+  }
+  const last = nums[nums.length - 1];
+  const limit = 256 ** (4 - nums.length + 1);
+  if (last >= limit) return void 0;
+  for (const num of nums.slice(0, -1)) if (num > 255) return void 0;
+  let result = 0;
+  for (const num of nums.slice(0, -1)) result = result << 8 | num;
+  return result * limit + last >>> 0;
+}
+function isLoopbackHost(host) {
+  const value = normalizeHostForCompare(host).toLowerCase();
+  if (value === "") return true;
+  if (value === "localhost" || value.endsWith(".localhost")) return true;
+  if (!value.includes(":")) {
+    const ipv4 = parseIpv4(value);
+    if (ipv4 === void 0) return false;
+    return ipv4 >>> 24 === 127;
+  }
+  const groups = expandIpv6(value);
+  if (groups === void 0) return false;
+  if (groups.slice(0, 7).every((group) => group === 0) && groups[7] === 1) return true;
+  const mapped = groups.slice(0, 5).every((group) => group === 0) && groups[5] === 65535;
+  return mapped && groups[6] >>> 8 === 127;
 }
 
 // plugin-src/client/openai-gateway-panel.js
@@ -2250,7 +2590,24 @@ function gatewayButtonTitle(status) {
 function gatewayEndpoint(status) {
   const address = status?.address;
   if (!address) return "";
-  return `http://${address.host}:${address.port}/v1`;
+  return gatewayHttpUrl(address.host, address.port, "/v1");
+}
+function gatewayLoopbackOnly(status) {
+  const host = status?.address?.host;
+  if (typeof host !== "string" || host.trim() === "") return true;
+  return isLoopbackHost(host);
+}
+function nonLoopbackNotice(status) {
+  const address = status?.address;
+  const host = typeof address?.host === "string" && address.host.trim() !== "" ? address.host : "非回环地址";
+  return `监听地址是 ${host}（不再是本机回环）：只应在容器/端口映射场景使用，此时同一容器网络内的其它容器与宿主都能连到这个端口。仅本机使用时把 DSH_OPENAI_GATEWAY_HOST 改回 127.0.0.1（或删除该环境变量）并重启。`;
+}
+function gatewayFootnote(status) {
+  if (status?.running && !gatewayLoopbackOnly(status)) {
+    const host = typeof status.address?.host === "string" ? status.address.host : "非回环地址";
+    return `网关绑定在 ${host}，同一容器网络内的其它容器与宿主都能连到该端口 —— 隔离只靠密钥，不要把它配置进任何浏览器端工具或扩展。仅本机使用时把 DSH_OPENAI_GATEWAY_HOST 改回 127.0.0.1（或删除该环境变量）并重启。`;
+  }
+  return "网关只绑定 127.0.0.1，但这挡不住同机的其它用户或进程 —— 真正的隔离靠密钥，不要把它配置进任何浏览器端工具或扩展。";
 }
 function gatewayStatusLines(status) {
   if (!status) return ["正在读取网关状态…"];
@@ -2271,7 +2628,12 @@ function gatewayStatusLines(status) {
       "推荐使用 CC Switch 进行网关配置。",
       "协议支持：OpenAI Chat Completions 与 OpenAI Responses API。",
       // 地址单列一行（带端口），它是用户要抄走的东西。
-      endpoint ? `API 请求地址：${endpoint}` : ""
+      endpoint ? `API 请求地址：${endpoint}` : "",
+      // ⚠️ 暴露面变了必须**明说**（issue IKL7UN）。原先「只绑定 127.0.0.1」是
+      // 常量文案，host 可配之后它就是错误陈述 —— 用户会以为「外面连不上是
+      // 设计如此」而放弃排查。反之，回环部署下**不加这句**，避免把刚精简过的
+      // 三行文案重新撑肿（精简是用户 2026-10-04 的明确要求）。
+      gatewayLoopbackOnly(status) ? "" : nonLoopbackNotice(status)
     ].filter(Boolean);
   }
   if (status.enabled) {
@@ -3159,8 +3521,7 @@ function createdAtMs(record) {
   return Date.now();
 }
 
-// plugin-src/client/jet-hub.js
-var JET_HUB_RPC_CHANNEL = "/jet-hub";
+// plugin-src/client/provider-icons.js
 var CODEARTS_ICON = "data:image/png;base64,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";
 var CODEBUDDY_ICON = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEYAAABGCAYAAABxLuKEAAAQAElEQVR4AdRbaZRV1ZX+zn2vZuZREAQEBBFQBEwT0YBKcEAcE8ek1dhtYujVK1ltVmekiN0rSaeTjiYmGpOOJqaTtWwNJtpqEhWHVhEHHAKISFSiyFRQVBU1vHr39PftO7z7Xr0SktU/4lv3e3ufffY5Z+/v7nPefa9WBTjE17Xn+uNWnO0fycBTfz8ginm5b1YOh5guDkrMiuXF5hVnhz4o+hcAvygDruHfD4hi9n6lclAuyomBv+fVLzErlhUWcZJH4LESEAHl8/gqNnlEdvlHqGzLp4TIp7yt1TQq6SvX1VvyjzTvPcLQgyIyxO+0UKsyD3NacXbRvxdBVYlZsazY7BE84r1fpMUieC4cQ6RwPfaXbHRS27qsjylQpm2FyLZ8DOxgk+PpJ93GU6dkkwovOqiptmQJcRw0iJABg4HDJwINTT4myHNeDS7NQVc2eEVm9lMPsVK5MrQ+Vx9iWCnNnHYlFE1/SFbpr7+avXKM2oJ8Eyn9z4DnuNHjgHOvcLj40w7nXeUwfjIjp53vTJYsVJsv069clTOdy64yYuTg4VaWefyVNpTboKHAkgtJxhSgrh6YNA1Y/rcOU2bCKuJQQ1fOyj3rnxJz7bJCcwisJIPk+K//Pch5/M1pDkeQFJEEF5ExdCRw5iUBJh+DaFsdYjbKneTwoI7oSYkB/EpwkvcDdK5Mmg7MOoFsMA9HkUApDBkOnHFRgHFHMhseynynlz8o6LGSTnYZMdcu627WhO8HeM9DthE4YXHAwxYqFKSkxASBrxGHkZyLAwxjBXmWw6HkxjNrkXHB8UYMB9kWAhVtIslqSPoSWemTtSd6Iit91U76Diblm8CzAqbOcpgw1UEkOWaQEJPoIEHkjwexw2kXBKhr4Ap05jtTVk9fJH10W0knBNee2XNcaiQxINSuhqQvkZU+WXuiJ7LSV+2k72BSvgZG3TAAOH5hgJpaICXEVdfB1zHzAixYEsAFERk2T5UcszGIkwBB8VyOf19cLBZMmeFw+CQywYgdhSFAiaSMDvbncsCJS3OYOivgYYxDenkX/kfgPT4ktqqCnVXtiNiv2veXjHmv+eI+7n/U1XscuyBALatFSYuUREqvBjHRNBA47fwcho5gxGI3npMtdlfPhfyyL77kIjWVTq3ScLXSPjWIPm2OETcG9uvq4yNjBbI+0oWsi86W8ZMDfjwHllY1EvqzKZbxRzqcfGYOAStI7fcEF+bO84s8lxJ0mplM2hkpevrrq7TDMS0hM77SR+0ssvNLF6xfczCLXB6YOT9APT+RyD2MhACRlCGju370eSfnMO1Yxy3F+Div1qgKfhUi/XTiwiLFnBL9r0hqGw0/zGHKMcwYSMkwckjKQWU0DDq4Fy/PY+BgZqr83oOcAO+Dl3KYNjvA4GFkQfFSpGQwg6yOpC9rj23iYdK0AKoczcmS0Gwyl0k1ODwtWDqU6+SVPhpejnKvv7x1SPMzg4YmYPpxAQJGayQkMk7YbIegizSdMQuW5DFyDFfnQazotVtUlYmUrjOmavIc1ocoTSKo7/8DmqsasnMXix7j+PE8dgLZYEQHJYFuqU8Vncli9OGOzzZ5Eu0Rcv7seonOoXL9C8A7pDuQHrQ8bH0M2bK62iVwLY2l6O/SI3zIx/g8D9wxR7D0P5RHXQO9OS6btNa3NrMwmelP+zK2xEd9C5fm8dFr6vgErcGkQ5uCSyQXrbJE8Lwj/SJO2rsQBlAaSiM4PeeN2lk9siTv8bhknmReeBRZ2o41PHIs7+hpeVzy6TpcdV0dZs3P2XRJYlUlM0ntB9EZJBoaHRaekccnv9SA5R+rxdCR0adVEqUe8LS1GJbcE0REWTTWwzb3etROfKpLetoI9UrPSumV8CyPsBiyIrydI+ddWYcr/6keZ19eixnH5zBoqINLE83qyNipuz8Pqhp4Zwf60gtrjaDjT+T24jz69s4lFX4WrGFEbWMvuaOStJstK2XPINkynjbpWSk9O14V0jjA4fiFNbhsRQMu/VQD5p2Ux9DhDs7xNigUwHS1/ywws9S/qu5sXsSvCVMDfPwz9ba9zufNCSxYJhEFHJZSpk2JMTwOjXpTX/alemkEUlvSD46TLpmA7ZDVV1sPzPlgHpf/QwPOv7IeU4/JobaOq+meABZ0qVIA/T2jv0ThAOvLEpDYqkoX+TuOi8cwJDQ0OSxeXsvfcuq0nCJJAIDOQmJhtUGQDfZiD5Mz0iol2JeF+tWWJEgTEHgceXQOF/19Ay64ogGTjspBX/QUmNZQgopK0hAAJh1lVlc7QWzXx7mekAUd3LkaQLrsEcmOcxGxfzqv49wxEL/oEiWjoO2OMxHpvHew5NmOdNY1D0zZ1G++SvYQoSrRebH0vDpc9qlGzJiTR56Ba/U0QEaT6nGgpbZjUgzJxYh9lbSILRaBll0hXt/QixefLuDZxwp48akCtmwo0u6hfiOJ57jNGY/P6si8eP8sTZoUYgmWOEkxSUIiL76TCJFjZKX9kT3yrdDpoyqZNjuPy0nIojPq0DTQ2YFvQSWJVsoAJSIyelJNCSF7d4d47P5u/Oc3O3DjV9rxg+s78ONvHsBt3+7Aj/7tAG5qbsd3vtiGH329A4/e2409O0JorIB4TVR5cUmmSAdtF08Hk0peCcUysmX8aDcSSKuRxHY1GXKOOj61nnpWHS6+uhETpuh2cRFeZaQwirSd0ZPAnXPgZQgcbHvs3xfi9/d04fv/0o47f9SJl9YVsJtJd3V5VgdvDpMJ+fDW1emxa3uIF1g9v/jBAdzw5TY8eGcX2lu9zcdQql6BEmTK7PSw5PRswkRl5/SQtH7awMoRZKuKgCNiFOExfJTDhR9rxKnLGqBPH50jSYImsyRkdOtzDMdszhJw1LUVeno8nnm0B7d8ox333HEA27f1QvEF/KuBU4xcV21GQi3KSc9G6vcM4N1tRdz9kwO45Wvt+OOrGsvhVS4uFw1WokU9U3A6BRbkAR1eQd7DcVHvQlGGIifXeZGC/hrrRQgDkx5yniOOzOHSTwzAsfNqEcSF4riac0AqK3W1hcQv1jWey2DzKwXcfkM7/uvmdrzxWoEmxkZfEVEC+PKErr7ScU4RtOH5Htz69Xa88mxBjn2gdGwBfXweNbPG7u55vMsXXdXE8ieY3EeuaMJ5lzXhzAsasej0esw/sRbTZ9fg8Ik5DBnuUNvAeTmTCBF902fV4pIrB2DC5DznRnTHGZCCcs5F7aDSznaFLeC+CWjb8U4Rd93ejlu/1Yb163pQKHiIXNgrqY2sVIePucpImS0iwOZ9u4if3diOzS/3JScA77LuyCln1eOiqwbgQ0vrcez8WhzNxKfNrDE5e24t5i2ow0mn1uP05Y04/9IBuPzqgbh6xSBc84+DcfWnB+GSKwZi6dmNWHJmIz5y+QCMHpOzMJxDREQig4q27BU2BZ3LO7S3hXjovgP4/jda8cgDnehoL0JbQjELRgXjjxlAVlofSchK9audyIA3c9f2Iu68tQN7+YnGCdKLXeDjODDpqJroAYtd3C32qZFIfaFLdPJvieqjtpEPRCNGBZg0pQZzT6jD0mVNOGN5E4YMjX7/MlLipJNPk6zNxX1mE0FEQEJ6eQOfW9uNW77dirt/3o6dO3ohX81hiaVkMFheisnA8Uo6AjsqLvnIlJUqiq2bCvjdrzotZ/ULgc6EXn55s/LkxE6oDDhuQ31C3JavFsmSpknNL+MjPwO3hknNUQE9i6hv62s9uO2Hrbjt5n3YsrkHik+Hp6SQrRS1y4lii6TxHYJ8I5IsSobWj2Qs//vbTmx+iXeEXroCDe7pCdGypwi7K3RyQgCo7aQLmXafxNUnHyGjm1+FLTuf+rVtdNd27Sri7jvb8IMb9mLd2k70FEJEhz5TZLKwT8RIFyGWcGITDfKhNHss6U2t9J7ty+r6NGtrDfHgXQfQzY938BWAE/Zyr7y9LWIrIUNBu2pJBYDZK/pU5n3sWV928kIyv+N4PbYf6Ayx5uEOfO+GPXjw/nbsbyvCzhGONQIYH+irZylLpqwNvlgF7KdCEvROWJv2koXG+ErMFdJxvT88143nnug2R9tKWvjNN3rQySBZ7ZCT4+QpOKjMpnbSzwFlfok9kebrkB2vbaNv1utf7MLNN7fgl7/ch3e2F+ByIaBHg4BRB9QpRY5PKoOk6P4j26YNfJCASKCufsHasS3RZe8P8inwGen3qw9gz07eHM/JFMzOnb3Y/k4vVNbOAU4JESLNqS2wXa47WDtrdxwrpDYX+TggmfvNt3rw05/vxQ9/vAcbNnWiqAT4vGTPQikZHopNNn2lkEzBmK2PEoSerdQO+OzFUQh56Kkt3UAftZW8/MsA3oQYOsveer2A3959gBuAg+TY2V3Exg1d0MuSdYgSShOsbDu4yj5HnzKbS+dQlbTs7cU9/7MPN96yC0883Y6uQhGuhqHHVaLgDSInhmIzWxwnHNMjZBdYV5jIT9RLrxmEFV8Ygo9+YhCfr/KsIc6rOVhdGi9fyRQkgx7QFs1CpD7+AImRo+6IsGlTF/a1soxyTJCLuwRlybKvsi2/PjYHHawipLs7xOMk4oZbd+KeB/ehZX8BeqJWpUZVwPSUhKGkWzJm412VJDk+TtRTV6UcOS2Paz83FEvObsJxH6jHGRc04ZOfG4KxE3JWOZoDmTEalwCcA+xLQTpBW1dXSDqoyJG1g527Cti0scsSchWJqj8ligov6O5V+snunEPA8eBr0xaeI3fsxO3/vQtvvtMNkQESHxHieccEVQGlkuc461Nc1qbdZfvZ5vkjn4DVtmhpEx8muYdQeo2fVIPTzx+AXB0Q2hyI1pGueQlmTpvsleD87A8iBw/JXu7NZ5/vwIEDIQIHOAbpJBNY26HM5uiXIO7P5YAOzvGr37bguz99Fy9s7IDmduk5EsLHyXkGi4zuM3qUFAPloRzZNY5tjgnpl2fio8eWk4L4dcLCRsw4rtbOr7KxybblHKndcV4XzasiEQK9qXw8Ox0HvbGtGxs3dyE5KJ0lCxLlSIgASoJ2I89RT+Ggcbv39eLHd+3Arx9uQVtnLyJCuHgQLQ5JruUTaXrUb32xHUzeJ5BPDLBf6OFjxi5WOaq86hscTj93IJoGO4T09xprc3moar1sCdI+bWPBc3rHUjIHzk7Zw1/sn1zbhk7uM8fkrToCF5HhgNQmPYH1O2j77NtfxO2rd2LdH9rhOT7aNloD4GqGKEjZGCTXtCBZZSatLZIIBSxwnrI+2Yhefot//Il2q3DOjkrMmFWPD5zUgNBl5rLq4w3ieItD0tZMYoniClQp3tFIaHHHALe80YVXNnYiFyfsHErE9NGd9YmUQq/H3Q/txguvtkPV5+0OMSiTDCaIYWvJHrcTe4W0Oy0bkwmVQIwwbusTbcOrB/DkU+2o9lJMHz5zIEaMzaGoGPJck3NE46UTstMmkqL1IlugbSSIHEF3tZtV8+jT+9HeUbQqfCPP1AAAC1tJREFUcA6WfF/pUnsuAJ55pQ2Pr29FZalqTigAJVkGBZGQQ50JeyH2QSy9SfYnc1gibNO3gBAPPNSKXbt7Ue01bnwtTlkyECIx1DiRI1C3NqWtybm86VE8gcpdhAgJQXokf/2tTqx7qb1EDBNPiAmoOOfgYlvggL1tvXjgqRZ094YA7VnYcwJtUYLRwkl/uU19LOUcK5iIAhUBtKutwztOSn0h20p427td+N2afdV4MdvChQMwehyrhsmHGs9x3mQIa2tuQwjNKwRGBu9Icnes7bx9ijz8dCt286FMJekc4upwsUzasC33wuZ2/JEB9t1CIdLkHRNM1woRsl1EyE+OGGwnvlbWTERBJkjvcJyUZ4JhDedh+5G1rdjCIwBVXoMH5zDiMD700S9MxnCc58e9zWH2EKnOdYOoUniXFJSjDDxURUrwTzu78Ng6bg0u5pwjIQIoYwBQtXTzbFm3sY1kcnKNd5wnC9liIGAfIVL0B7b5swbg0rNG4pxTh2Pc2FqEAeewu6c4CNNpY/AiyBJjckrCy0YdtR57Ogq495EW6JxjWGVXN389aO0qwNdyHhISkekRcrx0T5vnPGprDelBUiGSWSSEPfZcK97a3s2qAEQC+SkRw0ZA457WAqulE9pacIyJJKgCUzhuDYF27xgc9Zpah0tOH4nrPj4eH1kyElcsH43PXzUeM49qREgfO6dyHhZoIpmIF3hHlUQWjkmv3bAfT67fzwDKr6dfasObu7sgAkP6GRGUCSmhSDFyQpiNawTeRUFLZmEkBR4tbT3Y+qdOiADHpBMEVHiRMIftLd3Yz+cVEWFbgXNm5zIb5zIbZZGJz5zciDMWDEMNf7FL0hgzshYXnz4KgwbxcZ5+ngR4kcLAfRbaApVg1XSiF7fdvx13rdmFLW93YgvjvvOhXfjZg++iWxu2jomLEPoaAdI5T0JWSN2TFBHFimFpWyIMr4+kLQDyDF4kRHBwTgBlhN2smAIfthAAcJoPSKQdvLFNWzRqe0waV4/aGg1A2evoiY04ed5gaEuFOSAkOaEFy6Syknc4TGAJ8tCv443s6sHPfv8uvvKTrfjKbVtxx8PvYm8Pt1E9x8uvGjSPyLI+D1VUQBEF1ocU9tCmytEP0+QCzjkETJKCOgzgq4PfzENE/qoKjVGVqIJSxHOprT49EXNon0tzn8lKGjs6Pm9UKdmq0V2NYcQoGUssjLYByVEFtIW9EDyrRJAtpF4OD7WTfp1ByZyBJaGgmZj0BGmC7NPfYZxzRoRjKlQhGUhh2y4Z6GvjSbdJtjWPgTYRIuh3j/Vb2/D27m4bWvk2Zngdt9lwBLVA2VYSIaoaEUF43mXBkhZBSjyWSlZQ4gZVjPqF2Ccdp3YGuUbo/jEs56ESZxjgiUPoXS2Cao/+juMA8RDBURdgr6aGAOClOQy0chjnoeKyoJVrOfq+s7cb963bXfbLPD3Ta/GxQzB9YkP8xOqRbieRQ9idJTmSfchR8kSRCLOEqE0UY1sijTjZSU7Q4HHWh4YxHQbqLQW+SyfAZHSXdddD9rV39coE55whcKBE+ho5uIbnEEmkr8Yk0ByclVa+c15rx5IrY83LLfjDW9Uf5wc25nHOgpGob+SXQFaJ15bKEBKR4W0rRIlJF8LIpuQJkSMCBCOJNvOvlCRF9lPmD8VHTxmt8NwaOCbFgKNMeVeZimxK0FNPng3IC4TIr/Q+lqU/qDFHT3lzLmmcU+ORSs5rOsexYrSd9nUWsHrtTnTzLwK09rnmTh6E46YMjKpGpIggyoiUEF7JcDtpS5RtG959JdkvElJiv15KsFI+PHc4rjh1LBpqgzWBdzzNmYhFJXIYvLaD0tPPfONG1eHE2YOjbnvv+zZqSC0mHcZvsZonnkPjE1I0nygzsN/aXEc/UTy3tRVPvVr9cb42H+Do8U3wIiMhhbptH0kSY+TEB25EhGfFRDCyRILA5KOKUV8I02kr1BYxdGgeV558OK5ZPB4D6nOWIO+dVzpsRLL07hGwd9nCEZg0toH9/V9K4INHD0E+x2w1G+FFgCQRVU5cMZqGfdANCTy6+IV19bM7sJdPruqqRGeRXxq4jUISIYJCO1c8TFq1lHRvbSZNwlRFIQmTzUA9TPpFCOfRIXvy1GFoXjoVFx53GOpLjw+PBoFzn9HdZdiMKXqnYoficJ4dx08fqOZBccK0wZg8hoclfwVURaQDxJXIkYGEqM9Io126qmbzjgO4f/0ueZRBj/nPbGM1kRidMaFkTJAlS10ESQ9jMkwXCUzebJIZ6Mzx7D/6sAH43ILJ+OeFUzB95ICyddlYHdx568z1VHglpEh6EuMxelgthg2sYd/BryFNeZw1byRqVDUkR2SDRESS7yJC08iWQnauxer51fM7cOe67di5vxttPOw37+zATU+8gVf3tEPfoEWM511OZEhSrC3JShAhgsjwJMnTFmZQpK2XGD24DlfPPAL/+sHpOOWIEajLcVsorgycc+tjq18Fvnx8ZyWFpoYcP20cew7t0naaPYmHpbjlEIkI0bsRRVKsxWlVOfbAwCjaCr34yZN/wnV3b8J1qzfii/dtwuNv7IERoUqJERHC6Ng2XcmLMBJUantuNc/D2SMkGb3sb+KHwzkTx+Ab847BZZPHY1hdLSPse73T3mVcMCTg7h8e28x7tybmJfXuLXpWTto8qNJYl8N5fzPaDrAw9RYNbJAIvkdLSCf0sOcp9dkogookbXt7F7a0dGBfoQDkGVXOQ18NsgRlt5SRkZBCAqxNslQxIiTH/BeMHobrZ87AZ4+agklNfHpTIFWwta0Dhw9saFZXoDfBw5MpvmsbxLm0thegr+zqP1Qcy4pZOGMIvL47GQ2aTGCSIoHJJ5VDC6Rb5cge0I8fCjp3QELsqZcSrA7TJauBxHjCSKEs5kOExNTBTbhu6lG4ftoMzB8yFDmnAFD19dzefVj18sZVSWdKzOqb56yhMe7w9km7e28P9Mcx2g/5ygUO53xgNEYPqSM53sbpnZRTlyY62BIRjNMTRo4iETGEkcC2ZJYgT9KSyklIMEJEFgmR3ktCRjbW4cojJuLfp83GspFj0Ki/53D1apf+aHfvju346qsbVv30xPnNiQ+XT1Rg9ffnNPM5c5VutOJVxby2raPkcIjaxFENOGPuSOgGRVQkA9UiNDlNZaSQKLW9JKMyUowkEsmqMUIkhXiLmU2kEL25EPW1OZw1agy+OXUW/m7sJIzSL2Fcp79rb28BN739Or617dVVv15wYkqK/BmCRAmrvze32TnPyvHQGbP2lX1VfxUrjaiuLZ0zAkePGwD9wwJTQ/LyKSkiyMPaIoN2nTnJeaMzxypERAiMVGQltmh7AUUS4vjBOX/oUFw/eQa+MGE6pjUe/BHj5QOt+PK2V/CL3W+tWjN/cXMSXyK5XKKW5Oob5zbDY5U6X9zcho1/bC91HqI2pKkGF580FoMa8txSGuT1FnMU67KQFAltJ4gctr2BrqoYwsgiOdpWCULaRcqkpiZ89oij8LUjZ+HEQSOQd5zEJqz+pp8i7mh5E59/5+U1azv2LH56zql9SNFI5S7ZB78mOb+5YZ7r6Oxd9ZsndqKLv5v2cTqIYe7kwbho4RjoyZh/G4N+vmC6mVERQQkRCTlGBBMXUdJVSfYjF6OVLlKG19fiY2Mn4FtTZ+OCkYdjYI77KzNzpVrknV7X2YLPv/sSvtvy2qr7pp60+NlZS3SuVrpam0uZ7Pft3u/Mb/7SVVPc8xv2z6HTKkKTCVTf+9LNWz5/NM6aOwo8k1PnmA7YNkqsqhLqIkmEqE8kmGQRmC6yGPHxQ4bgq1OPwbXjJ2Os/esbB/Z/renwvWtua31jzRd3vDTnpsPnumemLqlaJdkp/g8AAP//yTjXGwAAAAZJREFUAwBmqwu5LEuj0wAAAABJRU5ErkJggg==";
 var WORKBUDDY_ICON = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEgAAABICAYAAABV7bNHAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAABcVSURBVHhe7Zt3fBRl/scHEtJ3QwSxgIgFhDvb6XlY7myn3nln15PziojtPPVEakJCeu+FQKRJCS2AInqWl9iT7M7M7mzLBkJIQjG0ECG9Zz+/3/eZmWR3Ek+ORe+ffF+vz2unPc88n/d853memd3luJEYiZEYiZEYiZEYiaERZn5/ss763hy99M4qvWnn56HCdrOOL7HohO3S/0R8iYXaoBd3fKE37Vytc7w3J8z5/mRtu3/0GGsquU5v21Wsk3a2hVZ9hNCqD6F3vg+9YzdCHe8NkV5RKNu/W1mW1933DS7Tp3zs8PUMLrtrYLvzfcjt+gh66Z02amuwqeQ6rY8fJfTSzii99d3u0P0fQWfeAR2/FXp+K3T8NiZa1ivL8j71Uz5GXVf3uZfVamg9nmXHGDZhdPkmcOUbEWjcMnCMxznMO0BtpTZT27V+zl98GeurM20v0dd8DJ20AzrjloFG/NQiqATll/YPsbmhDpGHrQjlt8LXUKwA14jaKu1AaM0nIA/cl1/6au15HTpx23Z97SfKSQnO/0Z6fgt8DBsxVdoFoeUU6rvbcbynAzsbD2GCWML2yZCGlmVwyYO4bbvWn1cRwm+O1Nd+PMwJf3oFGTfDz1CMrafqcLirDY72M6hoP4NjPR349+lvcYGwDb4M0tCyqsgLedL6PKcIMW+erpNK+nRSCXT85vOmkGG2aTXcMVzZOsw+UIaj3e0MTGXHGeztaGJq6OnE1lMH4W8sRoCxeEjZAZEXqaSPvGn9/tcRImzeotv/AUKMmxDCk6jh6vIPSXus+7q6rD3Gfb/nPn/jRkwQt6G8pQE1nS0Mzr6OJlR1NGF/RzOqO5txpq8bGfUV4MreRvCQ+pVl4yYwT8LmLVq//1UEWksmhgibu0LMW4cx8NNKx28CV7YWcw8KONHTwTKG4OzvaGJgDnQ2M2gHO1vR1NuD2QdKwZWtGVLPgMiTsLkr0FAyUev7rCNI3PK8rmo3Qvji/7n8jBswQdwKvrUBdZ0tLGuqOwbB1Ha2sO0Hu1pxvLsD33a14Xrbe+DK32ZwtfWRdFXvIYgvfl7r+6wjWNi0Vle1CyH8Rk3l7uvaZe2xZ1Puh0XZ8HJNOetn3LNGBVPX1YpDXa04rKi5rwefNR1DoHEDAowbhj9n1S6QR63vsw4dX/xViHMnghXj9KnV923/of0qTO224cqQQfr8rOkovu1u88yarlaWNTKcNhzpbmPH0PDf4+pH5GEzuNJVQ87PzuOkiW7xV1rfZx0h/EYpxLFdqZAaKTf0h5fddTbHfN8+eRtXvgZ/3PspTvZ0DrmdhgNDI9yx7g409nbhu94u3GDbhVHlaxXwg/WGOEoQImyUtL7POoKFDRJVMrThP52CFEDrTlajsadTyRo3ON0ynPruNgWMPHGkjvxkTwf6XC7s/u4wRpWvQSC/3qNu5k3Y4B2gYMc2BLOK/5PohNpt50c+hrWYZtnBwFDfcrCrZaCvkbOmnWWNJ5hO1ledUjLIBRceq9oDrmwlQtzbSt68ARQorJeCHVuVCtchiF/P5L6unsx9n7qsXVfLeULQ1iPvp22+xrXgvl6GNw8a0dLXw7JmEIz77dQ+kDEMTE/nwO11ureLZZHUdgpBxnXgSt9CgNoG8ias9x4QNfqnkr/xbXDlK9nVvsS0CU9U7YG57RTLjiNdrQqYobdTQ0+HAqZzAMyZ3m4098kiSJa2Rvyl+guMKl/NzkHeyKPW91lHoLBOCnZscTPwttun+7L7Nne5lxtufXCbr3ENuLIitu3BvR+j6MReONtPo6mvm0E43N2qAaNmjZIxPZ5gqByBocxr7etBW38P1PisqR43298FJ70NzrjaO0BBDJDW+PmTDGYFJogb8VpdGb5uPsaMksFjPe1ut1ObBoz77dSpgJHLuYOR4fSio78Pnf196O7vZ5C6+vuw6IQFN9p2eANorRTk2Iwgfu15VwAvgwkT1mP+QQNsbY1sckfG5X5m6O10oqd9WDAkdzCDWdOLdgUMAel29bO5Ua9LhkThcrm8BbQJgTwNkWvdPlXRuvs27fLQ4wkOZ3gLXHkRZu3fA6G1gRmibKHRaTgwatYM18+09fWwUWq4oK0MTH/fABjqi/rdSngFKMADkPfy51eDKyvENMtWbDl1gD15k/HBYVuGowVDWXOqhyZ+MhgSGaegfXua6rHseAWij4iIOiwg+6gdH5w+xJ7H1CAo7mDU8BLQGinQUYxAfvUwItPabcMriF+D0SxrlmPOgS9QQ68lertwqEue22izxrOf8cya9v5eZmxfxxnMrSvDFGkTOEMRA8+VLVNUyM41XlyHp/d/iq+aj2qwDMZ5ALTRw2yAm7Qgvk9c+Qro+NVYccLJ+hnKDoLjCaaN3WYEZzgw1L9Q0L4lh3mECmvAlRZglOEt+POrhpwzgF8FHyNNF5YxWLMPfM7q0YaXgFZLAY6N7ATqiTzkftXK5as2ylCEMcaVrIGB/Cq273KpGHuavkVrf8/A07YHmIGskeEMgulkmUZBHezqE3txhVQMrjQfPsa3WP3DST23+unHr2RlZli2YH9n0/kD5C+skvzs63GncxcWHzIg95gdRSecTPnHHEiplxB+2IgXa77CI/s+wkzHTkyRiqETVoMzLAf3TS5utm+Hvb2RjTJq1hAYedhu8wCjjk4EhkRQKAjubyreBVdWwOol47LkC/H9GtwvX6wCTJE2snOfF0BceYH0bD29/6UHQno4pIdEehZqwbfdrTjaQwblvoKM0mRub8dplDYfw5ZT1Uirl1DZcZqlNu2jMmrWeILpwKnewayhkYmiquMMnq3eo2RnAQJ4yhpvRJmUh/sqd58vQPlS8ncV7HZwtDeiov07ODu+Y6YJxL6O08xEdecZHOhsQm1nM7t9qC8hs9RvyJO9QTDut5NnP9OJpl65n6HhO/6IgLEC9SG58ONXIJAvcpNsOOgspB6nlgvgi8CVZmPVycrzAKgsT3rpuIGZGw4M3c8EpkaBU9fVPJBhh5UsGwQjZ83JgX5GHrbVyV6/y8XmKJsaqjDdQv1MDnwMhQhSoHgaV9eLEEzLAq3Ly+7rnscOiuq9yLQGbTTsewXImC/dVvsBM05QBsFQ1qhwhoKRR6dWDzAet5Nb1tAsl6Ks5Sjur9zFMoYrzx/IFtmgImEFU/Bw4hW5ryvLajkmpS66AEsbrd4BGs0vl/QV6/FN81EGwBPMYNZowQz0M91tGjCDWUOzZ4qDXc34R+3n8DUUMDgByu0UxJMZFchyRbLxEH45QpTPIL4QfsYCBPLLoOOXD0g+ZjlCBPnTE9hy+POFGOtcj7KWY+cOyE8okjjLCqTWm1knqgVD5gbnMwTGM2uGA6MO2y30/dVRMyaI1HFmYYyxEIEMjmxAVbCbWWZeKGQKFZbD10hA83GltAahQiFGGXLYp14jtUwIT5LrJOC+9pW4xurFCzM/YYXEWYtwW8UOlg11GjA0Mskd8HC3UzsDc6pXfUToZM9DNNV/p/EArrdtAleaiVEGuvrLZTEohUzBzIwsnbAMekWhwjKMFZZhjDEHN9o2oLS5ng0GzvZGPLzvXYwuz0KYUMiOIdHxJLU81aXjl8l1O9bAhy/wBtByydexGj6GfPz79EFmVns7DQdGmzXq7WRpa8Aj+3aDK88GV56DAJ6yhuDIUFQwMhzZjCeYAoQJBdDz+Rgr5MPZfkoZrOXo6O/FdMtqBBqzMU4owAVCPi5QylBZkgesilUIEQq9A+TvoAfMLMyq/pi9QjjSrY5OMpzBfkYGo53TUCfc6epD3BEjAo3Uz2TCj6c5TaEMSFiGIEXB7MoSmALomRnZFBmUzeZjnJCPIGMWbnds9ICjxo7GffApT8UEIQ8XKhov5rFyVD5MILhy3aEVK6ETvcqgQsmPMshYwDpDvvU4G5K1WdOgZo0bGHkm3Mcmib+rfAdcaRpGG/MQwC8b0AAcvkCBU6DAkTOEzMhQ8jBeMTtBzEUYn4UZliK0Ks9n2niociuCDKm4RMzFxWIuLhJzMUHIxYWiXA/Vx2BVvAW994DoWYaetzIxp2YP60eO93hmzeCrCOXNXp/81E26x7mDwaGs8WeZo8IpQBCJwSlAiJDPwIQKeRjLDMhGxgu5DAqZvFjMwaViDiaK2QgyJCP/KK9lw0JqPYZxfBouFbMw0ZSNiWIOLhFzWHmq50Ihl9U7rqIIYWK+t4BWYgxfgNFGmpsUQGg9zh4F1BHKfbJHYOiZi0YoitfrvgD3TQr8+Hz4MxGgAgQK+UxBfD6C+XwFTh6DE8bgyAYmMENkjkxmY5KYjctMWZhsysKlQjqmmnNwrLtFy4fF/LqPoDcmYIpy/GUmufylYjaDRfVOqFiOcWLeuQPyFQoGAFEGcGXp+NP+D9mM1310ksHIryQIDr2W+rq5Hlx5FhuKVUAEJ2AInDzohVyECrkIo6sq5uBCZoCMEBgyl4XJYhammDJxhSkTV5kyMNWcgXHGOCys+7eWDYvj3S24TsrB5WIarjRlsHKXmzIZrElilgzKWUjZ6R2gMY63MIbPZ/Lh8zDakI1Pmw4xSGrWqGCoE1dfaD20j2bFdGvlKdlDgPIQKOQhiM9DMJ8HnZDL4IwxpoMrT8ao8mSM5TMYGLo9JolkKBNTTBnM5NWmdEwzp2O6OR0zzGmYbkrFlWICbG31Wj4sXqjeholCPK4xy+Wo/BWmDAbqMpKzAJeasr0BlK8AylOUz7LoDmcJexVB73cIDnWW9LUKwaF5TlXHafgTTGPOACCCEyDkIpDPRTCfixAGJwejDam4vWIDkr8tw5JDn2OqVIAwPoWBuZxdednYNaY0BuXn5lRcZ07FDeYU/EJKwdVCDP5etU7LhsWsvWtxtRiHa82p+BkBNadhmikNVymgplTmY5Ip0xtAedIYR5EboDz48nksM9Y3OBkM9TsnmoOoz1UrT9jBlVHfk8tAkVQ4QQxODnQCPYym4tF9O9hop0Z1RyOukXJxiZDMjEwzE5hUBuZ6cwpuNCfjJikZv5SS8CspCTOlJMwQI1F8wuCGBtjdaMW1pljcLCWx4280p+A6cwqrZ7o5FVNNabi6Mpey01tAK+DL5w5oDJ/LzC869DVrCGUNwZG/VpGNvlr3GbiyZAVQLvyFHAQIOQjicxDM4GRDx2chwJjGRhxtbG6wYqwxGtewK0/GyGAyM/srKRG3Som43ZKIX1sS8BtLAn5ticNMczQia7dh/fGvEXtwJ2ZKsbhVimPHzZQScQsDlcTqIVAEffreHFwtpZ07IJ8hgHLYJwFKrpeH2E4Fjvv3TY9XUf+jZpAMJ5DPQZCQjRAhG3oCJGRgrJCBus4zGjz0dY0Lj1auwWQhBjewjJHB3CYRjATcaYnH3ZZ43GuJw2+tcbjfGof7LLG41RSOW0yLMNMUjnsssbjXGo+7LPH4jSUed1gScKuUgFukRPxCSsL15mRcuzcL06RUbwDlSr6O5QqYQVF2JNcbmRnKGoLTpzxnUfxx304FUA78hWwECNkI5LMRzMBkIVTIRJiQCR9DAlYcFz3gqMG3HMRVwlLcJCVgppSAOyzxuNMSh3sYlFg8YI3F760xeNAagz9YY/BHa7Qsm7xO239njcH91lh2/N2WOAbqdikev5IScJOUiBv3Uucff+6AfHkCVAhfPttDXFkSoo6UMiPql3Hu3zc9U/2Bcotlw1/IQgCfhSAhCyFCFvRCJsYKmRgnZCCUT8FUKReNve1upQdjUe12TBfCmTEyKIORzT9ki8bDtmg8aluKx2xL8bibaJ22P2xbyqARyPutMbjXGou7LHEMNkH/WWUC5lR58eOFMXzOV75OyqChgObUfMxMDObNYEQfKQVXmgg/giNkIZDPQjADlIlQIQNhQgYuFNNxiZgGf0M0Ig99oq2CRX3XadxtpX5mKTP4oDWagSHzj9ui8KQtCn+yR+FpeyRmuelP9kg8ZZf303GPECgbgYrGfdYY3GWJxXRhAcJP7kJbb9e5/wTPV8he61tVBB8+y03Z4EoTEH5Y7qSHi0/O1IErT4KfkIkAPhOBQiaChUyl30nHOCEdE0R6FEjFRDEZE8UE7G0/oa2GRfaR3ZhpWog/WJcyo2T4KVskg/KMfQn+Yl+Cv9oj8Dc3/VXZ/mf7Enbck7ZIPGaLYhn1W0sEfmmah4jazaAe0+VynfuPOEeLWc/7aABxhlT8zLYW7W4/J9EGDfuXSSswypjCAAUJGQgRMqAX0hEmpGG8mIaLxVRMMqVgiikFF/JRmL2/WFsNi5IT3+B205t4xBaFJwiMbQkDQ1CetYdjtj0czznCMcdNtD7bEY6/M1gRDNSTtgjca56LpxxxeK9B7j8p+lyuc/8ZMGfNnugjZHX5mHPgw2cycWUJKDph9TAxXKQeNYArjUUAn4EgIR0hQjpChTRcIKRhgkhP2jQZTMaVpiRMMydiEh+BT0/L3zS4x+IDq3GftIBlwSyWGRH4uwLlecdivOhYjJcci/Cym2j9BcdizHEsxmzHYjxheQNPWheg8Mh2NPYMfnHocrm6XC7Xuf+QnMJHyNjis38FfIwZGMWnswyytA1/O7gHza4nS4UYbUhCsJAOnZCGsUIqxompuEhMwURTMqaYknC1KREzzAmYborGHdZkfHGmEq19nTjZfQYF377H4DxhW4JZLBvCWdaQ8RcVGK9ULMQ/KxbiVTfR+isVizDbNhezrK8hqWY59rcd1DaRAHn3VwQKP3PWdB8pu2+0lA3OmAYfPgMHOk9rzzVsrG+gGXUMgoU06IU0hIkpGC+m4GIxGZeZknCFKRHTzAn4uTkeN0nxuNEchZvNEXjMkYKH7XG4W5qHx23Uj6hwFuN5JUMIDMF4rWIh/lWxYEBvECDHm3jW+g8s2ZcAw2mTtlksXC42q/X+zywUo/n0SJ/aInB8GkYZU+FoP6k937BB49vtznXgDHEIFVJxgZiCC8VkXCImYbIpEVeZEjDdnIDrzHG4WYrFbZYY3GlZijstEXjAEo5HbUvwlC0Cz9ipP6FbhuBQdhAcFch8vOmUNbdiHl60vYx5zoX44MSH6Oof+mMFNVwu1/n5O5Qao4SM7aNrV4Arj8eu7/Zrz/e9UdZyBKMNcQgRknGBkIwJYhIuNSXiclMCrjYlYIY5DjdIsbhFisEdlmjcY43CA9ZIPGRbgidsEZhlD8ff7IvxnGMRXmRwFuA1Bmc+5jrnY55zHuY75+FV+yt43fEq1h9Zj4buBm0zPKIf/ef3D3Usvoz1HWXO3Mbty8Ib9Z9rz/kf47ka+lNJFMaLybhITMJEUyKmmBIw1RyPn5vj8AspBjOlaDbfudcaid9bI/GILQJP2cPxjH0xnmWd7kK8XLFAyRzKGBnMG47X8E/7S8ityUJ16w9fuDM9zSVf4kf4S+ZACAlRl1Wu7Bp8/v7hONrdggmmNATzsbhITMQkUwKuMMVjmpleRcTiJikGt7JbKwr3WSPxB1sEHrOF42n7YvzVvgjPORbiJccC/LNiPl6vmIe5znmYW/EG/mF7AXFVUTB8V6Y95ZDo6uvqPtBR+yP+qdc9vnzj2tKu4xtdLtfg70h+IN7trEGAPREXOdMwuTINV1WmYsbeZNywNwm37EvEr6vicW9VPB7cH4tHq2PwdPVS/O1AFObUROLlmiV4rTYCc2vDsaAuHPNr5yP20FJ80bZHe5ohQW3sd7mKa1prfpq/hbsHgMkul2uOy+Va5XK56L4zu1wuC33fPZxeqNkpBQpR0iQpXrpSipeukeKkay0x0k2WaOk261LpbmuU9IBtifSwI0J60hEu/dmxWHq2YqH0QsUC6RXnfOl153zp1Yp/SanVKdLhjoND6qdz9/f3S/39/V8obZpDbdS2eyRGYiRGYiRGYiRG4v/j/wA7uND5glG+pQAAAABJRU5ErkJggg==";
@@ -3176,90 +3537,44 @@ var ZCODE_ICON = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABz
 var OPENCODE_ICON = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHJlY3Qgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiByeD0iNSIgZmlsbD0iIzEyMTYxZCIvPjxwYXRoIGQ9Ik02LjUgOC41IDEwLjUgMTJsLTQgMy41IiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iMS44IiBmaWxsPSJub25lIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz48cGF0aCBkPSJNMTIuNSAxNmg1IiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iMS44IiBmaWxsPSJub25lIiBzdHJva2UtbGluZWNhcD0icm91bmQiLz48L3N2Zz4=";
 var GEMINI_ICON = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PGRlZnM+PGxpbmVhckdyYWRpZW50IGlkPSJnIiB4MT0iMCIgeTE9IjAiIHgyPSIxIiB5Mj0iMSI+PHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjNDI4NUY0Ii8+PHN0b3Agb2Zmc2V0PSIxIiBzdG9wLWNvbG9yPSIjOUI3MkNCIi8+PC9saW5lYXJHcmFkaWVudD48L2RlZnM+PHBhdGggZD0iTTEyIDJjLjQgMy45IDIuMSA2LjYgNiA4LTMuOSAxLjQtNS42IDQuMS02IDgtLjQtMy45LTIuMS02LjYtNi04IDMuOS0xLjQgNS42LTQuMSA2LThaIiBmaWxsPSJ1cmwoI2cpIi8+PHBhdGggZD0iTTE5LjUgMTRjLjIgMS43LjkgMi45IDIuNiAzLjUtMS43LjYtMi40IDEuOC0yLjYgMy41LS4yLTEuNy0uOS0yLjktMi42LTMuNSAxLjctLjYgMi40LTEuOCAyLjYtMy41WiIgZmlsbD0idXJsKCNnKSIvPjwvc3ZnPg==";
 var AGGREGATE_ICON = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PGNpcmNsZSBjeD0iNSIgY3k9IjUiIHI9IjIuNiIgZmlsbD0iIzRGOERGNyIvPjxjaXJjbGUgY3g9IjUiIGN5PSIxOSIgcj0iMi42IiBmaWxsPSIjOUI3MkNCIi8+PGNpcmNsZSBjeD0iMTkiIGN5PSIxMiIgcj0iMi42IiBmaWxsPSIjNEY4REY3Ii8+PHBhdGggZD0iTTcgNi4yIDE2LjQgMTFNNyAxNy44IDE2LjQgMTMiIHN0cm9rZT0iIzlCNzJDQiIgc3Ryb2tlLXdpZHRoPSIxLjciIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgZmlsbD0ibm9uZSIvPjxjaXJjbGUgY3g9IjEyIiBjeT0iMTIiIHI9IjEuNSIgZmlsbD0iIzlCNzJDQiIvPjwvc3ZnPg==";
-var PROVIDERS = Object.freeze([
-  { id: "codearts", label: "CodeArts (华为云)", icon: CODEARTS_ICON, logoClass: "codearts" },
-  { id: "buddy", label: "CodeBuddy (腾讯)", icon: CODEBUDDY_ICON, logoClass: "buddy" },
-  // ⚠️ 这几条 label 是**最长行**，直接决定 rail 要多宽才不会出省略号
-  // （WorkBuddy 国际版这条实测要 141px）。改长度前先看 `jet-hub-styles.js`
-  // 里 .dim-jh-rail 的算式；且 raccoon 那条与 `RaccoonProduct.displayName`
-  // 有跨文件一致性断言（`raccoon-client-panel.spec.ts`），不能只改一处。
-  { id: "workbuddy", label: "WorkBuddy (国际版)", icon: WORKBUDDY_ICON, logoClass: "workbuddy" },
-  { id: "lobsterai", label: "LobsterAI (有道)", icon: LOBSTERAI_ICON, logoClass: "lobsterai" },
-  { id: "qoder", label: "Qoder", icon: QODER_ICON, logoClass: "qoder" },
-  // ⚠️ label 用『Qoder (中国版)』而非『Qoder CN』——与 `QODER_CN.displayName`
-  // 保持一致；长度受上面那条算式约束。
-  { id: "qodercn", label: "Qoder (中国版)", icon: QODERCN_ICON, logoClass: "qodercn" },
-  { id: "trae", label: "TRAE (字节)", icon: TRAE_ICON, logoClass: "trae" },
-  { id: "cline", label: "Cline", icon: CLINE_ICON, logoClass: "cline" },
-  { id: "loomy", label: "Loomy (讯飞)", icon: LOOMY_ICON, logoClass: "loomy" },
-  // ⚠️ 用『Raccoon (商汤)』而非『Raccoon Work (商汤)』—— 后者在 provider 列表里
-  // **触发换行**（用户报障）。与 `RaccoonProduct.displayName` 保持一致，
-  // 且这条一致性由 `raccoon-client-panel.spec.ts` 锁死。
-  { id: "raccoon", label: "Raccoon (商汤)", icon: RACCOON_ICON, logoClass: "raccoon" },
-  { id: "minimax", label: "MiniMax Code", icon: MINIMAX_ICON, logoClass: "minimax" },
-  /**
-   * ZCode（智谱）。
-   *
-   * ⚠️ 注释**刻意不写「第几个 provider」**（Gitee issue IKJLK3 F2）：这种序号型
-   *   注释在增删 provider 时必然失效 —— 原来这里写「第十个」、下面 opencode 那条
-   *   写「第 12 个」，两者都已与实际顺序对不上，却一直没人发现。改用不含序号的表述。
-   *
-   * ⚠️ 用『ZCode (智谱)』，与 `ZCODE.displayName` 保持一致；长度也刻意
-   * 控制在不会触发换行/省略号的范围内（见上面 workbuddy 那条的算式）。
-   *
-   * ⚠️ 它走**标准两步式登录**（与 codearts / qoder / trae 同型）：
-   * 后端立刻返回官方授权 URL（`https://bigmodel.cn/login?appId=zcode…`），
-   * 前端弹窗、用户在浏览器授权，后端轮询到 `status: "ready"` 后拿到 token。
-   * 唯一的例外是**登录渠道要先问一句**（`bigmodel` / `zai`，见 `new-account.js`）——
-   * 这两个渠道的授权页与凭据落点都不同，必须由用户选。
-   * 除那一次选择外，它**不需要任何特殊分支** —— 与其余 provider 共用同一条
-   * 「弹窗 + 登录轮询」路径。
-   */
-  { id: "zcode", label: "ZCode (智谱)", icon: ZCODE_ICON, logoClass: "zcode" },
-  /**
-   * OpenCode。
-   *
-   * ⚠️ label 必须与 `OPENCODE.displayName` **逐字一致**（'OpenCode'）：
-   * rail 宽度算式与 `tests/unit/opencode-client-panel.spec.ts` 的跨文件
-   * 一致性断言都依赖它（raccoon 那条同理，改一处会连锁失败）。
-   *
-   * ⚠️ 它是**唯一不跳浏览器**的 provider：登录走自绘的 API key 弹窗
-   * （`OpencodeKeyModal`），故 `createAccount` 在最前面就改道、**不会**走到
-   * 下面的「弹窗 + 轮询」路径 —— 也因此它**不**经过 zCode 的渠道选择弹窗。
-   */
-  { id: "opencode", label: "OpenCode", icon: OPENCODE_ICON, logoClass: "opencode" },
-  /**
-   * Gemini Code Assist（Google Cloud Code 免费线，第 14 个 provider）。
-   *
-   * ⚠️ label 必须与 `GEMINI.displayName` **逐字一致**（`src/gemini.ts` 的
-   * `displayName: 'Gemini Code Assist'`）：rail 宽度算式（`.dim-jh-rail` 的
-   * 228px）与跨文件一致性断言都依赖它。这条是本表里**最长**的 label，
-   * 但它仍短于既有的「WorkBuddy (国际版)」（141px 实测），故不会撑破 rail。
-   *
-   * ⚠️ 登录走**浏览器回调式 OAuth**（本地 `127.0.0.1` 起回调服务），
-   * 后端在 `account.create` 里**立即返回 loginUrl** —— 前端与其余 provider
-   * 共用同一条「弹窗 + 登录轮询」路径，无需特殊分支。
-   */
-  { id: "gemini", label: "Gemini Code Assist", icon: GEMINI_ICON, logoClass: "gemini" },
-  /**
-   * 聚合 provider（跨渠道临期优先）。
-   *
-   * ⚠️ 它**不是**一个普通渠道：没有账号、没有凭据、没有积分、没有登录按钮。
-   * 面板是独立组件 `AggregatePanel`（见 `renderRail` 与面板分流处的注释）。
-   *
-   * ⚠️ 加它会让**四处**从 `PROVIDERS` 正则派生 id 的既有断言需要同步
-   *（`zcode-wiring.spec.ts` 两处、`credits-capabilities.spec.ts`、
-   *`jet-hub-store.spec.ts`）—— 那四处已在 P2 Task 6 一并处理。
-   *
-   * ⚠️ id 必须**纯小写字母**（不带连字符）：上面那四处里**三处**用的字符类是
-   * `[a-z]+` / `[a-z0-9]+`，连字符会让它们**静默漏算**一个 id（保险失效比变红更糟）。
-   */
-  { id: "aggregate", label: "聚合 (跨渠道)", icon: AGGREGATE_ICON, logoClass: "aggregate" }
-]);
+var OFFICEACE_ICON = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHJlY3Qgd2lkdGg9IjIwIiBoZWlnaHQ9IjIwIiB4PSIyIiB5PSIyIiByeD0iNCIgZmlsbD0iI2M3MDAwMCIvPjx0ZXh0IHg9IjEyIiB5PSIxNS41IiBmb250LXNpemU9IjgiIGZvbnQtZmFtaWx5PSJBcmlhbCIgZm9udC13ZWlnaHQ9ImJvbGQiIGZpbGw9IiNmZmYiIHRleHQtYW5jaG9yPSJtaWRkbGUiPk9BPC90ZXh0Pjwvc3ZnPg==";
+var ACCIO_ICON = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHJlY3Qgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiByeD0iNSIgZmlsbD0iI0ZGNkEwMCIvPjxwYXRoIGQ9Ik03LjQgMTcuMiAxMSA2LjhoMmwzLjYgMTAuNGgtMi4xbC0uNzItMi4yNEgxMC4ybC0uNzIgMi4yNEg3LjRaIiBmaWxsPSIjZmZmIi8+PHBhdGggZD0iTTEwLjc0IDEzLjI2aDIuNTJMMTIgOS41bC0xLjI2IDMuNzZaIiBmaWxsPSIjRkY2QTAwIi8+PC9zdmc+";
+var PROVIDER_ICONS = {
+  codearts: CODEARTS_ICON,
+  buddy: CODEBUDDY_ICON,
+  workbuddy: WORKBUDDY_ICON,
+  lobsterai: LOBSTERAI_ICON,
+  qoder: QODER_ICON,
+  qodercn: QODERCN_ICON,
+  trae: TRAE_ICON,
+  cline: CLINE_ICON,
+  loomy: LOOMY_ICON,
+  raccoon: RACCOON_ICON,
+  minimax: MINIMAX_ICON,
+  zcode: ZCODE_ICON,
+  opencode: OPENCODE_ICON,
+  gemini: GEMINI_ICON,
+  officeace: OFFICEACE_ICON,
+  accio: ACCIO_ICON,
+  aggregate: AGGREGATE_ICON
+};
+
+// plugin-src/client/jet-hub.js
+var JET_HUB_RPC_CHANNEL = "/jet-hub";
+var PROVIDERS = Object.freeze(
+  PROVIDER_REGISTRY.map((d) => Object.freeze({
+    id: d.id,
+    label: d.label,
+    icon: PROVIDER_ICONS[d.id],
+    logoClass: d.logoClass
+  }))
+);
 function providerLabel(id) {
   return PROVIDERS.find((p) => p.id === id)?.label ?? id;
 }
 var GROWTH_TASK_PROVIDERS = /* @__PURE__ */ new Set(["buddy"]);
+var ACCIO_DAILY_BUCKET = "每日积分";
+var ACCIO_DAILY_REWARD_NOTE = "Accio 的每日积分由服务端在登录时发放，有效期 24 小时，次日刷新、不累积。它没有可调用的领取接口 —— 要重新拿到这份每日额度，请删除该账号后重新登录一次。";
 function ProviderLogo({ provider }) {
   const p = PROVIDERS.find((p2) => p2.id === provider);
   if (!p) return null;
@@ -3348,18 +3663,24 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
   const split = splitCreditsByExpiry(all, windowDays, now);
   const formatForUnit = (value) => formatUnits(value, unit);
   const expiryText = formatExpirySplitLine(split, formatForUnit);
+  const expiryParts = expirySplitParts(split, formatForUnit, now);
   const detail = [
     all.length > 1 ? `共 ${all.length} 个资源包，${activeCount} 个有效` : null,
     ...all.map((pkg) => formatPackageLine(pkg, windowDays, now))
   ].filter(Boolean).join("\n");
   const quotaDetail = quotaText === null ? null : formatQuotaDetail(all);
-  const poolSplitText = formatPoolSplitLine(
+  const poolSplitText = provider === "accio" ? null : formatPoolSplitLine(
     all,
     formatForUnit,
     // Loomy 的另一个池就叫「永久积分」；Raccoon 的奖励/会员/充值三种池
     // 到期规则各不相同，不能统称永久。
     provider === "loomy" ? "永久" : "长期"
   );
+  const namedPoolText = provider === "accio" ? formatNamedPoolLine(all, formatForUnit) : null;
+  const accioResetNote = provider === "accio" ? (() => {
+    const countdown = formatAccioResetCountdown(accioResetSeconds(all, now));
+    return countdown === null ? null : `每日额度 ${countdown}后刷新`;
+  })() : null;
   return React2.createElement(
     "div",
     { className: "dim-jh-metaRow" },
@@ -3379,21 +3700,46 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
       // ⚠ 数字按**包自身的单位**格式化（remote 的单位支持）：池可能来自
       // 不同 provider，不能假定都是积分。
       poolSplitText ? React2.createElement("span", { className: "dim-jh-creditPools" }, poolSplitText) : null,
+      // 两个 buddy + TRAE + LobsterAI + OfficeAce：按「会不会近期作废」分**三档**，
+      // 与选号判据同一套规则（后端只分两档，前端把「真永久」与「到期还远」拆开着色）。
+      // 这条也解释了「锁定永久积分后为什么没有可用账号」——临期桶是 0。
+      // ⚠️ 用词「长期」不是「永久」：有到期日的积分即使很远也不叫永久（用户定）；
+      //    只有**服务端没给到期时间**的才是真·永久（绿）。
+      // ⚠️ Accio 的逐池列（与 loomy 的 `poolSplitText` 同位置、同样式，故视觉统一）。
+      namedPoolText ? React2.createElement("span", { className: "dim-jh-creditPools" }, namedPoolText) : null,
+      /**
+       * ⚠️ Accio 的每日额度重置倒计时（**唯一**与 loomy 不同的附注）。
+       *
+       * 别的家没有这一条；但 accio 的每日额度是 24 小时作废且**不累积**，
+       * 「还有多久刷新」是用户唯一能据此决定「现在要不要用掉」的信息。
+       * ⚠️ 它放在**积分行内**（而不是另起区块）—— 这正是 2026-10-13 的统一要求。
+       */
+      accioResetNote ? React2.createElement("span", {
+        className: "dim-jh-creditPools",
+        title: ACCIO_DAILY_REWARD_NOTE
+      }, accioResetNote) : null,
       // 两个 buddy + TRAE + LobsterAI：按「会不会近期作废」分桶，与选号判据同一套规则。
       // 这条也解释了「锁定永久积分后为什么没有可用账号」——临时桶是 0。
       // ⚠️ 用词「长期」不是「永久」：这些积分都有到期日，只是较远（用户定）。
       // ⚠️ 与上面的池分桶互斥：有当日池的（loomy / raccoon）走池名分桶，
       // 没有的走到期时间分桶。
-      !poolSplitText && expiryText ? React2.createElement("span", {
+      !poolSplitText && expiryParts.length > 0 ? React2.createElement("span", {
         className: "dim-jh-creditPools",
-        title: `临时 = 距扣费截止不足 ${windowDays} 天（再不用就作废，优先消耗）；长期 = 其余积分（锁定永久积分后不参与消耗）。`
-      }, expiryText) : null,
+        title: `永久 = 服务端未给到期时间（不会作废）；长期 = 有到期时间但距扣费截止还有 ${windowDays} 天以上；临期 = 距扣费截止不足 ${windowDays} 天（再不用就作废，优先消耗，锁定永久积分后不参与消耗）。`
+      }, expiryParts.flatMap((part, index) => {
+        const node = React2.createElement("span", {
+          key: part.key,
+          className: "dim-jh-creditPoolPart",
+          "data-tone": part.tone
+        }, part.countdown === void 0 ? part.text : `${part.text}（${part.countdown}）`);
+        return index === 0 ? [node] : [React2.createElement("span", { key: `sep-${part.key}`, className: "dim-jh-creditPoolSep" }, " · "), node];
+      })) : null,
       // ⚠️ 配额单位（Gemini）下**不渲染**这句：它的两个「包」是 5 小时窗口与
       // 周窗口，不是资源包 —— 说「2/2 个资源包有效」既没信息量又误导
       // （用户报障原文：「不要渲染 / 2/2 个资源包有效」）。窗口自身的读数
       // 已由上面的 `quotaText` 逐条列出，这里再补一句纯属噪音。
       // ⚠️ 非配额单位（真正由多个资源包构成余额的 provider）行为**逐字不变**。
-      quotaText === null && !poolSplitText && !expiryText && all.length > 1 ? React2.createElement(
+      quotaText === null && !poolSplitText && expiryParts.length === 0 && all.length > 1 ? React2.createElement(
         "span",
         { className: "dim-jh-creditPackages" },
         `${activeCount}/${all.length} 个资源包有效`
@@ -3715,6 +4061,7 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
   const [phase, setPhase] = React2.useState("loading");
   const [error, setError] = React2.useState(null);
   const [toggleError, setToggleError] = React2.useState(null);
+  const [toggleWarnings, setToggleWarnings] = React2.useState([]);
   const [busyIds, setBusyIds] = React2.useState(() => /* @__PURE__ */ new Set());
   const [deadRestoreBusy, setDeadRestoreBusy] = React2.useState(false);
   const [bulkBusy, setBulkBusy] = React2.useState(false);
@@ -3754,9 +4101,11 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
   const toggleModel = async (modelId, disabled) => {
     setBusyIds((prev) => new Set(prev).add(modelId));
     setToggleError(null);
+    setToggleWarnings([]);
     try {
-      await rpcCall("model.setDisabled", { provider, modelId, disabled });
+      const res = await rpcCall("model.setDisabled", { provider, modelId, disabled });
       if (!mounted.current) return;
+      setToggleWarnings(res?.warnings || []);
       setModels((prev) => (prev || []).map((m) => m.id === modelId ? { ...m, disabled } : m));
     } catch (caught) {
       console.error("[jet-hub] toggle model failed:", caught);
@@ -3833,9 +4182,11 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
     }
     setGroupBusy(group.key);
     setToggleError(null);
+    setToggleWarnings([]);
     try {
-      await rpcCall("model.setDisabledMany", { provider, modelIds: ids, disabled });
+      const res = await rpcCall("model.setDisabledMany", { provider, modelIds: ids, disabled });
       if (!mounted.current) return;
+      setToggleWarnings(res?.warnings || []);
       const changed = new Set(ids);
       setModels((prev) => (prev || []).map((m) => changed.has(m.id) ? { ...m, disabled } : m));
     } catch (caught) {
@@ -3990,6 +4341,17 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
         "data-tone": "error",
         role: "alert"
       }, React2.createElement("div", null, toggleError)) : null,
+      // ⚠️ 与 `toggleError` 分开渲染（Issue IKJW33）：本条是「操作成功，但没有
+      // 实际效果」的说明（下架模型的空操作），用中性 tone + `role=status`；
+      // 混进错误通道会让「模型已下架」看起来像插件故障。
+      toggleWarnings.length > 0 ? React2.createElement("div", {
+        className: "dim-jh-probeNotice",
+        // ⚠️ tone 取值必须是 `warn`：样式表里定义的是 `[data-tone="warn"]`
+        //（全仓既有约定），写成 `warning` 会静默落到默认中性色 —— 不报错，
+        // 但提示看起来和普通文字一样，等于没做。
+        "data-tone": "warn",
+        role: "status"
+      }, toggleWarnings.map((text, index) => React2.createElement("div", { key: index }, text))) : null,
       phase === "error" ? React2.createElement(
         "div",
         { className: "dim-jh-modalBody" },
@@ -5228,12 +5590,31 @@ ${tokenSummaryTooltip(historyDays.find((day) => day.day === cell.day)?.totals)}
     )
   );
 }
+function formatAccioResetCountdown(seconds) {
+  if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds <= 0) return null;
+  const totalMinutes = Math.floor(seconds / 60);
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  if (hours > 0) return `${hours} 小时 ${minutes} 分`;
+  if (minutes > 0) return `${minutes} 分`;
+  return `${seconds} 秒`;
+}
+function accioResetSeconds(packages, now) {
+  if (!Array.isArray(packages)) return null;
+  const daily = packages.find((pkg) => pkg && pkg.name === ACCIO_DAILY_BUCKET);
+  if (daily === void 0) return null;
+  const end = typeof daily.cycleEndTime === "string" && daily.cycleEndTime.length > 0 ? Date.parse(daily.cycleEndTime) : Number.NaN;
+  if (!Number.isFinite(end)) return null;
+  const at = typeof now === "number" && Number.isFinite(now) ? now : Date.now();
+  return Math.max(0, Math.round((end - at) / 1e3));
+}
 function ProviderPanel({ provider, rpcCall }) {
   const [accounts, setAccounts] = React2.useState([]);
   const [phase, setPhase] = React2.useState("loading");
   const [error, setError] = React2.useState(null);
   const [creating, setCreating] = React2.useState(false);
   const [zcodeProvider, setZcodeProvider] = React2.useState("bigmodel");
+  const [accioRegion, setAccioRegion] = React2.useState("cn");
   const [pendingLogin, setPendingLogin] = React2.useState(void 0);
   const [probeBusy, setProbeBusy] = React2.useState(null);
   const [probeNotice, setProbeNotice] = React2.useState(null);
@@ -5270,7 +5651,19 @@ function ProviderPanel({ provider, rpcCall }) {
       setPhase("error");
     }
   }, [provider, rpcCall]);
+  const reloadAccountsQuietly = React2.useCallback(async () => {
+    try {
+      const res = await rpcCall("account.list", { provider });
+      if (!mounted.current) return;
+      const list = res.accounts || [];
+      accountsRef.current = list;
+      setAccounts(list);
+    } catch (caught) {
+      console.error("[jet-hub] 静默重读账号列表失败（不影响积分显示）:", caught);
+    }
+  }, [provider, rpcCall]);
   const canLoadCredits = supportsCreditBalance(provider);
+  const accioDialog = provider === "accio";
   const supportsCredits = supportsDailyCheckin(provider);
   const supportsGrowthTasks = GROWTH_TASK_PROVIDERS.has(provider);
   const canShowSubscriptionQuota = supportsSubscriptionQuota(provider);
@@ -5286,6 +5679,7 @@ function ProviderPanel({ provider, rpcCall }) {
       }
       setCredits(next);
       setExpiryWindowDays(res?.windowDays ?? null);
+      await reloadAccountsQuietly();
     } catch (caught) {
       console.error("[jet-hub] load credits failed:", caught);
       if (!mounted.current) return;
@@ -5300,7 +5694,7 @@ function ProviderPanel({ provider, rpcCall }) {
     } finally {
       if (mounted.current) setCreditsLoading(false);
     }
-  }, [provider, rpcCall, canLoadCredits]);
+  }, [provider, rpcCall, canLoadCredits, reloadAccountsQuietly]);
   React2.useEffect(() => {
     mounted.current = true;
     void loadAccounts();
@@ -5540,7 +5934,10 @@ function ProviderPanel({ provider, rpcCall }) {
     let accountId = "";
     let loginUrl = "";
     try {
-      const res = await rpcCall("account.create", buildCreateAccountPayload(provider, zcodeProvider));
+      const res = await rpcCall(
+        "account.create",
+        buildCreateAccountPayload(provider, zcodeProvider, accioRegion)
+      );
       accountId = res.accountId;
       loginUrl = res.loginUrl;
       console.log("[jet-hub] account.create ok, provider =", provider, ", accountId =", accountId);
@@ -5551,10 +5948,15 @@ function ProviderPanel({ provider, rpcCall }) {
         return;
       }
       if (loginUrl) {
-        const loginWindow = window.open(loginUrl, "_blank", "width=800,height=600");
-        if (!loginWindow || loginWindow.closed) {
-          setLoginUrlForManual(loginUrl);
-          setLoginLinkCopied(null);
+        let loginWindow = null;
+        if (res.incognitoOpened === true) {
+          console.log("[jet-hub] account.create 已由宿主以无痕窗口打开授权页");
+        } else {
+          loginWindow = window.open(loginUrl, "_blank", "width=800,height=600");
+          if (!loginWindow || loginWindow.closed) {
+            setLoginUrlForManual(loginUrl);
+            setLoginLinkCopied(null);
+          }
         }
         const deadline = Date.now() + 3e5;
         pollRef.current = setInterval(async () => {
@@ -5869,10 +6271,13 @@ function ProviderPanel({ provider, rpcCall }) {
           },
           disabled: creating
         }, creating ? "正在登录…" : "+ 新建账号"),
-        // ★ 渠道选择对话框（用户 2026-10-03：从按钮旁搬到弹窗里）
+        // ★ 预选对话框（用户 2026-10-03：从按钮旁搬到弹窗里）
+        //
+        // ⚠ 内容按 provider 分支：zcode 问**登录渠道**，accio 问**登录区域**
+        //   （两者都收在 `newAccountAsksChannel` 的白名单里）。
         //
         // ⚠ `newAccountAsksChannel(provider)` 这道是**防御性**的：按钮已经分支过，
-        //   正常路径下非 zcode 永远不会把 `pendingLogin` 置为「开」。
+        //   正常路径下不在白名单的 provider 永远不会把 `pendingLogin` 置为「开」。
         //   但状态是活的（用户切 provider 时本面板会重新挂载，理论上仍可能
         //   残留一帧），漏掉它就会退回 issue 里那个「非 zcode 弹出 ZCode 窗」的形态。
         //
@@ -5898,19 +6303,32 @@ function ProviderPanel({ provider, rpcCall }) {
             React2.createElement(
               "h3",
               { className: "dim-jh-zcDialogTitle" },
-              "添加 ZCode 账号"
+              accioDialog ? "添加 Accio 账号" : "添加 ZCode 账号"
             ),
             React2.createElement(
               "p",
               { className: "dim-jh-zcDialogHint" },
-              "选择登录渠道后才会打开对应的认证页面。两个渠道的授权页与凭据各自独立，",
+              accioDialog ? "Accio 的登录页按区域分域名，且区域由服务端按账号下发 —— 登录前无法自动判断。请选择该账号所属的区域，否则会打开打不开的登录页。" : "选择登录渠道后才会打开对应的认证页面。两个渠道的授权页与凭据各自独立，"
+            ),
+            accioDialog ? null : React2.createElement(
+              "p",
+              { className: "dim-jh-zcDialogHint" },
               "可用 z.ai（国际）登录另一个账号。"
             ),
             React2.createElement(
               "label",
               { className: "dim-jh-zcProvider" },
-              "登录渠道",
-              React2.createElement(
+              accioDialog ? "登录区域" : "登录渠道",
+              accioDialog ? React2.createElement(
+                "select",
+                {
+                  className: "dim-jh-zcSelect",
+                  value: accioRegion,
+                  onChange: (event) => setAccioRegion(event.target.value)
+                },
+                React2.createElement("option", { value: "cn" }, "中国版（www.accio-ai.com）"),
+                React2.createElement("option", { value: "global" }, "国际版（zh.accio.com）")
+              ) : React2.createElement(
                 "select",
                 {
                   className: "dim-jh-zcSelect",
@@ -6085,6 +6503,11 @@ function ProviderPanel({ provider, rpcCall }) {
           busy: probeBusy !== null,
           credits: credits[account.id],
           creditsLoading: creditsLoading && credits[account.id] === void 0,
+          // ⚠️ accio **不再**关掉通用积分行（2026-10-13 改）：
+          // 用户报障原文「accio 的显示和别的 provider 没统一，例如 loomy 的」。
+          // 现改为与 loomy 同形 —— 卡片里就是积分行，三类桶由
+          // `CreditBalanceRow` 的 `formatNamedPoolLine` 逐池列出，
+          // 倒计时作为同一行内的一个附注（见那里的注释）。
           showCredits: canLoadCredits,
           // 账号名 hover 列资源包：只有余额真由多个包构成的 provider 才挂
           // （loomy 的池是我们合成的、无到期字段，列出来会把「每日赠送」
@@ -7139,10 +7562,14 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
               // ⚠️ 用户 2026-10-04 要求这句只留「在 127.0.0.1 监听，供客户端调用」——
               // 原先列了 Pi / Continue / Cline / OpenCode 四个客户端名，在窄面板下折成两行
               // 且把「打开/关闭」那个动作词挤到很后面。客户端列举属于 README 的内容。
+              // ⚠️ **地址必须是动态的**（issue IKL7UN）：host 现在可配（容器化部署下
+              // 就是容器桥接 IP），写死 127.0.0.1 会让用户照着抄一个从容器外连不上的
+              // 地址 —— 而那正是 issue 报告者踩的坑。未在监听时退回「本机」这一定性
+              // 说法（与 gatewayEndpoint 返回 '' 的既有取舍同源：不编造具体地址）。
               React2.createElement(
                 "code",
                 { className: "dim-jh-modelId" },
-                "在 127.0.0.1 监听，供客户端调用"
+                status?.address ? `在 ${status.address.host} 监听，供客户端调用` : "在本机监听，供客户端调用"
               )
             ),
             React2.createElement("input", {
@@ -7378,13 +7805,14 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
             })
           ) : null
         ),
-        // ⚠️ 用户 2026-10-04 要求**删掉两段 curl 命令**（模型目录与对照表各一条）。
-        // 它们已被 README 的「拿到地址与密钥」/「思考档位」两节完整收录，
-        // 而弹窗里那两段是「命令行查看同一份…」的重复说明 —— 正是用户说的「三坨字混在一起」。
+        // ── 网关弹窗脚注 ──
+        // ⚠️ 这段是**安全声明**，随着 host 可配（issue IKL7UN）它必须跟着实际监听
+        // 地址变化 —— 写死「只绑定 127.0.0.1」在容器部署下是错误陈述（详见
+        // `gatewayFootnote` 的注释）。
         React2.createElement(
           "p",
           { className: "dim-jh-modalHint dim-jh-gatewayFootnote" },
-          "网关只绑定 127.0.0.1，但这挡不住同机的其它用户或进程 —— 真正的隔离靠密钥，不要把它配置进任何浏览器端工具或扩展。"
+          gatewayFootnote(status)
         ),
         notice ? React2.createElement("div", {
           className: "dim-jh-probeNotice",
@@ -8559,6 +8987,7 @@ var React3 = __toESM(require("react"), 1);
 var BADGE_PREFERENCES = Object.freeze(["auto", "subscription", "credits"]);
 var DEFAULT_BADGE_PREFERENCE = "auto";
 var AGGREGATE_PROVIDER_ID = "aggregate";
+var AUTO_PROVIDER_ID = "jet-hub-auto";
 function resolveBadgeProvider(provider, active) {
   if (typeof provider !== "string" || provider.length === 0) return null;
   if (provider !== AGGREGATE_PROVIDER_ID) return provider;
@@ -8572,6 +9001,7 @@ var HOST_STALE_HINT = "插件宿主未加载最新版本，请重启 DSH 后重�
 function describeBadgeError(error, fallback = "") {
   const message = typeof error?.message === "string" ? error.message : "";
   if (message.includes("unknown method")) return HOST_STALE_HINT;
+  if (message.includes("unsupported provider")) return HOST_STALE_HINT;
   return message.length > 0 ? message : fallback;
 }
 var BADGE_PREFERENCE_LABELS = Object.freeze({
@@ -8776,6 +9206,39 @@ function orderCreditRows(rows, options = {}) {
   const hidden = Math.max(0, ordered.length - limit);
   return { shown: options.expanded === true ? ordered : ordered.slice(0, limit), hidden };
 }
+function autoBadgeName(options = {}) {
+  const fallback = typeof options.fallback === "string" ? options.fallback : "";
+  const target = options.autoActual;
+  if (typeof target !== "object" || target === null || typeof target.provider !== "string" || target.provider.length === 0) {
+    return fallback;
+  }
+  const labelOf = typeof options.providerLabel === "function" ? options.providerLabel : (id) => id;
+  const shortName = shortProviderName(labelOf(target.provider)) || target.provider;
+  let name2 = `自动 → ${shortName}${typeof target.model === "string" && target.model.length > 0 ? ` ${target.model}` : ""}`;
+  const price = options.price;
+  if (typeof price === "number" && Number.isFinite(price)) {
+    name2 += ` ${price === 0 ? "免费" : `x${price}`}`;
+  }
+  if (target.viaImageFallback === true) name2 += "（图）";
+  const expiryAt = options.expiryAt;
+  if (typeof expiryAt === "number" && Number.isFinite(expiryAt)) {
+    const text = expiryCountdownText(expiryAt, options.now);
+    if (text.length > 0) name2 += ` · ${text}`;
+  }
+  return name2;
+}
+function expiryCountdownText(at, now = Date.now()) {
+  if (typeof at !== "number") return "";
+  const d = new Date(at);
+  if (!Number.isFinite(d.getTime())) return "";
+  const n = new Date(now);
+  const hm = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  const sameDay = d.getFullYear() === n.getFullYear() && d.getMonth() === n.getMonth() && d.getDate() === n.getDate();
+  return `${sameDay ? "今日" : `${d.getMonth() + 1}/${d.getDate()} `}${hm}过期`;
+}
+function shortProviderName(name2) {
+  return String(name2 ?? "").replace(/\s*[（(][^)）]*[)）]\s*/g, "").trim();
+}
 function creditSectionLabel(groups) {
   const list = Array.isArray(groups) ? groups.filter((g) => g && typeof g.unit === "string") : [];
   const quotaGroup = list.find((g) => g.unit === QUOTA_UNIT);
@@ -8903,7 +9366,20 @@ function UsageBadge(props) {
   if (isAggregate) {
     provider = resolveBadgeProvider(provider, activeProvider === null ? null : { provider: activeProvider });
   }
+  if (isAggregate && provider === null) {
+    return React3.createElement("span", {
+      className: "dim-jh-badgePending",
+      role: "status",
+      title: "聚合（跨渠道）：尚未发出过请求，还不知道会走哪个渠道。发送一条消息后这里会显示实际使用的渠道与积分。"
+    }, [
+      React3.createElement("span", { key: "dot", className: "dim-jh-badgeDot", "data-tone": "muted" }),
+      React3.createElement("span", { key: "text" }, "聚合 · 待首次请求")
+    ]);
+  }
   if (typeof provider !== "string" || provider.length === 0) return null;
+  if (provider === AUTO_PROVIDER_ID) {
+    return React3.createElement(UsageBadgeActive, { ...props, provider });
+  }
   if (!supportsCreditBalance(provider)) return null;
   return React3.createElement(UsageBadgeActive, { ...props, provider });
 }
@@ -9010,8 +9486,15 @@ function UsageBadgeActive(props) {
   }, [claimNotice]);
   const value = snapshot?.value;
   const effectivePreference = preference ?? value?.preference ?? "auto";
+  const badgeName = autoBadgeName({
+    fallback: label,
+    autoActual: value?.autoActual,
+    price: value?.autoPrice,
+    expiryAt: value?.autoExpiryAt,
+    providerLabel: providerLabel2
+  });
   const view = badgeView({
-    providerLabel: label,
+    providerLabel: badgeName,
     preference: effectivePreference,
     subscription: value?.subscription,
     accounts: value?.accounts ?? [],
@@ -9367,8 +9850,9 @@ function UsageBadgeActive(props) {
             title: row.error || void 0
           }, row.balance === null ? row.error || "查询失败" : balanceLine(row.balance))
         ]),
-        // 分桶/资源包说明：灰色小字，存在时才占一行
-        row.balance === null ? null : renderNote(splitLine(row.balance, windowDays, provider))
+        // 分桶/资源包说明：小字**逐段带色**（永久绿 / 长期黄 / 临期红 + 倒计时），
+        // 存在时才占一行。用户 2026-10-12 明确要求三档分色。
+        row.balance === null ? null : renderSplitNote(splitParts(row.balance, windowDays, provider))
       ])),
       hidden === 0 ? null : React3.createElement("button", {
         key: "more",
@@ -9382,6 +9866,20 @@ function UsageBadgeActive(props) {
   function renderNote(text) {
     if (typeof text !== "string" || text.length === 0) return null;
     return React3.createElement("div", { key: "note", className: "dim-jh-badgeRowNote" }, text);
+  }
+  function renderSplitNote(parts) {
+    if (!Array.isArray(parts) || parts.length === 0) return null;
+    const children = [];
+    parts.forEach((part, index) => {
+      if (index > 0) children.push(React3.createElement("span", { key: `sep-${part.key}`, className: "dim-jh-badgeNoteSep" }, " · "));
+      children.push(React3.createElement("span", {
+        key: part.key,
+        className: "dim-jh-badgeNotePart",
+        "data-tone": part.tone,
+        ...part.countdown === void 0 ? {} : { title: `最早作废：${part.countdown}后` }
+      }, part.countdown === void 0 ? part.text : `${part.text}（${part.countdown}）`));
+    });
+    return React3.createElement("div", { key: "note", className: "dim-jh-badgeRowNote" }, children);
   }
   function renderClaim() {
     const canClaimCurrent = supportsDailyCheckin(provider);
@@ -9496,7 +9994,7 @@ function balanceLine(balance) {
   const text = formatUnits(balance.total, unit) ?? "0";
   return `${text}${unitLabel(unit)}`;
 }
-function splitLine(balance, windowDays, provider) {
+function splitParts(balance, windowDays, provider) {
   const packages = balance.packages || [];
   const unit = packages.find((pkg) => pkg && pkg.unit)?.unit;
   if (unit === QUOTA_UNIT) {
@@ -9504,15 +10002,14 @@ function splitLine(balance, windowDays, provider) {
     for (const pkg of packages) {
       if (!pkg) continue;
       const left = quotaResetsIn(pkg.cycleEndTime);
-      if (left.length > 0) parts.push(`${pkg.name || "未命名"} ${left}`);
+      if (left.length > 0) parts.push({ key: pkg.name || "unnamed", text: `${pkg.name || "未命名"} ${left}`, tone: "muted" });
     }
-    return parts.join(" · ");
+    return parts;
   }
   const format = (value) => formatUnits(value, unit);
   const poolText = formatPoolSplitLine(packages, format, provider === "loomy" ? "永久" : "长期");
-  if (poolText !== null) return poolText;
-  const expiryText = formatExpirySplitLine(splitCreditsByExpiry(packages, windowDays, Date.now()), format);
-  return expiryText ?? "";
+  if (poolText !== null) return [{ key: "pool", text: poolText, tone: "muted" }];
+  return expirySplitParts(splitCreditsByExpiry(packages, windowDays, Date.now()), format, Date.now());
 }
 function summarizeClaim(result) {
   const summary = result?.summary;

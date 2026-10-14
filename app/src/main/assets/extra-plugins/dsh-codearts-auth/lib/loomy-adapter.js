@@ -15,13 +15,14 @@
  * `loomyChatHeaders()`（两个都发），`listModels()` 用 `loomyBusinessHeaders()`。
  */
 import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
-import { providerCatalogVisible } from './account-pool.js';
+import { createModelCatalog } from './model-catalog.js';
 import { RemoteCatalogGate } from './remote-catalog-gate.js';
 import { broadcastCatalogChanged } from './catalog-broadcast.js';
 import { isLoomyChatModel, isLoomyExpired, loomyChatHeaders, loomyDisplayName, splitLoomyRate, } from './loomy.js';
 import { LOOMY, loomyContextWindow } from './loomy-product.js';
 import { registerAdapterIdempotent, } from './llm-register-compat.js';
 import { collectImages, consumeOpenAiSse, errorDetail, httpErrorCode, isTransportError, serializeMessages, } from './openai-compat.js';
+import { planSessionTitleThinking } from './session-title.js';
 /** 本适配器注册的 provider 路由名（等价于 `LOOMY.id`）。 */
 export const PROVIDER = 'loomy';
 /**
@@ -248,6 +249,14 @@ export class LoomyAdapter extends LlmAdapter {
         this.fallbackIndex = new Map(this.product.fallbackModels.map((model) => [model.id, model]));
         // 目录落地后通知客户端重读（issue IKJVTF 的缺陷①）。
         this.catalogGate = new RemoteCatalogGate(options.onCatalogLoaded === undefined ? {} : { onLoaded: options.onCatalogLoaded });
+        // ⚠️ 共享骨架：门控 → 读目录 → 黑名单 → 回填 → 三态，全在 `model-catalog.ts`。
+        this.catalog = createModelCatalog({ accountPool: options.accountPool }, {
+            product: this.product,
+            loadCatalog: () => this.loadCatalogEntries(),
+            // ⚠️ 未知 id 保守报 ['text']（宁可少报能力，也不报服务端可能不认的模态）。
+            unknownModelInputModalities: () => ['text'],
+            syncCatalog: () => this.syncCatalogEntries(),
+        });
     }
     /**
      * 描述本适配器拥有的 provider 路由。
@@ -261,10 +270,18 @@ export class LoomyAdapter extends LlmAdapter {
         const id = typeof provider === 'string' && provider.length > 0 ? provider : this.product.id;
         return { id, name: this.product.displayName };
     }
+    /**
+     * ⚠️ **2026-10-08 Task 7a：三个方法收敛到共享骨架** `createModelCatalog`。
+     *
+     * 原先 `listModels` / `resolveModel` / `listAllModels` 各写一遍骨架（实测与
+     * `minimax` / `raccoon` **归一化后逐字相同**）。现在只剩 `toCatalogEntry`
+     * 这一个**本家私有**的转换，骨架（门控 → 读目录 → 黑名单 → 回填 → 三态）
+     * 由 `src/model-catalog.ts` 统一持有。
+     */
+    catalog;
     /** 完整目录（**不套黑名单**），带最终展示名。设置页需要它渲染被关闭的模型。 */
     listAllModels() {
-        const source = this.remoteModels ?? this.product.fallbackModels.map(fallbackToRemote);
-        return source.map((model) => ({ id: model.id, name: model.name }));
+        return this.catalog.listAllModels();
     }
     /**
      * 取远端模型目录；**失败时不把兜底表写进缓存**。
@@ -292,50 +309,43 @@ export class LoomyAdapter extends LlmAdapter {
         }
         return this.product.fallbackModels.map(fallbackToRemote);
     }
-    inputModalitiesFor(model) {
-        return model?.supportsImage === true ? ['text', 'image'] : ['text'];
-    }
-    async listModels(_provider) {
-        // ⚠️ 无已登录账号时返回 `[]` → DSH 的 buildModelCatalog 把整个 provider
-        // 分组隐藏。**必须返回空数组而不能抛错**（抛错会被归入 catalog 的
-        // failures，界面上反而多一条 provider 报错）。
-        if (!await providerCatalogVisible(this.options.accountPool, this.product.id))
-            return [];
-        const all = await this.loadModels();
-        const disabled = this.options.accountPool?.disabledModelsFor(this.product.id);
-        const listed = disabled === undefined || disabled.size === 0
-            ? all
-            : all.filter((model) => !disabled.has(model.id));
-        return listed.map((model) => ({
-            provider: this.product.id,
+    /**
+     * 把本家私有的远端/兜底条目转成共享骨架的中间结构。
+     *
+     * ⚠️ 这里是**唯一**还认识「倍率格式」与「supportsImage」的地方 ——
+     * 骨架不认识它们（各家格式不同）。
+     */
+    toCatalogEntry(model, fallback) {
+        const reasoning = this.reasoningFor(model, fallback);
+        const contextWindow = model.contextWindow;
+        return {
             id: model.id,
             // 倍率拼进 name（不是 description）：composer 的模型切换菜单只渲染 name。
             name: model.name,
-            inputModalities: this.inputModalitiesFor(model),
-        }));
-    }
-    async resolveModel(provider, model, _signal) {
-        const all = await this.loadModels();
-        const entry = all.find((item) => item.id === model);
-        const fallback = this.fallbackIndex.get(model);
-        // ⚠️ name **不带倍率**（与 qoder/trae 一致）：价格只属于选择列表语境。
-        const bareName = fallback !== undefined ? splitLoomyRate(fallback.name).name : model;
-        const resolved = {
-            provider,
-            id: model,
-            name: entry !== undefined ? splitLoomyRate(entry.name).name : bareName,
-            inputModalities: this.inputModalitiesFor(entry),
+            // ⚠️ `resolveModel` 用**裸名**（不带倍率）—— 价格只属于选择列表语境。
+            bareName: splitLoomyRate(model.name).name,
+            // ⚠️ 三态：`supportsImage` 为 false 时是**明确不支持**（不是「未知」）——
+            // 本家的远端条目**总是**带该布尔，故这里恒为数组，不会是 undefined。
+            inputModalities: model.supportsImage ? ['text', 'image'] : ['text'],
+            ...contextWindow !== undefined && contextWindow > 0 ? { contextWindow } : {},
+            ...reasoning !== undefined ? { reasoning } : {},
         };
-        const contextWindow = entry?.contextWindow ?? fallback?.contextWindow;
-        // 未知模型不编造 context（宁可让 DSH 用默认值，也不报一个假窗口）。
-        if (contextWindow !== undefined && contextWindow > 0) {
-            resolved.context = { contextWindow };
-        }
-        // 思考档位：**远端 `reasoning_efforts` 直接生成**（用户要求）。
-        const reasoning = this.reasoningFor(entry, fallback);
-        if (reasoning !== undefined)
-            resolved.reasoning = reasoning;
-        return resolved;
+    }
+    /** 本家全部条目（远端缓存 ?? 兜底表），已转成中间结构。 */
+    async loadCatalogEntries() {
+        const all = await this.loadModels();
+        return all.map((model) => this.toCatalogEntry(model, this.fallbackIndex.get(model.id)));
+    }
+    /** 同步视图（`listAllModels` 用，见 `ModelCatalogConfig.syncCatalog` 的说明）。 */
+    syncCatalogEntries() {
+        const source = this.remoteModels ?? this.product.fallbackModels.map(fallbackToRemote);
+        return source.map((model) => this.toCatalogEntry(model, this.fallbackIndex.get(model.id)));
+    }
+    async listModels(_provider) {
+        return this.catalog.listModels(_provider);
+    }
+    async resolveModel(provider, model, signal) {
+        return this.catalog.resolveModel(provider, model, signal);
     }
     /**
      * 该模型的思考档位（`resolveModel` 的 `reasoning` 字段）。
@@ -397,7 +407,10 @@ export class LoomyAdapter extends LlmAdapter {
         const entry = all.find((item) => item.id === options.model);
         let imageUrls;
         if (imageRefs.size > 0) {
-            if (!this.inputModalitiesFor(entry).includes('image')) {
+            // ⚠️ 这里**不能**走 `this.catalog` —— 它要的是「这个模型支不支持图片」这一个
+            // 判据，而 `resolveModel` 会顺带做 name 回退/context/maxTokens/reasoning，
+            // 在**发请求前**的这条路径上多算一遍没有意义（且 `resolveModel` 是 async）。
+            if (entry?.supportsImage !== true) {
                 throw new LlmError(`loomy: 模型 "${options.model}" 不支持图片输入`, 'UNSUPPORTED_CONTENT');
             }
             if (this.options.readImage === undefined) {
@@ -407,6 +420,27 @@ export class LoomyAdapter extends LlmAdapter {
             // 空 Map 仍会让 userContentParts 产出 [image unavailable] 占位符。
             imageUrls = new Map();
             for (const [id, ref] of imageRefs) {
+                /**
+                 * ⚠️ **此处刻意走「原图」路径，未接 `readImageRequest` 缩放桥接**
+                 * （Gitee issue IKKX0T，2026-10-12 复核）。
+                 *
+                 * 既有理由「loomy 实测 24 张全过、无证据说明它有约束」**已被推翻**：
+                 * issue 的独立实测给出 `413 Request Entity Too Large` / `504`，
+                 * 且本仓库那个「24 张」= **91.8 MiB** 恰落在 issue 的 87.4~96.6 MiB
+                 * 区间**内部** —— 即当时是**侥幸通过**，不是没有约束。
+                 *
+                 * ⇒ **但当前仍不接**，理由只有一条：**边界未经本仓库复测**。
+                 * 两家 fixture 的量纲不同（issue 3.45 MiB/张 vs 本仓库 2.87 MiB/张），
+                 * 直接套用别家的 `imageMaxBytes` 等于写进一个没验证的猜测
+                 * （本仓库规矩：拿不到阈值就不定值）。
+                 *
+                 * **复测入口**：`pnpm test:e2e:image-bisect`
+                 * （`tests/e2e/image-limit-bisect.e2e.spec.ts`，二分到 ≤3 张）。
+                 * 复测后：① 给 `LoomyProduct.imageMaxBytes` 赋值；
+                 * ② 这里改为 `projectRequestImage(ref, {...})` 并保留「拿不到就回退原图」；
+                 * ③ 宿主侧 `index.ts` 补 `readImageRequest` 桥接；
+                 * ④ 删掉 `tests/unit/image-budget.spec.ts` 里那条「loomy/trae 不误接」守卫。
+                 */
                 const image = await this.options.readImage(ref);
                 if (image === undefined)
                     continue;
@@ -465,17 +499,39 @@ export class LoomyAdapter extends LlmAdapter {
          */
         const effortsForModel = (await this.loadModels()).find((m) => m.id === options.model)?.efforts
             ?? this.fallbackIndex.get(options.model)?.efforts;
-        const effort = options.reasoningEffort !== undefined
+        /**
+         * 会话自动命名（`purpose: 'session-title'`）的思考与预算决策（issue IKKVDH）。
+         *
+         * DSH 用 **64 token** 发标题请求且**不传 `reasoningEffort`**，而宿主会把
+         * 远端声明的默认档注入进来。本家远端 `reasoning_efforts` 实测形如
+         * `['none','low','medium','high','xhigh']`（**含 `none`**）⇒ 声明了它的
+         * 模型关得掉；远端未声明档位的模型只能抬预算兜底。
+         */
+        const titlePlan = planSessionTitleThinking({
+            purpose: options.purpose,
+            requestedEffort: options.reasoningEffort === undefined ? undefined : String(options.reasoningEffort),
+            declaredEfforts: effortsForModel ?? [],
+            maxTokens: options.maxTokens,
+        });
+        /**
+         * ⚠️ **仍须做档位白名单校验**（这是本家原有的判据，不能因为接入标题逻辑
+         * 而丢掉）：DSH 会把用户选的档位直接透传，给一个远端不认的值比不给更糟。
+         *
+         * 两种请求的取值来源不同，但**都要过这一关**：
+         * - 标题请求：`titlePlan.effort`（声明了 `none` 时就是它）；
+         * - 普通请求：调用方给的档位（与本次改动前**逐字节等价**）。
+         */
+        const effort = titlePlan.effort !== undefined
             && effortsForModel !== undefined
-            && effortsForModel.includes(options.reasoningEffort)
-            ? options.reasoningEffort
+            && effortsForModel.includes(titlePlan.effort)
+            ? titlePlan.effort
             : undefined;
         /** 构造请求体。 */
         const buildBody = () => JSON.stringify({
             model: options.model,
             messages: wireMessages,
             stream: true,
-            ...options.maxTokens !== undefined ? { max_tokens: options.maxTokens } : {},
+            ...titlePlan.maxTokens !== undefined ? { max_tokens: titlePlan.maxTokens } : {},
             ...options.temperature !== undefined ? { temperature: options.temperature } : {},
             ...options.stop !== undefined && options.stop.length > 0 ? { stop: options.stop } : {},
             ...effort !== undefined ? { reasoning_effort: effort } : {},

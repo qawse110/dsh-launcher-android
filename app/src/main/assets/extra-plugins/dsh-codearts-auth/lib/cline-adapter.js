@@ -27,7 +27,7 @@
  * 故本适配器**不硬编码任何免费模型名** —— 与 CodeArts benefit 集合同约定。
  */
 import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
-import { providerCatalogVisible } from './account-pool.js';
+import { createModelCatalog } from './model-catalog.js';
 import { clineExhaustedAdvice, clineRateLimitResetAt, parseClineRateLimitHint, recordsClineRateLimit, } from './cline-rate-limit.js';
 import { RemoteCatalogGate } from './remote-catalog-gate.js';
 import { broadcastCatalogChanged } from './catalog-broadcast.js';
@@ -40,6 +40,7 @@ import { parseClineRouting } from './cline-routing.js';
 import { recordClineRequest } from './cline-request-log.js';
 import { registerAdapterIdempotent, } from './llm-register-compat.js';
 import { collectImages, consumeOpenAiSse, errorDetail, httpErrorCode, isTransportError, serializeMessages, } from './openai-compat.js';
+import { planSessionTitleThinking } from './session-title.js';
 /** 本适配器注册的 provider 路由名（等价于 `CLINE.id`）。 */
 export const PROVIDER = 'cline';
 /** 换号次数上限（对齐 buddy / lobsterai / trae 的 `MaxRotate = 3`）。 */
@@ -146,17 +147,64 @@ export class ClineAdapter extends LlmAdapter {
      *
      * 判据用「已完整」而非「已定义」：残缺时放行到闸门，由冷却控制重试节奏
      * （30 秒一轮，不会打风暴）。
+     *
+     * ⚠️⚠️ **「完整」必须包含 models.dev**（issue IKKZUG，2026-10-12）。
+     *
+     * 修复前它只反映**两个 Cline 端点**（`remote.complete`），**不含 models.dev**
+     * ⇒ models.dev 超时后 `remoteComplete` 仍是 `true` ⇒ 上面这个短路把闸门
+     * 彻底旁路 ⇒ 闸门的冷却永远读不到 ⇒ models.dev 在整个进程生命周期内
+     * 只被调 1 次。而 `cline-pass/*` 的模型条目与图片能力**只由 models.dev 提供**
+     * ⇒ 它们会「明确不支持图片」到进程结束，**只能重启才能恢复**。
+     *
+     * 用户实测：桌面端 10-11 23:02 启动 → 10-12 00:30 仍稳定拒图。
+     *
+     * ⇒ 现在的口径是「**两个端点 + models.dev 都就绪**」。⚠️ 方向是「宁可多试
+     * 一次」：多试的代价只是多发一次 models.dev 请求（自带 TTL 与闸门冷却），
+     * 而漏判的代价是整个 provider 的图片能力永久失效。
      */
     remoteComplete = false;
-    /** 正在进行中的目录加载（避免并发重复请求）。 */
-    loading;
     /**
-     * models.dev 目录（`模型 id → 条目`，含名字/窗口/图片能力）。
+     * 兜底目录的**记忆化**结果（issue IKL3YH）。
      *
-     * ⚠️ `undefined` = **还没读到**（不是「空目录」）：读不到时目录照常工作，
-     * 只是少了它补的那几条。这条区分是整个模块的要点 ——
-     * 把「没读到」当「不支持」正是「支持图片的模型发不了图」那个缺陷的形态。
+     * ⚠️ 不是为了省那点构造开销，而是为了**数组身份稳定**：下面的
+     * `entriesCache` / `catalogIndexCache` 都以「来源数组的 `===`」为失效判据，
+     * 若 `fallbackCatalog()` 每次返回新数组，离线路径会**每调用一次就重建一份**
+     * 缓存（先是白建，接着被下一次覆盖）—— 缓存等于没有，且**症状静默**。
+     *
+     * 它的取值只来自 `this.product.fallbackModels`（静态产品配置），故记忆化安全。
      */
+    fallbackModelsCache;
+    /**
+     * 已构建好的 `CatalogEntry[]`，按**来源数组身份**失效（issue IKL3YH）。
+     *
+     * ⚠️⚠️ 这是本次性能缺陷的**主因**修复点。DSH 的 `buildModelCatalog` 形状是
+     * 「1 次 `listModels` + **每模型一次** `resolveModelInfo`」，而 `dsh-llm` 的
+     * `resolveModelInfo` 会**直连适配器、不做任何缓存**。共享骨架
+     * `model-catalog.ts` 的 `resolveModel` 每次都 `await config.loadCatalog()`
+     * ⇒ 整份目录被重建 N 次，叠加每个条目的模态查找就是 O(N²)。
+     *
+     * 实测（本仓产物，N=471 的宿主调用形状）：原实现 **293 ms/次**；
+     * 只修模态查找是 121 ms；**再补上本缓存是 1.2 ms**。
+     *
+     * 失效判据用**身份**而不是长度：`ensureRemoteModels` 每次补齐都赋一个
+     * **新数组**（`this.remoteModels = merged`），故「补齐 / 登录后重拉」都能
+     * 自然失效；用长度会在「换了模型但条数相同」时读到陈旧目录。
+     */
+    entriesCache;
+    /**
+     * `模型 id → 条目` 的 O(1) 索引，同样按来源数组身份失效。
+     *
+     * ⚠️ 只服务 `stream()` 的门禁（`inputModalitiesFor`）。`toCatalogEntry`
+     * **不再走它** —— 它手上就有条目本体，直接读字段即可（见 `toCatalogEntry`）。
+     */
+    catalogIndexCache;
+    /**
+   * models.dev 目录（`模型 id → 条目`，含名字/窗口/图片能力）。
+   *
+   * ⚠️ `undefined` = **还没读到**（不是「空目录」）：读不到时目录照常工作，
+   * 只是少了它补的那几条。这条区分是整个模块的要点 ——
+   * 把「没读到」当「不支持」正是「支持图片的模型发不了图」那个缺陷的形态。
+   */
     modelsDev;
     /** 正在进行中的 models.dev 加载（并发去重）。 */
     modelsDevLoading;
@@ -170,6 +218,12 @@ export class ClineAdapter extends LlmAdapter {
      * 详见 `src/remote-catalog-gate.ts` 的实测依据。
      */
     catalogGate;
+    /**
+     * ⚠️ **2026-10-08 Task 7d：三个方法收敛到共享骨架** `createModelCatalog`。
+     * 原先 `listModels` / `resolveModel` / `listAllModels` 各写一遍骨架，
+     * 现在只剩 `toCatalogEntry`（本家私有形状 + 免费集合 + 统一思考档位）。
+     */
+    catalog;
     constructor(options) {
         super();
         this.options = options;
@@ -179,6 +233,32 @@ export class ClineAdapter extends LlmAdapter {
         // 目录落地后通知客户端重读（issue IKJVTF 的缺陷①）。回调由接线层桥接
         // （适配器拿不到 ctx），见 `ClineAdapterOptions.onCatalogLoaded`。
         this.catalogGate = new RemoteCatalogGate(options.onCatalogLoaded === undefined ? {} : { onLoaded: options.onCatalogLoaded });
+        // ⚠️ 共享骨架（Task 7d）：门控 → 读目录 → 黑名单 → 回填 → 三态。
+        this.catalog = createModelCatalog({ accountPool: options.accountPool }, {
+            product: this.product,
+            loadCatalog: () => this.loadCatalogEntries(),
+            syncCatalog: () => this.syncCatalogEntries(),
+            // ⚠️ **未知 id 省略 `inputModalities`**（issue IKKZUG），与 buddy 同口径。
+            // ⚠️ `unknownModelInputModalities` **刻意不提供**（返回 undefined）：
+            // 骨架的契约是「不提供 ⇒ 省略该字段」（见 `ModelCatalogConfig` 的说明），
+            // 而本家的 `supportsImage` 就是「远端没读到 ⇒ 未知」的高发场景
+            // ——`cline-pass/*` 只由 models.dev 提供，报 `['text']` 会让宿主
+            // 把图片静默投影成占位文本。
+            // ⚠️ 与其余 12 家的 `['text']` **刻意不同**：它们的能力来源要么是
+            // 编译期表（恒可用，不存在未知态）、要么已实测过保守方向；cline 有
+            // 真实的「外部站点失败」场景。**不要**为了「统一」改回去。
+            // ⚠️ 思考档位仍**统一给 5 档**（下方），那是另一条独立决策。
+            // ⚠️ **未知模型也声明思考档位**（真实回归防线）：本家档位来自**产品配置**
+            // （远端不下发），与具体模型无关 ⇒ 原实现对未知 id 同样给 5 档。
+            // 由 cline-adapter.spec.ts 的「未知模型同样有 5 档」用例守着。
+            unknownModelReasoning: () => ({
+                efforts: CLINE_REASONING_EFFORTS.map((effort) => ({
+                    id: ReasoningEffortId(effort.id),
+                    name: effort.name,
+                })),
+                defaultEffort: ReasoningEffortId(CLINE_DEFAULT_REASONING_EFFORT),
+            }),
+        });
     }
     /**
      * 描述本适配器拥有的 provider 路由。
@@ -193,25 +273,107 @@ export class ClineAdapter extends LlmAdapter {
         return { id, name: this.product.displayName };
     }
     /**
-     * 模型接受的输入模态。
+     * 模型接受的输入模态；`undefined` = **能力未知**。
      *
-     * 两级判据（**顺序不能颠倒**）：
+     * ## 两级判据（**顺序不能颠倒**）
+     *
      * 判据是**目录条目上的 `supportsImage`**，而它有两个来源（优先级即顺序）：
      * 1. **本地兜底表/内嵌目录**（`product.fallbackModels` 的策展条目）——
      *    从官方客户端内嵌目录提取的，比社区目录权威；显式 `false` 也照样赢。
      * 2. **models.dev**（`src/cline-models-dev.ts` 补进目录）—— 补前者覆盖不到的
      *    模型（`cline-pass/*` 等）。
      *
-     * ⚠️ **这是「支持图片的模型发不了图」的修复点**：修复前只看第 1 级，而它
-     * 全表只有寥寥几条 `cline-free/*` 条目 ⇒ `cline-pass/*` 等**全部**被播报成
-     * 纯文本 ⇒ DSH 根本不把图片送进来。详见 `src/cline-models-dev.ts`。
+     * ## ⚠️⚠️ 三态：为什么 `undefined` 是**必需**的第三态（issue IKKZUG）
      *
-     * ⚠️ 没有结论时保守报 `text`（宁可少报能力，也不要报一个服务端不认的模态）
-     * —— 注意这与「明确读到不支持」是两回事，但外部行为一致。
+     * 修复前恒返回两态，而这两态把**语义相反**的两种状态压成了同一个结果：
+     * - 目录条目**明确** `supportsImage: false`（**确认不支持**）；
+     * - 目录里**压根没有该 id**（**不知道**）。
+     *
+     * 而 cline 的「不知道」是**真实高频**的：`cline-pass/*` 的条目**只由
+     * models.dev 提供**（网关 `recommended-models` 实测只下发 14 条，models.dev
+     * 有 18 条），而 models.dev 是一个 5.39 MB 的外部站点、超时 20~60 秒
+     * （用户实测直连三次：超时/超时/1.9 秒成功）。
+     *
+     * 报 `['text']` 的代价有二，第二个更隐蔽：
+     * 1. 门禁文案说「模型不支持图片输入」，而真实原因是「目录还没拉到」——
+     *    用户会去换模型、查文档，而解法只是**等目录就绪**；
+     * 2. `['text']` 报给宿主后，DSH 见到「不含 image」的声明会按
+     *    「**确认是纯文本模型**」把图片**静默投影成占位文本**
+     *    （dsh-llm 的 `projectImagesForTextModel`）⇒ 图片既没进请求体、
+     *    用户也拿不到任何原因。
+     *
+     * ✅ 宿主契约明写 `absent means unknown`（dsh-llm `types.d.ts` 的
+     * `inputModalities`），故「不知道」必须表达为**省略该字段**。
+     *
+     * ⚠️ 与 `buddy-adapter.ts` 同构，但**判据的来源不同**：buddy 查四个来源
+     * （远端 / 产品兜底表 / `IMAGE_MODELS` / 覆盖白名单），cline 只需查**目录
+     * 条目这一个字段** —— 因为合并阶段已把两个来源都归一进条目了。
+     *
+     * ⚠️ **方向仍是保守**：未知**不放行**图片（见 `stream()` 的门禁），
+     * 只是不再谎报「不支持」。
      */
     inputModalitiesFor(model) {
-        const entry = this.remoteModels?.find((candidate) => candidate.id === model);
-        return entry?.supportsImage === true ? ['text', 'image'] : ['text'];
+        const source = this.remoteModels ?? this.fallbackCatalog();
+        const entry = this.catalogIndexFor(source).get(model);
+        // ⚠️ 必须判 `=== undefined`（**字段缺席**）而不是 `!== true`：
+        // 后者把「明确 false」与「没这条记录」压成同一结果，正是本条要修的形态。
+        if (entry?.supportsImage === undefined)
+            return undefined;
+        return entry.supportsImage ? ['text', 'image'] : ['text'];
+    }
+    /**
+     * 目录健康快照（issue IKKZUG 第 5 点：可观测性）。
+     *
+     * ## 为什么需要
+     *
+     * 本家的目录来自**三个来源**，其中 `models.dev` 是 5.39 MB 的外部站点、
+     * **经常拉不到**（用户实测直连三次：超时 / 超时 / 1.9 秒成功）。而失败时
+     * 只有一行 `console.warn`，**宿主不落盘** ⇒ 用户与排障者看到的只是
+     * 「贴不了图」，**无从判断**是「这个模型不支持图片」还是「目录还没拉到」。
+     *
+     * 用户正是靠手工推演才定位到这一层 —— 那不该是排障的常规成本。
+     *
+     * ## 三条纪律
+     *
+     * 1. ⚠️ **零 IO**：设置页挂载时对每个供应商都会调它，一旦触发网络请求
+     *    就会拖慢首屏（本端点全程只用同步内存副本正是为此）。故只读内存字段。
+     * 2. ⚠️ `note` **只在异常时给**：完整时不写该字段 —— 一句「一切正常」
+     *    对排障毫无价值，真正需要看的正是异常时（也省掉前端一处渲染分支）。
+     * 3. ⚠️ `complete: false` **不等于故障**：插件会按闸门冷却**自动重试**
+     *    （见 `remoteComplete`），用户无需做任何事。它只说明「现在看到的
+     *    列表与能力可能不全，但会自愈」—— 故文案里必须写明这一点，
+     *    否则用户会以为要自己去修。
+     */
+    describeCatalogHealth() {
+        const total = (this.remoteModels ?? this.fallbackCatalog()).length;
+        const modelsDevReady = this.modelsDev !== undefined;
+        return {
+            total,
+            complete: this.remoteComplete,
+            ...this.remoteComplete ? {} : {
+                note: modelsDevReady
+                    ? 'Cline 模型目录来源未取全（会自动重试）'
+                    : 'models.dev 未就绪 —— cline-pass/* 的模型与图片能力只由它提供（会自动重试）',
+            },
+        };
+    }
+    /**
+     * 取（或建）`模型 id → 条目` 的 O(1) 索引，按来源数组身份失效。
+     *
+     * ⚠️ **原实现在这里做的是 `remoteModels.find(...)`**（issue IKL3YH 的热点）：
+     * 每个模型一次全表线性扫描 ⇒ 整表 O(N²)。实测该形态**全仓只有这一处**
+     * （其余家是 `remoteMeta.get()` / `fallbackIndex.get()` 或直接吃已解析的条目）。
+     *
+     * ⚠️ 判据必须是「来源数组身份变了」而**不是**「长度变了」：目录补齐会换上
+     * 一个条数可能相同的新数组，只看长度会读到陈旧索引。
+     */
+    catalogIndexFor(source) {
+        if (this.catalogIndexCache !== undefined && this.catalogIndexCache.source === source) {
+            return this.catalogIndexCache.index;
+        }
+        const index = new Map(source.map((model) => [model.id, model]));
+        this.catalogIndexCache = { source, index };
+        return index;
     }
     /**
      * 懒加载远端模型目录。
@@ -265,6 +427,12 @@ export class ClineAdapter extends LlmAdapter {
                 // ⚠️ 用 `=== true` 而非直接取值：万一有调用方（旧注入式替身）省了该字段，
                 // 保守按**不完整**处理 —— 方向是「宁可多试一次」。
                 // 反过来（把缺失当完整）会让残缺目录永久固化，那正是本 issue 的缺陷②。
+                //
+                // ⚠️⚠️ **完整必须同时包含 models.dev**（issue IKKZUG，2026-10-12）：
+                // 它也是目录来源，而 `cline-pass/*` 的模型条目与图片能力**只有它提供**。
+                // 漏掉它 ⇒ models.dev 超时后目录被判成「已完整」⇒ 下面的 `remoteComplete`
+                // 短路永久生效 ⇒ 整个进程生命周期内不再重试 ⇒ 只能重启才能恢复。
+                // 详见 `remoteComplete` 字段的注释与该 issue 的实测（23:02→次日 00:30）。
                 const complete = remote === undefined ? got : remote.complete === true;
                 // ⚠️ **warnings 循环必须在 `if (!got)` 之前**（真实回退，审计发现）：
                 // 基线里它排在 `if (!gotRemote) return false` **之前**，而基线那两个端点
@@ -288,8 +456,12 @@ export class ClineAdapter extends LlmAdapter {
                 // ⚠️ 残缺目录也落缓存（否则每次 `listModels` 都重拉两个端点），
                 // 但 `remoteComplete` 保持 false ⇒ 下次仍进闸门，由冷却控制重试。
                 this.remoteModels = merged;
-                this.remoteComplete = complete;
-                return { got: true, complete };
+                // ⚠️⚠️ 并上「models.dev 已读到」（issue IKKZUG）。
+                // 判据是 `modelsDev !== undefined`（**读到过**，含读到空表），
+                // 与「merged 里有没有补进条目」无关 —— 上游确实没有 cline-pass 块时
+                // 读到的是空表，那同样属于「已就绪」，不该无限重试。
+                this.remoteComplete = complete && this.modelsDev !== undefined;
+                return { got: true, complete: this.remoteComplete };
             }
             catch (error) {
                 // 拉取失败保持未定义，后续 listModels/resolveModel 仍回退静态兜底表。
@@ -332,7 +504,12 @@ export class ClineAdapter extends LlmAdapter {
     }
     /** 兜底目录（远端不可用时的静态表，含 5 个免费模型）。 */
     fallbackCatalog() {
-        return this.product.fallbackModels.map((model) => ({
+        // ⚠️ 记忆化：`entriesCache` / `catalogIndexCache` 都以来源数组的 `===` 为
+        // 失效判据，若这里每次返回新数组，离线路径会每调用一次就白建一份缓存
+        // （见 `fallbackModelsCache` 的说明）。
+        if (this.fallbackModelsCache !== undefined)
+            return this.fallbackModelsCache;
+        this.fallbackModelsCache = this.product.fallbackModels.map((model) => ({
             id: model.id,
             name: model.name,
             isFree: model.isFree === true,
@@ -341,6 +518,7 @@ export class ClineAdapter extends LlmAdapter {
             ...model.supportsImage === undefined ? {} : { supportsImage: model.supportsImage },
             ...model.description === undefined ? {} : { description: model.description },
         }));
+        return this.fallbackModelsCache;
     }
     /**
      * 完整模型目录（**不应用用户黑名单**），含最终展示名（免费标记）。
@@ -356,81 +534,113 @@ export class ClineAdapter extends LlmAdapter {
      * 故实际使用中不会读到空目录。
      */
     listAllModels() {
-        const source = this.remoteModels ?? this.fallbackCatalog();
-        if (this.remoteModels === undefined)
-            void this.ensureRemoteModels();
-        // ⚠️ 必须带上 `isFree`：Jet Hub 的模型列表要按「计费/来源」分组
-        // （订阅 / 免费 / Cloud / 按量计费），而**免费集合是远端动态下发的**
-        // （见 `cline-models.ts` 的并集规则）—— 让客户端按前缀猜会漂移。
-        return source.map((model) => ({ id: model.id, name: clineDisplayName(model), isFree: model.isFree }));
+        return this.catalog.listAllModels();
     }
-    async listModels(_provider) {
-        // ⚠️ 没有任何已登录账号时返回空数组 → DSH 的 `buildModelCatalog` 把整个
-        // provider 分组隐藏（它显式 `.filter(group => group.models.length > 0)`）。
-        // ⚠️ 必须返回 `[]` 而**不能抛错**（抛错会被归入 catalog 的 `failures`，
-        // 界面上反而多出一条 provider 报错）。
-        //
-        // ⚠️ 门控放在 `ensureRemoteModels()` **之前**：没有已登录账号时连远端目录都
-        // 不必拉。
-        if (!await providerCatalogVisible(this.options.accountPool, this.product.id))
-            return [];
+    /**
+     * 把本家条目转成共享骨架的中间结构。
+     *
+     * ⚠️ 本家四处**真实差异**：
+     * 1. **`isFree` 必须透出**：Jet Hub 的模型列表要按「计费/来源」分组
+     *    （订阅 / 免费 / Cloud / 按量计费），而**免费集合是远端动态下发的**
+     *    （见 `cline-models.ts` 的并集规则）—— 让客户端按前缀猜会漂移。
+     *    ⚠️ 原声明把 `isFree` 写成**必填**（全仓唯一），而契约
+     *    （`jet-hub-rpc.ts` 的 `ModelCatalogSource`）是**可选** ⇒ 此处按契约放宽
+     *    （纯类型放宽，运行时行为不变：本家恒有值）。
+     * 2. `description` 透传（`cline-models.ts` 的 `models.dev` 补缺）。
+     * 3. `maxTokens` 过 `clampClineMaxTokens`（**必须声明**，否则上限永久退回网关默认）。
+     * 4. `reasoning` 对**所有**模型统一声明（远端不下发档位，见产品配置注释）——
+     *    这是 composer 里「思考强度」选择器的唯一入口。
+     *
+     * ⚠️⚠️ **`inputModalities` 直接读条目自己的 `supportsImage`**（issue IKL3YH）。
+     * 原实现是 `this.inputModalitiesFor(model.id)`，即拿 id 回 `remoteModels` 里
+     * **全表线性查找**一次 —— 而这里手上**就是那条条目**，查找纯属多余，且
+     * 整表累积成 O(N²)。更糟的是它**掩盖了一个真缺陷**：搜索源只有
+     * `remoteModels`，离线 / 首拉失败时它是 `undefined` ⇒ 兜底表里
+     * `supportsImage: true` 的策划条目（`stealth/space-bunny-alpha` 等）
+     * 被误报成**纯文本**，DSH 于是把图片静默投影成占位符。
+     */
+    toCatalogEntry(model) {
+        const maxTokens = clampClineMaxTokens(model.maxTokens);
+        return {
+            id: model.id,
+            // 免费标记拼进 `name`（**不是** `description`）：composer 的模型切换菜单
+            // 只渲染 name，description 仅用于 /model 弹窗。
+            name: clineDisplayName(model),
+            // ⚠️ `resolveModel` 的 `name` **不带**免费标记（与 Qoder/TRAE 一致）：
+            // 标记只属于「选择列表」语境；会话记录里带上它会污染历史展示。
+            bareName: model.name,
+            ...model.description === undefined ? {} : { description: model.description },
+            // ⚠️ 直接读字段，**不要**回头查索引（见方法注释：那是 O(N²) + 离线误报）。
+            // ⚠️⚠️ 三态（issue IKKZUG）：`supportsImage` **缺席** = 未知 ⇒ 必须
+            // **省略** `inputModalities` 字段（宿主契约 `absent means unknown`），
+            // 报 `['text']` 会让 DSH 把图片静默投影成占位文本。
+            ...(model.supportsImage === undefined
+                ? {}
+                : { inputModalities: model.supportsImage ? ['text', 'image'] : ['text'] }),
+            ...model.contextWindow !== undefined ? { contextWindow: model.contextWindow } : {},
+            ...maxTokens !== undefined ? { maxTokens } : {},
+            isFree: model.isFree,
+            reasoning: {
+                efforts: CLINE_REASONING_EFFORTS.map((effort) => ({
+                    id: ReasoningEffortId(effort.id),
+                    name: effort.name,
+                })),
+                defaultEffort: ReasoningEffortId(CLINE_DEFAULT_REASONING_EFFORT),
+            },
+        };
+    }
+    /**
+     * 把一份来源目录转成 `CatalogEntry[]`，**按来源数组身份缓存**（issue IKL3YH）。
+     *
+     * ⚠️ 必须缓存：`resolveModel` 会**每个模型**调用一次 `loadCatalog`，
+     * 而 DSH 的 `buildModelCatalog` 恰好是「1 次 `listModels` + 每模型一次
+     * `resolveModelInfo`」，且 `dsh-llm` 的 `resolveModelInfo` **不做缓存**。
+     * 不缓存就是 N² 次条目构造 —— 实测 N=471 时 293 ms/次 对 1.2 ms/次。
+     *
+     * ⚠️ 失效判据用**身份**（`ensureRemoteModels` 每次落目录都赋新数组）
+     * 而不是长度：补齐后的目录条数可能不变，只看长度会读到陈旧条目。
+     */
+    catalogEntries(source) {
+        if (this.entriesCache !== undefined && this.entriesCache.source === source) {
+            return this.entriesCache.entries;
+        }
+        const entries = source.map((model) => this.toCatalogEntry(model));
+        this.entriesCache = { source, entries };
+        return entries;
+    }
+    async loadCatalogEntries() {
         // 必须 await：冷缓存时目录尚未落地就返回，模型选择器会短暂显示错误的
         // 模型集合（Jet Hub 的模型开关也据此渲染）。
         // ⚠️ 目录里**已经**并入 models.dev（补缺的模型 / 可读名 / 图片能力），
         // 故这里不需要再单独 await 一次模态表。
         await this.ensureRemoteModels();
-        const source = this.remoteModels ?? this.fallbackCatalog();
-        // 用户在 Jet Hub 关闭的模型（黑名单制：不在表里即默认打开）。
-        // 只影响此处对外播报的模型目录，不改变 resolveModel/stream 的路由能力
-        // ——与 DSH 对 listModels 的约定一致（目录是建议性的，缺省不构成拒绝）。
-        const disabled = this.options.accountPool?.disabledModelsFor(this.product.id);
-        const listed = disabled === undefined || disabled.size === 0
-            ? source
-            : source.filter((model) => !disabled.has(model.id));
-        return listed.map((model) => ({
-            provider: this.product.id,
-            id: model.id,
-            // 免费标记拼进 `name`（**不是** `description`）：composer 的模型切换菜单
-            // 只渲染 name，description 仅用于 /model 弹窗。
-            name: clineDisplayName(model),
-            ...model.description === undefined ? {} : { description: model.description },
-            inputModalities: this.inputModalitiesFor(model.id),
-        }));
+        return this.catalogEntries(this.remoteModels ?? this.fallbackCatalog());
     }
-    async resolveModel(provider, model, _signal) {
-        // 目录里已并入 models.dev（名字 / 窗口 / 图片能力），故 `inputModalities`
-        // 与展示名在这一次 await 之后就都是最终值。
-        await this.ensureRemoteModels();
+    /**
+     * 同步视图（`listAllModels` 用）。
+     *
+     * ⚠️ 原实现的语义：读已缓存目录，**首次调用若缓存为空会触发一次后台加载**
+     * （`void this.ensureRemoteModels()`），由下一次调用拿到结果 ——
+     * 而 `model.list` 端点之前一定会先走 `ctx.llm.listModels()`（那会 await 加载完成），
+     * 故实际使用中不会读到空目录。此处**逐字保留**该 fire-and-forget。
+     */
+    syncCatalogEntries() {
         const source = this.remoteModels ?? this.fallbackCatalog();
-        const entry = source.find((candidate) => candidate.id === model);
-        const resolved = {
-            provider,
-            id: model,
-            // ⚠️ `resolveModel` 的 `name` **不带**免费标记（与 Qoder/TRAE 一致）：
-            // 标记只属于「选择列表」语境；会话记录里带上它会污染历史展示。
-            name: entry?.name ?? model,
-            inputModalities: this.inputModalitiesFor(model),
-        };
-        // 上下文窗口：远端/兜底表已知时才声明（未知时不编造，让 DSH 用默认值）。
-        if (entry?.contextWindow !== undefined)
-            resolved.context = { contextWindow: entry.contextWindow };
-        // 单次输出上限：必须声明为 `defaultMaxTokens`，否则 DSH 只在调用方显式
-        // 给值时才下发 `max_tokens`，上限永久退回网关默认值
-        //（这正是 buddy 那条「回答在 32000 token 处被截断」的根因）。
-        const maxTokens = clampClineMaxTokens(entry?.maxTokens);
-        if (maxTokens !== undefined)
-            resolved.defaultMaxTokens = maxTokens;
-        // 思考档位：对**所有**模型统一声明（远端不下发档位，见产品配置注释）。
-        // 这是 composer 里「思考强度」选择器的唯一入口 —— 不声明则 UI 显示
-        // 「当前模型未提供推理等级」。
-        resolved.reasoning = {
-            efforts: CLINE_REASONING_EFFORTS.map((effort) => ({
-                id: ReasoningEffortId(effort.id),
-                name: effort.name,
-            })),
-            defaultEffort: ReasoningEffortId(CLINE_DEFAULT_REASONING_EFFORT),
-        };
-        return resolved;
+        if (this.remoteModels === undefined)
+            void this.ensureRemoteModels();
+        return this.catalogEntries(source);
+    }
+    async listModels(_provider) {
+        return this.catalog.listModels(_provider);
+    }
+    /**
+     * 解析模型元信息。
+     *
+     * ⚠️ 原实现里的四处判据（context / maxTokens / reasoning / modalities）现已
+     * 收敛到 `toCatalogEntry`；骨架的 `resolveModel` 只做回填与「不声明未知」。
+     */
+    async resolveModel(provider, model, signal) {
+        return this.catalog.resolveModel(provider, model, signal);
     }
     /**
      * 兼容 0.1.1-rc.2：新版 `LlmRuntime.prepareCall()` 会调用
@@ -462,7 +672,19 @@ export class ClineAdapter extends LlmAdapter {
             // `resolveModel`，缺了这一步会把支持图片的模型误判成纯文本
             // —— 那正是「支持图片的模型发不了图」的形态。
             await this.ensureRemoteModels();
-            if (!this.inputModalitiesFor(options.model).includes('image')) {
+            // ⚠️⚠️ **三态门禁**（issue IKKZUG）：未知**仍然拒绝**，但**不得**说成
+            // 「不支持」—— 那会把「目录还没拉到」误导成「这个模型看不了图」，
+            // 用户会去换模型、查文档，而解法只是等目录就绪。
+            //
+            // ⚠️ 错误码用 `INVALID_REQUEST`（**不在** harness 的可重试集合里）：
+            // 这类「等一会儿就好」的错误**不该由 harness 自动重试** ——
+            // 自动重试会让用户在 15 秒里看到 6 次闪动（500/1000/2000/4000/8000 ms）。
+            // ⚠️ **不要**用 `TRANSPORT`：实测它在 `DEFAULT_RETRYABLE_CODES` 里。
+            const modalities = this.inputModalitiesFor(options.model);
+            if (modalities === undefined) {
+                throw new LlmError(`cline: 模型 "${options.model}" 的能力列表尚未加载完成，暂时无法判断是否支持图片；请稍后重试。`, 'INVALID_REQUEST');
+            }
+            if (!modalities.includes('image')) {
                 throw new LlmError(`cline: 模型 "${options.model}" 不支持图片输入`, 'UNSUPPORTED_CONTENT');
             }
             if (this.options.readImage === undefined) {
@@ -518,7 +740,20 @@ export class ClineAdapter extends LlmAdapter {
         }
         if (options.temperature !== undefined)
             bodyObj.temperature = options.temperature;
-        const maxTokens = clampClineMaxTokens(options.maxTokens);
+        /**
+         * 会话自动命名（`purpose: 'session-title'`）的思考与预算决策（issue IKKVDH）。
+         *
+         * DSH 用 **64 token** 发标题请求且**不传 `reasoningEffort`**，而宿主会把
+         * `CLINE_DEFAULT_REASONING_EFFORT` 注入进来。本家档位是**产品级常量**
+         * （`CLINE_REASONING_EFFORTS`，与模型无关）且**含 `none`** ⇒ 关得掉。
+         */
+        const titlePlan = planSessionTitleThinking({
+            purpose: options.purpose,
+            requestedEffort: options.reasoningEffort === undefined ? undefined : String(options.reasoningEffort),
+            declaredEfforts: CLINE_REASONING_EFFORTS.map((effort) => effort.id),
+            maxTokens: options.maxTokens,
+        });
+        const maxTokens = clampClineMaxTokens(titlePlan.maxTokens);
         if (maxTokens !== undefined)
             bodyObj.max_tokens = maxTokens;
         if (options.stop !== undefined && options.stop.length > 0)
@@ -530,8 +765,10 @@ export class ClineAdapter extends LlmAdapter {
         // 且上游对**完全不认识**的档位也只是静默忽略 —— 实测
         // `reasoning_effort: 'banana'` 返回 HTTP 200、思考量为 0，**不报错**，
         // 故白名单既无必要也无收益。
-        if (options.reasoningEffort !== undefined) {
-            bodyObj.reasoning_effort = options.reasoningEffort;
+        //
+        // ⚠️ 标题请求改走 `titlePlan.effort`（本家恒有 `none` 档，故就是它）。
+        if (titlePlan.effort !== undefined) {
+            bodyObj.reasoning_effort = titlePlan.effort;
         }
         const body = JSON.stringify(bodyObj);
         // 计时起点:**首次发起请求**的时刻(图片读取/凭据解析不算 —— 那是本地开销,

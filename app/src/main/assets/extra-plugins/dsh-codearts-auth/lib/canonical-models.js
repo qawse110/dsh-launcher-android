@@ -71,6 +71,15 @@ export const EXCLUDED_ALIASES = new Set([
 const PRIMARY_CHANNEL = Object.freeze({
     qoder: 'name',
     qodercn: 'name',
+    // ⚠️ accio（阿里 Accio Work，2026-10-13，用户要求）：与 qoder **完全同因** ——
+    //    它的 `modelCode` 是 `1Drift-F8hS3mK7pL2n` 这种**内部代号**（上游刻意不给
+    //    可读 id，真名只在 `modelDisplayName` 里，详见
+    //    `docs/agent-notes/providers-accio.md` §7）。走 id 通道的实测后果：
+    //    accio 的每个模型各自成一个**孤立虚拟模型**（键形如 `1drift-…`），
+    //    跨渠道聚合**完全不发生** ⇒ 用户在聚合的「Qwen3.8-Flash 轮换列表」里
+    //    **永远看不到 accio**（症状是静默的：它只是不在候选表里）。
+    //    ⚠️ 判据同 qoder：**该渠道的 id 对人类与其它渠道都无信息**，不是「哪个方便」。
+    accio: 'name',
 });
 /** 该 provider 的归一化主通道；未声明者默认 `id`。 */
 export function channelOf(provider) {
@@ -164,6 +173,54 @@ export const CANONICAL_OVERRIDES = Object.freeze({
     // ⚠️ qoder / qodercn 的 dfmodel 是否属于 V4.1 **尚未实测确认**
     //（其展示名不带版本号）。在确认前**故意不登记** —— 它会经 name 通道归成
     // `deepseek-flash`，单独成一个虚拟模型。登记它请先跑实发验证。
+    /**
+     * ⚠️⚠️ **accio**（用户要求它进聚合的轮换候选表，2026-10-13）。
+     *
+     * ## 为什么需要（实测的键形态差异）
+     *
+     * `accio` 走 `name` 通道（见 `PRIMARY_CHANNEL`），而它的展示名 `Qwen 3.8 Flash`
+     * 里**有空格** ⇒ `normalizeNameKey` 把空格转成连字符 ⇒ 得 `qwen-3-8-flash`。
+     * 而 loomy / trae / qoder 走 **id 通道**，id 形如 `qwen3.8-flash`（**无空格**）
+     * ⇒ `normalizeModelKey` 只转点号 ⇒ 得 `qwen3-8-flash`（**无连字符**）。
+     *
+     * ⇒ 两者是**同一个模型但键不同** ⇒ 被拆成两个虚拟模型
+     * ⇒ 用户在聚合的「Qwen3.8-Flash 轮换列表」里**看不到 accio**（症状静默：
+     * 它只是不在候选表里）。实测逐个跑 `canonicalKeyFor`：
+     *
+     * ```
+     * loomy / trae / qoder → qwen3-8-flash   ← 三家在用的既有键
+     * accio（不加补丁）    → qwen-3-8-flash  ← 多一个连字符，成了孤例
+     * ```
+     *
+     * ## ⚠️ 只登记**确知是同一模型**的那些
+     *
+     * 方向是**宁可拆开也不误并**（本文件铁律：猜错会让请求打到错的模型且无提示）。
+     * 逐条实测后的结论：
+     * - `Qwen 3.8 Flash`（`1Drift-F8hS3mK7pL2n`）→ `qwen3-8-flash` ✅ **登记**
+     *   —— 四家展示名逐字一致，确知同模型；
+     * - `Qwen 3.8 Max` → **不登记**：它经 name 通道得 `qwen-3-8-max`，而 loomy 的
+     *   id `qwen-3.8-max` 也得 `qwen-3-8-max`，**本来就一致**，加补丁是多此一举
+     *   （且有守卫锁着「连字符形态本来就一致」这件事）；
+     * - `Qwen 3.8 27B` / `Qwen 3.5 A3B` / `Standard` / `Professional` / `Ultimate`
+     *   → **不登记**：它们是 accio（或其上游）**独有的规格**，猜着并进别家 =
+     *   打错模型。⚠️ 27B 与 A3B 是**两个不同的模型**，绝不能并进 `qwen3-8-flash`。
+     *
+     * ## ⚠️⚠️ 索引键是 **accio 的对外 id（slug）**，不是上游 `modelCode`
+     *
+     * 补丁按 `realId` 查，而 `realId` 来自 `ctx.llm.listModels(provider)` 返回的
+     * **`id`**。自 2026-10-13 起 accio 的对外 id 改成了 slug
+     * （`accio-adapter.ts` 的 `accioModelIdOf`，为的是让模型能自报人话）⇒
+     * **本表必须跟着改用 slug 索引**。
+     *
+     * ⚠️ 这是一条**静默的连带失效**：若仍按 `1Drift-F8hS3mK7pL2n` 索引，
+     * 查表恒不命中 ⇒ accio 掉回 `qwen-3-8-flash` 孤例键 ⇒
+     * **聚合的轮换列表里又看不到它了**（正是加这条补丁要解决的症状），
+     * 且不会有任何报错。
+     */
+    accio: Object.freeze({
+        // 对外 id（`normalizeNameKey('Qwen 3.8 Flash')`）→ 三家在用的既有规范键。
+        'qwen-3-8-flash': 'qwen3-8-flash',
+    }),
 });
 /**
  * 一个候选条目归入哪个规范键。
