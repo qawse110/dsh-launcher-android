@@ -6,7 +6,8 @@
 
 **不需要 Termux、不需要外部 Node**；联网仅用于 npm 首次安装与后续更新。
 
-- 包名 `com.dsh.nextapp1` · 当前版本 **v4.10.2**（versionCode 33）
+- 包名 `com.dsh.nextapp1` · 当前版本 **v4.10.2-fix6**（`versionCode 300`）
+  —— 以 [`app/build.gradle.kts`](app/build.gradle.kts) 的 `versionCode`/`versionName` 为准
 - 架构：AGP 9.0 / Kotlin / Gradle 8.x · minSdk 24 / targetSdk 28 / compileSdk 35
 
 ## 目录
@@ -34,7 +35,7 @@
 | **界面** | 内嵌 WebView（Chromium）+ 任意浏览器访问同一地址 |
 | **语音** | 双 TTS：系统引擎（离线）/ Edge 在线语音（微软神经音色，零依赖实现） |
 | **悬浮窗** | 状态条 + 桌宠动画双样式；普通服务 + 无障碍双通道保活 |
-| **插件化适配** | 能由插件实现的功能一律下沉为独立内置插件（内置 3 个 + 可选 4 个），脚本补丁降至最低 |
+| **插件化适配** | 能由插件实现的功能一律下沉为独立内置插件（内置 **11** 个 + 可选 **2** 个，见下），脚本补丁降至最低 |
 | **环境** | apt/dpkg 原生可用；Termux 环境自动准备（幂等） |
 
 ## 架构：最小脚本干预，能力插件化
@@ -67,7 +68,8 @@ files/.dsh/profiles/web ──cordis 装配──▶ dsh web @ 127.0.0.1:3080 �
 | 脚本 | 职责 | 是否改写 dsh 本体 |
 |---|---|---|
 | `install-dsh.mjs` | 官方 npm 安装/更新 + `dsh plugin` 装配 | 否（官方通道） |
-| `stub-dsh.mjs` | 加载期/引导期修复（native 模块顶替、CJS 盲区、HTML shim） | 是，仅剩 8 处必需项（带审计） |
+| `stub-dsh.mjs` | 加载期/引导期修复的**驱动层**（按序 import `assets/stub/patchers/*.mjs`） | 是，仅剩 8 处必需项（带审计，见 `docs/plugin-conversion-audit.md`） |
+| `assets/stub/patchers/{native-stubs,host-runtime,plugin-compat,flock}.mjs` | 各补丁实现（原生模块顶替 / 宿主运行时 / 插件兼容 / flock 降级） | 是（同上） |
 | `fs-register/loader/promises-compat` | Node `--import` 会话级兼容层（SELinux 禁硬链接） | 否 |
 | `routing-suite.mjs` | 第三方聚合仓库的一次性适配安装 | 否（官方 plugin add + 预设拷贝） |
 | `tpkg.sh` | `apt install` 失败时的 deb 手动兜底 | 否（Termux 层） |
@@ -81,11 +83,11 @@ Kotlin 展示面与 `install-dsh.mjs` 装配面都从它派生；一致性由 `n
 
 | 插件 | 来源 | 作用 |
 |---|---|---|
-| `dsh-web-mobile` | <https://github.com/mexiaosqwq/dsh-web-mobile> `v3.0.5` | 竖屏/窄屏 Web 适配（抽屉导航、全宽会话、安全区、触控人体工学） |
+| `dsh-web-mobile` | <https://github.com/mexiaosqwq/dsh-web-mobile> `v3.1.0` | 竖屏/窄屏 Web 适配（抽屉导航、全宽会话、安全区、触控人体工学） |
 | `dsh-prompt-optimizer-mobile` | <https://github.com/WestFox-AwA/dsh-prompt-optimizer> `v0.8.3-stable` 基线（见 [FORK.md](app/src/main/assets/extra-plugins/dsh-prompt-optimizer-mobile/FORK.md)） | 提示词优化（发送前用独立 AI 改写成命令）。**本部署默认启用**：未配置即启用，仅显式 `enabled:false` 才关闭（上游原版默认不启用，本部署依需要翻转）；另保留移动端窄屏 UI 适配与包名对齐 |
-| `dsh-codearts-auth` | <https://gitee.com/iJetLi/deepseek-harness-codearts> tag `0.2.0-rc.5` 本地构建 | CodeArts / Buddy / Qoder / Trae / Cline / Loomy / Gemini 等多 Provider 登录与模型接入 |
-| `dsh-status-bridge` | **本仓库自研** | dsh 运行状态桥接到悬浮窗/通知（本地 HTTP，默认 :3190）。**与启动器 Kotlin 侧强耦合**：不装配则悬浮窗状态显示/TTS 播报链路失效（心跳 note 记为 `bridge-absent`，与「装了但掉线」区分开）。`/status` **需要 token**（每次启动轮换、写入 `files/status-bridge.json`，Kotlin 通过 `BridgeContract` 同源读取；不再回 CORS 头）；`lastText` 支持**逐段实时增长**（经 LLM 层 `llm/stream` waterfall 钩子对主请求做 tee，只取 `text-delta`，`reasoning`/`tool-call` 不外放） |
-| `dsh-android-links` | **本仓库自研** | 在 dsh HOME 创建 `sdcard → /storage/emulated/0` 符号链接，让工作区目录浏览器直达 SD 卡 |
+| `dsh-codearts-auth` | <https://gitee.com/iJetLi/deepseek-harness-codearts> tag `0.2.0-rc.10` 本地构建 | CodeArts / Buddy / Qoder / Trae / Cline / Loomy / Gemini 等多 Provider 登录与模型接入（另含 Accio 等新增适配器；已重放移动端窄屏 UI 适配层） |
+| `dsh-status-bridge` | **本仓库自研** `v0.1.3` | dsh 运行状态桥接到悬浮窗/通知（本地 HTTP，默认 :3190）。**与启动器 Kotlin 侧强耦合**：不装配则悬浮窗状态显示/TTS 播报链路失效（心跳 note 记为 `bridge-absent`，与「装了但掉线」区分开）。`/status` **需要 token**（每次启动轮换、写入 `files/status-bridge.json`，Kotlin 通过 `BridgeContract` 同源读取；不再回 CORS 头）；`lastText` 支持**逐段实时增长**（经 LLM 层 `llm/stream` waterfall 钩子对主请求做 tee，只取 `text-delta`，`reasoning`/`tool-call` 不外放） |
+| `dsh-android-links` | **本仓库自研** `v0.1.1` | 在 dsh HOME 创建 `sdcard → /storage/emulated/0` 符号链接，让工作区目录浏览器直达 SD 卡 |
 | `dsh-net-proxy` | <https://github.com/mafeis/dsh-net-proxy> `v0.8.0` | 让 agent 自身的网络请求（web_search / web_fetch / 外部 API）走已配置的 HTTP(S) 代理 |
 | `dsh-provider-headers` | 自 `prebuilt.tgz` 恢复 | 在 Web 的模型设置页为自定义（llm-pi-ai）Provider 配置自定义请求头 |
 | `dsh-vision` | 自 `prebuilt.tgz` 恢复 | 给纯文本模型加上 `view_image` 工具：复用宿主 Provider 配置，或接自定义 OpenAI 兼容 VLM 端点 |
@@ -105,8 +107,8 @@ Kotlin 展示面与 `install-dsh.mjs` 装配面都从它派生；一致性由 `n
 
 | 插件 | 作用 |
 |---|---|
-| `dsh-llm-codebuddy` | CodeBuddy 中国区/国际版 LLM Provider（独立命名空间 `llm-codebuddy`，只新增 Provider） |
-| `@dsh-external/dsh-oh-we-need` | 推理风格 Skill（历史遗留，此前从未接入装配链） |
+| `dsh-llm-codebuddy` | `v1.6.0` | CodeBuddy 中国区/国际版 LLM Provider（独立命名空间 `llm-codebuddy`，只新增 Provider）。⚠ 本仓版本**领先**于 npm 上该包的 `latest`（1.3.10），属有意保留，不降级 |
+| `@dsh-external/dsh-oh-we-need` | `v0.2.0` | 推理风格 Skill（历史遗留，此前从未接入装配链；未发布到 npm） |
 
 > **⚠ 其中两项（`dsh-provider-headers` / `dsh-vision`）的来源需说明**：
 > 它们原先只存在于 `prebuilt.tgz` 的 `third_party/`，而该供给链已在提交 `e3cf666` 移除，
@@ -135,7 +137,10 @@ Kotlin 展示面与 `install-dsh.mjs` 装配面都从它派生；一致性由 `n
 > `dsh-web-mobile` 是其前身插件改名后的**后继**（同一插件的新名），旧名已退役以免双份注册，
 > 本仓不再维护退役旧名的名录；插件自带的迁移说明见各插件 README。
 
-### 针对 dsh 0.1.7-rc.2 的适配（恢复的两项）
+### 针对 dsh 0.1.7-rc.2 的适配（历史记录：恢复的两项）
+
+> **本节为历史记录**，记录 `dsh-provider-headers` / `dsh-vision` 当初为适配 0.1.7-rc.2 所做的改动；
+> 当前适配目标已前进到 `0.2.0-rc.2`（见下文「dsh 版本适配」）。这两项至今仍保留该适配。
 
 | 插件 | 上游写法 | 适配后 | 依据 |
 |---|---|---|---|
@@ -177,6 +182,41 @@ Kotlin 展示面与 `install-dsh.mjs` 装配面都从它派生；一致性由 `n
 > （仓库源码未受影响，仍是新版）。本次已按仓库重新同步并重跑装配，11 项全部为最新版。
 > 结论：**APK 重装会以 assets 覆盖 extra-plugins**；改完插件后若发生重装，需重新同步一次。
 
+### 插件版本同步记录（最近一轮）
+
+| 插件 | 旧 → 新 | 合入方式 |
+|---|---|---|
+| `dsh-web-mobile` | 3.0.5 → **3.1.0** | 整包替换（与 npm 3.1.0 tarball 逐文件一致：0 differ 行、9 个共有文件 sha256 全同；peer 与 3.0.5 逐条相同） |
+| `dsh-codearts-auth` | tag rc.5 → **tag 0.2.0-rc.10** | `pnpm build:all` 本地构建（192 个 js）+ **重放移动端适配层** |
+
+- **codearts rc.10 的适配层必须重放**：上游该版**仍未内置**窄屏适配
+  （构建产物中 `max-width: 560px` 命中 0）。重放后做了非循环比对——
+  把「合并文件减去适配块」与**全新构建产物**逐行比对：两边均 **9958 行、差异 0**；
+  192 个 js 中 **191 个与构建产物逐字节相同**，唯一不同者正是承载适配块的 `lib/client/jet-hub.js`。
+  适配块与 rc.5 旧版**逐行 diff = 173 行、差异 0**（完整重放，非部分重放）。
+- **`dsh-web-mobile` 3.1.0 不带上游的 `assets/*.png`**：这 4 个 PNG 仅被上游 README 引用，
+  任何 `lib/*.js` 都不引用（grep 命中 0），且上一版副本同样不含 ⇒ 属本仓既有分发惯例
+  （只随包分发运行时 `lib/*.js`，不带 `src/`、`lib/types/`、`*.map`、README 截图）。
+
+> ⚠ **需实机手测确认**：codearts 的窄屏适配层为本地重放，其视觉与交互效果
+> **只能由真机确认**（源码与结构校验不能替代实机渲染）；`dsh-web-mobile` 3.1.0 的窄屏布局同理。
+> 装配层已机械验证：`builtin plugins assembled: 11 ok, 0 failed / 11 total`、
+> `compat audit: 11 compatible, 0 incompatible`、`plugin-status.json` 无 WARN。
+
+### 弃用插件（retired）核查
+
+「已弃用插件」在本仓有机械判据：`install/plugins.mjs` 的 `pruneRetiredBuiltins()`
+把「extra-plugins 同步 marker 记录过、但已不在清单 `builtin` 中」的目录判为 retired，
+装配时自动剪枝并注销其 `link:` 依赖与 `bundles` 条目。
+
+**最近一次核查结论：不存在任何 retired 插件。** 各差集（设备 `files/plugins/`、
+`assets/extra-plugins/`、`assets/optional-plugins/`、profile `dependencies`/`bundles`、
+同步 marker 与清单）**全部为空**；清单 `builtin=11` = assets extra=11 = 设备 plugins=11；
+装配日志中 `retired builtin pruned` 出现 **0** 次。
+
+`optional-plugins/dsh-oh-we-need` 被本文档标为「历史遗留」，但它位于 **optional**、
+从未装配、也不在 profile 中——属「分发但默认不装配」的正常状态，**不是 retired**。
+
 
 **依赖桥接（`modsearch` 专有的隐性契约）**：该包的 `dsh/index.js` 以
 `process.execPath` 拉起自带 CLI `dist/main.js`，而 CLI 顶层 `import { Command } from "commander"`
@@ -201,8 +241,14 @@ Kotlin 展示面与 `install-dsh.mjs` 装配面都从它派生；一致性由 `n
 钉死版本唯一真源是 [`app/src/main/assets/dsh-pin.json`](app/src/main/assets/dsh-pin.json)：
 `DshFlow.PINNED_DSH_TAG` 与 `install-dsh.mjs` 的默认 tag 都读同一份（此前两处各自硬编码，漏同步就静默装错版本）。
 
-当前适配目标：**`0.1.7-rc.2`**（npm `next` dist-tag）。
+当前适配目标：**`0.2.0-rc.2`**（npm `next` dist-tag）。
 `stub-dsh.mjs` 内每个补丁块都标注了「已针对该版本核实的锚点状态」，失效时会打印显式 WARN 而非静默跳过。
+
+> dsh 0.2.0 起 app-boot 新增**插件兼容性前置校验**（`evaluatePluginCompatibility` +
+> `prepareProfileEntries`）：插件声明的 `@deepseek-ai/dsh*` peer 范围若不覆盖运行时版本，
+> 该插件行会被**判定不兼容并在运行时禁用**——而 `dsh plugin add` 照旧成功，属静默失败。
+> 故升级 `dsh-pin.json` 的 tag 时，必须回头核对每个插件副本 `package.json` 的 peer 范围，
+> 并以装配后的 `files/plugin-status.json`（由 `auditBuiltinCompatibility()` 用 dsh 自带的同一函数生成）为验收依据。
 
 0.1.7 相对上一适配版本（0.1.5-rc.2）的关键破坏性变更与处置：
 
@@ -289,10 +335,13 @@ adb shell am start -n com.dsh.nextapp1/.MainActivity   # 或直接点应用图�
 
 | 文档 | 内容 |
 |---|---|
+| [`docs/plugin-roster.md`](docs/plugin-roster.md) | 插件名册：候选面、逐项决策、落地结果、来源可靠性核查 |
+| [`docs/update-check-log.md`](docs/update-check-log.md) | 历次「检查更新」的可核证据（查询时间、dist-tag、实际版本号），append-only |
 | [`docs/plugin-conversion-audit.md`](docs/plugin-conversion-audit.md) | 脚本式 dsh 修改审计：12 处补丁逐项判定 + 升级守护清单 |
 | [`docs/architecture-optimization-plan.md`](docs/architecture-optimization-plan.md) | 架构优化路线图（P0/P1/P2 + 执行状态） |
 | [`docs/review-findings-scripts.md`](docs/review-findings-scripts.md) | 脚本层全量 review 记录 |
 | [`docs/review-findings-r1.md`](docs/review-findings-r1.md) | overlay/service/ui 横切 review 记录 |
+| [`docs/review-findings-bridge-plugins.md`](docs/review-findings-bridge-plugins.md) | 桥接类插件 review 记录 |
 | [`docs/plugin-conversion-recon.md`](docs/plugin-conversion-recon.md) | directory-picker 插件化侦察（ctx.directoryPicker 服务缝） |
 
 ## 发布
