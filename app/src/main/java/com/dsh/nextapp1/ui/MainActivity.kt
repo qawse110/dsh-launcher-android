@@ -999,7 +999,14 @@ class MainActivity : AppCompatActivity() {
                     val refreshed = AssetSync.refreshBundledPluginCopies(
                         extraPlugins, File(filesDir, "plugins"), onlyExisting = true
                     )
-                    if (refreshed > 0) appendMiniLog("✓ 已刷新 $refreshed 个内置插件的装配副本")
+                    // ⚠️ appendMiniLog 会写 miniLog 的 visibility/text ⇒ 必须回主线程。
+                    // 本段在 thread{} 里，此处曾漏包 runOnUiThread，真机日志里表现为
+                    // "apk asset sync failed: Only the original thread that created a
+                    //  view hierarchy can touch its views … Calling: Thread-3"，
+                    // 并使后面的安装戳写入被跳过（于是每次启动都重做一遍同步）。
+                    if (refreshed > 0) runOnUiThread {
+                        appendMiniLog("✓ 已刷新 $refreshed 个内置插件的装配副本")
+                    }
                 }
                 // ★ 安装戳标记必须在**同步成功之后**才写：提前写会让一次失败
                 //   （弱网/空间不足）把自己永久标记成"已同步"，之后再不重试。
