@@ -65,7 +65,12 @@ class WebViewActivity : AppCompatActivity() {
      * about:blank，已恢复）。所以 setSupportMultipleWindows(true) 与 onCreateWindow
      * 必须同时成立，否则宁可不做。
      */
+    /** agent 页的容器：压在 GUI **之下**（索引 0），避免遮住 dsh 界面。 */
     private var popupLayer: FrameLayout? = null
+
+    /** 插件/用户自己开的窗口（如 codearts 登录小窗）：放在**最上层**，必须可见。 */
+    private var userPopupLayer: FrameLayout? = null
+
     private val popups = mutableListOf<WebView>()
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -275,6 +280,7 @@ class WebViewActivity : AppCompatActivity() {
         popups.toList().forEach { runCatching { destroyPopup(it) } }
         popups.clear()
         popupLayer = null
+        userPopupLayer = null
         rootView?.let { root ->
             root.removeAllViews()
         }
@@ -548,17 +554,24 @@ class WebViewActivity : AppCompatActivity() {
      *   · 子 WebView 自己也要有 WebChromeClient，否则它再开新页会被静默忽略。
      */
     private fun openPopupWebView(resultMsg: Message): Boolean {
-        val layer = popupLayer ?: FrameLayout(this).apply {
-            setBackgroundColor(Ui.BG)
-            layoutParams = FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            )
-        }.also {
-            popupLayer = it
-            // ★ 索引 0 = 最底层：让 agent 页压在 GUI 下面。
-            //   绝不能 appendChild（默认加到顶层）——那会把用户的 dsh GUI 整屏遮住。
-            rootView?.addView(it, 0)
+        // ★ 两类窗口分两层，判据由**发起方**（中继）留下的标记决定：
+        //   · agent 造的页 → popupLayer，索引 0 = GUI 之下（否则遮住 dsh 界面）；
+        //   · 其它（插件/用户自己 window.open 的登录小窗）→ userPopupLayer，最上层可见。
+        //   为什么不能用 isUserGesture：插件是先 await RPC 再 window.open，手势已丢
+        //   （lib/client/jet-hub.js:5955 实测如此），isUserGesture 恒 false。
+        val isAgent = isAgentWindowMarkerFresh()
+        val layer = if (isAgent) {
+            popupLayer ?: newPopupLayer().also {
+                popupLayer = it
+                // 索引 0 = 最底层：让 agent 页压在 GUI 下面。
+                rootView?.addView(it, 0)
+            }
+        } else {
+            userPopupLayer ?: newPopupLayer().also {
+                userPopupLayer = it
+                // 默认 appendChild = 最顶层：登录小窗必须看得见。
+                rootView?.addView(it)
+            }
         }
 
         val child = WebView(this)
@@ -623,12 +636,52 @@ class WebViewActivity : AppCompatActivity() {
         runCatching { (window.parent as? ViewGroup)?.removeView(window) }
         runCatching { window.removeAllViews() }
         runCatching { window.destroy() }
-        if (popups.isEmpty()) {
-            popupLayer?.let { l -> runCatching { rootView?.removeView(l) } }
-            popupLayer = null
+        // 哪一层空了就撤哪一层（两层互相独立，不能因为另一层还有页就把这层留着）。
+        popupLayer?.let { l ->
+            if (l.childCount == 0) {
+                runCatching { rootView?.removeView(l) }
+                popupLayer = null
+            }
+        }
+        userPopupLayer?.let { l ->
+            if (l.childCount == 0) {
+                runCatching { rootView?.removeView(l) }
+                userPopupLayer = null
+            }
         }
         AppLog.i(TAG, "popup WebView destroyed (remaining=" + popups.size + ")")
     }
+
+    /** 新建一个铺满父容器的弹层容器。 */
+    private fun newPopupLayer(): FrameLayout = FrameLayout(this).apply {
+        setBackgroundColor(Ui.BG)
+        layoutParams = FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        )
+    }
+
+    /** 中继留下的「这次 window.open 来自 agent」标记文件（与中继同一个 state 目录）。 */
+    private fun agentWindowFlagFile(): File {
+        val xdg = System.getenv("XDG_STATE_HOME")
+        val base = if (!xdg.isNullOrBlank()) xdg else File(filesDir, ".local/state").absolutePath
+        return File(base, "ego-lite-linux/agent-window.flag")
+    }
+
+    /**
+     * 该标记是否新鲜；**缺省一律按「不是 agent 窗口」**（false）。
+     *
+     * 读不到 / 解析不了 / 过期 都返回 false ⇒ 放到最上层可见。这个默认是刻意的：
+     * 判错的代价不对称 —— 把 agent 页错放最上层只是挡一会儿界面，而把用户的登录
+     * 小窗错藏到 GUI 后面，就是「点了登录没反应」（本轮 codearts 的实际故障）。
+     */
+    private fun isAgentWindowMarkerFresh(maxAgeMs: Long = 4_000L): Boolean = runCatching {
+        val f = agentWindowFlagFile()
+        if (!f.isFile) return@runCatching false
+        val ts = f.readText().trim().toLongOrNull() ?: return@runCatching false
+        val age = System.currentTimeMillis() - ts
+        age in 0..maxAgeMs
+    }.getOrDefault(false)
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 

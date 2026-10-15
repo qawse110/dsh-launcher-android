@@ -50,6 +50,12 @@ const MAX_FRAME_BYTES = 64 * 1024 * 1024;
 const DBG = !!process.env.RELAY_DEBUG;
 // 用户 dsh web 的端口（用于认领 GUI 页）。与 DshFlow.WEB_PORT 对齐，可覆盖。
 const USER_PORT = Number(process.env.DSH_WEB_PORT || 0) || 3080;
+// ★ 「这次 window.open 是 agent 发起的」标记文件。宿主（Kotlin onCreateWindow）
+//   读它来决定新窗口压在 GUI 之下（agent 页）还是放在最上层（插件/用户的登录窗）。
+//   放在 writeBrowserStateFile() 用的 state 目录里 —— 那个目录启动时必被创建。
+const STATE_DIR =
+  (process.env.XDG_STATE_HOME || (process.env.HOME || "") + "/.local/state") + "/ego-lite-linux";
+const AGENT_WINDOW_FLAG = STATE_DIR + "/agent-window.flag";
 /**
  * 宿主是否已经实现多窗口（setSupportMultipleWindows + onCreateWindow）。
  *
@@ -403,6 +409,9 @@ function onClient(client) {
     const guiId = isUserPage(opener) ? opener.targetId : null;
     const guiUrl = guiId ? String(opener.url || "") : null;
     const sessionId = await controlSession(opener.targetId);
+    // ★ 先留标记再 open：宿主 onCreateWindow 据此把这一页压到 GUI 之下，
+    //   而把插件/用户自己开的登录窗放在最上层（见 markAgentWindow 注释）。
+    markAgentWindow();
     await internalCall(
       "Runtime.evaluate",
       {
@@ -896,6 +905,26 @@ server.on("error", (e) => {
  * 不会出现「CDP 明明能用、--status 却说 running:false」的分裂。
  * pid 记本进程 —— 于是 ego 的 `--stop` 语义正好是「停掉这个桥」。
  */
+/**
+ * 标记「紧接着的这次 window.open 来自 agent」。
+ *
+ * 为什么需要它：宿主 WebView 的多窗口能力是所有 window.open 共用的，而两类窗口
+ * 的期望截然相反 ——
+ *   · agent 造的页：要压在用户 GUI **之下**（否则遮住 dsh 界面）；
+ *   · 插件/用户开的登录小窗（如 codearts 的 window.open(loginUrl)）：必须在**最上层**可见。
+ * 只靠 isUserGesture 区分不了：插件那边是先 await RPC 再 window.open，手势已经丢了
+ * （lib/client/jet-hub.js:5955 实测如此）。所以由发起方（本中继）显式留标记。
+ * 默认（没有标记 / 标记过期）一律按「用户窗口」处理 —— 宁可让 agent 页露出来，
+ * 也绝不能再把用户的登录窗藏起来。
+ */
+function markAgentWindow() {
+  try {
+    writeFileSync(AGENT_WINDOW_FLAG, String(Date.now()));
+  } catch (e) {
+    if (DBG) process.stderr.write("DBG markAgentWindow failed: " + String((e && e.message) || e) + "\n");
+  }
+}
+
 function writeBrowserStateFile() {
   try {
     const home = process.env.HOME || "";

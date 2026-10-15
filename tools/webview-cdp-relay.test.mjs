@@ -418,6 +418,22 @@ async function main() {
   const guiBefore = targets.find((t) => t.url === GUI_URL);
   const r2 = await call("Target.createTarget", { url: "https://example.com/" });
   check("createTarget 成功并回了一个 targetId", !!(r2.result && r2.result.targetId), JSON.stringify(r2).slice(0, 180));
+
+  // ★ 新增：「这一次 window.open 来自 agent」的标记必须被写下。
+  //   宿主（Kotlin onCreateWindow）据此把 agent 页压到 GUI 之下，而把插件/用户
+  //   自己开的登录小窗放最上层。没有它，两类窗口就分不开 —— 要么遮住 GUI，
+  //   要么把用户的登录窗藏到 GUI 后面（codearts 登录「不跳转」的成因）。
+  const flagPath = join(relay.home, ".local/state/ego-lite-linux/agent-window.flag");
+  let flagFresh = false;
+  let flagWhy = "missing";
+  try {
+    const raw = readFileSync(flagPath, "utf8").trim();
+    const ts = Number(raw);
+    const age = Date.now() - ts;
+    flagFresh = Number.isFinite(ts) && age >= 0 && age < 4000;
+    flagWhy = "age=" + age + "ms raw=" + raw.slice(0, 20);
+  } catch (e) { flagWhy = "read failed: " + String((e && e.message) || e); }
+  check("createTarget 留下了 agent-window 标记（宿主据此分层）", flagFresh, flagWhy);
   check(
     "拿到的不是用户页的 targetId（是新页）",
     !!(r2.result && r2.result.targetId && r2.result.targetId !== guiBefore.targetId),
