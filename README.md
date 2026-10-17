@@ -93,7 +93,7 @@ Kotlin 展示面与 `install-dsh.mjs` 装配面都从它派生；一致性由 `n
 | `dsh-vision` | 自 `prebuilt.tgz` 恢复 | 给纯文本模型加上 `view_image` 工具：复用宿主 Provider 配置，或接自定义 OpenAI 兼容 VLM 端点 |
 | `@liustack/modsearch` | <https://github.com/liustack/modsearch> `v5.10.6`（npm 产物，整包同源） | 联网检索：把 `web_search`/`web_fetch` 的后端换成免密钥的 modsearch 引擎链（Firecrawl 免密钥、1,000 次/月），并新增 `x_search`、`read_page`。⚠ 运行时依赖 `commander`/`undici` 由**依赖桥接**供给（见下） |
 | `dsh-ego-browser` | <https://github.com/Fisfzy/dsh-ego-browser> `v0.8.6`（npm 产物，整包同源） | Agent 浏览器：30+ `ego_*` 工具 + 实时观察窗，底层内置 ego-lite 运行时。⚠ **运行期需一个可达的 Chrome/Chromium 二进制**（本机未装，见下） |
-| `billion-context-dsh` | <https://github.com/Tyan66666/billion-context-dsh> `v0.2.27`（npm 产物，整包同源） | 上下文压缩 ACP：给模型 `compress`/`decompress`/`search_context`/`acp_status` 四个工具，由模型自己决定何时压缩、压缩什么（而非硬性截断），另附 `/acp-prune` 命令与压缩提示。⚠ 其自带的 `cordis.patch.yml` 会**同时 disable 宿主的 `compaction-basic` 行**（一个 realm 只能有一个 `ctx.compaction` 提供方） |
+| `billion-context` | <https://github.com/ranxianglei/billion-context> `v0.1.198`（npm 产物，按上游 `files` 字段裁剪） | 上下文压缩 ACP：给模型 `compress`/`decompress`/`search_context`/`acp_status`/`acp_cache`/`read_original_image` 六个工具，由模型自己决定何时压缩、压缩什么（而非硬性截断），另附 `/acp`、`/acp-cache` 命令。⚠ 与旧内置的 `billion-context-dsh` 是**两个不同的包**：本包为进程外 MITM 代理架构，插件本体只注册工具，实际压缩由它 spawn 的 `dist/index.js` 代理进程完成。其自带的 `dsh.bundle.patch.yml` 会 disable 宿主的 `compaction-basic` 行，并**整体替换** `llm-deepseek` 的 `retryPolicy`、向四个 preset 注入 `biliBasicCompactionPolicy` |
 
 ### 内置集合的构成
 
@@ -151,12 +151,14 @@ Kotlin 展示面与 `install-dsh.mjs` 装配面都从它派生；一致性由 `n
 
 这些插件在真机上均通过 **ESM 链接测试**（`import()` 插件入口）：入口的 `apply` 均为 function。
 
-### 本轮新增的三项（`modsearch` / `dsh-ego-browser` / `billion-context-dsh`）
+### 本轮新增的三项（`modsearch` / `dsh-ego-browser` / `billion-context`）
 
-三项均取自各自 **npm 官方 tarball**（`registry.npmmirror.com`），**整包同源、未改任何字节**，
+三项均取自各自 **npm 官方 tarball**，**整包同源、未改任何源码字节**，
 因此不需要「就地适配」那一档处置。
-`billion-context-dsh` 的本地副本与 tarball `diff -rq` 逐字节一致（仅删去 `dist/index.js.map`，
-与 modsearch / ego-browser / codearts 的既有惯例一致：不带 sourcemap 分发）。
+`billion-context` 的本地副本按**上游 `files` 字段裁剪**：只保留 `package.json`、`dsh.bundle.patch.yml`、
+`README.md`、`CONFIGURATION.md`、`LICENSE`、`dist/index.js`、`dist/agent/dsh-native.js`，
+删去 106.8MB sourcemaps、0.9MB 论文配图与其余 9 个客户端适配入口（pi / omp / opencode / kimi / zcode / claude 等）。
+裁剪后 7.3MB；与 modsearch / ego-browser / codearts 的既有惯例一致：不带 sourcemap 分发。
 
 **兼容性事实（读 package.json 实测，非推断）**：`@liustack/modsearch` **未声明任何
 `@deepseek-ai/dsh*` peer**（只有 `commander`/`undici` 两个 dependencies），
@@ -165,16 +167,27 @@ Kotlin 展示面与 `install-dsh.mjs` 装配面都从它派生；一致性由 `n
 `>=0.1.2-rc.1` 的下界范围且均标 `optional`，`0.2.0-rc.2` 全部满足。
 用 **dsh 自带的那个判定函数**逐个核对，三者均返回 `undefined`（兼容）。
 
-**`billion-context-dsh` 的两个特殊点**（与另外两项不同）：
+**`billion-context` 的三个特殊点**（与另外两项不同）：
 
-1. **它此前不是内置插件，而是 profile 里的普通 npm 依赖**（`"billion-context-dsh": "^0.2.27"`）。
-   本轮改为随 APK 内置分发：`dsh plugin add` 已把依赖规格改写为
-   `link:…/files/plugins/billion-context-dsh`，`node_modules` 下是符号链接、`.pnpm` 里不再有
-   npm 解析副本（已核实无残留）。**这是「追加内置」，不是「改成可选」**——它仍在 `builtin` 数组里。
-2. **它的 `cordis.patch.yml` 会连带 disable 宿主的 `compaction-basic` 行**。原因：一个 realm 只能有一个
-   `ctx.compaction` 提供方，宿主的自动压缩后端与 ACP 引擎不能并存。已用 `--dump-config` 核实
-   宿主面 `compaction-basic` 确为 `disabled: true`、`compaction-acp` 挂宿主面且未禁用。
-   这是插件自带行为，非本仓改动。
+1. **它替换了此前内置的 `billion-context-dsh`**（`Tyan66666/billion-context-dsh@0.2.27`）。
+   换包的**唯一硬理由**是 dsh 0.2.1 的兼容性判定：`billion-context-dsh` 有 16 条 `@deepseek-ai/dsh-*`
+   peer 要么钉死 `0.2.0-rc.2`、要么上界写死 `<0.2.1-0`，把 pin 升到 `0.2.1-rc.2` 后会被
+   `evaluatePluginCompatibility` 判定不兼容并**静默禁用**（`dsh plugin add` 照旧成功，属静默失败）。
+   `billion-context@0.1.198` 的 `peerDependencies` 为空且无 `engines.dsh`，不受该判定约束。
+   旧包已归档至 `assets/optional-plugins/billion-context-dsh/` 备回滚，**不再装配**——两者都会
+   disable 宿主 `compaction-basic` 并争抢同一个 `ctx.compaction`，不能并存。
+2. **它是进程外 MITM 代理架构，与旧包的进程内 CompactionEngine 完全不同**。插件本体
+   `dist/agent/dsh-native.js` 在 dsh 进程内做两件事：`spawn` 出代理子进程（`dist/index.js`），
+   以及从 `/__bili/plugin/manifest` 动态拉取工具定义后逐条 `ctx.tools.register`。
+   代理起不来时**不崩**：打一条 `proxy bootstrap failed — model traffic goes direct (uncompressed)`
+   然后降级为不压缩。因此 `dist/index.js` 必须与 `dist/agent/dsh-native.js` 一起分发。
+   模型侧工具面与旧包**同名同义且更多**：`compress` / `decompress` / `search_context` /
+   `acp_status` / `acp_cache` / `read_original_image`（实测 `/__bili/plugin/manifest` 返回）。
+3. **它的 `dsh.bundle.patch.yml` 会连带改写宿主配置**：disable `compaction-basic`（改为
+   `config.auto: false`，旧包是 `disabled: true`）、向 `preset-standard` / `preset-ptc` /
+   `preset-minimal` / `preset-cordis` 注入 `inject: [biliBasicCompactionPolicy]`，并**整体替换**
+   `llm-deepseek` / `llm-deepseek-account` 的 `retryPolicy`（patch 是替换非合并，上游注释已说明
+   它会重述全部默认 retry 码）。这是插件自带行为，非本仓改动。
 
 > ⚠ **实测发现的部署陷阱（本轮顺带发现，值得记录）**：设备在 23:23 被**重装过一次 APK**，
 > 那次重装把 `files/extra-plugins/` 覆盖成**该 APK 内置的旧版 assets**——上一轮更新过的

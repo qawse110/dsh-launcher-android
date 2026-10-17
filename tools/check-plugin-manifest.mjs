@@ -75,23 +75,32 @@ for (const section of ['builtin', 'optional']) {
     catch (e) { fail(`${where}: package.json 解析失败: ${e.message}`); continue; }
     if (pkg.name !== row.name) fail(`${where}: name 不一致 —— 清单=${row.name}, package.json=${pkg.name}`);
     // 3. id 对齐
-    // cordis.patch.yml 的位置以 package.json 的 exports 为准（dsh 就是这么解析的）：
-    // 上游 0.6+ 把插件代码移入子目录（po06/），补丁层随之声明为
-    // `exports["./cordis.patch.yml"] = "./po06/cordis.patch.yml"`。
-    // 早先这里硬编码根目录，遇到该布局会误报「缺少 cordis.patch.yml」。
-    // 先认 exports，再回退根目录（兼容未声明 exports 的旧版布局）。
-    let patch = join(dirAbs, 'cordis.patch.yml');
-    if (!existsSync(patch)) {
+    // 补丁层文件的位置与文件名都**以 package.json 的声明为准**，dsh 本身就是这么解析的
+    // （app-boot：`const declared = typeof bundle.patch === "string" ? [bundle.patch] : bundle.patch`，
+    // 读的是 `dsh.bundle.patch`，文件名不参与判断）。因此这里按以下优先级解析：
+    //   a. `dsh.bundle.patch` —— dsh 现代布局的主声明（billion-context 等上游即用此字段，
+    //      文件名可叫 dsh.bundle.patch.yml 而非 cordis.patch.yml）；
+    //   b. `exports["./cordis.patch.yml"]` —— 上游 0.6+ 把插件代码移入子目录（po06/）时
+    //      随之声明的路径（`"./po06/cordis.patch.yml"`）；
+    //   c. 根目录 cordis.patch.yml —— 兼容未做任何声明的旧版布局。
+    // 早先这里硬编码根目录，遇到 a/b 两种布局都误报「缺少 cordis.patch.yml」。
+    let patch = null;
+    const declaredBundle = pkg.dsh && pkg.dsh.bundle && pkg.dsh.bundle.patch;
+    const bundleRel = typeof declaredBundle === 'string' ? declaredBundle
+      : Array.isArray(declaredBundle) ? declaredBundle[0] : null;
+    if (typeof bundleRel === 'string') patch = join(dirAbs, bundleRel);
+    if (!patch || !existsSync(patch)) {
       const declared = pkg.exports && pkg.exports['./cordis.patch.yml'];
       const rel = typeof declared === 'string'
         ? declared
         : declared && (declared.default || declared.import || declared.require);
       if (typeof rel === 'string') patch = join(dirAbs, rel);
     }
-    if (!existsSync(patch)) fail(`${where}: 缺少 cordis.patch.yml`);
+    if (!patch || !existsSync(patch)) patch = join(dirAbs, 'cordis.patch.yml');
+    if (!existsSync(patch)) fail(`${where}: 缺少补丁层文件（dsh.bundle.patch / exports["./cordis.patch.yml"] / cordis.patch.yml 均未命中）`);
     else {
       const ids = patchIds(patch);
-      if (!ids.includes(row.id)) fail(`${where}: id 不一致 —— 清单=${row.id}, cordis.patch.yml=[${ids.join(', ')}]`);
+      if (!ids.includes(row.id)) fail(`${where}: id 不一致 —— 清单=${row.id}, ${patch.split('/').pop()}=[${ids.join(', ')}]`);
     }
     // 5. 唯一性
     for (const [map, key, label] of [[seenDir, row.dir, 'dir'], [seenName, row.name, 'name'], [seenId, row.id, 'id']]) {

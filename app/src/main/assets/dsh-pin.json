@@ -1,6 +1,6 @@
 {
   "$comment": "dsh 本体钉死版本 —— 单一真源。DshFlow.kt（PINNED_DSH_TAG）与 install-dsh.mjs（默认 DSH_TAG）都从这里读取，两侧不得再各自硬编码。tag 为 next dist-tag 对应的精确版本；升级时只改这一处。",
-  "tag": "0.2.0-rc.2",
+  "tag": "0.2.1-rc.2",
   "distTag": "next",
-  "note": "0.2.0-rc.2 = registry.npmjs.org 的 next dist-tag（本轮实测 latest 亦为 0.2.0-rc.2）。相对 0.1.7-rc.2 的关键变化：app-boot 新增**插件兼容性前置校验**（evaluatePluginCompatibility / prepareProfileEntries）——凡声明了 @deepseek-ai/dsh 或 @deepseek-ai/dsh-* peer 的插件，其 peer 范围若不覆盖运行时版本，该插件行会被**判定不兼容并禁用**（只有 compatibility.json 里的精确豁免能放行）。故本仓插件副本的 dsh-* peer 范围已同步放开到 0.2.x。升级时只改这一处。"
+  "note": "0.2.1-rc.2 = registry.npmjs.org 的 next dist-tag（本轮 2026-10-17 实测：latest=0.2.0-rc.2、next=0.2.1-rc.2、alpha=0.2.1-alpha.5；本仓跟随 next 通道，alpha 不作为升级依据）。相对 0.2.0-rc.2 的关键变化：(1) app-boot 的 evaluatePluginCompatibility 新增 unmetRequirements() 前置分支——插件声明 engines.dsh 时该字段**独占判定**并完全忽略 peerDependencies；(2) 移除直连依赖 dsh-webhook / dsh-tool-ralph / dsh-hooks-codex（降为 devDependencies）；(3) 新增 ralph-bundle / tool-worktree / session-search / terminal-bundle / inspector-profile / plugin-market-bundle / session-titles-bundle / cot-translation-bundle 等 experimental bundle。兼容性影响：旧内置的 billion-context-dsh@0.2.27 有 16 条 dsh-* peer 钉死 0.2.0-rc.2 或上界 <0.2.1-0，升级后会被判定不兼容并静默禁用，故本轮已改用 billion-context@0.1.198（peerDependencies 为空且无 engines.dsh，不受该判定约束）替代。升级时只改这一处。"
 }

@@ -53,13 +53,19 @@
 ＋ `dsh-status-bridge`、`dsh-android-links`（由 optional 移入 `assets/extra-plugins/`）
 ＋ `dsh-net-proxy`、`dsh-provider-headers`、`dsh-vision`（自 `prebuilt.tgz` 残留恢复并适配）
 ＋ `modsearch`（`@liustack/modsearch` v5.10.6）、`dsh-ego-browser`（v0.8.6）
-＋ `billion-context-dsh`（v0.2.27）
+＋ `billion-context`（v0.1.198）
 （后三项为 npm 官方产物整包同源，见 README「本轮新增的三项」）。
 
-> `billion-context-dsh` 加入前**不是内置插件**，而是 profile 里的普通 npm 依赖
-> （`"billion-context-dsh": "^0.2.27"`）；本轮改为随 APK 内置分发（依赖规格已改写为 `link:`）。
-> 它自带的 `cordis.patch.yml` 会**同时 disable 宿主的 `compaction-basic` 行**——
-> 一个 realm 只能有一个 `ctx.compaction` 提供方，属插件自带行为。
+> `billion-context` 替换了此前内置的 `billion-context-dsh@0.2.27`。换包理由是 dsh 升到
+> `0.2.1-rc.2` 后，旧包 16 条 `@deepseek-ai/dsh-*` peer（钉死 `0.2.0-rc.2` 或上界 `<0.2.1-0`）
+> 会被 `evaluatePluginCompatibility` 判为不兼容并**静默禁用**；新包 `peerDependencies` 为空且无
+> `engines.dsh`，不受该判定约束。旧包已归档到 `assets/optional-plugins/billion-context-dsh/`，
+> **不再装配**——两者都会 disable 宿主 `compaction-basic` 并争抢同一个 `ctx.compaction`，不能并存。
+> 新包为**进程外 MITM 代理**架构：插件本体 `spawn` 出 `dist/index.js` 代理进程完成压缩，
+> 工具面经 `/__bili/plugin/manifest` 动态下发（`compress` / `decompress` / `search_context` /
+> `acp_status` / `acp_cache` / `read_original_image`）。其 `dsh.bundle.patch.yml` 还会
+> disable `compaction-basic`（`config.auto: false`）、向四个 preset 注入 `biliBasicCompactionPolicy`，
+> 并**整体替换** `llm-deepseek` / `llm-deepseek-account` 的 `retryPolicy`，均属插件自带行为。
 
 
 ### 可选集合（2 个，未动）

@@ -3,8 +3,8 @@
   "version": 1,
   "profile": "web",
   "$targetDsh": "本清单内的插件副本已针对该 dsh 版本适配；与 assets/dsh-pin.json 的 tag 同源，升级 pin 时必须回头核对每个插件 package.json 的 @deepseek-ai/dsh-* peer 范围是否覆盖新版本。",
-  "targetDsh": "0.2.0-rc.2",
-  "$compatContract": "dsh 0.2.0 起 app-boot 新增兼容性前置校验（evaluatePluginCompatibility + prepareProfileEntries）：插件任一 @deepseek-ai/dsh / @deepseek-ai/dsh-* peer 范围不覆盖运行时版本，该插件行即被判定不兼容并在运行时禁用——而 dsh plugin add 照旧成功，属静默失败。install/plugins.mjs 的 auditBuiltinCompatibility() 会在装配后用 dsh 自带的同一函数核对，结果写入 files/plugin-status.json 并在日志打 WARN。",
+  "targetDsh": "0.2.1-rc.2",
+  "$compatContract": "dsh 0.2.0 起 app-boot 新增兼容性前置校验（evaluatePluginCompatibility + prepareProfileEntries）：插件任一 @deepseek-ai/dsh / @deepseek-ai/dsh-* peer 范围不覆盖运行时版本，该插件行即被判定不兼容并在运行时禁用——而 dsh plugin add 照旧成功，属静默失败。dsh 0.2.1 起该函数先走 unmetRequirements()：插件一旦声明 engines.dsh 字段，该字段独占判定并**完全忽略 peerDependencies**。install/plugins.mjs 的 auditBuiltinCompatibility() 会在装配后用 dsh 自带的同一函数核对，结果写入 files/plugin-status.json 并在日志打 WARN。",
   "$builtinComment": "内置集合由用户逐项决定（原「仅内置三个」约束已撤回）。builtin = 源码在 assets/extra-plugins/、随 APK 装配进 web profile；optional = 源码在 assets/optional-plugins/、分发但不默认装配。",
   "builtin": [
     {
@@ -94,13 +94,13 @@
       "upstream": "https://github.com/Fisfzy/dsh-ego-browser"
     },
     {
-      "dir": "billion-context-dsh",
-      "name": "billion-context-dsh",
-      "id": "compaction-acp",
+      "dir": "billion-context",
+      "name": "billion-context",
+      "id": "bili-native",
       "title": "上下文压缩 ACP",
-      "desc": "Active Context Pruning：给模型 compress / decompress / search_context / acp_status 四个工具，由模型自己决定何时压缩、压缩什么（而非硬性截断），并附 /acp-prune 命令与压缩提示。取自上游 Tyan66666/billion-context-dsh v0.2.27 的 npm 产物（整包同源，无本地改动：其 dsh-* peer 逐个核对均覆盖 targetDsh 0.2.0-rc.2，故无需适配）。⚠ 该插件自带的 cordis.patch.yml 除插入自身外还会 **disable 宿主的 compaction-basic 行**（一个 realm 只能有一个 ctx.compaction 提供方），并在宿主面挂载 ACP 引擎；此前它是以 npm 依赖形式装进 profile 的，现改为随 APK 内置分发",
-      "version": "0.2.27",
-      "upstream": "https://github.com/Tyan66666/billion-context-dsh"
+      "desc": "Active Context Pruning（ACP）：给模型 compress / decompress / search_context / acp_status / acp_cache / read_original_image 六个工具，由模型自己决定何时压缩、压缩什么（而非硬性截断），另附 /acp 与 /acp-cache 命令。上游 ranxianglei/billion-context v0.1.198 的 npm 产物。与旧内置的 billion-context-dsh 相比，本包是**进程外 MITM 代理**架构：插件本体 dist/agent/dsh-native.js 在 dsh 进程内注册工具，实际压缩由它 spawn 的 dist/index.js 代理进程完成，工具清单经 /__bili/plugin/manifest 动态下发。其 peerDependencies 为空且无 engines.dsh，故不约束 dsh 版本。⚠ 该插件自带的 dsh.bundle.patch.yml 会 disable 宿主的 compaction-basic 行（改为 config.auto:false），并**整体替换** llm-deepseek / llm-deepseek-account 的 retryPolicy、向 preset-standard/ptc/minimal/cordis 注入 biliBasicCompactionPolicy。已按上游 files 字段裁剪：去掉 106.8MB sourcemaps 与 0.9MB 论文配图，仅保留运行时必需文件。旧包已归档至 assets/optional-plugins/billion-context-dsh 备回滚",
+      "version": "0.1.198",
+      "upstream": "https://github.com/ranxianglei/billion-context"
     }
   ],
   "$optionalComment": "optional 条目与 builtin 一样带 version（便于追溯副本对应哪一版）；本仓自研的桥接插件是本地实现、无上游仓库，故不带 upstream 字段——不编造出处。",
@@ -120,6 +120,15 @@
       "title": "oh-we-need",
       "desc": "提示词/技能增强包（历史遗留，从未接入装配链）",
       "version": "0.2.0"
+    },
+    {
+      "dir": "billion-context-dsh",
+      "name": "billion-context-dsh",
+      "id": "compaction-acp",
+      "title": "上下文压缩 ACP（旧版，已归档）",
+      "desc": "旧的内置上下文压缩插件（Tyan66666/billion-context-dsh v0.2.27，进程内 CompactionEngine 架构），已被 billion-context v0.1.198（进程外 MITM 代理架构）替换。归档理由：dsh 升到 0.2.1-rc.2 后，本包 16 条 @deepseek-ai/dsh-* peer（钉死 0.2.0-rc.2 或上界 <0.2.1-0）会被 evaluatePluginCompatibility 判为不兼容并静默禁用；新包 peerDependencies 为空且无 engines.dsh，不受该判定约束。⚠ 两者都会 disable 宿主的 compaction-basic 并争抢同一个 ctx.compaction，因此不可与新包同时装配；本条目仅作源码存档与回滚路径，默认不装配。回滚方法：在清单里把它移回 builtin 区、把 billion-context 移出，并把 dsh-pin 的 tag 改回 0.2.0-rc.2",
+      "version": "0.2.27",
+      "upstream": "https://github.com/Tyan66666/billion-context-dsh"
     }
   ]
 }
