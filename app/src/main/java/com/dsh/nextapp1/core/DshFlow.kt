@@ -221,13 +221,31 @@ object DshFlow {
             )
         }
 
-        // 安装+启动模式且 dsh 已安装：快速启动，跳过 npm 更新/插件装配/Termux 全量准备
+        // 安装+启动模式且 dsh 已安装：快速启动，跳过 npm 更新/插件装配/Termux 全量准备。
+        //
+        // ⚠️ 必须先比对**版本**再决定能否跳过。历史上这里只判 isInstalled()（bin.js 是否
+        //    存在），于是只要曾经装过任何一版 dsh，此后每次启动都走快速启动、
+        //    npm 安装那一步永远不跑 —— 表现就是「pin 改成 0.2.1-rc.2 了，设备上
+        //    却一直停在 0.2.0-rc.2」。pinnedTag() 与 DshUpdater.currentVersion()
+        //    两个值本来就在手边，只是这个判断没拿它们比。
+        //
+        // 目标版本要与**安装分支同一口径**：用户显式选过 tag（dsh_install_tag，含
+        // 「检查到新版本→更新」写入的精确版本、或回滚写入的上一版本）时以它为准，
+        // 否则用 pin。两处口径必须一致，否则会出现「拿 pin 判定不需升级、实际却
+        // 装了另一个版本」的分裂。
+        val installedVer = DshUpdater.currentVersion(ctx)
+        val wantedVer = ctx.getSharedPreferences(AppState.Prefs.CONSOLE, Context.MODE_PRIVATE)
+            .getString("dsh_install_tag", null) ?: pinnedTag(ctx)
         if (mode == Mode.INSTALL_AND_START && !forceFullInstall && isInstalled(ctx)) {
-            fl(">> 快速启动：已安装 dsh v${DshUpdater.currentVersion(ctx)}，跳过 npm/插件装配…")
-            return runQuickStart(
-                ctx, nodeDir, dshPrefix, onState, ::fl,
-                okLabel = "OK 快速启动完成", failLabel = "FAIL 快速启动"
-            )
+            if (installedVer == wantedVer) {
+                fl(">> 快速启动：已安装 dsh v$installedVer，跳过 npm/插件装配…")
+                return runQuickStart(
+                    ctx, nodeDir, dshPrefix, onState, ::fl,
+                    okLabel = "OK 快速启动完成", failLabel = "FAIL 快速启动"
+                )
+            }
+            // 版本不符 ⇒ 不能快速启动，落到下面的完整安装把版本追平。
+            fl(">> dsh 版本需升级：已装 v$installedVer → 目标 v$wantedVer，走完整安装…")
         }
 
         fl(">> 1.5/4 准备内置 Termux（bash/coreutils + git/rg/file）…")

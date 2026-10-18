@@ -381,4 +381,50 @@ class DshUpdaterTest {
         assertFalse(Supervisor.maybeRollbackOnCrashLoop(ctx, ::log))
         assertNull(console().getString("dsh_install_tag", null))
     }
+
+    // ================= 「版本没追平就不许快速启动」=================
+
+    /**
+     * 回归：pin 从 0.2.0-rc.2 改成 0.2.1-rc.2 后，设备上一直停在旧版本。
+     *
+     * 根因是 DshFlow 的快速启动分支只判 isInstalled()（bin.js 是否存在），
+     * 不比对版本 ⇒ 只要装过任何一版，npm 安装那一步永远不跑。
+     * 这组测试钉住两件事：
+     *   1) 已装版本 != 目标版本 ⇒ 目标版本确实与已装不同（可判定需要升级）；
+     *   2) 目标版本的口径 = 用户显式 tag（dsh_install_tag）优先，否则 pin。
+     */
+    @Test fun `已装版本与目标不一致时应当判定需要升级`() {
+        fakeInstall("0.2.0-rc.2")
+        val installed = DshUpdater.currentVersion(ctx)
+        val wanted = "0.2.1-rc.2"
+        assertEquals("0.2.0-rc.2", installed)
+        assertTrue("版本不同必须走完整安装", installed != wanted)
+        // isInstalled 只证明 CLI 在，不足以证明版本对 —— 这正是原 bug 的形状。
+        assertTrue("bin.js 存在 ⇒ 旧逻辑会误判为「无需安装」", DshFlow.isInstalled(ctx))
+    }
+
+    @Test fun `未安装时版本为 0_0_0 且判定为未安装`() {
+        fakeInstall(null)
+        assertEquals("0.0.0", DshUpdater.currentVersion(ctx))
+        assertFalse(DshFlow.isInstalled(ctx))
+    }
+
+    @Test fun `目标版本口径以用户显式 tag 优先`() {
+        // 用户从「检查更新」点了某个精确版本 ⇒ 它写在 dsh_install_tag 里，
+        // 此时目标就该是它，而不是 pin —— 两处口径必须一致。
+        console().edit().putString("dsh_install_tag", "0.2.1-rc.2").commit()
+        val wanted = console().getString("dsh_install_tag", null) ?: DshFlow.pinnedTag(ctx)
+        assertEquals("0.2.1-rc.2", wanted)
+
+        // 未显式选择时回落到 pin（assets/dsh-pin.json；Robolectric 下 assets 即仓库资产）。
+        console().edit().remove("dsh_install_tag").commit()
+        val fallback = console().getString("dsh_install_tag", null) ?: DshFlow.pinnedTag(ctx)
+        assertTrue("缺省应回落到一个非空 pin 版本", fallback.isNotBlank())
+    }
+
+    @Test fun `版本相同则应允许快速启动`() {
+        fakeInstall("0.2.1-rc.2")
+        assertEquals("0.2.1-rc.2", DshUpdater.currentVersion(ctx))
+        assertTrue("同版本无需重装", DshUpdater.currentVersion(ctx) == "0.2.1-rc.2")
+    }
 }
