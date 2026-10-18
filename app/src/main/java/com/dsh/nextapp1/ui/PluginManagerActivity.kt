@@ -843,12 +843,52 @@ class PluginManagerActivity : AppCompatActivity() {
         return runCatching { !AssetSync.dirContentEquals(src, dir) }.getOrDefault(false)
     }
 
-    /** 目录健康：package.json 存在、可解析、name 非空（空壳损坏判定）。 */
+    /**
+     * 目录健康：package.json 存在、可解析、name 非空，**且入口文件真实存在**。
+     *
+     * ⚠️ 只校验 name 是不够的（真机事故）：`billion-context@0.1.198` 的副本只剩 7 个文件，
+     * `package.json` 完好、`name` 非空 ⇒ 旧判据判「健康」，但它的 `exports["./client"]`
+     * 指向的 `dist/agent/dsh-native-client.js` 并不存在。结果启动时 dsh-client-modules
+     * 抛 `client bundles not found`，整个 client 组装失败、WebUI 起不来 ——
+     * 而插件管理器里该插件显示为正常，用户毫无线索。
+     *
+     * 这里补一层「入口可达性」校验：把 `main` 与 `exports` 里所有字符串值（含嵌套）
+     * 解析出来，逐个检查对应文件是否存在。缺任一入口即判损坏，让健康检查能报出来、
+     * 并走「从内置源恢复」的修复路径。
+     *
+     * 只查**文件是否存在**，不解析模块内容：目的是拦住「残缺副本」，不是校验代码正确性。
+     */
     private fun bundleHealthy(dir: File): Boolean {
         val p = File(dir, "package.json")
         if (!p.isFile) return false
         val j = runCatching { JSONObject(p.readText()) }.getOrNull() ?: return false
-        return j.optString("name").isNotBlank()
+        if (j.optString("name").isBlank()) return false
+        // 收集入口路径：main + exports 的全部字符串叶子
+        val entries = mutableListOf<String>()
+        j.optString("main").takeIf { it.isNotBlank() }?.let { entries.add(it) }
+        j.opt("exports")?.let { collectExportPaths(it, entries) }
+        // 相对路径才可解析；带 scheme 的（如 "node:fs"）跳过
+        for (raw in entries) {
+            if (raw.isBlank() || raw.contains(":")) continue
+            // ⚠️ 跳过**纯类型声明**：.d.ts 只在 TypeScript 开发期需要，运行时从不加载。
+            //    内置插件副本按 files 字段裁剪，通常不带 types/ 目录 —— 若把它们也算作
+            //    「必须存在」，dsh-web-mobile / dsh-codearts-auth 这类正常插件会被误判损坏。
+            if (raw.endsWith(".d.ts") || raw.endsWith(".d.mts") || raw.endsWith(".d.cts")) continue
+            // 通配出口（如 "./locale/*.json"）无法逐个校验，跳过
+            if (raw.contains("*")) continue
+            val rel = raw.removePrefix("./")
+            if (!File(dir, rel).isFile) return false
+        }
+        return true
+    }
+
+    /** 递归收集 `exports` 字段里的全部字符串叶子（exports 可嵌套多层对象/数组）。 */
+    private fun collectExportPaths(node: Any?, out: MutableList<String>) {
+        when (node) {
+            is String -> out.add(node)
+            is JSONObject -> node.keys().forEach { collectExportPaths(node.opt(it), out) }
+            is JSONArray -> for (i in 0 until node.length()) collectExportPaths(node.opt(i), out)
+        }
     }
 
     /**

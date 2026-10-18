@@ -601,7 +601,10 @@ object DshFlow {
         // 残留（端口被占但 web 不响应）视为脏状态，先清理再重启。
         // （v4.9.1 起移除「环境代次」检测：衔接版 v4.9.0 已让全部存量进程完成迁移）
         if (isPortListening(WEB_PORT)) {
-            if (waitForWebReady(ctx, 5_000, onLog)) {
+            // 这里只判断「已在运行」：传入**当前**日志长度，即只看这 5 秒内新写入的内容。
+            // 历史日志里的 EADDRINUSE 不该让「已在运行」被判成「启动失败」。
+            val offsetNow = runCatching { File(FileLog.dir(ctx), WEB_LOG).length() }.getOrDefault(0L)
+            if (waitForWebReady(ctx, 5_000, onLog, offsetNow)) {
                 onLog(">> dsh web 已在运行 (http://127.0.0.1:$WEB_PORT)")
                 // ★ 早退分支也必须确认中继在跑：这条路径会跳过下面整段 launcher，
                 //   而中继正是由 launcher 启动的。若只在这里 return，那么「dsh web
@@ -651,10 +654,15 @@ object DshFlow {
                 .replace("@RELAY_PORT@", RELAY_PORT.toString())
         )
         launcher.setExecutable(true)
+        // ★ 记录本次启动前的日志长度：waitForWebReady 只读这之后写入的段，
+        //   避免上一次启动残留的 EADDRINUSE 让本次启动被误判「启动即失败」
+        //   （真机事故：历史 EADDRINUSE → 每次启动都在 150ms 内放弃等待）。
+        val webLogFile = File(FileLog.dir(ctx), WEB_LOG)
+        val logOffsetBeforeStart = runCatching { webLogFile.length() }.getOrDefault(0L)
         // 唯一解释器：内置 Termux bash
         exec(ctx, "${TermuxRuntime.bashPath(ctx).absolutePath} ${launcher.absolutePath}") { onLog(it) }
         onLog(">> dsh web 已后台启动，等待 web 就绪（http://127.0.0.1:$WEB_PORT）…")
-        return waitForWebReady(ctx, 90_000, onLog)
+        return waitForWebReady(ctx, 90_000, onLog, logOffsetBeforeStart)
     }
 
     /**
@@ -770,7 +778,13 @@ object DshFlow {
 
     /** 轮询等待 dsh web 的 HTTP 真正可访问，超时后打印 web 日志尾部。
      *  前 6 秒每 150ms 探测一次（node 冷启动通常 1~3s，尽快感知就绪），之后放宽到 500ms。 */
-    private fun waitForWebReady(ctx: Context, timeoutMs: Long, onLog: (String) -> Unit): Boolean {
+    private fun waitForWebReady(
+        ctx: Context,
+        timeoutMs: Long,
+        onLog: (String) -> Unit,
+        /** 本次启动开始前的日志长度：只有这之后写入的内容才算「本次启动的日志」。 */
+        sinceOffset: Long = 0L,
+    ): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMs
         var lastLog = 0L
         val webLog = File(FileLog.dir(ctx), WEB_LOG)
@@ -778,7 +792,8 @@ object DshFlow {
             if (httpResponds(WEB_PORT)) return true
             // 快速失败：进程已因致命错误退出时，继续等满超时只会白等 90 秒，
             // 且用户看到的是「未就绪」而非真正的错误原因（真机 EADDRINUSE 即如此）。
-            if (webLogIsFatal(webLog)) {
+            // sinceOffset 保证只读本次启动写入的日志段（见 webLogIsFatal 的事故说明）。
+            if (webLogIsFatal(webLog, sinceOffset)) {
                 onLog("✗ dsh web 启动即失败（端口冲突或插件加载错误），日志尾部：")
                 appendLogTail(webLog, 25, onLog)
                 return false
@@ -803,13 +818,30 @@ object DshFlow {
      * - `EADDRINUSE`：端口被占（多为 watchdog 与启动流程双拉，见 Supervisor.reviveWebIfDue）；
      * - `Node.js v`：node 打印版本号后退出＝进程已终结（正常运行时不会出现）。
      *
-     * 只看日志**尾部**，避免历史残留的旧错误导致永久误判。
+     * ⚠️ 只认**本次启动之后**写入的日志段（真机事故）：
+     *
+     * 旧实现取「日志尾部 8000 字符」判断，注释称「避免历史残留导致永久误判」——
+     * 但 8000 字符远大于一次启动的日志量，实际会把**上一次**启动的 EADDRINUSE 也读进来。
+     * 真机现象：上一次启动失败留下 EADDRINUSE → 之后每次启动（哪怕新进程能正常 bind）
+     * 都在 150ms 内被判「启动即失败」并放弃等待，应用表现为「dsh web 未就绪」，
+     * 而实际上后台已有一个健康的 dsh web 在跑（端口 3080 返回 401）。
+     *
+     * 修法：调用方在**起进程之前**记下日志长度 [sinceOffset]，这里只看该偏移之后的内容。
+     * 这样「历史残留」在物理上不可能被读到。
      */
-    private fun webLogIsFatal(log: File): Boolean = try {
+    private fun webLogIsFatal(log: File, sinceOffset: Long): Boolean = try {
         if (!log.isFile) false
         else {
-            val tail = log.readText().takeLast(8_000)
-            tail.contains("EADDRINUSE") || tail.contains("Node.js v")
+            val len = log.length()
+            // 文件被轮转/截断（len < sinceOffset）时退化为看整个文件
+            val from = if (len >= sinceOffset && sinceOffset >= 0) sinceOffset else 0L
+            java.io.RandomAccessFile(log, "r").use { raf ->
+                raf.seek(from)
+                val buf = ByteArray((len - from).coerceAtMost(16_384L).toInt())
+                raf.readFully(buf)
+                val seg = String(buf, Charsets.UTF_8)
+                seg.contains("EADDRINUSE") || seg.contains("Node.js v")
+            }
         }
     } catch (t: Throwable) {
         false
