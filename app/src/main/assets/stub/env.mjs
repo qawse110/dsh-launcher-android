@@ -22,6 +22,7 @@ const PNPM_DIR = join(NODE_MODULES, '.pnpm');
 // 真机事故：codebuddy 修好后 dsh-vision 又炸，同类错误换了个插件。
 const PLUGINS_DIR = process.env.DSH_PLUGINS_DIR || join(HOME, 'plugins');
 const pkgCache = new Map();
+const allPkgCache = new Map();
 let pnpmEntries = null;
 const OUT = join(HOME, 'install_log.txt');
 const OUT_SHARED = '/sdcard/Download/DshLauncher/install_log.txt';
@@ -54,23 +55,44 @@ function findPkg(pkgName, rel) {
 }
 
 function findPkgUncached(pkgName, rel) {
+  return findAllPkgPaths(pkgName, rel)[0] || null;
+}
+
+/**
+ * 定位包内相对路径的**全部**副本。
+ *
+ * 为什么需要（真机事故 0.2.1-rc.2 启动即失败）：升级 dsh 后 `.pnpm` 里会同时留下
+ * 旧版与新版的同名包（旧版不会被 npm 自动 prune）。[findPkg] 只返回**第一个**
+ * 命中的副本（目录名字典序），于是给旧版打了补丁、新版仍是原生实现：
+ *   · 日志显示 `JS shim already applied`（打在 0.1.6 上），看起来完全正常；
+ *   · dsh 实际加载的是 0.1.9（依赖范围重新解析到的新版）→ boot 期
+ *     `No usable native binding found for node-addon-require-builtin-android-arm64`。
+ * 补丁必须**覆盖每一个副本**，否则「补丁成功」的假象会把排查引向网络/端口。
+ *
+ * @returns 绝对路径数组（去重，按 pnpm 目录名升序后接扁平/嵌套布局）
+ */
+function findAllPkgPaths(pkgName, rel) {
+  const key = pkgName + '\u0000' + rel;
+  const hit = allPkgCache.get(key);
+  if (hit) return hit;
+  const out = [];
+  const push = (p) => { if (p && existsSync(p) && !out.includes(p)) out.push(p); };
   // pnpm v10: node_modules/.pnpm/<name>@<hash>/node_modules/<pkg>/<rel>
   if (existsSync(PNPM_DIR)) {
     const prefix = pkgName.replace('/', '+') + '@';
-    for (const d of getPnpmEntries()) {
-      if (!d.startsWith(prefix)) continue;
-      const p = join(PNPM_DIR, d, 'node_modules', pkgName, rel);
-      if (existsSync(p)) return p;
-    }
+    const dirs = getPnpmEntries().filter((d) => d.startsWith(prefix)).sort();
+    for (const d of dirs) push(join(PNPM_DIR, d, 'node_modules', pkgName, rel));
   }
   // npm 扁平布局
-  const flat = join(NODE_MODULES, pkgName, rel);
-  if (existsSync(flat)) return flat;
-  // 依赖可能被嵌套安装（如 @deepseek-ai/dsh-subprocess-local/node_modules/node-pty）
-  return findNestedPkg(pkgName, rel);
+  push(join(NODE_MODULES, pkgName, rel));
+  // 嵌套布局只取首个命中：全树递归很贵（每次启动多个补丁 × 数百包），而重复副本
+  // 实际只出现在 .pnpm（上面已全量覆盖），嵌套目录里不会同时存在新旧两版。
+  push(findNestedPkg(pkgName, rel));
+  allPkgCache.set(key, out);
+  return out;
 }
 
-/** 递归查找嵌套 node_modules 中的包（pnpm 之外的 npm 嵌套布局）。 */
+/** 递归查找嵌套 node_modules 中的包（pnpm 之外的 npm 嵌套布局），首个命中即返回。 */
 function findNestedPkg(pkgName, rel) {
   const found = [];
   function walk(dir, depth) {
@@ -150,6 +172,6 @@ function eachPluginClientFile() {
 // 空导出面会误导读者以为它们是公共 API，也让「谁在用」无从判断。
 export {
   HOME,
-  log, findPkg,
+  log, findPkg, findAllPkgPaths,
   eachPluginEntry, eachPluginClientFile,
 };

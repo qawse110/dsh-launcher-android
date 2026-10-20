@@ -8,9 +8,10 @@
  * 因此在引导期脚本里改写。koffi/node-pty/sharp 与 dsh 版本无关、无锚点；
  * attachment-local 用**扫描式**改写（不锚定单一字面量，上游重构也不会静默失效）。
  */
-import { writeFileSync, readFileSync, existsSync, readdirSync } from 'node:fs';
+import { writeFileSync, readFileSync, existsSync, readdirSync, unlinkSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { join, dirname } from 'node:path';
-import { log, findPkg } from '../env.mjs';
+import { log, findPkg, findAllPkgPaths } from '../env.mjs';
 
 const KSTUB = 'Y29uc3QgcD1uZXcgUHJveHkoZnVuY3Rpb24oKXt9LHtnZXQ6KHQsayk9PihrPT09U3ltYm9sLnRvUHJpbWl0aXZlKT8oKT0+MDooaz09PSd0aGVuJ3x8az09PSdjYXRjaCd8fGs9PT0nZmluYWxseScpP3VuZGVmaW5lZDpwLGFwcGx5OigpPT5wLGNvbnN0cnVjdDooKT0+cH0pO2NvbnN0IGtvZmZpPXtsb2FkOigpPT5wLGRlY29kZTooKT0+MCxlbmNvZGU6KCk9PjAsCnNpemVvZjooKT0+MCxhbGlnbm9mOigpPT4wLGZ1bmN0aW9uOigpPT5wLHN0cnVjdDooKT0+cCx1bmlvbjooKT0+cCxlbnVtOigpPT5wLHR5cGVkZWY6KCk9PnAscG9pbnRlcjooKT0+cCwKcmVnaXN0ZXI6KCk9PnAsS29mZmlFcnJvcjpjbGFzcyBleHRlbmRzIEVycm9ye319O2V4cG9ydCBkZWZhdWx0IGtvZmZpOw==';
 const KCJS = 'Y29uc3QgcD1uZXcgUHJveHkoZnVuY3Rpb24oKXt9LHtnZXQ6KHQsayk9PihrPT09U3ltYm9sLnRvUHJpbWl0aXZlKT8oKT0+MDooaz09PSd0aGVuJ3x8az09PSdjYXRjaCd8fGs9PT0nZmluYWxseScpP3VuZGVmaW5lZDpwLGFwcGx5OigpPT5wLGNvbnN0cnVjdDooKT0+cH0pO2NvbnN0IGtvZmZpPXtsb2FkOigpPT5wLGRlY29kZTooKT0+MCxlbmNvZGU6KCk9PjAsCnNpemVvZjooKT0+MCxhbGlnbm9mOigpPT4wLGZ1bmN0aW9uOigpPT5wLHN0cnVjdDooKT0+cCx1bmlvbjooKT0+cCxlbnVtOigpPT5wLHR5cGVkZWY6KCk9PnAscG9pbnRlcjooKT0+cCwKcmVnaXN0ZXI6KCk9PnAsS29mZmlFcnJvcjpjbGFzcyBleHRlbmRzIEVycm9ye319O21vZHVsZS5leHBvcnRzPWtvZmZpO21vZHVsZS5leHBvcnRzLmRlZmF1bHQ9a29mZmk7';
@@ -31,17 +32,19 @@ const SHARP_STUB_ESM = 'Y29uc3QgcD1uZXcgUHJveHkoZnVuY3Rpb24oKXt9LHtnZXQ6KHQsayk9
  * 0.1.7 安装树中两者仍在（koffi 经 dsh-win32-process、node-pty 经 subprocess 相关包）。
  * 未命中时打 'not found, skip'，可诊断。 */
 try {
-  const ke = findPkg('koffi', 'index.js');
-  if (ke) { writeFileSync(ke, Buffer.from(KSTUB, 'base64')); log('koffi ESM stub ok: ' + ke); }
-  const kc = findPkg('koffi', 'index.cjs');
-  if (kc) { writeFileSync(kc, Buffer.from(KCJS, 'base64')); log('koffi CJS stub ok: ' + kc); }
-  if (!ke && !kc) log('koffi: not found, skip');
+  /* 全部副本都要顶替：`.pnpm` 里可能残留多个版本的同一包（升级 dsh 后旧 hash
+     目录不会被清理），只改第一个会让「已打补丁」的日志与实际生效版本脱节。 */
+  const keys = findAllPkgPaths('koffi', 'index.js');
+  const kcs = findAllPkgPaths('koffi', 'index.cjs');
+  for (const ke of keys) { writeFileSync(ke, Buffer.from(KSTUB, 'base64')); log('koffi ESM stub ok: ' + ke); }
+  for (const kc of kcs) { writeFileSync(kc, Buffer.from(KCJS, 'base64')); log('koffi CJS stub ok: ' + kc); }
+  if (keys.length + kcs.length === 0) log('koffi: not found, skip');
 } catch (e) { log('WARN koffi: ' + e.message); }
 
 try {
-  const p = findPkg('node-pty', 'lib/index.js');
-  if (p) { writeFileSync(p, Buffer.from(PSTUB, 'base64')); log('node-pty stub ok: ' + p); }
-  else log('node-pty: not found, skip');
+  const ptys = findAllPkgPaths('node-pty', 'lib/index.js');
+  for (const p of ptys) { writeFileSync(p, Buffer.from(PSTUB, 'base64')); log('node-pty stub ok: ' + p); }
+  if (ptys.length === 0) log('node-pty: not found, skip');
 } catch (e) { log('WARN node-pty: ' + e.message); }
 
 /* 已针对 0.1.7-rc.2 核实：**与 dsh 版本无关，无锚点**。
@@ -64,20 +67,21 @@ try {
   const writtenShims = [];
   let n = 0;
   for (const [pkg, rel, req] of targets) {
-    const p = findPkg(pkg, rel);
-    if (!p) continue;
-    const rootDir = p.slice(0, p.length - rel.length - 1);
-    const shimAbs = join(rootDir, 'dist', '_dshshim.cjs');
-    if (!writtenShims.includes(shimAbs)) {
-      writeFileSync(shimAbs, Buffer.from(SHIM_B64, 'base64'));
-      writtenShims.push(shimAbs);
+    /* 同 koffi/node-pty：逐个副本改写，避免只改到 .pnpm 里的旧版本 */
+    for (const p of findAllPkgPaths(pkg, rel)) {
+      const rootDir = p.slice(0, p.length - rel.length - 1);
+      const shimAbs = join(rootDir, 'dist', '_dshshim.cjs');
+      if (!writtenShims.includes(shimAbs)) {
+        writeFileSync(shimAbs, Buffer.from(SHIM_B64, 'base64'));
+        writtenShims.push(shimAbs);
+      }
+      const payload = rel.endsWith('.mjs')
+        ? 'import { createRequire } from "node:module";const require=createRequire(import.meta.url);const s=require(' + JSON.stringify(req) + ');export default s;export const versions=s.versions;export const format=s.format;'
+        : 'module.exports=require(' + JSON.stringify(req) + ');module.exports.default=module.exports;';
+      writeFileSync(p, payload);
+      log('sharp shim ok: ' + p);
+      n++;
     }
-    const payload = rel.endsWith('.mjs')
-      ? 'import { createRequire } from "node:module";const require=createRequire(import.meta.url);const s=require(' + JSON.stringify(req) + ');export default s;export const versions=s.versions;export const format=s.format;'
-      : 'module.exports=require(' + JSON.stringify(req) + ');module.exports.default=module.exports;';
-    writeFileSync(p, payload);
-    log('sharp shim ok: ' + p);
-    n++;
   }
   if (n === 0) log('sharp: not found, skip');
 } catch (e) { log('WARN sharp shim: ' + e.message); }
@@ -161,17 +165,24 @@ try {
     'QWxsb3dlZEludGVybmFsSWQsIGdldEJpbmRpbmdJbmZvIH07Cm1vZHVsZS5leHBvcnRzLmRlZmF1bHQgPSBtb2R1' +
     'bGUuZXhwb3J0czsK';
   const NARB_MARKER = 'dsh-launcher-android-narb-shim-v1';
-  const narb = findPkg('node-addon-require-builtin', 'lib/index.js');
-  if (!narb) {
-    log('WARN node-addon-require-builtin: not found — 0.1.7 boot 将失败（该包是 app-boot 的硬依赖）');
+  /* ⚠ 必须覆盖**每一个副本**：`.pnpm` 会同时留着旧版与新版同名包（升级 dsh 后
+     不复用旧 hash 目录），而 findPkg 只返回第一个（旧版）→ 给旧版打补丁、新版
+     原样保留，dsh 实际加载新版后仍在 boot 期炸「No usable native binding」。
+     真机 0.2.1-rc.2 现场：0.1.6（已打）与 0.1.9（未打）并存，日志却是
+     「already applied」——排查时极具误导性。 */
+  const narbs = findAllPkgPaths('node-addon-require-builtin', 'lib/index.js');
+  if (narbs.length === 0) {
+    log('WARN node-addon-require-builtin: not found — boot 将失败（该包是 app-boot 的硬依赖）');
   } else {
-    const cur = readFileSync(narb, 'utf8');
-    if (cur.includes(NARB_MARKER)) {
-      log('node-addon-require-builtin JS shim already applied');
-    } else {
+    let applied = 0, already = 0;
+    for (const narb of narbs) {
+      const cur = readFileSync(narb, 'utf8');
+      if (cur.includes(NARB_MARKER)) { already++; continue; }
       writeFileSync(narb, Buffer.from(NARB_B64, 'base64'));
       log('node-addon-require-builtin JS shim applied: ' + narb);
+      applied++;
     }
+    log(`node-addon-require-builtin JS shim done: applied=${applied} already=${already} total=${narbs.length}`);
   }
 } catch (e) { log('WARN node-addon-require-builtin shim: ' + e.message); }
 

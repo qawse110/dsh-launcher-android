@@ -274,6 +274,16 @@ Kotlin 展示面与 `install-dsh.mjs` 装配面都从它派生；一致性由 `n
 
 已核实**未漂移**、继续有效的锚点：koffi ABI 断言（`dsh-win32-process`）、`attachment-local` 两点 link 调用、
 `dsh-fs-local` chmod 三处字面量、`flock` 锚点、`dsh-settings` 已删除符号、`--no-open` 参数、前端静态模块种子表。
+
+> ⚠ **`.pnpm` 同名包多副本会让「补丁已打」变成假象**（0.2.1-rc.2 真机事故）：
+> 升级/回滚/修复安装都会在 `.pnpm` 下**新建目录**而不复刻旧目录，同一个包因此并存多个版本
+> （实测最多的安装树里 `node-addon-require-builtin` 有 12 个副本）。补丁若只改写
+> 「第一个命中」的副本，打到的是旧版；dsh 实际加载的新版仍是原生实现 → boot 期
+> `No usable native binding found`，而日志里却是 `JS shim already applied`。
+> 现约定：包定位统一走 `findAllPkgPaths()`（全副本覆盖），且 `DshFlow.stubPatchesPresent()`
+> 会在信任 `stub-applied` marker 前**校验产物是否真的在树上**——安装树被重装时 marker 仍命中，
+> 只靠 marker 会导致整段 stub 被永久跳过。
+
 ## 构建
 
 ```sh

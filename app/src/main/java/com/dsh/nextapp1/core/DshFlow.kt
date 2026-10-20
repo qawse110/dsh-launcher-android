@@ -62,6 +62,12 @@ object DshFlow {
     /** stub 补丁载荷文件名（assets → files 同步；两条启动路径共用）。 */
     private const val STUB_SCRIPT = "stub-dsh.mjs"
 
+    /**
+     * node-addon-require-builtin JS 顶替的 marker（与 native-stubs.mjs 中
+     * NARB_MARKER 必须字面一致）。用于 [stubPatchesPresent] 的产物健康检查。
+     */
+    private const val NARB_SHIM_MARKER = "dsh-launcher-android-narb-shim-v1"
+
     /** 启动前预热 V8 字节码缓存的脚本（见 assets/warmup-modules.mjs 顶部说明）。 */
     private const val WARMUP_SCRIPT = "warmup-modules.mjs"
 
@@ -569,9 +575,16 @@ object DshFlow {
         val apkStamp = AssetSync.apkInstallStamp(ctx)
         val stubFp = AssetSync.fileFingerprint(stubScript)
         val expected = "apk:$apkStamp|dsh:${DshUpdater.currentVersion(ctx)}|fp:$stubFp"
-        if (MarkerStore.get(ctx, "stub-applied") == expected) {
+        val marked = MarkerStore.get(ctx, "stub-applied") == expected
+        if (marked && stubPatchesPresent(dshPrefix)) {
             fl(">> Android 兼容修复已应用（$expected），跳过 stub")
             return
+        }
+        if (marked) {
+            // 标记看起来有效、但补丁产物已不在树上：安装树被重装过（回滚到同版本、
+            // 修复安装、依赖被重新解析都会新建 .pnpm 目录），此时跳过 stub 等于
+            // 让 dsh 带着原生依赖裸跑——真机表现就是「启动卡在等待 web 就绪」。
+            fl(">> 兼容标记命中但补丁不在安装树（node_modules 被重装），重打 stub")
         }
         val exit = exec(
             ctx, "$nodeDir/bin/node ${stubScript.absolutePath}",
@@ -588,6 +601,30 @@ object DshFlow {
             MarkerStore.put(ctx, "stub-applied", expected)
         } else {
             fl("WARN stub-dsh 退出码 $exit（不写 marker，下次重跑）")
+        }
+    }
+
+    /**
+     * stub 补丁的**产物健康检查**（只查 boot 级硬阻断点）。
+     *
+     * 为什么不能只信 marker：marker 的 dsh 版本维度取自「当前安装版本」，而同一个
+     * 版本可以被**重装**（回滚、修复安装、依赖范围重新解析），每次重装都会生成新的
+     * `.pnpm` 目录、把已打补丁的文件换回上游原样。此时 marker 仍然命中，stub 被跳过，
+     * dsh 直接以「Native binding 缺失」在 boot 期失败（0.2.1-rc.2 真机事故）。
+     *
+     * 只校验 node-addon-require-builtin：它是 app-boot 的硬依赖，缺失即 boot 失败；
+     * 其余补丁（koffi/node-pty/sharp）缺失只影响具体功能，不必为它们拖慢每次启动。
+     *
+     * @return true 表示「要么没有该包、要么每个副本都已打上 JS 顶替」。
+     */
+    internal fun stubPatchesPresent(dshPrefix: File): Boolean {
+        val pnpm = File(File(dshPrefix, "node_modules"), ".pnpm")
+        if (!pnpm.isDirectory) return true
+        val dirs = pnpm.listFiles { f -> f.isDirectory && f.name.startsWith("node-addon-require-builtin@") } ?: return true
+        if (dirs.isEmpty()) return true
+        return dirs.all { d ->
+            val entry = File(File(File(d, "node_modules"), "node-addon-require-builtin"), "lib/index.js")
+            entry.isFile && runCatching { entry.readText().contains(NARB_SHIM_MARKER) }.getOrDefault(false)
         }
     }
 
