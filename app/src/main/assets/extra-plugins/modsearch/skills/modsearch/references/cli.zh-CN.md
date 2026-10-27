@@ -60,6 +60,6 @@ macOS 和 Linux 完整支持，CI 在 Node 22 和 24 上跑全量测试。skill 
 
 CI 矩阵同样包含 `windows-latest` 的 Node 22 和 24，跑同一套 typecheck、测试、构建关卡。各部分在 Windows 上的可用性取决于它依赖什么：
 
-- **CLI 本体、路由与配置逻辑、HTTP 引擎**（`local` 抓取、Tavily、Exa、Firecrawl）是纯 Node：只用 `fetch` 和文件系统，天然跨平台。
+- **CLI 本体、路由与配置逻辑、HTTP 引擎**（`local` 抓取、Tavily、Exa、Firecrawl、Keenable）是纯 Node：只用 `fetch` 和文件系统，天然跨平台。
 - **agy 和 grok 是外部 CLI。** modsearch 不经 shell 按名字直接运行它们，所以 PATH 上的原生 Windows 可执行文件可用，npm 风格的 `.cmd` 垫片不可用。有没有 Windows 构建是每个工具自己的决定，不是 modsearch 的。每个直接子进程都会带 `windowsHide: true` 启动，因此没有控制台的 GUI 宿主不会在每次调用时闪出黑框。
 - **冷却状态文件**通过临时文件加原子重命名写入。Windows 上这个重命名能替换目标，但替换不了被其他进程占用的文件，所以极少数的同时写入竞争可能丢掉一次写。这个存储是读取时合并的尽力缓存，丢掉的内容后续运行会重新发现。

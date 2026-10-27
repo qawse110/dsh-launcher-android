@@ -1,7 +1,9 @@
 import { createServer } from 'node:http';
 import { spawn, execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { getRandomValues, randomUUID, randomBytes } from 'node:crypto';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { CLIENT_ID, REDIRECT_PATH, credentialFromTokenResponse, exchangeAuthorizationCode, generateDpopKeyPair, generatePkcePair, } from './oauth.js';
 export const CODEARTS_LOGIN_BASE = 'https://devcloud.cn-north-4.huaweicloud.com/doer/redirect';
 export const HUAWEI_AUTH_BASE = 'https://auth.huaweicloud.com/authui/login.html';
@@ -172,7 +174,7 @@ const CORS_HEADERS = {
  *
  * @returns 可执行文件路径；读不到时 `undefined`（调用方回退到 `openBrowser`）。
  */
-function defaultBrowserExecutable() {
+export function defaultBrowserExecutable() {
     if (process.platform !== 'win32')
         return undefined;
     // ⚠️ 只用 `reg.exe` 而不引第三方依赖：注册表读取是本功能唯一的平台相关调用，
@@ -218,6 +220,93 @@ function defaultBrowserExecutable() {
         catch { /* 试下一个位置 */ }
     }
     return undefined;
+}
+/**
+ * 为一次「换账号登录」准备**独立的浏览器 profile 目录**
+ * （Gitee issue IKM741 修法，2026-10-16 真机三次对照实测）。
+ *
+ * ## 为什么必须按窗口独立（而不是复用默认 profile）
+ *
+ * 见 {@link openIncognitoWindow} 里那张三格对照表：`--incognito` 的 cookie jar
+ * 是**按浏览器进程**共享的，故**只有**「独立 `--user-data-dir`」能让第二个窗口
+ * 真正拿到自己的会话。默认 profile 下两个窗口共享 jar ⇒ 第二个号登不进去。
+ *
+ * ## 生命周期与清理（⚠️ 这里有一条**刻意保守**的取舍）
+ *
+ * - 目录名带**随机后缀** ⇒ 两次开窗必然不同（同名会被浏览器复用同一个 jar，
+ *   那就等于没修）。
+ * - ⚠️⚠️ **只清理「够旧」的遗留目录**（超过 {@link STALE_PROFILE_MAX_AGE_MS}），
+ *   **不是**「所有其他同前缀目录」。理由：上一轮我第一版写的是后者，那会在
+ *   **第一个窗口仍开着**时去删它正在使用的 profile —— Windows 上被占用的文件
+ *   删不掉（会被 catch 吞掉），但**部分未占用的文件可能被删成功** ⇒ 那个
+ *   正在登录的窗口的 profile 被撕裂。那是我自己引入的、比原缺陷更糟的风险。
+ * - 用 6 小时这个阈值是**启发式而非证明**（如实登记）：一次换账号登录在几分钟内
+ *   结束，6 小时前的目录不可能还有窗口在用它。**代价**：若用户在同一天内连续
+ *   登很多账号，这些目录会保留到 6 小时后才被下次开窗顺手清掉
+ *（每个 Chromium profile 目录几 MB 级，不清理会缓慢增长，故需要这个闸门）。
+ * - ⚠️ **绝不删本次刚建的那个**：浏览器此刻正在用它。
+ */
+function prepareIncognitoProfileDir(nowMs = Date.now()) {
+    const prefix = INCOGNITO_PROFILE_PREFIX;
+    const dir = join(tmpdir(), `${prefix}${randomBytes(8).toString('hex')}`);
+    // 清「够旧」的遗留：同前缀、不是本次这个、且 mtime 超过阈值。
+    // ⚠️ 清理是**尽力而为**（失败一律忽略），绝不该阻断登录。
+    try {
+        for (const entry of readdirSync(tmpdir())) {
+            if (!entry.startsWith(prefix))
+                continue;
+            const stale = join(tmpdir(), entry);
+            if (stale === dir)
+                continue;
+            try {
+                const age = nowMs - statSync(stale).mtimeMs;
+                if (age <= STALE_PROFILE_MAX_AGE_MS)
+                    continue;
+                rmSync(stale, { recursive: true, force: true });
+            }
+            catch { /* 正被某个窗口使用 ⇒ 留给下次（这正是阈值要保护的情形） */ }
+        }
+    }
+    catch { /* 读不到 tmp 目录 ⇒ 跳过清理 */ }
+    try {
+        mkdirSync(dir, { recursive: true });
+    }
+    catch { /* 建不出来也照常传参：浏览器会自己尝试创建 */ }
+    return dir;
+}
+/** 独立 profile 目录的前缀（清理时按它筛；同前缀才可能是我们留下的）。 */
+const INCOGNITO_PROFILE_PREFIX = 'dsh-officeace-login-';
+/**
+ * 遗留 profile 目录的保留时长（6 小时）。
+ *
+ * ⚠️ 这是**启发式**：它的作用是「保证不删可能正在被窗口使用的目录」，
+ * 而不是「精确判断谁在用」。取值远大于任何一次登录交互（分钟级）。
+ */
+const STALE_PROFILE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+/**
+ * 构造**无痕窗口**的浏览器命令行参数 —— 抽成**纯函数**以便确定性地单测
+ * （Gitee issue IKM741 修法）。
+ *
+ * ⚠️ 抽出来的理由与 `officeacePendingTtlMs` 同源：`openIncognitoWindow` **会真的
+ * `spawn` 浏览器**，故它本身在单测里被 `NODE_ENV === 'test'` 断路器挡住 ⇒
+ * 「参数到底传对了没有」这一格**在单测里不可达**。把参数构造抽成纯函数后，
+ * 这一格可以在零副作用下被逐项断言（本仓库既有范式：`raccoonDefaultEffort`）。
+ *
+ * @param exe - 浏览器可执行文件（只看是否 Firefox 决定分支）。
+ * @param url - 授权页 URL。
+ * @param profileDir - **本次专用的**独立 profile 目录（须每次不同）。
+ */
+export function incognitoWindowArgs(exe, url, profileDir) {
+    // ⚠️ Firefox 用 `-private-window` 且**不认** `--user-data-dir`（它用 `-profile`），
+    //    故**刻意不给它加**该参数（加了会被当成未知参数）。
+    //
+    // ⚠️⚠️ **如实登记一处未修的缺口**：Firefox 的 `-private-window` 之间同样会
+    //    **共享**私有浏览会话 ⇒ Firefox 上「连续新建两个账号」仍会复用同一个号。
+    //    本机**没有 Firefox**，无法实测 `-profile <新目录>` 能否真正隔离 ——
+    //    按仓库铁律「拿不到阈值就不定值」，故**不凭猜测**改它。
+    if (/firefox\.exe$/i.test(exe))
+        return ['-private-window', url];
+    return [`--user-data-dir=${profileDir}`, '--incognito', '--new-window', url];
 }
 /**
  * 用**无痕窗口**打开 URL（华为云 OAuth 换账号登录用）。
@@ -282,11 +371,43 @@ export function openIncognitoWindow(url) {
     // 窗口形态交给浏览器（有地址栏，但功能完全正确）。
     //
     // ⚠️ 无痕开关是 Chromium 家族的通用参数（Chrome / Edge / 360 / Brave /
-    //    Vivaldi 等）。Firefox 用 `-private-window` 且不认它，故走下面的分支。
-    const isFirefox = /firefox\.exe$/i.test(exe);
-    const args = isFirefox
-        ? ['-private-window', url]
-        : ['--incognito', '--new-window', url];
+    //    Vivaldi 等）。Firefox 用 `-private-window` 且不认它 —— **分支判定在
+    //    `incognitoWindowArgs` 里**（那是纯函数，可被单测逐项断言；
+    //    本函数因会真开窗而在单测里被断路器挡住）。
+    //
+    // ⚠️⚠️ **每次开窗都必须给一个独立的 `--user-data-dir`**（Gitee issue IKM741
+    //    真机实测，2026-10-16）。
+    //
+    // 为什么单靠 `--incognito` **不够**（本轮实证）：原实现只传 `--incognito`，
+    // 注释里写「无痕窗口 = 全新 cookie jar」。那句话对**第一个**窗口成立，对
+    // **第二个**不成立 —— Chromium 的 `--incognito` 是**按浏览器进程**共享一个
+    // 临时 cookie jar，**不是每窗口一个**。第一个窗口还开着时，第二个
+    // `--incognito` 只是**加入同一个 jar**。
+    //
+    // 真机三次测量的对照（本地 HTTP 服务器按「是否已带 `jar` cookie」决定要不要
+    // 重种，故回报里的 cookie 值直接暴露 jar 是否共享）：
+    //   场景 A：`--incognito` ×2（同一 profile）      ⇒ A43993 / **A43993** ❌ 共享
+    //   场景 B：独立 profile ×2（**无** incognito）    ⇒ C85845 / D85845    ✅ 隔离
+    //   场景 C：**独立 profile + `--incognito`** ×2    ⇒ E88407 / F88407    ✅ 隔离
+    // ⚠️ B 与 C 都测是**刻意的**（本仓库纪律：对照矩阵必须检查每个变量是否真的
+    //    独立）—— 只测 B 会让 `--incognito` 这个变量没被验证，而修法恰恰要带上它。
+    //
+    // 端到端后果（真实账号登录，同一次 e2e 运行）：
+    //   第一个号耗时 83 秒 → 登录框出现了，用户真的操作了
+    //   第二个号耗时  4 秒 → 人类不可能这么快 ⇒ 授权页**直接放行**
+    //   两者云侧 `accountId` **完全相同** ⇒ 两次登的是**同一个华为号**
+    //
+    //    ⇒ 「华为 authui 静默复用会话」这条**根因判断是对的**，但初版修法
+    //    **只挡住了一半**：它防住了「复用用户**日常浏览器**的会话」，没防住
+    //    「复用**我们上一个无痕窗口**的会话」。用户报障「新建账号那个链接就自动
+    //    用之前登录的账号授权了」的**后半句**（连续新建两个号）正是这一格。
+    //
+    // 目录的生命周期：用**独立的临时目录**而不是复用浏览器默认 profile
+    //（复用默认 profile 就等于**没有**隔离，那正是缺陷）；目录名带随机后缀
+    // ⇒ 两次开窗必然不同；启动时只清**够旧**的遗留目录（见
+    // `prepareIncognitoProfileDir` 的保留时长取舍）。
+    const profileDir = prepareIncognitoProfileDir();
+    const args = incognitoWindowArgs(exe, url, profileDir);
     try {
         const child = spawn(exe, args, { detached: true, stdio: 'ignore' });
         // ⚠️ 必须挂 'error' 监听器 + unref：理由见 `openBrowser` 的长注释

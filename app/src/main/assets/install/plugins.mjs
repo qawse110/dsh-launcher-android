@@ -71,6 +71,36 @@ function pkgVersion(dir) {
   try { return JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')).version || ''; } catch { return ''; }
 }
 
+/**
+ * 解析版本串里的数字段（不降级守卫用）。
+ *
+ * 本仓实际版本串不是规范 semver：0.9.0-stable / 0.8.4-stable / 0.2.1-rc.2 /
+ * 0.1.208 / 5.10.10 / 3.2.1。所以只取**首个数字点分段序列**做逐段**数值**比较——
+ * 字符串比较会把 5.10.10 判成小于 5.10.6；预发布后缀（-stable / -rc.N）一律忽略，
+ * 后缀只决定同核心版本内的先后，不影响「谁明显更新」这个本守卫关心的问题。
+ * 取不到数字段（缺失/损坏/自由文本）返回 null。
+ */
+function parseVersionNum(v) {
+  if (typeof v !== 'string') return null;
+  const m = v.match(/(\d+(?:\.\d+)*)/);
+  if (!m) return null;
+  return m[1].split('.').map((n) => Number(n));
+}
+
+/** 版本比较：a 明显更新 → 1，a 更旧 → -1，同核心版本 → 0，任一侧无法解析 → null。 */
+function compareVersion(a, b) {
+  const A = parseVersionNum(a);
+  const B = parseVersionNum(b);
+  if (!A || !B) return null;
+  const n = Math.max(A.length, B.length);
+  for (let i = 0; i < n; i++) {
+    const x = A[i] || 0;
+    const y = B[i] || 0;
+    if (x !== y) return x > y ? 1 : -1;
+  }
+  return 0;
+}
+
 function profileDeps() {
   try {
     const pkg = JSON.parse(readFileSync(join(FILES_DIR, '.dsh/profiles', DSH_PROFILE, 'package.json'), 'utf8'));
@@ -178,10 +208,41 @@ function syncExtraPlugin(dir, dest) {
   const src = join(EXTRA_PLUGINS_SRC, dir);
   if (!existsSync(join(src, 'package.json'))) return false;
   const srcVer = pkgVersion(src);
+  const dstVer = pkgVersion(dest);
+  const destExists = existsSync(join(dest, 'package.json'));
+
+  /* ── 不降级守卫 ─────────────────────────────────────────────────────────
+   * 真机事故（2026-10-28 flow.log 06:56 段）：设备装的 APK 里 assets/extra-plugins
+   * 是旧版（工作区的插件更新从未提交，origin/next 停在 ca9e1f9）；AssetSync 因
+   * 目标指纹判据变动把 APK 资产重拷到 files/extra-plugins/，本函数随后无条件
+   * rm+cp，于是 files/plugins（profile link 指向、dsh 真正加载的副本）被**静默降级**：
+   *   billion-context 0.1.208 -> 0.1.198、dsh-ego-browser 0.9.4 -> 0.8.6、
+   *   modsearch 5.10.10 -> 5.10.6。
+   * APK 资产只在**升级 APK**时才变新，正常路径下不会比已同步的副本旧；一旦更旧，
+   * 说明这条供给链不可信（旧 APK / 误判的重拷），宁可不覆盖。
+   * 显式回滚：环境变量 DSH_PLUGIN_ALLOW_DOWNGRADE=1 恢复旧的无条件覆盖行为。
+   *
+   * 判据放在 marker 快路径**之前**：降级检查必须每次都可复算，不能被上一轮写下的
+   * marker 短路掉。同版本但内容变化不受影响（compareVersion === 0 → 照常往下走
+   * marker+dirFingerprint 判据覆盖）。
+   *
+   * 跳过时**刻意不写 marker**：marker 的语义是「dest 内容 == 该资产签名」。跳过意味着
+   * dest 内容与资产内容不同，把资产签名记成「已同步」既是假账，又会让守卫从第二次
+   * 启动起彻底静默（只剩首轮一行日志）；保留原 marker，资产追平后自动恢复同步。
+   * ────────────────────────────────────────────────────────────────────── */
+  if (destExists && process.env.DSH_PLUGIN_ALLOW_DOWNGRADE !== '1') {
+    const order = compareVersion(dstVer, srcVer);
+    if (order === null) {
+      log(`WARN extra plugin ${dir}: 版本无法解析 (dest=${JSON.stringify(dstVer)} asset=${JSON.stringify(srcVer)})，按旧行为覆盖`);
+    } else if (order > 0) {
+      log(`extra plugin ${dir} skip downgrade: keep ${dstVer} (> asset ${srcVer})`);
+      return false;
+    }
+  }
+
   const sig = srcVer + '@apk:' + (DSH_APK_VER || '0') + '/' + dirFingerprint(src);
   const markers = readSyncMarker();
-  if (markers[dir] === sig && existsSync(join(dest, 'package.json'))) return false;
-  const dstVer = pkgVersion(dest);
+  if (markers[dir] === sig && destExists) return false;
   try {
     rmSync(dest, { recursive: true, force: true });
     cpSync(src, dest, { recursive: true, force: true });

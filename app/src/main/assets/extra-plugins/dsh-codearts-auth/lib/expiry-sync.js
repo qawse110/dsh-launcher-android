@@ -21,6 +21,46 @@ export function shouldRefreshNow(expiresAtMs, nowMs = Date.now()) {
     return expiresAtMs - nowMs <= REFRESH_LEAD_MS;
 }
 /**
+ * 本轮是否需要为该凭据发一次续期请求：**access 与 refresh 两条腿取或**。
+ *
+ * ⚠️ 这是 {@link shouldRefreshNow} 的**带 refresh 寿命腿**版本，只有 CodeArts
+ * 走它（其余八家不提供 `refreshExpiresAtOf`，行为与旧版逐字节相同）。
+ *
+ * ## 为什么必须取「或」而不是「与」
+ *
+ * 取「与」（两条腿都满足才续）会**制造**一个新缺陷：refresh 剩 3 天、access
+ * 剩 2 小时（正常态）时反而**不续**，access 一过期账号就报废 —— 而此刻 refresh
+ * 明明还好好活着。取「或」的语义才是对的：**任一条腿进入告警区间就续期**，
+ * 两条腿都能因此被拉满。
+ *
+ * ## 为什么 refresh 已过期时也要放行（而不是直接判定失败）
+ *
+ * `refreshExpiresAt < now` 时本函数返回 `true`，让调用方**真去发一次**请求：
+ * 上游可能已经续发过（多端登录会重签 refresh），本地这一份过期不代表云端不接受。
+ * 让真实报文来否决，比凭本地过期时间猜要可靠 —— 且调用方对 `invalid_grant`
+ * 已有终态处理（写 `refreshable: false` 并提示重新登录）。
+ *
+ * ⚠️ 但**读不到**（`undefined` / NaN）时**必须当「不知」而非「已过期」**：
+ * CodeArts 的 refresh 是 JWT，`exp` 明文可读，读不到只可能是旧版 ticket 凭据
+ * （没有 refresh_token），那种情况由 `isCodeArtsRefreshable` 拦下；若在这里
+ * fail-closed 成 `true`，会让所有读不到腿的凭据每 30 分钟被无谓刷一次。
+ */
+export function shouldRefreshNowWithRefreshExpiry(params) {
+    const nowMs = params.nowMs ?? Date.now();
+    // 主腿：access 进入 lead 窗口（含已过期 / 读不到）。
+    if (shouldRefreshNow(params.expiresAtMs, nowMs))
+        return true;
+    // refresh 这条腿：读不到就**放弃这条腿**（fail-open 到「按 access 判」）。
+    const r = params.refreshExpiresAtMs;
+    if (r === undefined || !Number.isFinite(r))
+        return false;
+    // 已过期 → 放行（让真实请求去否决，见上方注释）。
+    if (r <= nowMs)
+        return true;
+    // 剩余不足一个 lead 周期 → 提前续，别等到 access 的窗口才发现来不及。
+    return r - nowMs <= REFRESH_LEAD_MS;
+}
+/**
  * 把凭据的过期信息同步回账号池（UI 读的就是这里）。
  *
  * 三条从 raccoon 既有实现继承下来的硬规矩，改动时必须保持：
@@ -81,7 +121,10 @@ export async function syncAccountExpiry(params) {
 export async function refreshAccountWithReconcile(params) {
     const { pool, provider, tag, accountId, credential, accessors, current, refresh, save } = params;
     const expiresAt = accessors.expiresAtOf(credential);
-    if (!shouldRefreshNow(expiresAt)) {
+    if (!shouldRefreshNowWithRefreshExpiry({
+        expiresAtMs: expiresAt,
+        refreshExpiresAtMs: accessors.refreshExpiresAtOf?.(credential),
+    })) {
         // 凭据仍在有效期内：只把池值对账，不发请求。
         await syncAccountExpiry({
             pool,

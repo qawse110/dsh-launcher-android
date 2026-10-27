@@ -55,7 +55,7 @@
  */
 import { ToolCallId } from '@deepseek-ai/dsh-llm';
 import { normalizeHarnessMessages } from './message-shape.js';
-import { createDsmlMarkerNormalizer, fixDsmlMarkers, resolveToolPairing } from './sse.js';
+import { createDsmlMarkerNormalizer, fixDsmlMarkers, hasUsableToolName, resolveToolPairing } from './sse.js';
 /**
  * 构造 Anthropic Messages 请求体。
  *
@@ -245,16 +245,22 @@ export function serializeMinimaxMessages(messages, images) {
                 });
                 continue;
             }
-            if (block.type === 'tool-result') {
+            // ⚠️ 判据必须走**宽松读取**而不是直接 `block.type === 'tool-result'`：
+            // 0.2.0 的 `ContentBlockMap` 已删除 `'tool-result'`（它只是 ≤0.1.6 的
+            // 历史形状），直接比较会让 TS 把该分支收窄成 `never`（TS2367）并连带
+            // 报出 `toolCallId`/`content`/`isError` 不存在。此处读的是
+            // `normalizeHarnessMessages` 降级产出的**宽松块**，故按结构读取。
+            const legacy = block;
+            if (legacy.type === 'tool-result') {
                 // ⚠️ 孤儿结果不下发（服务端同样 400）。
-                if (!keepResultIds.has(String(block.toolCallId)))
+                if (!keepResultIds.has(String(legacy.toolCallId)))
                     continue;
                 pendingToolResults.push({
                     type: 'tool_result',
-                    tool_use_id: block.toolCallId,
+                    tool_use_id: legacy.toolCallId,
                     // ⚠️ 工具结果内的图片也要内联（否则「工具返回截图」的场景会丢图）。
-                    content: serializeToolResultContent(block.content, images),
-                    ...(block.isError === true ? { is_error: true } : {}),
+                    content: serializeToolResultContent(Array.isArray(legacy.content) ? legacy.content : [], images),
+                    ...(legacy.isError === true ? { is_error: true } : {}),
                 });
                 continue;
             }
@@ -432,6 +438,33 @@ export async function* consumeMinimaxSse(options) {
     let stopReason;
     let usage = { inputTokens: 0, outputTokens: 0 };
     let sawAnyChunk = false;
+    /**
+     * 名字不可用、因而**整块丢弃**的 `tool_use` 索引。
+     *
+     * ⚠️ 这些块必须**一个 chunk 都不产出**（连 `block-start` 都不发）——
+     * `BlockAssembler.assemble()` 对**没有 `block-end`** 的 partial 同样会组装出
+     * `name: partial.toolCallName ?? ''`，故只跳过收尾的 `block-end` 是不够的。
+     * 与 `openai-compat.ts` / `zcode-anthropic.ts` 的同款约定（AGENTS.md 的
+     * 「空名 tool_call 会永久报废会话」事故：harness 执行出 `unknown tool ""`、
+     * 坏块持久化进会话，之后切到别的 provider 时被每次重放 → 400 code 11133）。
+     */
+    const droppedToolIndexes = new Set();
+    /**
+     * 是否**真的丢弃过**名字不可用的 `tool_use`。
+     *
+     * ⚠️ 收尾归类需要它，而**不能**读 `droppedToolIndexes.size`：该集合在
+     * `content_block_stop` 处理时会被逐条 `delete`（丢弃的块同样不发 `block-end`），
+     * 到收尾时**恒为空**，判据会恒不命中 ⇒ 修复静默失效。故单独留一个只增不减的
+     * 布尔。
+     *
+     * ⚠️ 为什么**不**直接用「finish 报 `tool_use` 却没发出任何 tool-call 块」当判据：
+     * 那会把「上游报 `tool_use` 但压根没发工具块」这一**与本次缺陷无关**的既有
+     * 情形一起改写（改成 `max-tokens` ⇒ harness 重跑该步）。本次只修「坏块被丢弃」
+     * 这一条因果链，范围越窄越不容易引入新行为。
+     */
+    let droppedAnyTool = false;
+    /** 是否真的**发射过**可执行的 `tool-call` 块（丢弃的不算）。 */
+    let emittedToolCall = false;
     /** DSML 标记归一化器（见 sse.ts）；每个 SSE 消费一个实例。 */
     const dsmlFix = createDsmlMarkerNormalizer();
     /**
@@ -544,8 +577,39 @@ export async function* consumeMinimaxSse(options) {
             else if (kind === 'tool_use') {
                 const id = typeof b.id === 'string' ? b.id : '';
                 const name = typeof b.name === 'string' ? b.name : '';
+                /**
+                 * ⚠️ **名字不可用时一个 chunk 都不产出**（与 `zcode-anthropic.ts` /
+                 * `openai-compat.ts` 同款）：
+                 *
+                 * - 只跳过收尾的 `block-end` 不够 —— `BlockAssembler.assemble()` 对
+                 *   没有 `block-end` 的 partial 照样组装出 `name: ''`；
+                 * - 该空名块会被 harness 执行成 `unknown tool ""` 并**持久化进会话**，
+                 *   之后切到别的 provider（如 workbuddy）时被每次请求原样重放 ⇒
+                 *   **HTTP 400 code 11133**，整条会话报废（AGENTS.md 有完整事故记录）。
+                 *
+                 * 上游虽是 Anthropic 协议、名字本应随 `content_block_start` 一起到，
+                 * 但 qoder 实测过**完全没有 `name` 字段**的畸形 tool-call 帧，故这里
+                 * 不能假定「名字一定到」——`block-end` 处原有的 `?? ''` 回退正是那条
+                 * 污染路径的另一半。
+                 */
+                if (!hasUsableToolName(name)) {
+                    droppedToolIndexes.add(index);
+                    droppedAnyTool = true;
+                    // 仍记 `sawAnyChunk`：上游确实产出了内容（只是不可用），
+                    // 由下面的 finish 归类决定报 `max-tokens` 而非 `EMPTY_RESPONSE`。
+                    sawAnyChunk = true;
+                    return;
+                }
                 blocks.set(index, { type: 'tool-call', text: '', toolId: id, toolName: name, toolArgs: '' });
+                /**
+                 * ⚠️ **必须清掉同 index 的「已丢弃」标记**：畸形上游可能复用 index
+                 *（先发一个无名的 `tool_use`、再用同一 index 发一个合法的）。留着旧标记
+                 * 会让下面 `content_block_stop` 的闸门**吞掉这个合法块的 `block-end`**
+                 * —— 于是「本该正常收尾的调用」被静默地少发一帧。
+                 */
+                droppedToolIndexes.delete(index);
                 sawAnyChunk = true;
+                emittedToolCall = true;
                 yield { type: 'block-start', index, blockType: 'tool-call' };
             }
             return;
@@ -572,12 +636,37 @@ export async function* consumeMinimaxSse(options) {
                 yield { type: 'reasoning-delta', index, text: d.thinking };
             }
             else if (d.type === 'input_json_delta' && typeof d.partial_json === 'string') {
+                // ⚠️ 已丢弃的块**不累积、不发 delta** —— 发了会让 `BlockAssembler`
+                // 为它建出 partial，于是「一个 chunk 都不产出」这条约定被绕过。
+                if (droppedToolIndexes.has(index))
+                    return;
                 if (state !== undefined)
                     state.toolArgs += d.partial_json;
                 yield {
                     type: 'tool-call-delta',
                     index,
                     id: ToolCallId(state?.toolId ?? ''),
+                    /**
+                     * ⚠️ 名字必须**随每一片**下发（PR #93 的修复）。
+                     *
+                     * 下游 OpenAI 网关（`openai-gateway/stream.ts` 的 `consumeChunk`）
+                     * 里 `tool.name` **只**从本 chunk 的 `name` 填，而 `block-start` /
+                     * `block-end` 在网关侧直接 `return undefined`（不消费）⇒
+                     * `tool-call-delta` 是 `function.name` 的**唯一来源**。漏发即
+                     * `delta.tool_calls[0].function` 缺 `name`，标准客户端（openai-node
+                     * 的 zod 校验 / Codex / Cursor）抛
+                     * `Expected 'function.name' to be a string`。
+                     *
+                     * 重复下发是**安全**的：openai-node 对 `function.name` 是**覆盖**
+                     *（`if (functionName) functionSnapshot.name = functionName`），
+                     * 不像 `arguments` 那样拼接；本仓库其余八个适配器（openai-compat /
+                     * buddy / lobsterai / trae / llm-adapter / gemini）本来就每片都发 name。
+                     *
+                     * ⚠️ 名字为空时**省略该键**、不写空串：空串会让消费侧解析出空名工具
+                     *（见本文件 `content_block_start` 的丢弃分支与 `sse.ts` 的
+                     * `hasUsableToolName`）。此处 `state` 非 undefined 即已通过该闸门。
+                     */
+                    ...state?.toolName !== undefined && state.toolName.length > 0 ? { name: state.toolName } : {},
                     argumentsDelta: d.partial_json,
                 };
             }
@@ -588,6 +677,19 @@ export async function* consumeMinimaxSse(options) {
         if (type === 'content_block_stop') {
             const index = nonNegativeInt(frame.index) ?? 0;
             const state = blocks.get(index);
+            /**
+             * ⚠️ 被丢弃的空名 `tool_use`：**不发 `block-end`**。
+             *
+             * 判据用 `state === undefined`（**不**只看 `droppedToolIndexes`）：
+             * 丢弃时我们**故意不往 `blocks` 里写**，故「标记在、且没有 state」两者
+             * 同时成立才是「这个 index 的收尾不该发」。若只判标记，畸形上游复用
+             * 同一 index 时会把合法块的收尾一起吞掉（`content_block_start` 那边
+             * 已经 `delete` 过标记，这里是第二道一致性的兜底）。
+             */
+            if (state === undefined && droppedToolIndexes.has(index)) {
+                droppedToolIndexes.delete(index);
+                return;
+            }
             if (state === undefined)
                 return;
             let block;
@@ -604,10 +706,20 @@ export async function* consumeMinimaxSse(options) {
                 block = { type: 'reasoning', text: state.text };
             }
             else {
+                /**
+                 * ⚠️ 这里**不再**回退成 `?? ''`（那正是空名块的另一半来源）。
+                 * 能走到这里说明 `content_block_start` 已通过 `hasUsableToolName`
+                 * 闸门，故名字必然可用；用断言而非回退，避免将来有人放宽入口条件时
+                 * 又悄悄产出空名块（与 `openai-compat.ts` 同款注释）。
+                 */
+                if (!hasUsableToolName(state.toolName)) {
+                    blocks.delete(index);
+                    return;
+                }
                 block = {
                     type: 'tool-call',
                     id: ToolCallId(state.toolId ?? ''),
-                    name: state.toolName ?? '',
+                    name: state.toolName,
                     arguments: state.toolArgs,
                 };
             }
@@ -673,6 +785,25 @@ export async function* consumeMinimaxSse(options) {
         throw new Error(`minimax: 模型未返回任何内容块${sample === '' ? '' : `（响应原文：${sample.slice(0, 500)}）`}`);
     }
     yield { type: 'usage', usage };
-    yield { type: 'finish', reason: mapMinimaxStopReason(stopReason) };
+    /**
+     * ⚠️ 丢弃过空名 `tool_use` 时**不得**报 `tool-calls`。
+     *
+     * 与 `openai-compat.ts` 的同款口径（`droppedUnnamedCalls && toolOrder.length === 0`
+     * ⇒ `max-tokens`）：上游报 `tool_use`、harness 却收到「finish=tool-calls 但一个
+     * tool-call 块都没有」是自相矛盾的状态 —— harness 会等一个永远不存在的工具调用，
+     * 表现为又一次「没有任何报错就停住」。报 `max-tokens`（不完整、**可重试**）
+     * 让 harness 重跑该步，才是与「坏块已丢弃」自洽的结局。
+     *
+     * ⚠️ **只在真的一个可执行工具调用都没发出时**才改写：若同一步里另有合法调用
+     *（实测线上形态就是「一个无名 + 一个合法」），照常报 `tool-calls`，不能因坏块
+     * 作废好块。
+     */
+    const mapped = mapMinimaxStopReason(stopReason);
+    yield {
+        type: 'finish',
+        reason: mapped.kind === 'tool-calls' && droppedAnyTool && !emittedToolCall
+            ? { kind: 'max-tokens' }
+            : mapped,
+    };
 }
 //# sourceMappingURL=minimax-messages.js.map

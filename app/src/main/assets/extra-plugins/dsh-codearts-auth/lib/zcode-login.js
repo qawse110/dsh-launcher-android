@@ -125,7 +125,7 @@ export async function startZcodeLogin(fetchImpl = fetch, options = {}) {
                 'User-Agent': `ZCode/${appVersion}`,
                 'HTTP-Referer': ZCODE_ORIGIN,
                 'X-ZCode-App-Version': appVersion,
-                'X-Platform': 'win32',
+                'X-Platform': 'win32-x64',
             },
             body: JSON.stringify({ provider }),
             signal: AbortSignal.timeout(30_000),

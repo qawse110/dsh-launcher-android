@@ -246,6 +246,9 @@ const QODER_CN_FALLBACK_MODELS = [
     // - `efforts` 取自目录 `thinking_config.enabled.efforts` 的**键**（目录原序）；
     // - `defaultEffort` 取该对象里 `is_default: true` 的键；
     // - `supportsDisable` = 目录存在 `thinking_config.disabled` 分支。
+    // ⚠️ **这些数组为什么不是升序**（`xhigh` 在 `low` 前等）—— 那是**上游原样**，
+    // 本仓库刻意如实镜像、不重排；完整理由与「排序责任在渲染方」见
+    // `QoderFallbackModel.efforts` 的注释（Issue IKLIDV）。**不要**把它当 bug 顺手排序。
     // ⚠️ **`qmodel` / `qmodel_latest` 只有「关闭思考」**：目录里它们的 `enabled`
     // **没有 `efforts` 键**，只有 `disabled` + `enabled.is_default` ——
     // 即官方就只提供「关」这一个选项（用户 2026-09-28 确认：

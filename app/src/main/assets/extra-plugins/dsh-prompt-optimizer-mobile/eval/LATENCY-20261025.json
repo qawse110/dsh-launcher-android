@@ -1,0 +1,180 @@
+{
+  "version": "authorized-latency-20261025",
+  "objective": "Exactly two sequential real optimizer measurements for the exact tank prompt; no worker or judge calls",
+  "provider": "deepseek-official",
+  "model": "deepseek-flash",
+  "reasoningEffort": "max",
+  "englishMode": false,
+  "tier": "heavy",
+  "framing": "hard",
+  "protocolVersion": "3",
+  "promptRevision": "scaffold-directions-1",
+  "promptSource": "file (current user override resolved by buildInterpreterProtocol)",
+  "entryPoints": [
+    "buildInterpreterProtocol",
+    "buildOptimizerUserMessage",
+    "interpretViaLlm",
+    "parseInterpreterOutput",
+    "renderOptimizerPacket"
+  ],
+  "logicalRuns": 2,
+  "totalStreamStarts": 2,
+  "streamCap": 6,
+  "semanticRetries": 0,
+  "transportRetries": 0,
+  "workerCalls": 0,
+  "judgeCalls": 0,
+  "timeUnit": "ms (Date.now; first-delta and stream end/finish offsets are relative to the respective llm.stream start)",
+  "cases": [
+    {
+      "caseNo": 1,
+      "mode": "plain single generation",
+      "streamNo": 1,
+      "startAt": 1792900717785,
+      "startIso": "2026-10-25T03:58:37.785Z",
+      "systemChars": 1968,
+      "userChars": 338,
+      "firstReasoningMs": 740,
+      "firstTextMs": 19234,
+      "finishMs": 25318,
+      "finishAt": 1792900743103,
+      "streamEndMs": 25321,
+      "streamEndAt": 1792900743106,
+      "modelWallMs": 25324,
+      "canonicalWallMs": 25325,
+      "fullHarnessAttemptWallMs": 25529,
+      "reasoningChars": 5643,
+      "outputChars": 1483,
+      "finish": {
+        "kind": "stop"
+      },
+      "usage": {
+        "inputTokens": 464,
+        "outputTokens": 3468,
+        "cacheReadTokens": 896,
+        "cacheWriteTokens": 0,
+        "totalTokens": 4828
+      },
+      "toolCalls": 0,
+      "toolLoopRounds": 0,
+      "parseOk": false,
+      "parseCode": "BAD_OPTIMIZER_SHAPE",
+      "parseReason": "intent.text must describe the current input",
+      "parseDetail": "Model returned intent as a string and relation at top level; canonical schema requires intent:{text,relation}. No repair or independent retry was performed.",
+      "renderOk": false,
+      "packetChars": 0,
+      "counts": null,
+      "evidence": "case1.json",
+      "packetEvidence": null
+    },
+    {
+      "caseNo": 2,
+      "mode": "optional read tools, new empty scratch root only",
+      "streamNo": 2,
+      "startAt": 1792900755373,
+      "startIso": "2026-10-25T03:59:15.373Z",
+      "systemChars": 2012,
+      "userChars": 338,
+      "firstReasoningMs": 758,
+      "firstTextMs": 19350,
+      "finishMs": 24167,
+      "finishAt": 1792900779540,
+      "streamEndMs": 24169,
+      "streamEndAt": 1792900779542,
+      "modelWallMs": 24173,
+      "canonicalWallMs": 24175,
+      "fullHarnessAttemptWallMs": 24357,
+      "reasoningChars": 6487,
+      "outputChars": 1242,
+      "finish": {
+        "kind": "stop"
+      },
+      "usage": {
+        "inputTokens": 1080,
+        "outputTokens": 3487,
+        "cacheReadTokens": 896,
+        "cacheWriteTokens": 0,
+        "totalTokens": 5463
+      },
+      "availableTools": [
+        "read",
+        "glob",
+        "grep",
+        "run"
+      ],
+      "scratchRoot": "C:/Users/33875/.dsh/plugins/dsh-wish-specializer/.po06-tmp/latency-20261025/empty-root-7FyDmb",
+      "scratchEntriesBefore": [],
+      "scratchEntriesAfter": [],
+      "toolCalls": 0,
+      "toolLoopRounds": 1,
+      "toolUsingRounds": 0,
+      "parseOk": true,
+      "renderOk": true,
+      "packetChars": 1451,
+      "counts": {
+        "add": 7,
+        "scaffold": 5,
+        "ask": 3
+      },
+      "evidence": "case2.json",
+      "packetEvidence": "case2-packet.txt"
+    }
+  ],
+  "usageTotal": {
+    "inputTokens": 1544,
+    "outputTokens": 6955,
+    "cacheReadTokens": 1792,
+    "cacheWriteTokens": 0,
+    "totalTokens": 10291
+  },
+  "observedCanonicalWallDifferenceMs": 1150,
+  "limitations": [
+    "n=1 per condition; order fixed plain then tools; provider/network/cache and stochastic response differences are uncontrolled. The observed 1150ms difference is not evidence of a systematic speedup.",
+    "Case2 chose no tools, so this does not measure an executed read-tool round trip or multi-stream loop overhead.",
+    "Case1 completed the provider stream but failed the canonical parser; no valid packet exists for that run.",
+    "SDK usage is recorded exactly as reported, with cached input separate. No reasoning-token/text-token split was reported; outputTokens cannot be treated as visible JSON-only tokens.",
+    "canonicalWallMs spans interpretViaLlm plus canonical parse/render; fullHarnessAttemptWallMs also includes SDK/protocol setup and evidence persistence.",
+    "The measurements preceded the intent-string normalization fix; replayAfter is separate and did not repeat generation. Both requests used no conversation history or capability list, so these are isolated optimizer-model timings rather than a live chat end-to-end latency guarantee."
+  ],
+  "normalizationReplay": {
+    "originalSampleParseFailed": true,
+    "additionalModelCalls": 0,
+    "replayOk": true,
+    "counts": {
+      "add": 9,
+      "scaffold": 7,
+      "ask": 4
+    },
+    "warnings": [
+      "string intent normalized with top-level relation"
+    ],
+    "packetChars": 1686,
+    "fixture": "po06/test/fixtures/flash-tank-string-intent.json"
+  },
+  "liveProtocol": {
+    "before": {
+      "revision": null,
+      "http": 200,
+      "cancelResponse": {
+        "ok": true,
+        "reason": null,
+        "chars": 0,
+        "packet": ""
+      }
+    },
+    "after": {
+      "revision": "single-run-1",
+      "moduleUrl": "file:///C:/Users/33875/.dsh/plugins/dsh-wish-specializer/po06/lib/index.js",
+      "http": 200,
+      "cancelResponse": {
+        "ok": true,
+        "reason": null,
+        "runId": "probe-cancel",
+        "chars": 0,
+        "packet": ""
+      }
+    },
+    "activation": "Native profile reconciliation disposed installed alias, activated physical source URL and watched only po06/lib; app not restarted",
+    "profileBackup": "profiles/desktop/cordis.patch.yml.bak-before-wish-protocol-20261025"
+  }
+}

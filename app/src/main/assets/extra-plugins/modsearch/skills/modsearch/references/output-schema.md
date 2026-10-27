@@ -62,7 +62,7 @@ result fields in beside them:
 | :-- | :-- |
 | `source` | `web` or `x`, the corpus this entry's evidence actually came from |
 | `requestedSource` | `web` or `x`, the corpus that was asked for. Differs from `source` when the run degraded |
-| `engine` | which engine actually answered (`antigravity-cli`, `tavily`, `grok-cli`, `local`), or `null` when the source was unreachable |
+| `engine` | which engine actually answered (`antigravity-cli`, `tavily`, `keenable`, `grok-cli`, `local`), or `null` when the source was unreachable |
 | `model` | the model used, where the engine has one (empty string when it does not) |
 | `status` | `ok`, `degraded`, or `unavailable` (see below) |
 | `warnings` | routing and runtime warnings for this source: a fallback, a degrade caveat, a config typo, the local engine's "no synthesis" and "private network allowed" notices. About how the answer was produced, not the facts in it. Always an array, often empty |
@@ -126,8 +126,8 @@ for:
 
 Engines that meter their usage report it on the attempt that ran, so a caller can
 track what a run cost. Both fields are optional: they appear only on the engine
-that reports them, and never on engines that report neither (agy, tavily, the
-local engine).
+that reports them, and never on engines that report neither (agy, tavily,
+keenable, the local engine).
 
 - `cost`: US dollars, from exa.
 - `credits`: firecrawl credits.

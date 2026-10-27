@@ -54,6 +54,18 @@ export function readBounded(root, path, cap) {
     return { data: buffer.subarray(0, count), actual }
   } finally { closeSync(fd) }
 }
+// Preserve complete observed lines in the bounded head/tail excerpt. Omitted lines are never result evidence.
+export function selectMaterialExcerpt(text,budget,startLine=1) {
+  if(text.length<=budget)return {content:text,ranges:[{startLine,endLine:startLine+Math.max(0,text.split('\n').length-(text.endsWith('\n')?2:1)),selectionComplete:true}]}
+  const room=Math.max(0,budget-120),headLimit=Math.floor(room/2),tailLimit=room-headLimit
+  const firstBreak=text.lastIndexOf('\n',headLimit),lastBreak=text.indexOf('\n',Math.max(0,text.length-tailLimit))
+  if(firstBreak<0 || lastBreak<0 || firstBreak>=lastBreak)return {content:text.slice(0,budget),ranges:[],partialLine:true}
+  const head=text.slice(0,firstBreak+1),tail=text.slice(lastBreak+1)
+  const headCount=head.split('\n').length-1,tailStart=startLine+text.slice(0,lastBreak+1).split('\n').length-1
+  const endLine=startLine+text.split('\n').length-(text.endsWith('\n')?2:1)
+  return {content:head+'[omitted lines '+(startLine+headCount)+'..'+(tailStart-1)+'; read the required range before using it]\n'+tail,
+    ranges:[{startLine,endLine:startLine+headCount-1,selectionComplete:true},{startLine:tailStart,endLine,selectionComplete:true}]}
+}
 function reasonOf(error) {
   if (error?.code === 'ENOENT') return 'file-not-found'
   if (error?.code === 'EACCES' || error?.code === 'EPERM') return 'permission-denied'
@@ -72,7 +84,9 @@ export async function prepareAdvisorMaterials({ args, root, enabled, imageSuppor
     const row = { ...descriptor, evidenceType: descriptor.evidenceType ?? 'other', status: 'unavailable', sent: false, previewAvailable: false }
     if (row.kind === 'file') Object.assign(row, { selectionScope: row.startLine !== undefined || row.endLine !== undefined ? 'line-range' : 'whole-file', selectionComplete: false, wholeFileComplete: false })
     materials.push(row)
-    const fail = reason => { row.reason = reason; limited = true; evidence.push({ id: row.id, path: row.path, purpose: row.purpose, status: row.status, evidenceType: row.evidenceType, selectionScope: row.selectionScope, selectionComplete: row.selectionComplete, wholeFileComplete: row.wholeFileComplete, reason }) }
+    const fail = reason => {
+      evidenceIds.add(row.id);
+ row.reason = reason; limited = true; evidence.push({ id: row.id, path: row.path, purpose: row.purpose, status: row.status, evidenceType: row.evidenceType, selectionScope: row.selectionScope, selectionComplete: row.selectionComplete, wholeFileComplete: row.wholeFileComplete, reason }) }
     if (!enabled || !root) { fail('read-tools-disabled-or-no-cwd'); continue }
     try {
       if (row.kind === 'file') {
@@ -135,8 +149,10 @@ export async function prepareAdvisorMaterials({ args, root, enabled, imageSuppor
   }
   for (const { row, selected, entry, budget } of pending) {
     if (signal?.aborted) throw signal.reason || new Error('cancelled')
-    const body = selected.slice(0, budget)
-    row.selectionComplete = body.length === selected.length
+    const excerpt = selectMaterialExcerpt(selected,budget,row.selectedStartLine)
+    const body = excerpt.content
+    row.observedRanges = excerpt.ranges
+    row.selectionComplete = selected.length <= budget
     row.wholeFileComplete = row.selectionComplete && row.selectedStartLine === 1 && row.selectedEndLine === row.totalLines
     row.status = row.selectionComplete ? 'ready' : 'truncated'
     row.truncated = !row.selectionComplete; row.sent = true
@@ -144,7 +160,7 @@ export async function prepareAdvisorMaterials({ args, root, enabled, imageSuppor
     Object.assign(entry, { status: row.status, chars: row.chars, sentChars: row.sentChars, sha256: row.sha256,
       selectionScope: row.selectionScope, selectionComplete: row.selectionComplete, wholeFileComplete: row.wholeFileComplete,
       totalLines: row.totalLines, selectedStartLine: row.selectedStartLine, selectedEndLine: row.selectedEndLine,
-      selectedChars: row.selectedChars, text: body })
+      selectedChars: row.selectedChars, observedRanges: row.observedRanges, text: body })
     evidenceIds.add(row.id); resultIds.add(row.id)
     limited ||= !row.wholeFileComplete
   }

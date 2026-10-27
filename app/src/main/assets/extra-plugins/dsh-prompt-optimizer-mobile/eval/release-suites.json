@@ -1,16 +1,23 @@
 {
-  "at": "2026-10-09T14:50:31.597Z",
+  "at": "2026-10-25T17:12:28.874Z",
   "summary": {
-    "suites": 93,
-    "passed": 93,
+    "suites": 146,
+    "passed": 146,
     "failed": 0,
-    "passTotal": 1003,
+    "passTotal": 1498,
     "failing": []
   },
   "results": [
     {
       "file": "adaptive-collaboration.test.mjs",
       "pass": 9,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "advisor-claim-evidence.test.mjs",
+      "pass": 26,
       "fail": 0,
       "exit": 0,
       "ok": true
@@ -23,8 +30,50 @@
       "ok": true
     },
     {
+      "file": "advisor-contribution-memory.test.mjs",
+      "pass": 7,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
       "file": "advisor-coverage.test.mjs",
       "pass": 9,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "advisor-delivery-gate.test.mjs",
+      "pass": 8,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "advisor-delivery.test.mjs",
+      "pass": 11,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "advisor-e2e-contract.test.mjs",
+      "pass": 4,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "advisor-entries.test.mjs",
+      "pass": 4,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "advisor-evidence-paths.test.mjs",
+      "pass": 3,
       "fail": 0,
       "exit": 0,
       "ok": true
@@ -44,6 +93,13 @@
       "ok": true
     },
     {
+      "file": "advisor-hard-gate.test.mjs",
+      "pass": 2,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
       "file": "advisor-host-registration.test.mjs",
       "pass": 1,
       "fail": 0,
@@ -51,8 +107,29 @@
       "ok": true
     },
     {
+      "file": "advisor-ledger.test.mjs",
+      "pass": 8,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "advisor-loop-integration.test.mjs",
+      "pass": 16,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
       "file": "advisor-materials.test.mjs",
       "pass": 13,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "advisor-open-issue-30.test.mjs",
+      "pass": 8,
       "fail": 0,
       "exit": 0,
       "ok": true
@@ -72,6 +149,20 @@
       "ok": true
     },
     {
+      "file": "advisor-prompt-gate.test.mjs",
+      "pass": 3,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "advisor-report-recovery.test.mjs",
+      "pass": 4,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
       "file": "advisor-result-contract.test.mjs",
       "pass": 11,
       "fail": 0,
@@ -80,14 +171,21 @@
     },
     {
       "file": "advisor-scopes.test.mjs",
-      "pass": 5,
+      "pass": 9,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "advisor-session.test.mjs",
+      "pass": 6,
       "fail": 0,
       "exit": 0,
       "ok": true
     },
     {
       "file": "advisor-stage-card.test.mjs",
-      "pass": 9,
+      "pass": 11,
       "fail": 0,
       "exit": 0,
       "ok": true
@@ -114,6 +212,27 @@
       "ok": true
     },
     {
+      "file": "advisor-stall.test.mjs",
+      "pass": 7,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "advisor-switch.test.mjs",
+      "pass": 2,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "advisor-wish-style.test.mjs",
+      "pass": 8,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
       "file": "advisor-workflow.test.mjs",
       "pass": 6,
       "fail": 0,
@@ -122,7 +241,7 @@
     },
     {
       "file": "advisor.test.mjs",
-      "pass": 11,
+      "pass": 13,
       "fail": 0,
       "exit": 0,
       "ok": true
@@ -157,7 +276,7 @@
     },
     {
       "file": "bash-diagnostics.test.mjs",
-      "pass": 15,
+      "pass": 16,
       "fail": 0,
       "exit": 0,
       "ok": true
@@ -268,6 +387,13 @@
       "ok": true
     },
     {
+      "file": "client-abi.test.mjs",
+      "pass": 36,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
       "file": "client-advisor-stream.test.mjs",
       "pass": 9,
       "fail": 0,
@@ -275,8 +401,15 @@
       "ok": true
     },
     {
+      "file": "client-auto-wait.test.mjs",
+      "pass": 34,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
       "file": "client-file.test.mjs",
-      "pass": 36,
+      "pass": 37,
       "fail": 0,
       "exit": 0,
       "ok": true
@@ -289,8 +422,22 @@
       "ok": true
     },
     {
+      "file": "client-injection-card.test.mjs",
+      "pass": 12,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
       "file": "client-overlay-z.test.mjs",
       "pass": 9,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "client-settings.test.mjs",
+      "pass": 5,
       "fail": 0,
       "exit": 0,
       "ok": true
@@ -310,6 +457,13 @@
       "ok": true
     },
     {
+      "file": "context-injection-strip.test.mjs",
+      "pass": 4,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
       "file": "control-api.test.mjs",
       "pass": 17,
       "fail": 0,
@@ -324,6 +478,13 @@
       "ok": true
     },
     {
+      "file": "double-enter-skip.test.mjs",
+      "pass": 4,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
       "file": "dump-wire.test.mjs",
       "pass": 10,
       "fail": 0,
@@ -332,7 +493,7 @@
     },
     {
       "file": "english-mode.test.mjs",
-      "pass": 15,
+      "pass": 30,
       "fail": 0,
       "exit": 0,
       "ok": true
@@ -366,6 +527,13 @@
       "ok": true
     },
     {
+      "file": "exit-motion.test.mjs",
+      "pass": 9,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
       "file": "feedback.test.mjs",
       "pass": 24,
       "fail": 0,
@@ -373,22 +541,8 @@
       "ok": true
     },
     {
-      "file": "framing-note.test.mjs",
-      "pass": 9,
-      "fail": 0,
-      "exit": 0,
-      "ok": true
-    },
-    {
-      "file": "framing-voice.test.mjs",
-      "pass": 4,
-      "fail": 0,
-      "exit": 0,
-      "ok": true
-    },
-    {
-      "file": "framing.test.mjs",
-      "pass": 8,
+      "file": "follow-model-effort.test.mjs",
+      "pass": 5,
       "fail": 0,
       "exit": 0,
       "ok": true
@@ -422,6 +576,13 @@
       "ok": true
     },
     {
+      "file": "how-it-works.test.mjs",
+      "pass": 4,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
       "file": "identity.test.mjs",
       "pass": 2,
       "fail": 0,
@@ -430,14 +591,56 @@
     },
     {
       "file": "inference-boost.test.mjs",
-      "pass": 13,
+      "pass": 32,
       "fail": 0,
       "exit": 0,
       "ok": true
     },
     {
-      "file": "inference-ui.test.mjs",
-      "pass": 3,
+      "file": "inference-cancel-session.test.mjs",
+      "pass": 1,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "inference-context.test.mjs",
+      "pass": 7,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "inference-directions.test.mjs",
+      "pass": 47,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "inference-evidence.test.mjs",
+      "pass": 46,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "inference-focus.test.mjs",
+      "pass": 10,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "inference-profile.test.mjs",
+      "pass": 8,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "inject-empty-shell.test.mjs",
+      "pass": 1,
       "fail": 0,
       "exit": 0,
       "ok": true
@@ -451,7 +654,7 @@
     },
     {
       "file": "intercept-timing.test.mjs",
-      "pass": 8,
+      "pass": 11,
       "fail": 0,
       "exit": 0,
       "ok": true
@@ -499,29 +702,78 @@
       "ok": true
     },
     {
+      "file": "open-issues-31-32.test.mjs",
+      "pass": 3,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "optimization-runs.test.mjs",
+      "pass": 9,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "optimizer-intent-normalization.test.mjs",
+      "pass": 2,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
       "file": "optimizer-protocol.test.mjs",
-      "pass": 14,
+      "pass": 15,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "packet-render.test.mjs",
+      "pass": 8,
       "fail": 0,
       "exit": 0,
       "ok": true
     },
     {
       "file": "packet-shape.test.mjs",
-      "pass": 5,
+      "pass": 6,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "pending-decisions.test.mjs",
+      "pass": 6,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "pipeline-shell-drop.test.mjs",
+      "pass": 1,
       "fail": 0,
       "exit": 0,
       "ok": true
     },
     {
       "file": "pipeline.test.mjs",
-      "pass": 23,
+      "pass": 15,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "placeholder-not-content.test.mjs",
+      "pass": 2,
       "fail": 0,
       "exit": 0,
       "ok": true
     },
     {
       "file": "policy.test.mjs",
-      "pass": 7,
+      "pass": 8,
       "fail": 0,
       "exit": 0,
       "ok": true
@@ -536,6 +788,34 @@
     {
       "file": "preflight-e001.test.mjs",
       "pass": 8,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "preset-dismissed-policy.test.mjs",
+      "pass": 2,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "preset-notice.test.mjs",
+      "pass": 3,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "preset-packaging.test.mjs",
+      "pass": 3,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "preset-wish.test.mjs",
+      "pass": 7,
       "fail": 0,
       "exit": 0,
       "ok": true
@@ -562,6 +842,13 @@
       "ok": true
     },
     {
+      "file": "quality-contribution.test.mjs",
+      "pass": 9,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
       "file": "read-session.test.mjs",
       "pass": 6,
       "fail": 0,
@@ -570,7 +857,7 @@
     },
     {
       "file": "read-tools.test.mjs",
-      "pass": 11,
+      "pass": 12,
       "fail": 0,
       "exit": 0,
       "ok": true
@@ -590,8 +877,29 @@
       "ok": true
     },
     {
+      "file": "retired-optimizer-metadata.test.mjs",
+      "pass": 1,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
       "file": "rollout.test.mjs",
       "pass": 11,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "scaffold-directions.test.mjs",
+      "pass": 14,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "segmented-motion.test.mjs",
+      "pass": 5,
       "fail": 0,
       "exit": 0,
       "ok": true
@@ -605,7 +913,7 @@
     },
     {
       "file": "settings.test.mjs",
-      "pass": 17,
+      "pass": 20,
       "fail": 0,
       "exit": 0,
       "ok": true
@@ -618,8 +926,29 @@
       "ok": true
     },
     {
+      "file": "skip-hint.test.mjs",
+      "pass": 4,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
       "file": "slash-review.test.mjs",
       "pass": 5,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "state-for-optimizer.test.mjs",
+      "pass": 2,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "subagent-skip.test.mjs",
+      "pass": 4,
       "fail": 0,
       "exit": 0,
       "ok": true
@@ -632,6 +961,27 @@
       "ok": true
     },
     {
+      "file": "tier-presets-sync.test.mjs",
+      "pass": 2,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "tier-subconcepts.test.mjs",
+      "pass": 5,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "tool-continuation.test.mjs",
+      "pass": 7,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
       "file": "tool-note.test.mjs",
       "pass": 3,
       "fail": 0,
@@ -639,8 +989,22 @@
       "ok": true
     },
     {
+      "file": "turn305-parity.test.mjs",
+      "pass": 0,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "ui-picker.test.mjs",
+      "pass": 5,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
       "file": "verifier-html.test.mjs",
-      "pass": 14,
+      "pass": 3,
       "fail": 0,
       "exit": 0,
       "ok": true
@@ -654,7 +1018,14 @@
     },
     {
       "file": "wire.test.mjs",
-      "pass": 36,
+      "pass": 52,
+      "fail": 0,
+      "exit": 0,
+      "ok": true
+    },
+    {
+      "file": "wish-check.test.mjs",
+      "pass": 4,
       "fail": 0,
       "exit": 0,
       "ok": true

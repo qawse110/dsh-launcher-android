@@ -69,11 +69,26 @@ export function splitStages(command) { return scan(command).parts }
 
 export function chainFinding(command) {
   const parts = splitStages(command)
-  const commands = parts.filter(p => !SEPARATORS.has(p))
-  const risky = [...new Set(parts.filter(p => p === ';' || p === '|' || p === '||'))]
-  if (commands.length < 3 || !risky.length) return ''
-  return '这条链有 ' + commands.length + ' 段，连接符（' + risky.join(' ') + '）存在中间失败被后续状态覆盖的风险；'
-    + 'pipefail、set -e、条件恢复及具体 shell 上下文会影响结果，不能仅凭链结构断言吞错。失败时可分步运行并检查各段状态。'
+  const stages = parts.filter(p => !SEPARATORS.has(p))
+  if (stages.length < 2) return ''
+  // `;`、`&&`、`||` 都不会掩盖状态：返回的就是最后一条**真正执行**的命令的退出码。
+  // 只有管道会把前面各段的状态吞掉（除非显式 pipefail），所以只在有管道时提示。
+  if (!parts.includes('|')) return ''
+  if (/\b(set\s+-o\s+pipefail|set\s+-eo\s+pipefail|pipefail)\b/.test(String(command || ''))) return ''
+  return '这条链用了管道（|）：退出码只反映最后一段，前面各段是否失败看不出来，存在被掩盖的风险；'
+    + '需要逐段状态时拆开运行，或显式 set -o pipefail。不能仅凭链结构断言吞错。'
+}
+
+/** 最后一段是「无匹配即退出码 1」的命令时，退出码 1 是正常结果，不是失败。 */
+const NO_MATCH = /^(?:[A-Za-z0-9_./-]*[\\/])?(grep|rg|ag|diff|cmp)\b/
+export function noMatchFinding(command) {
+  const parts = splitStages(command)
+  if (parts.includes('|')) return ''
+  const stages = parts.filter(p => !SEPARATORS.has(p))
+  const last = String(stages.at(-1) || '').trim()
+  const name = NO_MATCH.exec(last)?.[1]
+  if (!name) return ''
+  return '最后一段是 ' + name + '：退出码 1 通常表示没有匹配/存在差异，属正常结果，不代表命令出错或前面几段被吞。'
 }
 
 const HEAVY = [
@@ -112,6 +127,9 @@ export function usageNote(o) {
   const lines = ['', header(ms, outLen, opt)]
   if (ms >= 60000 && outLen < 400) lines.push('少量可读输出本身不代表失败或纯损失；本次等待较久，可检查退出状态和预期产物后再决定是否扩大运行。')
   if (stdoutDiscarded(opt.command)) lines.push('- 检测到 stdout 重定向到 /dev/null；排障时可保留相关日志。')
+  // 先判「最后一段本来就是 1」的情况，避免把正常结果说成失败。
+  const noMatch = noMatchFinding(opt.command)
+  if (noMatch) lines.push('- ' + noMatch)
   const chain = chainFinding(opt.command)
   if (chain) lines.push('- ' + chain)
   for (const finding of heavyFindings(opt.command)) lines.push('- ' + finding)

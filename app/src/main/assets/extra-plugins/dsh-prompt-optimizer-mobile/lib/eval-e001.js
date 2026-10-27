@@ -118,7 +118,9 @@ async function compilePackets({ tasks, llm, llmLib, spec, report, onSpend, outDi
       if (!c.ok || !c.text) throw new Error('Legacy packet empty or audit failed: ' + (c.problems || []).join('; '))
     }
     packets.set(task.id, c.text)
-    writeFileSync(cached, c.text, 'utf8')
+    // ⚠ 落盘失败不影响本轮：v3 重写这一段时把原来的 try/catch 丢掉了（只留下裸 writeFileSync），
+    //   于是缓存目录写不进去就会**整轮抛出**——而缓存只是加速手段。变异锚点也因此失效（2026-10-11 恢复）。
+    try { writeFileSync(cached, c.text, 'utf8') } catch { /* 落盘失败不影响本轮 */ }
     if (!c.text && p.optimizer) writeFileSync(cached + '.empty.json', JSON.stringify({ fp, taskId: task.id, protocolVersion: OPTIMIZER_PROTOCOL_VERSION }), 'utf8')
     report.steps.packets.push({ taskId: task.id, chars: c.text.length, usage, ms: res.ms, fp, ...(p.optimizer ? { protocolVersion: OPTIMIZER_PROTOCOL_VERSION, noAddition: !c.text } : {}) })
   }

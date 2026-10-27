@@ -39,13 +39,60 @@ import Schema from '@deepseek-ai/schemastery';
 import { hasLegacyNamespaceRegistration, readService, settingsOf } from './settings-compat.js';
 /** Jet Hub schema namespace（老契约的 settings 命名空间名）。 */
 export const JET_HUB_NS = 'jet-hub';
-/** 老契约的 schema：必须是 schemastery（`plainSchema` 会调 `toJSON()`）。 */
-const jetHubSchema = Schema.object({
+/** {@link PanelEntry} 的合法取值，也是 RPC 写入侧的校验表（唯一真源）。 */
+export const PANEL_ENTRY_VALUES = ['sidebar', 'settings'];
+/** 缺键 / 脏值 / 老文档迁移时的默认入口。 */
+export const DEFAULT_PANEL_ENTRY = 'sidebar';
+/**
+ * 持久化文档的 schema（两种后端共用）。
+ *
+ * ⚠️ 必须是 schemastery（`plainSchema` 会调它的 `toJSON()`）。
+ *
+ * ⚠️ **导出仅供测试**：老契约后端（SettingsStore，**≤0.1.6 的
+ * `settings.register` 契约**）的 `scope.get()` 按「schema defaults →
+ * registrant 的 base → 用户文档」三层解析，也就是**会过一遍本 schema**；
+ * 而单测里那些 `scope.get()` 替身默认不过。`tests/unit/jet-hub-store.spec.ts`
+ * 的「老契约后端」组用本导出复刻真实行为 —— 否则「schema 的 `.default()` 把
+ * 迁移短路」这类缺陷会整组躲过去（2026-10-24 复核 C1 实测如此）。
+ *
+ * ⚠️ 上面的版本限定是必要的：0.1.7 起 `settings` 换成 `SettingsForms`（没有
+ * `register`），本插件在那里走 FileStore，**不经过**本 schema。
+ *
+ * 生产代码不要直接用它做校验，走 sanitize 函数。
+ */
+export const jetHubSchema = Schema.object({
     accounts: Schema.array(Schema.any()).default([]),
     disabledModels: Schema.dict(Schema.any()).default({}),
     loomyPermanentLocked: Schema.boolean().default(false),
     gatewayEnabled: Schema.boolean().default(true),
+    // 「允许局域网访问」：默认关闭（暴露面变大必须是显式选择）。
+    gatewayAllowLan: Schema.boolean().default(false),
+    nativeWebSearchEnabled: Schema.boolean().default(true),
+    // 缺键 = 「仅侧栏」（升级前的默认就是显示那一行；改掉是显式动作）。
+    // ⚠️ 用 `Schema.string()` 而不是 `Schema.union([...])`：schema 只负责类型，
+    // 取值合法性由 `sanitizePanelEntry` 在**读写两侧**统一判（老契约后端不经过
+    // schema，只靠那个函数；两处用同一份判据才不会漂移）。与下面 `minimaxXff` 同款。
+    //
+    // ⚠️⚠️ **绝不能加 `.default()`**（真实缺陷，2026-10-24 复核实测）：
+    //    schemastery 的 `.default()` 会在 `scope.get()` 返回的文档里**填入**默认值，
+    //    于是 `sanitizePanelEntry(value.panelEntry, …)` 第一层（新键合法即返回）
+    //    直接命中，第二层的**老布尔迁移永远不执行** ⇒ 老用户明确关掉的侧栏入口
+    //    在升级后静默变回「仅侧栏」，且此后每次 save() 都把 `'sidebar'` 写进文档，
+    //    原设置**永久丢失**。
+    //    实测（schemastery 3.18.4）：`{ sidebarEntryEnabled: false }` 经 `.default()`
+    //    后 `panelEntry === 'sidebar'`（错误），去掉后经 sanitize 得 `'settings'`（正确）。
+    //    缺键时由 `sanitizePanelEntry` 自己兜底成 `DEFAULT_PANEL_ENTRY`，不需要这里再给。
+    panelEntry: Schema.string(),
     providerOrder: Schema.array(Schema.string()).default([]),
+    // ⚠️ 用 `Schema.string()` 而不是自定义 IP 校验：schema 只负责类型，
+    // 取值合法性由 `sanitizeMinimaxXff` 在**读写两侧**统一判（老契约后端不经过
+    // schema，只靠那个函数；两处用同一份判据才不会漂移）。
+    // 缺键 = 不附 XFF（行为与修复前逐字节一致）。
+    minimaxXff: Schema.string().default(''),
+    // ⚠️ 同 `disabledModels`：用 `Schema.dict(Schema.any())`，取值合法性由
+    // `sanitizeProviderClosed` 在**读写两侧**统一判（老契约后端不经过 schema）。
+    // 缺键 = 没有任何供应商被关闭（与升级前行为一致）。
+    providerClosed: Schema.dict(Schema.any()).default({}),
 });
 /**
  * 归一化「本机 OpenAI 网关」开关。
@@ -61,6 +108,55 @@ export function sanitizeGatewayEnabled(raw) {
     return raw !== false;
 }
 /**
+ * 归一化「允许局域网访问」开关。
+ *
+ * ⚠️ 方向与 {@link sanitizeGatewayEnabled} **刻意相反**：只有显式 `true` 才算
+ * 打开，其余（缺键 / `false` / 字符串 / 对象 / 数组）一律按**关闭**处理。
+ * 理由：它把网关暴露给整个网络，丢失/脏值必须回到「只绑回环」的安全默认——
+ * 反过来（缺键即开启）会让任何一次读取失败都变成**未授权暴露**，而用户对此
+ * 毫无知觉。
+ */
+export function sanitizeGatewayAllowLan(raw) {
+    return raw === true;
+}
+/**
+ * 归一化「渠道原生搜索」总开关。
+ *
+ * 判据与 {@link sanitizeGatewayEnabled} **逐字同构**，理由也同向：
+ * **只有显式 `false` 才算关闭**，其余（缺键 / `true` / 字符串 / 对象 / 数组）
+ * 一律按启用处理。
+ *
+ * ⚠️ 方向不能反。文档缺失、被手工编辑成脏值、或老版本代码整体重写时丢了本键，
+ * 都必须**回到默认启用** —— 反过来（只认 `true`）会让任何一次读取失败都变成
+ * 「原生搜索被静默关闭」，用户根本不知道自己关过它，只会看到搜索突然开始
+ * 要 API Key。
+ */
+export function sanitizeNativeWebSearchEnabled(raw) {
+    return raw !== false;
+}
+/**
+ * 归一化「面板入口」（{@link JetHubState.panelEntry}）。
+ *
+ * 判据两层，顺序不能反：
+ * 1. `raw` 命中 {@link PANEL_ENTRY_VALUES} 就原样返回（新文档 / 合法值优先）；
+ * 2. 否则看老布尔 `legacySidebarEnabled` —— **只有显式 `false`** 才算
+ *    `'settings'`，其余（`undefined` / `true` / 字符串 / 对象 / 数组）一律
+ *    回 {@link DEFAULT_PANEL_ENTRY}。
+ *
+ * ⚠️ 方向不能反。文档缺失、被手工编辑成脏值、或老版本代码整体重写时丢了本键，
+ * 都必须**回到默认「仅侧栏」** —— 反过来会让任何一次读取失败都变成「侧栏入口
+ * 被静默藏起来」，而用户从来没改过它。
+ *
+ * ⚠️ 字符串 `'false'` **不算** `false`：它是脏数据，不是用户意图。这一条与
+ * {@link sanitizeNativeWebSearchEnabled} 的判据同构（那边也是 `raw !== false`）。
+ */
+export function sanitizePanelEntry(raw, legacySidebarEnabled) {
+    if (typeof raw === 'string' && PANEL_ENTRY_VALUES.includes(raw)) {
+        return raw;
+    }
+    return legacySidebarEnabled === false ? 'settings' : DEFAULT_PANEL_ENTRY;
+}
+/**
  * 归一化供应商自定义显示顺序（{@link JetHubState.providerOrder}）。
  *
  * 只保留非空字符串 id 并**去重**（保留首次出现位置）；非数组一律视为
@@ -69,6 +165,106 @@ export function sanitizeGatewayEnabled(raw) {
  * 代码重写文档」场景下的顺序无法保留 —— 展示层对数组中不认识 / 缺失的
  * id 自带稳定兜底，脏条目天然无害。
  */
+/**
+ * 归一化 MiniMax 国际站绕过分流用的 `X-Forwarded-For` 值。
+ *
+ * ## ⚠️ 为什么必须校验，而不是「用户填什么就发什么」
+ *
+ * 这个值会被**原样拼进 HTTP 请求头**。不校验的话，用户（或一份被篡改的
+ * `state.json`）填入 `1.2.3.4\r\nX-Evil: 1` 就能向**上游**注入任意请求头
+ * —— 那是典型的头注入（CRLF injection）。故判据必须**白名单字符集**，
+ * 而不是「挡掉已知坏字符」。
+ *
+ * ## 取值口径
+ *
+ * - **只接受 IP 字面量**：IPv4（`a.b.c.d`，四段 0-255）与 IPv6
+ *  （含 `::` 压缩、`%zone` 允许但**原样保留**——本机链路本地地址确实带它）；
+ * - 主机名、`1.2.3.4, 5.6.7.8`（XFF 链）、前后空白以外的任何字符 ⇒ `undefined`；
+ * - **空串 / 仅空白 ⇒ `undefined`**（语义 = 不附头，与缺键一致）；
+ * - 超长（>128）⇒ `undefined`（最长合法 IPv6 也只有 45 字符）。
+ *
+ * ⚠️ 归一化只做 `trim()`，**不改大小写、不改缩写**：这个值是用户从自己的
+ * 代理/VPN 那里抄来的，改写它只会让「为什么我填对了却不生效」更难查。
+ *
+ * ⚠️ 返回 `undefined` 表示「不附头」。**绝不能**把它变成空串头
+ * （`X-Forwarded-For: `）—— 空值在 Akamai 侧会被当成非法并回退真实 IP，
+ * 行为与不附头相同，但会污染上游日志。
+ */
+export function sanitizeMinimaxXff(raw) {
+    if (typeof raw !== 'string')
+        return undefined;
+    // ⚠️⚠️ **必须在 `trim()` 之前查 CR/LF**（本函数初版就栽在这里）：
+    //    `'1.2.3.4\r'` 被 `trim()` 去掉 `\r` 后变成合法 IPv4 并**通过**校验 ——
+    //    于是「以换行结尾的值」在 store 层被洗干净、看不出问题，而一旦有别的
+    //    写入路径没走本函数，那个 `\r` 就会被拼进请求头（头注入）。
+    //    ⇒ 判据必须是「**原始串里不含控制字符**」，而不是「trim 后形状合法」。
+    if (/[\r\n]/.test(raw))
+        return undefined;
+    const value = raw.trim();
+    if (value.length === 0 || value.length > 128)
+        return undefined;
+    // 白名单字符集：十六进制数字、点、冒号、百分号（IPv6 zone）、连字符。
+    // ⚠️ zone 名（`fe80::1%eth0`）是**字母**组成的，故还要放行 a-z/A-Z；
+    //    但仅当存在 `%` 时才允许字母（纯字母串如 `localhost` 必须被拒）。
+    const hasZone = value.includes('%');
+    const allowed = hasZone ? /^[0-9A-Za-z.:%-]+$/ : /^[0-9A-Fa-f.:]+$/;
+    if (!allowed.test(value))
+        return undefined;
+    // IPv4：四段十进制，每段 0-255。
+    const isIpv4 = (() => {
+        const parts = value.split('.');
+        if (parts.length !== 4)
+            return false;
+        return parts.every((p) => /^\d{1,3}$/.test(p) && Number(p) <= 255);
+    })();
+    if (isIpv4)
+        return value;
+    /**
+     * IPv6：要求**段数合法**（≤ 8 段，且 `::` 压缩最多一次）。
+     *
+     * ⚠️ **初版只做形状校验、不数段数**（2026-10-17 审计指出的真实缺口）：
+     * `1:2:3:4:5:6:7:8:9:10`（10 段）当时被**放行**，而 IPv6 最多 8 段。
+     * 后果不是安全漏洞（它只是个非法字符串），但「只接受 IP 字面量」这条
+     * 契约就名不副实 —— 用户填错也得不到纠正，请求带上一个必然无效的头。
+     *
+     * ⚠️ 判据按「**冒号切分后的组数**」，并显式处理 `::` 压缩：
+     * - 无 `::` ⇒ 必须**恰好 8 组**；
+     * - 有 `::` ⇒ 两侧合计**少于 8 组**（`::` 至少要顶替 1 组）。
+     * 组内允许 1~4 位十六进制。
+     *
+     * ⚠️ 仍**刻意不支持** IPv4-mapped（`::ffff:1.2.3.4`）：本设置用不到，
+     * 少一个分支就少一处判定误差（这一点写进契约，见下）。
+     */
+    if (value.includes(':')) {
+        if (/:::/.test(value))
+            return undefined;
+        if (value.startsWith(':') && !value.startsWith('::'))
+            return undefined;
+        if (value.endsWith(':') && !value.endsWith('::'))
+            return undefined;
+        // zone id 不参与段数计算（`fe80::1%eth0` 的 `%eth0` 是链路作用域，不是一组）。
+        const addressPart = value.split('%')[0] ?? '';
+        if (addressPart.length === 0)
+            return undefined;
+        const hasCompression = addressPart.includes('::');
+        if (hasCompression && addressPart.split('::').length > 2)
+            return undefined;
+        const groups = addressPart.split(':').filter((g) => g.length > 0);
+        // 组内必须是 1~4 位十六进制。
+        if (!groups.every((g) => /^[0-9A-Fa-f]{1,4}$/.test(g)))
+            return undefined;
+        if (hasCompression) {
+            // `::` 至少顶替一组 ⇒ 显式组数必须 < 8。
+            if (groups.length >= 8)
+                return undefined;
+        }
+        else if (groups.length !== 8) {
+            return undefined;
+        }
+        return value;
+    }
+    return undefined;
+}
 export function sanitizeProviderOrder(raw) {
     if (!Array.isArray(raw))
         return [];
@@ -144,6 +340,26 @@ export function sanitizeDisabledModels(raw) {
     return result;
 }
 /**
+ * 把读到的原始值归一化为 {@link ProviderClosedMap}（Gitee issue IKP8OF）。
+ *
+ * 判据照 {@link sanitizeDisabledModels} 的形态：**只把显式 `true` 视为关闭意图**，
+ * 其余（`false` / `1` / `'true'` / `null` / 对象 / 数组）一律忽略。
+ *
+ * ⚠️ 宽松接受 truthy 是**危险方向**：`'false'` 是非空字符串（truthy），
+ * 被当成关闭意图会让该供应商的**全部模型**静默从选择器消失，用户只看到
+ * 「模型全没了」而无从归因。故必须严格 `=== true`。
+ */
+export function sanitizeProviderClosed(raw) {
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw))
+        return {};
+    const result = {};
+    for (const [provider, flag] of Object.entries(raw)) {
+        if (flag === true)
+            result[provider] = true;
+    }
+    return result;
+}
+/**
  * 归一化聚合 provider 的「拒绝轮换」表（见 {@link AggregateRejectionMap}）。
  *
  * 判据（照 {@link sanitizeDisabledModels} 的形态）：
@@ -182,6 +398,143 @@ export function sanitizeAggregateRejections(raw) {
             result[canonicalId] = perProvider;
     }
     return result;
+}
+/**
+ * 归一化聚合「显式允许」白名单。
+ *
+ * 判据与 {@link sanitizeAggregateRejections} **逐格同构**（只认显式 `true`、空层不保留、
+ * 畸形退化空表、`Object.entries` 遍历自有键）—— 两张表口径一致才能让上层用同一套读法。
+ *
+ * ⚠️ 判据**不能宽松接受 truthy**：表里一旦被 `1` / `'true'` 污染，下次读取就有人按 truthy
+ * 判成「允许」= 静默放行一个我们没有余额信息的渠道。
+ */
+export function sanitizeAggregateAllowed(raw) {
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw))
+        return {};
+    const result = {};
+    for (const [canonicalId, byProvider] of Object.entries(raw)) {
+        if (typeof byProvider !== 'object' || byProvider === null || Array.isArray(byProvider))
+            continue;
+        const perProvider = {};
+        for (const [provider, byRealId] of Object.entries(byProvider)) {
+            if (typeof byRealId !== 'object' || byRealId === null || Array.isArray(byRealId))
+                continue;
+            const perRealId = {};
+            for (const [realId, flag] of Object.entries(byRealId)) {
+                if (flag === true)
+                    perRealId[realId] = true;
+            }
+            if (Object.keys(perRealId).length > 0)
+                perProvider[provider] = perRealId;
+        }
+        if (Object.keys(perProvider).length > 0)
+            result[canonicalId] = perProvider;
+    }
+    return result;
+}
+/**
+ * 归一化聚合**手工顺序**表。
+ *
+ * 判据（三条都必须，缺一条就是静默失效）：
+ *
+ * - 元素必须是**字符串且含 NUL 分隔符** —— 否则它在适配器里解析不出 `(provider, realId)`，
+ *   会被静默忽略 ⇒「顺序表看着有内容、实际全不生效」；
+ * - **去重**（保留首次出现）—— 重复元素会让比较器**非确定**（同一候选有两个位次）；
+ * - 空数组 **丢键**（= 未自定义，与 `providerOrder` 同语义）。
+ */
+export function sanitizeAggregateOrder(raw) {
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw))
+        return {};
+    const result = {};
+    for (const [canonicalId, entries] of Object.entries(raw)) {
+        if (!Array.isArray(entries))
+            continue;
+        const seen = new Set();
+        const kept = [];
+        for (const entry of entries) {
+            if (typeof entry !== 'string' || !entry.includes('\u0000'))
+                continue;
+            if (seen.has(entry))
+                continue;
+            seen.add(entry);
+            kept.push(entry);
+        }
+        if (kept.length > 0)
+            result[canonicalId] = kept;
+    }
+    return result;
+}
+/**
+ * 归一化排序模式：**只有字面量 `'manual'`** 认作手工序，其余（含缺键 / 畸形 / 大小写不同）
+ * 一律回落到 `'expiry'` = 升级前行为。
+ */
+export function sanitizeAggregateOrderMode(raw) {
+    return raw === 'manual' ? 'manual' : 'expiry';
+}
+/**
+ * 从拒绝表里移除「该渠道在该虚拟模型下」的**整层**。
+ *
+ * ⚠️⚠️ 这是 **D4 降级语义**的恢复路径，**只留这一份实现**：`AccountPool.setAggregateRejected`
+ * 的 `false` 分支调它（`setAggregateAllowed` **不调** —— 两表各有各的域，见
+ * {@link AggregateAllowedMap} 的说明）。
+ *
+ * ## 为什么是「整渠道层」而不是「只删这一个 realId」
+ *
+ * D4 规定：`(虚拟模型, 渠道)` 下有 `true` 记录、但那些 `realId` **都不在**当前候选中
+ *（id 漂移）⇒ **降级为渠道级拒绝**。而漂移的**旧键会一直留在表里** ⇒ 用户按降级告警的
+ * 指引来面板「重新打开」**当前**候选时，若只删**当前**键，**旧键仍在** ⇒ 降级判据依然成立：
+ *
+ * - 面板用「该 realId 在不在表里」判断显示 ⇒ 显示「参与轮换」；
+ * - 宿主实际**仍拒绝** ⇒ **显示与行为分叉**，告警指引的那条恢复路径**走不通**。
+ *
+ * 用户「重新打开」的意图是「让这个渠道在这个模型下重新参与」，而 D4 本就是**渠道级**语义
+ * ⇒ 唯一自洽的结果就是**整渠道恢复**。
+ *
+ * ⚠️ 调用方**不得**在清层后再把 `perProvider[provider] = perRealId` 挂回去
+ *（初版正是如此：删除被自己覆盖，降级不解除；独立审计用真实池实测证伪）。
+ */
+export function clearRejectionLayer(rejections, canonicalId, provider) {
+    const next = { ...rejections };
+    const perProvider = { ...(next[canonicalId] ?? {}) };
+    delete perProvider[provider];
+    if (Object.keys(perProvider).length === 0)
+        delete next[canonicalId];
+    else
+        next[canonicalId] = perProvider;
+    return next;
+}
+/**
+ * 白名单侧写入（不可变；空层不保留）。
+ *
+ * 唯一调用方是 `AccountPool.setAggregateAllowed(..., true)`。
+ */
+export function withAllowed(allowed, canonicalId, provider, realId) {
+    const next = { ...allowed };
+    const perProvider = { ...(next[canonicalId] ?? {}) };
+    perProvider[provider] = { ...(perProvider[provider] ?? {}), [realId]: true };
+    next[canonicalId] = perProvider;
+    return next;
+}
+/**
+ * 白名单侧**单键**删除（不可变；空层逐级清理）。
+ *
+ * ⚠️ 唯一调用方是 `AccountPool.setAggregateAllowed(..., false)` —— **只删同键**：
+ * 同渠道其它被手工打开的候选必须保留（用户逐条打开的是**候选**，不是渠道）。
+ */
+export function withoutAllowed(allowed, canonicalId, provider, realId) {
+    const perProvider = { ...(allowed[canonicalId] ?? {}) };
+    const perRealId = { ...(perProvider[provider] ?? {}) };
+    delete perRealId[realId];
+    if (Object.keys(perRealId).length === 0)
+        delete perProvider[provider];
+    else
+        perProvider[provider] = perRealId;
+    const next = { ...allowed };
+    if (Object.keys(perProvider).length === 0)
+        delete next[canonicalId];
+    else
+        next[canonicalId] = perProvider;
+    return next;
 }
 /**
  * 归一化账号条目数组。
@@ -270,9 +623,73 @@ export function sanitizeAccounts(raw) {
             // 无有效项时写 `undefined`：`JSON.stringify` 会整个丢弃该键，
             // 故落盘/传输形态与「从未有过标记」完全一致（不留 `{}` 噪音）。
             modelRateLimits: limits,
+            // ⚠️ 四个代理字段统一过闸（2026-10-25 审计 B2-1，见 `PROXY_FIELDS` 的注释）。
+            // 与 `modelRateLimits` 同款：**显式写键名并置于展开之后**，否则
+            // `candidate` 里的脏值会把清理结果整个覆盖回去（本文件第一版正是如此）。
+            ...sanitizeProxyFields(candidate),
         });
     }
     return accounts;
+}
+/**
+ * 四个出口代理字段 —— 备份/状态文件里**唯一**需要「取值校验而非形状校验」的一类。
+ *
+ * ## ⚠️⚠️ 为什么必须在 `sanitizeAccounts` 这一处挡（2026-10-25 审计 B2-1）
+ *
+ * `sanitizeAccounts` 是「外部数据 → 池」的**唯一闸门**（`state.json` 读取与
+ * `backup.import` 都过它），而它原先用 `{ ...candidate }` **原样透传**代理字段 ——
+ * 只限「是不是字符串」、不限「是不是合法代理」。后果链（真跑端点实测）：
+ *
+ * ```
+ * backup.import（载荷 qoderProxy = "ftp://host:21"）→ ok:true、账号落池
+ *   → 此后该账号每次取 fetcher 都抛「代理地址无效 — 不支持的协议 ftp」
+ *   → 该账号【永久不可用】
+ * ```
+ *
+ * ⚠️ 而客户端**有**导入按钮（`jet-hub.js` 的 `backup.import`）⇒ 这条路径
+ * **UI 可达**。池自己的注释也早把备份文件当不可信输入（`qoderProxyFor` 明写
+ * 「池里可能存在 `"qoderProxy": 12345`」），却只防了非字符串。
+ *
+ * ## 为什么修在这里，而不是各 provider 的读取侧
+ *
+ * 四个 provider 的解析器**同形**地在读取侧 `throw`
+ * （`opencode.ts` / `gemini-proxy.ts` / `minimax-proxy.ts` / `qoder-proxy.ts`）。
+ * 改读取侧要四处同改、且很容易只改一家而让三家分叉；修在这个唯一闸门上，
+ * 四个字段同时受益，**四个 provider 的读取侧永远遇不到脏值**。
+ *
+ * ## 处置：清掉该字段（降级直连），不是丢弃整条账号
+ *
+ * 丢账号会让用户「导入后少了几个号」且不知道为什么；清字段只让该账号回到
+ * 「直连」，面板上「当前：直连」一眼可见、可重填。**删一个字段比删一条账号可逆得多。**
+ *
+ * ## ⚠️ 判据为什么只查 scheme（而不是搬 `normalizeProxy` 进来）
+ *
+ * `normalizeProxy` 住在 `opencode.ts`（provider 实现层），而本文件是**底层**
+ * store —— 反向依赖会成环。故这里只做**最小形状闸**：scheme 必须是三家
+ * 支持的之一（`http` / `https` / `socks5`）。它足以挡住「导出/导入往返里混进
+ * 的 `ftp://` / 少 scheme / 垃圾串」这类会**让账号永久不可用**的值，
+ * 而更细的校验（端口范围、authority 形态）留给真正建连接时的 `normalizeProxy`
+ * —— 那时即使失败也只是**一次请求**失败，不再是「账号永久不可用」。
+ */
+const PROXY_FIELDS = ['opencodeProxy', 'geminiProxy', 'minimaxIntlProxy', 'qoderProxy'];
+/** 三家解析器共同支持的 scheme。 */
+const PROXY_SCHEME_RE = /^(?:https?|socks5):\/\/\S+$/i;
+/**
+ * 清掉四个代理字段里的**非法值**（返回的键值对会覆盖 `...candidate` 的脏值）。
+ *
+ * ⚠️ 用 `undefined` 而不是 `delete`：本函数返回的是**展开进新对象**的键值对，
+ * `undefined` 让 `JSON.stringify` 整个丢弃该键（与 `modelRateLimits` 同款口径）。
+ */
+function sanitizeProxyFields(candidate) {
+    const out = {};
+    for (const field of PROXY_FIELDS) {
+        const raw = candidate[field];
+        if (raw === undefined)
+            continue;
+        const text = typeof raw === 'string' ? raw.trim() : '';
+        out[field] = PROXY_SCHEME_RE.test(text) ? text : undefined;
+    }
+    return out;
 }
 /**
  * 判定一个「限流解禁时刻」是否为**可用的毫秒时间戳**。
@@ -372,12 +789,26 @@ class SettingsStore {
             disabledModels: sanitizeDisabledModels(value.disabledModels),
             // 老文档没这个键 → 空表（没有任何拒绝），与升级前行为一致。
             aggregateRejections: sanitizeAggregateRejections(value.aggregateRejections),
+            // 老文档没这三个键 → 空白名单 / 空顺序表 / 临期序，与升级前行为一致（未接入渠道仍不参与）。
+            aggregateAllowed: sanitizeAggregateAllowed(value.aggregateAllowed),
+            aggregateOrder: sanitizeAggregateOrder(value.aggregateOrder),
+            aggregateOrderMode: sanitizeAggregateOrderMode(value.aggregateOrderMode),
             // 只是**镜像**（权威表在 permanent-locks.json）；老文档没这个键 → false。
             loomyPermanentLocked: value.loomyPermanentLocked === true,
             // 老文档没这个键 → 启用，与升级前行为一致。
             gatewayEnabled: sanitizeGatewayEnabled(value.gatewayEnabled),
+            // 老文档没这个键 → 关闭（安全默认：暴露面变大必须是显式选择）。
+            gatewayAllowLan: sanitizeGatewayAllowLan(value.gatewayAllowLan),
+            // 老文档没这个键 → 启用（原生搜索本就是新功能，默认开启才符合「装上就能用」）。
+            nativeWebSearchEnabled: sanitizeNativeWebSearchEnabled(value.nativeWebSearchEnabled),
+            // 老文档没新键 → 按老布尔迁移（只有明确 false 才是「仅设置页」）；两者都没有 → 仅侧栏。
+            panelEntry: sanitizePanelEntry(value.panelEntry, value.sidebarEntryEnabled),
             // 老文档没这个键 → 空数组（未自定义），展示侧按声明顺序渲染。
             providerOrder: sanitizeProviderOrder(value.providerOrder),
+            // 老文档没这个键 ⇒ `undefined` ⇒ 不附 XFF（与修复前行为逐字节一致）。
+            minimaxXff: sanitizeMinimaxXff(value.minimaxXff),
+            // 老文档没这个键 → 空表（没有任何供应商被关闭），与升级前行为一致。
+            providerClosed: sanitizeProviderClosed(value.providerClosed),
         };
     }
     async save(state) {
@@ -394,13 +825,51 @@ class SettingsStore {
             //    ⚠️ 与下面三个「接受丢失」的键**不同**：那三个丢失后果**可逆且用户可见**
             //    （网关回默认、顺序回声明序），而拒绝表丢失是**静默误路由**。
             aggregateRejections: state.aggregateRejections ?? {},
+            // ⚠️⚠️ **三个新键同样必须带上**（与拒绝表逐条同因）：
+            //    `replace` 是**整体替换**语义 ⇒ 漏键 = 永不落盘 + 被任何写入抹掉。
+            //    其中白名单丢失的后果**不是**「可逆即可接受」那一档：它会让用户手工打开的
+            //    无临期渠道**静默回到不参与**（用户下次发消息时发现请求不走那个渠道，
+            //    却看不到任何提示 —— 与拒绝表丢失同属「静默改路由」）。
+            //    ⚠️ 探针实测的既有形态：漏键时 section 里根本没有该键，新实例读回缺省值。
+            aggregateAllowed: state.aggregateAllowed ?? {},
+            aggregateOrder: state.aggregateOrder ?? {},
+            aggregateOrderMode: state.aggregateOrderMode === 'manual' ? 'manual' : 'expiry',
             // 镜像字段由 AccountPool 与独立文档**同源写出**：同机上只认这个字段的
             // 旧版本代码（其它 profile）读它、也会原样写回它，故两边不会脱节。
             loomyPermanentLocked: state.loomyPermanentLocked === true,
             // 开关丢失只会让网关回到默认启用（可逆），故接受老版本重写时丢掉本键。
             gatewayEnabled: state.gatewayEnabled !== false,
+            // ⚠️ **必须带上本键**（与上一行同因）：`replace` 是整体替换语义 —— 漏键会让
+            // 用户打开的「允许局域网访问」在任何一次其它写入时被抹掉，重启后**静默
+            // 回到只绑回环**（可逆但用户会以为坏了）。缺键语义为关闭（安全默认）。
+            gatewayAllowLan: state.gatewayAllowLan === true,
+            // ⚠️ **必须带上本键**（真实缺陷，PR95 审计实测证伪）：
+            //    `replace` 是**整体替换**语义 —— 漏掉本键会让用户明确关闭的「渠道原生
+            //    搜索」在**任何**一次账号/黑名单/网关/顺序写入时被抹掉，
+            //    重启后**静默回到原生搜索**（用户无从察觉，正是本键加进来时那条
+            //    「只有显式 false 才算关闭」要守的东西）。
+            //    探针实测（老契约后端）：`setNativeWebSearchEnabled(false)` 的
+            //    replace 载荷里根本没有本键，新实例读回 `true`。
+            nativeWebSearchEnabled: state.nativeWebSearchEnabled !== false,
+            // ⚠️ **必须带上本键**（与 `nativeWebSearchEnabled` 同因，是同一个
+            //    `replace` 整体替换陷阱的第二个受害者）：漏键会让用户改过的
+            //    「面板入口」在**任何**一次账号/黑名单/网关/顺序写入时被抹掉，
+            //    重启后**静默回到默认「仅侧栏」**（用户本以为改过了它）。
+            //    过一遍 sanitize：入参可能来自任何调用方，脏值不该被写进文档。
+            panelEntry: sanitizePanelEntry(state.panelEntry),
             // 顺序丢失只会回到声明顺序（可逆，重拖一次即恢复），同理接受丢失。
             providerOrder: state.providerOrder ?? [],
+            // ⚠️ **必须带上本键**：`replace` 是整体替换语义 ⇒ 漏键会让用户设置的
+            //    XFF 在**任何**一次账号/黑名单/网关/顺序写入时被抹掉，
+            //    进而「国际站明明能用却突然又开始 307」—— 症状极难对应到本键。
+            //    缺键/空串一律写 `''`（= 不附头），不会写出 `undefined` 空洞。
+            minimaxXff: sanitizeMinimaxXff(state.minimaxXff) ?? '',
+            // ⚠️⚠️ **必须带上本键**（与上面几个新键逐条同因）：`replace` 是**整体替换**
+            //    语义 ⇒ 漏键会让「供应商关闭意图」**永不落盘**，且**任何**账号 / 黑名单 /
+            //    网关 / 顺序写入都会顺带把它抹掉 ⇒ 重启后该供应商**静默回到「已打开」**
+            //    （Gitee issue IKP8OF 原样复发，且用户无从察觉自己「又打开过」它）。
+            //    缺键 / 脏值一律写 `{}`，不会写出 `undefined` 空洞。
+            providerClosed: sanitizeProviderClosed(state.providerClosed),
         });
     }
 }
@@ -446,8 +915,8 @@ class MemoryStore {
  *
  * 依据 `src/product.ts` 与各 `*-product.ts` 的 `id` 字段：
  * `codearts` / `buddy` / `workbuddy` / `lobsterai` / `qoder` / `qodercn`
- * / `trae` / `cline` / `loomy` / `raccoon` / `minimax` / `zcode`
- * / `opencode` / `gemini` / `officeace` / `accio`。
+ * / `trae` / `cline` / `loomy` / `raccoon` / `minimax` / `minimaxintl`
+ * / `zcode` / `opencode` / `gemini` / `officeace` / `accio` / `astudio`。
  * ⚠️ 这行清单必须与**下面那张表的实际项数**一致（2026-10-13 合并审计：
  *    此前它漏了 `officeace` —— 表里有、清单里没有，属注释失实）。
  */
@@ -464,10 +933,26 @@ const REF_PREFIX_TO_PROVIDER = [
     ['RACCOON', 'raccoon'],
     // ⚠️ 第 12 个 provider（上游 2026-10-02 合并）—— 曾漏加，见上方注释 ②。
     ['MINIMAX', 'minimax'],
+    // ⚠️ 第 17 个 provider（minimaxintl，2026-10-15）—— 同款坑第 **六** 次。
+    // MiniMax Code 国际版与本表里的 `minimax` **是两个 provider**（账号不互通、
+    // 凭据 ref 前缀不同），故必须各占一行。
+    // 漏加 = `MINIMAXINTL_ACCOUNT_*` 的账号在 `state.json` 缺失时静默消失
+    //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新登录）。
+    // ⚠️ 它与 `MINIMAX` 是**超串关系**（`MINIMAXINTL` 以 `MINIMAX` 开头）——
+    //    顺序由 `ACCOUNT_REF_RE` 内部的**长度降序排序**保证，与本数组的书写顺序无关。
+    ['MINIMAXINTL', 'minimaxintl'],
     ['ZCODE', 'zcode'],
     // ⚠️ 第 13 个 provider（opencode，2026-10-01）—— 与上面 minimax 同款坑：
     // 漏加会让「恢复备份」认不出 opencode 账号（见上方注释 ②）。
     ['OPENCODE', 'opencode'],
+    // ⚠️ **本 fork 独有**的 provider（modelscope，2026-10-16）—— 同款坑第 **五** 次。
+    // 漏加 = `MODELSCOPE_ACCOUNT_*` 的账号在 `state.json` 缺失时**静默消失**
+    //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新授权）。
+    //
+    // ⚠️ 前缀取 `MODELSCOPE`（不是旧 fork 反代的 `PROXY_UPSTREAM_MODELSCOPE`）：
+    //    上游整套反代命名空间都不存在，且 `account.create` 生成的账号 ref 恒为
+    //    `${provider.toUpperCase()}_ACCOUNT_${suffix}` —— 两者必须对上，否则本表认不出它。
+    ['MODELSCOPE', 'modelscope'],
     // ⚠️ 第 14 个 provider（gemini，2026-10-03）—— 同款坑第 **三** 次。
     // 漏加 = `GEMINI_ACCOUNT_*` 的账号在 `state.json` 缺失时静默消失
     //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新授权）。
@@ -484,8 +969,65 @@ const REF_PREFIX_TO_PROVIDER = [
     // 漏加 = `ACCIO_ACCOUNT_*` 的账号在 `state.json` 缺失时静默消失
     //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新登录）。
     ['ACCIO', 'accio'],
+    ['AUTOCLAW', 'autoclaw'],
+    // ⚠️ 第 18 个 provider（astudio，2026-10-16）—— 同款坑第 **六** 次。
+    // 漏加 = `ASTUDIO_ACCOUNT_*` 的账号在 `state.json` 缺失时静默消失
+    //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新导入）。
+    ['ASTUDIO', 'astudio'],
+    // ⚠️ Codely（Unity，2026-10-19）：**UI 先行阶段**就提前登记（registry 里该条
+    //    `channel: false`，但恢复表守卫按**全量** registry 派生、只豁免 aggregate
+    //    —— 漏加会让 `jet-hub-store.spec.ts` 的派生用例变红）。账号 ref 形态沿用
+    //    统一规则 `CODELY_ACCOUNT_${suffix}`（`account.create` 的前缀规则）。
+    ['CODELY', 'codely'],
+    // ⚠️ 第 19 个 provider（autoclawintl，2026-10-20）—— 同款坑第 **七** 次。
+    // 漏加 = `AUTOCLAWINTL_ACCOUNT_*` 的账号在 `state.json` 缺失时**静默消失**
+    //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新导入）。
+    // ⚠️ 与 `AUTOCLAW` 是**超串关系**（`AUTOCLAWINTL` 以 `AUTOCLAW` 开头）——
+    //    顺序由 `ACCOUNT_REF_RE` 内部的**长度降序排序**保证，与本数组书写顺序无关
+    //    （与 `MINIMAX` / `MINIMAXINTL` 同型）。
+    ['AUTOCLAWINTL', 'autoclawintl'],
 ];
-/** 账号凭据 ref 形态：`{PREFIX}_ACCOUNT_{HEX}`（前缀由单一真相源派生）。 */
+/**
+ * 账号凭据 ref 形态：`{PREFIX}_ACCOUNT_{SUFFIX}`（前缀由单一真相源派生）。
+ *
+ * ## 尾段判据为什么不能只是 `[0-9A-Fa-f]{6,}`（2026-10-25 审计 A1-F4 / B1）
+ *
+ * 大多数 provider 的尾段确实是纯 hex（`${provider}_ACCOUNT_${randomHex}`）。
+ * 但 **opencode 的尾段不是**：它在 key 尾 8 位含 `-`/`.` 时会生成
+ * `OPENCODE_ACCOUNT_<剥完非法字符>_<8 位 hex>`
+ * （`opencode-rpc.ts` 的 `slotNamesOf`）—— 尾段含 `_`，**永远不是纯 hex**。
+ *
+ * 旧判据下 `providerOfAccountRef` 对这类 ref 返回 `undefined`，后果**两条**：
+ *
+ * 1. `state.json` 缺失时该账号**静默消失**（凭据还在、索引建不出来）；
+ * 2. ⚠️ 更严重：`backup.ts` 的跨 provider 校验把 `undefined` 当「不是账号 ref」
+ *    **放行**（fail-open）⇒ 一份 `provider:'buddy'` 却引用 `OPENCODE_ACCOUNT_*`
+ *    的备份会被**采纳**（实测 `imported=1`），而同一误用在合法 hex 尾 ref 下
+ *    会被拒（`imported=0`）。同一份校验对两种 ref 形态给出**相反**结论，
+ *    正是「一文件两套同义判据」的变体。
+ *
+ * ⇒ 尾段放宽为「字母数字/下划线 + 可选的 `_<8 位 hex>` 后缀」：
+ * `([0-9A-Za-z]{6,}(?:_[0-9A-Fa-f]{8})?|[0-9A-Za-z]*_[0-9A-Fa-f]{8})`。
+ *
+ * ⚠️ 三条并列分支，缺一不可（都是 `slotNamesOf` **真实会产出**的形态）：
+ *
+ * | 形态 | 例 | 为什么需要单独一条 |
+ * |---|---|---|
+ * | `[0-9A-Za-z]{6,}` | `OPENCODE_ACCOUNT_AAAAAA` | 存量纯 hex / 合法字母尾段 |
+ * | `[0-9A-Za-z]{6,}_[0-9A-F]{8}` | `OPENCODE_ACCOUNT_AAAABCD_6480DB97` | 归一化 + hash |
+ * | `[0-9A-Za-z]*_[0-9A-F]{8}` | `OPENCODE_ACCOUNT__9ABB433E` | 尾段**全是非法字符**时剥完为空，长度不足 6 |
+ *
+ * 另外「合法尾段本身可含 `_`」也是一种真实形态（`OPENCODE_ACCOUNT_AAAAB_CD`
+ * —— 尾 8 位 `aaaab_cd` 全合法、走合法分支且不带 hash）⇒ 纯 hex 判据
+ * **从一开始就漏掉它**，与本次归一化无关。故第一条分支也接受 `_`。
+ *
+ * ⚠️ **识别面只增不减**：纯 hex 仍匹配（存量 ref 逐字节不受影响），新形态也匹配。
+ * ⚠️ 两个捕获组的语义保持不变（`[1]` = 前缀、`[2]` = 尾段），
+ * `accountFromCredentialRef` 用尾段合成 id —— 它会把尾段小写后拼进 id，
+ * 对 `AAAABCD_6480DB97` 得到 `opencode-aaaabcd_6480db97`（与 `slotNamesOf`
+ * 的 id 前缀一致性**不要求逐字相同**：那条 id 是首次添加时算的，恢复路径
+ * 只在 `state.json` 缺失时兜底，且两端都以「尾段」为身份锚点）。
+ */
 const ACCOUNT_REF_RE = new RegExp(
 // ⚠️ 按前缀长度**降序**排列：`QODERCN` 必须排在 `QODER` 之前。虽然正则的
 // 回溯最终仍能让 `QODERCN_*` 匹配成功（所以顺序错了也**暂时**看不出问题），
@@ -495,7 +1037,7 @@ const ACCOUNT_REF_RE = new RegExp(
 `^(${REF_PREFIX_TO_PROVIDER
     .map(([prefix]) => prefix)
     .sort((a, b) => b.length - a.length)
-    .join('|')})_ACCOUNT_([0-9A-Fa-f]{6,})$`);
+    .join('|')})_ACCOUNT_([0-9A-Za-z_]{6,}|[0-9A-Za-z]*_[0-9A-Fa-f]{8})$`);
 /**
  * 由账号凭据 ref 反推 provider；不是账号 ref 形态时返回 `undefined`。
  *
@@ -596,12 +1138,26 @@ class FileStore {
                 disabledModels: sanitizeDisabledModels(value.disabledModels),
                 // 老文档没这个键 → 空表（没有任何拒绝），与升级前行为一致。
                 aggregateRejections: sanitizeAggregateRejections(value.aggregateRejections),
+                // 老文档没这三个键 → 空白名单 / 空顺序表 / 临期序，与升级前行为一致。
+                aggregateAllowed: sanitizeAggregateAllowed(value.aggregateAllowed),
+                aggregateOrder: sanitizeAggregateOrder(value.aggregateOrder),
+                aggregateOrderMode: sanitizeAggregateOrderMode(value.aggregateOrderMode),
                 // 只是镜像（权威表在 permanent-locks.json）；老文档没这个键 → false。
                 loomyPermanentLocked: value.loomyPermanentLocked === true,
                 // 老文档没这个键 → 启用，与升级前行为一致。
                 gatewayEnabled: sanitizeGatewayEnabled(value.gatewayEnabled),
+                // 老文档没这个键 → 关闭（安全默认，与读站点 A 同判据）。
+                gatewayAllowLan: sanitizeGatewayAllowLan(value.gatewayAllowLan),
+                // 老文档没这个键 → 启用，与升级前行为一致。
+                nativeWebSearchEnabled: sanitizeNativeWebSearchEnabled(value.nativeWebSearchEnabled),
+                // 老文档没新键 → 按老布尔迁移（与 `SettingsStore` 同一判据）；两者都没有 → 仅侧栏。
+                panelEntry: sanitizePanelEntry(value.panelEntry, value.sidebarEntryEnabled),
                 // 老文档没这个键 → 空数组（未自定义），展示侧按声明顺序渲染。
                 providerOrder: sanitizeProviderOrder(value.providerOrder),
+                // 老文档没这个键 ⇒ `undefined` ⇒ 不附 XFF（与修复前行为逐字节一致）。
+                minimaxXff: sanitizeMinimaxXff(value.minimaxXff),
+                // 老文档没这个键 → 空表（没有任何供应商被关闭），与升级前行为一致。
+                providerClosed: sanitizeProviderClosed(value.providerClosed),
             };
         }
         catch (error) {
@@ -610,7 +1166,17 @@ class FileStore {
         }
     }
     async save(state) {
-        this.write(state);
+        // ⚠️ **过一遍 sanitize，与 `SettingsStore.save` 对齐**（2026-10-24 审计 M7）。
+        //
+        // 两个后端写的是同一份文档形状，但此前只有 `SettingsStore.save` 归一化入参，
+        // 本方法原样落盘 ⇒ 同一语义两套判据（本仓库红线 PR !62 的幼苗形态）。
+        // 生产影响低（`AccountPool.queueStoreSave` 传入的都是已归一的缓存），
+        // 但「脏值只可能从读路径进来」这个假设不该靠约定维持 —— 读侧有
+        // `sanitizePanelEntry`，写侧也必须有。
+        //
+        // ⚠️ 只归一**本键**：其余键的归一化各有自己的守卫与事故史（见
+        // `SettingsStore.save` 的逐键注释），在这里顺手全做会越过那些判据。
+        this.write({ ...state, panelEntry: sanitizePanelEntry(state.panelEntry) });
     }
     write(state) {
         mkdirSync(join(this.home, 'jet-hub'), { recursive: true });
@@ -645,12 +1211,26 @@ class FileStore {
                 disabledModels: {},
                 // 凭据文件里没有任何拒绝信息 → 空表（与全新安装一致）。
                 aggregateRejections: {},
+                // 凭据文件里也没有白名单/顺序/模式信息 → 全部缺省（与全新安装一致）。
+                aggregateAllowed: {},
+                aggregateOrder: {},
+                aggregateOrderMode: 'expiry',
                 // 凭据文件里没有任何锁定信息 → 镜像写 false（权威表另有其文档）。
                 loomyPermanentLocked: false,
                 // 恢复出的文档本来就不含任何开关信息 → 启用（与全新安装一致）。
                 gatewayEnabled: true,
+                // 同上：恢复出的文档不含局域网开关信息 → 关闭（安全默认，与全新安装一致）。
+                gatewayAllowLan: false,
+                // 同上：恢复出的文档不含原生搜索开关信息 → 启用（与全新安装一致）。
+                nativeWebSearchEnabled: true,
+                // 同上：恢复出的文档不含面板入口信息 → 默认「仅侧栏」（与全新安装一致）。
+                panelEntry: DEFAULT_PANEL_ENTRY,
                 // 凭据文件里也没有顺序信息 → 空数组（未自定义，与全新安装一致）。
                 providerOrder: [],
+                // 凭据文件里没有 XFF 设置 → 不附头（与全新安装一致）。
+                minimaxXff: undefined,
+                // 凭据文件里也没有关闭意图 → 空表（与全新安装一致）。
+                providerClosed: {},
             };
             try {
                 this.write(state);

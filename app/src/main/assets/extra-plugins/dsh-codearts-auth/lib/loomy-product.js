@@ -97,21 +97,140 @@ const LOOMY_DEFAULT_EFFORT = 'high';
  */
 export const LOOMY_CONTEXT_WINDOW_OVERRIDES = {
     // 远端虚报 1048576，官方客户端本地表与上游墙位都是 262144（见上）。
+    // ⚠️ 键必须**小写**：查表经 `loomyCatalogKey()` 归一，混入大写键会恒不命中。
     'spark-x': 262_144,
 };
+/**
+ * 模型 id 的**归一化查表键**：本家两张能力覆盖表唯一的查表口径。
+ *
+ * ## 为什么需要（2026-10-14 审计发现）
+ *
+ * 覆盖表原先用 `Set.has(modelId)` / `OVER[modelId]` 做**逐字节精确匹配**，而
+ * 同一文件里读远端模态的 `readInputModalities()` 却把值 `.toLowerCase()` 归一了
+ * ⇒ **同一个「模型身份」概念在相邻两处用了两套归一标准**。
+ *
+ * 后果是**静默失效**：一旦上游把 id 改成 `Qwen-3.8-Max` 或前后带空白，
+ * 覆盖表恒不命中 ⇒ `inputModalities` 退回 `['text']` ⇒ DSH 附件准入闸门
+ * （`MODEL_DOES_NOT_SUPPORT_IMAGES`）重新拒图，**用户看到的就是本次修复前的
+ * 症状原样复现**，而全程不抛异常、不打日志、测试全绿。
+ *（本仓库有同型前科：`docs/agent-notes/providers-zcode.md` 的
+ * 「上游小写 vs 目录大写」。）
+ *
+ * ## ⚠️ 一个已权衡的取舍（如实登记，别当它不存在）
+ *
+ * 归一化后，**仅大小写不同的两个 id 会折叠成同一个键**。若上游真的同时上架
+ * `spark-x` 与 `Spark-X` 两个不同模型、且只有一个能读图，本函数会把图也放给
+ * 另一个（上游回一个更晚、更难懂的 400 —— 正是覆盖表注释警告的那种代价）。
+ * 判定为**可接受**，理由：① 远端现有 8 条 chat 模型 id 两两不同、且本就混用
+ * 大小写（`MiniMax-M3` / `spark-x`），说明上游按 id 区分模型而非按大小写；
+ * ② 「仅大小写不同」的模型目录会让 DSH 自身的选择器也无法区分，属病态输入；
+ * ③ 反向的代价（不归一 ⇒ 静默拒图）**已经真实发生过一次**。
+ *
+ * ## ⚠️ 只用于查表，**绝不改对外 id**
+ *
+ * `model.id` 同时是 `fallbackIndex`（`loomy-adapter.ts`）与 `effortsForModel`
+ * 的索引键，也是 DSH 选择模型时用的身份。归一化只发生在**查表那一刻**，
+ * 对外播报的 id 逐字节不变 —— 否则会重演 accio「改对外 id ⇒ 聚合补丁索引
+ * 恒不命中」那类**静默**连带失效。
+ *
+ * @param modelId 待查的模型 id（远端原值或兜底表值）。
+ * @returns 小写、去首尾空白的查表键。
+ */
+function loomyCatalogKey(modelId) {
+    return modelId.trim().toLowerCase();
+}
 /**
  * 取一个模型的**真实**上下文窗口。
  *
  * 覆盖表优先于远端，原因见 {@link LOOMY_CONTEXT_WINDOW_OVERRIDES}。
  * ⚠️ 远端与兜底表**两条路径都必须过这里** —— 只改兜底表无效（远端可用时
  * 走的是远端值），这是个曾经差点踩空的点。
+ * ⚠️ 查表走 {@link loomyCatalogKey}（大小写/空白不敏感），理由见该函数。
  *
  * @param modelId 模型 id。
  * @param declared 声明值（远端 `context_length` 或兜底表的值）。
  * @returns 覆盖值（若有），否则原样返回 `declared`。
  */
 export function loomyContextWindow(modelId, declared) {
-    return LOOMY_CONTEXT_WINDOW_OVERRIDES[modelId] ?? declared;
+    return LOOMY_CONTEXT_WINDOW_OVERRIDES[loomyCatalogKey(modelId)] ?? declared;
+}
+/**
+ * 远端声明为**纯文本**、但实测**能读图**的模型（`input_modalities` 漏报）。
+ *
+ * ## 为什么需要（真实缺陷，2026-10-14 用户报障）
+ *
+ * 用户报障「loomy 的模型输入不能上图？尤其是 qwen3.8max」。根因与 raccoon 那起
+ * （`tags.vision` 不是能力契约，见 `RACCOON_TEXT_ONLY_MODELS`）**同型**，
+ * 只是这次的「元数据」是 `input_modalities` 而不是 `tags`：
+ *
+ * 1. 远端 `GET /api/v1/models` 对 `qwen-3.8-max` 下发
+ *    `capabilities.input_modalities = ['text']`（`vision: false`）；
+ * 2. 适配器原样直译 ⇒ `supportsImage: false` ⇒ `toCatalogEntry` 播报
+ *    `inputModalities: ['text']`；
+ * 3. DSH 按它做准入（`dsh-api-session-controller` 的
+ *    `MODEL_DOES_NOT_SUPPORT_IMAGES`）与投影 ⇒ **图片根本发不出去**，
+ *    用户看到的是「当前模型不支持图片，请切换支持图片的模型」。
+ *
+ * ### 硬证据（2026-10-14，真实凭据直连生产端点）
+ *
+ * 判据是**随机纯色 PNG**（纯标准库生成，64×64，约 137 B）：纯文本模型答不出颜色，
+ * 读得到的模型答得出。`qwen-3.8-max` 两轮合计 **4/5 次答对**：
+ *
+ * | 判据 | 目标 | 模型回答 |
+ * |---|---|---|
+ * | 颜色名 | 紫 (150,40,200) | 「紫色」 |
+ * | 颜色名 | 蓝 (40,70,220) | 「蓝色」 |
+ * | RGB 三元组 | (144,127,136) | `142,132,140` |
+ * | RGB 三元组 | (197,197,174) | `180,186,169` |
+ * | RGB 三元组 | (129,204,71) | HTTP 504（上游网关超时，不计） |
+ *
+ * ### 同批实测的对照（一次一色，同一账号）
+ *
+ * | 模型 | 远端 `input_modalities` | 实测读图 | 备注 |
+ * |---|---|---|---|
+ * | `DeepSeek-V4.1-Flash` | text,image | ✅ | |
+ * | `Kimi-k2.6` | text,image,video | ✅ | |
+ * | `qwen3.8-flash` | text,image,video | ✅ | |
+ * | `mimo-v2.5` | text,audio,image,video | ✅ | |
+ * | `GLM-5.3-Flash` | text,image,video | ⚠️ | 颜色名答错一次；RGB 3 次中 2 次命中 |
+ * | **`qwen-3.8-max`** | **text（漏报）** | ✅ | **本表要修的就是它** |
+ * | `MiniMax-M3` | text,image,video | ❌ | 4/4 未命中；答案像经典 CSS 色值（`135,206,235`…）⇒ 疑似在编 |
+ * | `deepseek-v4-flash-0731` | text | ❌ | 思考链吃满预算，正文为空 |
+ * | `spark-x` | text | ❌ | 自称「我无法读取图片」 |
+ * | `auto` | 无声明 | ❌ | 未定论（思考吃满 / 答「灰」） |
+ *
+ * ⚠️ **`MiniMax-M3` 的疑似假声明（声明 image、实测读不出）本次刻意不动**：
+ * 用户 2026-10-14 明确「我主要关心 loomy 的 qwen3.8max」，且**降级**一个已声明的
+ * 能力会改变既有可用路径 —— raccoon 的 `sn-glm-5-3` 就有「网关节点不一致、
+ * 3 次只对 1 次」的先例 ⇒ 单账号证据不足以判死。它按**已知 provider 缺陷**
+ * 记录在案，待多节点复核后再决定。
+ *
+ * ⚠️ **不要改成「该家恒支持图片」**：白名单只覆盖**实测确认**的个案。将来上架
+ * 纯文本模型时恒 true 会把图放行，让上游回一个更难懂的 400（错误更晚、更难查）。
+ *
+ * ⚠️ 表内条目必须**小写**：查表经 `loomyCatalogKey()` 归一，混入大写条目会恒不命中。
+ */
+export const LOOMY_IMAGE_CAPABILITY_OVERRIDES = new Set([
+    'qwen-3.8-max',
+]);
+/**
+ * 取一个模型的**真实**图片能力。
+ *
+ * ⚠️ 远端与兜底表**两条路径都必须过这里** —— 与 {@link loomyContextWindow}
+ * 同一条纪律：只改一侧，远端可用时那一侧就白改了（`contextWindow` 曾差点踩空）。
+ * ⚠️ 与 raccoon 的**两个真相源**（兜底表 `supportsImage` + 远端判定函数）不同，
+ * 本家只有一个真相源（本函数）——兜底表的 `supportsImage` 恒由 `false` 起算，
+ * 故不存在「兜底表与远端判定分叉」的形态。
+ * ⚠️ 查表走 {@link loomyCatalogKey}（大小写/空白不敏感），与
+ * {@link loomyContextWindow} 同一口径 —— 两张覆盖表若口径不同，
+ * 「同一条纪律」这句话本身就是假的（2026-10-14 审计发现）。
+ *
+ * @param modelId 模型 id。
+ * @param declared 远端 `input_modalities` 是否含 `image`（兜底表一律传 `false`）。
+ * @returns 覆盖值（若有），否则原样返回 `declared`。
+ */
+export function loomySupportsImage(modelId, declared) {
+    return LOOMY_IMAGE_CAPABILITY_OVERRIDES.has(loomyCatalogKey(modelId)) || declared;
 }
 const LOOMY_FALLBACK_MODELS = [
     { id: 'deepseek-v4-flash-0731', name: 'DeepSeek V4 Flash 0731 · x3.0', contextWindow: 1_048_576, efforts: [...LOOMY_EFFORTS], defaultEffort: LOOMY_DEFAULT_EFFORT },

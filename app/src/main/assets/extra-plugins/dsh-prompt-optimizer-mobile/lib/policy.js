@@ -13,11 +13,16 @@
 // 返工门（P6）的生产触发本来就是默认关闭的，不因为档位而打开——档位不该悄悄放大自主权。
 import { normalizeSettings, tierOf, TIER_PRESETS } from './settings.js'
 import { strategyForTier } from './strategy.js'
+import { OPTIMIZER_OUTPUT_BUDGET_TOKENS } from './optimizer-protocol.js'
 import { readFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 
-/** 意图包字符预算：默认与 `compiler.DEFAULT_BUDGET` 一致（1200），避免"没设置就变行为"。 */
-export const DETAIL_BUDGET = Object.freeze({ minimal: 700, standard: 1200, detailed: 2000 })
+// All three sections share one 3000-token ceiling. Tiers vary detail, not the cap.
+export const DETAIL_TOKENS = Object.freeze({ minimal: OPTIMIZER_OUTPUT_BUDGET_TOKENS, standard: OPTIMIZER_OUTPUT_BUDGET_TOKENS, detailed: OPTIMIZER_OUTPUT_BUDGET_TOKENS })
+/** Approximate tokenizer ratios for the legacy character-budget compiler only. */
+export const TOKENS_PER_CHAR = Object.freeze({ zh: 1.4, en: 0.25 })
+export const DETAIL_BUDGET = DETAIL_TOKENS
+
 /** 一批最多问几个问题：默认与 `clarifier` 的默认一致（2）。 */
 export const BUDGET_QUESTIONS = Object.freeze({ minimal: 1, standard: 2, generous: 3 })
 /** 未指定（字段缺失）时用的档位，与 settings 的默认一致。 */
@@ -65,12 +70,14 @@ export function policyFor(settings, sessionId) {
     model: s.model,
     detail: s.detail,
     budget: s.budget,
-    // 0.7.8 协作基调：`neutral` 不注入任何东西，`hard` 由编译器加一段语域匹配的短块。
-    framing: s.framing, englishMode:s.englishMode,
+    englishMode:s.englishMode,
+    modelState: s.modelState === 'extreme' ? 'extreme' : 'normal',
     reasoningBoost: s.reasoningBoost, reasoningMode: s.reasoningMode,
     reasoningCandidates: s.reasoningCandidates, reasoningRounds: s.reasoningRounds, reasoningPace:s.reasoningPace,
     injectPacket: s.assist !== 'off',
-    packetBudgetChars: DETAIL_BUDGET[s.detail],
+    packetBudgetTokens: DETAIL_TOKENS[s.detail] || DETAIL_TOKENS.detailed,
+    // The legacy compiler accepts a language-based character estimate, not a measured token count.
+    packetBudgetChars: Math.floor((DETAIL_TOKENS[s.detail] || DETAIL_TOKENS.detailed) / TOKENS_PER_CHAR[s.englishMode ? 'en' : 'zh']),
     maxQuestions: BUDGET_QUESTIONS[s.budget],
     // ⚠ P10 补接（真机台账照出来的洞，别删这几行）：
     // 引擎侧（`renderObserverBlock` / `readToolsFor`）读的是 `pol.historyMode` / `pol.turns` / `pol.readTools`，
@@ -83,6 +90,9 @@ export function policyFor(settings, sessionId) {
     readTools: s.readTools,
     // 0.7.1：内置 Bash 的开关（host 侧据此决定是否把 bash 工具注册给模型）。
     bash: s.bash,
+    // 2026-10-20：顾问开关。**不加这一行，pol.advisor 永远是 undefined**，
+    // 于是"关掉顾问"既不会拦工具、也不会停注入——一个死开关（真机测试抓到的）。
+    advisor: s.advisor !== false,
     // 0.7.5：**按模型的思考档位表**（{ "provider/model": "effortId" }）。
     // ⚠ 必须出现在这里——引擎读的是 pol.*，政策里没有的字段会静默变 undefined，
     // 于是"档位设置"就成了又一个死开关（P10 那三个死开关的教训，见上面那段注释）。
@@ -93,6 +103,11 @@ export function policyFor(settings, sessionId) {
     // 由 strategy.js 唯一决定；下游（解释层提示词、编译器、只读工具）读 `pol.strategy`。
     tier: tierOf(effectiveSettings(settings, sessionId)),
     strategy: strategyForTier(tierOf(effectiveSettings(settings, sessionId))),
+    // ⚠ 2026-10-22（issue #37）：**同一类死开关的第三例**。settings.js 有默认值、在白名单里、
+    // 也能写盘，但 policyFor 不转交 ⇒ 下游读到的恒是 undefined ⇒「以后不再显示」永远无效。
+    // 前面两次分别是 historyMode/turns/readTools（P10）与 effortByModel（P11），注释都在。
+    presetNoticeDismissed: s.presetNoticeDismissed === true,
+    skipHintDismissed: s.skipHintDismissed === true,
   }
 }
 
@@ -105,11 +120,11 @@ export function policyFor(settings, sessionId) {
  *
  * 为什么单独拎出来：包文本是**按当时政策编译好的一整段字符串**（存在 intentBySession 里）。
  * 政策一变，那份字符串就过期了；若不作废，它会在后续回合继续被注入 ——
- * 用户实测 2026-09-29：切回普通档（framing=neutral）后，注入文里**仍然带着硬邦邦那段**。
+ * 因此辅助开关、补充程度、自主预算或英文模式变化时，必须重新生成包文本。
  */
 export function packetShapeOf(pol) {
   if (!pol) return ''
-  return [pol.assist, pol.detail, pol.budget, pol.framing,pol.englishMode?'en':'original'].join('|')
+  return ['scaffold-directions-1', pol.assist, pol.detail, pol.budget,pol.englishMode?'en':'original'].join('|')
 }
 
 /** 写盘前后形状不同 ⇒ 已存的包文本必须作废（下一次拦截会重编译）。两侧都取不到时不作废。 */

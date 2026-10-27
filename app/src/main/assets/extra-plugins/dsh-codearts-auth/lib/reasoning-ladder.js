@@ -11,7 +11,7 @@
  * | TRAE | `light` / `high` / `extra_high` | Light / High / Extra High |
  * | LobsterAI | `off` / `high` / `xhigh` | 关闭 / 高 / **Max** |
  * | Cline | `none` / `low` / `medium` / `high` / `max` | None / Low / Medium / High / **Extra** |
- * | Raccoon | `on` / `off` | 开启 / 关闭 |
+ * | Raccoon | `off` / `on` | 关闭 / 开启 |
  *
  * 而走 OpenAI 协议的客户端只有**一套固定的 8 档词汇**：
  * `none minimal low medium high xhigh max ultra`

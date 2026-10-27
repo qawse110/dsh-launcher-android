@@ -16,6 +16,7 @@
 // ~/.modsearch/config.json, shared with every harness.
 import {
   chmodSync,
+  existsSync,
   lstatSync,
   mkdirSync,
   readFileSync,
@@ -327,8 +328,25 @@ function childEnv() {
   return process.versions.electron ? { ...process.env, ELECTRON_RUN_AS_NODE: '1' } : process.env;
 }
 
-async function runCli(args, signal) {
+/**
+ * The CLI this plugin spawns. Only the npm package ships dist/: a GitHub
+ * source install (DSH's add dialog takes a repo URL) carries no build, and
+ * the bare "Cannot find module" Node prints then names no way out.
+ */
+function cliPath() {
   const cli = process.env.MODSEARCH_DSH_CLI || CLI_PATH;
+  if (!existsSync(cli)) {
+    throw new Error(
+      `modsearch's CLI build is missing (${cli}). This happens when the plugin was ` +
+        'installed from its GitHub repository, which ships source only. Remove the ' +
+        'plugin and add it again by package name: @liustack/modsearch',
+    );
+  }
+  return cli;
+}
+
+async function runCli(args, signal) {
+  const cli = cliPath();
   const { stdout, stderr, code } = await run(process.execPath, [cli, ...args], signal, childEnv());
   if (code !== 0) {
     throw new Error(`modsearch failed (exit ${code}): ${(stderr || stdout).trim().slice(0, 500)}`);
@@ -436,13 +454,21 @@ function renderFetchEvidence(value) {
 // ---------------------------------------------------------------------------
 
 /** The engines the card offers, in the order the docs introduce them. */
-const CARD_ENGINES = ['antigravity-cli', 'tavily', 'exa', 'firecrawl', 'grok-cli', 'local'];
+const CARD_ENGINES = [
+  'antigravity-cli',
+  'tavily',
+  'exa',
+  'firecrawl',
+  'keenable',
+  'grok-cli',
+  'local',
+];
 /** The HTTP engines: the only ones with a key and an endpoint to configure. */
-const KEYED_ENGINES = ['tavily', 'exa', 'firecrawl'];
+const KEYED_ENGINES = ['tavily', 'exa', 'firecrawl', 'keenable'];
 /**
  * Engines whose `model` setting a run actually reads. The others are shown
- * without the field rather than with one nothing is behind: tavily, exa and
- * firecrawl ignore it, and grok-cli follows whatever Grok Build is signed in
+ * without the field rather than with one nothing is behind: the HTTP engines
+ * ignore it, and grok-cli follows whatever Grok Build is signed in
  * with.
  */
 const MODEL_ENGINES = ['antigravity-cli'];
@@ -467,6 +493,7 @@ const ENGINE_ENV_BINDINGS = {
   tavily: { apiKey: 'TAVILY_API_KEY', baseURL: 'TAVILY_BASE_URL' },
   exa: { apiKey: 'EXA_API_KEY', baseURL: 'EXA_BASE_URL' },
   firecrawl: { apiKey: 'FIRECRAWL_API_KEY', baseURL: 'FIRECRAWL_BASE_URL' },
+  keenable: { apiKey: 'KEENABLE_API_KEY', baseURL: 'KEENABLE_BASE_URL' },
 };
 
 /** The canonical engine a stored name means, or '' when it names none. */

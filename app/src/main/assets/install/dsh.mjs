@@ -197,6 +197,48 @@ function ensureHostPkg() {
   }
 }
 
+/**
+ * 删掉 pnpm 里 `@deepseek-ai/dsh` 的**元数据（packument）缓存条目**，逼 pnpm 下次解析时联网取。
+ *
+ * 为什么必须有这一步（真机 flow.log 2026-10-28 06:56 + scratch 双重复现）：pnpm 解析 spec 时
+ * 优先信任本地元数据缓存。缓存里的 dist-tags 仍是发布当天那份（next=0.2.1-rc.2、versions 里
+ * 没有 0.2.1-rc.4）时：
+ *   - `pnpm add @deepseek-ai/dsh@next` 解析回**已安装**的 0.2.1-rc.2 → exit=0、什么都没做
+ *     （package.json spec 与 node_modules 都不变，日志上完全看不出来）；
+ *   - `pnpm add @deepseek-ai/dsh@0.2.1-rc.4` 直接报 `No matching version found`。
+ * 实测带不带 --prefer-offline 都会命中陈旧缓存；删掉该条目后同一条命令立刻装到 rc.4，
+ * 且缓存被重新写成 next=0.2.1-rc.4。只删这一个包的文件，代价是一次 packument 请求。
+ * 缓存根取 pnpm 默认位置（HOME/.cache/pnpm，真机 HOME=FILES_DIR）；版本目录形如 `v11`。
+ */
+function clearPnpmPackumentCache() {
+  const roots = [];
+  if (process.env.XDG_CACHE_HOME) roots.push(join(process.env.XDG_CACHE_HOME, 'pnpm'));
+  if (process.env.HOME) roots.push(join(process.env.HOME, '.cache', 'pnpm'));
+  roots.push(join(FILES_DIR, '.cache', 'pnpm'));
+  const removed = [];
+  for (const root of roots) {
+    let vdirs = [];
+    try { vdirs = readdirSync(root); } catch { continue; }
+    for (const v of vdirs) {
+      if (!/^v\d+/.test(v)) continue;
+      for (const kind of ['metadata', 'metadata-full']) {
+        const md = join(root, v, kind);
+        let hosts = [];
+        try { hosts = readdirSync(md); } catch { continue; }
+        for (const host of hosts) {
+          for (const file of ['dsh.jsonl', 'dsh.json']) {
+            const f = join(md, host, '@deepseek-ai', file);
+            if (!existsSync(f)) continue;
+            try { rmSync(f, { force: true }); removed.push(f); } catch {}
+          }
+        }
+      }
+    }
+  }
+  if (removed.length) log('cleared stale pnpm packument cache: ' + removed.join(', '));
+  return removed.length;
+}
+
 function ensureDsh() {
   mkdirSync(DSH_PREFIX, { recursive: true });
   ensureHostPkg();
@@ -212,6 +254,27 @@ function ensureDsh() {
   const pnpmBin = join(FILES_DIR, '.tools', 'bin', 'pnpm');
   const pnpmStoreEnv = { npm_config_store_dir: join(FILES_DIR, '.tools', 'pnpm-store') };
   const pnpmCommon = ['--ignore-scripts', '--prefer-offline', '--reporter', 'append-only', '--loglevel', 'warn'];
+  // pnpm remove **不接受** --ignore-scripts / --prefer-offline（真机 flow.log + scratch 实测：
+  //   `[ERROR] Unknown options: 'ignore-scripts', 'prefer-offline'` → exit=1）。
+  // 旧代码把 pnpmCommon 直接拼给 remove，于是「强制重装」里的删包这一步在真机上必然失败。
+  const pnpmRmCommon = ['--reporter', 'append-only', '--loglevel', 'warn'];
+  // 强制重装刻意**不带 --prefer-offline**：配合 clearPnpmPackumentCache() 删掉陈旧的元数据
+  // 缓存条目，逼 pnpm 必须联网取 packument（带着 --prefer-offline 会再次命中旧缓存）。
+  const pnpmForceCommon = ['--ignore-scripts', '--reporter', 'append-only', '--loglevel', 'warn'];
+  const readInstalledVersion = () => {
+    try { return JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8')).version || ''; } catch { return ''; }
+  };
+  // 强制把某个**精确版本**装上：先清掉 pnpm 里本包陈旧的元数据缓存条目，再按精确 spec 安装
+  // （spec 必然与旧 spec 不同 → pnpm 不会判成 no-op）。返回装上后的实际版本。
+  const forceInstallExactVersion = (ver, registry, label) => {
+    if (!ver) return { ok: false, version: readInstalledVersion() || beforeVersion };
+    clearPnpmPackumentCache();
+    const r = runEx(pnpmBin, ['add', '--dir', DSH_PREFIX, `@deepseek-ai/dsh@${ver}`, '--registry', registry, ...pnpmForceCommon],
+      { env: { ...envBase(), ...pnpmStoreEnv }, timeoutMs: NPM_TIMEOUT_MS });
+    const got = readInstalledVersion();
+    log(`${label}: install @deepseek-ai/dsh@${ver} via ${registry} → ok=${r.ok}, installed=${got || 'unknown'}`);
+    return { ok: r.ok && got === ver, version: got || beforeVersion };
+  };
 
   log(`install/update ${pkgSpec} ... (currently ${beforeVersion || 'absent'})`);
   // 引擎优先级：pnpm（内存占用远低于 npm；npm Arborist 在设备上解析 150+ 包
@@ -254,6 +317,15 @@ function ensureDsh() {
       break;
     }
     log(`attempt ${a.label} failed (ok=${r.ok}, dshInstalled=${dshInstalled()})`);
+  }
+  if (!succeeded || !dshInstalled()) {
+    // 兜底（精确版本路径，「检查更新」走这条）：pnpm 会拿**陈旧的元数据缓存**解析 spec ——
+    // 缓存里没有目标版本时直接报 `No matching version found`，缓存里 dist-tag 陈旧时静默装回旧版本。
+    // 这里清掉陈旧缓存条目后按精确版本再强制装一次，避免把可用安装判死。
+    if (tag !== 'latest' && tag !== 'next') {
+      const forced = forceInstallExactVersion(tag, REGISTRY, 'force-after-attempts');
+      if (forced.ok) succeeded = true;
+    }
   }
   if (!succeeded || !dshInstalled()) {
     log('FATAL: official dsh install/update failed after all engines/registries');
@@ -301,15 +373,32 @@ function ensureDsh() {
     cmpVerLocal(afterVersion, distTagVersion) >= 0;
   if (!tagSatisfied) {
     log(`stale install detected: ${afterVersion} != dist-tag ${tag}=${distTagVersion}, force reinstall`);
-    runEx(pnpmBin, ['remove', '--dir', DSH_PREFIX, '@deepseek-ai/dsh', ...pnpmCommon],
-      { env: { ...envBase(), ...pnpmStoreEnv }, timeoutMs: NPM_TIMEOUT_MS });
-    const fr = runEx(pnpmBin, ['add', '--dir', DSH_PREFIX, pkgSpec, '--registry', REGISTRY, ...pnpmCommon],
-      { env: { ...envBase(), ...pnpmStoreEnv }, timeoutMs: NPM_TIMEOUT_MS });
-    try {
-      afterVersion = JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8')).version || afterVersion;
-    } catch {}
-    if (!fr.ok || afterVersion === beforeVersion) {
-      log(`WARN forced reinstall still at ${afterVersion} (registry mirror may lag upstream)`);
+    // 根因（真机 flow.log 2026-10-28 06:56 + scratch 复现）：
+    //  1) pnpm 解析 spec 时优先信任**本地元数据缓存**。缓存里的 dist-tags 还停在旧版本
+    //     （next=0.2.1-rc.2、versions 里没有 0.2.1-rc.4）时，`pnpm add @next` 解析回
+    //     「已安装的那个版本」→ exit=0 却什么都没做（package.json spec 与 node_modules
+    //     都不变），日志上完全看不出是空转。带不带 --prefer-offline 都会命中这个陈旧缓存。
+    //  2) 本该兜底的 `pnpm remove` 拼的是 pnpmCommon，而 pnpm remove 不认 --ignore-scripts /
+    //     --prefer-offline（[ERROR] Unknown options → exit=1），于是没有任何一步会刷新缓存，
+    //     更新永远停在旧版本。
+    // 修法：先删掉 pnpm 里本包的元数据缓存条目，再按 dist-tag 解析出的**精确版本**安装
+    // （spec 必然变化，不是空转）；只有这也不行时才退回 remove + add（remove 只带支持的 flag）。
+    let forced = forceInstallExactVersion(distTagVersion, REGISTRY, 'force-exact');
+    if (!forced.ok && REGISTRY_FALLBACK !== REGISTRY) {
+      forced = forceInstallExactVersion(distTagVersion, REGISTRY_FALLBACK, 'force-exact-fallback');
+    }
+    afterVersion = forced.version || afterVersion;
+    if (!forced.ok) {
+      log(`WARN exact-version install still at ${afterVersion}; fallback to remove + add`);
+      const rr = runEx(pnpmBin, ['remove', '--dir', DSH_PREFIX, '@deepseek-ai/dsh', ...pnpmRmCommon],
+        { env: { ...envBase(), ...pnpmStoreEnv }, timeoutMs: NPM_TIMEOUT_MS });
+      if (!rr.ok) log(`WARN pnpm remove failed (ok=${rr.ok}); continuing with add`);
+      const fr = runEx(pnpmBin, ['add', '--dir', DSH_PREFIX, pkgSpec, '--registry', REGISTRY, ...pnpmForceCommon],
+        { env: { ...envBase(), ...pnpmStoreEnv }, timeoutMs: NPM_TIMEOUT_MS });
+      afterVersion = readInstalledVersion() || afterVersion;
+      if (!fr.ok || afterVersion === beforeVersion) {
+        log(`WARN forced reinstall still at ${afterVersion} (registry mirror may lag upstream)`);
+      }
     }
   }
   try {
@@ -320,6 +409,11 @@ function ensureDsh() {
   // 否则说明镜像滞后/解析漂移——日志大声报出来，别让版本静默漂移。
   if (tag !== 'latest' && tag !== 'next' && afterVersion && afterVersion !== tag) {
     log(`WARN pinned version mismatch: installed ${afterVersion}, expected ${tag}`);
+    // 「检查更新」传精确版本号走这条。与 stale 分支同因（陈旧元数据缓存），再清一次缓存并
+    // 强制装精确版本（幂等；失败只告警，保留「钉死版本漂移必须大声报出来」的原语义）。
+    const forced = forceInstallExactVersion(tag, REGISTRY, 'force-pinned');
+    afterVersion = forced.version || afterVersion;
+    if (afterVersion !== tag) log(`WARN pinned version still mismatched after forced install: installed ${afterVersion}, expected ${tag}`);
   }
 }
 

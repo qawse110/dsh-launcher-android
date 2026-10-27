@@ -29,7 +29,7 @@
  *    `getAvailableAccount`（自动选择，只认启用账号）。
  */
 import { createUserMessage, LlmError } from '@deepseek-ai/dsh-llm';
-import { isRateLimited, parseRateLimitError } from './llm-adapter.js';
+import { creditExhaustedResetAtMs, explicitRateResetAtMs, isCreditExhausted, isRateLimited, parseRateLimitError, } from './llm-adapter.js';
 import { runtimeOf } from './provider-runtime.js';
 /** 探测请求的提示语（与 e2e 探针保持一致，最大化可比性）。 */
 const PROBE_PROMPT = '只回答两个字：收到';
@@ -233,12 +233,76 @@ async function probeWithAdapter(entry, credential, modelId, timeoutMs) {
             // 把它往后推。这里必须把它解析出来一并回传，否则调用方只能保留存储里的旧值，
             // 旧值过期后 UI 就不再渲染「限额重置」（表现为"重测说仍受限、卡片却没有"）。
             // 解析失败（文案无时间）时不带该字段，调用方按「无法确认」处理、保留原标记。
+            //
+            // ⚠️⚠️ **额度耗尽（14018）不能用 `parseRateLimitError` 的 1 小时兜底**
+            // （Gitee IKQ6HJ，2026-10-25 修）：它的报文里没有时间字段，而那 1 小时会让
+            // 账号每小时被重新选中一次、必然再失败一次。
+            //
+            // ⚠️⚠️ **两条腿必须逐字同形**（对抗审计实测的真缺陷，本行第一版就是错的）：
+            // 推理腿（`buddy-adapter.ts`）算的是
+            // `explicitRateResetAtMs(errorText) ?? creditExhaustedResetAtMs()`，
+            // 而本行第一版**只有后一半** ⇒ 同一条报文（14018 码 + 显式 `reset at` 时刻）
+            // 在两条腿上算出**两个不同的解禁时刻**：
+            // | 路径 | 报文含显式时刻时写下的标记 |
+            // |---|---|
+            // | 推理腿 | `2099-12-31T15:59:59Z`（按服务端声明） |
+            // | 探测腿（第一版） | `2026-10-25T16:00:00Z`（按自然日） |
+            // ⇒ 用户点一次「重测」就看到解禁时间跳变。**这不是理论风险**：实测两值不同。
+            // 故这里补上 `explicitRateResetAtMs`，与推理腿逐字同形。
+            //
+            // ⚠️ 为什么不把两处抽成「一个函数」：探测层**不得**反向 import
+            // `buddy-adapter.ts`（`account-probe-adapter.spec.ts` 会 `vi.mock` 它，
+            // 让导出一起变成 `undefined`）。共享的只能放在 `llm-adapter.ts`，而
+            // 「显式优先 + 自然日兜底」这两个原语已经都在那里 ⇒ 两处写出**同一个表达式**
+            // 是本仓库在此约束下的最优解；该表达式由本文件与 buddy 两侧的用例共同锁住
+            // （任一侧少了 explicit 腿，那条「服务端给了时刻以它为准」的用例就会红）。
             const parsed = parseRateLimitError(message, modelId);
+            //
+            // ⚠️⚠️ **入参是「适配器压平后的 message」，不是原始报文** —— 这带来一条
+            // 已实测的窄风险（对抗审计 2026-10-25 登记，未修）：
+            // `isCreditExhausted` 有一条**文案腿**（`积分|额度|余额` + `不足|耗尽|用尽`），
+            // 它扫的是这段被包装过的文本。实测一条**普通限流**报文
+            // `{"code":429,"msg":"所有账号的「15 天内到期」积分都已用尽…"}` 命中
+            // `积分.{0,4}用尽` ⇒ 被判「额度耗尽」⇒ 写下**自然日**冷却，
+            // 而它本该走 `+1h` / 服务端时刻。
+            //
+            // 触发面窄（要求 429 正文含那几句确定性格式），故**仅登记不改判据**：
+            // 收窄文案腿会让「上游改措辞」时漏判（更常见的失败形态），
+            // 而收窄的收益只是这一格。若将来实测到该形态，正确修法是
+            // **让探测腿能拿到原始报文**（在 `ProbeModelResult` 上加一个原始 body 字段），
+            // 而不是继续在压平文本上加正则。
+            const creditExhausted = isCreditExhausted(message);
+            const resetTimeMs = creditExhausted
+                ? explicitRateResetAtMs(message) ?? creditExhaustedResetAtMs()
+                : parsed?.resetTimeMs;
             return {
                 modelId,
                 ok: false,
-                message: `仍受限：${message}`,
-                ...(parsed !== null ? { resetTimeMs: parsed.resetTimeMs } : {}),
+                // ⚠️ **额度耗尽不能只说「仍受限」**（Gitee IKQ6HJ 的另发现 1）：
+                // 那个词把用户引向「等一会儿再试」，而真实出路是「等次日配额或充值」。
+                // 两者在上游是**完全不同的恢复机制**，文案必须分出档次。
+                //
+                // ⚠️⚠️ **文案不得断言「已按 …… 设置」**（对抗审计实测为假话，本仓库红线）：
+                // `AccountPool.updateModelRateLimit` 的语义是「只接受更长的时刻」
+                //（`markerUnchanged = currentValid && current >= resetAtMs` ⇒ 静默忽略），
+                // 而探测层**无从知道**这次写入是否真的生效 —— 池里若已有一个更晚的标记
+                // （历史遗留，或 P0-2 那种两腿不一致的现场），存储里仍是旧值，而文案却说
+                // 「已按当日 24:00 设置」。实测：写入被忽略时存储留 `2099-12-31`，文案照旧。
+                //
+                // ⇒ 处置：**只说事实**（额度耗尽、出路是等次日/充值），把「实际生效时刻」
+                // 交给 UI 已有的 `resetTimeMs` / 徽章渲染 —— 那是从存储读出来的真值。
+                //
+                // ⚠️ 判据只用共享层的 `isCreditExhausted`，**不得**在这里 import
+                // `buddy-adapter.ts` 的 `isContentRejection` /
+                // `isChannelVerificationRejection`：探测层反向依赖某个渠道的适配器会
+                // 被 `account-probe-adapter.spec.ts` 的 `vi.mock` 一起变成 `undefined`
+                // （该陷阱已在本 issue 里被真实踩到一次）。其余两档（账号被封 /
+                // 请求形态被拒）由上游原文自带指引（「账号存在异常行为，已被限制使用」
+                // / 「请求被拦截」），故只做本档的措辞分辨。
+                message: creditExhausted
+                    ? `额度已耗尽（不是频率限流）：该账号在该模型上的配额用光 —— 请等次日配额重置或充值；${message}`
+                    : `仍受限：${message}`,
+                ...resetTimeMs !== undefined ? { resetTimeMs } : {},
             };
         }
         return { modelId, ok: false, message: `无法确认：${message}` };

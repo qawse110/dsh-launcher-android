@@ -1,0 +1,177 @@
+{
+  "rows": [
+    {
+      "id": "d1-car",
+      "dim": "D1",
+      "packetChars": 1137,
+      "baselineChars": 8496,
+      "injectedChars": 17777,
+      "judge": {
+        "injected": {
+          "exec": 1,
+          "spec": 2,
+          "risk": 1
+        },
+        "baseline": {
+          "exec": 2,
+          "spec": 3,
+          "risk": 1
+        },
+        "winner": "Y",
+        "why": "两份代码都被截断、不能直接运行，但 Y 已给出完整场景、灯光和跑车分块建模参数，X 只到材质且缺少车辆与控制逻辑。"
+      },
+      "winB": -1
+    },
+    {
+      "id": "d1-film",
+      "dim": "D1",
+      "packetChars": 1360,
+      "baselineChars": 4134,
+      "injectedChars": 2584,
+      "judge": {
+        "injected": {
+          "exec": 4,
+          "spec": 5,
+          "risk": 5
+        },
+        "baseline": {
+          "exec": 5,
+          "spec": 3,
+          "risk": 2
+        },
+        "winner": "X",
+        "why": "X的镜头/声音节拍与验收流程更具体可验，且明确风险规避；Y虽有可运行HTML片头，但整体分镜与风险控制较弱。"
+      },
+      "winB": 1
+    },
+    {
+      "id": "d2-bug",
+      "dim": "D2",
+      "packetChars": 998,
+      "baselineChars": 2810,
+      "injectedChars": 4110,
+      "judge": {
+        "injected": {
+          "exec": 5,
+          "spec": 5,
+          "risk": 5
+        },
+        "baseline": {
+          "exec": 4,
+          "spec": 4,
+          "risk": 3
+        },
+        "winner": "X",
+        "why": "X 给出可直接运行的幂等 rAF 方案、ResizeObserver 处理与量化验收，风险覆盖更全；Y 根因描述更细但代码仍保留元素 resize 失效点、相位恢复会跳且缺少验证指标。"
+      },
+      "winB": 1,
+      "expectHits": {
+        "baseline": 2,
+        "injected": 3,
+        "of": 4
+      }
+    },
+    {
+      "id": "d2-decide",
+      "dim": "D2",
+      "packetChars": 1051,
+      "baselineChars": 1807,
+      "injectedChars": 3117,
+      "judge": {
+        "injected": {
+          "exec": 5,
+          "spec": 5,
+          "risk": 5
+        },
+        "baseline": {
+          "exec": 3,
+          "spec": 3,
+          "risk": 2
+        },
+        "winner": "X",
+        "why": "X 给出可落地的真源划分、迁移与版本闸门代码、可复现验证指标及明确反转条件；Y 的 storage 合并仅注释未实现，缺验证方案。"
+      },
+      "winB": 1,
+      "expectHits": {
+        "baseline": 3,
+        "injected": 3,
+        "of": 4
+      }
+    },
+    {
+      "id": "d4-spec",
+      "dim": "D4",
+      "packetChars": 1001,
+      "baselineChars": 3743,
+      "injectedChars": 7895,
+      "judge": {
+        "injected": {
+          "exec": 2,
+          "spec": 2,
+          "risk": 2
+        },
+        "baseline": {
+          "exec": 3,
+          "spec": 3,
+          "risk": 3
+        },
+        "winner": "X",
+        "why": "X更贴近规格且代码结构更完整，Y明显增加额外视觉参数并偏离减半与颜色规则，两者代码均截断但X可补救性更高。"
+      },
+      "winB": -1,
+      "specKept": "5/5",
+      "specDropped": []
+    },
+    {
+      "id": "d4-launch",
+      "dim": "D4",
+      "packetChars": 1339,
+      "baselineChars": 5630,
+      "injectedChars": 4743,
+      "judge": {
+        "injected": {
+          "exec": 3,
+          "spec": 4,
+          "risk": 3
+        },
+        "baseline": {
+          "exec": 5,
+          "spec": 4,
+          "risk": 4
+        },
+        "winner": "Y",
+        "why": "Y 代码完整、两段式与硬停归零可直接开工并给出10次拖拽/失焦/多指验证；X 虽模型具体但终止路径截断、缺验证且角度取自按下点总位移，不符合第二段。"
+      },
+      "winB": -1,
+      "specKept": "4/4",
+      "specDropped": []
+    },
+    {
+      "id": "d5-top",
+      "dim": "D5",
+      "packetChars": 1075,
+      "baselineChars": 1960,
+      "injectedChars": 2522,
+      "judge": {
+        "injected": {
+          "exec": 4,
+          "spec": 5,
+          "risk": 5
+        },
+        "baseline": {
+          "exec": 5,
+          "spec": 4,
+          "risk": 4
+        },
+        "winner": "Y",
+        "why": "Y 对“居中正常/偏心异常”给出更可证伪的力臂坐标系假设，并覆盖高速自旋下单帧隧穿与不掩盖证据的验证边界；X 的冲量修复可直接开工但诊断面偏窄。"
+      },
+      "winB": 1,
+      "expectHits": {
+        "baseline": 5,
+        "injected": 4,
+        "of": 5
+      }
+    }
+  ]
+}

@@ -1,4 +1,5 @@
 import {isRealUserInput} from './wire.js'
+import {revisionMarker} from './advisor-scopes.js'
 
 export const REVIEW_CONTEXT_LIMIT=2200
 export function renderStageSummary(state,englishMode=false) {
@@ -32,8 +33,12 @@ export function createAdvisorFeedback({stages,coverage}) {
   const rows=coverage?.history?.({sessionId:String(session.id),requestId}) || []
   const latest=rows.at(-1)
   if(!latest)return ''
-  const checks=(latest.report?.checks || []).filter(c=>c.status!=='satisfied').slice(0,3).map(c=>({criterion:c.criterion.slice(0,90),status:c.status}))
-  return (policy.englishMode?'[Advisor status, stage not registered]':'【顾问状态 · 未登记阶段】')+JSON.stringify({tracked:false,verdict:latest.report?.verdict || 'unverified',checks,
-   action:policy.englishMode?'Use advisor_stage for complex dependencies. Fix established failures, obtain missing evidence, and do not repeat archived reports.':'复杂任务用advisor_stage登记当前阶段；已失败项需修复，缺证需补证。历史报告归档不重复展开。'})
+  const current=coverage.feedback?.({sessionId:String(session.id),root:session.header?.cwd||context.root,readEnabled:policy.readTools===true,revisionMarker:revisionMarker(events)})
+  const issues=(current?.openIssues||[]).filter(x=>x.requestId===requestId)
+  const source=issues.length?issues:(latest.report?.checks||[]).filter(c=>c.status!=='satisfied')
+  const ordered=source.slice().sort((a,b)=>(a.status==='failed'?0:1)-(b.status==='failed'?0:1))
+  const checks=ordered.slice(0,6).map(c=>({criterion:String(c.criterion).slice(0,110),status:c.status,action:c.action||'provide-evidence',...(c.materialReason?{reason:c.materialReason}:{})}))
+  return (policy.englishMode?'[Current advisor review, scoped not task completion]':'【当前顾问复核 · 局部状态非整体完成】')+JSON.stringify({tracked:false,verdict:latest.report?.verdict||'unverified',reviewPassed:source.length===0&&latest.report?.verdict==='pass',completionClaimAllowed:false,checks,omittedChecks:Math.max(0,source.length-checks.length),
+   action:policy.englishMode?'Repair established failures or obtain the specific missing evidence. If unavailable, share a pending version with its limits; edits alone do not close review items.':'已确认失败需修复，缺证需取得对应证据；确实无法补证可分享待验证版本并保留限制，改了文件不能自行清除复核问题。'})
  }
 }

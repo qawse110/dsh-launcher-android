@@ -1,5 +1,23 @@
 # Changelog
 
+## 5.10.10 - 2026-10-19
+
+- `web_fetch` in DeepSeek Harness no longer fails with `multiple usable web providers are registered (deepseek-fetch-api, http); configure one explicitly` (#43). To send `web_search` to modsearch, the plugin rewrites dsh's web settings, and that rewrite replaces the whole block, so it also dropped dsh's own `fetchProvider: http`. That was harmless while `http` was the only page fetcher. Newer dsh builds, the desktop app 44.7.0 among them, add a second one, `deepseek-fetch-api`, so dsh could no longer choose. The plugin now keeps `fetchProvider: http`. If you added a `- id: web` override to your profile patch as a workaround, you can delete it now, or leave it in place. Either way works. The dsh guide's example for switching search back now keeps that line too.
+
+## 5.10.9 - 2026-10-18
+
+- Correction to 5.10.8 for the DeepSeek Harness desktop app (#42). The dsh CLI refuses to change the desktop app's `desktop` profile (`profile "desktop" is managed exclusively by the Electron application`), so the command INSTALL.md gave there could not work. INSTALL.md now has the AI ask you to open **Plugins**, click **Add plugin**, and enter `@liustack/modsearch`, then confirm the install from the profile's `package.json`. The browser UI and other profiles are unchanged: the AI still installs those itself. The README and dsh guide say the same.
+
+## 5.10.8 - 2026-10-18
+
+- Asking an AI to install modsearch inside DeepSeek Harness (dsh) now installs the dsh plugin (#42). INSTALL.md used to install the skill everywhere, but dsh already has its own `web_search` tool, so the skill was never called and searches kept going to dsh's default provider. INSTALL.md now starts with a dsh step: when `DSH_SHELL=1` is set, it installs the plugin into the running profile (`DSH_PROFILE`, so the desktop app's `desktop` profile is covered too), checks it with `--dump-config`, and skips the skill. The README says the same next to the install sentence, and the skill tells a model inside dsh to point the user to the plugin.
+
+## 5.10.7 - 2026-10-16
+
+- New search engine: Keenable (#36). It searches with no key and no signup, on a pool of 1,000 requests an hour shared by everyone on the same IP. A free key (`modsearch config set keenable.apiKey <key>` or `KEENABLE_API_KEY`) gives you 100,000 requests a month of your own with no hourly cap. It sits second in the search chain, right after Firecrawl, so a machine with nothing set up still has a fallback when Firecrawl's allowance runs out. It searches only: page fetch stays with Firecrawl, agy, and local. The dsh settings card lists it next to Firecrawl as a keyless engine.
+- On Windows, a search that had already printed its result no longer crashes on the way out with `Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)` and exit code 3221226505 (#38). 5.10.6 ended the process the moment the result was written, which on Windows could tear down a network connection that was still closing, so callers that check the exit code threw away a good result. The CLI now sets its exit code and lets Node finish on its own. A 2 second backstop still ends a run that work abandoned at its deadline would otherwise keep alive.
+- A dsh plugin installed from the GitHub repository now says what went wrong (#41). The repository holds source only, so that install has no built CLI, and every search used to fail with a bare `Cannot find module .../dist/main.js`. The plugin now says the build is missing and to add it again by package name, `@liustack/modsearch`. The README and dsh docs say the same up front.
+
 ## 5.10.6 - 2026-10-04
 
 - dsh's `web_search` no longer dies with `tool call timed out after 60000ms` when the first engine is slow (#35). `--timeout` limits each engine, and every fallback engine used to start with a fresh budget, so a slow first engine could use up the host's whole 60 seconds before the fallback answered. The new `--deadline <ms>` limits the whole run: each engine gets the smaller of `--timeout` and the time left, and an engine whose turn comes after the deadline is skipped and listed in `attempts`. The dsh plugin now passes 40 seconds per engine and a 55 second deadline for `web_search` (configurable as `providerTimeoutMs` and `providerDeadlineMs`), and 120 and 180 seconds for `x_search` and `read_page`.

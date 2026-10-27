@@ -31,6 +31,8 @@
  * **⇒ 「每日随机派发」不是随机推送，而是「服务端按活跃信号决定要不要给」。**
  * 所以要领额度必须**先补两条事件**，再查 preview，再 claim。
  */
+import { randomUUID } from 'node:crypto';
+import { release as osRelease } from 'node:os';
 import { ZCODE_APP_VERSION_FALLBACK } from './zcode.js';
 import { extractZcodeLogId, formatZcodeEdgePageHint, hasZcodeUnusualActivity, looksLikeZcodeHtmlPage, parseZcodeBusinessCode, } from './zcode-diagnostics.js';
 /** ZCode 平台 origin（官方默认）。 */
@@ -63,24 +65,178 @@ export const ZCODE_EVENT_REPORT_URL = `${ZCODE_ORIGIN}/api/v1/event/report`;
 /** 客户端配置端点（captcha 配置与模型池都从这里来）。 */
 export const ZCODE_CLIENT_CONFIGS_URL = `${ZCODE_ORIGIN}/api/v1/client/configs`;
 /**
+ * 营销投放查询端点（**只读**）。
+ *
+ * ## 来源（逆向官方 `app.asar` 实证，2026-10-23）
+ *
+ * 官方 Electron 产物的 `createMarketingTouchService`（scoop 安装版
+ * `resources/app.asar` → `out/host/index.js`）：
+ *
+ * ```js
+ * GET  /api/v1/marketing/touch?seq=<n>          // 查投放（deliveries[]）
+ * POST /api/v1/marketing/touch/action           // 回执 {campaign_id, action_type}
+ * ```
+ *
+ * 请求头只有四个：`X-Device-Mid` / `X-Client-Language` /
+ * `X-ZCode-App-Version` /（可选）`Authorization`。
+ */
+export const ZCODE_MARKETING_TOUCH_URL = `${ZCODE_ORIGIN}/api/v1/marketing/touch`;
+/** 营销动作回执端点（`action_type` 实测只有 `confirm` / `cancel`）。 */
+export const ZCODE_MARKETING_ACTION_URL = `${ZCODE_ORIGIN}/api/v1/marketing/touch/action`;
+/**
+ * ★★ **受版本门控的功能**所需的**最低客户端版本**（实测，2026-10-23）。
+ *
+ * ## 门控在**两个端点上都成立**（两条独立实测）
+ *
+ * ### ① 营销投放（同一账号、同一套头，**只改这一个头**）
+ *
+ * | `X-ZCode-App-Version` | `GET /marketing/touch` 的 `data.deliveries` |
+ * |---|---|
+ * | `3.14.3`（本插件此前写入凭据的版本） | **`[]`（空）** |
+ * | `3.16.3`（用户装的官方版） | `[{campaign_id:"2113475573403824128", …}]` |
+ *
+ * ### ② **领取**（`POST /zcode-plan/billing/claim`，2026-10-23 真机一发定音）
+ *
+ * | `X-ZCode-App-Version`（**其余头完全相同**） | claim 返回 |
+ * |---|---|
+ * | `3.14.3` | **`400 / code 1004 "no permission"`**（官方文案 `manualClaimPlan.claim.failure.ineligible` = 「当前账号或**客户端版本**不满足领取条件」） |
+ * | `3.16.2` | **`200 / code 0`** + `data.plan.{user_plan_id, status:"active", entitlements:[3 亿 + 2 亿]}` ★ |
+ *
+ * ⇒ 只抬营销请求的版本**不够**：`1004` 会让「拿到了活动却领不到」，
+ *   而它**看起来像账号没资格**（极具误导性）。两个端点必须**同抬**。
+ *
+ * ⚠ 官方客户端的 claim 也报自己的版本（`app.asar` → `out/host/index.js` 的
+ *   `claimManualPlan`：`'X-ZCode-App-Version': Ir`；本机 `Ir` 即客户端版本
+ *   `3.16.2`，同文件 `var Vu="3.16.2"`）⇒ **我们报 3.14.3 才是那个异类**。
+ *
+ * ⚠ **只对这两条门控路径覆盖版本**（`zcodeVersionGatedAppVersion()`），
+ *   不改凭据里的 `app_version`、也**不**全局抬 `ZCODE_APP_VERSION_FALLBACK`：
+ *   推理路径的既有实测结论（含 `3012` 的消融矩阵）都是在 3.14.3 上取到的，
+ *   无证据地整体抬版本会把这些结论一起作废。
+ *
+ * ⚠ **下限未二分**：营销侧只测了 `3.14.3` 空 / `3.16.3` 有；领取侧测了
+ *   `3.14.3` 失败 / `3.16.2` 成功。取 `3.16.3` 是该区间内的保守上界，
+ *   **不声称它是最低下限**。
+ */
+export const ZCODE_VERSION_GATED_MIN_APP_VERSION = '3.16.3';
+/**
+ * 合法的客户端版本号形态（`major.minor.patch`，纯数字、**无前导零**）。
+ *
+ * ⚠ 它**是安全闸，不只是格式偏好**（2026-10-25 审计实测）：`app_version` 会原样
+ * 进 `User-Agent` / `X-ZCode-App-Version` / **URL 的 query**。`Headers()` 对非法
+ * 头值抛 `TypeError`（`"3.16.3\r\nX-Injected: 1"` 实测如此）⇒ 一份脏凭据（手改
+ * 备份导入）能把整个 zcode 请求打成未分类错误；而 `'3.16.3-beta.1'` / `'3.016.3'`
+ * 会被 `compareZcodeAppVersion` 当成「更大 / 等值」⇒ **绕过**门控。
+ *
+ * ⚠ 前导零也算脏：`3.016.3` 数值上等于 `3.16.3`，但不是官方会发出的形态。
+ */
+const ZCODE_APP_VERSION_PATTERN = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
+/**
+ * 「每个账号一个、进程内稳定」的伪会话 id。
+ *
+ * ⚠ 官方每个会话一个 uuid（抓包实测 `x-session-id: df5db422-…`，同会话内恒定）。
+ * 插件没有「会话」这一层，故退而求其次：**每个账号（`device_mid`）一个**、
+ * 请求间复用 —— 比每请求换新更接近真实客户端。
+ *
+ * ⚠⚠ **不能做成 `randomUUID()` 的模块级常量**（2026-10-25 审计打穿）：
+ * 那样**池里所有账号共用一个 session id**，上游完全可以把两个不同账号关联成
+ * 「同一会话」，而我们恰恰在多账号轮换 —— 这个关联没有任何真实客户端会产出。
+ */
+const ZCODE_SESSION_IDS = new Map();
+/** 取该账号的伪会话 id（首见时生成，进程内复用）。 */
+function zcodeSessionId(deviceMid) {
+    const key = typeof deviceMid === 'string' ? deviceMid : '';
+    const existing = ZCODE_SESSION_IDS.get(key);
+    if (existing !== undefined)
+        return existing;
+    const created = randomUUID();
+    ZCODE_SESSION_IDS.set(key, created);
+    return created;
+}
+/**
+ * 官方客户端的「平台三件套」—— **必须同源**。
+ *
+ * ## ⚠⚠ 为什么三件套要由同一个函数产出（2026-10-25 审计打穿）
+ *
+ * 改前是 `X-Platform: 'win32-x64'` / `X-Os-Category: 'windows'` 两处**硬编码**，
+ * 而 `X-Os-Version: os.release()` 是**真值** ⇒ 在非 Windows 宿主上同一请求里出现
+ * 「Windows 平台 + Darwin 内核号（如 `24.6.0`）」这种**任何官方客户端都不会发出**
+ * 的组合 —— 三件套自相矛盾本身就是一条新的指纹，与「对齐官方」的目的相反。
+ *
+ * ## 取舍
+ *
+ * - **win32 宿主**：三件套全取真值（`os.release()`，实测 `10.0.26100`）。
+ * - **其它宿主**：三件套**一起**伪装成官方 Windows 客户端（本文件存在的理由就是
+ *   「形状像官方」；只伪装一半反而是更强的异常信号）。
+ *
+ * ⚠ 残留且**已登记**的不一致：`system` 的 `# Environment` 段仍报**真实**平台
+ * （`buildEnvironmentSection` 默认 `process.platform`）—— 那是模型看的自我描述，
+ * 伪装它会降低工具使用正确率（bash vs powershell）。两者分属「请求指纹」与
+ * 「模型上下文」，刻意不强行统一；改这里时别顺手把 `# Environment` 也改成 win32。
+ */
+const ZCODE_SPOOF_PLATFORM = Object.freeze({
+    platform: 'win32-x64',
+    osCategory: 'windows',
+    osVersion: '10.0.26100',
+});
+/**
+ * 该宿主该发的平台三件套（三值同源，见上方注释）。
+ *
+ * ⚠ 两个形参都**必须入参化**（默认取真实宿主）：三件套的自洽性只在「非 win32
+ * 宿主」上才可能出问题，而 CI / 开发机大多是 win32 ⇒ 不注入就**永远测不到**那条
+ * 分支。2026-10-25 审计实测：在 Windows 上把 `X-Os-Version` 换回 `os.release()`
+ * 后，宿主机相关的断言**全绿** —— 因为本机的 `os.release()` 恰好就是
+ * `10.0.26100`，与伪装值逐字相同。故内核版本也必须能注入。
+ */
+export function zcodeClientPlatform(hostPlatform = process.platform, hostOsVersion = osRelease()) {
+    if (hostPlatform === 'win32') {
+        return { platform: 'win32-x64', osCategory: 'windows', osVersion: hostOsVersion };
+    }
+    return { ...ZCODE_SPOOF_PLATFORM };
+}
+/**
  * 构造 ZCode 的「来源标识」请求头。
  *
- * ⚠ 这些头是官方客户端在真实流量里发的。实测**它们不是 3012 的判据**
- * （判据是请求体里的 system 内容），但它们仍是「像官方客户端」的一部分，
- * 且 `X-Device-Mid` **是硬需求**（缺它 billing 全家桶回 400）。
+ * ## ★ 这些头的值以官方客户端的真实抓包为准（2026-10-25 逐字对齐）
+ *
+ * 官方 GUI 的一次 `/v1/messages` 带 **18 个头**。本函数此前只发 10 个，
+ * 且其中**两个的值与官方不符**：
+ *
+ * | 头 | 官方 | 本函数（改前） |
+ * |---|---|---|
+ * | `x-release-channel` | `production` | `stable` ✗ |
+ * | `x-platform` | `win32-x64` | `win32` ✗ |
+ *
+ * 并缺 7 个官方每次都带的头：`x-title` / `x-os-version` / `x-zcode-agent` /
+ * `x-session-id` / `x-zcode-session-type` / `x-request-id` / `x-zcode-trace-id`。
+ *
+ * ⚠ 旧注释写「实测它们不是 3012 的判据」—— 那是**旧版客户端**上取到的结论。
+ * 上游在 2026-10-23 升级到 `3.16.3` 之后，`405 + unusual activity` 开始在
+ * **所有**插件请求上稳定出现（跨账号、跨会话），而官方客户端同账号同网络正常
+ * ⇒ 头的形状重新成为首要嫌疑，故此处逐字对齐抓包。
+ *
+ * ⚠ `X-Device-Mid` **仍是硬需求**（缺它 billing 全家桶回 400）。
  */
 export function buildZcodeHeaders(credential, options = {}) {
-    const appVersion = credential.app_version ?? ZCODE_APP_VERSION_FALLBACK;
+    const appVersion = options.appVersion ?? zcodeVersionGatedAppVersion(credential);
+    const platform = options.platform ?? zcodeClientPlatform();
     const headers = {
         'User-Agent': `ZCode/${appVersion}`,
         'HTTP-Referer': ZCODE_ORIGIN,
+        'X-Title': 'Z Code@electron',
         'X-ZCode-App-Version': appVersion,
-        'X-Release-Channel': 'stable',
+        'X-Release-Channel': 'production',
         'X-Client-Language': 'zh-CN',
         'X-Client-Timezone': 'Asia/Shanghai',
         'X-Device-Mid': credential.device_mid,
-        'X-Platform': 'win32',
-        'X-Os-Category': 'windows',
+        'X-Platform': platform.platform,
+        'X-Os-Category': platform.osCategory,
+        'X-Os-Version': platform.osVersion,
+        'X-ZCode-Agent': 'glm',
+        'X-Session-Id': zcodeSessionId(credential.device_mid),
+        'X-ZCode-Session-Type': 'other',
+        'X-Request-Id': randomUUID(),
+        'X-ZCode-Trace-Id': randomUUID(),
         'anthropic-version': '2023-06-01',
     };
     if (options.json !== false)
@@ -182,7 +338,7 @@ export async function fetchZcodeBalance(credential, fetchImpl = fetch) {
         return undefined;
     if (typeof data.displayMode === 'string' && data.displayMode === 'enterprise') {
         // ⚠ 企业版**不下发额度数字**，也就没有可领活动 ⇒ 不发 preview 请求。
-        return { enterprise: true, buckets: [], remaining: 0, total: 0, claimablePlans: [] };
+        return { enterprise: true, buckets: [], remaining: 0, total: 0, claimablePlans: [], pendingPlans: [] };
     }
     const rawBuckets = Array.isArray(data.balances) ? data.balances : [];
     const buckets = [];
@@ -227,7 +383,75 @@ export async function fetchZcodeBalance(credential, fetchImpl = fetch) {
         expiresAt,
         planName: buckets[0]?.showName,
         claimablePlans: await fetchClaimablePlans(credential, fetchImpl),
+        pendingPlans: pendingPlansOf(data.plans),
     };
+}
+/**
+ * 从 `billing/balance` 的 `plans[]` 里挑出「**已领、但还没生效**」的计划。
+ *
+ * ## 判据（三条，缺一不可）
+ *
+ * | 条件 | 为什么 |
+ * |---|---|
+ * | `status === 'active'` | 只有 active 的计划是「已领到、未作废」 |
+ * | 有 `entitlements[].effective_at` | **生效时刻**；缺它就无法判断「还没生效」 |
+ * | `effective_at` **晚于现在** | 已生效的计划会变成 `balances` 里的桶 ⇒ 不该重复计入 |
+ *
+ * ⚠ **只统计 `effective_at` 未到的那部分 entitlement**（不是整个 plan）：
+ *   同一 plan 里可能混着已生效与未生效的条目。
+ * ⚠ **额度按同 `unit_type` 求和**（与营销投放那条同规则），单位不同不混加。
+ *
+ * @param nowUnixSeconds 「现在」（Unix 秒）。留成参数是为了可测。
+ */
+export function pendingPlansOf(rawPlans, nowUnixSeconds = Math.floor(Date.now() / 1000)) {
+    if (!Array.isArray(rawPlans))
+        return [];
+    const out = [];
+    for (const item of rawPlans) {
+        if (item === null || typeof item !== 'object')
+            continue;
+        const record = item;
+        if (record.status !== 'active')
+            continue;
+        const ents = Array.isArray(record.entitlements) ? record.entitlements : [];
+        let units = 0;
+        let unitType;
+        let effectiveAt;
+        let saw = false;
+        for (const ent of ents) {
+            if (ent === null || typeof ent !== 'object')
+                continue;
+            const entRecord = ent;
+            const eff = num(entRecord.effective_at);
+            // ⚠ 已生效（effective_at 已到）的条目不在这里算 —— 它已变成 balances 桶。
+            if (eff === undefined || eff <= nowUnixSeconds)
+                continue;
+            const grant = num(entRecord.grant_units);
+            if (grant === undefined)
+                continue;
+            const type = typeof entRecord.unit_type === 'string' && entRecord.unit_type.length > 0
+                ? entRecord.unit_type
+                : undefined;
+            if (unitType === undefined)
+                unitType = type;
+            if (type !== unitType)
+                continue;
+            units += grant;
+            effectiveAt = effectiveAt === undefined ? eff : Math.min(effectiveAt, eff);
+            saw = true;
+        }
+        if (!saw)
+            continue;
+        out.push({
+            planId: typeof record.plan_id === 'string' ? record.plan_id : '',
+            ...typeof record.name === 'string' ? { name: record.name } : {},
+            grantUnits: units,
+            ...unitType === undefined ? {} : { unitType },
+            effectiveAt,
+            endsAt: num(record.ends_at),
+        });
+    }
+    return out;
 }
 /**
  * 取「可领活动」摘要（**只读**，不消耗额度）。
@@ -250,8 +474,8 @@ export async function fetchZcodeBalance(credential, fetchImpl = fetch) {
  */
 async function fetchClaimablePlans(credential, fetchImpl) {
     try {
-        const appVersion = credential.app_version ?? ZCODE_APP_VERSION_FALLBACK;
-        const response = await fetchWithTimeout(fetchImpl, `${ZCODE_BILLING_PREVIEW_URL}?app_version=${encodeURIComponent(appVersion)}&platform=win32`, { method: 'GET', headers: buildZcodeHeaders(credential, { json: false }) }, 15_000);
+        const appVersion = zcodeCredentialAppVersion(credential);
+        const response = await fetchWithTimeout(fetchImpl, `${ZCODE_BILLING_PREVIEW_URL}?app_version=${encodeURIComponent(appVersion)}&platform=win32`, { method: 'GET', headers: buildZcodeHeaders(credential, { json: false, appVersion }) }, 15_000);
         if (!response.ok)
             return [];
         const parsed = await response.json();
@@ -284,12 +508,12 @@ async function fetchClaimablePlans(credential, fetchImpl) {
  * 幂等（服务端按 device_mid + 日期去重），故每次查 preview 前都可以补。
  */
 export async function reportZcodeActivation(credential, fetchImpl = fetch) {
-    const appVersion = credential.app_version ?? ZCODE_APP_VERSION_FALLBACK;
+    const appVersion = zcodeCredentialAppVersion(credential);
     for (const event of ['app_launch', 'app_daily_active']) {
         try {
             await fetchWithTimeout(fetchImpl, ZCODE_EVENT_REPORT_URL, {
                 method: 'POST',
-                headers: buildZcodeHeaders(credential, { json: true }),
+                headers: buildZcodeHeaders(credential, { json: true, appVersion }),
                 body: JSON.stringify({
                     event,
                     device_mid: credential.device_mid,
@@ -305,11 +529,11 @@ export async function reportZcodeActivation(credential, fetchImpl = fetch) {
 }
 /** 查当前可领的活动。 */
 export async function fetchZcodeClaimablePlans(credential, fetchImpl = fetch) {
-    const appVersion = credential.app_version ?? ZCODE_APP_VERSION_FALLBACK;
+    const appVersion = zcodeCredentialAppVersion(credential);
     const url = `${ZCODE_BILLING_PREVIEW_URL}?app_version=${encodeURIComponent(appVersion)}&platform=win32`;
     const response = await fetchWithTimeout(fetchImpl, url, {
         method: 'GET',
-        headers: buildZcodeHeaders(credential, { json: false }),
+        headers: buildZcodeHeaders(credential, { json: false, appVersion }),
     }, 25_000);
     if (!response.ok)
         return [];
@@ -350,6 +574,351 @@ export async function fetchZcodeClaimablePlans(credential, fetchImpl = fetch) {
     plans.sort((a, b) => b.priority - a.priority);
     return plans;
 }
+/** 比较两个点分版本号（只看数字段，缺失段按 0；非数字段取前导数字）。 */
+export function compareZcodeAppVersion(a, b) {
+    const segments = (value) => value.split('.').map((part) => {
+        const match = /^\s*(\d+)/.exec(part);
+        return match === null ? 0 : Number(match[1]);
+    });
+    const left = segments(a);
+    const right = segments(b);
+    const count = Math.max(left.length, right.length);
+    for (let index = 0; index < count; index += 1) {
+        const l = left[index] ?? 0;
+        const r = right[index] ?? 0;
+        if (l !== r)
+            return l < r ? -1 : 1;
+    }
+    return 0;
+}
+/**
+ * **受版本门控的请求**该用的 `app_version`：**凭据里的版本与最低版本取较大者**。
+ *
+ * 使用者只有两处（都是实测门控过的）：{@link fetchZcodeMarketingPlans} 与
+ * {@link claimZcodePlan}。**其余请求一律用凭据里的版本**（见常量注释里的理由）。
+ *
+ * ⚠ 取较大者（而不是恒定 3.16.3）是为了**向前兼容**：用户若在更新的官方版上
+ * 登录（凭据里写着 3.17.x），就用它自己的版本号，而不是把它降级成 3.16.3。
+ * 依据与「为什么不能改凭据本身」见 {@link ZCODE_VERSION_GATED_MIN_APP_VERSION}。
+ */
+export function zcodeVersionGatedAppVersion(credential) {
+    const stored = typeof credential.app_version === 'string' ? credential.app_version.trim() : '';
+    if (!ZCODE_APP_VERSION_PATTERN.test(stored))
+        return ZCODE_VERSION_GATED_MIN_APP_VERSION;
+    return compareZcodeAppVersion(stored, ZCODE_VERSION_GATED_MIN_APP_VERSION) < 0
+        ? ZCODE_VERSION_GATED_MIN_APP_VERSION
+        : stored;
+}
+/**
+ * **不受门控**的请求（query / body 里的 `app_version`）该用的版本。
+ *
+ * ⚠ 与 {@link zcodeVersionGatedAppVersion} 的分工必须分清：
+ * - 本函数 = 「凭据里的版本，但必须是干净的 semver」⇒ 拿不到干净的就用兜底值；
+ * - 门控版 = 「与 `3.16.3` 取较大者」⇒ 只给**实测过门控**的路径（见常量注释）。
+ *
+ * ## 为什么必须存在（2026-10-25 审计打穿）
+ *
+ * 改前这些站点写的是 `credential.app_version ?? ZCODE_APP_VERSION_FALLBACK` ——
+ * `??` **只挡 `undefined`/`null`**，于是空串会发出 `app_version=`、脏值会原样
+ * 发出（换行注入会让 `Headers()` 抛 `TypeError`）。而同一请求的头走门控、
+ * query 走凭据 ⇒ 还会出现「同一请求里两个版本号」的自相矛盾。
+ */
+export function zcodeCredentialAppVersion(credential) {
+    const stored = typeof credential.app_version === 'string' ? credential.app_version.trim() : '';
+    return ZCODE_APP_VERSION_PATTERN.test(stored) ? stored : ZCODE_APP_VERSION_FALLBACK;
+}
+/** 深度扫描投送物时的最大层数（投送物是服务端下发的任意 JSON）。 */
+const MARKETING_SCAN_MAX_DEPTH = 8;
+/**
+ * 把 `entitlements[]` 的 `grant_units` **求和**（同 `unit_type` 才相加）。
+ *
+ * ## ⚠ 为什么这里求和，而 `fetchZcodeClaimablePlans` 只取第一条
+ *
+ * 实测（2026-10-23，本机 4 个账号一致）1024 活动的 plan 有**两条** entitlement：
+ *
+ * ```json
+ * entitlements: [
+ *   { "show_name": "GLM-5.3-Flash", "unit_type": "token", "grant_units": 300000000 },
+ *   { "show_name": "GLM-5.3",       "unit_type": "token", "grant_units": 200000000 }
+ * ]
+ * ```
+ *
+ * 「5 亿」= 3 亿 + 2 亿 ⇒ 只取第一条会把这次领取**少报 2 亿**
+ * （用户看到的正是「5 亿 TOKENS」那行文案）。
+ *
+ * ⚠ **刻意不改 preview 那条路径**（它取 `entitlements[0]`）：那边实测每个 plan
+ * 只有一条 entitlement，改口径会牵动 plan 排序与额度展示，属**无证据的扩大改动**。
+ * 两条路径各有各的实测依据，故分开实现并在测试里分别钉住。
+ */
+function sumMarketingGrantUnits(plan) {
+    const raw = plan.entitlements;
+    if (!Array.isArray(raw))
+        return {};
+    let units = 0;
+    let unitType;
+    let saw = false;
+    for (const item of raw) {
+        if (item === null || typeof item !== 'object')
+            continue;
+        const record = item;
+        const value = num(record.grant_units);
+        if (value === undefined)
+            continue;
+        const type = typeof record.unit_type === 'string' && record.unit_type.length > 0 ? record.unit_type : undefined;
+        if (unitType === undefined)
+            unitType = type;
+        // 单位不同不混加（宁可少报，也不把 token 与积分加成一个数）。
+        if (type !== unitType)
+            continue;
+        units += value;
+        saw = true;
+    }
+    return saw ? { units, unitType } : { unitType };
+}
+/**
+ * 收集一个投送物里所有「形如 plan」的对象（按 `plan_id` 索引）。
+ *
+ * ⚠ 必须**递归找**而不是写死路径：实测同一份 `zcode_plan` 元数据出现在
+ * banner 的 `background.args`、`success_popup.hero.args` **等多处**
+ * （服务端把同一份 plan 描述镜像到每个资产位），而 popup 形态的路径又不同。
+ * 写死路径会在下一次投放改版时静默失效（少报额度、不发 confirm）。
+ *
+ * ⚠ 深度有上限（`MARKETING_SCAN_MAX_DEPTH`）：投送物是服务端可控的任意 JSON，
+ * 递归必须有界（与 `captcha-asset` 那类「服务端数据也要设界」的纪律一致）。
+ */
+function collectZcodeMarketingPlanMetas(root) {
+    const out = new Map();
+    const visit = (node, depth) => {
+        if (depth > MARKETING_SCAN_MAX_DEPTH || node === null || typeof node !== 'object')
+            return;
+        if (Array.isArray(node)) {
+            for (const item of node)
+                visit(item, depth + 1);
+            return;
+        }
+        const record = node;
+        const planId = record.plan_id;
+        if (typeof planId === 'string' && planId.length > 0) {
+            const meta = out.get(planId) ?? {};
+            if (typeof record.name === 'string' && record.name.length > 0)
+                meta.name = record.name;
+            const priority = num(record.priority);
+            if (priority !== undefined && meta.priority === undefined)
+                meta.priority = priority;
+            const grant = sumMarketingGrantUnits(record);
+            if (grant.units !== undefined) {
+                meta.grantUnits = grant.units;
+                meta.unitType = grant.unitType;
+            }
+            out.set(planId, meta);
+        }
+        for (const value of Object.values(record))
+            visit(value, depth + 1);
+    };
+    visit(root, 0);
+    return out;
+}
+/**
+ * 取一个投送物里所有按钮（banner 本体 + banner 的 `success_popup` + popup 本体）。
+ *
+ * 依据：`out/renderer/assets/src-oukR4Y1K.js` 的投放 schema ——
+ * `resource_position` 二选一（`banner` / `popup`），banner 另有 `success_popup`。
+ */
+function marketingButtonsOf(delivery) {
+    const out = [];
+    const pushButtons = (value) => {
+        if (!Array.isArray(value))
+            return;
+        for (const item of value) {
+            if (item !== null && typeof item === 'object')
+                out.push(item);
+        }
+    };
+    const banner = delivery.banner;
+    if (banner !== null && typeof banner === 'object') {
+        const record = banner;
+        pushButtons(record.buttons);
+        const popup = record.success_popup;
+        if (popup !== null && typeof popup === 'object')
+            pushButtons(popup.buttons);
+    }
+    const popup = delivery.popup;
+    if (popup !== null && typeof popup === 'object')
+        pushButtons(popup.buttons);
+    return out;
+}
+/**
+ * 从营销投送物里取出**可领 plan**（纯函数，便于单测）。
+ *
+ * 判据是按钮的 action：`{type:'claim_zcode_plan', args:{plan_id}}`
+ * —— 官方 renderer 里这条 action 被翻译成 `{type:'claim_plan', planId}` 交给
+ * 主进程的 `claimManualPlan()`，后者调的正是我们既有的
+ * `POST /zcode-plan/billing/claim`（**带 captcha**）。
+ *
+ * ⚠ 其余 action（`close` / `open_url` / `navigate` / `copy_text`）一律**不是**领取，
+ * 不得混进来（`close` 尤其危险：把它当领取会对着一个空 plan_id 发请求）。
+ */
+export function claimablePlansFromMarketingDeliveries(deliveries) {
+    if (!Array.isArray(deliveries))
+        return [];
+    const plans = [];
+    const seen = new Set();
+    for (const delivery of deliveries) {
+        if (delivery === null || typeof delivery !== 'object')
+            continue;
+        const record = delivery;
+        const campaignId = typeof record.campaign_id === 'string' && record.campaign_id.length > 0
+            ? record.campaign_id
+            : undefined;
+        const metas = collectZcodeMarketingPlanMetas(record);
+        const fallbackPriority = num(record.priority) ?? 0;
+        for (const button of marketingButtonsOf(record)) {
+            const action = button.action;
+            if (action === null || typeof action !== 'object')
+                continue;
+            const actionRecord = action;
+            if (actionRecord.type !== 'claim_zcode_plan')
+                continue;
+            const args = actionRecord.args;
+            const planId = args !== null && typeof args === 'object'
+                ? args.plan_id
+                : undefined;
+            if (typeof planId !== 'string' || planId.length === 0)
+                continue;
+            if (seen.has(planId))
+                continue;
+            seen.add(planId);
+            const meta = metas.get(planId) ?? {};
+            plans.push({
+                planId,
+                priority: meta.priority ?? fallbackPriority,
+                ...meta.name === undefined ? {} : { name: meta.name },
+                ...meta.grantUnits === undefined ? {} : { grantUnits: meta.grantUnits },
+                ...meta.unitType === undefined ? {} : { unitType: meta.unitType },
+                ...campaignId === undefined ? {} : { marketingCampaignId: campaignId },
+            });
+        }
+    }
+    return plans;
+}
+/**
+ * 查**营销投放**里的可领 plan（只读）。
+ *
+ * ## 为什么必须有这条来源（真实缺口，用户报障 2026-10-23）
+ *
+ * 用户报障原文：「我在 scoop 中装了 zcode 最新版 3.16.3，其中有 1024 程序员节
+ * 送的 5 亿 token，把这个领取功能集成在每日签到中一并领取」。
+ *
+ * 本机**只读实测**（4 个账号、`scripts/probe-zcode-marketing-touch.mjs`）：
+ *
+ * | 端点 | 结果 |
+ * |---|---|
+ * | `billing/preview` | `data.plans = []`（**永远是空**） |
+ * | `billing/balance` | `data.balances = []` |
+ * | `marketing/touch`（`3.16.3`） | `deliveries[0].banner.buttons[1].action = claim_zcode_plan(zcode-v3-start-plan-1024)` |
+ *
+ * ⇒ **1024 活动根本不走 `preview`**，只在营销投放里。只领 preview 的签到
+ * 永远看不到它（而它在 wire 上与「今天没活动」同形 —— 没有任何报错）。
+ *
+ * ⚠ **版本门控**：见 {@link ZCODE_VERSION_GATED_MIN_APP_VERSION}
+ * （同一个账号、同一套头，只有版本号不同：`3.14.3` → `deliveries: []`）。
+ *
+ * ⚠ **失败一律降级为空数组**，绝不影响 preview 那条主路径（与
+ * `fetchClaimablePlans` 同规矩：营销是补充，不是主体）。
+ */
+export async function fetchZcodeMarketingPlans(credential, fetchImpl = fetch) {
+    const appVersion = zcodeVersionGatedAppVersion(credential);
+    try {
+        const response = await fetchWithTimeout(fetchImpl, `${ZCODE_MARKETING_TOUCH_URL}?seq=0`, {
+            method: 'GET',
+            headers: buildZcodeHeaders(credential, {
+                json: false,
+                appVersion,
+                authorization: `Bearer ${credential.zcode_jwt}`,
+            }),
+            redirect: 'error',
+        }, 20_000);
+        if (!response.ok)
+            return [];
+        const parsed = await response.json();
+        return claimablePlansFromMarketingDeliveries(parsed.data?.deliveries);
+    }
+    catch {
+        return [];
+    }
+}
+/**
+ * 回报一次营销动作（`confirm` / `cancel`）——**写操作，best-effort**。
+ *
+ * ## 为什么要回报（对应用户可见的代价）
+ *
+ * 官方 renderer 在动作**成功后**立刻 `p(delivery, 'confirm')`
+ * （`out/renderer/assets/styles-n-UNIiNg.js`）。不回报的后果不是「少了记账」，
+ * 而是**服务端会继续重复投放同一个 campaign** ⇒ 我们每轮签到都会为一个
+ * 已经领过的 plan 再 mint 一次 captcha。captcha 是**设备级**配额
+ * （阿里云同设备每小时 150 次，见 `captcha-backoff.ts` 的开头），
+ * 为一个已领的 plan 反复消耗它是净负面。
+ *
+ * ⚠ **只在领取成功/已领取（`code 0` / `1003`）后调用**：`confirm` 的语义是
+ *   「本次活动我已处理完」。若在**失败**时回报，就等于告诉服务端
+ *   「别再给我看了」—— 用户会**白丢一次领取机会**（`cancel` 语义更明确地
+ *   表示放弃，本实现**从不**发送）。
+ *
+ * ⚠ **不参与 `noteZcodeRequest*` 埋点**：那套是给 `3012` 风控画像统计
+ *   「去推理/领取端点的请求」的，营销端点不是风控对象，混进去会污染画像。
+ *
+ * @returns 只有 `{code:0}` 才算成功（与官方 `z.object({code:z.literal(0)})` 同口径）。
+ */
+export async function reportZcodeMarketingAction(credential, campaignId, actionType, fetchImpl = fetch) {
+    const appVersion = zcodeVersionGatedAppVersion(credential);
+    try {
+        const response = await fetchWithTimeout(fetchImpl, ZCODE_MARKETING_ACTION_URL, {
+            method: 'POST',
+            headers: buildZcodeHeaders(credential, {
+                json: true,
+                appVersion,
+                authorization: `Bearer ${credential.zcode_jwt}`,
+            }),
+            body: JSON.stringify({ campaign_id: campaignId, action_type: actionType }),
+            redirect: 'error',
+        }, 15_000);
+        if (!response.ok)
+            return false;
+        const parsed = await response.json();
+        return parseZcodeBusinessCode(parsed.code) === 0;
+    }
+    catch {
+        return false;
+    }
+}
+/**
+ * 合并两个来源的可领 plan（**按 `planId` 去重 + priority 降序**）。
+ *
+ * ⚠ **`preview` 优先**：同一 `planId` 同时出现在两边时保留 preview 那份
+ *   （它的额度口径是既有实测过的），只把 marketing 的 `campaign_id`
+ *   **补进去**（否则那份 plan 领完了却不会回报 confirm）。
+ *
+ * ⚠ 排序按 `priority` 降序与两个来源各自的约定一致 —— 1024 活动的
+ *   `priority` 是 **101**，实测高于每日赠送那条（`fetchZcodeClaimablePlans`
+ *   的注释：官方「先领高优先级」），故它会排在最前、先被领取。
+ */
+export function mergeZcodeClaimablePlans(preview, marketing) {
+    const byId = new Map();
+    for (const plan of preview)
+        if (!byId.has(plan.planId))
+            byId.set(plan.planId, plan);
+    for (const plan of marketing) {
+        const existing = byId.get(plan.planId);
+        if (existing === undefined) {
+            byId.set(plan.planId, plan);
+            continue;
+        }
+        if (existing.marketingCampaignId === undefined && plan.marketingCampaignId !== undefined) {
+            byId.set(plan.planId, { ...existing, marketingCampaignId: plan.marketingCampaignId });
+        }
+    }
+    return [...byId.values()].sort((a, b) => b.priority - a.priority);
+}
 /**
  * 领取一个 plan。
  *
@@ -378,6 +947,21 @@ export async function claimZcodePlan(credential, planId, captcha, fetchImpl = fe
             headers: buildZcodeHeaders(credential, {
                 authorization: `Bearer ${credential.zcode_jwt}`,
                 captcha,
+                /**
+                 * ★★ **领取也必须抬版本**（2026-10-23 真机一发定音，见常量注释）：
+                 *
+                 * | `X-ZCode-App-Version`（其余头完全相同） | 返回 |
+                 * |---|---|
+                 * | `3.14.3`（凭据里的） | `400 / code 1004 "no permission"` |
+                 * | `3.16.2` | **`200 / code 0`** + `data.plan.{status:"active", …}` |
+                 *
+                 * ⚠ `1004` 的官方文案是「当前账号或**客户端版本**不满足领取条件」
+                 *   —— 不抬版本时，用户会看到「拿到了活动却领不到」，而它**看起来像
+                 *   账号没资格**（极易被误判成「这个账号不行」而不是「我们的版本号旧了」）。
+                 * ⚠ 官方客户端 claim 同样报自己的版本（`claimManualPlan` 的
+                 *   `'X-ZCode-App-Version': Ir`），**报 3.14.3 的才是我们**。
+                 */
+                appVersion: zcodeVersionGatedAppVersion(credential),
             }),
             body: JSON.stringify({ plan_id: planId }),
         }, 60_000);
@@ -514,12 +1098,12 @@ export async function claimZcodePlan(credential, planId, captcha, fetchImpl = fe
  * （{@link ZCODE_CAPTCHA_FALLBACK}）—— **不让配置拉取失败阻塞推理**。
  */
 export async function fetchZcodeCaptchaConfig(credential, fetchImpl = fetch) {
-    const appVersion = credential.app_version ?? ZCODE_APP_VERSION_FALLBACK;
+    const appVersion = zcodeCredentialAppVersion(credential);
     const url = `${ZCODE_CLIENT_CONFIGS_URL}?app_version=${encodeURIComponent(appVersion)}&platform=unknown`;
     try {
         const response = await fetchWithTimeout(fetchImpl, url, {
             method: 'GET',
-            headers: buildZcodeHeaders(credential, { authorization: `Bearer ${credential.zcode_jwt}`, json: false }),
+            headers: buildZcodeHeaders(credential, { authorization: `Bearer ${credential.zcode_jwt}`, json: false, appVersion }),
         }, 20_000);
         if (!response.ok)
             return undefined;
@@ -592,12 +1176,12 @@ export async function fetchZcodeCaptchaConfig(credential, fetchImpl = fetch) {
  * 失败返回 `undefined`，由调用方回退兜底表（**不让目录拉取失败让 provider 不可用**）。
  */
 export async function fetchZcodeModels(credential, fetchImpl = fetch) {
-    const appVersion = credential.app_version ?? ZCODE_APP_VERSION_FALLBACK;
+    const appVersion = zcodeCredentialAppVersion(credential);
     const url = `${ZCODE_CLIENT_CONFIGS_URL}?app_version=${encodeURIComponent(appVersion)}&platform=unknown`;
     try {
         const response = await fetchWithTimeout(fetchImpl, url, {
             method: 'GET',
-            headers: buildZcodeHeaders(credential, { authorization: `Bearer ${credential.zcode_jwt}`, json: false }),
+            headers: buildZcodeHeaders(credential, { authorization: `Bearer ${credential.zcode_jwt}`, json: false, appVersion }),
         }, 20_000);
         if (!response.ok)
             return undefined;

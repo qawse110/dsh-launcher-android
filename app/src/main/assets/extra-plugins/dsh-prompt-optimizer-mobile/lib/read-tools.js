@@ -116,7 +116,7 @@ export const TOOL_SCHEMAS = Object.freeze([
     // 不翻译成 PowerShell）⇒ Windows 与 Linux 上同一结果。只读；超出子集**显式失败**。
     description: '按 bash/POSIX 语义执行一条**只读**命令（' + SUPPORTED_COMMANDS.join('/') + '；'
       + '可用 ' + SUPPORTED_OPERATORS.join(' ') + ' 串联，`|` 按行过滤）。'
-      + '由插件自己实现，不依赖系统里有没有这些命令。写类命令与重定向会被拒绝。',
+      + '这是项目根内的虚拟文件查询，不是系统 shell，不能探测已安装程序或 PATH。写入、重定向和其他命令均被拒绝；拒绝会作为工具结果返回。',
     parameters: {
       type: 'object',
       properties: {
@@ -128,7 +128,7 @@ export const TOOL_SCHEMAS = Object.freeze([
 ])
 
 export const EN_TOOL_SCHEMAS = TOOL_SCHEMAS.map(t=>{
- const descriptions={read:'Read a line range of an authorized project file. Returns numbered source text.',glob:'List matching project files with ** and *; names alone are not evidence of file contents.',grep:'Search authorized project text using a regular expression; returns file:line:content.',run:'Execute the supported read-only POSIX subset. Writes, redirection and commands outside the supported subset are rejected.'}
+ const descriptions={read:'Read a line range of an authorized project file. Returns numbered source text.',glob:'List matching project files with ** and *; names alone are not evidence of file contents.',grep:'Search authorized project text using a regular expression; returns file:line:content.',run:'Query files within the project root using this virtual POSIX subset: '+SUPPORTED_COMMANDS.join(', ')+'. This is not a system shell and cannot probe installed programs or PATH. Writes, redirection and other commands return a rejected tool result.'}
  const parameters=JSON.parse(JSON.stringify(t.parameters))
  for(const [name,p]of Object.entries(parameters.properties||{}))if(p.description)p.description={path:'Path relative to the supplied project root.',pattern:'Glob or regular-expression pattern, as appropriate for this tool.',command:'Read-only POSIX command using the declared supported subset.'}[name]||''
  return {...t,description:descriptions[t.name],parameters}
@@ -323,9 +323,14 @@ export function executeReadOnlyTool(root, name, args) {
 /** 组装一条"助手请求工具"的消息（形状错了模型就看不到自己的调用）。
  *  宿主有 `createAssistantMessage` 时走工厂：它负责 **id 与冻结**（0.1.7 的 id 是 brand 类型，
  *  手搓字符串等于绕开契约）；没有才退回手搓（更早的宿主）。 */
-export function assistantToolCallMessage(calls, provider, model, mod) {
-  const content = calls.map((c) => ({ type: 'tool-call', id: c.id, name: c.name, arguments: c.arguments }))
-  const source = { provider: String(provider || ''), model: String(model || '') }
+export function assistantToolCallMessage(calls, provider, model, mod, response=null) {
+  // Preserve the exact provider response blocks/signatures when the SDK supplies them. Tool-only
+  // reconstruction loses native thinking replay required by current Messages routes.
+  const observed=Array.isArray(response?.content)?response.content:null
+  const observedCalls=observed?.filter(b=>b.type==='tool-call')||[]
+  const complete=observed && observedCalls.length===calls.length && calls.every(c=>observedCalls.some(b=>b.id===c.id&&b.name===c.name&&b.arguments===c.arguments))
+  const content = complete ? observed : calls.map((c) => ({ type: 'tool-call', id: c.id, name: c.name, arguments: c.arguments }))
+  const source = { provider: String(provider || ''), model: String(model || ''),...(complete&&response.replayState!==undefined?{replayState:response.replayState}:{}) }
   if (mod && typeof mod.createAssistantMessage === 'function') {
     return mod.createAssistantMessage({ content, source })
   }
@@ -359,15 +364,14 @@ function resolveShape(x) {
 /**
  * 收干**一轮**带工具的流：返回正文/思考/用量/结束原因/**工具调用清单**。
  *
- * 与 eval-llm.js 的 `drain` 分开写（不复用）的理由：drain 是**无工具**单次补全的收流器，
- * 生产路径上它一个字都不能变（"默认路径逐字节等价"这条约束就落在那几行上）。
- * 本函数多收两样：`tool-call-delta`（增量拼参数）与 `block-end`（装配好的调用）。
- * **不抛**：错误收进 `error` 字段，由调用方决定降级（见 runReadOnlyToolLoop 的回落）。
+ * eval-llm.js 的无工具收集也复用本函数。保留工具调用块与 provider replay，
+ * 供同一对话继续时使用；流错误返回 error，不把工具调用当成最终正文。
  */
 export async function drainWithTools(stream, t0, sink) {
   const out = {
     text: '', reasoning: '', usage: null, finish: null, error: null,
     ms: 0, calls: [], chunkTypes: {},
+    content: [], replayState: undefined,
   }
   // P11：**思维层要有内容**（用户 2026-09-21："只读工具开启时看不见思维"）。
   // 工具路径此前不接 sink ⇒ 进度面收不到任何流式片段 ⇒ 界面只有一个"已用 N 秒"。
@@ -388,13 +392,17 @@ export async function drainWithTools(stream, t0, sink) {
         if (!call) { call = { id: chunk.id, name: '', arguments: '' }; out.calls.push(call) }
         if (chunk.name) call.name = chunk.name
         call.arguments += String(chunk.argumentsDelta || '')
-      } else if (t === 'block-end' && chunk.block && chunk.block.type === 'tool-call') {
+      } else if (t === 'block-end' && chunk.block) {
+        if(['text','reasoning','tool-call'].includes(chunk.block.type))out.content.push({index:Number.isSafeInteger(chunk.index)?chunk.index:out.content.length,block:chunk.block})
+        if(chunk.block.type==='tool-call'){
         const b = chunk.block
         const hit = out.calls.find((c) => c.id === b.id)
         // block-end 给的是**装配好的**参数 ⇒ 覆盖 delta 拼出来的那份（文件头观察点）
         if (hit) { hit.name = b.name || hit.name; hit.arguments = b.arguments || hit.arguments }
         else out.calls.push({ id: b.id, name: b.name, arguments: b.arguments })
+        }
       } else if (t === 'finish') {
+        if(chunk.replayState!==undefined)out.replayState=chunk.replayState
         out.finish = chunk.reason || chunk.finish || null
         const kind = out.finish && out.finish.kind
         if (kind === 'error' || kind === 'aborted') {
@@ -416,6 +424,9 @@ export async function drainWithTools(stream, t0, sink) {
   } catch (e) {
     out.error = String((e && e.message) || e)
   }
+  out.content=out.content.sort((a,b)=>a.index-b.index).map(x=>x.block)
+  const endedText = out.content.filter(block => block.type === 'text').map(block => String(block.text || '')).join('')
+  if (endedText) { const missingDeltas = !out.text; out.text = endedText; if (missingDeltas) emit(endedText, '') }
   out.ms = Date.now() - t0
   return out
 }
@@ -424,7 +435,7 @@ export async function drainWithTools(stream, t0, sink) {
  * **只读工具循环**：模型自己决定读什么/搜什么，直到给出结论或撞上限。
  *
  * `llm.stream` 必须由调用方注入（本模块不碰 ctx，便于用桩做定点核对）。
- * **绝不静默失败**：出错/空产出/超时都如实报进返回值，由调用方决定回落（见 index.js）。
+ * 工具成功与拒绝都回到同一对话；只有最终模型失败才结束运行，不重新从原话生成。
  *
  * @param opts.llm      宿主 llm 服务（只要有 stream）
  * @param opts.cfg       { provider, model }
@@ -454,8 +465,8 @@ export async function runReadOnlyToolLoop(opts) {
   // 硬上限在这里兜住：调用方传 999 也只会跑到 6
   const want = Math.max(1, Math.floor(Number(o.count) || LOOP_DEFAULT_ROUNDS))
   const maxRounds = Math.min(want, LOOP_HARD_MAX_ROUNDS)
-  const budgetMs = Math.max(1000, Number(o.budgetMs) || LOOP_BUDGET_MS)
-  const deadline = t0 + budgetMs
+  const budgetMs = o.budgetMs === null ? null : Math.max(1000, Number(o.budgetMs) || LOOP_BUDGET_MS)
+  const deadline = budgetMs === null ? null : t0 + budgetMs
   const base = { root, maxRounds, budgetMs }
   const fail = (error) => ({
     ...base, ok: false, empty: true, error: String(error), text: '', rounds: 0,
@@ -464,7 +475,7 @@ export async function runReadOnlyToolLoop(opts) {
   if (typeof root !== 'string' || !root) return fail('no-root')
   if (!llm || typeof llm.stream !== 'function') return fail('llm-unavailable')
   // 工具结果的**消息形状**要在回灌之前拿到（0.1.7 起是 `role:'tool'` 一等消息，更早是 user+`tool-result` 块）。
-  // 拿不到就不造结果消息 ⇒ 循环自然收敛（模型不会再收到"读到了什么"）⇒ 由调用方走回落。
+  // 无法回灌工具结果时，在任何付费调用之前明确失败，不能把 tool-calls 当作最终回答。
   // **绝不自己猜一个形状**：猜错的代价是静默失效（台账 `UNSUPPORTED_CONTENT`：循环跑了两轮，
   // 第 2 轮会话说不出那条结果）。`o.shape` 是给测试注入用的。
   // ⚠ `env` 必须显式传：`loadLlmLib` 的默认值是**空表**（为的是让单测完全掌控候选顺序），
@@ -472,6 +483,7 @@ export async function runReadOnlyToolLoop(opts) {
   // 表现是"明明设了环境变量却still 解析不到"（测试夹具也指不过来）。
   const shapeT = o.shape === undefined ? await loadLlmLib({ env: process.env, argv1: process.argv[1], cwd: process.cwd() }) : o.shape
   const resultShape = resolveShape(shapeT)
+  if (typeof resultShape?.make !== 'function') return fail('tool-result-format-unavailable')
   /** 宿主 llm 模块本身（`loadLlmLib` 的返回带 `mod`；直接传模块时就是它）。给工厂用。 */
   const llmMod = shapeT && shapeT.mod && typeof shapeT.mod === 'object' ? shapeT.mod : (shapeT && typeof shapeT.createAssistantMessage === 'function' ? shapeT : null)
 
@@ -500,21 +512,25 @@ export async function runReadOnlyToolLoop(opts) {
 
   const notify = (event) => { try { if (typeof o.onEvent === 'function') o.onEvent(event) } catch { /* UI only */ } }
   const usageSum = {}
+  let usageKnownCalls=0,usageUnknownCalls=0
   const trace = []
   let rounds = 0
   let capped = false
+  let finalize = false
   let error = null
-  let text = ''
+  let text = '', finish = null
   for (let round = 1; round <= maxRounds + 1; round += 1) {
     if (signal?.aborted) { error = 'cancelled'; break }
-    const useTools = round <= maxRounds && now() < deadline
+    const useTools = !finalize && round <= maxRounds && (deadline === null || now() < deadline)
     if (round > 1) {
       // 上一轮的正文是**脚手架**（"我先读一下项目结构…"），到下一轮就作废。
       // 不清掉的话，最终产出会被脚手架污染——这是 0.5 实测踩到的。
       text = ''
     }
-    // 到上限这一轮：**明确告诉模型"到此为止，用已有证据给结论"**（不许它继续要工具）
-    if (round === maxRounds + 1) {
+    // Finalization stays in this conversation: the original input, assistant calls and
+    // every tool result (including rejections) remain visible to the model.
+    if (!useTools) {
+      capped = true
       messages.push({
         role: 'user',
         content: [{ type: 'text', text: o.finalNote || '【系统】已达本次查证轮次上限，请立即用已获得的证据给出 JSON 产出，不要再请求工具。' }],
@@ -531,8 +547,10 @@ export async function runReadOnlyToolLoop(opts) {
       stream = llm.stream({
         provider: cfg.provider,
         model: cfg.model,
+        // 会话标识：网关要求的 x-*-session 头由它派生（缺了就是 400）
+        ...(o.sessionId ? { sessionId: String(o.sessionId) } : {}),
         system,
-        messages,
+        messages: messages.slice(),
         // 0.7.5：思考档位也走这条路径（开"只读工具"时模型调用在这里发起）。
         // 按 cfg 选定的那个模型查表；没配就不传，由 provider 用默认档。
         ...(cfg.reasoningEffort ? { reasoningEffort: cfg.reasoningEffort } : {}),
@@ -541,19 +559,26 @@ export async function runReadOnlyToolLoop(opts) {
         ...(signal ? { signal } : {}),
       })
     } catch (e) {
-      return { ...base, ok: false, empty: true, error: 'stream-threw:' + String((e && e.message) || e), text: '',
-        rounds, toolCalls: trace.length, names: namesOf(trace), trace, capped, ms: now() - t0 }
+      usageUnknownCalls++;error='stream-threw:'+String((e&&e.message)||e);break
     }
     const r = await drainWithTools(stream, rt, typeof opts.onDelta === 'function' ? opts.onDelta : null)
     rounds = round
+    finish = r.finish
+    if(r.usage&&Object.values(r.usage).some(x=>typeof x==='number'&&Number.isFinite(x)))usageKnownCalls++;else usageUnknownCalls++
     if (r.usage) for (const [key, value] of Object.entries(r.usage)) {
       if (typeof value === 'number' && Number.isFinite(value)) usageSum[key] = (usageSum[key] || 0) + value
     }
+    if (signal?.aborted) { error = 'cancelled'; break }
     if (r.text) text = r.text
     if (r.error) { error = r.error; break }
     const calls = Array.isArray(r.calls) ? r.calls.filter((c) => c && c.id && c.name) : []
-    if (!useTools || calls.length === 0) break
-    messages.push(assistantToolCallMessage(calls, cfg.provider, cfg.model, llmMod))
+    if (!useTools && calls.length) { error = 'tool-calls-after-finalization'; break }
+    if (!useTools || calls.length === 0) {
+      const kind = typeof r.finish === 'object' ? r.finish?.kind : r.finish
+      if (!['stop', 'end', 'complete', 'completed'].includes(kind)) error = 'optimizer-incomplete:' + String(kind || 'missing-finish')
+      break
+    }
+    messages.push(assistantToolCallMessage(calls, cfg.provider, cfg.model, llmMod, r))
     const outputs = []
     for (const call of calls) {
       let args = {}
@@ -573,15 +598,16 @@ export async function runReadOnlyToolLoop(opts) {
         ok: res.ok === true && res.rejected !== true, ms: now() - st })
       outputs.push(res)
     }
+    if (signal?.aborted) { error = 'cancelled'; break }
     messages.push(...toolResultMessages(calls, outputs, resultShape))
-    if (round === maxRounds) capped = true
-    // 形状拿不到 ⇒ 没有结果消息 ⇒ 下一轮模型看不到任何读取内容，循环到此为止（不花第二轮的钱）
-    if (!resultShape || typeof resultShape.make !== 'function') break
+    // A rejected read is a tool result, not a failed model completion. Close further
+    // lookup, then let the model finish from this same conversation once.
+    if (outputs.some(output => output.rejected === true)) finalize = true
   }
   const outText = String(text || '')
   return {
-    ...base, ok: !error, error, text: outText, rounds, toolCalls: trace.length,
-    usageSum: Object.keys(usageSum).length ? usageSum : null,
+    ...base, ok: !error, error, finish, text: outText, rounds, toolCalls: trace.length,
+    usageSum: Object.keys(usageSum).length ? usageSum : null,usageComplete:usageUnknownCalls===0,usageKnownCalls,usageUnknownCalls,
     names: namesOf(trace), trace, capped, ms: now() - t0, empty: outText.trim().length === 0,
   }
 }

@@ -22,7 +22,7 @@
  *    「没有 Claimable」反推（与 Qoder「领取成功后列表仍非空」同型教训）。
  */
 import { MINIMAX, MINIMAX_CREDIT_DETAILS_PATH, MINIMAX_REQUEST_TIMEOUT_MS, MINIMAX_SIGNIN_CLAIM_PATH, MINIMAX_SIGNIN_STATUS_PATH, } from './minimax-product.js';
-import { minimaxHeaders } from './minimax.js';
+import { describeMinimaxGeoRoute, minimaxFetch, minimaxHeadersFor } from './minimax.js';
 import { roundCredits } from './credits.js';
 /** 单日状态（asar `SigninDayStatus`）。 */
 export const MINIMAX_SIGNIN_STATUS = Object.freeze({
@@ -248,19 +248,47 @@ function unwrapEnvelopeData(payload) {
  *
  * ⚠️ 不抛错 —— 调用方按 `ok` 分支处理（批量领取时单账号失败不应中断其余账号）。
  */
-async function requestEnvelope(url, credential, init, fetcher) {
+async function requestEnvelope(url, credential, init, fetcher, product, xff) {
     try {
         // ⚠️ 必须传**真正的 `Headers` 实例**，不能 `{...headers}` 摊平成普通对象 ——
         // 后者会被 fetch 正常接受（看不出问题），但调用方拿到的 `.headers` 不再有
         // `.get()`，任何「断言某个头没被误设」的检查都会崩（写用例时实测到了）。
-        const headers = minimaxHeaders(credential);
-        if (init.body !== undefined)
-            headers.set('Content-Type', 'application/json');
-        const response = await fetcher(url, {
-            method: init.method,
-            headers,
-            ...init.body === undefined ? {} : { body: init.body },
-            signal: AbortSignal.timeout(MINIMAX_REQUEST_TIMEOUT_MS),
+        //
+        // ⚠️ 这里返回的是**构造器**：`minimaxFetch` 每跳调用一次，保证跟随重定向时
+        // 凭据被**重新附上**（fetch 自动跟随会剥掉 Authorization，issue IKMEVG）。
+        const buildInit = () => {
+            // ⚠️ 走 `minimaxHeadersFor`：国际站会附上用户设置的 `X-Forwarded-For`
+            //（绕开 Akamai 按出口 IP 的地理分流，见 `src/minimax.ts` 的 `withMinimaxXff`）。
+            const headers = minimaxHeadersFor(credential, xff, product.id);
+            if (init.body !== undefined)
+                headers.set('Content-Type', 'application/json');
+            return {
+                method: init.method,
+                headers,
+                ...init.body === undefined ? {} : { body: init.body },
+                signal: AbortSignal.timeout(MINIMAX_REQUEST_TIMEOUT_MS),
+            };
+        };
+        /**
+         * ⚠️ **带传输级重试 + 保凭据跟随重定向**，两者都是真实缺陷的修法：
+         *
+         * 1. 传输级重试（2026-10-15）—— 本机环境里的 HTTPS 检查代理约 **50%**
+         *    概率打断到本家的请求（`fetch failed ← SELF_SIGNED_CERT_IN_CHAIN`），
+         *    签到端实测 10 次里失败 5 次；
+         * 2. 保凭据跟随 3xx（2026-10-17，issue IKMEVG）—— `agent.minimax.io`
+         *    恒 307 到 `agent.minimaxi.com`，而 fetch 跨 origin 跟随会剥掉
+         *    `Authorization` ⇒ 第二跳无凭据 ⇒ `400 invalid signature`。
+         *
+         * ⚠️ 两者合成在 `minimaxFetch` 一处（`src/minimax.ts`），与推理 / 目录
+         * 路径**共用同一份**实现 —— 本文件不另写判据（同义判据分两处必然漂移）。
+         *
+         * ⚠️ `onGeoRoute`：在**跟随之前**记下「这是地理路由」（跟随后 401 与
+         * 「凭据失效」逐字同形，事后无法区分）。
+         */
+        let geoRouted = false;
+        const response = await minimaxFetch(url, buildInit, {
+            fetcher,
+            onGeoRoute: () => { geoRouted = true; },
         });
         const text = await response.text();
         let payload;
@@ -280,6 +308,81 @@ async function requestEnvelope(url, credential, init, fetcher) {
             return { ok: false, code: -1, message: '响应无法解析' };
         }
         const record = payload;
+        /**
+         * ⚠️⚠️ **地理路由必须给出可操作文案**（issue IKMEVG，2026-10-17）。
+         *
+         * 判据是 `geoRouted`（跟随**之前**看到的 307），而不是响应体 ——
+         * 因为跟到中国站后，国际站 token 得到的 `401 invalid access token`
+         * 与「凭据真失效」**逐字同形**（本机实测），拿它判会把「换个网络就能用」
+         * 误报成「请重新登录」（用户重登一百次也没用）。
+         *
+         * ⚠️ 只在**真的失败**时用这条文案：若用户设了可用的 XFF、请求成功，
+         * `geoRouted` 为 false（根本没 307），不会走到这里。
+         *
+         * ⚠️⚠️ **必须把真实业务错误一起传进去**（自查发现的真实缺陷）：
+         * `geoRouted` 只说明「这次请求经历过 307」，**不说明失败原因就是它**。
+         * 实测反例：`307 → 402 insufficient_balance_error` 时，若整段换成地理路由
+         * 说明，用户会一直去折腾网络，而**「去充值」这个唯一有效动作彻底消失**。
+         * 故这里取响应体里的可读原因（`describeMinimaxApiError`）一并透出。
+         */
+        if (geoRouted && !response.ok) {
+            return {
+                ok: false,
+                code: response.status,
+                message: describeMinimaxGeoRoute(describeMinimaxApiError(record)),
+            };
+        }
+        /**
+         * ⚠️⚠️ **HTTP 非 2xx 必须判失败**（2026-10-17 修复的真实缺陷，issue IKMEVG）。
+         *
+         * ## 修前是什么样
+         *
+         * 整个函数只解析 JSON 体、**从不看 HTTP 状态码**（全文件唯一的
+         * `response.status` 只出现在上面那条「非 JSON」文案里）。于是
+         * `400 {"error":"invalid signature"}` 这种**没有 `base_resp`** 的响应体
+         * 会走到下面的 `statusCode === undefined` ⇒ 被判 **`ok: true`**。
+         *
+         * ## 后果（用户看到的正是这三条）
+         *
+         * | 入口 | 拿到 `ok:true` 之后 | 面板文案 |
+         * |---|---|---|
+         * | `claim` | `data.claim_result` 缺失 | 「签到响应缺少有效的 claim_result」 |
+         * | `signin/status` | 形状不认 ⇒ `null` | 签到状态不可用 |
+         * | `credit/details` | `details`/`total_count` 都缺失 ⇒ `null` | 「余额查询失败」 |
+         *
+         * ⇒ 一条「ALB 说没凭据」，被翻译成三句**与真因无关**的话。
+         *
+         * ## ⚠️ 为什么这一格此前零覆盖
+         *
+         * 反向验证实测：注入 `if (!response.ok) return {ok:false…}` 后跑 62 条
+         * minimax 用例 **全绿** —— 既有用例构造的响应全是 200 + 合法业务码，
+         * 结构上抓不到这个分支。
+         *
+         * ## 取值口径
+         *
+         * - 报文里有 `base_resp.status_code` 时**仍以它为准**（本家「HTTP 200 +
+         *   业务码」的既有习惯不变，见下面那段），HTTP 状态只作兜底；
+         * - 把响应体里的 `error` / `error_description` / `message` 拼进文案 ——
+         *   这条是**唯一有用的线索**（`invalid signature` 与
+         *   `invalid access token` 指向完全不同的动作：前者是网关/重定向问题，
+         *   后者才是凭据问题），丢掉它就只剩一句无信息的「失败」。
+         */
+        const apiError = describeMinimaxApiError(record);
+        if (!response.ok) {
+            const suffix = apiError === undefined ? '' : `：${apiError}`;
+            if (response.status === 401 || response.status === 403) {
+                return {
+                    ok: false,
+                    code: response.status,
+                    message: `凭据已失效（HTTP ${response.status}）${suffix || '，请重新登录该账号'}`,
+                };
+            }
+            return {
+                ok: false,
+                code: response.status,
+                message: `服务端返回 HTTP ${response.status}${suffix}`,
+            };
+        }
         const baseResp = typeof record.base_resp === 'object' && record.base_resp !== null
             ? record.base_resp
             : {};
@@ -298,20 +401,85 @@ async function requestEnvelope(url, credential, init, fetcher) {
         };
     }
 }
+/**
+ * 从**非信封**错误体里取一句人类可读的原因。
+ *
+ * 本家在失败时不给 `base_resp`，而是几种平铺形状（都是实测/已知形态）：
+ * - `{"error":"invalid signature"}` —— ALB 网关层（无凭据/签名不对）；
+ * - `{"error":"invalid access token"}` —— 凭据层（过期/非本站）；
+ * - `{"error":"invalid_grant","error_description":"…"}` —— OAuth 层；
+ * - `{"code":401,"message":"auth failed"}` —— 推理端点的自家信封。
+ *
+ * ⚠️ **必须如实透出原文**：`invalid signature` 与 `invalid access token`
+ * 指向**完全不同**的处置动作（前者是网关/重定向，后者要重新登录），
+ * 压成一句笼统的「查询失败」会让用户照着错的指引去重登。
+ *
+ * ⚠️ 只取第一个可用字段并**截断到 200 字符**：错误体可能很长（HTML/堆栈），
+ * 而它要进 UI 文案。取不到就返回 `undefined`（**不编造**原因）。
+ */
+function describeMinimaxApiError(record) {
+    const candidates = [
+        record.error_description,
+        record.error,
+        record.message,
+        record.msg,
+        // 嵌套形态：`{ error: { message } }`
+        typeof record.error === 'object' && record.error !== null
+            ? record.error.message
+            : undefined,
+    ];
+    for (const candidate of candidates) {
+        if (typeof candidate === 'string' && candidate.trim().length > 0) {
+            const text = candidate.trim();
+            return text.length > 200 ? `${text.slice(0, 200)}…` : text;
+        }
+    }
+    return undefined;
+}
 /** 构造带 `timezone_id` 的 URL。 */
 function withTimezone(base, path, timezoneId) {
     const url = new URL(`${base}${path}`);
     url.searchParams.set('timezone_id', timezoneId);
     return url.toString();
 }
-/** 查询签到状态；失败返回 `null`（不抛错）。 */
-export async function fetchMinimaxSigninStatus(credential, fetcher = fetch, product = MINIMAX) {
+/**
+ * 查询签到状态；失败返回 `null`（不抛错）。
+ *
+ * ⚠️⚠️ **本函数会丢弃失败原因**（返回 `null` 而非原因）—— 面板只能显示一句
+ * 写死的「余额查询失败」。要拿到原因请用 {@link fetchMinimaxSigninStatusDetailed}。
+ * 保留本签名是为了不破坏既有调用点与 `ProviderCredits.fetchStatus` 契约。
+ */
+export async function fetchMinimaxSigninStatus(credential, fetcher = fetch, product = MINIMAX, xff) {
+    const detailed = await fetchMinimaxSigninStatusDetailed(credential, fetcher, product, xff);
+    return detailed.status;
+}
+/**
+ * 查询签到状态，**失败时带原因**（`{ status: null, error }`）。
+ *
+ * ## ⚠️⚠️ 为什么必须有这个变体（真实缺陷，2026-10-17 审计打穿）
+ *
+ * `requestEnvelope` 会为失败构造**可操作**的文案（地理路由的两条出路 /
+ * `凭据已失效（HTTP 401）：invalid access token` / `服务端返回 HTTP 400：invalid signature`），
+ * 但 {@link fetchMinimaxSigninStatus} 与 {@link fetchMinimaxCreditBalance} 在
+ * `!result.ok` 时**直接 `return null`** ⇒ 那条文案**一行都到不了 UI**，
+ * 面板最终只显示 `jet-hub-rpc.ts` 里写死的「余额查询失败」。
+ *
+ * ⇒ 症状就是用户报障的原话「余额查询失败」**在修复后逐字未变** ——
+ *   修好了判据，却把判据的结论扔掉了。
+ *
+ * 本仓库既有先例：`fetchBalanceDetailed`（codearts / gemini / clio 那一批）
+ * 就是为「失败原因必须区分」而存在的。这里照同一模式补两个 Detailed 变体。
+ */
+export async function fetchMinimaxSigninStatusDetailed(credential, fetcher = fetch, product = MINIMAX, xff) {
     const url = withTimezone(product.apiHost, MINIMAX_SIGNIN_STATUS_PATH, resolveMinimaxTimezoneId());
-    const result = await requestEnvelope(url, credential, { method: 'GET' }, fetcher);
+    const result = await requestEnvelope(url, credential, { method: 'GET' }, fetcher, product, xff);
     if (!result.ok)
-        return null;
+        return { status: null, error: result.message };
     const panel = parseMinimaxSigninPanel(unwrapEnvelopeData(result.payload));
-    return panel === undefined ? null : minimaxPanelToCheckinStatus(panel);
+    if (panel === undefined) {
+        return { status: null, error: '签到面板响应形状不符合预期（服务端可能改版）' };
+    }
+    return { status: minimaxPanelToCheckinStatus(panel) };
 }
 /**
  * 领取每日签到。
@@ -321,9 +489,9 @@ export async function fetchMinimaxSigninStatus(credential, fetcher = fetch, prod
  *
  * ⚠️ 本函数**不抛错**（失败也返回 `failed`），保证批量领取不因单账号中断。
  */
-export async function claimMinimaxDailyCheckin(credential, fetcher = fetch, product = MINIMAX) {
+export async function claimMinimaxDailyCheckin(credential, fetcher = fetch, product = MINIMAX, xff) {
     const url = withTimezone(product.apiHost, MINIMAX_SIGNIN_CLAIM_PATH, resolveMinimaxTimezoneId());
-    const result = await requestEnvelope(url, credential, { method: 'POST', body: '{}' }, fetcher);
+    const result = await requestEnvelope(url, credential, { method: 'POST', body: '{}' }, fetcher, product, xff);
     if (!result.ok) {
         return { kind: 'failed', code: result.code, message: result.message };
     }
@@ -379,32 +547,112 @@ export async function claimMinimaxDailyCheckin(credential, fetcher = fetch, prod
  *   **不是**「查询失败」。两者必须区分（`null` 才是失败）。
  * - ⚠️ `base_resp.status_code` 非 0 ⇒ `null`（真失败）。
  *
- * ⚠️ **`expiredTotal` 仍为 0**：`details[]` 里没有区分「本周期有效」的标志
- *（`credit_type` 的语义未实测），故**不凭猜测分类**。`packages` 同理留空 ——
- * 需要时再按实测补充，**不得**用 locale 文案反推字段名。
+ * ## `packages` 的产出（2026-10-20 用户报障后补）
+ *
+ * 用户报障原文：「MiniMax Code 积分也有到期时间，也应当有相同功能」（附 AStudio
+ * 面板截图作参照）。此前本函数把 `packages` **硬编码成 `[]`**，理由是
+ * 「`credit_type` 的语义未实测，不凭猜测分类」—— 但那个理由说的是**分类**
+ * （哪些算过期），与**到期时刻**是两件事：每个 `details[]` 条目都带
+ * `expire_at_ms`（毫秒时间戳，实测 2026-10-20 真实账号 20 条全部有值），
+ * 直接可用，无需猜 `credit_type` 语义。
+ *
+ * 实测形状（两站各取真实账号，`GET /minimax-cloud/api/v1/credit/details`）：
+ *
+ * | 发放 `granted_at_ms` | 剩余 `remaining_amount` | 到期 `expire_at_ms` |
+ * |---|---|---|
+ * | 2026-10-20 01:41:32 | 1000.00 | 2026-11-19 00:00:00 |
+ * | 2026-10-19 00:40:51 | 1000.00 | 2026-11-18 00:00:00 |
+ * | 2026-10-18 02:24:45 | 400.00 | 2026-11-17 00:00:00 |
+ *
+ * ⇒ 每条明细就是一个独立的「积分包」，到期时刻 = `granted_at_ms` 的 30 天后零点。
+ * 这正是「临期优先」要的信息：先烧最快作废的那一笔。
+ *
+ * ⚠️ **`expiredTotal` 仍为 0**：它要与 `total` 相加构成「已过期」口径，
+ *   而本响应**不下发已过期条目**（服务端只回有效包）⇒ 无从计算，不编造。
+ *   `packages[].active` 恒为 `true` 是基于「服务端只回有效包」的实测；
+ *   若将来它开始回过期条目，**必须**改用 `expire_at_ms > Date.now()` 判定
+ *   （已在该处留注释）。
  */
-export async function fetchMinimaxCreditBalance(credential, fetcher = fetch, product = MINIMAX) {
+export async function fetchMinimaxCreditBalance(credential, fetcher = fetch, product = MINIMAX, xff) {
+    const detailed = await fetchMinimaxCreditBalanceDetailed(credential, fetcher, product, xff);
+    return detailed.balance;
+}
+/**
+ * 查询积分余额，**失败时带原因**（`{ balance: null, error }`）。
+ *
+ * ⚠️⚠️ 理由见 {@link fetchMinimaxSigninStatusDetailed}：原变体把
+ * `requestEnvelope` 的可操作文案**整个丢弃**（`return null`），面板只显示写死的
+ * 「余额查询失败」—— 于是用户永远不知道是地理分流、凭据失效还是网关签名。
+ * 本函数把它透出来，供 `fetchBalanceDetailed` 通道使用。
+ */
+export async function fetchMinimaxCreditBalanceDetailed(credential, fetcher = fetch, product = MINIMAX, xff) {
     const url = `${product.apiHost}${MINIMAX_CREDIT_DETAILS_PATH}`;
-    const result = await requestEnvelope(url, credential, { method: 'GET' }, fetcher);
+    const result = await requestEnvelope(url, credential, { method: 'GET' }, fetcher, product, xff);
     if (!result.ok)
-        return null;
+        return { balance: null, error: result.message };
     // ⚠️ 余额响应是**平铺**的（`details` / `total_count` 与 `base_resp` 同级，
     // 无 `data`）；`unwrapEnvelopeData` 对这种形状会原样返回顶层。
     const data = unwrapEnvelopeData(result.payload);
     // ⚠️ `base_resp.status_code` 由 `requestEnvelope` 判过，这里只需确认形状：
     // 若连 `details` 与 `total_count` 都没有，说明响应形状不对，不编造 0。
     const details = Array.isArray(data.details) ? data.details : undefined;
-    if (details === undefined && finiteNumber(data.total_count) === undefined)
-        return null;
+    if (details === undefined && finiteNumber(data.total_count) === undefined) {
+        return { balance: null, error: '余额响应形状不符合预期（服务端可能改版）' };
+    }
     // ⚠️ 余额 = 各包 `remaining_amount` 之和；缺失 `details` ⇒ 0（真的为 0）。
     let total = 0;
+    const packages = [];
     for (const entry of details ?? []) {
         if (typeof entry !== 'object' || entry === null)
             continue;
-        const remaining = looseAmount(entry.remaining_amount);
-        if (remaining !== undefined)
-            total += remaining;
+        const row = entry;
+        const remaining = looseAmount(row.remaining_amount);
+        if (remaining === undefined)
+            continue;
+        total += remaining;
+        const granted = finiteNumber(row.granted_at_ms);
+        const expires = finiteNumber(row.expire_at_ms);
+        packages.push({
+            /**
+             * ⚠️ 包名**不编造业务含义**：`credit_type` 的语义未实测（实测全部样本都是 2），
+             * 故不按它起名（「签到包」/「活动包」都是猜测）。用发放日期作可区分标识
+             * —— 它来自实测字段，且在 UI 上足以让用户对上「哪一笔」。
+             */
+            name: granted === undefined
+                ? '积分包'
+                : `积分包 ${new Date(granted).toLocaleDateString('zh-CN')}`,
+            unit: 'credit',
+            remaining,
+            total: remaining,
+            // ⚠️ `consumed_amount` 与 `granted_amount` 都在，但口径不确定
+            //（`total` 究竟该取发放额还是「剩余+已用」未实测，两者在多笔混合消耗时不等）
+            // ⇒ 只填有把握的：`total = remaining`，`used = 0`。
+            // 两者在 `splitCreditsByExpiry` / `sharedPackageExpiry` 里**都没有消费者**
+            //（它们只读 `active`/`remaining`/`deductionEndTime`），故不编造不会影响分档。
+            used: 0,
+            /**
+             * ⚠️ 恒 `true`，依据是**实测「服务端只回有效包」**（20 条样本全部
+             * `expire_at_ms` 晚于现在、`remaining_amount` 非 0）。
+             * 若将来它开始回过期条目，**必须**改成
+             * `expires !== undefined && expires > Date.now()`
+             * —— 否则过期包会参与分档排序，把「已作废的额度」当成可用。
+             */
+            active: true,
+            cycleStartTime: '',
+            cycleEndTime: '',
+            expiredTime: expires === undefined
+                ? ''
+                : new Date(expires).toISOString(),
+            /**
+             * ⚠️⚠️ **这才是分档与到期排序唯一读的字段**（`CreditPackage` 的类型注释
+             * 第 130 行起有完整说明）。`expire_at_ms` 实测是**毫秒时间戳**（无需 ×1000），
+             * 直接透传 —— 不要做 `Date.parse` / 时区换算（那是字符串形态才需要的）。
+             * 解析不出就**不写这个键**（`undefined` = 「到期时间未知」，
+             * 分档会落到永久桶），绝不填 0（0 会被判成「服务端未下发」，语义不同）。
+             */
+            ...expires === undefined ? {} : { deductionEndTime: expires },
+        });
     }
-    return { total: roundCredits(total), packages: [], expiredTotal: 0 };
+    return { balance: { total: roundCredits(total), packages, expiredTotal: 0 } };
 }
 //# sourceMappingURL=minimax-credits.js.map

@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { isRealUserInput, extractUserText } from './wire.js'
-import { OPTIMIZER_FORMAT } from './optimizer-protocol.js'
+import { OPTIMIZER_FORMAT, normalizeOptimizerValue } from './optimizer-protocol.js'
 
 export const CAPABILITY_VERSION = '3'
 const short = (value, cap = 1200) => {
@@ -24,7 +24,7 @@ export function normalizeCollaboration(value) {
   if (!value || typeof value !== 'object') return { understanding: null, support: null }
   const o = value.optimizer
   if (o?.version === '3' && typeof o.intent?.text === 'string' && ['new', 'continue', 'uncertain'].includes(o.intent.relation) && ['clarify', 'add', 'ask'].every(k => Array.isArray(o[k]) && o[k].every(s => typeof s === 'string'))) {
-    return { optimizer: copy(o), understanding: { summary: o.intent.text, relation: o.intent.relation, action: o.intent.relation === 'continue' ? 'continue' : 'execute', focus: '' }, support: { mode: 'none' } }
+    return { optimizer: copy(normalizeOptimizerValue(o).value), understanding: { summary: o.intent.text, relation: o.intent.relation, action: o.intent.relation === 'continue' ? 'continue' : 'execute', focus: '' }, support: { mode: 'none' } }
   }
   const u = value.understanding
   const understanding = u && typeof u === 'object' && typeof u.summary === 'string' && u.summary.trim()
@@ -114,7 +114,14 @@ export function createCapability({ home = null, namespace = 'default', now = () 
   }
   const current=(sid,token)=>{const s=get(sid);return !!s && !!token && s.epoch===token.epoch && s.current?.id===token.id}
   const api={
-    beginInput:begin,
+    beginInput(sid, id, text, seq = null) { const token = begin(sid, id, text, seq); const s = get(sid); if (token && s?.current) s.current.pending = true; return token },
+    bindSubmitted(sid, runId, messageId, seq) {
+      const s = get(String(sid))
+      if (!s?.current || s.current.id !== runId || !messageId) return false
+      s.current.id = String(messageId); s.current.seq = seq; s.current.pending = false
+      for (const input of s.taskInputs) if (input.id === runId) { input.id = String(messageId); input.seq = seq }
+      save(s); return true
+    },
     token(sid){const s=get(String(sid));return s?.current ? {sessionId:String(sid),id:s.current.id,epoch:s.epoch} : null},
     isCurrent:current,
     bindTranslation(sid,translatedText){const s=get(sid);if(s?.current)s.current.sentFingerprint=inputHash(translatedText)},
@@ -133,11 +140,7 @@ export function createCapability({ home = null, namespace = 'default', now = () 
       if(isRealUserInput(event)) {
         const id=String(d.id || d.message?.id || 'human-'+String(seq)),text=extractUserText(event)
         if(!text.trim())return false
-        if((s.current?.fingerprint===inputHash(text)||s.current?.sentFingerprint===inputHash(text)) && s.current.id.startsWith('po06-intercept-')) {
-          const previous=s.current.id;s.current.id=id;s.current.seq=seq
-          for(const input of s.taskInputs)if(input.id===previous){input.id=id;input.seq=seq}
-          save(s);return 'submitted'
-        }else if(s.current?.id!==id){begin(sid,id,text,seq);return 'new-input'}
+        if(s.current?.id!==id){begin(sid,id,text,seq);return 'new-input'}
         if(seq!==undefined){s.current.seq=seq;for(const input of s.taskInputs)if(input.id===id)input.seq=seq}
         return 'same-input'
       }
@@ -183,7 +186,7 @@ export function createCapability({ home = null, namespace = 'default', now = () 
       let start=0
       for(let i=events.length-1;i>=0;i--)if(isRealUserInput(events[i])){start=i;break}
       for(const event of events.slice(start)){
-        if(isRealUserInput(event) && s.current?.id.startsWith('po06-intercept-'))continue
+        if(isRealUserInput(event) && s.current?.pending)continue
         api.observe(session,event)
       }
     },
@@ -217,12 +220,14 @@ export function createCapability({ home = null, namespace = 'default', now = () 
       }
       if(!s.optimizer && s.understanding && s.understanding.action!=='acknowledge' && s.understanding.summary!==s.current?.text)lines.push('【当前任务理解 · 机器解释，非新增要求】\n'+s.understanding.summary+(s.understanding.focus?'\n当前对象：'+s.understanding.focus:''))
       if(!s.optimizer && s.support && s.support.mode!=='none' && (s.support.contribution || (s.support.reason && s.support.nextAction))) {
-        const advice=['【解题贡献 · 机器建议，以原话和实际依据为准】']
+        // 2026-10-19：顾问改成"愿望式方向"后，注入给执行者的标题也改成方向口径；
+        // 但**不是新增用户要求**这条边界不变（下方那句仍然要求按原话判断是否适用）。
+        const advice=['【解题方向 · 机器提出的方向要求（不是新增用户要求）】']
         if(s.support.reason)advice.push(s.support.reason)
         if(s.support.contribution)advice.push(s.support.contribution)
         if(s.support.assumptions?.length)advice.push('待核对的前提：\n'+s.support.assumptions.map(x=>'· '+x).join('\n'))
         if(s.support.nextAction)advice.push('可选下一步：'+s.support.nextAction)
-        advice.push('判断该贡献是否适用于当前任务；采纳、修改或反驳均可，建议不改变用户目标和授权。')
+        advice.push('这些方向只为抬高成果上限；按用户原话判断是否适用，采纳或反驳都可以，它们不改变用户目标与授权。')
         lines.push(advice.join('\n'))
       }
       if(packet)lines.push(packet)
@@ -240,6 +245,14 @@ export function createCapability({ home = null, namespace = 'default', now = () 
         current:s ? {inputId:s.current?.id || null,understanding:s.understanding,support:s.support,
           optimizer:s.optimizer || null,sourceMessages:s.taskInputs.length,contributionChars:s.support?.contribution?.length || 0,claims:s.claims,failures:s.failures.map(f=>({name:f.name,count:f.count})),
           review:s.review,metrics:{...s.metrics},injectedChars:s.lastInjectedChars || 0,problem:s.problem} : null}
+    },
+    abandonInput(sid, id) {
+      const s = get(String(sid))
+      if (!s || (id && s.current?.id !== id)) return
+      const cancelledId = s.current?.id
+      s.taskInputs = s.taskInputs.filter(input => input.id !== cancelledId)
+      s.current = null; s.understanding = null; s.support = null; s.optimizer = null; s.claims = []; s.epoch++
+      save(s)
     },
     clear(sid) {if(sid){const s=get(String(sid));if(s){s.understanding=null;s.support=null;s.optimizer=null;s.claims=[];s.epoch++}}else for(const s of states.values()){s.understanding=null;s.support=null;s.optimizer=null;s.claims=[];s.epoch++}},
     dispose(){states.clear()}

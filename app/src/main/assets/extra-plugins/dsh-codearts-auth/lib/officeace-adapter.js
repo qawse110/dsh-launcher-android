@@ -10,9 +10,23 @@
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
 import { OFFICEACE, OFFICEACE_MODELS } from './officeace-product.js';
 import { basicAuthorization, fetchModelTokenRates, isExpiring, readOfficeAceCredential, refreshStoredCredential } from './officeace-auth.js';
-import { consumeOpenAiSse, serializeMessages } from './openai-compat.js';
+import { collectImages, consumeOpenAiSse, serializeMessages } from './openai-compat.js';
 import { registerAdapterIdempotent } from './llm-register-compat.js';
+import { createModelCatalog, isCatalogFreshFor } from './model-catalog.js';
 import { buildDsmlSystemPrompt, needsDsmlToolMode } from './dsml.js';
+import { isBasicCredentialRejection, noteOfficeaceRejection, noteOfficeaceSuccess, officeaceBreakerState, } from './officeace-credential-health.js';
+/**
+ * 「重发一次有没有意义」的指纹：**决定 Basic 鉴权与目标 host 的三个字段**。
+ *
+ * ⚠️ 它**不是**「同一对已被拒绝的 key」那个指纹（`officeaceCredentialFingerprint`
+ * 只含 Basic 二元组）：本函数要多含 `maasBaseUrl`，因为 2026-10-13 那个真实缺陷里
+ * **只有网关变了**（华为按账号下发专属网关 `modelgw-0004.…`，打错硬编码 host 恒 401，
+ * 而 Basic 二元组完全正确）⇒ 换 host 后重发**是**有意义的。
+ * 两个问题不同，故两份判据并存，且各自注释说明为什么不能合并。
+ */
+function basicAuthFingerprint(credential) {
+    return `${credential.modelAppKey}\u0000${credential.modelAppSecret}\u0000${maasBaseUrlOf(credential)}`;
+}
 /**
  * 推理/探测该用哪个 host —— **必须优先用凭据里按账号下发的 `maasBaseUrl`**。
  *
@@ -61,31 +75,48 @@ function isMultimodalModel(model) {
 /**
  * 收集消息中的图片附件引用（含工具结果内层，任意深度），按 attachmentId 去重。
  *
- * ⚠️ 与 trae / buddy / lobsterai 的同名助手同义。收集必须**递归**进
- * `tool-result.content`：只走一层时，深层图片会被收进 refs 却在序列化时丢失。
+ * ⚠️ **已改为复用共享实现**（Issue IKLSB8）。原先这里是一份与
+ * `openai-compat.ts` 逐字同义的私有副本，看似无害，实际是缺陷的一半：
+ * 收集侧递归进 `tool-result` 内层，而**注入侧不递归** ⇒ 深层图片被收进 refs、
+ * 读出了字节、却在序列化阶段被静默丢弃（连 `[image unavailable]` 占位符都没有）。
+ * 判据：**收集与注入必须同源同深度**，两份实现分处两文件时没有任何东西保证它们
+ * 同步 —— 共享一份才让这类分叉不可能发生（同 `buddy-adapter.ts` 的注释所警告）。
  */
-function collectImages(content, refs) {
-    for (const raw of content) {
-        if (typeof raw !== 'object' || raw === null)
-            continue;
-        const block = raw;
-        if (block.type === 'image' && typeof block.attachment?.attachmentId === 'string') {
-            refs.set(block.attachment.attachmentId, block.attachment);
-            continue;
-        }
-        if (block.type === 'tool-result' && Array.isArray(block.content))
-            collectImages(block.content, refs);
-    }
-}
 export class OfficeAceAdapter extends LlmAdapter {
     options;
     /** 目录是否已广播过（只广播一次）。 */
     announced = false;
     /** 倍率缓存（listModels 时填充，resolveModel 复用——保持两处名字一致）。 */
     rateCache = new Map();
+    /**
+     * 上次**成功**刷新目录的时刻（毫秒）；`0` = 从未成功读过。
+     *
+     * ⚠️ 它同时覆盖**两个独立端点**：`/v2/models` 探测与 `/v1/model-token-rates`
+     *    倍率。二者任一单独缓存都会让另一半每轮照旧打上游（倍率尤其致命 ——
+     *    用户原话就是「不更新就拿不到实际倍率」），故**共用同一个时刻**。
+     *
+     * ⚠️ 判据只有一份：`model-catalog.ts` 的 `isCatalogFresh`（周期 20 分钟）。
+     */
+    catalogAt = 0;
+    /**
+     * 共享目录骨架（`model-catalog.ts`）——**黑名单 / 关闭意图 / 目录门控 /
+     * 映射**的唯一实现处（2026-10-23 迁移，见 `listModels` 的注释）。
+     */
+    skeletonCatalog;
     constructor(options = {}) {
         super();
         this.options = options;
+        // ⚠️⚠️ **`accountPool` 必须是真池**：骨架里 `deps.accountPool?.disabledModelsFor`
+        //    与 `providerClosedFor?.(...)` 全靠它；传 `{}` 或 `undefined` 会让
+        //    `?.` 变成静默 no-op（Gitee IKP8OF 实测过的形态）。
+        this.skeletonCatalog = createModelCatalog(this.options.accountPool === undefined ? {} : { accountPool: this.options.accountPool }, {
+            product: OFFICEACE,
+            loadCatalog: () => this.loadCatalogEntries(),
+            syncCatalog: () => this.syncCatalogEntries(),
+            // ⚠️ 未知 id **保守报 `['text']`**：与本家 `resolveModel` 的取向一致
+            //    （6 个纯文本模型不声明 image、也不给未知 id 编造能力）。
+            unknownModelInputModalities: () => ['text'],
+        });
     }
     /**
      * 取当前可用凭据；STS 临期（10 分钟内）先静默刷新。
@@ -102,6 +133,17 @@ export class OfficeAceAdapter extends LlmAdapter {
         }
         return credential;
     }
+    /**
+     * 目录专用凭据：**锁定永久积分也必须能读目录**（见 `probeCredential` 的注释）。
+     *
+     * ⚠️ 未注入 `probeCredential` 时回落 `resolveCredential()`：既有嵌入方与单测
+     *    的行为逐字不变（只有宿主装配层会注入它）。
+     */
+    async probeCredential() {
+        return this.options.probeCredential !== undefined
+            ? this.options.probeCredential()
+            : this.resolveCredential();
+    }
     providerInfo(provider) {
         const id = typeof provider === 'string' && provider.length > 0 ? provider : OFFICEACE.id;
         return { id, name: OFFICEACE.displayName };
@@ -114,39 +156,113 @@ export class OfficeAceAdapter extends LlmAdapter {
      * 目录：凭据可读 + `/v2/models` 可达才暴露（隐藏不可恢复的分组，
      * 与 AutoClaw 同一约定：空目录 = 隐藏，而不是报错）。
      */
+    /**
+     * 模型选择器的目录 —— **委托共享骨架**（`model-catalog.ts`）。
+     *
+     * ## ⚠️⚠️ 2026-10-23 迁移（用户要求：实体 provider 一律走共享骨架）
+     *
+     * 迁移前本方法**手写**了四件事：判 `providerClosed`、过滤 `disabledModels`、
+     * 凭据探测门控、手工 map 成 `LlmModelInfo`。其中「关闭意图 / 黑名单 /
+     * `provider` 回填」与其余 13 家**逐字同义** ⇒ 各写一份正是 Gitee IKP8OF
+     * 那类漂移缺陷的温床。
+     *
+     * 现在那三条由骨架承担，**本家独有的三条**放进 `loadCatalog`
+     * （`loadCatalogEntries`）：
+     * - 只读探测凭据门控（`probeCredential()` 抛不出「锁定」错）；
+     * - **20 分钟 TTL**（`isCatalogFreshFor`，判据仍只有 `model-catalog.ts` 一份）；
+     * - 倍率（`/v1/model-token-rates`）拼进展示名。
+     *
+     * ⚠️ **门控口径变更（刻意，已与用户确认）**：骨架额外要求「账号池里有已登录
+     * 账号」（`providerCatalogVisible`）。对本家而言这更贴近用户预期 —— 池里
+     * 没有账号时那个 provider 本就没有可用号。
+     */
     async listModels(_provider) {
-        const disabled = this.options.disabledModels?.() ?? new Set();
-        const credential = await this.resolveCredential();
+        return await this.skeletonCatalog.listModels(_provider);
+    }
+    /**
+     * 异步读目录并转成骨架的中间结构。
+     *
+     * ⚠️⚠️ **本家独有逻辑全在这里**（迁移前它们在 `listModels` 里）：
+     * ① 只读探测凭据门控；② 20 分钟 TTL + 探测；③ 倍率取数。
+     */
+    async loadCatalogEntries() {
+        // ⚠️ 目录用**只读探测凭据**（见 `probeCredential` 的长注释）：恒不抛「锁定」错。
+        //    `/v2/models` 与倍率都是只读端点，不扣积分，锁定它们只会得到一串
+        //    与锁定毫不相干的症状（面板「读取模型列表失败」、关不掉供应商、分组消失）。
+        const credential = await this.probeCredential();
         if (credential === undefined)
             return [];
-        try {
-            const probe = await this.probe(credential);
-            if (!probe)
-                return [];
+        // ⚠️⚠️ **20 分钟 TTL（本家是 23 家里唯一手写目录、此前每轮真打上游的一家）**：
+        //    `/v2/models` 探测与 `/v1/model-token-rates` 倍率**各是一次真实往返**
+        //    （实测日志稳定 80~340ms，其余 22 家是 1~17ms 的纯本地读）。
+        //
+        // ⚠️ **判据只有一份**：`isCatalogFresh`（`model-catalog.ts`，周期 20 分钟）。
+        //    本家不得自己写第二份「多久算新鲜」。
+        // ⚠️ 这里用 `isCatalogFreshFor`（多一个**正交**的「用户主动失效」输入）：
+        //    用户在 Jet Hub 改开关后要**立即**重拉目录（规格 §6 的正确性要求，
+        //    见 `invalidateCatalogCache`）。本家**不需要**「拉失败时别用失效判据」
+        //    那一条：它下面失败分支走的是 `this.catalogAt === 0` 而不是新鲜度判据
+        //    ⇒ 旧读数照常保留，不会退化。
+        // ⚠️ **两个端点共用这一个时刻**：单独缓存其一时，另一处仍每轮打上游 ——
+        //    而倍率恰恰是用户要求「20 分钟更新一次」的那一半（不更新就拿不到实际倍率）。
+        //
+        // ⚠️ **凭据仍每轮现取**：本地读凭据不花钱，而「换了账号/换了 `maasBaseUrl`」
+        //    只有在每次探测时才知道 —— 缓存住凭据会让新账号的目录迟迟不生效。
+        const catalogFresh = isCatalogFreshFor(OFFICEACE.id, this.catalogAt, this.options.now?.() ?? Date.now());
+        if (!catalogFresh) {
+            let probed = false;
+            try {
+                probed = await this.probe(credential);
+            }
+            catch {
+                probed = false;
+            }
+            // ⚠️⚠️ **刷新失败必须保留旧读数、清空是错的**：空列表会让 DSH 的
+            //    `buildModelCatalog` **隐藏整个分组**（用户界面上一个模型都不剩，
+            //    且无日志）—— 而故障只是一次瞬时抖动。
+            //    `catalogAt` 也**不刷新**：刷新了就得再等满 20 分钟才会重试。
+            //
+            // ⚠️ **冷启动例外**：从未成功读过（`catalogAt === 0`）时没有「旧值」可留，
+            //    仍然诚实地返回 `[]` —— 这正是「凭据不可达 ⇒ 隐藏不可恢复的分组」
+            //    那条既有约定（锁定态 / 未登录的既有行为逐字不变）。
+            if (!probed) {
+                if (this.catalogAt === 0)
+                    return [];
+            }
+            else {
+                this.announceLater();
+                // 倍率（costCoefficient）：OfficeAce 主界面显示 `0.7x` 的那个值，来自
+                // `/v1/model-token-rates`（V11 签名，管理面 API —— 保持默认域，
+                // 见 `officeace-base-url.spec.ts` 的范围守卫）。取不到（未装 OfficeAce）时
+                // 优雅降级 —— 名字后不带 x 系数，模型照常可选。
+                const rates = await fetchModelTokenRates();
+                this.rateCache = rates;
+                // ⚠️ **只在成功走到这里才记时刻**：失败不写（见上面的注释）。
+                this.catalogAt = this.options.now?.() ?? Date.now();
+            }
         }
-        catch {
-            return [];
-        }
-        this.announceLater();
-        // 倍率（costCoefficient）：OfficeAce 主界面显示 `0.7x` 的那个值，来自
-        // `/api/subscription/model-token-rates`。取不到（未装 OfficeAce）时优雅降级
-        // —— 名字后不带 x 系数，模型照常可选。
-        const rates = await fetchModelTokenRates();
-        this.rateCache = rates;
-        return OFFICEACE_MODELS
-            .filter((m) => !disabled.has(m.id))
-            .map((m) => {
-            const coeff = rates.get(m.id);
-            return {
-                provider: OFFICEACE.id,
-                id: m.id,
-                name: coeff !== undefined ? `${m.name} · x${coeff}` : m.name,
-                // ⚠️ **图片准入闸门**（实测表见 `OFFICEACE_MODELS` 的 `multimodal` 注）：
-                //    不声明 `image` 时附件在入库阶段就被拒（用户看到「当前模型不支持
-                //    图片」）—— 这是对 6 个纯文本模型的**诚实**行为。
-                inputModalities: isMultimodalModel(m.id) ? ['text', 'image'] : ['text'],
-            };
-        });
+        return OFFICEACE_MODELS.map((m) => this.toCatalogEntry(m));
+    }
+    /** **同步**全量目录（`listAllModels()` 用；同样带缓存倍率）。 */
+    syncCatalogEntries() {
+        return OFFICEACE_MODELS.map((m) => this.toCatalogEntry(m));
+    }
+    /**
+     * 本家私有形状 → 骨架的 `CatalogEntry`（**唯一**转换点）。
+     *
+     * ⚠️ 倍率拼进 `name` 是**本家既有口径**（`resolveModel` 也这么做，两处必须
+     * 同源，否则选择器显示 `GLM-5.2 · x0.7`、选中后底部胶囊只显示 `GLM-5.2`）。
+     */
+    toCatalogEntry(m) {
+        const coeff = this.rateCache.get(m.id);
+        return {
+            id: m.id,
+            name: coeff !== undefined ? `${m.name} · x${coeff}` : m.name,
+            // ⚠️ **图片准入闸门**（实测表见 `OFFICEACE_MODELS` 的 `multimodal` 注）：
+            //    不声明 `image` 时附件在入库阶段就被拒（用户看到「当前模型不支持
+            //    图片」）—— 这是对 6 个纯文本模型的**诚实**行为。
+            inputModalities: isMultimodalModel(m.id) ? ['text', 'image'] : ['text'],
+        };
     }
     announceLater() {
         if (this.announced)
@@ -214,6 +330,26 @@ export class OfficeAceAdapter extends LlmAdapter {
                 + '或确认 Redis 6399 与 Windows 凭据管理器条目可读');
         }
         const f = this.options.fetchImpl ?? fetch;
+        // ── 熔断快速失败（Gitee issue IKLTHB 第 ③ 条）──
+        //
+        // ⚠️ **为什么要在这里拦，而不只是靠聚合折算剔除**：
+        //
+        // 折算层（`officeaceExpiry`）把熔断中的凭据判成 `UNUSABLE`，于是**自动路由**
+        // 不会再选它；但用户**显式**选中 officeace 的模型、或聚合在别处兜底时，
+        // 请求仍会落到这里 —— 那时再发一个已经知道结果的请求，白白等一个网络往返，
+        // 还会把「暂时不可用」表现成一个像服务端错误的 401。
+        //
+        // ⚠️ 快速失败**不会**让熔断永不解除：`until` 到期即自动放行（半开），
+        //    届时这次真请求就是探针。文案里带上剩余时间，用户不必猜「为什么立刻失败」。
+        const breaker = officeaceBreakerState(credential);
+        if (breaker.open) {
+            const minutes = Math.max(1, Math.ceil(breaker.remainingMs / 60000));
+            throw new Error(`OfficeAce：该账号的 Basic 凭据已被华为 MaaS 连续拒绝 ${breaker.consecutive} 次`
+                + `（最近一次：${breaker.lastReason.slice(0, 120)}），`
+                + `已临时跳过本渠道，约 ${minutes} 分钟后自动重试。`
+                + '⚠️ 这与额度无关，**不要**去解锁永久积分；重新登录也改变不了'
+                + '（云侧下发的 `modelAppKey`/`modelAppSecret` 不会变）。');
+        }
         const controller = new AbortController();
         const onAbort = () => controller.abort();
         options.signal?.addEventListener('abort', onAbort);
@@ -256,44 +392,34 @@ export class OfficeAceAdapter extends LlmAdapter {
                 imageUrls.set(id, `data:${image.mediaType};base64,${Buffer.from(image.data).toString('base64')}`);
             }
         }
-        const wireMessages = serializeMessages(options.messages);
-        // 把图片 parts 注回 user 消息：共享 `serializeMessages` 会把 content 压成
-        // 纯文本（图片静默丢失 ——「发不了图片」的成因），这里按 user 消息出现顺序
-        // 一一对应，把该消息内（含 tool-result 内层）的图片补成
-        // `{type:'image_url'}` parts（MaaS 实测接受该形态，deepseek-v4.1-flash /
-        // kimi-k2.6 均正常描述图片内容）。
-        if (imageUrls !== undefined) {
-            const originalUsers = options.messages.filter((m) => m.role === 'user');
-            let userIdx = 0;
-            for (const wire of wireMessages) {
-                if (wire.role !== 'user')
-                    continue;
-                const original = originalUsers[userIdx++];
-                if (original === undefined)
-                    break;
-                const inner = Array.isArray(original.content) ? original.content : [];
-                const parts = [];
-                const text = typeof wire.content === 'string' ? wire.content : '';
-                if (text.length > 0)
-                    parts.push({ type: 'text', text });
-                for (const raw of inner) {
-                    if (typeof raw !== 'object' || raw === null)
-                        continue;
-                    const block = raw;
-                    if (block.type === 'image') {
-                        const url = block.attachment?.attachmentId === undefined
-                            ? undefined
-                            : imageUrls.get(String(block.attachment.attachmentId));
-                        // 解析不到字节时留占位文本，而不是静默吞掉整张图。
-                        parts.push(url === undefined
-                            ? { type: 'text', text: '[image unavailable]' }
-                            : { type: 'image_url', image_url: { url } });
-                    }
-                }
-                if (parts.length > 0)
-                    wire.content = parts;
-            }
-        }
+        // ⚠️⚠️ **`imageUrls` 必须交给共享 `serializeMessages`**（Issue IKLSB8，
+        // 2026-10-14 真机报障）。此前这里**只传了 1 个实参**，而共享实现的第二参
+        // 是图片字节映射；缺了它有两道后果**同时**发生：
+        //
+        // 1. 工具结果内层的图片（= **Claude Code / Claude Desktop 唯一的图片形状**，
+        //    即 `tool_result.content=[{type:'image'}]`）没有任何一条腿去读它 ——
+        //    共享实现里 `imageUrls === undefined` 那一段整节跳过 ⇒ 图片字节
+        //    **根本没进请求**（实测 `input_tokens` ≈76 vs 带图 ≈245，是字节缺失
+        //    而不是上游拒绝）；
+        // 2. 图片型工具结果被 `contentToText` 压成空串 ⇒ 落到 `'(no output)'` 兜底
+        //    ⇒ 模型被告知「工具没有任何输出」，于是答「Read 没有返回内容」，
+        //    用户据此误判成模型没有视觉能力（真实原因是「有输出，输出是图」）。
+        //
+        // ⚠️ 旧实现在此之后有一段**补偿性注图循环**（按 `role==='user'` 出现顺序
+        // 一一对应，把图补成 parts）。它有两个独立缺陷，故**整段删除**、不再保留：
+        //
+        // - **够不到内层**：只遍历 user 消息 content 的**顶层**，而 `collectImages`
+        //   是递归的 ⇒ 收进了 refs、读出了字节、注入时却丢掉（连 `[image unavailable]`
+        //   都没有）。这正是 `buddy-adapter.ts` 注释里警告过的形态。
+        // - **索引错位**：`wireMessages` 与 `options.messages` 的 user **数量并不相等**
+        //   —— 工具结果会被展开成 `role:'tool'`，而「只含工具结果」的 user 消息
+        //   在源里占一个位置、在 wire 上却不是 user。实测（真实 Claude Code 形态：
+        //   user(看图) → assistant(tool_call) → user(仅工具结果) → user(图+提问)）
+        //   注图循环把**图注到了前一条文本消息上**，带图那条反而没有图。
+        //
+        // ⇒ 不再自己维护第二套「D+/注入」实现：共享实现已与 `collectImages` 同深度，
+        // 且遵守 `0dd27ca` 的阶段结论（图片必须与提问**同一条** user 消息，图在前）。
+        const wireMessages = serializeMessages(options.messages, imageUrls);
         // ── 工具定义下发 ──
         //
         // ⚠️ **这是「工具调用被当正文、模型停住不动」的真正根因**（2026-10-13）。
@@ -372,13 +498,59 @@ export class OfficeAceAdapter extends LlmAdapter {
             });
             if (!response.ok) {
                 const text = await response.text().catch(() => '');
-                // ⚠️ 401 = Basic 凭据失效。MaaS 的凭据与 STS 生命周期不同步，**STS 也快到期**
-                //    是常见成因 —— 这里续期一次再重发，与 trae / gemini 同款模式。
-                //    不接 `options.refresh` 时静默失败（接线层漏接的症状即此）。
-                if (response.status === 401 && this.options.refresh !== undefined) {
+                // ── 401：先判断「续期一次再重发」这件事**有没有意义** ──
+                //
+                // ⚠️⚠️ 这是一个**真实缺陷**的现场（Gitee issue IKLTHB 第 ② 条，2026-10-14
+                //    起 264+ 次连续失败）。改前的代码是：
+                //
+                //     ```ts
+                //     await this.options.refresh().catch(() => undefined)
+                //     const renewed = await this.resolveCredential()
+                //     if (renewed !== undefined && renewed !== credential) { /* 重发 */ }
+                //     ```
+                //
+                //    那句 `renewed !== credential` **恒为真**：`resolveCredential()` 每次都
+                //    `JSON.parse` 出一份**新对象**，对象身份永远不同 ⇒ 这个守卫一个都拦不住，
+                //    401 恒被重发一次。于是真实报障里的每一轮都是「白撞一次 + 重新登录一次」
+                //    —— 而取证证明重新登录**换掉了账号与 credentialRef
+                //    （`OFFICEACE_ACCOUNT_651558E5` → `F1557964`）、换掉了整条 STS 三元组，
+                //    却让 `modelAppKey`/`modelAppSecret` 逐字节不变**（`ffff8ba7…c476` /
+                //    `bd4da972…d76b`，`accountId` 也没变）⇒ 重发注定得到同一个 401。
+                //
+                // ⇒ 判据必须落在**能修好 401 的那几个字段**上（见 `basicAuthFingerprint`），
+                //    而不是对象身份。这样「没变」这一事实本身就成了诊断依据：
+                //    报文里会**明确写出**「已续期但凭据一个字节都没变」，
+                //    用户不必再去重复一次无效的重新登录。
+                let finalStatus = response.status;
+                let finalText = text;
+                // ⚠️ 续期闸门必须是**超集**：`401` **照旧一律**尝试续期（形状未知的网关 401
+                //    也可能是凭据陈旧，旧行为能救回来的不能丢），**另外**把「4xx + 报文点名
+                //    这对 Basic 凭据」也算进来 —— 华为文档把 APIG.1009 定义为 400、真机回
+                //    401，只认 401 就会漏掉文档那一侧（第二轮对抗性审计查出的真实缺口：
+                //    判据只认状态码，而它自己的注释写着「不得依赖状态码」）。
+                const credentialRejected = isBasicCredentialRejection(response.status, text);
+                /**
+                 * 产生**最终**那次拒绝的凭据。
+                 *
+                 * ⚠️ 续期真的换掉了 Basic 三元组时，下一轮请求用的会是**新**那份
+                 *    （续期已就地更新凭据库）⇒ 熔断记账必须落在**它**身上，否则熔断器
+                 *    永远追不上实际在用的凭据，每轮仍白撞一次（正是 issue 第 ③ 条）。
+                 */
+                let rejected = credential;
+                // ⚠️ **四态**，不是布尔：`renewed === undefined`（续期后读不到凭据）与
+                //    「读到了但一个字节没变」是**两件不同的事**，文案必须分开说 ——
+                //    用布尔会把前者说成后者（或反之），而这两种指引指向完全不同的动作。
+                let renewal = 'not-attempted';
+                if ((response.status === 401 || credentialRejected) && this.options.refresh !== undefined) {
+                    const before = basicAuthFingerprint(credential);
                     await this.options.refresh().catch(() => undefined);
                     const renewed = await this.resolveCredential();
-                    if (renewed !== undefined && renewed !== credential) {
+                    if (renewed === undefined) {
+                        renewal = 'unreadable';
+                    }
+                    else if (basicAuthFingerprint(renewed) !== before) {
+                        renewal = 'changed';
+                        rejected = renewed;
                         const retry = await f(`${maasBaseUrlOf(renewed)}${OFFICEACE.chatPath}`, {
                             method: 'POST',
                             headers: {
@@ -390,6 +562,8 @@ export class OfficeAceAdapter extends LlmAdapter {
                             signal: controller.signal,
                         });
                         if (retry.ok) {
+                            // 续期真的换掉了 Basic 三元组且重发通了 ⇒ 成功，顺带解除熔断记录。
+                            noteOfficeaceSuccess(renewed);
                             yield* consumeOpenAiSse(retry, { signal: controller.signal }, {
                                 label: OFFICEACE.id,
                                 firstTokenTimeoutMs: OFFICEACE.headerTimeoutMs,
@@ -399,11 +573,25 @@ export class OfficeAceAdapter extends LlmAdapter {
                             });
                             return;
                         }
+                        finalStatus = retry.status;
+                        finalText = await retry.text().catch(() => '');
+                    }
+                    else {
+                        renewal = 'unchanged';
                     }
                 }
-                throw new Error(`OfficeAce (华为MaaS) 返回 HTTP ${response.status}：${text.slice(0, 200)}`
-                    + `（${this.diagnose(response.status)}）`);
+                // ── 熔断记账：**只认确定的凭据拒绝形状**（见 `isBasicCredentialRejection`）──
+                //
+                // ⚠️ 不能「凡 401 都记」：网关/代理层的 401（HTML / 空体）形状未知，
+                //    据此熔断等于把一次基础设施抖动放大成「渠道消失 10 分钟」。
+                if (isBasicCredentialRejection(finalStatus, finalText)) {
+                    noteOfficeaceRejection(rejected, finalText);
+                }
+                throw new Error(`OfficeAce (华为MaaS) 返回 HTTP ${finalStatus}：${finalText.slice(0, 200)}`
+                    + `（${this.diagnose(finalStatus, finalText, renewal)}）`);
             }
+            // ⚠️ 成功即解除熔断（**唯一**的正常出口）：这证明这对 Basic 凭据是好的。
+            noteOfficeaceSuccess(credential);
             yield* consumeOpenAiSse(response, { signal: controller.signal }, {
                 label: OFFICEACE.id,
                 firstTokenTimeoutMs: OFFICEACE.headerTimeoutMs,
@@ -417,9 +605,78 @@ export class OfficeAceAdapter extends LlmAdapter {
             controller.abort();
         }
     }
-    diagnose(status) {
-        if (status === 401)
-            return 'Basic 凭据失效：OfficeAce 会话已过期，请重新登录 OfficeAce 客户端';
+    /**
+     * 把 HTTP 失败翻译成「用户下一步该做什么」。
+     *
+     * ## ⚠️ 401 那一格曾经**写死了被证伪的指引**（Gitee issue IKLTHB 第 ② 条）
+     *
+     * 改前的实现是一句无条件的断言：
+     *
+     * > `Basic 凭据失效：OfficeAce 会话已过期，请重新登录 OfficeAce 客户端`
+     *
+     * 那句在真实报障里**是错的**，而且**有反证**：用户按它去重新登录，
+     * 结果 `modelAppKey`/`modelAppSecret` **逐字节不变**（取证见 `stream()` 里
+     * `basicAuthFingerprint` 的注释）⇒ 重新登录在结构上就不可能修好这个 401，
+     * 却被指引去做了一遍又一遍（264+ 次失败里有相当一部分是这么来的）。
+     *
+     * 现在改为**按报文与续期结果分派**：
+     *
+     * | 情形 | 文案指向 |
+     * |---|---|
+     * | 报文是 `APIG.1009` 且**续期没换掉 Basic 三元组** | 华为侧认定的 key 与本地不一致，**重新登录改变不了**；去华为云控制台/订阅处核对 |
+     * | 报文是 `APIG.1009` 且**刚换过**凭据 | 新凭据也被拒 ⇒ 权限/订阅面 |
+     * | 其它 401 形状 | 形状未知 ⇒ 如实说「不是已知的凭据失效形状」，提示核对 endpoint 与出口 |
+     *
+     * ⚠️ **分派必须先判形状、再判状态码**：`APIG.1009` 那几行的条件里**不得**出现
+     *    `status === 401` —— 华为官方文档把它定义为 **400**、真机回 **401**，
+     *    钉死 401 会让「文档那一侧」的报障彻底拿不到归因（第二轮审计实测缺口）。
+     *    状态码只用于**兜底文案**（403 未订阅 / 404 / 429 / 5xx）。
+     *
+     * ⚠️ 与 `diagnose` 的调用方约定：本方法的返回值会被**拼进错误 message**，
+     *    故错误本身**不得**带 `AUTH` / `QUOTA` / `ACCOUNT_QUOTA` 这类会被 DSH 客户端
+     *    整段替换的码（`stream()` 抛的是**裸 `Error`**，无 `code`）。
+     *
+     * @param status - 终态 HTTP 状态（重发过的话是重发的那个）。
+     * @param body - 终态响应正文。
+     * @param refreshedUnchanged - 本次已续期，但 Basic 三元组**一个字节都没变**。
+     */
+    diagnose(status, body = '', renewal = 'not-attempted') {
+        // ⚠️⚠️ 这里原先整个 APIG.1009 分支都嵌在 `if (status === 401)` **里面** ——
+        //    所以只把 `isBasicCredentialRejection` 放宽到 4xx 是**不够的**：华为官方
+        //    文档把 APIG.1009 定义为 **400**，按文档回 400 时这段归因**一个字都用不上**
+        //    （第二轮对抗性审计查出的真实缺口；同一处「注释说不依赖状态码、代码却钉死
+        //    401」的自相矛盾在两个文件里各有一份）。改为**先判形状、再判 401**。
+        if (isBasicCredentialRejection(status, body)) {
+            // ⚠️ 四态**各说各的**：把「续期后读不到凭据」说成「凭据没变」会让用户
+            //    去华为云控制台查一个根本不存在的问题；反之会让他重复一次无效重登。
+            if (renewal === 'unreadable') {
+                return '华为 APIG.1009：MaaS 侧不认这对 AppKey/AppSecret。'
+                    + '本次已发起续期，但**续期后读不到新凭据**（凭据库/登录态异常）⇒ 请先确认'
+                    + '账号的凭据能正常读出（Jet Hub 的 OfficeAce 账号卡片），再判断是否需要重新登录。';
+            }
+            if (renewal === 'changed') {
+                return '华为 APIG.1009：MaaS 侧不认这对 AppKey/AppSecret（本次凭据刚续期且已变化，'
+                    + '仍被拒）⇒ 更可能是该账号的 MaaS 应用凭据或模型订阅在华为云侧被撤销，'
+                    + '请在华为云控制台核对。';
+            }
+            if (renewal === 'unchanged') {
+                return '华为 APIG.1009：MaaS 侧不认这对 AppKey/AppSecret。'
+                    + '本次**已经发起过续期**，但凭据里的 `modelAppKey`/`modelAppSecret`/推理网关'
+                    + '**一个都没变** —— 所以**重新登录 OfficeAce 改不了这个结果**'
+                    + '（重新登录只会换掉账号与 STS，Basic 这对 key 由云侧按账号下发）。'
+                    + '请到华为云控制台核对这个账号的 MaaS 应用凭据/模型订阅，或在 Jet Hub 里'
+                    + '删除该账号后用另一个华为云账号重新登录。';
+            }
+            return '华为 APIG.1009：MaaS 侧不认这对 AppKey/AppSecret。'
+                + `本次**没有续期**（未接入续期，或 ${status} 不是续期重试路径）⇒ 可先在 Jet Hub 的`
+                + 'OfficeAce 账号卡片点一次「刷新」看凭据是否会变；若不变，重新登录同样无效'
+                + '（Basic 这对 key 由云侧按账号下发）。';
+        }
+        if (status === 401) {
+            return 'HTTP 401，但报文不是已知的「AppKey/AppSecret 无效」形状 —— '
+                + '可能是网关/代理层的鉴权或登录态问题：请核对凭据里的推理网关地址（`maasBaseUrl`）'
+                + '与网络出口，而不是直接重新登录。';
+        }
         if (status === 403)
             return '该账号未订阅此模型（ModelArts.81004）：请在 OfficeAce 或华为云控制台订阅';
         if (status === 404)

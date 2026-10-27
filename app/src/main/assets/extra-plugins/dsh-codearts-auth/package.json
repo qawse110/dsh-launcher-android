@@ -1,7 +1,7 @@
 {
   "name": "dsh-codearts-auth",
-  "version": "0.2.0-rc.10",
-  "description": "deepseek-harness plugin: CodeArts (Huawei Cloud) browser login, storing the temporary credential via ctx.credentials",
+  "version": "0.2.1-rc.2",
+  "description": "DeepSeek Harness plugin: one hub for AI coding providers — account login, multi-account pools, silent credential refresh, credit claiming, and a local OpenAI-compatible gateway",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -24,16 +24,24 @@
     "build:client": "node plugin-src/client/build.mjs",
     "build:assets": "node scripts/copy-assets.mjs",
     "qoder:wasm": "node scripts/extract-qoder-wasm.mjs",
-    "build:all": "pnpm build && pnpm build:assets && pnpm build:client",
-    "prepare": "pnpm build:all",
+    "build:all": "tsc -p tsconfig.json && node scripts/copy-assets.mjs && node plugin-src/client/build.mjs",
+    "prepare": "tsc -p tsconfig.json && node scripts/copy-assets.mjs && node plugin-src/client/build.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck:tests": "tsc -p tsconfig.tests.json",
+    "pretest": "npm run typecheck:tests",
     "test": "vitest run",
     "test:e2e:login": "cross-env DSH_CODEARTS_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/login.e2e.spec.ts",
+    "test:e2e:officeace": "cross-env DSH_OFFICEACE_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/officeace-incognito-login.e2e.spec.ts",
+    "test:e2e:officeace-abandoned": "cross-env DSH_OFFICEACE_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/officeace-abandoned-login.e2e.spec.ts",
+    "test:e2e:officeace-switch": "cross-env DSH_OFFICEACE_SWITCH_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/officeace-real-account-switch.e2e.spec.ts",
+    "test:e2e:officeace-jar": "cross-env DSH_OFFICEACE_JARPROBE_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/officeace-jar-isolation.e2e.spec.ts",
     "test:e2e:buddy": "cross-env DSH_BUDDY_E2E=1 DSH_BUDDY_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/buddy-models.e2e.spec.ts",
     "test:e2e:buddy-cache": "cross-env DSH_BUDDY_E2E=1 DSH_BUDDY_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/buddy-cache-probe.e2e.spec.ts",
     "test:e2e:buddy-probe": "cross-env DSH_BUDDY_PROBE=1 vitest run --config vitest.e2e.config.ts tests/e2e/buddy-login-probe.e2e.spec.ts",
     "test:e2e:buddy-pool": "cross-env DSH_BUDDY_POOL_E2E=1 DSH_BUDDY_POOL_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/buddy-pool-probe.e2e.spec.ts",
+    "test:e2e:buddy-conv": "cross-env DSH_BUDDY_CONV_E2E=1 DSH_BUDDY_CONV_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/buddy-conversation-headers.e2e.spec.ts",
     "test:e2e:buddy-ratelimit": "cross-env DSH_BUDDY_RATELIMIT_E2E=1 DSH_BUDDY_RATELIMIT_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/buddy-ratelimit-probe.e2e.spec.ts",
+    "test:e2e:buddy-fingerprint": "cross-env DSH_BUDDY_FINGERPRINT_E2E=1 DSH_BUDDY_FINGERPRINT_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/buddy-fingerprint-roles.e2e.spec.ts",
     "test:e2e:codearts": "cross-env DSH_CODEARTS_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/v4-models.e2e.spec.ts tests/e2e/v4-large-write.e2e.spec.ts",
     "test:e2e:codearts-credits": "cross-env DSH_CODEARTS_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/codearts-credits-probe.e2e.spec.ts",
     "test:e2e:codearts-claim": "cross-env DSH_CODEARTS_E2E=1 DSH_CODEARTS_CLAIM_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/codearts-claim-probe.e2e.spec.ts",
@@ -65,7 +73,15 @@
     "test:e2e:minimax-claim": "cross-env DSH_MINIMAX_E2E=1 DSH_MINIMAX_CLAIM_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/minimax-claim-probe.e2e.spec.ts",
     "test:e2e:minimax-chat": "cross-env DSH_MINIMAX_CHAT_E2E=1 DSH_MINIMAX_CHAT_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/minimax-chat-probe.e2e.spec.ts",
     "test:e2e:minimax-image": "cross-env DSH_MINIMAX_IMAGE_E2E=1 DSH_MINIMAX_IMAGE_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/minimax-image-probe.e2e.spec.ts",
-    "test:e2e:image-burst": "cross-env DSH_IMAGE_BURST_E2E=1 DSH_IMAGE_BURST_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/image-burst-cross-provider.e2e.spec.ts"
+    "test:e2e:minimaxintl": "cross-env DSH_MINIMAXINTL_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/minimaxintl-probe.e2e.spec.ts",
+    "test:e2e:minimaxintl-claim": "cross-env DSH_MINIMAXINTL_E2E=1 DSH_MINIMAXINTL_CLAIM_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/minimaxintl-claim-probe.e2e.spec.ts",
+    "test:e2e:image-burst": "cross-env DSH_IMAGE_BURST_E2E=1 DSH_IMAGE_BURST_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/image-burst-cross-provider.e2e.spec.ts",
+    "test:e2e:image-bisect": "cross-env DSH_IMAGE_BISECT_E2E=1 DSH_IMAGE_BISECT_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/image-limit-bisect.e2e.spec.ts",
+    "test:e2e:accio": "cross-env DSH_ACCIO_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/accio-probe.e2e.spec.ts",
+    "test:e2e:accio-chat": "cross-env DSH_ACCIO_CHAT_E2E=1 DSH_ACCIO_CHAT_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/accio-chat-probe.e2e.spec.ts",
+    "test:e2e:accio-tools": "cross-env DSH_ACCIO_TOOLS_E2E=1 DSH_ACCIO_TOOLS_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/accio-tools-probe.e2e.spec.ts",
+    "test:e2e:accio-refresh": "cross-env DSH_ACCIO_REFRESH_E2E=1 DSH_ACCIO_REFRESH_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/accio-refresh-probe.e2e.spec.ts",
+    "test:e2e:accio-image": "cross-env DSH_ACCIO_IMAGE_E2E=1 DSH_ACCIO_IMAGE_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/accio-image-probe.e2e.spec.ts"
   },
   "dsh": {
     "bundle": {
@@ -76,15 +92,16 @@
       "inject": [
         "@deepseek-ai/dsh-client-connection",
         "@deepseek-ai/dsh-client-ui-settings",
-        "@deepseek-ai/dsh-client-ui-model-selection"
+        "@deepseek-ai/dsh-client-ui-model-selection",
+        "@deepseek-ai/dsh-client-ui-plugin-manager"
       ]
     }
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-commands": "^0.1.2-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1",
-    "@deepseek-ai/dsh-credentials": "^0.1.2-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1",
-    "@deepseek-ai/dsh-llm": "^0.1.2-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1",
+    "@deepseek-ai/dsh-commands": "^0.1.2-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1 || ^0.2.1-rc.2",
+    "@deepseek-ai/dsh-credentials": "^0.1.2-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1 || ^0.2.1-rc.2",
+    "@deepseek-ai/dsh-llm": "^0.1.2-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1 || ^0.2.1-rc.2",
     "@deepseek-ai/schemastery": "^3.18.4"
   },
   "dependencies": {
@@ -94,10 +111,11 @@
     "undici": "^8.11.2"
   },
   "devDependencies": {
-    "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-commands": "^0.1.2-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1",
-    "@deepseek-ai/dsh-credentials": "^0.1.2-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1",
-    "@deepseek-ai/dsh-llm": "^0.1.2-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1",
+    "@deepseek-ai/cordis": "~4.0.5",
+    "@deepseek-ai/dsh-agent": "^0.1.2-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1 || ^0.2.1-rc.2",
+    "@deepseek-ai/dsh-commands": "^0.1.2-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1 || ^0.2.1-rc.2",
+    "@deepseek-ai/dsh-credentials": "^0.1.2-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1 || ^0.2.1-rc.2",
+    "@deepseek-ai/dsh-llm": "^0.1.2-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1 || ^0.2.1-rc.2",
     "@deepseek-ai/schemastery": "^3.18.4",
     "@types/node": "^22.0.0",
     "cross-env": "^7.0.3",

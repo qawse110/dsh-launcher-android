@@ -83,17 +83,17 @@ Kotlin 展示面与 `install-dsh.mjs` 装配面都从它派生；一致性由 `n
 
 | 插件 | 来源 | 作用 |
 |---|---|---|
-| `dsh-web-mobile` | <https://github.com/mexiaosqwq/dsh-web-mobile> `v3.1.0` | 竖屏/窄屏 Web 适配（抽屉导航、全宽会话、安全区、触控人体工学） |
-| `dsh-prompt-optimizer-mobile` | <https://github.com/WestFox-AwA/dsh-prompt-optimizer> `v0.8.3-stable` 基线（见 [FORK.md](app/src/main/assets/extra-plugins/dsh-prompt-optimizer-mobile/FORK.md)） | 提示词优化（发送前用独立 AI 改写成命令）。**本部署默认启用**：未配置即启用，仅显式 `enabled:false` 才关闭（上游原版默认不启用，本部署依需要翻转）；另保留移动端窄屏 UI 适配与包名对齐 |
-| `dsh-codearts-auth` | <https://gitee.com/iJetLi/deepseek-harness-codearts> tag `0.2.0-rc.10` 本地构建 | CodeArts / Buddy / Qoder / Trae / Cline / Loomy / Gemini 等多 Provider 登录与模型接入（另含 Accio 等新增适配器；已重放移动端窄屏 UI 适配层） |
+| `dsh-web-mobile` | <https://github.com/mexiaosqwq/dsh-web-mobile> `v3.2.1` | 竖屏/窄屏 Web 适配（抽屉导航、全宽会话、安全区、触控人体工学） |
+| `dsh-prompt-optimizer-mobile` | <https://github.com/WestFox-AwA/dsh-wish-specializer> `v0.9.0-stable` 基线（见 [FORK.md](app/src/main/assets/extra-plugins/dsh-prompt-optimizer-mobile/FORK.md)） | 提示词优化（发送前用独立 AI 改写成命令）。**本部署默认启用**：未配置即启用，仅显式 `enabled:false` 才关闭（上游原版默认不启用，本部署依需要翻转）；另保留移动端窄屏 UI 适配与包名对齐 |
+| `dsh-codearts-auth` | <https://gitee.com/iJetLi/deepseek-harness-codearts> master `4d5e6779` 本地构建（2026-10-27；上游已强推重写历史，旧基线 `86e3591` 不再是祖先：此前**定向恢复的 buddy / workbuddy 渠道与第 4 条内容级 DSH 身份首句指纹现为上游原生存在**，本地仅余 5 处包名对齐） | CodeArts / Buddy / Qoder / Trae / Cline / Loomy / Gemini 等多 Provider 登录与模型接入（另含 Accio、AStudio、Gemini 代理等新增适配器；buddy 指纹规则 4 条；上游已有基础 720px 窄屏适配，本仓另重放扩展适配层） |
 | `dsh-status-bridge` | **本仓库自研** `v0.1.3` | dsh 运行状态桥接到悬浮窗/通知（本地 HTTP，默认 :3190）。**与启动器 Kotlin 侧强耦合**：不装配则悬浮窗状态显示/TTS 播报链路失效（心跳 note 记为 `bridge-absent`，与「装了但掉线」区分开）。`/status` **需要 token**（每次启动轮换、写入 `files/status-bridge.json`，Kotlin 通过 `BridgeContract` 同源读取；不再回 CORS 头）；`lastText` 支持**逐段实时增长**（经 LLM 层 `llm/stream` waterfall 钩子对主请求做 tee，只取 `text-delta`，`reasoning`/`tool-call` 不外放） |
 | `dsh-android-links` | **本仓库自研** `v0.1.1` | 在 dsh HOME 创建 `sdcard → /storage/emulated/0` 符号链接，让工作区目录浏览器直达 SD 卡 |
 | `dsh-net-proxy` | <https://github.com/mafeis/dsh-net-proxy> `v0.8.0` | 让 agent 自身的网络请求（web_search / web_fetch / 外部 API）走已配置的 HTTP(S) 代理 |
 | `dsh-provider-headers` | 自 `prebuilt.tgz` 恢复 | 在 Web 的模型设置页为自定义（llm-pi-ai）Provider 配置自定义请求头 |
 | `dsh-vision` | 自 `prebuilt.tgz` 恢复 | 给纯文本模型加上 `view_image` 工具：复用宿主 Provider 配置，或接自定义 OpenAI 兼容 VLM 端点 |
-| `@liustack/modsearch` | <https://github.com/liustack/modsearch> `v5.10.6`（npm 产物，整包同源） | 联网检索：把 `web_search`/`web_fetch` 的后端换成免密钥的 modsearch 引擎链（Firecrawl 免密钥、1,000 次/月），并新增 `x_search`、`read_page`。⚠ 运行时依赖 `commander`/`undici` 由**依赖桥接**供给（见下） |
-| `dsh-ego-browser` | <https://github.com/Fisfzy/dsh-ego-browser> `v0.8.6`（npm 产物，整包同源） | Agent 浏览器：30+ `ego_*` 工具 + 实时观察窗，底层内置 ego-lite 运行时。⚠ **运行期需一个可达的 Chrome/Chromium 二进制**（本机未装，见下） |
-| `billion-context` | <https://github.com/ranxianglei/billion-context> `v0.1.198`（npm 产物，按上游 `files` 字段裁剪） | 上下文压缩 ACP：给模型 `compress`/`decompress`/`search_context`/`acp_status`/`acp_cache`/`read_original_image` 六个工具，由模型自己决定何时压缩、压缩什么（而非硬性截断），另附 `/acp`、`/acp-cache` 命令。⚠ 与旧内置的 `billion-context-dsh` 是**两个不同的包**：本包为进程外 MITM 代理架构，插件本体只注册工具，实际压缩由它 spawn 的 `dist/index.js` 代理进程完成。其自带的 `dsh.bundle.patch.yml` 会 disable 宿主的 `compaction-basic` 行，并**整体替换** `llm-deepseek` 的 `retryPolicy`、向四个 preset 注入 `biliBasicCompactionPolicy` |
+| `@liustack/modsearch` | <https://github.com/liustack/modsearch> `v5.10.10`（npm 产物，整包同源） | 联网检索：把 `web_search`/`web_fetch` 的后端换成免密钥的 modsearch 引擎链（Firecrawl 免密钥、1,000 次/月），并新增 `x_search`、`read_page`。⚠ 运行时依赖 `commander`/`undici` 由**依赖桥接**供给（见下） |
+| `dsh-ego-browser` | <https://github.com/Fisfzy/dsh-ego-browser> `v0.9.4`（npm 产物，整包同源） | Agent 浏览器：30+ `ego_*` 工具 + 实时观察窗，底层内置 ego-lite 运行时。⚠ **运行期需一个可达的 Chrome/Chromium 二进制**（本机未装，见下） |
+| `billion-context` | <https://github.com/ranxianglei/billion-context> `v0.1.208`（npm 产物，按上游 `files` 字段裁剪） | 上下文压缩 ACP：给模型 `compress`/`decompress`/`search_context`/`acp_status`/`acp_cache`/`read_original_image` 六个工具，由模型自己决定何时压缩、压缩什么（而非硬性截断），另附 `/acp`、`/acp-cache` 命令。⚠ 与旧内置的 `billion-context-dsh` 是**两个不同的包**：本包为进程外 MITM 代理架构，插件本体只注册工具，实际压缩由它 spawn 的 `dist/index.js` 代理进程完成。其自带的 `dsh.bundle.patch.yml` 会 disable 宿主的 `compaction-basic` 行，并**整体替换** `llm-deepseek` 的 `retryPolicy`、向四个 preset 注入 `biliBasicCompactionPolicy` |
 
 ### 内置集合的构成
 
@@ -173,7 +173,7 @@ Kotlin 展示面与 `install-dsh.mjs` 装配面都从它派生；一致性由 `n
    换包的**唯一硬理由**是 dsh 0.2.1 的兼容性判定：`billion-context-dsh` 有 16 条 `@deepseek-ai/dsh-*`
    peer 要么钉死 `0.2.0-rc.2`、要么上界写死 `<0.2.1-0`，把 pin 升到 `0.2.1-rc.2` 后会被
    `evaluatePluginCompatibility` 判定不兼容并**静默禁用**（`dsh plugin add` 照旧成功，属静默失败）。
-   `billion-context@0.1.198` 的 `peerDependencies` 为空且无 `engines.dsh`，不受该判定约束。
+   `billion-context@0.1.208` 的 `peerDependencies` 为空且无 `engines.dsh`，不受该判定约束。
    旧包已归档至 `assets/optional-plugins/billion-context-dsh/` 备回滚，**不再装配**——两者都会
    disable 宿主 `compaction-basic` 并争抢同一个 `ctx.compaction`，不能并存。
 2. **它是进程外 MITM 代理架构，与旧包的进程内 CompactionEngine 完全不同**。插件本体
@@ -195,26 +195,48 @@ Kotlin 展示面与 `install-dsh.mjs` 装配面都从它派生；一致性由 `n
 > （仓库源码未受影响，仍是新版）。本次已按仓库重新同步并重跑装配，11 项全部为最新版。
 > 结论：**APK 重装会以 assets 覆盖 extra-plugins**；改完插件后若发生重装，需重新同步一次。
 
-### 插件版本同步记录（最近一轮）
+### 插件版本同步记录（本轮 · 2026-10-27）
+
+本轮对齐上游 4 个插件（dsh 本体 pin 保持 0.2.1-rc.2 不变），全部在仓库源码层完成并已重跑设备装配：
 
 | 插件 | 旧 → 新 | 合入方式 |
 |---|---|---|
-| `dsh-web-mobile` | 3.0.5 → **3.1.0** | 整包替换（与 npm 3.1.0 tarball 逐文件一致：0 differ 行、9 个共有文件 sha256 全同；peer 与 3.0.5 逐条相同） |
-| `dsh-codearts-auth` | tag rc.5 → **tag 0.2.0-rc.10** | `pnpm build:all` 本地构建（192 个 js）+ **重放移动端适配层** |
+| `dsh-prompt-optimizer-mobile` | 0.8.4-stable → **0.9.0-stable** | 上游已改名 WestFox-AwA/dsh-wish-specializer；以 git 浅取 tag 拿到 v0.9.0-stable（codeload tarball 走代理 TLS 失败）→ 全量取上游 `po06/lib` 后用 `git merge-file` 重放本地 3 组改动（6 个文件出 diff、9 处冲突逐 hunk 判读）；上游 lib 72→83 文件（+12 个 `advisor-*` / `inference-*` 模块，−`framing.js`），`node --check` 83/83 通过 |
+| `dsh-codearts-auth` | 上游 master `86e3591` → **`4d5e6779`** | 上游 force-push 重写历史：`86e3591` 已不是 HEAD 祖先（两树相差 333 文件 / +88221 / −13939）；`pnpm build:all` 重建后本地 delta 收敛为 **5 处包名对齐**，另重放 172 行窄屏扩展块 |
+| `dsh-ego-browser` | 0.8.6 → **0.9.4** | npm 产物整包同源替换（51 文件 / 1,389,213 bytes，`diff -rq` 对新包为空） |
+| `billion-context` | 0.1.202 → **0.1.208** | npm 产物按 11 文件裁剪集替换（新增 `dist/agent/dsh-compaction-gate.js`）；`node dist/index.js --version` → 0.1.208 |
 
-- **codearts rc.10 的适配层必须重放**：上游该版**仍未内置**窄屏适配
-  （构建产物中 `max-width: 560px` 命中 0）。重放后做了非循环比对——
-  把「合并文件减去适配块」与**全新构建产物**逐行比对：两边均 **9958 行、差异 0**；
-  192 个 js 中 **191 个与构建产物逐字节相同**，唯一不同者正是承载适配块的 `lib/client/jet-hub.js`。
-  适配块与 rc.5 旧版**逐行 diff = 173 行、差异 0**（完整重放，非部分重放）。
-- **`dsh-web-mobile` 3.1.0 不带上游的 `assets/*.png`**：这 4 个 PNG 仅被上游 README 引用，
-  任何 `lib/*.js` 都不引用（grep 命中 0），且上一版副本同样不含 ⇒ 属本仓既有分发惯例
-  （只随包分发运行时 `lib/*.js`，不带 `src/`、`lib/types/`、`*.map`、README 截图）。
+- **prompt-opt 0.9.0 重放与核验**：`diff -rq` 仓库 lib 对上游 `v090/po06/lib` 恰为 6 个本地改动文件（`client` / `index` / `control-api` / `eval-llm` / `rollout` / `assembly-gate`）且无 Only-in；`eval/`（25 文件）与 `README.md` / `HELP-0.6.md` / `HELP-0.6.en.md` 与上游逐字节相同；**反向三方合并**（current=上游 v090 / base=v084 / other=更新前本地副本）对 `rollout` / `assembly-gate` / `control-api` 输出与仓库文件逐字节相同 ⇒ `repo == 上游 ⊕ 本地 delta`。上游 0.9.0 在 `cordis.patch.yml` 里新增了第二条 insert（`preset-wish`），**未采纳**（本部署无该 preset，沿用单条本地 insert，id 仍 `prompt-optimizer`）。
+- **issue #16 记录更正**：旧日志 [docs/update-check-log.md:250-254](docs/update-check-log.md#L250-L254) 写「插件 `lib/settings.js` 带本地 issue #16 补丁、升级时必须重放」——经核对**不成立**：本仓 0.8.4 的 `lib/settings.js` 与上游 v0.8.4 **逐字节相同**（sha256 `23cba71c…ac843b`），bySession 档位判据本属上游自带、并非本地补丁；0.9.0 更已自行修复并增强（逐会话 `previous` / `merged` 比对 + `delete after.framing`），故本轮直接取上游（sha256 `2a267e87…959d9b`）。该条历史记录保留原文，以此处更正为准。
+- **codearts 强推后的差异收敛**：`git diff --stat HEAD -- plugin-src package.json cordis.patch.yml` = 5 文件 +7/−7（`package.json` 与 `cordis.patch.yml` 的 `name`、`plugin-src/client/jet-hub-styles.js` 的 `PLUGIN_ID`、`plugin-src/client/index.js` 的配置槽 key、`plugin-src/client/panel-entry.js` 的 `data-plugin`；`id` 仍 `codearts-auth`）；产物 `diff -rq` 对仓库 exit 0、`node --check` 244/244、定向 vitest 6 文件 157 passed / 0 failed、`tsc --noEmit` exit 0。上游 2026-10-27 新增的第 5 条内容级指纹（「DeepSeek Harness Web GUI」）随包分发。
+- **ego-browser 0.9.4**：`files` 新增 `extension/`（4 个 MV3 文件，桌面扩展专用、Android 不适用）；`dsh-plugin.json` 新增 `residentExecutor` / `residentIdleMin` / `disableFrameRelay` / `tuiAutoOpenPanel` 设置项、`captureQuality` 取值改为 `low|balanced|high`，并移除未实现的 TUI Scene 声明（启动器 Kotlin 侧零引用，已 grep 确认）。
+- **billion-context 0.1.208**：新增 `dist/agent/dsh-compaction-gate.js`（上游 `exports` 的 `./dsh-compaction-gate`，缺它会让 `dsh-client-modules` 报 client bundle not found 并使 WebUI 起不来）；新增运行时依赖 `mysql2 ^3.15.3` 只被 mysql 存储后端动态 `import`，本机未随包（启用该后端时会明确报错）；`dsh.bundle.patch.yml` 2256→2814 bytes。
+- **兼容性复核**：用 dsh 自带的 `evaluatePluginCompatibility`（`@deepseek-ai/dsh-app-boot`）在 runtimeVersion `0.2.1-rc.2` 与 `0.2.1-rc.4` 各跑一遍：11 内置 + 2 可选**全部 compatible**，仅归档的 `billion-context-dsh@0.2.27` 被判 incompatible（16 条钉死 peer，符合预期）。
+- **本轮未验证项**：真机浏览器渲染/交互与 ego-browser 实机自动化只能由设备确认（本机无 Chrome/Chromium 二进制，`ego_*` 工具可加载可调用但会如实回报「未找到浏览器二进制」）；`extension/` 与 TUI 面在 Android 不适用；本轮**不重启 dsh**，插件热加载效果未验证。
+### 插件版本同步记录（上一轮 · 2026-10-21/22）
 
-> ⚠ **需实机手测确认**：codearts 的窄屏适配层为本地重放，其视觉与交互效果
-> **只能由真机确认**（源码与结构校验不能替代实机渲染）；`dsh-web-mobile` 3.1.0 的窄屏布局同理。
-> 装配层已机械验证：`builtin plugins assembled: 11 ok, 0 failed / 11 total`、
-> `compat audit: 11 compatible, 0 incompatible`、`plugin-status.json` 无 WARN。
+该轮（2026-10-21）对齐上游 5 个插件；dsh 本体 pin 保持 `0.2.1-rc.2`（npm `latest`/`next` 均为该版本，无更新）。同日稍晚又把 `dsh-codearts-auth` 从 tag `0.2.1-rc.2` 改装为上游 master `651dac30` 本地构建（包内 version 仍为 `0.2.1-rc.2`，内容领先 tag）；**2026-10-22 又更新到上游 master `70d1d64`，并定向恢复该压合提交移除的 `buddy` / `workbuddy` 渠道**；**同日下半天再把上游从 `70d1d64` 追到 `86e3591`**（4 个 perf/fix 提交：单渠道折算加总预算、`collectCreditsStatus` 有限并发 3 及其审计打穿的 8 处修复），同时**恢复被压合提交删掉的 probe-system 守卫**（探测请求必须带首条 system）。差异与恢复做法见下表与 [构建溯源](docs/codearts-master-build-evidence.md)。
+
+| 插件 | 旧 → 新 | 合入方式 |
+|---|---|---|
+| `dsh-web-mobile` | 3.1.0 → **3.2.1** | npm 产物按本仓裁剪惯例替换（去 `assets/`、`src/`、`lib/types/`、`*.map`；8 个文件），`node --check` 通过；上游本版移除 `lib/reasoning-effort.js` |
+| `dsh-prompt-optimizer-mobile` | 0.8.3-stable → **0.8.4-stable** | 上游 `v0.8.4-stable` 全量替换 `lib/`、`eval/` 与三份文档后，重放 3 组本地补丁（默认启用翻转、窄屏 UI、包名/注册 id 对齐）；`git merge-file` 对 6 个文件 0 冲突，新增 8 个 `advisor-*` 模块（详见 [FORK.md](app/src/main/assets/extra-plugins/dsh-prompt-optimizer-mobile/FORK.md)） |
+| `dsh-codearts-auth` | `651dac30` → **上游 master `86e3591`**（保留 buddy/workbuddy + probe 守卫） | 在 buddy 恢复提交 `172e2a3` 上 `git merge origin/master`（merge-base `70d1d64`，无冲突；交集 3 文件）再追 4 个 perf/fix 提交（`9ba4505` 折算预算 / `9ca6c22` 有限并发 3 / `019e144` 预算断言 / `86e3591` 审计修复 8 处），合并提交 `b4c4933` + 顶层 chore `3b26420` + 测试侧修正 `167e0f4`（HEAD）；`pnpm build:all` 本地构建（226 个 js / 233 个文件 / 7.65 MiB / 8,017,482 bytes）+ **重放 172 行移动端扩展适配层**；上游 `70d1d64` 是一条**压合提交**（32 D 含 6 个 `src/buddy*.ts`、2 篇 buddy 文档、24 个 buddy 测试），没有可单独排除的 commit，故以新树为基线**定向恢复**这 8 个源文件并适配通用化改名（`buddy-balance-rank/selector.ts → balance-rank/selector.ts`），另补 `src/product.ts` 的 `BuddyProduct` 兼容别名与 `src/types.ts` 的成长 RPC 类型，并按**官方同形措辞**补回同批被删的第 4 条内容级风控指纹（DSH 身份首句；buddy 直连必需）；另恢复被上游整段跳过的 probe-system 守卫（`tests/unit/account-probe-adapter.spec.ts`，98+/12−，5 条 live：trae / lobsterai / workbuddy / buddy /「只有一条 user 消息」，断言未削）；包名仍对齐本地 `dsh-codearts-auth`（三处）；构建来源、产物哈希、15 处守卫对齐与复核命令见 [构建溯源](docs/codearts-master-build-evidence.md) |
+| `@liustack/modsearch` | 5.10.6 → **5.10.10** | npm 产物整包同源替换（36 个文件，`diff -rq` 对新包为空） |
+| `billion-context` | 0.1.198 → **0.1.202** | npm 产物按既有 10 文件裁剪集替换；上游本版已不再发行 sourcemap（tarball 8.9MB），保留文件与包内对应文件 `cmp` 一致 |
+
+- **codearts 构建产物裁剪**：只复制 `lib/*.js`、`lib/qoder-auth-wasm.wasm`、`locale/`、`package.json`、`cordis.patch.yml`、`README.md`、`LICENSE`；剔除构建产物中的 225 个 `.d.ts` 与 450 个 `*.map`，保留 226 个 js、233 个文件、7.65 MiB（8,017,482 bytes；`node --check` 226/226 通过、`diff -rq dist TARGET` exit 0）。
+- **codearts 适配层**：上游 master 已有基础 720px 窄屏块（`plugin-src/client/jet-hub-styles.js` 相对 tag +114 行），旧记录「上游仍未内置」已不成立；本仓 172 行扩展块重放进 `STYLES` 模板，出现 1 次，合并文件去掉该块后与干净构建产物逐字节一致（`final === clean.slice(0,93904) + block + clean.slice(93904)` 为 true，字节增量 8,604）；`registration-id-check` 通过（三处 id 一致）。**运行代码的 `dsh-providers-hub` 加载身份残留 0**；字面量共 7 处：`lib/login-failure.js:27` 的 `Symbol.for('dsh-providers-hub/loginNeedsExternalAction')` 是跨模块内部 key（上游测试 `tests/unit/login-external-action.spec.ts` 依赖该字面量，保留 1 处），另有插件自带 `README.md` 上游改名/安装示例 6 处（文档不参与加载，逐条见 [构建溯源](docs/codearts-master-build-evidence.md#6-上游改名残留)）。
+- **prompt-opt 补丁重放**：`git merge-file -p`（本地 0.8.3 为 current、上游 0.8.3 为 base、上游 0.8.4 为 other）对 6 个文件全部 exit 0、0 conflicts；`node --check` 全通过；与上游 0.8.4 的 diff hunk 与旧补丁一一对应。另外把 0.8.4 新增的 `clientPath` 诊断探针里的上游包名改回 `dsh-prompt-optimizer-mobile`。
+- **上游 codearts 单测（如实记录）**：上一轮 4 个相关 spec（registration-id / login-external-action / tencent-fingerprint / jet-hub-styles-ownership）→ **85 tests 全通过**（13 / 8 / 49 / 15；`tencent-fingerprint` 41→49）。本轮（追 `86e3591`）定向：`tests/unit/aggregate-expiry.spec.ts` 与 `openai-gateway-tencent-fingerprint.spec.ts` 通过；`tests/unit/jet-hub-rpc.spec.ts` **247 passed**（修回被行级合并丢掉的 `LOBSTERAI` import）；probe 守卫 spec `tests/unit/account-probe-adapter.spec.ts` **5 passed | 17 skipped**（EXIT 0；`tsc -p tsconfig.tests.json` EXIT 0）。全量 `npx vitest run tests/unit/` → **10,139 passed / 2 failed / 30 skipped（10,171）**，唯一失败仍是 `tests/unit/astudio-auth.spec.ts`（:299 / :408 的 Windows 反斜杠路径断言）——用**未经本地改动的上游 `70d1d64` 检出处**（`pristine70` worktree）复跑同样 2 条失败 ⇒ 既有平台问题、非本轮回归（上一轮 10,120 passed / 2 failed / 33 skipped；本轮 +19 passed、−3 skipped，因 `account-probe-adapter.spec.ts` 三条 `it.skip` 转 live + 2 条新增用例）。e2e **本轮未重跑**（上一轮口径 `13 passed / 226 skipped`）。命令与原始输出见 [docs/codearts-master-build-evidence.md](docs/codearts-master-build-evidence.md)。
+- **本轮未发渠道请求**：buddy/CodeBuddy 只做静态构建与本地单测，未登录、未发任何模型请求；PR #130 声称的真机 400→200 因此**未复测**，本轮只证明第 4 条指纹已进入构建产物，不等同于渠道风控已放行。
+- **buddy / workbuddy 渠道定向恢复**：恢复 6 个 `src/buddy*.ts` + 2 篇文档 + 24 个测试文件（15 unit / 9 e2e，含上游改名后的 `dsh-credential.ts` 断链修复），并适配新版通用化命名；src 侧接线 8 个文件（`provider-registry.ts:222/:234` 注册两渠道，`provider-credits` / `provider-expiry` / `aggregate-adapter` / `aggregate-expiry` / `auto-adapter` / `badge-subscription` 接入，`product.ts:215` 的 `BuddyProduct` 兼容别名）；宿主侧 `src/index.ts:589/:597` 注册 2 个 `BuddyAdapter`、11 个 `kind:'buddy'` 余额块，`src/jet-hub-rpc.ts:2256` 的 `SELF_HEAL_REFRESHABLE_PROVIDERS` 含两渠道；通用接缝不做 buddy 定型（`src/credits.ts` / `src/provider-runtime.ts` 相对上游逐字未改）。⚠️ 上游同批删除的**第 4 条内容级风控指纹**（DSH 自身 system prompt 的身份首句 `You are an AI agent powered by DeepSeek Harness`，位于 `src/openai-gateway/tencent-fingerprint.ts`）也必须一并恢复：该模块 `TENCENT_PROVIDERS` 只含两渠道，漏恢复则 buddy 直连**每轮 400/11128**；本仓按上游 2026-10-21 实发验收过的**官方同形措辞**补回，并新增 8 条单测（41→49）锁住改写范围与两条网关路径。
+- **追到上游 `86e3591`**：在 buddy 恢复提交 `172e2a3` 上 `git merge origin/master`（merge-base `70d1d64`，自动合并无冲突；交集仅 3 文件，`tests/unit/aggregate-expiry.spec.ts` 与上游逐字节相同），合入 4 个 perf/fix 提交 → 合并提交 `b4c4933`（双亲 `172e2a3` + `86e3591`）→ 顶层 chore `3b26420`（`dist/` 移出索引）→ 测试侧修正 `167e0f4`（HEAD）。上游语义标记全在：`EXPIRY_PROBE_BUDGET_MS = 8_000`（`src/aggregate-expiry.ts:356`）、`EXPIRY_PROBE_MIN_SLICE_MS = 1_500`（:375）、`DEFAULT_CREDITS_STATUS_CONCURRENCY = 3`（`src/jet-hub-rpc.ts:953`）、`MAX_CREDITS_STATUS_CONCURRENCY = 8`（:975 + 硬顶 :997）。机械核验：4 文件 `git merge-file` 重放与 HEAD 逐字节相同、两 src 文件 U+FFFD = 0 ⇒ 上游改动无一被覆盖，`npx tsc -p tsconfig.json --noEmit` exit 0。**行级合并不保证语义正确**：`tests/unit/jet-hub-rpc.spec.ts` 的 `LOBSTERAI` import 曾被自动合并丢掉（本仓该 spec 从 `651dac30` 恢复时符号还在 `src/product.ts`，上游 `9ca6c22` 新增并发用例用新家符号），定向跑报 `ReferenceError: LOBSTERAI is not defined`（:408），补回 import 后 247 passed。
+- **probe-system 守卫恢复**（`tests/unit/account-probe-adapter.spec.ts`，98+/12−）：`describe.skip` → `describe`（现 :1060），5 条 live：trae :1070 / lobsterai :1081 / workbuddy :1095（新增）/ buddy :1105（新增）/「只有一条 user 消息」:1119；断言一条未削（`calls` 恰 1、`typeof system === 'string'` 且非空、`messages` 恰 1 且 `role === 'user'`）。失败模式已验证：临时注释 `src/account-probe.ts:304` 的 `system: PROBE_SYSTEM` ⇒ 4 failed / 1 passed（4 条全 `expected 'undefined' to be 'string'`），随后逐字节还原（`diff -q` 相同）。假桩适配 Task 8 新接缝 `src/account-probe.ts:201`；文件级 `beforeEach` 首次 `import('../../src/index.js')` 约 9.9s 超默认 hookTimeout ⇒ `}, 30_000)`（:57，只放宽墙钟预算）。`npx vitest run tests/unit/account-probe-adapter.spec.ts` = EXIT 0。
+- 同步对齐 15 处「手写镜像 / 漂移」守卫（只补登记与计数，未删断言）；恢复文档里被 `repo-pii-guard` 命中的样例手机号改为等长同尾占位号 `13999991100`；`tests/unit/officeace-refresh-all.spec.ts` 两处 timeout 放宽到 30s（只放宽墙钟预算、断言未改）。逐项见 [构建溯源](docs/codearts-master-build-evidence.md)。
+- **`dsh-web-mobile` 3.2.1 仍不带上游 `assets/*.png`**：沿用既有分发惯例（只带运行时 `lib/*.js`，不带 `src/`、`lib/types/`、`*.map`、README 截图）。
+
+> ⚠ **需实机手测确认**：codearts 上游已有 720px 基础块，本仓 172 行扩展层覆盖 ≤560px；两层叠加后的视觉与交互效果**只能由真机确认**（源码与结构校验不能替代实机渲染，且扩展层是按旧版上游块重放的，未针对新版基础块重新设计）；`dsh-web-mobile` 3.2.1 与 `dsh-prompt-optimizer-mobile` 0.8.4 的窄屏布局同理。
 
 ### 弃用插件（retired）核查
 
@@ -360,6 +382,8 @@ adb shell am start -n com.dsh.nextapp1/.MainActivity   # 或直接点应用图�
 |---|---|
 | [`docs/plugin-roster.md`](docs/plugin-roster.md) | 插件名册：候选面、逐项决策、落地结果、来源可靠性核查 |
 | [`docs/update-check-log.md`](docs/update-check-log.md) | 历次「检查更新」的可核证据（查询时间、dist-tag、实际版本号），append-only |
+| [`docs/codearts-master-build-evidence.md`](docs/codearts-master-build-evidence.md) | `dsh-codearts-auth` 上游 master 本地构建的溯源、产物哈希、裁剪/适配层重放、**保留 buddy/workbuddy 的定向恢复**与单测/设备复验证据 |
+| [`docs/codearts-master-build-evidence-20261021.md`](docs/codearts-master-build-evidence-20261021.md) | 上一轮（上游 `651dac30`）构建证据归档 |
 | [`docs/plugin-conversion-audit.md`](docs/plugin-conversion-audit.md) | 脚本式 dsh 修改审计：12 处补丁逐项判定 + 升级守护清单 |
 | [`docs/architecture-optimization-plan.md`](docs/architecture-optimization-plan.md) | 架构优化路线图（P0/P1/P2 + 执行状态） |
 | [`docs/review-findings-scripts.md`](docs/review-findings-scripts.md) | 脚本层全量 review 记录 |

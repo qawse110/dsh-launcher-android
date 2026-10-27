@@ -10,6 +10,38 @@ function isAbnormalNetworkError(error) {
     return /fetch failed|ENOTFOUND|ECONNREFUSED|proxy|unresolved host|getaddrinfo/i.test(message);
 }
 /**
+ * 「连不上」与「连上了但失败」必须分开（Gitee issue IKLTZ2）。
+ *
+ * ⚠️ `fetch failed` 是 undici 把**所有**传输层失败压成的同一句话，真因只在
+ * `cause` 上。`isAbnormalNetworkError` 把它（连同 `ENOTFOUND` /
+ * `ECONNREFUSED`）一律归成「1 分钟后重试的瞬时抖动」—— 对真正的抖动是对的，
+ * 但对**「墙外服务根本出不去」**是错的：那不是抖动，60 秒后再试还是同样的
+ * 超时，于是调度器**永远静默重试**，面板上零线索（issue 原话：「面板上完全
+ * 看不出是网络/代理原因，用户只能看到授权失败」）。
+ *
+ * ⚠️ 为什么是「拉长间隔」而不是「停止调度」：连接超时**可能**是临时的
+ * （用户正在切代理 / 代理刚启动）⇒ 保留重试但从 1 分钟拉到 30 分钟。
+ * **刻意不归终态**（`RefreshTokenExpiredError` 那种停调度）：凭据没坏，
+ * 代理一恢复就该自动复活。
+ *
+ * ⚠️ 判据读 `cause` 链上的**错误码**（`UND_ERR_*` / `EHOSTUNREACH` …）而不是
+ * message：`message` 恒为 `fetch failed`，用它判会把**所有**传输失败
+ * （含 5xx 之后的读体失败）都拉长间隔。
+ */
+export function isUnreachableNetworkError(error) {
+    // 遍历上限防病态自引用链（与 `opencode-rpc.ts` 的 `describeFetchError` 同款）。
+    let current = error;
+    for (let i = 0; i < 8 && current !== null && current !== undefined; i += 1) {
+        const code = current.code;
+        if (typeof code === 'string'
+            && /UND_ERR_CONNECT_TIMEOUT|UND_ERR_SOCKET|UND_ERR_HEADERS_TIMEOUT|EHOSTUNREACH|ENETUNREACH|ENOTFOUND/i.test(code)) {
+            return true;
+        }
+        current = current.cause;
+    }
+    return false;
+}
+/**
  * 判定 refresh_token 是否已失效（终态：停止调度并提示重新登录）。
  *
  * 结构化判定而非 instanceof：CodeArts（oauth.ts）与 Buddy（buddy-oauth.ts）
@@ -101,6 +133,27 @@ export class RefreshScheduler {
             if (this.timer !== undefined) {
                 clearTimeout(this.timer);
             }
+            // ⚠️⚠️ **刻意只有两格**：原提交在这里加了第三格
+            //（`isUnreachableNetworkError ? REFRESH_UNREACHABLE_RETRY_MS`），
+            // 而它是**净损害**，独立审计实测确认了两个原因：
+            //
+            // 1. **对 gemini 自身零作用** —— gemini **不使用** `RefreshScheduler`
+            //    （全仓 7 处 `new RefreshScheduler` 在 buddy / workbuddy / cline /
+            //    qoder / trae / lobsterai / autoclaw，**gemini-auth.ts 没有**）。
+            //    gemini 走账号池 `refreshAll`，由 `MultiAccountRefreshScheduler`
+            //    驱动，那里的间隔是**固定 30 分钟**、**没有任何错误分类** ⇒
+            //    「1 分钟 → 30 分钟」这层改动对 gemini 一行都不生效（它本来就是
+            //    30 分钟），commit message 的说法与实现不符。
+            // 2. **误伤了另外七个 provider** —— 它们与墙无关，把一次 DNS 抖动
+            //    （`ENOTFOUND`，典型的临时故障）从 60 秒拉长到 30 分钟，
+            //    代价是「代理抽风一次，用户 30 分钟不能用」。
+            //
+            // ⇒ 「连不上」这个判据**仍然有用**（它被 `geminiNetworkHint` 用于给出
+            //   指路文案，见 `src/gemini-proxy.ts`），但**重试间隔**不该动：
+            //   静默重试 60 秒一次不伤任何人，而拉长间隔才是净损失。
+            //   若将来 gemini 真要独立的退避策略，该加在
+            //   `MultiAccountRefreshScheduler` 上（它目前无错误分类能力），而不是
+            //   在这条**七家共享**的链上动。
             const retry = isAbnormalNetworkError(error) ? REFRESH_ABNORMAL_NETWORK_RETRY_MS : REFRESH_RETRY_MS;
             this.timer = setTimeout(() => {
                 void this.run();

@@ -100,7 +100,22 @@ export class BuddyBalanceSelector {
         const now = this.deps.now?.() ?? Date.now();
         const cached = this.cache.get(account.id);
         if (cached !== undefined) {
-            const ttl = cached.source.ok
+            /**
+             * ⚠️⚠️ **降级结果必须走「错误」那档短 TTL**（2026-10-21 二轮审计，P2）。
+             *
+             * `ok: true` + `degraded: true` 的组合语义是「总额读到了、逐包明细丢了」——
+             * 它**不是一个稳定的成功读数**，而是一次**瞬态不确定性**（例如流水端点抖动）。
+             *
+             * 若按 `ok` 走 60 秒长 TTL：一次抖动 ⇒ **60 秒内每次选号都报 `unknown`**
+             *（修前更糟：60 秒内报「积分都已用尽」）。
+             * ⇒ 降级与失败同等对待，走 `errorTtlMs`（默认 5 秒）⇒ 抖动一过即自愈。
+             *
+             * ⚠️ 判据必须读 `cached.source.balance.degraded`（**原料**），不是
+             * `classify()` 之后的条目 —— `classify` 依赖 `now`，而这里是在**决定
+             * 要不要重算**，必须看「当时取到的原料」。
+             */
+            const degradedSource = cached.source.ok && cached.source.balance.degraded === true;
+            const ttl = cached.source.ok && !degradedSource
                 ? (this.deps.ttlMs ?? BUDDY_BALANCE_CACHE_TTL_MS)
                 : (this.deps.errorTtlMs ?? BUDDY_BALANCE_ERROR_CACHE_TTL_MS);
             if (now - cached.at < ttl) {
@@ -129,6 +144,8 @@ export class BuddyBalanceSelector {
             expiringBalance: split.expiring,
             permanentBalance: split.permanent,
             split,
+            // ⚠️ 透传「降级」：总额可信、明细不可达 ⇒ 下游不得据此断言 exhausted。
+            ...(source.balance.degraded === true ? { degraded: true } : {}),
         };
         entry.tier = buddyBalanceTier(entry, { now, windowMs });
         return entry;
@@ -152,13 +169,41 @@ export class BuddyBalanceSelector {
             // 这里再加一道运行时防御 —— 万一有人用 `as` 绕过了类型，
             // 宁可立刻抛一条能指认到原因的错，也不要发出 `undefined/...` 的畸形请求
             // 让它变成一句无法归因的「余额查询失败」。
+            //
+            // ⚠️ **详细变体优先**（见 {@link BalanceQueryDetail}）：它返回
+            // `{ balance, error? }`，能同时给出「有没有余额」和「为什么查不到」。
+            // 传了它就不再走 `fetchBalance` —— 两者都传时详细变体是严格超集。
+            const detailed = this.deps.fetchBalanceDetailed;
+            if (detailed !== undefined) {
+                /**
+                 * ⚠️ **同样要传第三参**：详细变体优先于 `fetchBalance`，若此处不给
+                 * `ctx`，那些「按出口 IP 分流」的渠道会在这条腿上丢掉出口配置
+                 * （详见 {@link BuddySelectionDeps.fetchBalanceDetailed} 的注释）。
+                 */
+                const result = await detailed(credential, this.deps.product, {
+                    accountId: account.id,
+                    ...this.deps.fetchFor === undefined ? {} : { fetchFor: this.deps.fetchFor },
+                });
+                if (result.balance === null) {
+                    // ⚠️ `error` 缺失时仍给一句**能指认到「未知」**的话，而不是
+                    //    回落到那句会把用户引向凭据的概括文案 —— 后者是确定的错误归因。
+                    return { ok: false, error: result.error ?? '余额查询失败（未提供具体原因）' };
+                }
+                return { ok: true, balance: result.balance };
+            }
             const injected = this.deps.fetchBalance;
             if (injected === undefined && typeof this.deps.product.endpoint !== 'string') {
                 throw new Error(`${this.deps.product.id ?? 'provider'} 未注入 fetchBalance，`
                     + '且产品配置没有 endpoint —— 选号器无法查询该 provider 的余额');
             }
             balance = await (injected
-                ?? ((cred, product) => fetchCreditBalance(cred, product, this.deps.fetcher ?? fetch)))(credential, this.deps.product);
+                ?? ((cred, product) => fetchCreditBalance(cred, product, this.deps.fetcher ?? fetch)))(
+            /**
+             * ⚠️ **第三参带上账号上下文**：出口代理是**账号维度**的，而本方法
+             * 手上正有 `account.id` —— 不传下去，按出口 IP 分流的渠道（MiniMax
+             * 国际站）会恒查不到余额 ⇒ 在聚合轮换里被**静默剔除**。
+             */
+            credential, this.deps.product, { accountId: account.id, ...this.deps.fetchFor === undefined ? {} : { fetchFor: this.deps.fetchFor } });
         }
         catch (error) {
             return { ok: false, error: `余额查询异常：${error instanceof Error ? error.message : String(error)}` };
@@ -186,7 +231,9 @@ export class BuddyBalanceSelector {
      */
     async select(candidates, options = {}) {
         if (candidates.length === 0) {
-            return { ok: false, reason: { kind: 'exhausted' } };
+            // ⚠️ 空候选 = **压根没查过余额**，不能报 `exhausted`（那是在替服务端
+            //    断言「积分是 0」）。见 `no-candidates` 的说明。
+            return { ok: false, reason: { kind: 'no-candidates' } };
         }
         // 并发查余额：账号数通常个位数，并发比串行快得多。
         const balances = await Promise.all(candidates.map((c) => this.balanceOf(c)));
@@ -215,7 +262,34 @@ export class BuddyBalanceSelector {
  */
 function noAccountReason(balances) {
     const errors = balances.filter(b => !b.ok).map(b => b.error ?? '未知原因');
-    return errors.length > 0 ? { kind: 'unknown', errors } : { kind: 'exhausted' };
+    if (errors.length > 0)
+        return { kind: 'unknown', errors };
+    /**
+     * ⚠️⚠️ **「明细不可达」也不能断言 `exhausted`**（2026-10-21 二轮审计 P1）。
+     *
+     * `ok: false` 只覆盖「连总额都没拿到」。还有一类更隐蔽的：
+     * **总额拿到了、明细丢了**（`balance.degraded === true`）—— 例如 AutoClaw
+     * 的流水端点抖动时静默回退钱包包，回退包**没有 `deductionEndTime`**。
+     *
+     * 而 `splitBuddyCreditsByExpiry` 把「没有到期时刻」判成**永久桶**（对真·永久是对的）
+     * ⇒ 一次明细抖动会让「有临期积分的账号」被判成**只剩永久积分** ⇒
+     * 锁定时报「积分都已用尽」—— **那句会把用户推向不可撤回的解锁**。
+     *
+     * 实测（AutoClaw，同一账号同一 5000 余额，只改流水端点是否 500）：
+     * ```
+     * 流水正常 → split={expiring:5000} tier=expiring（可用）✅
+     * 流水 500 → split={permanent:5000} tier=none（「积分都已用尽」）❌
+     * ```
+     * ⇒ **降级必须与失败同等对待**：都归 `unknown`（「无法确认」），不归 `exhausted`。
+     */
+    const degraded = balances.filter((b) => b.ok && b.degraded === true);
+    if (degraded.length > 0) {
+        return {
+            kind: 'unknown',
+            errors: [`${degraded.length} 个账号的**逐包明细**不可用（总额已读到，但没有到期时刻）`],
+        };
+    }
+    return { kind: 'exhausted' };
 }
 /** 构造一个「查询失败」的余额条目。 */
 function failedEntry(id, error) {
@@ -247,7 +321,14 @@ function failedEntry(id, error) {
 export async function pickBuddyAccount(selector, candidates, options) {
     const tried = new Set();
     const allowPermanent = options.allowPermanent !== false;
-    let reason;
+    /**
+     * ⚠️ **候选为空必须当场定因**（真实报障 2026-10-13，CodeBuddy）：
+     * 下面的循环上界是候选数，空候选时**一次都不执行**，`reason` 会保持
+     * `undefined`；调用方的 `?? { kind: 'exhausted' }` 于是把「候选被模型限流
+     * 筛空」**凭空**断言成「积分都已用尽」，用户据此去解锁永久积分 ——
+     * 而解禁时刻其实就写在 `modelRateLimits` 里。
+     */
+    let reason = candidates.length === 0 ? { kind: 'no-candidates' } : undefined;
     // 循环上界取候选数：每次迭代至少排除一个账号，故必然终止。
     for (let remaining = candidates; remaining.length > 0;) {
         const picked = await selector.select(remaining, { ...options.tierOptions, allowPermanent });
@@ -264,6 +345,18 @@ export async function pickBuddyAccount(selector, candidates, options) {
     }
     // 锁定时的「无可用账号」是**用户要的确定性结果**，与凭据无关；
     // 未锁定时的失败只可能是凭据问题，交给调用方继续走池的兜底。
-    return { kind: allowPermanent ? 'exhausted' : 'locked', tried, ...reason ? { reason } : {} };
+    //
+    // ⚠️ `reason` 仍缺席 ⇒ **是「凭据全坏」而不是「积分用尽」**（2026-10-14 审计
+    //    实测打穿的漏网路径）。走到这里只有两种情形：
+    //    ① 候选为空 —— 开头已预置 `no-candidates`，故此时 `reason` 非空；
+    //    ② 候选非空、每次 `select()` 都返回 `ok:true`，但那些号的凭据都解析不出来
+    //       ⇒ 循环耗尽候选，`reason` 一次都没被赋值。
+    //    而 `ok:true` **本身就证明**该号落在「可用档」（锁定时只有 `expiring` 可用）
+    //    ⇒ 明知它有钱却报「积分都已用尽」是**自相矛盾**，且会把用户推向
+    //    「解锁永久积分」（不可撤回地烧钱）。故必须如实归到 `credential-only`。
+    //    ⚠️ 不能省着不填让调用方的 `?? { kind: 'exhausted' }` 兜底 —— 那正是缺陷本体。
+    if (reason === undefined)
+        reason = { kind: 'credential-only' };
+    return { kind: allowPermanent ? 'exhausted' : 'locked', tried, reason };
 }
 //# sourceMappingURL=buddy-balance-selector.js.map

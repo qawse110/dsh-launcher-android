@@ -1,0 +1,324 @@
+{
+  "rows": [
+    {
+      "id": "d1-car",
+      "dim": "D1",
+      "packetChars": 1133,
+      "baselineChars": 10353,
+      "injectedChars": 14798,
+      "judge": {
+        "first": {
+          "winB": -1,
+          "injected": {
+            "exec": 2,
+            "spec": 3,
+            "risk": 2
+          },
+          "baseline": {
+            "exec": 3,
+            "spec": 4,
+            "risk": 2
+          },
+          "why": "两者都缺主循环与驾驶物理、代码均被截断，但 Y 的车身几何已成型且材质/坐标参数更具体可检验，相对更接近能开工；风险维度双方均无显式说明与验证手段。"
+        },
+        "second": {
+          "winB": -1,
+          "injected": {
+            "exec": 1,
+            "spec": 4,
+            "risk": 1
+          },
+          "baseline": {
+            "exec": 1,
+            "spec": 4,
+            "risk": 2
+          },
+          "why": "两份代码都在关键处截断无法直接运行，但 X 的渲染与车辆骨架更完整、性能开销更可控；Y 的灯柱逐根创建、切换功能和放样车身均未落地，隐含性能与完成度风险更高。"
+        },
+        "agree": true
+      },
+      "winB": -1,
+      "disputed": false
+    },
+    {
+      "id": "d1-film",
+      "dim": "D1",
+      "packetChars": 997,
+      "baselineChars": 2703,
+      "injectedChars": 4018,
+      "judge": {
+        "first": {
+          "winB": 1,
+          "injected": {
+            "exec": 5,
+            "spec": 5,
+            "risk": 4
+          },
+          "baseline": {
+            "exec": 3,
+            "spec": 3,
+            "risk": 2
+          },
+          "why": "X给出逐秒分镜、镜头焦段/色温/灯位/dB与“6帧前置低频”“S5静音”等可检验参数，并附可运行的HTML时间轴强度曲线验收工具；Y有可跑的FFmpeg模板但各片段时长与爆点0.5秒静音未落地、依赖AI生成素材一致性无预案、无验证手段。"
+        },
+        "second": {
+          "winB": 1,
+          "injected": {
+            "exec": 4,
+            "spec": 5,
+            "risk": 4
+          },
+          "baseline": {
+            "exec": 4,
+            "spec": 4,
+            "risk": 2
+          },
+          "why": "Y 把“起鸡皮疙瘩的那一下”做成可检验对象（强度曲线+15.0s 爆点+6 帧提前低频+0.5s 静音+HTML 时间轴核验），并给出镜头/灯光/dB 级可开工参数；X 的 FFmpeg 拼接链虽能直接跑，但字体路径只适配 macOS、素材全靠 AI 生成且没有任何失效场景与验证手段。"
+        },
+        "agree": true
+      },
+      "winB": 1,
+      "disputed": false
+    },
+    {
+      "id": "d1-game",
+      "dim": "D1",
+      "packetChars": 890,
+      "baselineChars": 6175,
+      "injectedChars": 20419,
+      "judge": {
+        "first": {
+          "winB": -1,
+          "injected": {
+            "exec": 1,
+            "spec": 3,
+            "risk": 2
+          },
+          "baseline": {
+            "exec": 2,
+            "spec": 4,
+            "risk": 2
+          },
+          "why": "两版都被截断不能直接运行，但X仅缺结算界面和主循环（约20行即可补齐），玩法参数（速度280→760、缺口高度/间距公式、碰撞盒）具体可调；Y连玩家移动、碰撞、更新/渲染核心都缺失，补齐成本高得多，且两者都未写验证步骤与失败预案。"
+        },
+        "second": {
+          "winB": -1,
+          "injected": {
+            "exec": 1,
+            "spec": 3,
+            "risk": 2
+          },
+          "baseline": {
+            "exec": 1,
+            "spec": 4,
+            "risk": 3
+          },
+          "why": "两者都因代码截断不能直接玩，但Y的核心循环、碰撞、难度参数和音效保护更接近可开工，X范围更大却缺失更多关键逻辑。"
+        },
+        "agree": true
+      },
+      "winB": -1,
+      "disputed": false
+    },
+    {
+      "id": "d1-tool",
+      "dim": "D1",
+      "packetChars": 1151,
+      "baselineChars": 8669,
+      "injectedChars": 15337,
+      "judge": {
+        "first": {
+          "winB": 1,
+          "injected": {
+            "exec": 2,
+            "spec": 4,
+            "risk": 4
+          },
+          "baseline": {
+            "exec": 2,
+            "spec": 3,
+            "risk": 2
+          },
+          "why": "两者代码均截断不能直接运行，但 Y 的 CLI 设计更完整，含默认预览、--apply/--undo、日志、冲突检测与差异高亮，风险控制明显更强。"
+        },
+        "second": {
+          "winB": 1,
+          "injected": {
+            "exec": 2,
+            "spec": 4,
+            "risk": 4
+          },
+          "baseline": {
+            "exec": 2,
+            "spec": 3,
+            "risk": 2
+          },
+          "why": "X 的预览/执行/撤销/日志与规则参数更具体且安全，Y 的 GUI 更直观但核心重命名与撤销细节不足。"
+        },
+        "agree": true
+      },
+      "winB": 1,
+      "disputed": false
+    },
+    {
+      "id": "d1-site",
+      "dim": "D1",
+      "packetChars": 988,
+      "baselineChars": 14654,
+      "injectedChars": 11236,
+      "judge": {
+        "first": {
+          "winB": -1,
+          "injected": {
+            "exec": 2,
+            "spec": 3,
+            "risk": 3
+          },
+          "baseline": {
+            "exec": 3,
+            "spec": 3,
+            "risk": 2
+          },
+          "why": "X 提供了可渲染的页面骨架与明确视觉方向，Y 更系统但缺少 body 标记，直接开工性不足。"
+        },
+        "second": {
+          "winB": 1,
+          "injected": {
+            "exec": 2,
+            "spec": 4,
+            "risk": 3
+          },
+          "baseline": {
+            "exec": 2,
+            "spec": 3,
+            "risk": 2
+          },
+          "why": "两份代码都在 CSS 中段截断，均无法直接运行；但 X 的结构、栅格、排版变量与区块规划更完整，且已有 focus-visible 与 skip link，续建和验证成本更低；Y 的视觉手段虽具体，但内容结构化不足，固定噪点、blur、mix-blend 带来性能风险且无兜底。"
+        },
+        "agree": false
+      },
+      "winB": null,
+      "disputed": true
+    },
+    {
+      "id": "d1-diagram",
+      "dim": "D1",
+      "packetChars": 682,
+      "baselineChars": 2753,
+      "injectedChars": 3125,
+      "judge": {
+        "first": {
+          "winB": -1,
+          "injected": {
+            "exec": 4,
+            "spec": 4,
+            "risk": 3
+          },
+          "baseline": {
+            "exec": 5,
+            "spec": 5,
+            "risk": 4
+          },
+          "why": "X 的编号数据流、outbox+CDC 与幂等消费代码把一致性风险讲透；Y 图更漂亮且有验收问题，但双写事件与 CDC 汇入 Kafka 未说明去重/顺序，存在误导。"
+        },
+        "second": {
+          "winB": 1,
+          "injected": {
+            "exec": 5,
+            "spec": 5,
+            "risk": 5
+          },
+          "baseline": {
+            "exec": 5,
+            "spec": 5,
+            "risk": 4
+          },
+          "why": "X 的图同时画清正向、异步、批量、回流四类数据流，并把死信重放、对账回流、降级旁支和五条验收判据一并给出，因此图上每条流都有可检验的落点与故障去向；Y 的 outbox + 幂等代码与形态表很具体，但运维验证、回流和降级只停留在规则层，图上缺少观测与回滚链路。"
+        },
+        "agree": false
+      },
+      "winB": null,
+      "disputed": true
+    },
+    {
+      "id": "d1-write",
+      "dim": "D1",
+      "packetChars": 943,
+      "baselineChars": 1560,
+      "injectedChars": 1150,
+      "judge": {
+        "first": {
+          "winB": 1,
+          "injected": {
+            "exec": 4,
+            "spec": 4,
+            "risk": 4
+          },
+          "baseline": {
+            "exec": 3,
+            "spec": 2,
+            "risk": 2
+          },
+          "why": "X可直接改写发布且参数、限制与验证路径更具体；Y情绪足但隐私、AI语音/自动通话和可验证性风险明显更弱。"
+        },
+        "second": {
+          "winB": 1,
+          "injected": {
+            "exec": 3,
+            "spec": 5,
+            "risk": 5
+          },
+          "baseline": {
+            "exec": 4,
+            "spec": 3,
+            "risk": 2
+          },
+          "why": "Y 给出了可检验的参数、边界和验证路径，风险披露充分；X 更有感染力但关键能力多为不可验证描述，缺少失败场景与验证方案。"
+        },
+        "agree": true
+      },
+      "winB": 1,
+      "disputed": false
+    },
+    {
+      "id": "d1-platform",
+      "dim": "D1",
+      "packetChars": 1317,
+      "baselineChars": 33656,
+      "injectedChars": 3646,
+      "judge": {
+        "first": {
+          "winB": 1,
+          "injected": {
+            "exec": 4,
+            "spec": 5,
+            "risk": 4
+          },
+          "baseline": {
+            "exec": 2,
+            "spec": 2,
+            "risk": 1
+          },
+          "why": "X 是完整连贯、可落地开工的方案（附参数表、固定步长主循环、存档迁移链与热重载）；Y 自称可运行，但代码在存档段中途截断，核心玩法、编辑器和存档实现均缺失，几乎没有风险与验证内容。"
+        },
+        "second": {
+          "winB": 1,
+          "injected": {
+            "exec": 4,
+            "spec": 5,
+            "risk": 5
+          },
+          "baseline": {
+            "exec": 2,
+            "spec": 3,
+            "risk": 1
+          },
+          "why": "Y提供可直接开工的参数、数据结构、存档迁移与可验证脚手架；X代码截断且缺少核心循环，无法运行。"
+        },
+        "agree": true
+      },
+      "winB": 1,
+      "disputed": false
+    }
+  ]
+}

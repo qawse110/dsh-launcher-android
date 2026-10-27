@@ -4,6 +4,7 @@ import {randomUUID, createHash} from 'node:crypto'
 import {materialPath,readBounded} from './advisor-materials.js'
 import {ADVISOR_SCOPES} from './advisor-scopes.js'
 import {renderStageSummary} from './advisor-context.js'
+import {claimEvidenceState, evidencePathIdentity, CLAIM_EVIDENCE_POLICY} from './advisor-evidence.js'
 
 const copy=x=>JSON.parse(JSON.stringify(x))
 const text=(x,n)=>typeof x==='string' && x.trim() && x.length<=n
@@ -35,7 +36,7 @@ export function createAdvisorStages({home}={}) {
      if(t.activeStageId!==null && !t.stages.some(s=>s.id===t.activeStageId))throw new Error('invalid-active-stage')
      if(!text(t.sourceText,4000) || new Set(t.stages.map(s=>s.id)).size!==t.stages.length)throw new Error('invalid-task-source')
      for(const [i,s] of t.stages.entries()) {
-      if(s.id!=='S'+(i+1)||!ADVISOR_SCOPES.includes(s.scope)||s.scope==='delivery'||!text(s.focus,500)||!Array.isArray(s.checks)||!s.checks.length||s.checks.length>8||!materialsOK(s.materials)||!pathsOK(s.subjectPaths || [])||!materialsOK(s.subjects || [])||s.pendingReviewId && !safe(s.pendingReviewId)||s.checks.some((c,n)=>c.id!==s.id+'.K'+(n+1)||!text(c.criterion,500)||!['satisfied','failed','unverified','stale'].includes(c.status)||!Array.isArray(c.evidenceRefs)||c.evidenceRefs.length>12||c.evidenceRefs.some(ref=>!text(ref,180))))throw new Error('invalid-stage')
+      if(s.id!=='S'+(i+1)||!ADVISOR_SCOPES.includes(s.scope)||s.scope==='delivery'||!text(s.focus,500)||!Array.isArray(s.checks)||!s.checks.length||s.checks.length>8||!materialsOK(s.materials)||!pathsOK(s.subjectPaths || [])||!materialsOK(s.subjects || [])||s.pendingReviewId && !safe(s.pendingReviewId)||s.checks.some((c,n)=>c.id!==s.id+'.K'+(n+1)||!text(c.criterion,500)||!['satisfied','failed','unverified','stale'].includes(c.status)||!Array.isArray(c.evidenceRefs)||c.evidenceRefs.length>12||c.evidenceRefs.some(ref=>!text(ref,s.evidenceAssessment?1100:180))))throw new Error('invalid-stage')
      }
     }
     state=v
@@ -61,12 +62,10 @@ export function createAdvisorStages({home}={}) {
  const task=(state,id)=>state.tasks.find(t=>t.id===(id || state.activeTaskId))
  const inspect=(stage,opts={})=>{
   const result=copy(stage), budget=opts.budget || {left:STAGE_LIMITS.bytes,hashes:new Map()}
-  let fresh=stage.materials.length>0 && stage.invalidated!==true
-  if(['geometry','appearance'].includes(stage.scope) && !(stage.subjectPaths || []).length)fresh=false
-  const limitations=[]
-  const versionTargets=stage.subjects || []
-  for(const m of [...stage.materials,...versionTargets]) {
-   if(m.status!=='ready' || !m.sha256 || !opts.readEnabled || !opts.root){fresh=false;limitations.push('evidence-unavailable');continue}
+  const evidence=claimEvidenceState(stage), claim=evidence.policy===CLAIM_EVIDENCE_POLICY
+  const limitations=[], versionTargets=stage.subjects || []
+  const verify=m=>{
+   if(m.status!=='ready' || !m.sha256 || !opts.readEnabled || !opts.root){limitations.push('evidence-unavailable');return false}
    try {
     const p=materialPath(opts.root,m.path),st=statSync(p),cap=m.kind==='image'?5*1024*1024:2*1024*1024
     if(!st.isFile() || st.size>cap)throw new Error('evidence-limit')
@@ -75,18 +74,38 @@ export function createAdvisorStages({home}={}) {
      const bounded=readBounded(opts.root,m.path,Math.min(cap,budget.left))
      budget.left-=bounded.data.length;budget.hashes.set(bounded.actual,hash(bounded.data))
     }
-    if(budget.hashes.get(p)!==m.sha256){fresh=false;limitations.push('evidence-changed')}
-   }catch {fresh=false;limitations.push('evidence-missing-or-unreadable')}
+    if(budget.hashes.get(p)!==m.sha256){limitations.push('evidence-changed');return false}
+    return true
+   }catch {limitations.push('evidence-missing-or-unreadable');return false}
   }
-  if(!fresh)for(const c of result.checks)if(c.status==='satisfied')c.status='stale'
-  const failed=result.checks.filter(c=>c.status==='failed')
-  const pending=result.checks.filter(c=>c.status!=='satisfied')
+  const subjectFresh=versionTargets.map(verify).every(Boolean)
+  const invalidationOK=(stage.invalidated===undefined || typeof stage.invalidated==='boolean') && (stage.invalidatedChecks===undefined || Array.isArray(stage.invalidatedChecks) && stage.invalidatedChecks.length<=8 && new Set(stage.invalidatedChecks).size===stage.invalidatedChecks.length && stage.invalidatedChecks.every(id=>stage.checks.some(c=>c.id===id)))
+  if(!invalidationOK)limitations.push('claim-evidence-metadata-invalid')
+  const hasVisualSubjects=!['geometry','appearance'].includes(stage.scope) || (stage.subjectPaths || []).length>0
+  let fresh=invalidationOK && stage.invalidated!==true && hasVisualSubjects && subjectFresh
+  if(claim) {
+   const invalidated=new Set(Array.isArray(stage.invalidatedChecks)?stage.invalidatedChecks:[]), baseFresh=fresh
+   for(const [index,c] of result.checks.entries()) {
+    const entry=evidence.checks[index], targets=entry.bindings.filter(b=>b.path && b.sha256)
+    const checked=targets.map(b=>verify({...b,status:'ready'})).every(Boolean)
+    // Opaque E results need an independently hash-bound target; a record hash is not a live artifact.
+    const current=entry.complete && baseFresh && !invalidated.has(c.id) && checked && (targets.length>0 || versionTargets.length>0)
+    if(!current){fresh=false;if(c.status==='satisfied')c.status='stale'}
+   }
+   if(!evidence.complete)limitations.push('claim-evidence-incomplete')
+  } else {
+   const checked=stage.materials.map(verify).every(Boolean)
+   fresh=fresh && evidence.policy==='legacy' && stage.materials.length>0 && checked
+   if(evidence.policy==='invalid')limitations.push(evidence.reason)
+   if(!fresh)for(const c of result.checks)if(c.status==='satisfied')c.status='stale'
+  }
+  const failed=result.checks.filter(c=>c.status==='failed'), pending=result.checks.filter(c=>c.status!=='satisfied')
   result.advanceAllowed=fresh && !pending.length && stage.lastVerdict==='pass'
-  if(!stage.materials.length) limitations.push('evidence-not-provided')
-  result.action=failed.length?'repair':result.advanceAllowed?'advance':(stage.materials.length || versionTargets.length) && (!opts.readEnabled || !opts.root)?'ask-user':'collect-evidence'
-  if(stage.lastFailure) limitations.push(stage.lastFailure)
-  result.bindingScope=versionTargets.length?'declared-targets':'evidence-only'
-  if(!versionTargets.length) limitations.push('subject-binding-unspecified')
+  if(!stage.materials.length && !claim)limitations.push('evidence-not-provided')
+  result.action=failed.length?'repair':result.advanceAllowed?'advance':(stage.materials.length || versionTargets.length || claim) && (!opts.readEnabled || !opts.root)?'ask-user':'collect-evidence'
+  if(stage.lastFailure)limitations.push(stage.lastFailure)
+  result.bindingScope=versionTargets.length?'declared-targets':claim?'claim-evidence':'evidence-only'
+  if(!versionTargets.length)limitations.push('subject-binding-unspecified')
   result.limitations=[...new Set(limitations)]
   return result
  }
@@ -142,9 +161,10 @@ export function createAdvisorStages({home}={}) {
     return {ok:true,taskId:t.id,stageId:s.id,action:'collect-evidence'}
    })
   },
-  prepareReview({sessionId,taskId,stageId,root,readEnabled,materials=[]}={}) {
+  prepareReview({sessionId,taskId,stageId,root,readEnabled,materials=[],evidencePolicy}={}) {
+   if(evidencePolicy!==undefined && evidencePolicy!==CLAIM_EVIDENCE_POLICY)return fail('invalid-evidence-policy')
    const spec=store.reviewSpec({sessionId,taskId,stageId});if(!spec.ok)return spec
-   const inputs=[...new Set([...(spec.stage.subjectPaths || []),...materials.filter(m=>m.kind==='file' && m.status!=='excluded').map(m=>m.path)])]
+   const inputs=[...new Set([...(spec.stage.subjectPaths || []),...(evidencePolicy===CLAIM_EVIDENCE_POLICY?[]:materials.filter(m=>m.kind==='file' && m.status!=='excluded').map(m=>m.path))])]
    const subjects=[],budget={left:STAGE_LIMITS.bytes}
    let problem=null
    if(inputs.length>8)return fail('subject-path-limit')
@@ -163,13 +183,14 @@ export function createAdvisorStages({home}={}) {
     const images=materials.filter(m=>m.kind==='image' && m.status==='ready' && m.evidenceType!=='reference')
     const reused=images.some(m=>spec.stage.materials.some(old=>old.kind==='image' && old.evidenceType!=='reference' && old.sha256===m.sha256))
     if(!images.length)problem='visual-current-evidence-unavailable'
-    if(changed && reused)problem='visual-evidence-stale-after-subject-change'
+    if(changed && reused && evidencePolicy!==CLAIM_EVIDENCE_POLICY)problem='visual-evidence-stale-after-subject-change'
    }
    const attemptId='A'+randomUUID()
    const saved=mutate(sessionId,state=>{
     const t=task(state,taskId),s=t?.stages.find(s=>s.id===stageId)
     if(!s || s.id!==t.activeStageId)return fail('inactive-review-stage')
     s.pendingReviewId=attemptId;s.hasPreparedReview=true;s.invalidated=true;s.lastFailure=null;s.lastVerdict='unverified'
+    s.pendingEvidencePolicy=evidencePolicy || null;s.evidenceRoot=typeof root==='string'?root:null
     return {ok:true,attemptId,subjects,subjectProblem:problem}
    })
    return saved
@@ -185,28 +206,44 @@ export function createAdvisorStages({home}={}) {
   },
   recordReview({sessionId,taskId,stageId,reviewId,report,materials,subjects=[],attemptId,partial=false}={}) {
    if(!safe(reviewId)||!report||!Array.isArray(report.checks)||!report.checks.length||report.checks.length>8)return fail('invalid-stage-report')
+   const evidence=claimEvidenceState(report),claim=evidence.policy===CLAIM_EVIDENCE_POLICY
+   if(evidence.policy==='invalid')return fail(evidence.reason)
    return mutate(sessionId,state=>{
     const t=task(state,taskId),s=t?.stages.find(s=>s.id===stageId)
     if(!t||t.id!==state.activeTaskId||!s||s.id!==t.activeStageId)return fail('inactive-review-stage')
     if((s.hasPreparedReview || attemptId!==undefined) && (!s.pendingReviewId || s.pendingReviewId!==attemptId))return fail('stale-review-attempt')
+    if(s.pendingEvidencePolicy===CLAIM_EVIDENCE_POLICY && !claim)return fail('claim-evidence-metadata-required')
     if(!Array.isArray(subjects)||subjects.length>8||subjects.some(m=>!text(m.path,1000)||!['ready','unavailable'].includes(m.status)||m.status==='ready'&&!fingerprint(m.sha256)))return fail('invalid-review-subjects')
     if(s.subjectPaths?.some(path=>!subjects.some(m=>m.path===path)))return fail('missing-review-subject')
     const ids=new Set(report.checks.map(c=>c.checkId))
     if(ids.size!==report.checks.length || report.checks.some(c=>!s.checks.some(k=>k.id===c.checkId)||!['satisfied','failed','unverified'].includes(c.status)||!Array.isArray(c.evidenceRefs)||c.status==='satisfied'&&!c.evidenceRefs.length))return fail('stage-check-id-mismatch')
     if(!['pass','gaps','unverified','need_user'].includes(report.verdict))return fail('invalid-stage-verdict')
-    if(report.checks.some(c=>c.evidenceRefs.length>12 || c.evidenceRefs.some(r=>!text(r,180))))return fail('invalid-stage-citation')
+    if(report.checks.some(c=>c.evidenceRefs.length>12 || c.evidenceRefs.some(r=>!text(r,claim?1100:180))))return fail('invalid-stage-citation')
     if(!Array.isArray(materials))return fail('invalid-stage-material')
-    const ms=materials.filter(m=>m?.status!=='excluded')
-    if(!materialsOK(ms))return fail('invalid-stage-material')
-    if(ms.length>8)return fail('stage-material-limit')
+    const included=materials.filter(m=>m?.status!=='excluded')
+    if(included.length>(claim?104:8))return fail('stage-material-limit')
+    if(!included.every(m=>materialsOK([m])))return fail('invalid-stage-material')
+    const ms=included.slice(0,8)
+    if(claim && ['geometry','appearance'].includes(s.scope)) {
+     const prior=claimEvidenceState(s),changed=!!s.lastReviewId && subjects.some(m=>!(s.subjects || []).some(old=>old.path===m.path && old.sha256===m.sha256))
+     const oldImages=prior.policy===CLAIM_EVIDENCE_POLICY ? prior.checks.flatMap(c=>c.bindings).filter(b=>b.actualImage).map(b=>b.sha256) : s.materials.filter(m=>m.kind==='image' && m.evidenceType!=='reference').map(m=>m.sha256)
+     const reused=evidence.checks.flatMap(c=>c.bindings).some(b=>b.actualImage && oldImages.includes(b.sha256))
+     if(changed && reused)return fail('visual-evidence-stale-after-subject-change')
+    }
     s.subjects=subjects.map(m=>({path:m.path,kind:'file',status:m.status,sha256:m.sha256 || null}))
     s.materials=ms.map(m=>({path:m.path,kind:m.kind,status:m.status,sha256:m.sha256,evidenceType:m.evidenceType||'other'}))
+    if(claim)s.evidenceAssessment=copy(report.evidenceAssessment)
+    else delete s.evidenceAssessment
     for(const c of s.checks) {
      const reviewed=report.checks.find(x=>x.checkId===c.id)
-     if(reviewed) {c.status=partial?'unverified':reviewed.status;c.evidenceRefs=reviewed.evidenceRefs.slice(0,12);c.lastReviewId=reviewId}
+     if(reviewed) {
+      const keepFailure=c.status==='failed' && (partial || reviewed.status==='unverified')
+      if(!keepFailure) {c.status=partial && reviewed.status!=='failed'?'unverified':reviewed.status;c.evidenceRefs=reviewed.evidenceRefs.slice(0,12);c.lastReviewId=reviewId
+       if(claim)c.evidenceBindings=copy(reviewed.evidenceBindings);else delete c.evidenceBindings}
+     }
      else if(c.status==='satisfied')c.status='stale'
     }
-    s.invalidated=false;s.pendingReviewId=null;s.lastFailure=null; s.lastReviewId=reviewId; s.lastVerdict=partial?'unverified':report.verdict
+    s.invalidated=false;s.invalidatedChecks=[];s.pendingReviewId=null;s.pendingEvidencePolicy=null;s.lastFailure=null; s.lastReviewId=reviewId; s.lastVerdict=partial?'unverified':report.verdict
     return {ok:true,taskId:t.id,stageId:s.id}
    })
   },
@@ -220,13 +257,24 @@ export function createAdvisorStages({home}={}) {
     stage:inspected,action:problems.has(sessionId)?'report-store-error':!t?'start-task':!s?'define-stage':inspected.action==='repair'?'repair':dependencyStages.length?'review-dependency':inspected.action,
     declaredCheckpointsOnly:true}
   },
-  invalidate({sessionId,path}={}) {
+  invalidate({sessionId,path,root}={}) {
    if(!text(path,1000))return fail('invalid-invalidation-path')
    return mutate(sessionId,state=>{
     const t=task(state);if(!t)return fail('inactive-task')
     const norm=p=>p.replaceAll(String.fromCharCode(92),'/').toLowerCase()
     let count=0
-    for(const s of t.stages)if([...s.materials,...(s.subjects || [])].some(m=>norm(m.path)===norm(path))) {s.invalidated=true;count++}
+    for(const s of t.stages) {
+     const evidence=claimEvidenceState(s)
+     if(evidence.policy!==CLAIM_EVIDENCE_POLICY) {
+      if([...s.materials,...(s.subjects || [])].some(m=>norm(m.path)===norm(path))){s.invalidated=true;count++}
+      continue
+     }
+     const base=root || s.evidenceRoot || '/', key=evidencePathIdentity(path,base)
+     if(!key)continue
+     if((s.subjects || []).some(m=>evidencePathIdentity(m.path,base)===key)){s.invalidated=true;count++;continue}
+     const matched=s.checks.filter(c=>(c.evidenceBindings || []).some(b=>b.canonicalPath===key)).map(c=>c.id)
+     if(matched.length){s.invalidatedChecks=[...new Set([...(s.invalidatedChecks || []),...matched])];count++}
+    }
     return {ok:true,invalidatedStages:count}
    })
   },

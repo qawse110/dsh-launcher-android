@@ -34,7 +34,7 @@
  *   重试；正确做法是判 `max-tokens` 让 dsh 重试。
  */
 import { LlmError, ToolCallId } from '@deepseek-ai/dsh-llm';
-import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled, createDsmlMarkerNormalizer, fixDsmlMarkers, } from './sse.js';
+import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, classifyToolArguments, toolArgsInvalidBlocks, toolArgsInvalidIsSoleOutput, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled, createDsmlMarkerNormalizer, fixDsmlMarkers, toolArgsInvalidFailure, } from './sse.js';
 import { DsmlContentExtractor } from './dsml.js';
 import { normalizeHarnessMessages } from './message-shape.js';
 import { isBillingBusinessCode, looksLikeBillingError, parseQueueError, queueDelayMs } from './model-queue.js';
@@ -85,6 +85,23 @@ export function userContentParts(content, imageUrls) {
             parts.push(url === undefined
                 ? { type: 'text', text: '[image unavailable]' }
                 : { type: 'image_url', image_url: { url } });
+            continue;
+        }
+        // ⚠️⚠️ **已经拼好的 `image_url` 块必须原样透传**（2026-10-22 真实缺陷）。
+        //
+        // 背景：`analyzeImage` 的识图请求由**插件自己**构造（不是 harness 派生历史），
+        // 它把图片直接拼成上游要的 `{type:'image_url', image_url:{url}}` 形态后交给
+        // `adapter.stream()`。而本函数此前**只认 harness 原生** `{type:'image',
+        // attachment}`（`imageUrls` 里查字节），对 `image_url` **零命中** ⇒ 该块被
+        // **静默丢弃** ⇒ VL 模型只收到文字 ⇒ 回答「我看不到图片」。
+        // 症状极具误导性：HTTP 200、正文正常、上游无报错，只有答案是错的。
+        // ⇒ 修法：认到 `image_url` 就原样放进 parts（它已经是目标形态，无需再转）。
+        if (block.type === 'image_url') {
+            const url = block.image_url?.url;
+            if (typeof url === 'string' && url.length > 0) {
+                hasImage = true;
+                parts.push({ type: 'image_url', image_url: { url } });
+            }
             continue;
         }
         if (block.type === 'tool-result' && Array.isArray(block.content)) {
@@ -141,13 +158,32 @@ export function serializeMessages(messages, imageUrls) {
     const wire = [];
     const { keepCallIds, keepResultIds } = resolveToolPairing(normalized);
     let pendingToolImages = [];
-    const flushToolImages = () => {
-        if (pendingToolImages.length === 0)
+    // 含工具结果而被延后的那条 user 消息的内容（排在 `role:'tool'` 之后发出）。
+    let pendingOwnParts;
+    /**
+     * 发出挂起的工具结果图片；`own` 是**同一轮要发的那条 user 消息**的内容。
+     *
+     * ⚠️⚠️ **图片必须与提问同在一条 user 消息里**（Issue IKLIFH，与 buddy /
+     * lobsterai 适配器同型）。实测（2026-10-14，直连 `copilot.tencent.com`，
+     * hy4-preview，同一张 1024x768 双色图）：图与问**同条** ✅「左白右蓝」；
+     * 图单独成一条（无论带不带提示句）❌「图像已被过滤」/「不支持图片识别」；
+     * 图并入 `role:'tool'` ❌「不支持读取图片」。
+     *
+     * ⚠️ 症状极具误导性：wire 上**确实有图**、上游也**不报错**（HTTP 200），
+     * 只是模型**看不见**并自称「当前模型不支持图片输入」⇒ 用户会误判成模型
+     * 能力问题、反复换模型。
+     *
+     * ⚠️ 无挂图且 `own` 为空时**什么都不发**：凭空造一条 parts 消息会让纯文本
+     * 会话被上游 400（反向验证实测）。
+     */
+    const flushToolImages = (own) => {
+        const ownParts = own ?? [];
+        if (pendingToolImages.length === 0 && ownParts.length === 0)
             return;
-        wire.push({
-            role: 'user',
-            content: [{ type: 'text', text: TOOL_RESULT_IMAGE_TEXT }, ...pendingToolImages],
-        });
+        // 图与提问**同条**：图在前、own 的文本在后（两种顺序实测都能被看到）。
+        const ownImages = ownParts.filter((part) => part.type !== 'text');
+        const ownText = ownParts.filter((part) => part.type === 'text');
+        wire.push({ role: 'user', content: [...pendingToolImages, ...ownImages, ...ownText] });
         pendingToolImages = [];
     };
     for (const message of normalized) {
@@ -170,8 +206,9 @@ export function serializeMessages(messages, imageUrls) {
                 .join('');
             const text = contentToText(content);
             // 挂起的工具结果图片必须在 assistant 之前发出，否则会漂到这条
-            // assistant 之后，与产生它们的工具调用脱节。
-            flushToolImages();
+            // assistant 之后，与产生它们的工具调用脱节。延后正文一并带上。
+            flushToolImages(pendingOwnParts);
+            pendingOwnParts = undefined;
             wire.push({
                 role: 'assistant',
                 // 正文为空且有工具调用时 content 必须为 null（OpenAI 规范）。
@@ -182,7 +219,8 @@ export function serializeMessages(messages, imageUrls) {
             continue;
         }
         if (message.role === 'system') {
-            flushToolImages();
+            flushToolImages(pendingOwnParts);
+            pendingOwnParts = undefined;
             wire.push({ role: 'system', content: contentToText(message.content) });
             continue;
         }
@@ -192,14 +230,38 @@ export function serializeMessages(messages, imageUrls) {
         const text = contentToText(message.content);
         // 工具结果之外的常规内容（含顶层图片）。
         const regular = content.filter((block) => !(typeof block === 'object' && block !== null && block.type === 'tool-result'));
-        const parts = imageUrls === undefined ? undefined : userContentParts(regular, imageUrls);
-        if (parts !== undefined) {
-            flushToolImages();
-            wire.push({ role: 'user', content: parts });
+        // ⚠️⚠️ **不能只在 `imageUrls !== undefined` 时才走多模态**（2026-10-22 真实缺陷）：
+        // 插件自己构造的识图请求（`analyzeImage`）把图**直接拼成 `image_url` 块**，
+        // 且**没有** `imageUrls` 映射表 ⇒ 若这里仍按「有表才升级」，那些块永远走不到
+        // `userContentParts` ⇒ 被当成纯文本消息发出 ⇒ **图被静默丢弃**。
+        // ⇒ 判据改为「有映射表 **或** 内容里本来就带 `image_url` 块」。
+        const carriesInlineImage = regular.some((block) => typeof block === 'object' && block !== null && block.type === 'image_url');
+        const parts = imageUrls === undefined && !carriesInlineImage
+            ? undefined
+            : userContentParts(regular, imageUrls ?? new Map());
+        // ⚠️⚠️ **两条互斥分支**（Issue IKLIFH 的落点）：
+        // 无工具结果 → 立刻发出并让挂起图片搭车；含工具结果 → 整条延后到下一条
+        // user 消息（tool 消息必须紧跟其 assistant `tool_calls`，中间插消息会 400）。
+        const deferred = toolResults.length > 0;
+        // ⚠️⚠️ **无挂图且本条无图时必须保持「字符串」形态**（旧行为逐字节不变）：
+        // 纯文本若被包装成 `[{type:'text',…}]`，上游会以 `model_param_invalid` 400
+        // 拒收整个请求（实测）。
+        const hasImage = parts !== undefined;
+        const combined = pendingToolImages.length > 0 || hasImage
+            ? [
+                ...(pendingOwnParts ?? []),
+                ...(parts ?? (text.length > 0 ? [{ type: 'text', text }] : [])),
+            ]
+            : undefined;
+        pendingOwnParts = undefined;
+        if (deferred) {
+            pendingOwnParts = combined ?? (text.length > 0 ? [{ type: 'text', text }] : undefined);
         }
-        else if (text.length > 0 || toolResults.length === 0) {
-            flushToolImages();
-            wire.push({ role: 'user', content: text });
+        else if (combined !== undefined || toolResults.length === 0) {
+            // ⚠️ 核心修复：挂起图片与本条内容**同一条**发出，而非让图片单独成一条。
+            flushToolImages(combined);
+            if (combined === undefined)
+                wire.push({ role: 'user', content: text });
         }
         for (const result of toolResults) {
             // 丢弃孤儿工具结果：没有对应 assistant tool_call 的结果同样会让后端 400。
@@ -215,8 +277,18 @@ export function serializeMessages(messages, imageUrls) {
                         .filter((part) => part.type === 'text')
                         .map((part) => String(part.text))
                         .join('');
-                    if (joined.length > 0)
-                        resultText = joined;
+                    // ⚠️⚠️ **有图无文时绝不能落到 `(no output)`**（Issue IKLSB8，真实报障）。
+                    //
+                    // `resultParts !== undefined` 的含义是「该工具结果里有内容」，只是内容
+                    // **不是文本**（全是图片）。原先这里只在 `joined` 非空时改写 `resultText`，
+                    // 于是纯图片型工具结果保留了初值 `(no output)` —— 模型收到的是
+                    // **「工具没有任何输出」**，于是回答「Read 没有返回内容 / gave no output」，
+                    // 用户据此以为模型没有视觉能力；真实原因是「有输出，输出是图」。
+                    //
+                    // 判据必须用 `resultParts !== undefined`（**有内容**）而不是「有图」：
+                    // `[image unavailable]` 占位符也走这条腿，它同样不是「没有输出」。
+                    // 与 `trae-adapter.ts` / `accio-adapter.ts` 逐字同义（那两家早已如此兜底）。
+                    resultText = joined.length > 0 ? joined : TOOL_RESULT_IMAGE_TEXT;
                 }
                 else {
                     resultText = contentToText(result.content) || '(no output)';
@@ -231,8 +303,13 @@ export function serializeMessages(messages, imageUrls) {
                 content: resultText,
             });
         }
+        // ⚠️⚠️ **这里刻意不 flush**（Issue IKLIFH 的关键时序）：图片此刻刚由上面
+        // 的 `pendingToolImages.push` 入队，若在此发出就会**单独成一条** user
+        // 消息，而提问在再下一条 ⇒ 上游让模型「看不见」。留给下一条 user 消息搭车。
     }
-    flushToolImages();
+    // 历史末尾的残留：图片与延后正文**必须同一条**，否则上游看不见。
+    flushToolImages(pendingOwnParts);
+    pendingOwnParts = undefined;
     return wire;
 }
 /** 安全读取 Error.message。 */
@@ -246,8 +323,89 @@ export function errorMessage(error) {
         return 'unknown error';
     }
 }
-/** 从错误体提取可读 detail 文本。 */
+/**
+ * 读取错误体里 `detail` 字段的可读文本（字符串，或 `{message}` 嵌套对象）。
+ *
+ * ## 为什么单独成函数（Gitee issue IKLBSH A1）
+ *
+ * 上游代理的顶层 catch 常把异常包成
+ * `{"error":"acp-proxy failure","detail":"<真实原因>"}`：`error` 那条腿能取出的
+ * 只是**没有信息量的摘要**，而真正的原因（连接超时 / 鉴权细节 / 上游栈信息）
+ * 全在 `detail` 里。只认前者时用户只看到四个字，**根因完全不可见**。
+ *
+ * ⚠️⚠️ **本仓库有 6 份同义的 `errorDetail`**（`openai-compat` / `llm-adapter` /
+ * `buddy-adapter` / `lobsterai-adapter` / `trae-adapter` / `accio-adapter`）。
+ * 6 份各写一条判据必然漂移 —— 那正是本仓库首条红线「同一语义两套判据」的形态
+ * （`llm-adapter.ts` 的注释里就记着「两处改一处时**必须同时改另一处**」）。
+ * 故这条腿**只留一份实现**，其余 5 份 import 它。
+ *
+ * ⚠️ **证据强度如实标注：没有真实报文**。866 个真实会话（解压后 3.0 GB，
+ * 覆盖全部 `turn/end` 错误事件）里 `"detail"` **零命中**
+ * （`scripts/tmp-scan-iklbsh.mjs`）。该形态的依据是 ① 上游代理类实现的既有惯例、
+ * ② harness 自带的 `providerErrorDetail`（`dsh-llm-deepseek/lib/index.js`）
+ * 本身就**产出** `{message, detail}` 这一对字段。
+ * 属于「结构上必然可达、但未实测」的一条腿。
+ *
+ * ⚠️ **只加不减**（与 `errorDetail` 的既有纪律一致）：本函数只影响原先
+ * 「所有腿都落空 ⇒ 退回整段裸 JSON」那一种形态；它排在**最后**一条腿，
+ * 既有腿的优先级与产出**逐字节不变**。
+ */
+export function detailFieldText(value) {
+    if (value === null || typeof value !== 'object' || Array.isArray(value))
+        return undefined;
+    const detail = value.detail;
+    if (typeof detail === 'string')
+        return detail.length > 0 ? detail : undefined;
+    // 嵌套对象只认 `message`：整对象 stringify 会把 `{code,…}` 又变成一坨
+    // 不可读的裸 JSON，与这条腿的目的相反。
+    if (detail !== null && typeof detail === 'object' && !Array.isArray(detail)) {
+        const message = detail.message;
+        if (typeof message === 'string' && message.length > 0)
+            return message;
+    }
+    return undefined;
+}
+/**
+ * 从错误体提取可读 detail 文本（**含**顶层 `detail` 字段）。
+ *
+ * ## ⚠️⚠️ 这个函数是**展示**出口；`httpErrorCode` 一类**分类**出口必须排除 detail 腿
+ *
+ * `detail` 对展示有价值，但它会**加长分类判据的输入** ⇒ 可能翻转错误码
+ * （真实净回归，两轮审计独立确证）：
+ *
+ * | 报文 | 只算既有腿 | 加上 detail 腿 |
+ * |---|---|---|
+ * | `{"message":"bad request","detail":"insufficient quota"}` | `INVALID_REQUEST` | **`QUOTA_EXCEEDED`** |
+ * | `{"message":"bad request","detail":"prompt is too long for this model"}` | `INVALID_REQUEST` | **`CONTEXT_WINDOW_EXCEEDED`** |
+ *
+ * 后者还会**触发 DSH 的上下文溢出压缩** —— 纯展示改进换来行为变更，且**零守卫**
+ * （我加的用例只断言返回值，没有一条锁分类结果）。
+ *
+ * ⇒ 处置：**默认保持含 detail（= 展示行为不变）**，只有**分类调用点**显式传
+ * `{ forClassify: true }` 把它排除。本仓库需要排除的只有 `llm-adapter.ts` 的
+ * **两处**（`httpErrorCode` 与 4xx 额度判据）—— 它们是 `errorDetail` 产物
+ * 的**唯一**分类消费者（buddy 的 `httpErrorCode` 刻意收**原始 body**，见其注释）。
+ */
 export function errorDetail(body) {
+    return errorDetailImpl(body, true);
+}
+/**
+ * 从错误体提取**分类用**的可读文本 —— **不含**顶层 `detail` 字段。
+ *
+ * ⚠️ 分类调用点（`httpErrorCode` / `isSseQuotaExhaustedErrorCode` 一类）
+ * **必须**走本出口，理由与实测表见 {@link errorDetail}。
+ * 本出口保证分类输入与「加 detail 腿之前」**逐字节相同**。
+ */
+export function errorDetailForClassify(body) {
+    return errorDetailImpl(body, false);
+}
+/**
+ * `errorDetail` 的唯一实现（两条出口共用，**不各写一份** —— 那是本仓库首条红线
+ * 「同一语义两套判据」，且必然漂移）。
+ *
+ * @param includeDetailField - `true` = 展示出口；`false` = 分类出口。
+ */
+function errorDetailImpl(body, includeDetailField) {
     try {
         const data = JSON.parse(body);
         // ⚠️ `error` 也要认：Cline 的部分错误体是 `{error: "<文案>", success: false}`
@@ -262,6 +420,8 @@ export function errorDetail(body) {
             typeof data.message === 'string' ? data.message : undefined,
             typeof data.msg === 'string' ? data.msg : undefined,
             typeof nested === 'string' ? nested : undefined,
+            includeDetailField ? detailFieldText(data) : undefined,
+            // ⚠️ **最后一条腿**，且只在展示出口计入（见上）。
         ].filter((value) => value !== undefined);
         if (parts.length > 0)
             return parts.join(' ');
@@ -1151,6 +1311,19 @@ export async function* consumeOpenAiSse(response, options, config) {
     // 报告 tool-calls 会让 harness 执行缺参调用并报 schema 错误，
     // 模型收到莫名错误后陷入重试循环；报告 max-tokens 则丢弃并重试。
     const argsTruncated = [...toolCalls.values()].some(block => isTruncatedArguments(block.text));
+    /**
+     * **模型把工具参数写坏**（结构闭合配平但 JSON 非法）—— 与「流被掐断」
+     * 分开处置（真实缺陷，Gitee IKQ8Y1；与 `buddy-adapter.ts` 同因同修）。
+     *
+     * ⚠️ 这是**共享**链路（openai-compat 被多家 provider 复用）⇒ 本判据的
+     * 覆盖面比单家适配器更宽，改动前请读 `sse.ts` 的 `classifyToolArguments`。
+     *
+     * 只收**名字可用**的块：无名块的参数没有意义（它本来就会被丢弃）。
+     */
+    const invalidArgBlocks = [...toolCalls.values()]
+        .filter(block => hasUsableToolName(block.name))
+        .map(block => ({ block, kind: classifyToolArguments(block.text) }))
+        .filter(entry => entry.kind === 'invalid');
     const incompleteTools = finishReason === undefined && toolOrder.length > 0;
     /**
      * 是否丢弃过**名称不可用**的 tool-call 块（见上方 tool_calls 分支）。
@@ -1247,23 +1420,30 @@ export async function* consumeOpenAiSse(response, options, config) {
         // 不能报 error（会丢内容）。见上面 `reasoningLoopIsSoleOutput` 的表格。
         : loopDetected
             ? { kind: 'max-tokens' }
-            : finishReason === 'length'
-                || incompleteTools
-                || truncatedStream
-                || argsTruncated
-                || proseCutByStopString
-                // 丢弃了无名 tool-call、且**没有**任何可用调用留下来时，本步否则会以
-                // `stop` 收场 —— 模型本意要调工具、harness 却认为「正常答完了」，
-                // 又是一次无报错中断。报 max-tokens 让它重试。
-                //
-                // 若同批还有可用调用（`toolOrder.length > 0`），则照常报 `tool-calls`：
-                // 那几个调用与无名块各自独立，没理由因一个坏块把它们一起作废
-                // （实测线上形态正是「一个无名 + 一个合法 pwsh」）。
-                || (droppedUnnamedCalls && toolOrder.length === 0)
-                ? { kind: 'max-tokens' }
-                : finishReason === 'tool_calls' || toolOrder.length > 0
-                    ? { kind: 'tool-calls' }
-                    : { kind: 'stop' };
+            // ⚠️ **工具参数写坏必须有自己的码**（真实缺陷，Gitee IKQ8Y1）：
+            // 放在 `loopDetected` 之后、`max-tokens` 家族之前。报 max-tokens 会让 UI
+            // 说「已达到输出 token 上限」（固定 i18n，不读适配器 message），而实测
+            // 受害轮次 `outputTokens` 只用了 2516/128000。
+            // 门禁三条：有坏块 + 零正文 + 无另一个参数可解析的可用调用。
+            : toolArgsInvalidIsSoleOutput(invalidArgBlocks.length, emittedProse, toolCalls.values(), finishReason === 'length' || (finishReason === undefined && !streamEnded))
+                ? { kind: 'error', failure: toolArgsInvalidFailure(toolArgsInvalidBlocks(invalidArgBlocks)) }
+                : finishReason === 'length'
+                    || incompleteTools
+                    || truncatedStream
+                    || argsTruncated
+                    || proseCutByStopString
+                    // 丢弃了无名 tool-call、且**没有**任何可用调用留下来时，本步否则会以
+                    // `stop` 收场 —— 模型本意要调工具、harness 却认为「正常答完了」，
+                    // 又是一次无报错中断。报 max-tokens 让它重试。
+                    //
+                    // 若同批还有可用调用（`toolOrder.length > 0`），则照常报 `tool-calls`：
+                    // 那几个调用与无名块各自独立，没理由因一个坏块把它们一起作废
+                    // （实测线上形态正是「一个无名 + 一个合法 pwsh」）。
+                    || (droppedUnnamedCalls && toolOrder.length === 0)
+                    ? { kind: 'max-tokens' }
+                    : finishReason === 'tool_calls' || toolOrder.length > 0
+                        ? { kind: 'tool-calls' }
+                        : { kind: 'stop' };
     // 零内容块响应（例如本次只收到过那个被压制的空白 reasoning）否则会以
     // `stop` 收场 —— 那是 DSH `EMPTY_RESPONSE` 契约明令禁止的静默结束。
     // ⚠️ 传入的是**上面已算好的** `reason`：`loopDetected` / `length` /

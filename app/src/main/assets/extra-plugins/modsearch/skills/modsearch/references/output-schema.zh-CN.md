@@ -55,7 +55,7 @@ CLI 向 stdout 打印一个 JSON 对象。顶层信封对每次运行都一样�
 | :-- | :-- |
 | `source` | `web` 或 `x`，这条证据实际来自的语料 |
 | `requestedSource` | `web` 或 `x`，被请求的语料。运行降级时与 `source` 不同 |
-| `engine` | 实际作答的引擎（`antigravity-cli`、`tavily`、`grok-cli`、`local`），语料不可达时为 `null` |
+| `engine` | 实际作答的引擎（`antigravity-cli`、`tavily`、`keenable`、`grok-cli`、`local`），语料不可达时为 `null` |
 | `model` | 使用的模型，引擎有模型时才有值（没有时是空字符串） |
 | `status` | `ok`、`degraded` 或 `unavailable`（见下文） |
 | `warnings` | 这个语料的路由与运行警告：一次回退、一条降级说明、一个配置笔误、本地引擎的「无综述」和「已放行私有网络」提示。说的是答案怎么产生的，不是答案里的事实。永远是数组，常为空 |
@@ -100,7 +100,7 @@ CLI 向 stdout 打印一个 JSON 对象。顶层信封对每次运行都一样�
 
 ### attempt 上的引擎消耗
 
-计量自己用量的引擎会在实际运行的那条 attempt 上报告，调用方可以据此统计一次运行的成本。两个字段都可选：只出现在上报它们的引擎上，都不上报的引擎（agy、tavily、本地引擎）上永远没有。
+计量自己用量的引擎会在实际运行的那条 attempt 上报告，调用方可以据此统计一次运行的成本。两个字段都可选：只出现在上报它们的引擎上，都不上报的引擎（agy、tavily、keenable、本地引擎）上永远没有。
 
 - `cost`：美元，来自 exa。
 - `credits`：firecrawl 的 credits。

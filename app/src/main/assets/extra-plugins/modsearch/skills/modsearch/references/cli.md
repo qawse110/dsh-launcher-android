@@ -60,6 +60,6 @@ macOS and Linux are fully supported and run the whole test suite in CI on Node 2
 
 The CI matrix also includes `windows-latest` on Node 22 and 24, running the same typecheck, test, and build gate. What works on Windows follows from what each part depends on:
 
-- **The CLI, its routing and config logic, and the HTTP engines** (`local` fetch, Tavily, Exa, Firecrawl) are pure Node: they use `fetch` and the filesystem alone, so they are cross-platform.
+- **The CLI, its routing and config logic, and the HTTP engines** (`local` fetch, Tavily, Exa, Firecrawl, Keenable) are pure Node: they use `fetch` and the filesystem alone, so they are cross-platform.
 - **agy and grok are external CLIs.** modsearch runs them by name with no shell, so a native Windows executable on PATH works, while an npm-style `.cmd` shim does not. Whether a Windows build exists is each tool's own decision, not modsearch's. Every direct child is started with `windowsHide: true`, so a GUI host with no console does not flash a new black window per call.
 - **The cooldown state file** is written through a temp file and an atomic rename. On Windows that rename replaces the target, but the OS cannot replace a file another process holds open, so a rare simultaneous-writer race can drop one write. The store is a best-effort cache that merges on read, so a later run rediscovers anything lost.

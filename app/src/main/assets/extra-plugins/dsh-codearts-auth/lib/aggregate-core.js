@@ -31,6 +31,14 @@
 export const NEVER = Number.POSITIVE_INFINITY;
 /** 该 provider 本次不可用（无启用账号 / 探测失败）的哨兵值。 */
 export const UNUSABLE = -1;
+/** 见 {@link CandidateGate} 的判定表与优先级说明。 */
+export function resolveCandidateGate(input) {
+    if (input.rejected)
+        return 'rejected';
+    if (input.allowed)
+        return 'allowed';
+    return input.expiryWired ? 'allowed' : 'default-rejected';
+}
 /**
  * 从「provider → 最早失效时刻」里挑出胜者（**纯函数**）。
  *
@@ -97,20 +105,41 @@ export function priceFactorFromName(name) {
     return Number.isFinite(value) ? value : Number.POSITIVE_INFINITY;
 }
 /**
- * 候选排序：**临期升序 → 同档倍率升序 → 声明顺序兜底**。
+ * 候选排序：**手工位次严格优先 → 临期升序 → 同档倍率升序 → 声明顺序兜底**。
  *
- * - 第一判据「临期升序」：越早作废的先用掉（本功能的全部价值）；
- * - 第二判据「倍率升序」：同一临期档内挑便宜的（省钱）；
- * - 第三判据「声明顺序」：完全并列时保持候选表顺序（`Array.prototype.sort` 在
+ * - 第一判据「手工位次」（仅当传入 `manualRankOf`）：「按手工排序」模式下用户拖出来的顺序，
+ *   排过的一律排在**全部**没排过的之前；
+ * - 第二判据「临期升序」：越早作废的先用掉（本功能的全部价值）；
+ * - 第三判据「倍率升序」：同一临期档内挑便宜的（省钱）；
+ * - 第四判据「声明顺序」：完全并列时保持候选表顺序（`Array.prototype.sort` 在
  *   ES2019 起是**稳定**的，故无需显式兜底字段）。
+ *
+ * ⚠️⚠️ **手工位次是「严格序 + 临期兜底」，不是「临期为主、手工为辅」**（用户 2026-10-15 的取舍）：
+ *    已排过的候选按位次排在**全部**未排过的候选之前，即使它临期更晚。理由：用户拖动时表达的是
+ *    「我要这个渠道先被用」；若临期仍优先，拖动会被临期值**静默覆盖** ⇒ 面板显示的顺序与真实
+ *    轮换顺序分叉（本仓库红线之一）。
+ *
+ * ⚠️ `manualRankOf` 返回 `undefined` = 该候选没被手工排过。两者都未排过时**必须**落到
+ *    临期兜底分支 —— 那里用 `a.expiry !== b.expiry` 先判不等，**顺带避开**
+ *    `Infinity - Infinity === NaN`（两个 `NEVER` 候选相减会得到 `NaN`，而 `NaN` 不是合法的
+ *    比较器返回值：`sort` 会把它当 `0`，顺序随引擎实现漂移）。
+ *    ⇒ 别把两个分支合成 `(a.expiry - b.expiry) || (a.price - b.price)`。
  *
  * ⚠️ **纯函数**：不改传入数组（先 `slice()`）。适配器会对同一份候选表反复排序
  * （每次请求），原地排序会让顺序随调用次数漂移。
  */
-export function rankCandidates(candidates) {
+export function rankCandidates(candidates, manualRankOf) {
     return candidates
         .filter((candidate) => candidate.expiry !== UNUSABLE)
         .slice()
-        .sort((a, b) => (a.expiry !== b.expiry ? a.expiry - b.expiry : a.price - b.price));
+        .sort((a, b) => {
+        if (manualRankOf !== undefined) {
+            const rankA = manualRankOf(a) ?? Number.POSITIVE_INFINITY;
+            const rankB = manualRankOf(b) ?? Number.POSITIVE_INFINITY;
+            if (rankA !== rankB)
+                return rankA - rankB;
+        }
+        return a.expiry !== b.expiry ? a.expiry - b.expiry : a.price - b.price;
+    });
 }
 //# sourceMappingURL=aggregate-core.js.map

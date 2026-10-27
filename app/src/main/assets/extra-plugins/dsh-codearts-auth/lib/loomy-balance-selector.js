@@ -74,8 +74,32 @@ export class LoomyBalanceSelector {
         this.cache.set(account.id, { at: now, value });
         return value;
     }
-    /** 真正发请求查一次余额。 */
+    /**
+     * 真正取一次余额。
+     *
+     * ★ 2026-10-16：**先吃共享读数**（面板刚查过的那份），命中即零网络请求。
+     *
+     * ⚠️ **共享读数缺席时照常自己取数**（`undefined` ⇒ 往下走原路径）：
+     *   兼顶**不得**取代真实取数能力，否则「未接线」会变成「该渠道恒不可用」。
+     * ⚠️ **兼顶读数（`stale: true`）按成功处理**，但把失败原因带在 `error` 里
+     *   供诊断（`ok` 仍为 true —— 我们**确实**拿到了可用余额，标成失败会让
+     *   「有今日额度的号」被踢出候选，那正是本 issue 的核心症状）。
+     */
     async fetchBalance(account) {
+        if (this.deps.sharedReading !== undefined) {
+            const shared = await this.deps.sharedReading(account.id, account.credentialRef);
+            if (shared !== undefined && (shared.daily !== undefined || shared.permanent !== undefined)) {
+                return {
+                    id: account.id,
+                    ok: true,
+                    dailyBalance: shared.daily,
+                    permanentBalance: shared.permanent,
+                    // ⚠️ 兼顶读数带 `error`：那是**本次查询失败**的原因（UI 要显示
+                    //   「数据来自 HH:MM」），与「这个号不可用」是两件事。
+                    ...shared.error === undefined ? {} : { error: `余额为陈旧读数（${shared.error}）` },
+                };
+            }
+        }
         let credential;
         try {
             credential = await this.deps.resolveCredential(account.credentialRef);
@@ -142,14 +166,25 @@ export class LoomyBalanceSelector {
         return { ok: true, account: picked.account, balance: picked.balance };
     }
     /**
-     * 判定「为什么没有可用账号」：区分**真的用尽**与**查不到**。
+     * 判定「为什么没有可用账号」：**三分档**（issue IKMCOO 缺陷 2）。
      *
-     * 只要有任何一个候选是查询失败，就不能断言"额度都已用尽"——我们对它的余额
-     * 其实一无所知。
+     * - 全员查询失败 ⇒ `all-unknown`（上游整体不可用，**不是**凭据问题）
+     * - 部分查询失败 ⇒ `partial`（其余候选**确实**查到 0 了）
+     * - 无人失败 ⇒ `exhausted`（**唯一**有事实依据说「用尽」的一档）
+     *
+     * ⚠️ 分档判据是「**失败的占比**」，不是「有没有失败」—— 后者会把
+     * 「3 个号全查不到」说成「部分账号」（实测症状逐字相同）。
      */
     noAccountReason(balances) {
-        const errors = balances.filter(b => !b.ok).map(b => b.error ?? '未知原因');
-        return errors.length > 0 ? { kind: 'unknown', errors } : { kind: 'exhausted' };
+        const failed = balances.filter(b => !b.ok);
+        const errors = failed.map(b => b.error ?? '未知原因');
+        if (failed.length === 0)
+            return { kind: 'exhausted' };
+        // ⚠️ `balances.length === 0` 不可能走到这里（`select` 开头就挡了），
+        //   但仍写全称比较以免将来改了 `select` 就静默退化成 `partial`。
+        if (failed.length === balances.length)
+            return { kind: 'all-unknown', errors };
+        return { kind: 'partial', errors };
     }
 }
 //# sourceMappingURL=loomy-balance-selector.js.map

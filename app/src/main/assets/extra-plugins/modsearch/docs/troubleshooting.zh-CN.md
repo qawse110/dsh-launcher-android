@@ -23,7 +23,7 @@ Every engine for the web source failed.
   - firecrawl: ...
 ```
 
-Firecrawl 的免注册端点会收住普通搜索链，所以裸安装也有可用引擎。现在看到这条信息，表示所有候选都在运行时失败。按尝试列表找真实原因，常见情况是网络不可用、超时、免注册每日额度耗尽，或已配置引擎的账号额度用完。
+Firecrawl 和 Keenable 都能走免注册端点搜索，所以裸安装也有可用引擎。现在看到这条信息，表示所有候选都在运行时失败。按尝试列表找真实原因，常见情况是网络不可用、超时、免注册每日额度耗尽、Keenable 免注册的每小时额度用完，或已配置引擎的账号额度用完。
 
 ```bash
 curl -fsSL https://antigravity.google/cli/install.sh | bash && agy   # 然后登录
@@ -31,6 +31,7 @@ curl -fsSL https://antigravity.google/cli/install.sh | bash && agy   # 然后登
 modsearch config set tavily.apiKey <key>
 modsearch config set exa.apiKey <key>
 modsearch config set firecrawl.apiKey <key>
+modsearch config set keenable.apiKey <key>
 ```
 
 云端引擎失败时，单页抓取（`-u`）仍会落到内置本地引擎。
@@ -44,7 +45,7 @@ Individual quota reached. Please upgrade your subscription ... Resets in 94h19m9
 agy 的免费额度是 Antigravity 桌面应用、CLI、SDK 共享的每周配额，并行子 agent 会加速消耗。三条出路：
 
 - 等报错里写的重置时间。
-- 加一个带 key 的搜索引擎（Tavily、Exa 或 Firecrawl）。之后搜索自动落到它，你不用再做任何事。
+- 加一个带 key 的搜索引擎（Tavily、Exa、Firecrawl 或 Keenable）。之后搜索自动落到它，你不用再做任何事。
 - 冷却开着时（默认），agy 会被记为耗尽并挪到链末尾直到重置，后续运行先走别家。见下文「某个引擎总被跳过」。
 
 ## agy 在你所在地区不可用
@@ -65,24 +66,39 @@ modsearch config set antigravity-cli.enabled false
 
 窗口会自己关掉，不影响结果。想避开它，按上面的方法把 agy 移出自动链。需要时用 `-e antigravity-cli` 显式指定仍能调用它。
 
-## Exa 或 Firecrawl 鉴权被拒
+## Exa、Firecrawl 或 Keenable 鉴权被拒
 
 ```
 exa rejected the API key (401). Fix it: modsearch config set exa.apiKey <key>
 firecrawl rejected the API key (401). Fix it: modsearch config set firecrawl.apiKey <key>
+keenable rejected the API key (401). Fix it: modsearch config set keenable.apiKey <key>
 firecrawl rejected the keyless request (401). Anonymous access may be unavailable or rate-limited.
 ```
 
-前两条表示已配置的 key 错误或被吊销。按报错里的命令设一个有效值，或导出 `EXA_API_KEY` / `FIRECRAWL_API_KEY`。免注册报错表示 Firecrawl 没有接受这次匿名请求。等待每日额度恢复，配置免费 key 提高限制，或换其他引擎。鉴权失败不会进入冷却。
+前三条表示已配置的 key 错误或被吊销。按报错里的命令设一个有效值，或导出 `EXA_API_KEY` / `FIRECRAWL_API_KEY` / `KEENABLE_API_KEY`。配了多个 key 时，被拒的 key 会先轮换到下一个。免注册报错表示 Firecrawl 没有接受这次匿名请求。等待每日额度恢复，配置免费 key 提高限制，或换其他引擎。鉴权失败不会进入冷却。
 
-## Exa 或 Firecrawl 额度用完
+## Exa、Firecrawl 或 Keenable 额度用完
 
 ```
 exa is out of credits: ...
 firecrawl is out of credits: ...
+keenable is out of credits (HTTP 402). ...
 ```
 
-当前额度已经用完。对 Firecrawl 而言，它可能是免注册每日额度，也可能是账号额度。其他搜索引擎会自动接手，冷却开着时耗尽的引擎会被挪到链末尾直到恢复。加额度、换引擎，或等待对应周期重置。
+当前额度已经用完。对 Firecrawl 而言，它可能是免注册每日额度，也可能是账号额度。其他搜索引擎会自动接手，冷却开着时耗尽的引擎会被挪到链末尾直到恢复。加额度、换引擎，或等待对应周期重置。Keenable 带 key 的额度是每个组织每月 100,000 次，在 https://app.keenable.ai 管理。
+
+## Keenable 免注册额度本小时用完
+
+```
+keenable's keyless pool for this IP is used up for the hour (1,000 requests). Set a free key for your own quota: modsearch config set keenable.apiKey <key> ...
+```
+
+不带 key 时，Keenable 每个 IP 每小时给 1,000 次，同一 IP 上的所有人共用这份额度（办公室、VPN 出口、云主机都算），每秒最多 10 次。链上的下一个搜索引擎会自动接手。想要一份独享额度，到 https://app.keenable.ai 领个免费 key：带 key 的 Keenable 没有每小时上限，每月 100,000 次。
+
+```bash
+modsearch config set keenable.apiKey <key>
+# 或环境变量：export KEENABLE_API_KEY=<key>
+```
 
 ## Tavily 月度额度用完（432/433）
 

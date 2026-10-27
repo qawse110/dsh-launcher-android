@@ -13,7 +13,7 @@
       "id": "dsh-web-mobile",
       "title": "移动端适配",
       "desc": "竖屏/窄屏 Web 适配（抽屉导航、全宽会话、安全区、触控人体工学）",
-      "version": "3.1.0",
+      "version": "3.2.1",
       "upstream": "https://github.com/mexiaosqwq/dsh-web-mobile"
     },
     {
@@ -21,17 +21,17 @@
       "name": "dsh-prompt-optimizer-mobile",
       "id": "prompt-optimizer",
       "title": "提示词优化",
-      "desc": "发送前用独立 AI 把输入改写成命令。基于上游 WestFox-AwA/dsh-prompt-optimizer v0.8.3-stable，**本部署默认启用**（仅显式 enabled:false 才关闭；上游原版默认不启用），并保留移动端窄屏 UI 适配与包名对齐（详见该目录 FORK.md）",
-      "version": "0.8.3-stable",
-      "upstream": "https://github.com/WestFox-AwA/dsh-prompt-optimizer"
+      "desc": "发送前用独立 AI 把输入改写成命令。基于上游 WestFox-AwA/dsh-wish-specializer（原 dsh-prompt-optimizer）v0.9.0-stable，**本部署默认启用**（仅显式 enabled:false 才关闭；上游原版默认不启用），并保留移动端窄屏 UI 适配与包名对齐（详见该目录 FORK.md）。本轮基线为上游 v0.9.0-stable（仓库已改名 dsh-wish-specializer），上游新增 advisor-*/inference-* 等 12 个模块已整体采用；本地保留 6 个文件的身份/窄屏 UI 改动。上游 0.9.0 已自带并按会话增强 issue #16 的设置写回修复（lib/settings.js 逐字节取上游，无本地补丁）",
+      "version": "0.9.0-stable",
+      "upstream": "https://github.com/WestFox-AwA/dsh-wish-specializer"
     },
     {
       "dir": "dsh-codearts-auth",
       "name": "dsh-codearts-auth",
       "id": "codearts-auth",
       "title": "CodeArts 多 Provider",
-      "desc": "CodeArts/Buddy/Qoder/Trae/Cline/loomy/raccoon/zcode/opencode/gemini 等 Provider 登录、积分与模型接入。源码取自上游 tag 0.2.0-rc.10 本地构建（该仓库本版 tag 与包内 version 已同步，均为 0.2.0-rc.10）；已重放移动端窄屏 UI 适配层（上游仍未内置）",
-      "version": "0.2.0-rc.10",
+      "desc": "CodeArts/Buddy/Qoder/Trae/Cline/loomy/raccoon/zcode/opencode/gemini 等 Provider 登录、积分与模型接入。源码追到上游 gitee master 4d5e6779（2026-10-27；fix(client) 面板入口偏好首读超时改为有界重试，冷启动不再永久降级「仅侧栏」；包内 version 仍 0.2.1-rc.2）。上游已于 2026-10-27 强推（force-push）重写历史：旧基线 86e3591 不再是 HEAD 祖先（两树相差 333 文件 /+88221/-13939），此前两处本地恢复——buddy/workbuddy 渠道（8 个 src/buddy*.ts）与第 4 条 DSH 身份首句内容级指纹——现已是上游原生存在，不再重放。本仓相对 4d5e6779 的本地差异仅剩 5 处包名对齐（package.json 与 cordis.patch.yml 的 name、client/jet-hub-styles.js 的 PLUGIN_ID、client/index.js 的配置槽 key、client/panel-entry.js 的 data-plugin），id 仍为 codearts-auth。上游已改名 dsh-providers-hub，本仓沿用 dsh-codearts-auth 以保持 profile/清单稳定。上游已有基础 720px 窄屏适配，本仓另重放 172 行扩展适配层（≤560px 上下堆叠/触控/横滑）",
+      "version": "0.2.1-rc.2",
       "upstream": "https://gitee.com/iJetLi/deepseek-harness-codearts"
     },
     {
@@ -80,8 +80,8 @@
       "name": "@liustack/modsearch",
       "id": "modsearch",
       "title": "联网检索 ModSearch",
-      "desc": "把 web_search / web_fetch 的检索后端换成免密钥的 modsearch 引擎链（Firecrawl 免密钥、1,000 次/月），并新增 x_search（X 检索）与 read_page（精读网页）两个工具；引擎与密钥配置在 ~/.modsearch/config.json。取自上游 liustack/modsearch v5.10.6 的 npm 产物（整包同源，无本地改动：该包未声明任何 @deepseek-ai/dsh-* peer，0.2.0-rc.2 的兼容性前置校验对其不适用）。运行时依赖 commander / undici 由安装链的依赖桥接（dsh-prefix 的 .pnpm store 软链进 files/plugins/node_modules）提供，不再由 pnpm 按本包 dependencies 解析——桥接到的实际版本为 commander 15 / undici 8（本包声明为 ^13 / ^7），已真机跑通 modsearch doctor 与 modsearch search",
-      "version": "5.10.6",
+      "desc": "把 web_search / web_fetch 的检索后端换成免密钥的 modsearch 引擎链（Firecrawl 免密钥、1,000 次/月），并新增 x_search（X 检索）与 read_page（精读网页）两个工具；引擎与密钥配置在 ~/.modsearch/config.json。取自上游 liustack/modsearch v5.10.10 的 npm 产物（整包同源，无本地改动：该包未声明任何 @deepseek-ai/dsh-* peer，0.2.0-rc.2 的兼容性前置校验对其不适用）。运行时依赖 commander / undici 由安装链的依赖桥接（dsh-prefix 的 .pnpm store 软链进 files/plugins/node_modules）提供，不再由 pnpm 按本包 dependencies 解析——桥接到的实际版本为 commander 15 / undici 8（本包声明为 ^13 / ^7），已真机跑通 modsearch doctor 与 modsearch search",
+      "version": "5.10.10",
       "upstream": "https://github.com/liustack/modsearch"
     },
     {
@@ -89,8 +89,8 @@
       "name": "dsh-ego-browser",
       "id": "ego-browser",
       "title": "Agent 浏览器",
-      "desc": "30+ ego_* 工具驱动的结构化浏览器自动化（ego_click / ego_snapshot / ego_fill / ego_script 等），配实时观察窗（SSE 投屏 + 直接鼠标交互 + 下载捕获 + 人机验证提示），底层跑本包内置的 ego-lite 运行时。取自上游 Fisfzy/dsh-ego-browser v0.8.6 的 npm 产物（整包同源，无本地改动：其声明的最低 dsh 为 >=0.1.2-rc.1，覆盖 targetDsh 0.2.0-rc.2）。⚠ 运行期前提：设备上需有一个可达的 Chrome/Chromium 二进制（插件会自动探测 PATH 与常见路径，也可在插件设置里填 chromePath）——本机当前未装任何浏览器，故工具可加载可调用但会如实回报「未找到浏览器二进制」，这不是装配问题",
-      "version": "0.8.6",
+      "desc": "30+ ego_* 工具驱动的结构化浏览器自动化（ego_click / ego_snapshot / ego_fill / ego_script 等），配实时观察窗（SSE 投屏 + 直接鼠标交互 + 下载捕获 + 人机验证提示），底层跑本包内置的 ego-lite 运行时。取自上游 Fisfzy/dsh-ego-browser v0.9.4 的 npm 产物（整包同源，无本地改动：其声明的最低 dsh 为 >=0.1.2-rc.1，覆盖 targetDsh 0.2.1-rc.2）。0.9.x 起包内含 extension/ MV3 目录（桌面扩展专用，Android 不适用），dsh-plugin.json 新增 residentExecutor/residentIdleMin/disableFrameRelay/tuiAutoOpenPanel 设置项并移除未实现的 TUI Scene 声明。⚠ 运行期前提：设备上需有一个可达的 Chrome/Chromium 二进制（插件会自动探测 PATH 与常见路径，也可在插件设置里填 chromePath）——本机当前未装任何浏览器，故工具可加载可调用但会如实回报「未找到浏览器二进制」，这不是装配问题",
+      "version": "0.9.4",
       "upstream": "https://github.com/Fisfzy/dsh-ego-browser"
     },
     {
@@ -98,8 +98,8 @@
       "name": "billion-context",
       "id": "bili-native",
       "title": "上下文压缩 ACP",
-      "desc": "Active Context Pruning（ACP）：给模型 compress / decompress / search_context / acp_status / acp_cache / read_original_image 六个工具，由模型自己决定何时压缩、压缩什么（而非硬性截断），另附 /acp 与 /acp-cache 命令。上游 ranxianglei/billion-context v0.1.198 的 npm 产物。与旧内置的 billion-context-dsh 相比，本包是**进程外 MITM 代理**架构：插件本体 dist/agent/dsh-native.js 在 dsh 进程内注册工具，实际压缩由它 spawn 的 dist/index.js 代理进程完成，工具清单经 /__bili/plugin/manifest 动态下发。其 peerDependencies 为空且无 engines.dsh，故不约束 dsh 版本。⚠ 该插件自带的 dsh.bundle.patch.yml 会 disable 宿主的 compaction-basic 行（改为 config.auto:false），并**整体替换** llm-deepseek / llm-deepseek-account 的 retryPolicy、向 preset-standard/ptc/minimal/cordis 注入 biliBasicCompactionPolicy。已按上游 files 字段裁剪：去掉 106.8MB sourcemaps 与论文配图，仅保留运行时必需文件（含 exports 的 ./client → dist/agent/dsh-native-client.js，缺它会让 dsh-client-modules 报 client bundle not found 并导致 WebUI 起不来）。旧包已归档至 assets/optional-plugins/billion-context-dsh 备回滚",
-      "version": "0.1.198",
+      "desc": "Active Context Pruning（ACP）：给模型 compress / decompress / search_context / acp_status / acp_cache / read_original_image 六个工具，由模型自己决定何时压缩、压缩什么（而非硬性截断），另附 /acp 与 /acp-cache 命令。上游 ranxianglei/billion-context v0.1.208 的 npm 产物。与旧内置的 billion-context-dsh 相比，本包是**进程外 MITM 代理**架构：插件本体 dist/agent/dsh-native.js 在 dsh 进程内注册工具，实际压缩由它 spawn 的 dist/index.js 代理进程完成，工具清单经 /__bili/plugin/manifest 动态下发。其 peerDependencies 为空且无 engines.dsh，故不约束 dsh 版本。⚠ 该插件自带的 dsh.bundle.patch.yml 会 disable 宿主的 compaction-basic 行（改为 config.auto:false），并**整体替换** llm-deepseek / llm-deepseek-account 的 retryPolicy、向 preset-standard/ptc/minimal/cordis 注入 biliBasicCompactionPolicy。已按上游 files 字段裁剪：去掉论文配图（本版上游已不再发行 sourcemap），仅保留运行时必需文件（含 exports 的 ./client → dist/agent/dsh-native-client.js，缺它会让 dsh-client-modules 报 client bundle not found 并导致 WebUI 起不来）。0.1.202→0.1.208 新增 dist/agent/dsh-compaction-gate.js（上游 exports 的 ./dsh-compaction-gate，必须随包，否则 dsh-client-modules 报 client bundle not found 并导致 WebUI 起不来）；新增运行时依赖 mysql2 ^3.15.3 仅被 mysql 存储后端动态 import，本机未随包（启用该后端时会明确报错）。旧包已归档至 assets/optional-plugins/billion-context-dsh 备回滚",
+      "version": "0.1.208",
       "upstream": "https://github.com/ranxianglei/billion-context"
     }
   ],
@@ -126,7 +126,7 @@
       "name": "billion-context-dsh",
       "id": "compaction-acp",
       "title": "上下文压缩 ACP（旧版，已归档）",
-      "desc": "旧的内置上下文压缩插件（Tyan66666/billion-context-dsh v0.2.27，进程内 CompactionEngine 架构），已被 billion-context v0.1.198（进程外 MITM 代理架构）替换。归档理由：dsh 升到 0.2.1-rc.2 后，本包 16 条 @deepseek-ai/dsh-* peer（钉死 0.2.0-rc.2 或上界 <0.2.1-0）会被 evaluatePluginCompatibility 判为不兼容并静默禁用；新包 peerDependencies 为空且无 engines.dsh，不受该判定约束。⚠ 两者都会 disable 宿主的 compaction-basic 并争抢同一个 ctx.compaction，因此不可与新包同时装配；本条目仅作源码存档与回滚路径，默认不装配。回滚方法：在清单里把它移回 builtin 区、把 billion-context 移出，并把 dsh-pin 的 tag 改回 0.2.0-rc.2",
+      "desc": "旧的内置上下文压缩插件（Tyan66666/billion-context-dsh v0.2.27，进程内 CompactionEngine 架构），已被 billion-context v0.1.208（进程外 MITM 代理架构）替换。归档理由：dsh 升到 0.2.1-rc.2 后，本包 16 条 @deepseek-ai/dsh-* peer（钉死 0.2.0-rc.2 或上界 <0.2.1-0）会被 evaluatePluginCompatibility 判为不兼容并静默禁用；新包 peerDependencies 为空且无 engines.dsh，不受该判定约束。⚠ 两者都会 disable 宿主的 compaction-basic 并争抢同一个 ctx.compaction，因此不可与新包同时装配；本条目仅作源码存档与回滚路径，默认不装配。回滚方法：在清单里把它移回 builtin 区、把 billion-context 移出，并把 dsh-pin 的 tag 改回 0.2.0-rc.2",
       "version": "0.2.27",
       "upstream": "https://github.com/Tyan66666/billion-context-dsh"
     }

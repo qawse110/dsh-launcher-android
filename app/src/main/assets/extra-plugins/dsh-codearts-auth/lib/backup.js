@@ -183,6 +183,24 @@ export async function exportBackup(pool, credentials, options = {}) {
             credentials: exported,
             accounts,
             disabledModels: state.disabledModels,
+            // ⚠️⚠️ **本载荷刻意不含 `providerClosed`（供应商关闭意图）**
+            //（Gitee issue IKP8OF 审计登记 —— 不是漏键，`getStateSnapshot()` 同样不导出它）。
+            //
+            // 两条理由：
+            // ① **格式兼容**：加字段要抬 `BACKUP_VERSION`，而导入端对版本是**严格相等**
+            //    （见下方 `record.version !== BACKUP_VERSION` 的分支）⇒ 抬版本会让
+            //    老版本插件**完全无法导入**新备份（不是「忽略未知字段」，是整份拒绝）。
+            //    为一个「丢失后果可逆」的开关付这个代价不划算。
+            // ② **语义上它也不该被搬走**：关闭意图描述的是「**这台机器上这个 provider
+            //    该不该出现**」，而备份的主要用途是换机 / 迁移账号。把 A 机器的关闭态
+            //    带到 B 机器上，B 上那个 provider 会**静默消失**（选择器里一条模型都没有），
+            //    用户会以为「导入后模型全丢了」—— 那是比「关闭态丢失」更糟的方向。
+            //
+            // ⇒ 如实登记的代价：**导入备份会让「整家关闭」态退化为「逐条关闭」**。
+            //    目录不再变长时两者表现相同（派生判据仍报已关闭）；只有目录继续变长时
+            //    新增模型会重新出现。用户重新点一次供应商开关即恢复。
+            //    ⚠️ 这条代价**同机「导出 → 恢复」也会命中**（不是只有换机）。
+            //    见 `AccountPool.replaceAll` 里 `providerClosedCache = {}` 的注释。
             // 权威表 + Loomy 兼容字段**同源**（老版本只读后者，缺了会看到
             // 「锁定悄悄失效」，而失效的后果是真把永久积分烧掉了）。
             permanentLocks: locks,

@@ -46,6 +46,65 @@ export class RefreshTokenExpiredError extends Error {
         this.name = 'RefreshTokenExpiredError';
     }
 }
+/**
+ * 从 JWT 载荷里读 `exp` / `iat`（秒级 → 毫秒）。
+ *
+ * ⚠️ **不解签名**：这里只用于「本地估算还剩多久」的调度判据，不作任何信任判断；
+ * 真正的信任判定由服务端在续期请求时做。若解析失败一律返回 `undefined`，
+ * 调用方必须按「读不到」处理（不得 fail-closed 成「已过期」）。
+ *
+ * ⚠️ 用 `atob` 而非 `Buffer`：本函数必须在**客户端 bundle**（`plugin-src/client`）
+ * 之外也可用，而 `atob` 在 Node 22+ 与浏览器里都是全局的，不需要 import。
+ */
+function readJwtTime(token, claim) {
+    const parts = token.split('.');
+    if (parts.length !== 3)
+        return undefined;
+    const payload = parts[1];
+    if (payload === undefined || payload.length === 0)
+        return undefined;
+    try {
+        const base64 = payload.replace(/-/g, '+').replace(/_/g, '/');
+        const padded = base64.length % 4 === 2 ? `${base64}==`
+            : base64.length % 4 === 3 ? `${base64}=`
+                : base64;
+        const json = decodeURIComponent(atob(padded).split('').map((c) => `%${`00${c.charCodeAt(0).toString(16)}`.slice(-2)}`).join(''));
+        const value = JSON.parse(json)[claim];
+        if (typeof value !== 'number' || !Number.isFinite(value))
+            return undefined;
+        // ⚠️ 防御：秒级时间戳乘 1000 后不应超过 1e14（远超公元 5138 年）；
+        // 若拿到这种值说明载荷不是我们认的形状，按「读不到」处理。
+        const ms = value * 1000;
+        return Math.abs(ms) > 1e14 ? undefined : ms;
+    }
+    catch {
+        return undefined;
+    }
+}
+/**
+ * refresh_token 的到期时刻（毫秒）；读不到返回 `undefined`。
+ *
+ * ## 为什么需要它（2026-10-18 实测两个账号同时报废的根因）
+ *
+ * 华为 STS 的 refresh_token JWT 里，`exp` **恒等于「登录时刻 + 30 天」**，
+ * **续期不会延长它** —— 解开该账号全部历史凭据的 JWT 逐个核对，09-25 / 10-16×3 /
+ * 10-18 五次续期签发的 refresh_token，`exp` 全都收敛到同一个值。
+ * 而 access_token 寿命恒为 2 小时。
+ *
+ * ⇒ 最后一天出现「access 剩 2 小时、refresh 只剩约 50 分钟」的不对称，
+ * 而 lead-time 判据原本**只看 access**，会在 refresh 死线之后才放行，
+ * 那一轮续期必然失败，账号彻底不可用。
+ *
+ * 供 `expiry-sync.ts` 的 lead-time 判据补第二条腿（提前续期）使用。
+ */
+export function refreshTokenExpiresAt(credential) {
+    const token = credential.refresh_token;
+    if (typeof token !== 'string' || token.length === 0)
+        return undefined;
+    return readJwtTime(token, 'exp');
+}
+/** 导出给单测：直接解一个 JWT 的 `exp`/`iat`（毫秒）。 */
+export const __readJwtTimeForTest = readJwtTime;
 /** 向 STS token 端点发起一次带 DPoP 的 token 请求。 */
 export async function requestToken(body, keyPair, fetcher = fetch) {
     const dpop = await signDpopJws(keyPair, 'POST', STS_TOKEN_ENDPOINT);

@@ -182,6 +182,85 @@ function minimalHeaders(credential, product) {
     }
     return headers;
 }
+/**
+ * `/v2/chat/completions` 的 `X-Conversation-*` 三头（**逐请求一次性 id**）。
+ *
+ * ## ⚠️ 这三枚头**不是**准入必需 —— 但那是**按账号**的（2026-10-16，IKM7SG 结清）
+ *
+ * 原先以为「三头缺一即 400/11128 `conversation id missing`」，PR #104 据此补了
+ * 主链路。复测（真实凭据、约 90 次请求）**在该账号上**推翻了它：
+ * - 逐枚消融适配器构造的 **14 枚头，全部仍 200**（含这三枚）；
+ * - 逐级剥到「连 UA / 鉴权头 / 身份头都不发」仍 **200**；
+ * - 6 模型 × 4 请求形状 = 48 格，三头与响应状态**零关联**；
+ * - `conversation id missing` 这句 msg **零次复现**（同批复现了
+ *   `first message is not system prompt` 与 `Illegal API invocation from an
+ *   unapproved channel` 两句，证明这批请求确实打到了能报 11128 的网关）。
+ *
+ * ⚠️⚠️ **但 IKM7SG 用本仓库自己的 e2e（只换 `WB_REF`）证明这是「按账号」的**：
+ * 在**特定账号**（实测 `66E05E7C`）上，三头**缺任一枚即 400/11128**；
+ * 在**多数账号**（实测 `D87606B1`）上则非必需。
+ * ⇒ 准确表述是「**在多数账号上不是；在特定账号上是**」。
+ * 完整对照表与字段级穷举见 `src/buddy-adapter.ts` 内 `send()` 的对应注释。
+ *
+ * 上游对这三枚头的真实用法是**回显**：实测回包 `"id"` 的前缀 3/3 命中所发值，
+ * 填 `abc-123` 时上游直接回 `"id":"abc-123"`。⚠️ 但 IKM7SG 实测到**在那个账号上
+ * 「回显」与「准入判据」并存** ⇒ 「只当种子、不作判据」这句**对多数账号成立、
+ * 对那个账号不成立**。
+ *
+ * ## ⇒ 那为什么还要发（理由已按 IKM7SG 更新）
+ * 1. **对「要求三头」的账号是硬需求**（三枚齐全才 200）—— 不再是「反正无害」；
+ * 2. 对多数账号无害（无三头也 200）；
+ * 3. 官方客户端确实带这三枚，补上让后台归因与上游行为对齐；
+ * 4. **三条出站路径形态统一**，将来上游若真的收紧校验，改一处即可。
+ * ⚠️ ⇒ **删任何一枚都是错的**：IKM7SG 那批 14/14 消融数据**不能**用来论证
+ *「可以删」—— 它只在**不要求三头**的账号上取得。
+ *
+ * ⚠️ 这也**纠正了 PR #104 里「buddy-growth 早已带一枚 ⇒ 属补一致性缺口」的
+ * 论证**：那条论证本身是对的，但它恰恰是「一枚就够」的反证 —— 与
+ * 「缺一即 400」矛盾。结论保留（三头照发），**理由按 IKM7SG 更新为
+ * 「对『要求三头』的账号是硬需求 + 形态一致」**。
+ *
+ * ## ⚠️ 三头是逐请求 id，不是会话身份
+ * 官方 `X-Conversation-ID = context.id`（**会话稳定**），本实现逐请求新生成
+ * ⇒ 语义相反。实测上游不做跨轮状态机，故当前无害。
+ * 完整对照表见 `src/buddy-adapter.ts` 内 `send()` 的对应注释。
+ *
+ * ## ⚠️ 两条旁路的可达性（成本登记）
+ * - `chatRealSession`：**活路径** —— `skill_1` / `Expert_lighthouse` /
+ *   通用真实会话，经「一键领取积分」触发（`runGrowthTaskCompletions` 内）。
+ * - `keepStreakActive`（保连胜）：⚠️ **零生产调用方**（2026-10-16 全仓 grep 确认，
+ *   `jet-hub-rpc` / `provider-credits` 只 import `collectBuddyGrowth`）。
+ *   本次给它补三头 + 加守卫是**为将来接入时形态不漂移**，不代表它当前在线上跑。
+ *
+ * @param conversationId 逐请求生成的 32 位无横线 uuid
+ */
+export function conversationHeaders(conversationId) {
+    return {
+        'X-Conversation-ID': conversationId,
+        'X-Conversation-Request-ID': conversationId,
+        'X-Conversation-Message-ID': conversationId,
+    };
+}
+/** 生成 `/v2/chat/completions` 用的逐请求 conversation id（32 位无横线 uuid）。 */
+export function newConversationId() {
+    return crypto.randomUUID().replace(/-/g, '');
+}
+/**
+ * {@link growthHeaders} + 三枚 `X-Conversation-*`。
+ *
+ * ## ⚠️⚠️ 存在的原因是 {@link growthHeaders} 返回 **`Headers` 实例**
+ * 不能用对象展开合并 —— JS 的 `Headers` 没有自有可枚举属性，`{...headers}`
+ * **恒为 `{}`**。写错的后果是 `Authorization` 等 9 枚头**全部消失**、请求必然 401，
+ * 而只断言「三枚 Conv 头齐全」的守卫**照样全绿**（第二轮审计实测的假绿）。
+ * ⇒ 必须**在实例上逐枚 `set`**，且守卫要断言**原有头仍在**。
+ */
+function growthHeadersWithConversation(credential, product, conversationId) {
+    const headers = growthHeaders(credential, product);
+    for (const [key, value] of Object.entries(conversationHeaders(conversationId))) {
+        headers.set(key, value);
+    }
+    return headers;
+}
 /** 从 JSON 安全读取字符串。 */
 function readString(source, key) {
     if (typeof source !== 'object' || source === null) {
@@ -596,7 +675,16 @@ export async function keepStreakActive(credential, product, fetcher = fetch) {
     try {
         const response = await fetcher(`${product.endpoint}/v2/chat/completions`, {
             method: 'POST',
-            headers: growthHeaders(credential, product),
+            // ⚠️⚠️ **绝不能**写成 `{ ...growthHeaders(...), ...conversationHeaders(...) }`：
+            // `growthHeaders` 返回的是 **`Headers` 实例**（见其签名），而 JS 的 `Headers`
+            // **没有自有可枚举属性** —— 对象展开恒为 `{}`：
+            //   `new Headers([['a','1'],['b','2']]).spread` → `{}`
+            // ⇒ 那样写会让 `Authorization` / `X-Domain` / `X-Product` / `X-User-Id` /
+            // `User-Agent` 等 9 枚头**全部消失**，请求必然 401。
+            // （2026-10-16 第二轮审计实测发现：本 PR 的初版正是这样写的，
+            //   而当时的两条守卫只断言三枚 Conv 头齐全 ⇒ **假绿放过了这个回归**。）
+            // 故改为：在 `Headers` 实例上**逐枚 set**，不新建对象。
+            headers: growthHeadersWithConversation(credential, product, newConversationId()),
             body: JSON.stringify(body),
             signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
         });
@@ -1662,7 +1750,10 @@ async function chatRealSession(credential, product, fetcher, expertId, model = F
             headers: {
                 ...minimalHeaders(credential, product),
                 Accept: 'text/event-stream',
-                'X-Conversation-ID': `jb-conv-${Date.now()}`,
+                // ⚠️ 原先这里只有一枚 `X-Conversation-ID: jb-conv-<ts>`，另两枚缺失。
+                // 2026-10-16 起补齐三枚：**对「要求三头」的账号是硬需求**（IKM7SG 实测
+                // 三枚齐全才 200），且与主链路形态统一 —— 见 `conversationHeaders` 的注释。
+                ...conversationHeaders(newConversationId()),
                 'X-Request-ID': String(Date.now()),
                 'X-Expert-Id': expertId,
                 'X-Agent-Intent': 'craft',

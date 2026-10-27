@@ -124,7 +124,7 @@ function commandOnPath(bin, env = process.env, platform = process.platform) {
   return false;
 }
 const DEFAULT_MODEL = "gemini-3.6-flash-low";
-const DEFAULT_MAX_RESULTS$1 = 8;
+const DEFAULT_MAX_RESULTS$2 = 8;
 function buildAntigravityInvocation(options) {
   let prompt;
   let schemaJson;
@@ -144,7 +144,7 @@ function buildAntigravityInvocation(options) {
     }
     prompt = buildSearchPrompt({
       query: options.query,
-      maxResults: options.maxResults ?? DEFAULT_MAX_RESULTS$1,
+      maxResults: options.maxResults ?? DEFAULT_MAX_RESULTS$2,
       extraPrompt: options.extraPrompt
     });
     schemaJson = searchResultSchemaJson();
@@ -407,7 +407,7 @@ async function executeExaSearch(options) {
       title: r.title ?? "",
       url: r.url ?? "",
       snippet: r.highlights?.[0] ?? "",
-      source: r.url ? safeHostname$2(r.url) : void 0
+      source: r.url ? safeHostname$3(r.url) : void 0
     };
     if (r.publishedDate) {
       item.published_at = r.publishedDate;
@@ -434,7 +434,7 @@ async function executeExaSearch(options) {
     }
   };
 }
-function safeHostname$2(url) {
+function safeHostname$3(url) {
   try {
     return new URL(url).hostname;
   } catch {
@@ -811,7 +811,7 @@ async function firecrawlSearch(options) {
     title: r.title ?? "",
     url: r.url ?? "",
     snippet: r.description ?? "",
-    source: r.url ? safeHostname$1(r.url) : void 0
+    source: r.url ? safeHostname$2(r.url) : void 0
   }));
   const summary = items.length > 0 ? `Firecrawl returned ${items.length} ranked result(s) for "${options.query}". Read items for the sources.` : "";
   return {
@@ -962,7 +962,7 @@ function normalizeLinks(raw) {
   }
   return out;
 }
-function safeHostname$1(url) {
+function safeHostname$2(url) {
   try {
     return new URL(url).hostname;
   } catch {
@@ -1797,6 +1797,114 @@ const httpFetchProvider = {
   isAvailable: () => true,
   execute: executeHttpFetch
 };
+const DEFAULT_MAX_RESULTS$1 = 10;
+const MAX_RESULTS_CEILING = 50;
+const KEENABLE_DEFAULT_BASE = "https://api.keenable.ai";
+const APP_TITLE = "modsearch";
+async function executeKeenableSearch(options) {
+  if (options.mode === "fetch") {
+    throw new Error("The keenable engine does not support page fetch (-u). It searches only.");
+  }
+  if (!options.query) {
+    throw new Error("Search mode requires a query.");
+  }
+  const apiKeys = splitApiKeys(options.settings.apiKey);
+  const apiKey = apiKeys[0] ?? null;
+  const apiKeySecrets = [.../* @__PURE__ */ new Set([...apiKeys, ...options.apiKeySecrets ?? []])];
+  const maxResults = Math.min(options.maxResults ?? DEFAULT_MAX_RESULTS$1, MAX_RESULTS_CEILING);
+  const startedAt = Date.now();
+  const headers = { "content-type": "application/json" };
+  if (apiKey) {
+    headers["x-api-key"] = apiKey;
+  } else {
+    headers["x-keenable-title"] = APP_TITLE;
+  }
+  const { response, text } = await requestText(
+    "keenable",
+    resolveEndpoint(
+      options.settings.baseURL,
+      KEENABLE_DEFAULT_BASE,
+      apiKey ? "/v1/search" : "/v1/search/public"
+    ),
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ query: options.query, max_results: maxResults })
+    },
+    AbortSignal.timeout(options.timeoutMs),
+    options.timeoutMs,
+    [...apiKeySecrets, options.settings.baseURL]
+  );
+  if (!response.ok) {
+    const detail = redactSecrets(text.trim(), [...apiKeySecrets, options.settings.baseURL]);
+    const message = `keenable returned ${response.status} ${response.statusText}.${detail ? ` ${detail}` : ""}`;
+    if (response.status >= 500) {
+      throw new Error(message);
+    }
+    if (!apiKey) {
+      throw new Error(
+        response.status === 429 ? `keenable's keyless pool for this IP is used up for the hour (1,000 requests). Set a free key for your own quota: modsearch config set keenable.apiKey <key> (100,000 requests/month, https://app.keenable.ai)` : message
+      );
+    }
+    if (response.status === 402 || isQuotaFailureMessage(detail)) {
+      throw new ApiKeyFailureError(
+        `keenable is out of credits (HTTP ${response.status}).${detail ? ` ${detail}` : ""} Buy credits at https://app.keenable.ai/console, wait for the monthly reset, or search with another engine.`
+      );
+    }
+    if (response.status === 401 || response.status === 403 || response.status === 429) {
+      throw new ApiKeyFailureError(
+        response.status === 429 ? message : `keenable rejected the API key (${response.status}). Fix it: modsearch config set keenable.apiKey <key>${detail ? ` (${detail})` : ""}`
+      );
+    }
+    throw new Error(message);
+  }
+  const data = JSON.parse(text);
+  const items = (data.results ?? []).map((r) => {
+    const item = {
+      title: r.title ?? "",
+      url: r.url ?? "",
+      // The snippet is the page excerpt; the description is often empty.
+      snippet: r.snippet || r.description || "",
+      source: r.url ? safeHostname$1(r.url) : void 0
+    };
+    if (r.published_at) {
+      item.published_at = r.published_at;
+    }
+    return item;
+  });
+  const summary = items.length > 0 ? `Keenable returned ${items.length} ranked result(s) for "${options.query}". Read items for the sources.` : "";
+  return {
+    result: {
+      summary,
+      items,
+      uncertainty: items.length === 0 ? ["No results found for this query."] : [],
+      warnings: [
+        "Keenable returns ranked results without an LLM summary, so the summary is mechanical: read items directly for the evidence."
+      ]
+    },
+    meta: {
+      conversationId: null,
+      durationSeconds: (Date.now() - startedAt) / 1e3,
+      usage: { resultCount: items.length, mode: data.mode ?? null }
+    }
+  };
+}
+function safeHostname$1(url) {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return void 0;
+  }
+}
+const keenableProvider = {
+  name: "keenable",
+  roles: ["search"],
+  requirement: "nothing: search works keyless (1,000 requests/hour per IP, no signup). A free key lifts the hourly cap (100,000 requests/month)",
+  // Keyless search needs nothing, so it is always available. A key only
+  // changes which endpoint the call goes to.
+  isAvailable: () => true,
+  execute: executeKeenableSearch
+};
 const DEFAULT_MAX_RESULTS = 8;
 const TAVILY_DEFAULT_BASE = "https://api.tavily.com";
 async function executeTavilySearch(options) {
@@ -1895,6 +2003,7 @@ const ENGINES = {
   tavily: tavilyProvider,
   exa: exaProvider,
   firecrawl: firecrawlProvider,
+  keenable: keenableProvider,
   "grok-cli": grokCliProvider,
   grok: grokCliProvider,
   // The built-in direct fetcher, canonically `local`. `http` and `direct` stay
@@ -1905,10 +2014,12 @@ const ENGINES = {
 };
 const ROLE_PREFERENCE = {
   // Firecrawl leads: its keyless allowance works on a bare machine with no
-  // signup, which is the product's zero-setup promise. agy synthesizes and
-  // cites but its weekly quota is small, so it backs Firecrawl up rather than
-  // fronting the chain. Tavily and Exa are keyed backups.
-  search: ["firecrawl", "antigravity-cli", "tavily", "exa"],
+  // signup, which is the product's zero-setup promise. Keenable is the second
+  // keyless engine, so a bare machine still has a fallback when Firecrawl's
+  // daily allowance runs out. agy synthesizes and cites but its weekly quota
+  // is small, so it backs the keyless pair up rather than fronting the chain.
+  // Tavily and Exa are keyed backups.
+  search: ["firecrawl", "keenable", "antigravity-cli", "tavily", "exa"],
   // Firecrawl runs a cloud browser for JS-heavy pages, keyless by default
   // (opt out with firecrawl.keylessFetch false). agy extracts to a focus. The
   // local needs no setup and returns the page as served, so it stays the
@@ -1947,7 +2058,8 @@ function currentConfigPath() {
 const ENV_BINDINGS = {
   tavily: { apiKey: "TAVILY_API_KEY", baseURL: "TAVILY_BASE_URL" },
   exa: { apiKey: "EXA_API_KEY", baseURL: "EXA_BASE_URL" },
-  firecrawl: { apiKey: "FIRECRAWL_API_KEY", baseURL: "FIRECRAWL_BASE_URL" }
+  firecrawl: { apiKey: "FIRECRAWL_API_KEY", baseURL: "FIRECRAWL_BASE_URL" },
+  keenable: { apiKey: "KEENABLE_API_KEY", baseURL: "KEENABLE_BASE_URL" }
 };
 const SETTABLE_ENGINE_FIELDS = [
   "apiKey",
@@ -2660,6 +2772,19 @@ function diagnoseEngine(engine, config2, env, role) {
       keySource,
       reason: keySource ? apiKeyPresentReason(count, keySource) : "no API key (not in EXA_API_KEY or the config file)",
       ...ready2 ? {} : { fix: "modsearch config set exa.apiKey <key>" }
+    };
+  }
+  if (engine.name === "keenable") {
+    const { count, source: keySource } = configuredApiKeys(
+      env.KEENABLE_API_KEY,
+      config2.engines?.keenable?.apiKey
+    );
+    return {
+      engine: engine.name,
+      enabled,
+      ready: true,
+      keySource,
+      reason: keySource ? apiKeyPresentReason(count, keySource) : "keyless: works with no key and no signup (1,000 requests/hour, shared by everyone on this IP). Set a free key for 100,000 requests/month of your own."
     };
   }
   if (engine.name === "firecrawl") {
@@ -3566,6 +3691,7 @@ if (process.env.MODSEARCH_NESTED) {
   );
   process.exit(1);
 }
+const EXIT_BACKSTOP_MS = 2e3;
 function writeFully(stream, text) {
   return new Promise((resolve, reject) => {
     stream.write(text, (error) => error ? reject(error) : resolve());
@@ -3574,13 +3700,13 @@ function writeFully(stream, text) {
 const program = new Command();
 program.name("modsearch").description(
   "Plug-in web search and page fetch for models without native web access: query or URL in, structured JSON evidence out"
-).version("5.10.6");
+).version("5.10.10");
 program.command("search", { isDefault: true }).description("Search the web or X, or fetch a page (default command)").option("-q, --query <text>", "Search query (or answer focus when combined with -u)").option("-u, --url <url>", "Fetch this web page instead of searching").option("-o, --output <path>", "Write result JSON to a file").option(
   "-s, --source <list>",
   "Where to search: web, x, or web,x (default: web, or x when the query is about X)"
 ).option(
   "-e, --engine <name>",
-  "Engine for this run, overriding config (antigravity-cli, tavily, exa, firecrawl, grok-cli, local)"
+  "Engine for this run, overriding config (antigravity-cli, tavily, exa, firecrawl, keenable, grok-cli, local)"
 ).option("-m, --model <name>", "Engine model, where the engine has one").option("--prompt <text>", "Extra constraints for this run").option("--max-results <n>", "Maximum number of search results", "8").option("--timeout <ms>", "Engine timeout in milliseconds", "180000").option(
   "--deadline <ms>",
   "Wall-clock budget for the whole run in milliseconds, across every engine tried (default: none)"
@@ -3643,7 +3769,8 @@ program.command("search", { isDefault: true }).description("Search the web or X,
     exitCode = 1;
   }
   await waitForPendingKills();
-  process.exit(exitCode);
+  process.exitCode = exitCode;
+  setTimeout(() => process.exit(exitCode), EXIT_BACKSTOP_MS).unref();
 });
 program.command("doctor").description("Diagnose config and routing on this machine (no quota, no network)").option("--json", "Print the report as JSON").action((options) => {
   try {
@@ -3669,7 +3796,7 @@ config.command("init").description(`Create a starter config at ${CONFIG_PATH}`).
       [
         `Created ${CONFIG_PATH}`,
         "Everything is optional. Things you can set:",
-        "  modsearch config set engine <antigravity-cli|tavily|exa|firecrawl>   which engine searches",
+        "  modsearch config set engine <antigravity-cli|tavily|exa|firecrawl|keenable>   which engine searches",
         "  modsearch config set <engine>.<apiKey|bin|model|baseURL|keylessFetch> <value>   engine settings",
         "  modsearch config set cooldown <on|off>   quota cooldown failover (default on)",
         "  modsearch config set allowPrivateNetwork <true|false>   reach reserved/private ranges (default false)",

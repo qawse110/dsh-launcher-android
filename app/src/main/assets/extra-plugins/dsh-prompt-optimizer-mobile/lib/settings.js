@@ -13,6 +13,7 @@
 //   ③ **未知字段不写进去**：白名单合并，避免把别人的字段顺手改坏（ADR-0036 的同一条精神）。
 import { readFileSync, writeFileSync, existsSync, renameSync, rmSync, copyFileSync, readdirSync } from 'node:fs'
 import { dirname, basename, join } from 'node:path'
+import { FAST_REASONING_PROFILE } from './inference-profile.js'
 
 /** 补充程度：它决定"把用户的话展开到多细"。 */
 export const DETAIL_LEVELS = Object.freeze(['minimal', 'standard', 'detailed'])
@@ -54,33 +55,23 @@ export const TIER_PRESETS = Object.freeze({
 export const PERMISSIONS = Object.freeze(['review', 'auto'])
 /** 上下文模式（0.5 的"回合/全文"）：`turns` = 只读最近 N 回合；`full` = 与工作 AI 看到的一致。 */
 export const HISTORY_MODES = Object.freeze(['turns', 'full'])
+/** 模型状态：normal = 常规；extreme = 明确告知模型其身份与充足算力，鼓励拉满 (用户 2026-10-25)。 */
+export const MODEL_STATES = Object.freeze(['normal', 'extreme'])
 /** 回合数上限（0.5 是 0~10：再多容易把优化模型的上下文撑爆）。 */
 export const TURNS_MIN = 0
 export const TURNS_MAX = 10
 
-/**
- * 协作基调（0.7.8）：模型以什么**姿态**执行这一轮。
- *
- * 为什么要有这一档（用户 2026-09-27 实测）：把同样的要求用口语、带情绪、带关系感的说法讲出来
- * （"兄弟""贼拉牛逼""硬邦邦""赶紧搞起"），模型的首轮交付明显好于同等字数、同等信息量的正式说法。
- * 机制不是模型被"激励"，而是**语域条件化的分布**：正式语域命中"专业助手接正式请求"那一簇
- * （客套、hedging、模板化、求稳），口语+高唤醒语域命中"哥们帮你把活干出来"那一簇
- * （直接开干、投入、把成品拿出来）。所以这一档必须**保留语域本身**——
- * 把它消毒成"请更积极"的正式条目，就恰好把起作用的那部分扔掉了。
- *
- * ⚠ 两条边界：① 它只影响工作模型的执行姿态，**不改用户原话**、不升格为要求；
- *   ② 它**不放松决策边界**——强结果导向最容易带来"懒得问、自己定了"，所以块内必须显式反制。
- */
-export const FRAMINGS = Object.freeze(['neutral', 'hard'])
+// Deprecated input domains: accepted for migration, never an execution-path selector.
 export const REASONING_MODES = Object.freeze(['parallel', 'loop', 'hybrid'])
 export const REASONING_PACES = Object.freeze(['fast', 'balanced', 'inherit'])
 export const REASONING_KEYS = Object.freeze(['reasoningBoost', 'reasoningMode', 'reasoningCandidates', 'reasoningRounds', 'reasoningPace'])
 
 /** 默认值：字段**缺失**时用它。字段**写错**时也用它，但会记一条 `problems`（见文件头 ①）。 */
 export const DEFAULT_SETTINGS = Object.freeze({
+  // 2026-10-18 用户指定：新装默认「重度」（detail=detailed / budget=generous）。
   assist: 'auto',
-  detail: 'standard',
-  budget: 'standard',
+  detail: 'detailed',
+  budget: 'generous',
   model: null,          // null = 跟随会话模型（0.6 现状）；{ provider, model } = 固定解释层模型
   // 0.7.5：**思考档位，按模型各配各的**（用户 2026-09-26 反馈：一直用 max 档，思考仍时有时无）。
   // 为什么必须是映射而不是一个全局值：档位是**每个 provider/model 路由**自己的划分
@@ -102,25 +93,33 @@ export const DEFAULT_SETTINGS = Object.freeze({
   // ⚠ 只允许档位相关键：`bash`/`model`/`effortByModel`/`permission` 等仍是全局的
   //   （它们是"这台机器怎么跑"，不是"这个会话怎么跑"），越界的键会被归一化丢弃并记问题。
   bySession: {},
-  // 0.7.8：协作基调（普通 / 硬邦邦）。**默认普通**——硬邦邦只在用户显式选择时生效，
-  // 因为它会改变执行姿态（更强推进、更少客套），对正式类任务并不总是合适。
-  framing: 'neutral',
   reasoningBoost: false,
-  reasoningMode: 'parallel',
-  reasoningCandidates: 2,
-  reasoningRounds: 1,
-  reasoningPace: 'fast',
+  ...FAST_REASONING_PROFILE,
   englishMode: false,
+  // 2026-10-19 修：顾问默认**开**（此前默认值根本没写 ⇒ 界面拿不到布尔值 ⇒ 开关永远是灰的）。
+  advisor: true,
   permission: 'auto',   // P10
   historyMode: 'turns', // P10
-  turns: 6,             // P10：回合模式的窗口
+  turns: 10,            // 2026-10-18 用户指定：默认读最近 10 回合
   // ⚠ 读项目文件默认 **关**：它会给每轮加上"只读工具轮次"（时间与 token 都要花），
   // 而计划的不变量是"不得悄悄放大成本/自主权"。0.5 那边默认是开——要完全照搬的话
   // 把这一行改成 true 即可，属于一行决定，已在此写明以免下次又被当成"忘了"。
-  readTools: false,     // P10
+  readTools: true,      // 2026-10-18 用户指定：默认开只读工具
   // 0.7.1：内置 Bash（随本插件装配即提供）。默认 **开**——它是"内置功能"，
   // 关掉＝不把 bash 工具注册给模型（模型看不到它），不是在工具内部做软拦截。
   bash: true,
+  modelState: 'normal',
+  // 2026-10-19 用户要求：**双击 Enter 跳过本轮优化**；当天稍后改成**默认开**。
+  // 开着时：第一次 Enter 正常拦截并开始解释；600ms 内再按一次 Enter ⇒ 放弃本轮解释、
+  // 按原文立即发出（与面板上的「跳过」同一语义：不发包、不出注入卡片）。
+  doubleEnterSkip: true,
+  // 2026-10-19 用户提出：子代理也会跑这套解释/注入，通常没必要（白花 token）。
+  // 默认 **不应用**；要的话在「详情」里打开。
+  applyToSubagents: false,
+  // 2026-10-19：非 Wish/PTC 预设时的提示条。点"以后不再显示"就置 true。
+  presetNoticeDismissed: false,
+  // 2026-10-19：点「跳过并直接发送」时提示"开双击 Enter 跳过"的那张卡，点过"以后不再显示"就置 true。
+  skipHintDismissed: false,
   // 0.8：**斜杠命令允许列表**（命令名不带斜杠）。
   // 默认空 = 所有斜杠命令照旧交还宿主（与改动前完全一致）。
   // 为什么不直接放开斜杠：宿主自己的 /clear、/model、/compact 一旦被审查浮层接管，
@@ -129,7 +128,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
 })
 
 /** 允许按会话覆盖的键（档位四件套；其余设置保持全局）。 */
-export const SESSION_KEYS = Object.freeze(['assist', 'detail', 'budget', 'tier', 'framing', 'englishMode', ...REASONING_KEYS])
+export const SESSION_KEYS = Object.freeze(['assist', 'detail', 'budget', 'tier', 'englishMode', 'modelState', ...REASONING_KEYS])
 
 /** 斜杠命令名单上限（32 个字符/条，最多 16 条）。 */
 export const SLASH_REVIEW_MAX = 16
@@ -139,12 +138,17 @@ export const SETTINGS_KEYS = Object.freeze([
   'assist', 'detail', 'budget', 'model',
   'permission', 'historyMode', 'turns', 'readTools',
   'bash',
+  'modelState',
+  'doubleEnterSkip',
+  'applyToSubagents',
+  'presetNoticeDismissed',
+  'skipHintDismissed',
   'effortByModel',
   'bySession',
-  'framing',
   'slashReview',
   ...REASONING_KEYS,
   'englishMode',
+  'advisor',
 ])
 
 const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v)
@@ -188,6 +192,14 @@ export function normalizeSettings(raw) {
     }
     return v
   }
+  // Profile selectors are retained for old files, but reads and writes use one fast profile.
+  const pickReasoning = (key, value = src[key], problemKey = key) => {
+    const used = FAST_REASONING_PROFILE[key]
+    if (value !== undefined && value !== used) {
+      problems.push({ key: problemKey, kind: typeof value === typeof used ? 'fast-profile-migration' : 'wrong-type', got: value, used })
+    }
+    return used
+  }
   // 按会话的档位覆盖：{ [sessionId]: { assist?, detail?, budget?, tier? } }。
   // 只认 SESSION_KEYS 四个档位键；越界的键（如 bash/model）**丢弃并记问题**——
   // 它们是这台机器的属性，不该被某个会话改掉。逐条校验、坏条目单条丢弃，不整表回退。
@@ -195,7 +207,7 @@ export function normalizeSettings(raw) {
     const v = src.bySession
     if (v === undefined) return {}
     if (!isPlainObject(v)) { problems.push({ key: "bySession", kind: "wrong-type", got: v, used: {} }); return {} }
-    const domains = { assist: ASSIST_MODES, detail: DETAIL_LEVELS, budget: BUDGET_LEVELS, tier: TIER_LEVELS, framing: FRAMINGS }
+    const domains = { assist: ASSIST_MODES, detail: DETAIL_LEVELS, budget: BUDGET_LEVELS, tier: TIER_LEVELS, modelState: MODEL_STATES }
     const out = {}
     for (const [sid, ov] of Object.entries(v)) {
       if (typeof sid !== "string" || !sid) continue
@@ -205,11 +217,12 @@ export function normalizeSettings(raw) {
         if (!SESSION_KEYS.includes(k)) { problems.push({ key: "bySession[" + sid + "]." + k, kind: "not-session-scoped", got: ov[k], used: undefined }); continue }
         const val = ov[k]
         if (val === undefined) continue
+        // Only canonicalize keys actually present: sparse session intent must stay sparse.
+        if (Object.hasOwn(FAST_REASONING_PROFILE, k)) {
+          clean[k] = pickReasoning(k, val, 'bySession[' + sid + '].' + k)
+          continue
+        }
         const valid = k==='reasoningBoost'||k==='englishMode' ? typeof val==='boolean'
-          : k==='reasoningMode' ? REASONING_MODES.includes(val)
-          : k==='reasoningPace' ? REASONING_PACES.includes(val)
-          : k==='reasoningCandidates' ? Number.isInteger(val) && val>=2 && val<=3
-          : k==='reasoningRounds' ? Number.isInteger(val) && val>=1 && val<=3
           : typeof val==='string' && domains[k]?.includes(val)
         if (!valid) { problems.push({ key: "bySession[" + sid + "]." + k, kind: "not-in-domain", got: val, used: undefined }); continue }
         clean[k] = val
@@ -265,18 +278,23 @@ export function normalizeSettings(raw) {
     model: null,
     effortByModel: pickEffortMap(),
     bySession: pickSessionMap(),
-    framing: pick('framing', FRAMINGS, DEFAULT_SETTINGS.framing),
     reasoningBoost: pickBool('reasoningBoost', DEFAULT_SETTINGS.reasoningBoost),
-    reasoningMode: pick('reasoningMode', REASONING_MODES, DEFAULT_SETTINGS.reasoningMode),
-    reasoningCandidates: pickInt('reasoningCandidates', 2, 3, DEFAULT_SETTINGS.reasoningCandidates),
-    reasoningRounds: pickInt('reasoningRounds', 1, 3, DEFAULT_SETTINGS.reasoningRounds),
-    reasoningPace: pick('reasoningPace', REASONING_PACES, DEFAULT_SETTINGS.reasoningPace),
+    reasoningMode: pickReasoning('reasoningMode'),
+    reasoningCandidates: pickReasoning('reasoningCandidates'),
+    reasoningRounds: pickReasoning('reasoningRounds'),
+    reasoningPace: pickReasoning('reasoningPace'),
     englishMode: pickBool('englishMode', DEFAULT_SETTINGS.englishMode),
+    advisor: pickBool('advisor', DEFAULT_SETTINGS.advisor),
     permission: pick('permission', PERMISSIONS, DEFAULT_SETTINGS.permission),
     historyMode: pick('historyMode', HISTORY_MODES, DEFAULT_SETTINGS.historyMode),
     turns: pickInt('turns', TURNS_MIN, TURNS_MAX, DEFAULT_SETTINGS.turns),
     readTools: pickBool('readTools', DEFAULT_SETTINGS.readTools),
     bash: pickBool('bash', DEFAULT_SETTINGS.bash),
+    modelState: pick('modelState', MODEL_STATES, DEFAULT_SETTINGS.modelState),
+    doubleEnterSkip: pickBool('doubleEnterSkip', DEFAULT_SETTINGS.doubleEnterSkip),
+    applyToSubagents: pickBool('applyToSubagents', DEFAULT_SETTINGS.applyToSubagents),
+    presetNoticeDismissed: pickBool('presetNoticeDismissed', DEFAULT_SETTINGS.presetNoticeDismissed),
+    skipHintDismissed: pickBool('skipHintDismissed', DEFAULT_SETTINGS.skipHintDismissed),
     slashReview: pickSlashReview(),
   }
   // model：null / 缺省 = 跟随会话；给了就必须是 { provider, model } 两个非空字符串
@@ -311,7 +329,8 @@ export function tierOf(settings) {
 
 /** 合并补丁：只接受白名单键（外加档位别名 `tier`）；`undefined` 表示"不改这一项"。纯函数。 */
 export function mergeSettings(current, patch) {
-  const base = normalizeSettings(current).settings
+  const normalized = normalizeSettings(current)
+  const base = normalized.settings
   const p = isPlainObject(patch) ? patch : {}
   const next = { ...base }
   // 档位先铺预设，**显式给出的三项仍然覆盖它**（顺序就是语义，写在这里以免以后被"顺手重排"）
@@ -320,6 +339,14 @@ export function mergeSettings(current, patch) {
   for (const k of SETTINGS_KEYS) if (p[k] !== undefined) next[k] = p[k]
   // 非法档位也要如实报出来（不能静默丢弃）
   const out = normalizeSettings(p.tier !== undefined && !tierOk ? { ...next, tier: p.tier } : next)
+  // An unrelated write also migrates old stored profile values; report that migration.
+  // Do not carry stale source problems for a key/map explicitly replaced by the patch.
+  for (const problem of normalized.problems) {
+    const profileKey = Object.hasOwn(FAST_REASONING_PROFILE, problem.key)
+    const sessionProfileKey = /^bySession\[.*\]\.(reasoningMode|reasoningCandidates|reasoningRounds|reasoningPace)$/.test(problem.key)
+    if ((profileKey && p[problem.key] === undefined || sessionProfileKey && p.bySession === undefined)
+      && !out.problems.some((item) => item.key === problem.key)) out.problems.push(problem)
+  }
   // ⚠ 补丁里**多出来的键**也要报：界面上打错字段名时，用户会以为"保存成功了"，
   // 而实际上我们什么都没改——静默忽略等于骗人（实测这条是被用例逼出来的）。
   const extra = Object.keys(p).filter((k) => !SETTINGS_KEYS.includes(k) && k !== 'tier')
@@ -413,10 +440,17 @@ export function writeSettings({ path, patch, now = Date.now() } = {}) {
   //
   // 语义**故意与顶层写入不同**：按会话的写入**只能开、不能关** —— 把某一场设为"关闭"
   // 不代表别的会话也要关，所以 off 那条不写 gate（否则关掉一个会话就把整个插件关了）。
-  // 只改 `framing` 这类非档位字段同样不碰启用意图（与顶层那条边界一致）。
+  // 只改英文模式这类非档位字段同样不碰启用意图（与顶层那条边界一致）。
+  // Client session writes preserve the complete map. An unchanged tier in that map
+  // is not a new tier choice (e.g. an independent boost/English toggle).
   const sessionTurnsOn = isPlainObject(patch) && isPlainObject(patch.bySession)
-    && Object.values(patch.bySession).some((v) => isPlainObject(v)
-      && LEVEL_KEYS.some((k) => v[k] !== undefined) && v.tier !== 'off')
+    && Object.entries(patch.bySession).some(([sid, v]) => {
+      if (!isPlainObject(v)) return false
+      const previous = isPlainObject(before.bySession?.[sid]) ? before.bySession[sid] : {}
+      const clean = merged.settings.bySession[sid] || {}
+      return LEVEL_KEYS.some((k) => v[k] !== undefined && clean[k] !== undefined && clean[k] !== previous[k])
+        && clean.tier !== 'off'
+    })
   const gatePatch = {}
   if (hasTopLevel && tierOf(merged.settings) === 'off') {
     gatePatch.enabled = false
@@ -429,6 +463,8 @@ export function writeSettings({ path, patch, now = Date.now() } = {}) {
   }
   // gatePatch **最后**展开：档位写入的启用意图要盖过搬运来的旧值。
   const after = { ...gateFrom, ...before, ...merged.settings, ...gatePatch }
+  // This removed setting is not metadata: never copy it back from the raw file.
+  delete after.framing
   const out = {
     ok: false, before, after, backup: null, problems: merged.problems, path,
     recoveredFromCorrupt: corruptBefore,
@@ -484,5 +520,9 @@ export function describeSettings(settings) {
     turns: s.turns,
     readTools: s.readTools,
     readToolsLabel: s.readTools ? '开（会读项目文件后再写要求）' : '关（只依据你的话与上下文）',
+    doubleEnterSkip: s.doubleEnterSkip,
+    doubleEnterSkipLabel: s.doubleEnterSkip ? '开（600ms 内再按回车＝跳过本轮优化）' : '关',
+    applyToSubagents: s.applyToSubagents,
+    applyToSubagentsLabel: s.applyToSubagents ? '开（子代理也用这套解释与注入）' : '关（子代理不解释、不注入）',
   }
 }

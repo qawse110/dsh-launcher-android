@@ -1,0 +1,214 @@
+{
+  "summary": {
+    "version": "bench-1",
+    "budgetTokens": 3000,
+    "cases": 5,
+    "protocolPass": 5,
+    "sectionsPass": 4,
+    "budgetPass": 5,
+    "budgetUnknown": 0,
+    "askPurePass": 5,
+    "noInventedNumber": 5,
+    "langPass": 4,
+    "behaviorPass": 5,
+    "msP50": 12399,
+    "outTokensMean": 1640,
+    "rates": {
+      "protocol": 100,
+      "sections": 100,
+      "budget": 100,
+      "askPure": 100,
+      "noInventedNumber": 100,
+      "lang": 100,
+      "behavior": 100
+    },
+    "scoredCases": 4
+  },
+  "rows": [
+    {
+      "id": "short",
+      "tier": "heavy",
+      "inputChars": 5,
+      "route": {
+        "provider": "deepseek-official",
+        "model": "deepseek-flash",
+        "reasoningEffort": "max"
+      },
+      "revision": "scaffold-directions-1",
+      "usage": {
+        "inputTokens": 217,
+        "outputTokens": 1468,
+        "cacheReadTokens": 896,
+        "cacheWriteTokens": 0,
+        "totalTokens": 2581
+      },
+      "finish": "stop",
+      "protocol": true,
+      "warnings": [],
+      "counts": {
+        "add": 7,
+        "scaffold": 4,
+        "ask": 2
+      },
+      "packetChars": 881,
+      "sections": true,
+      "budget": true,
+      "askPure": true,
+      "inventedNumbers": [],
+      "noNumber": true,
+      "lang": true,
+      "behaviorFails": [],
+      "behavior": true,
+      "sample": "先把车身姿态与整体比例定准：轮廓要一眼读得出跑车身份，低伏、紧凑、有力量感，整体气势优先于局部零件堆叠。\n造型语言要统一：主特征线、轮拱、前脸进气与尾部扩散器彼此呼应，曲面转折干净连贯，避免拼贴感和造型断裂。\n按展示级质感处理材质与光影：车漆、玻璃、碳纤维、金属和橡胶的反射与粗糙度差异要清楚，灯光能勾勒出曲面起伏。\n细",
+      "ms": 12399
+    },
+    {
+      "id": "vague",
+      "tier": "heavy",
+      "inputChars": 14,
+      "route": {
+        "provider": "deepseek-official",
+        "model": "deepseek-flash",
+        "reasoningEffort": "max"
+      },
+      "revision": "scaffold-directions-1",
+      "usage": {
+        "inputTokens": 224,
+        "outputTokens": 1527,
+        "cacheReadTokens": 896,
+        "cacheWriteTokens": 0,
+        "totalTokens": 2647
+      },
+      "finish": "stop",
+      "protocol": true,
+      "warnings": [],
+      "counts": {
+        "add": 4,
+        "scaffold": 3,
+        "ask": 2
+      },
+      "packetChars": 746,
+      "sections": true,
+      "budget": true,
+      "askPure": true,
+      "inventedNumbers": [],
+      "noNumber": true,
+      "lang": true,
+      "behaviorFails": [],
+      "behavior": true,
+      "sample": "先确立一条统一的审美基调（例如克制干净，或活泼鲜明），让配色、字体、间距与形状语言都服从这条基调；风格一致比单点炫技更决定整体“好看”。\n视觉层次要让人一眼分清主次：核心信息在大小、颜色与位置上明显突出，其余内容主动后退，避免所有元素音量相同、整体发糊。\n精致感来自细节的克制与一致：元素少而准、对齐与留白到位，比堆装饰",
+      "ms": 11966
+    },
+    {
+      "id": "creative",
+      "tier": "heavy",
+      "inputChars": 36,
+      "route": {
+        "provider": "deepseek-official",
+        "model": "deepseek-flash",
+        "reasoningEffort": "max"
+      },
+      "revision": "scaffold-directions-1",
+      "usage": {
+        "inputTokens": 235,
+        "outputTokens": 1963,
+        "cacheReadTokens": 896,
+        "cacheWriteTokens": 0,
+        "totalTokens": 3094
+      },
+      "finish": "stop",
+      "protocol": true,
+      "warnings": [],
+      "counts": {
+        "add": 10,
+        "scaffold": 6,
+        "ask": 2
+      },
+      "packetChars": 1125,
+      "sections": true,
+      "budget": true,
+      "askPure": true,
+      "inventedNumbers": [],
+      "noNumber": true,
+      "lang": true,
+      "behaviorFails": [],
+      "behavior": true,
+      "sample": "整片视觉语言收束在一个主导色域，关键节点才让一个冲突色闯入；夸张要来自色彩关系的大胆与纯粹，而不是特效种类的堆叠。\n“你自己”的具象化要避开机器人、光球、人形剪影这类通用符号，确立一个能从极小尺度一路延续到超大尺度的形态母题，让观众在剧烈变化中始终认得出是同一个“我”。\n宏大要靠尺度对比与留白建立：巨大的结构、空旷的场",
+      "ms": 15652
+    },
+    {
+      "id": "engineering",
+      "tier": "standard",
+      "inputChars": 35,
+      "route": {
+        "provider": "deepseek-official",
+        "model": "deepseek-flash",
+        "reasoningEffort": "max"
+      },
+      "revision": "scaffold-directions-1",
+      "usage": {
+        "inputTokens": 210,
+        "outputTokens": 2904,
+        "cacheReadTokens": 896,
+        "cacheWriteTokens": 0,
+        "totalTokens": 4010
+      },
+      "finish": "stop",
+      "protocol": true,
+      "warnings": [],
+      "counts": {
+        "add": 8,
+        "scaffold": 4,
+        "ask": 2
+      },
+      "packetChars": 970,
+      "sections": true,
+      "budget": true,
+      "askPure": true,
+      "inventedNumbers": [],
+      "noNumber": true,
+      "lang": true,
+      "behaviorFails": [],
+      "behavior": true,
+      "sample": "两段要连续又一眼可辨：上弦段像结构被拉紧储能，甩出段像释放后的惯性运动，切换时有明确的“咬合/脱扣”瞬间，而不是靠文字说明阶段。\n力度反馈应由同一股“力”驱动阻力、形变、光影、拖尾与声音或触觉，各通道同步变化，避免视觉很猛但手感轻飘。\n把边界与失败态设计完整：拉到极限的受阻、越界回弹、中途取消、反向拖拽与快速重抓都要有",
+      "ms": 22361
+    },
+    {
+      "id": "meta",
+      "tier": "standard",
+      "inputChars": 2,
+      "route": {
+        "provider": "deepseek-official",
+        "model": "deepseek-flash",
+        "reasoningEffort": "max"
+      },
+      "revision": "scaffold-directions-1",
+      "usage": {
+        "inputTokens": 185,
+        "outputTokens": 340,
+        "cacheReadTokens": 896,
+        "cacheWriteTokens": 0,
+        "totalTokens": 1421
+      },
+      "finish": "stop",
+      "protocol": true,
+      "warnings": [],
+      "counts": {
+        "add": 0,
+        "scaffold": 0,
+        "ask": 1
+      },
+      "packetChars": 236,
+      "sections": false,
+      "budget": true,
+      "askPure": true,
+      "inventedNumbers": [],
+      "noNumber": true,
+      "lang": false,
+      "behaviorFails": [],
+      "behavior": true,
+      "sample": "",
+      "ms": 3209
+    }
+  ]
+}

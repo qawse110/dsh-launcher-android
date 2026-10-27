@@ -8,16 +8,16 @@
  * 模型列表：静态默认（对齐 /v3/config craft agent models）+ 登录后的动态拉取
  */
 import { attributionHeaders, CONTEXT_WINDOW_EXCEEDED_CODE, isContextWindowExceededError, LlmAdapter, LlmError, ReasoningEffortId, } from '@deepseek-ai/dsh-llm';
-import { createModelCatalog } from './model-catalog.js';
+import { createModelCatalog, isCatalogFreshFor } from './model-catalog.js';
 import { RemoteCatalogGate } from './remote-catalog-gate.js';
 import { broadcastCatalogChanged } from './catalog-broadcast.js';
-import { RATE_LIMIT_FALLBACK_MS, isModelSaturationError, isRateLimited, parseRateLimitError, } from './llm-adapter.js';
+import { RATE_LIMIT_FALLBACK_MS, creditExhaustedResetAtMs, explicitRateResetAtMs, isCreditExhausted, isModelSaturationError, isRateLimited, parseRateLimitError, } from './llm-adapter.js';
 import { ToolCallId } from '@deepseek-ai/dsh-llm';
 import { HTTP_HEADER_DOMAIN, HTTP_HEADER_PRODUCT, HTTP_HEADER_PRODUCT_CODE, credentialExpiresAtMs, formatCreditsRate, } from './buddy.js';
 import { CODEBUDDY, resolveUserAgent } from './product.js';
 import { normalizeHarnessMessages } from './message-shape.js';
 import { projectRequestImage } from './image-budget.js';
-import { createBlankReasoningSuppressor, createDsmlMarkerNormalizer, createReasoningLoopDetector, fixDsmlMarkers, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js';
+import { createBlankReasoningSuppressor, createDsmlMarkerNormalizer, createReasoningLoopDetector, fixDsmlMarkers, hasUsableToolName, classifyToolArguments, toolArgsInvalidBlocks, toolArgsInvalidIsSoleOutput, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled, toolArgsInvalidFailure } from './sse.js';
 import { registerAdapterIdempotent, } from './llm-register-compat.js';
 import { reportLedgerAccount } from './token-ledger.js';
 import { planSessionTitleThinking } from './session-title.js';
@@ -28,6 +28,14 @@ import { planSessionTitleThinking } from './session-title.js';
 // （400/11128），而「排查这个风控问题的会话」必然会把那句复述进正文 ——
 // 只在网关补 = 换一个入口又被拦。依据见那个文件的头。
 import { rewriteTencentContentFingerprints } from './openai-gateway/tencent-fingerprint.js';
+// ⚠️ `detail` 那条腿**只留一份实现**（`openai-compat.ts`）：本仓库 6 份同义的
+// `errorDetail` 各写一条判据必然漂移（IKLBSH A1）。
+import { detailFieldText, TOOL_RESULT_IMAGE_TEXT } from './openai-compat.js';
+// ⚠️ 原生搜索的错误码与错误类型从**契约文件**取（`native-search-contract.ts`）：
+//    取数虽已下沉到本适配器，但「同一种失败在任何渠道报同一个码」这条不能破 ——
+//    否则排查时会把「无账号」误判成「上游故障」。
+//    契约单独成文件是为了避免「渠道层 import 工具层」的反向依赖。
+import { classifyNativeAbort, NativeSearchCodes, WebNativeError } from './native-search-contract.js';
 /**
  * CodeBuddy（中国版）的 chat completions 基址。
  *
@@ -191,8 +199,6 @@ function contentToText(content) {
  * `provider` 形参就是为它加的：本函数服务 `buddy` / `workbuddy` 两个产品，
  * 而这个函数**自己**该只对腾讯系生效 —— 非腾讯系必须逐字节不变。
  */
-/** 工具结果内嵌图片的载体文本（与官方 deepseek 适配器同名同义）。 */
-const TOOL_RESULT_IMAGE_TEXT = 'Attached image(s) from tool result:';
 /**
  * 「wire 首条不是 system」时补在首位的最小 system 文本。
  *
@@ -211,15 +217,50 @@ function serializeMessages(messages, imageUrls, provider) {
     const wire = [];
     // 工具结果内嵌图片（read_image 等）不能并入 `role:'tool'` 消息：OpenAI 兼容
     // 协议要求每条 tool 消息紧跟其 assistant tool_call，中间插入任何消息都会 400。
-    // 故与官方 deepseek 适配器一致：挂起到其后的独立 user 消息统一发出。
+    // 但**也不能单独成一条 user 消息**（Issue IKLIFH，见 flushToolImages 的实测表）
+    // ⇒ 挂起，等下一条 user 消息把它「搭车」带走。
     let pendingToolImages = [];
-    const flushToolImages = () => {
-        if (pendingToolImages.length === 0)
+    // 含工具结果而被延后的那条 user 消息的内容（排在 `role:'tool'` 之后发出）。
+    let pendingOwnParts;
+    /**
+     * 发出挂起的工具结果图片 + 延后正文；`own` 是**同一轮要发的那条 user 消息**。
+     *
+     * ⚠️⚠️ **图片必须与提问同在一条 user 消息里**
+     * （Issue IKLIFH，真实报障「codebuddy hy4 不支持识别图片」）。
+     *
+     * 实测（2026-10-14，直连 `copilot.tencent.com`，hy4-preview，同一张
+     * 1024x768 双色图，问「左右分别什么颜色」）：
+     *
+     * | wire 形态                                     | 上游行为           |
+     * |-----------------------------------------------|--------------------|
+     * | 图与提问**同一条** user                        | ✅ 「左白右蓝」    |
+     * | 图与提问**同一条**，且前面已存在 tool 消息     | ✅ 「左白右蓝」    |
+     * | 图单独一条 user（有提示句），问在下一条       | ❌ 「图像已被过滤」|
+     * | 图单独一条 user（**无**提示句），问在下一条   | ❌ 「不支持图片识别」|
+     * | 图并入 `role:'tool'` 消息本身                 | ❌ 「不支持读取图片」|
+     *
+     * ⇒ 触发条件是**图片与提问不在同一条 user 消息**；与提示句无关，也与 hy4 无关
+     * （同一张图换 `deepseek-v4-flash` 同样答「已被过滤」，而它远端同样是
+     * `supportsImages: true`）。
+     *
+     * ⚠️ 症状极具误导性：wire 上**确实有图**（抓包可见 `image_url` data URL）、
+     * 上游也**不报错**（HTTP 200 + 正常流），只是模型**看不见**并自称
+     * 「当前模型不支持图片输入」⇒ 用户会误判成模型能力问题、反复换模型。
+     *
+     * ⚠️ `own === undefined`（assistant / system / 历史末尾三处）时**只在有挂图
+     * 或有延后正文时才发**：无内容却凭空造一条消息，纯文本会话会因此被上游 400
+     * （反向验证实测）。
+     */
+    const flushToolImages = (own) => {
+        const ownParts = own ?? [];
+        const hasImages = pendingToolImages.length > 0;
+        if (!hasImages && ownParts.length === 0)
             return;
-        wire.push({
-            role: 'user',
-            content: [{ type: 'text', text: TOOL_RESULT_IMAGE_TEXT }, ...pendingToolImages],
-        });
+        // 图与提问**同条**。顺序取「图在前、own 的文本在后」——两种顺序实测都能被
+        // 看到，前者与 harness 原生序列化（`requestImageHandleText` + image）一致。
+        const ownImages = ownParts.filter((part) => part.type !== 'text');
+        const ownText = ownParts.filter((part) => part.type === 'text');
+        wire.push({ role: 'user', content: [...pendingToolImages, ...ownImages, ...ownText] });
         pendingToolImages = [];
     };
     // ── 孤儿工具调用清理（会话续命的关键）──
@@ -268,8 +309,10 @@ function serializeMessages(messages, imageUrls, provider) {
             // 故下面两条**刻意不**改写（改了既换不来放行，又破坏回读证据）。
             const text = rewriteTencentContentFingerprints(contentToText(content), provider);
             // 挂起的工具结果图片必须在 assistant 之前发出（对齐官方适配器）：
-            // 否则它们会漂到这条 assistant 之后，与产生它们的工具调用脱节。
-            flushToolImages();
+            // 否则它们会漂到这条 assistant 之后，与产生它的 tool_call 脱节。
+            // ⚠️ 延后正文一并带上（它已无处可去），否则会被下一条 user 消息吞掉。
+            flushToolImages(pendingOwnParts);
+            pendingOwnParts = undefined;
             wire.push({
                 role: 'assistant',
                 // 正文为空且有工具调用时 content 必须为 null（对齐 openai_chat.rs）。
@@ -280,7 +323,8 @@ function serializeMessages(messages, imageUrls, provider) {
             continue;
         }
         if (message.role === 'system') {
-            flushToolImages();
+            flushToolImages(pendingOwnParts);
+            pendingOwnParts = undefined;
             // system 是这条风控的**已知**位置（IKJNA1），与网关路径同一判据、同一份表。
             wire.push({ role: 'system', content: rewriteTencentContentFingerprints(contentToText(message.content), provider) });
             continue;
@@ -303,13 +347,68 @@ function serializeMessages(messages, imageUrls, provider) {
         const parts = regularImageUrls === undefined
             ? undefined
             : userContentParts(regular, regularImageUrls);
-        if (parts !== undefined) {
-            flushToolImages();
-            wire.push({ role: 'user', content: parts });
+        // ⚠️⚠️ **两条互斥分支**（Issue IKLIFH 的落点）：
+        //
+        // | 本条形态                | 处置                                                  |
+        // |------------------------|-------------------------------------------------------|
+        // | 无工具结果              | **立刻**发出，并把挂起的工具结果图片**搭车**并入本条   |
+        // | 含工具结果（deferred）  | 本条内容也留到**下一条** user 消息，与挂图合并发出     |
+        //
+        // ⚠️ 「搭车」是本 issue 的正题：图若单独成一条 user 消息，上游就让模型
+        // 「看不见」（实测 hy4-preview 与 deepseek-v4-flash 均答「图像已被过滤」，
+        // 而两者远端都是 `supportsImages: true`）。明细见 flushToolImages 的表。
+        //
+        // ⚠️⚠️ **延后判据必须看「有没有挂图」，不能只看「本条有没有工具结果」**
+        // （2026-10-14 修复）。原实现 `const deferred = toolResults.length > 0`
+        // 在「tool 结果 → 一条无工具结果的 user（『好的』）→ 真正的提问」这一
+        // 真实序列上判错：那中间条把 `pendingToolImages` 与 `pendingOwnParts`
+        // **一起 flush 掉并单独发出**，真正的提问随后成了**纯字符串** user 消息
+        // ⇒ 图与问重新分处两条，**恰好复现 IKLIFH 本次要消灭的形态**。
+        //
+        // 触发前提：工具结果后跟**多于一条** user 消息。实测 wire（hy4-preview）：
+        //   修复前 [3]=user `image_url+text(好的)`、[4]=user `"这页写了什么？"`
+        //   修复后 [3]=user `image_url+text(好的)+text(这页写了什么？)`（同一条）
+        //
+        // ⚠️ 含工具结果时**整条延后**这条不变：OpenAI 兼容协议要求 tool 消息**紧跟**
+        // 其 assistant `tool_calls`，中间插任何 user 消息都会 400（trae 上游对应
+        // `code=4027`，回归见 `trae-adapter.spec.ts`）。与 trae 的 `deferred` 同型。
+        //
+        // ⚠️ 「有挂图」还必须覆盖「历史上一条延后的正文」：那种情况下
+        // `pendingOwnParts` 非空而 `pendingToolImages` 已空，若只看后者就会把
+        // 正文提前发出、同样与后续提问分处两条。
+        const deferred = toolResults.length > 0
+            || pendingToolImages.length > 0
+            || pendingOwnParts !== undefined;
+        // ⚠️ 本条同时是上一条延后内容的「搭车机会」：`pendingOwnParts` 里的正文
+        // 必须与本条内容、挂起图片**一起**发出一条，否则那份正文与提问分处两条。
+        //
+        // ⚠️⚠️ **无挂图时必须保持「字符串」形态**（旧行为逐字节不变）：纯文本若被
+        // 包装成 `[{type:'text',…}]` 发出去，上游会以 `model_param_invalid` 400
+        // 拒收整个请求（实测）。故这里只在**确实有挂图**或本条本身有图时才用
+        // parts，纯文本一律传 `undefined` 走字符串分支。
+        //
+        // ⚠️ 三个条件缺一不可（2026-10-14）：前两个覆盖「图还在排队」，
+        // **第三个覆盖「图已随上一条发出、但还有正文没走」** —— 那种情况下
+        // `pendingOwnParts` 非空而 `pendingToolImages` 已空，只看前两个会让本条
+        // 正文被提前单独发出、同样与提问分处两条。
+        const combined = pendingToolImages.length > 0 || parts !== undefined || pendingOwnParts !== undefined
+            ? [
+                ...(pendingOwnParts ?? []),
+                ...(parts ?? (text.length > 0 ? [{ type: 'text', text }] : [])),
+            ]
+            : undefined;
+        pendingOwnParts = undefined;
+        if (deferred) {
+            // ⚠️ `combined` 已含本条内容，直接沿用即可；仅当它是 undefined 而本条有
+            // 正文时（无图、无上一条延后内容）才需要把本条正文兜进来。
+            pendingOwnParts = combined ?? (text.length > 0 ? [{ type: 'text', text }] : undefined);
         }
-        else if (text.length > 0 || toolResults.length === 0) {
-            flushToolImages();
-            wire.push({ role: 'user', content: text });
+        else if (combined !== undefined || toolResults.length === 0) {
+            // ⚠️ 核心修复：挂起图片与本条内容**同一条**发出，而非让图片单独成一条。
+            flushToolImages(combined);
+            // 纯文本（无挂图无图）：与旧行为一致，发**字符串** content。
+            if (combined === undefined)
+                wire.push({ role: 'user', content: text });
         }
         for (const result of toolResults) {
             // 丢弃孤儿工具结果：没有对应 assistant tool_call 其结果同样会让后端 400。
@@ -327,8 +426,14 @@ function serializeMessages(messages, imageUrls, provider) {
                         .filter((part) => part.type === 'text')
                         .map((part) => String(part.text))
                         .join('');
-                    if (joined.length > 0)
-                        resultText = joined;
+                    // ⚠️⚠️ **有图无文时绝不能落到 `(no output)`**（Issue IKLSB8，与
+                    // `openai-compat.ts` 同一处同义修复）。`resultParts !== undefined`
+                    // 的含义是「该工具结果里有内容」，只是内容**不是文本**；原先只在
+                    // `joined` 非空时改写 `resultText`，纯图片型工具结果于是保留初值
+                    // `(no output)` ⇒ 模型答「Read 没有返回内容」，用户误判成模型没有
+                    // 视觉能力。判据用 `resultParts !== undefined`（**有内容**）而不是
+                    // 「有图」：`[image unavailable]` 占位符也走这条腿，它同样不是没有输出。
+                    resultText = joined.length > 0 ? joined : TOOL_RESULT_IMAGE_TEXT;
                 }
                 else {
                     resultText = contentToText(result.content) || '(no output)';
@@ -343,8 +448,22 @@ function serializeMessages(messages, imageUrls, provider) {
                 content: resultText,
             });
         }
+        // ⚠️⚠️ **这里刻意不 flush**（Issue IKLIFH 的关键时序）：
+        // 本条 user 消息的内容与刚入队的工具结果图片，**都留到下一条 user 消息**
+        // 一起发出 —— 只有那样图片才与提问同在一条消息里。
+        //
+        // 若在本条末尾就 flush，图片此刻刚由上面的 `pendingToolImages.push` 入队，
+        // 会**单独成一条** user 消息紧随 tool 之后，而提问在再下一条 ⇒ 复现 IKLIFH
+        // （实测：hy4-preview 与 deepseek-v4-flash 均答「图像已被过滤」，而两者
+        // 远端都是 `supportsImages: true`）。明细见 flushToolImages 的表。
+        //
+        // `pendingOwnParts` 与 `pendingToolImages` 都留在队列里，由下一条 user
+        // 消息的 `flushToolImages(own)` 合并发出；历史末尾则由下面的兜底处理。
     }
-    flushToolImages();
+    // 历史末尾的残留（工具结果之后没有再跟任何 user 消息）：图片与延后正文**必须
+    // 同一条**发出，否则上游看不见（Issue IKLIFH）。
+    flushToolImages(pendingOwnParts);
+    pendingOwnParts = undefined;
     return wire;
 }
 /** 安全读取 Error.message。 */
@@ -357,6 +476,15 @@ function errorMessage(error) {
     catch {
         return 'unknown error';
     }
+}
+/**
+ * 把未知值收敛成记录；非对象（含 `null`）返回 `undefined`。
+ *
+ * ⚠️ 与「返回 `{}`」不同：原生搜索的逐项过滤需要区分「不是对象」（丢弃）
+ * 与「是空对象」。搬自 `web-native.ts`（2026-10-14 架构改造）。
+ */
+function asRecord(value) {
+    return typeof value === 'object' && value !== null ? value : undefined;
 }
 /**
  * 腾讯侧**安全策略拦截**（业务码 11140）判定。
@@ -382,13 +510,613 @@ function errorMessage(error) {
  *
  * 判据用三个独立信号（任一命中即可）：业务码、`msg` 措辞、`displayMsg` 文案。
  * 只看状态码无法区分 —— 403 同时覆盖「真认证失败 / 额度 / 权限 / 安全策略」。
+ *
+ * ⚠️⚠️ **第二腿 `/request illegal/` 与 11128 渠道校验是同一句 msg**（2026-10-17 实测）
+ *
+ * `msg:"request illegal"` 并不是 11140 独占的措辞：`11128` 的「渠道校验」子原因
+ * **实测也用这一句**（同端点、同一天、两个账号上稳定复现，且那一句在本机从未
+ * 以 `conversation id missing` 的形态出现）。两者的处置**完全不同**：
+ *
+ * | | 11140（本档） | 11128 渠道校验 |
+ * |---|---|---|
+ * | 换个请求形态能否绕过 | ❌ 不能 | ✅ **能**（带上三枚 Conv 头即 200） |
+ * | 换号是否有效 | ✅ | ✅ |
+ * | 写 30 分钟冷却 | ✅ | ❌ **不可**（会把可用账号凭空封禁） |
+ *
+ * ⇒ 本档**必须先排除**渠道校验形态，否则：一份「带三头就能用」的报文会被判成
+ * 账号级拦截 → 换号 + 写 30 分钟冷却 + 出口文案建议用户**停用该账号** ——
+ * 而用户停用后少了账号，整条渠道更不可用。这是 IKM7SG 复验实测到的生产缺陷。
+ *
+ * ⚠️⚠️ **排除必须施加到「全部」可能命中渠道校验报文的腿，不止中间那条**（P0，
+ * 2026-10-17 对抗审计证伪）。第一版只给 `/request illegal/i` 那条加了排除，
+ * 于是下面这条仍然认领渠道校验报文：
+ * ```json
+ * {"code":11128,"msg":"request illegal","requestId":"…",
+ *  "displayMsg":{"en":"The content did not pass the safety review. Please retry."}}
+ * ```
+ * ⚠️ **这不是假想形态**：`displayMsg.en` 那句`The content did not pass the
+ * safety review.` 正是**本文件上方**记录的 11140 真报文措辞（zh=「内容未通过安全审核」），
+ * 而 11128 各子原因**共用/漂移 `displayMsg`** 本仓已有先例（见
+ * `tests/unit/buddy-adapter.spec.ts`「内容级风控」组里那条断言）⇒ 上游哪天把
+ * 渠道校验的 `displayMsg` 改成这句，缺陷原样复现。
+ * 实测（审计沙盒 + 本仓自查复现）：该报文三条腿里**命中的是第三条** ⇒ 落 11140 档
+ * ⇒ 写 30 分钟冷却 ⇒ 出口文案「全部账号均被服务端安全策略拦截…请停用被拦账号」。
+ * ⇒ **两条腿都必须排除**（下方实现用一次早退覆盖全部）。真实 11140 报文**仍被
+ * 全部三条腿命中**，未被削弱（审计实测 + 本仓回归用例各锁一遍）。
+ *
+ * ## ⚠️⚠️⚠️ 那个 P0 只修了一半：早退排除**只覆盖腿③**（2026-10-18 审计实测，本轮修）
+ *
+ * 排除用的判据是 `isChannelVerificationIllegalBody`，它只认 `code==11128` 且
+ * `msg` 含 `request illegal`。而渠道校验档**带 `msg` 措辞**的形态有**两种**：
+ * 腿① 认的 **`conversation id missing`**（**IKM7SG 原文措辞**，报障者两次独立
+ * 取证都拿到过它），**完全没被排除**。
+ *
+ * 触发形态（真实可达 —— 仓库自己就是证据）：
+ * ```json
+ * {"code":11128,"msg":"conversation id missing",
+ *  "displayMsg":{"zh":"内容未通过安全审核，请调整后重试。"}}
+ * ```
+ * `displayMsg.zh` 那句正是**本文件上方记录的 11140 真报文**（L623-625），
+ * 而「11128 各子原因共用/漂移 `displayMsg`」本仓**已有先例**（腿③ 的注释就把它
+ * 列为可达形态）⇒ 不是假想报文。
+ *
+ * | | 修复前 | 现版 |
+ * |---|---|---|
+ * | 归属 | 落 11140 档 | 落渠道校验档 |
+ * | 处置 | 换号 + **写 30 分钟账号冷却** | 换号、**不写冷却** |
+ * | 出口文案 | 「…请停用或更换被拦账号」 | 「未通过渠道校验…重发无效」 |
+ *
+ * 症状与本档注释明确写「**不可**」写账号级冷却的那件事逐字相同：可用账号被凭空
+ * 封 30 分钟、UI 显示「限额重置」、并建议用户停用它 —— 而该账号带上三头立刻 200。
+ *
+ * ⚠️ **为什么第一版的守卫抓不到**：那批夹具的 `msg` 全是 `request illegal`
+ * （腿③）⇒ 早退排除生效 ⇒ 腿①形态**完全不在观测范围内**。必须另造腿①夹具
+ * （见 `tests/unit/buddy-adapter.spec.ts` 的「P0 复发」组）。
+ *
+ * ⚠️⚠️ 修法**必须**保持「code 精确等于 11128」这道闸门，**不得**简写成
+ * `CHANNEL_VERIFICATION_MSG_FIELD.test(body)` —— 那条腿**不带 code 判据**
+ * （它要覆盖的正是「报文里带 `conversation id missing` 的一切形态」），
+ * 若单独拿它排除，`{"code":11140,"msg":"conversation id missing"}` 会被
+ * 放行 ⇒ 真 11140 反被剥掉冷却 ⇒ 每轮重撞同一坏账号（本组有反向守卫锁这一格）。
+ *
+ * ## ⚠️⚠️ 覆盖范围**不是**「全部三条腿」（2026-10-18 对抗审计纠正我的一处注释撒谎）
+ *
+ * 精确表述是：**覆盖渠道校验档全部「带 `msg`/`message` 措辞」的形态**
+ * —— 即腿①（结构化值位）与腿③（`request illegal`）。
+ *
+ * ⚠️ **腿②（`CHANNEL_VERIFICATION_BARE`，HTML / 纯文本裸子串兜底）结构上
+ * **不可**被本排除覆盖**：它锚的是「压根不是结构化报文」，**没有 `code` 键**
+ * ⇒ `ILLEGAL_CODE` 恒 false。而排除**必须**锚 `code`（见上：否则真 11140 被剥冷却）
+ * ⇒ 二者不可兼得。
+ * ⇒ 后果（**预先存在**，非本轮引入）：`<html>… conversation id missing …
+ * 内容未通过安全审核 …</html>` + HTTP 400 仍落 11140 档、写 30 分钟冷却。
+ * ⚠️ 该形态无实测可达性（真实错误体是 JSON 对象），故**如实登记、不修** ——
+ * 修它只能把排除改成「不锚 code」，而那会引入上面那条更严重的假阴性。
+ * ⚠️ 原注释写「全部三条腿」是**字面错误**（下一个审计会拿它当契约），本轮已更正。
  */
 function isContentRejection(body) {
     if (body.length === 0)
         return false;
+    // ⚠️ 先把渠道校验形态摘出来，下面三条腿共用它 —— 「排除一次、三条腿都干净」
+    // 比在每条腿里各写一遍判据更难漂移（少写一处就是本节记的那个 P0）。
+    //
+    // ⚠️⚠️ 排除必须覆盖渠道校验档**所有「带 msg 措辞」的形态**（2026-10-18 审计实测）：
+    // 只调 `isChannelVerificationIllegalBody` 会漏掉**腿①** 的
+    // `conversation id missing` 形态（**IKM7SG 原文措辞**）⇒ 那份报文只要
+    // `displayMsg` 漂成 11140 的安全审核措辞（本仓记录的 11140 真报文原句，
+    // 且「11128 各子原因共用/漂移 displayMsg」已有先例），就落进 11140 档 ⇒
+    // 换号 + **写 30 分钟账号冷却** ⇒ 可用账号被凭空封禁。
+    // ⚠️ 腿②（裸子串兜底）**刻意不覆盖**，理由见本函数文档注释的「覆盖范围」一节。
+    if (isChannelVerificationBody(body))
+        return false;
+    // ⚠️⚠️ 内容级 `Illegal API invocation…`（IKLYCT）**同样必须早退**，理由与证据见
+    // {@link CONTENT_BLOCKED_MSG} 的注释：`11128` 各子原因共用/漂移 `displayMsg`，
+    // 上游一漂成安全审核措辞，腿③ 就会把「换句即通」的内容级拦截误判成账号级 ⇒
+    // 烧完整池 + 锁 30 分钟。
+    // ⚠️⚠️ **与上面那条排除是两个独立子原因、共用同一个 `code`**：渠道校验
+    // （`request illegal` / `conversation id missing`）**按账号**生效、该换号；
+    // 内容级（`Illegal API invocation…`）**换句即通**，换号与冷却**全是误伤**
+    // ⇒ **两条排除各管一个，少一条即复发**（本轮两条都在）。
+    if (isContentBlockedIllegalBody(body))
+        return false;
     return /"code"\s*:\s*11140/.test(body)
         || /request illegal/i.test(body)
         || /安全审核|safety review/i.test(body);
+}
+/**
+ * ★★ 「渠道校验」拒绝：`11128`，**按账号生效**（2026-10-16 实测，2026-10-17 复验）。
+ *
+ * ## ⚠️⚠️ `msg` 有**两种**实测形态，判据必须**都**认（2026-10-17 真机复验）
+ *
+ * | 形态 | 出处 |
+ * |---|---|
+ * | `conversation id missing` | IKM7SG 记录；本机**从未复现**（5 账号 × 数十次零命中） |
+ * | **`request illegal`** | **本机实测稳定拿到**（两个不同账号、跨多次、逐字稳定） |
+ *
+ * ⚠️ **只认前者会让真实报文整条链路走错档** —— 实测后果：
+ * `isChannelVerificationRejection` 恒不命中 ⇒ 落进 `isContentRejection` 的
+ * `/request illegal/i` 腿（11140 档）⇒ 换号 + **写 30 分钟冷却** + 出口建议
+ * 用户「停用该账号」—— 而该账号**带上三头立刻 200**，正是本档明确写「不可写冷却」
+ * 的那一档。
+ *
+ * ⚠️⚠️ 而 `request illegal` **与 11140 共用**（11140 实测就是这句）⇒ 本档与
+ * `isContentRejection` **必须同时**按 `code` 精确值收窄，只改一侧都无效。
+ * 详见 `isChannelVerificationIllegalBody` 与本文件末尾的变异验证记录。
+ *
+ * ## 为什么必须与 `isContentRejection` 分开
+ *
+ * 两者**共用同一个业务码 `11128`**（前者）或相邻码（11140），但成因与处置都不同：
+ *
+ * | | `isContentRejection`（11140 系） | 本档（11128 渠道校验） |
+ * |---|---|---|
+ * | 成因 | 账号级安全策略拦截 | 网关对**特定账号**的渠道校验 |
+ * | 换个请求形态能否绕过 | ❌ 不能 | ✅ **能**（带上三枚 Conv 头即 200） |
+ * | 换号 | ✅（唯一出路） | ✅（唯一出路） |
+ * | 写 30 分钟冷却 | ✅ 否则每轮重撞 | ❌ **不可**（见下） |
+ *
+ * ⚠️ 判据**看的是这句 `msg` 的文本 + `code` 精确值**，绝不能只看 `code === 11128`
+ * —— 同码至少四族子原因（渠道级 / 消息形状级 / 内容指纹级 / 本档），`msg` 各不相同，
+ * 处置也不同。放宽成按 code 会把 `Illegal API invocation from an unapproved channel`
+ * （由腾讯指纹改写链路处理、与账号轮换无关）也拖进换号，属误伤。
+ * ⚠️ 但「看 msg」不等于「要求完整 JSON 片段」：见下方判据体内的书写变体表。
+ *
+ * ## ⚠️ 为什么不写账号冷却（与 11140 的关键差异）—— 依据已被 IKM7SG **复核**
+ *
+ * IKM7SG 实测（在「要求三头」那个账号上）：**带三头 → 200；紧接无头 → 400；
+ * 再带 → 200** ⇒ 判据是**逐请求**的（**非账号封禁、非状态粘性**）。
+ * ⇒ 该账号**并非坏账号**，只是要求「三枚 Conv 头同时存在且非空」，而本实现
+ * **本来就发**这三枚 ⇒ 请求形态凑齐即立刻可用。若照抄 11140 的
+ * `markPolicyBlockedAccount`，会把一个**可用**的账号封 30 分钟，且 UI 会把它
+ * 显示成「限额重置」——完全误导。故本档**只换号、不记冷却**。
+ *
+ * ⚠️ 该决定**不依赖**任何未结清的事实（`200→400→200` 来回可切是 IKM7SG 直接实测的），
+ * 且**账号级冷却的语义与「逐请求判定」直接冲突** —— 只要拒绝是逐请求的，就不该写。
+ *
+ * ⚠️ 原先那句「据 PR 作者的记录（**未独立复核**）」**已更正**：该记录现已被
+ * **独立复核**（复核者用本仓库自己的 e2e、只换 `WB_REF` 即复现分叉，见 IKM7SG）。
+ *
+ * ## ⚠️ 逐请求判定这条依据的**边界**（2026-10-17 对抗审计补登记）
+ *
+ * `200→400→200` 来回可切足以排除「**账号封禁**」，但**排除不了**
+ * 「**同一账号 + 同一个 Conv 头值重复使用**时被拒」这类**状态粘性** ——
+ * 实测每轮的 `200→400→200` 里，三枚头都是**新值**，从未复用过同一个值。
+ * ⇒ 本档「不写冷却」的结论**依赖**「每次 `send()` 都 `crypto.randomUUID()` 生成
+ * 新的三头」（见 `send()` 里那三行）。⚠️ **若有人改成会话级复用同一个 Conv 头值**，
+ * 该结论的前提就没了，而症状（每轮 400、换号也无益）**与账号封禁同形** ⇒
+ * 届时应重新评估本档，并补一组「同值连发 N 次」的 e2e 断言。
+ * 本轮**不**补该e2e：它是「上游行为」的未知面，且现状（逐请求换新值）恒不触发。
+ *
+ * ## ⚠️ 单账号 + **不注册 accountPool** + HTTP 400 时，本档**不生效**（既有旧洞）
+ *
+ * `stream()` 的 400 早退分支在**无账号池**时直接抛 `INVALID_REQUEST`
+ * （原始 detail 透传），既不换号也不给本档文案。实测（审计沙盒）：
+ * `INVALID_REQUEST` +「请求被拦截，请重新发送 request illegal」。
+ * ⚠️ **这不是本次修复引入的** —— master 的 `conversation id missing` 同形态**同样**
+ * 如此（那是上游在无池时唯一的文案）；有池时（本插件的正常形态）走换号循环，
+ * 本档生效。故**如实登记、不在本 PR 修**：修它要改的是 400 早退分支的整体口径，
+ * 超出本 PR 范围，且「无池」是插件正常用法之外的形态。
+ *
+ * ⚠️ **2026-10-18 独立审计补一层**：那条路径走的是 `errorDetail(body)` 而**不是**
+ * `channelVerificationUpstreamId(body)` ⇒ **`redactUpstreamActionHints` 的整套脱敏
+ * 在这里完全不生效** ⇒ 上游那句已被本档认定「诱导用户做无效动作」的
+ * 「请重新发送」会**原样**进用户可见文案。两种措辞均实测复现。
+ * 净效果 = 「用户被告知重发 + 重发确实无效 + 没有出路（无池可换）」。
+ * ⚠️ `INVALID_REQUEST` 不在客户端 `failureMessage` 的吞文案名单里 ⇒ message
+ * **不被吞**，用户确实看得到这句（与 IKLBSH 红线不同，属更轻的一档）。
+ * 仍**不修**：无池形态之外，且「有池时脱敏正常生效」已覆盖正常用法。
+ *
+ * ## ⚠️⚠️ 实测依据（**已按 IKM7SG 结清**：差的是**账号**，不是「互相否证」）
+ *
+ * 本档曾登记一处「证据等级冲突」：本档的逐账号对照 vs 同一提交内约 90 次复测的
+ * 「零次复现」。**IKM7SG 已把该冲突结清** —— 两者**都对**，差的是**账号**这个
+ * 控制变量：那批复测用的账号**不要求**三头（故 `conversation id missing` 零复现），
+ * 而 `66E05E7C` **要求**（故本档能稳定复现）。
+ *
+ * ⚠️ 原先写的「**至少有一份是错的**」「没有第三方独立复核」**均已作废** ——
+ * 复核已完成，且用的是**本仓库自己的 e2e**（`pnpm test:e2e:buddy-conv`）。
+ * 完整对照表与字段级穷举见本文件 `send()` 的 `X-Conversation-*` 注释。
+ *
+ * ⚠️ **仍未定论的部分**（别写成结论）：为什么**只有那个账号**要求三头、
+ * 生效范围会如何演进 —— IKM7SG 明确未定论（仅登记一条 n=1 的线索）。
+ *
+ * ## 本档的实测依据（同账号 / 同网络 / 同模型）
+ * - `66E05E7C` 不带三头：跨约 19 分钟共 10 次**全部 400**，`isRateLimited` 实测为 `false`；
+ * - `D87606B1` / `D3238B4E` 同样不带三头：**全部 200** ⇒ 该拒绝**按账号**生效；
+ * - 失败**只限聊天端点**（同刻 `/agenttool/v1/search` 200、`/v3/config` 200）；
+ * - `66E05E7C` 带上三头：立刻 200。
+ *
+ * ## ⚠️ 2026-10-17 独立复验（维护者本机，5 个 workbuddy 账号）
+ *
+ * 判据**完整复现**（三枚同值/异值/`abc-123` 全 200、空串 400、删任一枚 400、
+ * 补 `X-User-Id`/`X-Session-ID`/`X-Trace-Id`/`X-Request-Id` 全 400、
+ * `200→400→200` 逐请求可切、换 system 仍 400 ⇒ 内容无关），
+ * **按账号生效**复现为 **2/5**（两个受限账号、三个不受限）。
+ * ⚠️ 但 `msg` 复现成 **`request illegal`** 而非 `conversation id missing`
+ * —— 这正是上面新增腿③ 的由来，也是本档判据在 PR #104/#105 上恒不命中的原因。
+ * 完整报文、claim 对照、变异验证表见 `docs/agent-notes/providers-buddy.md`。
+ */
+/**
+ * 腿①：`msg` / `message` 键的**值**里含该句（容忍分词符与 JSON 转义）。
+ *
+ * ⚠️ `[^"]*` 只吃到该字符串值的闭合引号为止 —— 这正是「值里」的语义边界。
+ *
+ * ⚠️⚠️ 分隔符用 **`+`（至少一个）而不是 `*`**：`*` 允许**零个**分隔符，于是
+ * `conversationidmissing` 这类**粘连标识符**也会命中（2026-10-16 对抗性审计
+ * 实测：`conversationIdMissing` 这种 camelCase 键名/标识符同样命中）。
+ * 而 `conversationidmissing` 与上游那句错**不是同一件事**，误命中的代价是
+ * **白烧整池往返**。⇒ 语义是「分隔符**形式**可变，但必须**存在**」。
+ *
+ * ⚠️⚠️ 分隔符集合用 **Unicode 类别 `\p{Cf}` + `\s` + `:_-`**，**不枚举码点**：
+ * 本仓在「不可见字符」上已有一课（`docs/agent-notes/protocol-wire.md` 的网关通配
+ * 判据：枚举码点必漏 —— `Cf` 有 160+ 个，且 `\u034f` CGJ 是 `Mn` 不是 `Cf`）。
+ * 实测覆盖面（8 种不可见字符全部命中）：`U+200B` / `U+200C` / `U+200D` / `U+2060`
+ * / `U+FEFF` / `U+00AD`（软连字符）/ `U+180E`（蒙文元音分隔符）/ 多空格。
+ *
+ * ⚠️ `\\[nrt]` 是**转义序列本身**（真实 HTTP 报文体里换行是 `\n` 两个字符，
+ * 不是裸换行）—— 少了它，「上游把 msg 写成多行」就会漏认
+ * （2026-10-16 单测实测：这条腿是唯一能覆盖「上游 JSON 报文里改写换行」的写法）。
+ *
+ * ⚠️ 已知**不覆盖**（如实登记为残留缺口，不是遗漏）：纯中文措辞（「会话 id 缺失」）。
+ * 它需要新造一张中文同义词表，而**没有实测证据**表明上游会改说中文
+ *（真实报文实测为英文 `msg` + 中文 `displayMsg`）⇒ 不凭猜测扩容。
+ */
+const CHANNEL_VERIFICATION_MSG_FIELD = /"m(?:sg|essage)"\s*:\s*"[^"]*conversation(?:[\s:_\-\p{Cf}]|\\[nrt])+id(?:[\s:_\-\p{Cf}]|\\[nrt])+missing/iu;
+/** 腿②：无结构化字段时的裸子串腿（HTML / 纯文本网关页）。同理要求分隔符存在。 */
+const CHANNEL_VERIFICATION_BARE = /conversation(?:[\s:_\-\p{Cf}]|\\[nrt])+id(?:[\s:_\-\p{Cf}]|\\[nrt])+missing/iu;
+/**
+ * ⚠️⚠️ 腿③：**上游实际用的那句 `msg` 是 `request illegal`，不是 `conversation id missing`**。
+ *
+ * ## 为什么必须加这条腿（2026-10-17 真机复现，Gitee issue IKM7SG 复验）
+ *
+ * IKM7SG 记录的真实报文是 `{"code":11128,"msg":"conversation id missing",…}`，
+ * 而本机**独立复现**到的报文（两个不同账号、跨多次、逐字稳定）是：
+ *
+ * ```json
+ * {"code":11128,"msg":"request illegal","requestId":"…",
+ *  "displayMsg":{"en":"Request blocked. Please send it again","zh":"请求被拦截，请重新发送"},
+ *  "displayTips":{"en":"This call failed channel verification, possibly because it was not sent from an official client. …",
+ *                 "zh":"这次调用没通过渠道校验，可能不是官方客户端发出的。请用官方版本重新发送。"}}
+ * ```
+ *
+ * ⇒ **`conversation id missing` 这句在这台机器上从未出现过**（跨 5 账号 × 数十次
+ * 请求零命中）；本档腿①/腿② 对它**恒不命中**，于是这份报文整条链路走不进本档。
+ * 实测后果（生产链路，见 `docs/agent-notes/providers-buddy.md`）：
+ * | 环节 | 修复前 |
+ * |---|---|
+ * | 归属 | 落进 `isContentRejection`（它的 `/request illegal/i` 腿命中） |
+ * | 处置 | 当成 11140 账号级拦截 → 换号 + **写 30 分钟冷却** |
+ * | 出口文案 | 「全部账号均被服务端安全策略拦截…请在 Jet Hub 停用或更换被拦账号」 |
+ * 而该账号**带上三头立刻 200** ⇒ 正是本档注释里明确写「**不可**写冷却」的那一档。
+ * 症状与 PR #105 想避免的失败形态**逐字同形**（可用账号被凭空封 30 分钟、
+ * UI 显示「限额重置」、建议用户停用它），只是入口判据认错了报文。
+ *
+ * ## ⚠️⚠️⚠️ 为什么**不能**只按 `request illegal` 判（这是本条最易踩的坑）
+ *
+ * **`request illegal` 是 11140 与 11128 渠道校验「共用」的 msg** —— 本仓
+ * `isContentRejection` 的注释与全部单测都把它写成 11140 的报文（实测 11140 就是
+ * `{"code":11140,"msg":"request illegal"}`）。所以本条必须**同时**锚定：
+ *
+ * 1. `code` 键**存在**（结构化报文），且
+ * 2. 其值**精确等于 11128**（不是 11140、不是别的码）。
+ *
+ * ⚠️ 用 `/11128/` 子串匹配**不够**：裸子串会把 `111280` 这类码一起命中，而它们的
+ * 处置未知。⇒ 必须写**带右边界**的形式。
+ * ⚠️ 右边界是 `(?![\d.])`、**不是** `(?![0-9])`（2026-10-17 单测实测出的自引入缺陷）：
+ * JSON 允许非整数码，`JSON.stringify({code:11128.5})` 写出的是 `11128.5`，
+ * 而 `.` 不在 `[0-9]` 里 ⇒ 只挡数字的写法会**放行小数**并误命中。
+ * 实测：只挡数字时 `{"code":11128.5,"msg":"request illegal"}` 被判成渠道校验。
+ * ⇒ `.` 必须一并挡掉。
+ * ⚠️⚠️ **残留缺口（如实登记，不声称已挡）**（2026-10-17 常规审计实测）：
+ * 右边界只挡数字与小数点，**挡不住字母后缀与科学计数法**：
+ * | 报文 | 现状 | 说明 |
+ * |---|---|---|
+ * | `{"code":11128x}` | **命中** | `x` 不在 `[\d.]` 里 |
+ * | `{"code":11128e3}` | **命中** | 科学计数法；`e3` 不在 `[\d.]` 里 |
+ * | `{"code":11128e0}` | **命中** | 等价于 `11128` |
+ * | `{"code":111280}` / `{"code":11128.5}` | ✅ 已挡 | |
+ * | `{"code":1.1128e4}` | ✅ 已挡（无 `11128` 字面） | |
+ * ⚠️ 收紧到 `(?![\w.])` 可挡掉这些，但会一并挡掉**合法**的 `11128` 后接引号/逗号
+ * 之类边界 —— 实测 `\w` 已含数字与下划线，故 `(?![\w.])` 与 `(?![\d.])` 在真实报文
+ * 上**等价**，收益仅在字母后缀那几格。⚠️ **当前不收紧**：腾讯侧 `code` 是**业务整数码**
+ * （实测恒为 `11128`/`11140` 五位整数），这些形态**不会从上游出现**；而收紧会
+ * 引入「`code` 后紧跟一个字母标识符」这类**假想报文**上的新差异，收益不足。
+ * ⚠️ 若将来上游真的下发非整数 `code`，本条须重新评估（先看它到底想表达什么）。
+ * ⚠️ 也不写 `code` 腿的「存在性」判断就够了：只判「有 code 键」会把
+ * `{"code":11140,"msg":"request illegal"}` 一起吃掉 ⇒ 那正是 11140，必须放行。
+ *
+ * ## ⚠️ 为什么**不**用 `displayTips` 的「渠道校验 / channel verification」作判据
+ *
+ *  tempting 的做法是认那句提示，因为它字面就是「渠道校验」。**实测它不可用**：
+ * 11128 的**各个子原因共用逐字相同的 `displayTips`**（本机同时抓到
+ * `msg:"request illegal"` 与 `msg:"Illegal API invocation from an unapproved channel"`
+ * 两份报文，二者的 `displayTips` **逐字节相同**），且它与本仓库测试夹具里
+ * 11140 族那句「安全策略拦截 / blocked by security policy」也高度相近。
+ * ⇒ 用它会把**内容级**的 `Illegal API invocation…` 也拖进换号，
+ * 而那一句换号**完全无效**（由腾讯指纹改写链路处理、每个账号都会被拦在同一句上），
+ * 后果是整池被白烧 —— 与隔壁 describe 锁死的「别族不换号」直接冲突。
+ *
+ * ⇒ 判据只锚 `code` + `msg` 两处**都在结构化字段里**，不扫任何提示文案。
+ *
+ * ## ⚠️⚠️ **两个条件必须彼此独立，不许用 `[^{}]*` 串起来**（P1，2026-10-17 对抗审计）
+ *
+ * 初版写成 `/"code"\s*:\s*11128(?![\d.])[^{}]*"m(?:sg|essage)"\s*:…/`
+ * —— 两个条件之间夹了 `[^{}]*`，于是**引入了 JSON 字段顺序依赖**，实测三格漏判：
+ *
+ * | 报文 | 首版 | 现版 |
+ * |---|---|---|
+ * | `{"msg":"request illegal","code":11128}`（`msg` 在前） | ❌ | ✅ |
+ * | `{"code":11128,"displayMsg":{…},"msg":"request illegal"}`（中间夹对象） | ❌ | ✅ |
+ * | `{"code":"11128","msg":"request illegal"}`（`code` 是字符串） | ❌ | ✅ |
+ *
+ * ⚠️ 前两格**不是理论风险**：现网报文的字段顺序恰好是 `code` → `msg` → `displayMsg`
+ * （`msg` 紧跟 `code`），所以当前碰不到；但**JSON 对象键序无任何保证**，网关重排字段、
+ * 或在 `code` 与 `msg` 之间新增一个对象（如把 `displayMsg` 前置）就会**静默漏判** ——
+ * 漏判方向是「回落 11140 档」，即**本次要修的那个缺陷原样复现**。
+ *
+ * ⇒ 改成 `code` 与 `msg` 两条**独立**的前瞻断言（各用一个 `[^\n]{0,N}?` 的有界窗口
+ * 只做「同层级邻近」的兜底，不是串联）：键序变了也各自命中。
+ * ⚠️ 窗口**必须有界**（`{0,200}`）：无界会让「报文里任意位置有 code、任意位置有
+ * msg」也命中 ⇒ `{"code":11140,…前面…,"msg":"… request illegal"}` 这类跨族报文会误判。
+ */
+const ILLEGAL_CODE = /"code"\s*:\s*"?11128(?![\d.])/iu;
+const ILLEGAL_MSG = /"m(?:sg|essage)"\s*:\s*"[^"]{0,200}?request(?:[\s:_\-\p{Cf}]|\\[nrt])+illegal/iu;
+/**
+ * ⚠️⚠️ **内容级** `11128`（`Illegal API invocation from an unapproved channel`）的判定，
+ * 2026-10-18 为 IKLYCT 加。
+ *
+ * ## 为什么它必须在 `isContentRejection` 里被**排除**（这条注释就是那个缺陷的事故史）
+ *
+ * 腾讯系内容级风控的报文长这样（Gitee IKJNA1 / IKLS2L / **IKLYCT**，两端点一致）：
+ * ```json
+ * {"code":11128,"msg":"Illegal API invocation from an unapproved channel",
+ *  "displayMsg":{"en":"blocked by security policy","zh":"请求被拦截，请重新发送"}}
+ * ```
+ * 它是**内容级**拦截：同一账号换掉那一句就通 ⇒ **换号无效、写 30 分钟冷却纯属误伤**
+ * （会把可用账号凭空封禁，出口文案还建议用户去停用账号）。
+ *
+ * ⚠️⚠️ **本条原先是漏的，而漏的方式恰好被本文件自己记录过、却没落到这条腿上**：
+ * 上面那段「这不是假想形态」的注释已经指出——`11128` 各子原因**共用/漂移 `displayMsg`**
+ * （`displayMsg.en` 漂成 `The content did not pass the safety review.` **本仓已有先例**）。
+ * 于是当上游把这份 11128 的 `displayMsg` 漂成安全审核措辞时：
+ * - 腿① `"code":11140` —— **不命中**（code 是 11128）；
+ * - 腿② `/request illegal/i` —— **不命中**（msg 是 `Illegal API invocation…`）；
+ * - 早退 `isChannelVerificationIllegalBody` —— **不命中**（它要 `request illegal`）；
+ * - ⚠️⚠️ **腿③ `/安全审核|safety review/i` 扫整份报文（含 `displayMsg`/`displayTips`）⇒ 命中**
+ *   ⇒ 整份报文落进「账号级拦截」档 ⇒ **烧完整池 + 每个账号锁 30 分钟**。
+ *
+ * 实测（从 `lib/` 编译产物抠出判据实跑，2026-10-18；输入是本仓记录的**真实**报文措辞）：
+ * | 报文 | 判定 | 命中腿 |
+ * |---|---|---|
+ * | 真实 11128 渠道校验 | ✅ false | 早退排除 |
+ * | 真实 11128 内容级（本轮实测文案） | ✅ false | 无 |
+ * | ⚠️ 11128 内容级 + `displayMsg.en` 漂成 safety review | ❌ **true（错）** | **腿③** |
+ * | ⚠️ 11128 内容级 + `displayMsg.zh` 含「安全审核」 | ❌ **true（错）** | **腿③** |
+ * | ⚠️ 11128 内容级 + `displayTips` 含 safety review | ❌ **true（错）** | **腿③** |
+ * | 真实 11140 | ✅ true | 腿①②③（**未被削弱**） |
+ *
+ * ## 写法上刻意与 `isChannelVerificationIllegalBody` **同型**（三处都不可省）
+ *
+ * 1. **只认结构化 `code` + `msg` 两个键**，**绝不扫** `displayMsg` / `displayTips` /
+ *    正文 —— 腿③ 之所以出错，正是因为它扫了报文里**所有**地方。
+ * 2. `code` 用**精确值** `11128`（负向前瞻挡 `111280` / `11128.5`），不是子串。
+ * 3. 与渠道校验那档一样**各自排除**（早退各写一条），因为它们是**两个**不同的
+ *    子原因、同一个 `code`；少一条就回到「同码不同族被混为一谈」那个老问题上。
+ *
+ * ⚠️ **判窄不是为了放行真拦截**：`code:11140` 与内容级 11128 的处置**本来就不同**
+ * （前者是账号级、该冷却；后者换句即通、绝不能冷却）。排掉它之后，
+ * 腿③ 只对**真正的 11140 / 安全审核**报文生效 —— 这正是腿③ 的本意。
+ */
+const CONTENT_BLOCKED_CODE = /"code"\s*:\s*"?11128(?![\d.])/iu;
+const CONTENT_BLOCKED_MSG = /"m(?:sg|essage)"\s*:\s*"[^"]{0,200}?illegal\s+api\s+invocation/iu;
+/** 内容级 `11128` 的判定（见 {@link CONTENT_BLOCKED_MSG} 的事故史）。 */
+function isContentBlockedIllegalBody(body) {
+    return CONTENT_BLOCKED_CODE.test(body) && CONTENT_BLOCKED_MSG.test(body);
+}
+/**
+ * 渠道校验（11128）+ `request illegal` 形态的判定。
+ *
+ * ⚠️ 刻意**不是**单条正则：两个条件**独立**匹配（见上方「不许用 `[^{}]*` 串起来」）。
+ * ⚠️⚠️ 同码不同族时**必须**靠它排除 —— ⚠️ **但注意它已不是 `isContentRejection`
+ * 的排除判据**（2026-10-18 审计实测）：那里已改用覆盖面更全的
+ * {@link isChannelVerificationBody}（本函数只认腿③，漏掉腿① 的
+ * `conversation id missing` 形态 —— 那才是 P0 复发的原因）。
+ * ⇒ 本函数现在**只服务** `isChannelVerificationRejection` 自己的腿③。
+ * ⚠️ **刻意不写死行号**：注释里的行号必然随文件漂移（2026-10-18 审计实测已漂一次）。
+ */
+function isChannelVerificationIllegalBody(body) {
+    return ILLEGAL_CODE.test(body) && ILLEGAL_MSG.test(body);
+}
+/**
+ * ★ `code` 精确等于 11128 **且** `msg`/`message` 值位写着渠道校验措辞 —— 供
+ * {@link isContentRejection} 做**早退排除**用（2026-10-18 审计实测，本轮新增）。
+ *
+ * ## 为什么它与 `isChannelVerificationRejection` **刻意不同**
+ *
+ * 那三条腿里有**不锚 `code`** 的：腿② 是 HTML / 纯文本的裸子串兜底（锚的是
+ * 「压根不是结构化报文」），腿① 虽然结构化但**按 `code` 收窄是刻意不做的**
+ * （见该函数注释：同码至少四族子原因，按 code 会把内容级子原因也拖进换号）。
+ *
+ * ⚠️⚠️ **本档的排除恰好必须反过来 —— 必须锚 `code`**：排除是「别给**这一族**
+ * 写冷却」，而它只对 `code==11128` 的渠道校验族成立。若拿腿① 那种
+ * 「扫全文找措辞」的判据来排除，`{"code":11140,"msg":"conversation id missing"}`
+ * 会被放行 ⇒ **真 11140 反被剥掉冷却** ⇒ 每轮重撞同一坏账号（本组有反向守卫）。
+ *
+ * ## ⚠️ 覆盖范围 = 腿① + 腿③，**腿② 结构上不可覆盖**（对抗审计纠正）
+ *
+ * 本函数覆盖渠道校验档**全部带 `msg`/`message` 措辞**的形态。⚠️ **腿②**
+ * （HTML / 纯文本裸子串兜底）**刻意不覆盖**：它锚「压根不是结构化报文」、
+ * **没有 `code` 键** ⇒ `ILLEGAL_CODE` 恒 false；而排除**必须**锚 `code`
+ * （否则真 11140 被剥冷却）⇒ 二者不可兼得。
+ * ⇒ `<html>… conversation id missing … 安全审核 …</html>` + 400 仍落 11140 档、
+ * 写冷却（**预先存在**，无实测可达性）⇒ 如实登记、不修。
+ *
+ * ## ⚠️⚠️ 两个条件必须**独立**匹配，**不许**用 `[^{}]*` 串起来
+ *
+ * 同本文件 P1 那条教训（2026-10-17 对抗审计）：串起来会引入 **JSON 字段顺序依赖**，
+ * 而真实报文**本就带** `displayMsg` 嵌套对象（夹在 `code` 与 `msg` 之间）⇒
+ * 串起来的写法对**自己修的那族报文**恒漏判。⇒ 两条**独立**前瞻断言，
+ * 各自只在自己的字段位置上锚定。
+ *
+ * ## ⚠️⚠️⚠️ 值位窗口**必须与归属判据同宽**，否则修复方向会反转（2026-10-18 对抗审计实测，本轮修）
+ *
+ * 初版这里写 `[^"]{0,200}?`（有界，对齐腿③ `ILLEGAL_MSG`），而归属判据**腿①**
+ * 用的是 `[^"]*`（**无界**）⇒ 「属不属于渠道校验」判得比「要不要写冷却」**更宽**
+ * ⇒ 二者**不再是互斥关系**。实测措辞距 `msg` 值开头 **≥205 字符**时：
+ *
+ * | `msg` 前缀长度 | 排除 | 归属 | |
+ * |---|---|---|---|
+ * | 0 / 180 / 195 / 199 | ✅ | ✅ | 两档互斥 |
+ * | **205 / 260 / 500** | ❌ | ✅ | 🔴 落 **11140 档 ⇒ 写 30 分钟冷却** |
+ *
+ * ⚠️ **方向恰好与本函数存在的目的相反**：修复 A 是为消灭「可用账号被凭空封
+ * 30 分钟」，而这个不对称制造了**一条新的**同类触发面（端到端实测 403 与流内
+ * 200 两条通道都写冷却）。
+ *
+ * ⇒ **改为 `[^"]*` 与腿① 对齐**。⚠️ 「有界 vs 无界」此处**不是**取舍而是
+ * **一致性约束**：排除必须**至少**覆盖归属判据认得的一切，否则两档会同时认领。
+ * ⚠️ 反向也不成立：把腿① 收窄成有界会让「长 `msg` 里写着渠道校验措辞」的报文
+ * **两条腿都不认领** ⇒ 直接抛裸错误，比写冷却更差（丢掉了「换号 + 不写冷却」
+ * 这条唯一出路）。⇒ **只能向排除侧放宽**。
+ * ⚠️ 腿③（`ILLEGAL_MSG`）仍是有界 `{0,200}` —— 它**与排除同宽**，故 ③ 不存在
+ * 这个不对称；⚠️ 但这意味着「超长 `msg` 里的 `request illegal`」仍是
+ * **归属认不出、排除也认不出** ⇒ 落 11140 档（既有行为，本轮不扩大其范围）。
+ *
+ * ## ⚠️ 残留缺口（如实登记，**不是**本轮引入）：转义引号会截断值位窗口
+ *
+ * `[^"]` 遇到 JSON 里的**转义引号 `\"`** 会在那里停下，于是措辞若位于转义引号
+ * **之后**就漏认：
+ * ```json
+ * {"code":11128,"msg":"say \"hi\" then request illegal"}
+ * ```
+ * 实测三条腿（腿① / 腿③ / 本条）在这一格上**全部返回 false** ⇒ 这是**既有**
+ * 的同型缺口，不是本轮引入。
+ * ⚠️ **本轮刻意不修**：修它要写 JSON 感知的字符串扫描（`"(?:\\.|[^"\\])*"`），
+ * 而三条腿**同时**改是另一次结构性改动；且**实测报文的 `msg` 恒为短句**
+ * （`request illegal` / `conversation id missing`，均不含引号）⇒ 该形态
+ * 无实测可达性。⚠️ 若将来抓到含引号的 `msg`，三条腿必须**一并**改，
+ * 改一处会留下「腿① 认、腿③ 不认」的漂移。
+ *
+ * ## ⚠️ 残留缺口（**预先存在**，本轮把它**扩大了一个触发面**）：`ILLEGAL_CODE` 扫全文
+ *
+ * `ILLEGAL_CODE` 是**全文正则、不锚顶层** ⇒ 报文里**任何位置**出现 `"code":11128`
+ * 都算命中。于是外层真 11140、内嵌一个 11128 子报文时会被排除：
+ * ```json
+ * {"code":11140,"msg":"boom","inner":{"code":11128,"msg":"request illegal"}}
+ * ```
+ * ⇒ 排除触发 ⇒ 真 11140 **不写冷却** ⇒ 每轮重撞同一坏账号。
+ *
+ * ⚠️ **精确的归属（实测，别记错）**：
+ * - 该缺口在**腿③ 形态上上一版就有**（旧实现对上面那条报文同样排除）⇒ 非本轮引入；
+ * - ⚠️ 本轮**新增腿①** 让**同一个缺口多了一个触发面**（内层是
+ *   `conversation id missing` 时旧实现不排除、现版排除）—— 这才是本轮的净增量。
+ *
+ * ⚠️ **本轮刻意不修**，理由三条：
+ * 1. 锚「顶层」的两条常规写法都**不可行**：改成 `^\s*\{\s*"code"` 会打红
+ *    「`msg` 排在 `code` 之前必须仍被认领」那条 P1 守卫（JSON 键序无保证）；
+ * 2. 正解是 `JSON.parse` 取顶层 `code`（实测 8/8 形态正确），但它把
+ *    **格式错误报文从 fail-open 改成 fail-closed**（BOM / 尾随逗号会解析失败
+ *    ⇒ 不再认领），属**方向性变更**，必须单独评估、不能夹带进本轮；
+ * 3. 无实测可达性（真实错误体是**单层** JSON 对象，无内嵌子报文）。
+ *
+ * ⚠️ 若将来要修，**必须**连带处理：`JSON.parse` 失败时是回退到现状正则、还是
+ * fail-closed —— 这是**产品取舍**，不是实现细节。
+ *
+ * ## ⚠️ 覆盖范围核查：全部调用点**共用这一个早退**（2026-10-18 审计实测）
+ *
+ * 本文件有多处 `isContentRejection(...)` 调用（401/403 入口、换号途中、
+ * 401/403 出口、400 入口、400 换号途中、400 出口、单凭据出口、限流换号、
+ * `consumeSse` 流内），**全部经由本函数的同一个早退**，无第二份判据、无漏网入口
+ * ⇒ 本次修一处即覆盖全部通道。⚠️ 将来若有人**新增**调用点或**复制**一份判据，
+ * 必须重跑本节的核对（这正是 trae 那次「两处各写一套」的成因）。
+ * ⚠️ **刻意不写死调用点个数与行号** —— 两者都会随文件漂移（本条曾因写死行号
+ * 被审计打回，见 2026-10-18 记录）。
+ */
+const CHANNEL_VERIFICATION_PHRASE = /"m(?:sg|essage)"\s*:\s*"[^"]*?(?:conversation(?:[\s:_\-\p{Cf}]|\\[nrt])+id(?:[\s:_\-\p{Cf}]|\\[nrt])+missing|request(?:[\s:_\-\p{Cf}]|\\[nrt])+illegal)/iu;
+function isChannelVerificationBody(body) {
+    return ILLEGAL_CODE.test(body) && CHANNEL_VERIFICATION_PHRASE.test(body);
+}
+function isChannelVerificationRejection(body, status) {
+    if (body.length === 0)
+        return false;
+    // ⚠️⚠️ 判据有**三条腿，且顺序不可颠倒**（腿①② 是 2026-10-16 两轮整改的结果，
+    // 腿③ 是 2026-10-17 为 `request illegal` 形态加的）。
+    //
+    // ## 腿①（结构化，优先）：必须落在 `msg` / `message` 的**值**里
+    //
+    // 初版是 `/"msg"\s*:\s*"conversation id missing"/i` —— 只认**完整 JSON 片段**，
+    // 上游改一个字符就**静默漏认**，退回「只试一个账号就抛」：
+    // | 变体 | 初版 | 现版 |
+    // |---|---|---|
+    // | 键名 `message`（而非 `msg`） | ❌ | ✅ |
+    // | 值尾部带句点 `…missing.` | ❌ | ✅ |
+    // | 值前缀空格 `" conversation…"` | ❌ | ✅ |
+    // | 内部多空格 / 制表 / 换行（含 JSON 转义 `\n`） | ❌ | ✅ |
+    // | `conversation-id missing` / `conversation id: missing` | ❌ | ✅ |
+    //
+    // 这不是「放宽成按 code」——`code` 腿**仍然刻意不写**（见上：同码至少四族
+    // 子原因，按 code 会把 `Illegal API invocation from an unapproved channel`
+    // 也拖进换号）。放宽的只是**同一句 msg 的书写变体**：命中仍要求报文里出现
+    // `conversation id missing` 这串字面文本，且**必须出现在 `msg`/`message` 的值里**。
+    //
+    // ## 腿②（非结构化兜底）：只有**整份报文没有结构化字段**时才退化到裸子串
+    //
+    // ⚠️⚠️ 这一步是**必须**的（2026-10-16 自查实测到一处**我引入的假阳性**）：
+    // 第一版整改把判据直接换成「整份报文裸子串」，于是**别的** 11128 子原因只要在
+    // `displayTips` 里**引用**了这句话（例如英文提示 `If you see "conversation id
+    // missing", please resend…`），就会被判成「按账号生效」⇒ 本该只发一次变成
+    // **白烧整池往返**，还会**误导用户去停用一个好账号**；报文 echo 了请求体
+    //（用户消息里正好写了这句话）同型。⇒ 对**有结构化字段**的报文，只认该字段，
+    // **绝不**再扫 `displayTips` / `displayMsg` / 正文。
+    //
+    // ⚠️⚠️ **「结构化」的判据是「JSON 对象 + 有 `code` 键」，不只是「有 `msg`/`message` 键」**
+    //（2026-10-16 第三轮自查实测三处**已实测可达**的误命中；前两轮的用例都带
+    // `msg` 键，故从未打到这条腿）：
+    // | 报文体 | 仅有 msg 键守卫 | 加结构化守卫后 |
+    // |---|---|---|
+    // | `{"code":11128,"tips":"conversation id missing"}` | ❌ 误命中（烧整池） | ✅ |
+    // | `{"code":11128,"error":"conversation id missing"}`（`error` 是**字符串**） | ❌ | ✅ |
+    // | `{"code":400,"request":{…"conversation id missing"…}}`（**echo 请求体**） | ❌ | ✅ |
+    // 三者的共同点：报文**是结构化 JSON 对象**（有 `code`），却因为「没有 `msg` 键」
+    // 而被当成 HTML 兜底 ⇒ 这正是 `displayTips` 假阳性的**另一入口**。
+    // 而 HTML / 纯文本网关页**没有** `code` 键可锚，此时若不做裸子串兜底就会整族
+    // 漏认 ⇒ 保留它。三条腿合起来的语义是：
+    // 「`msg`/`message` 的值里写着它」**或**「是结构化对象却不在该字段里 ⇒ 否」
+    // **或**「压根不是结构化报文、而正文里写着它」。
+    //
+    // ⚠️ 判据里 `^\s*\{` 这一半**不可省**（实测教训）：只看 `"code"` 键的写法会把
+    // **JSON 数组**形态（`[{"code":11128,"conversation id missing":"…"}]`）也判成
+    // 结构化 ⇒ 漏认。真实网关错误体是**对象**，数组形态只出现在测试夹具里。
+    //
+    // ## ⚠️⚠️ 腿② 必须带**状态码闸门**（2026-10-16 第三轮审计 P1，本轮修）
+    //
+    // 前三轮只治了「报文体长什么样」，**没治「哪个状态码才可能出这个错」**。
+    // 实测后果（已实测可达）：**网关 5xx 故障页**只要日志文字里恰好含该句
+    // （例：`<html>502 Bad Gateway<br>upstream log: conversation id missing header</html>`
+    // —— 注意它**没有** `msg`/`code` 键，故走腿②），就会：
+    // | 观测 | 修复前 | 修复后 |
+    // |---|---|---|
+    // | 请求序列 | **烧满整池** `["AT1","AT2",…]` | `["AT1"]` |
+    // | 错误码 | `PERMISSION_DENIED`「未通过渠道校验」 | `SERVER`（5xx 既有分类） |
+    // | 用户被指引 | **「在 Jet Hub 停用或调整该账号的顺序」** | — |
+    // 即：**让用户为一次网关抖动去停用一批好账号**，且 `PERMISSION_DENIED` 不在
+    // harness 可重试集合里 ⇒ 一次瞬时故障被报成确定性结论。
+    //
+    // ⇒ 腿② 只在 `11128` **实际被观测到**的码域（`400` / `403`）启用。
+    // 5xx / 429 / 其他一律交给既有分类（`SERVER` / `RATE_LIMIT` / …）—— 那些码
+    // 本来就该由既有的状态码语义处理，不该被一句文本劫持。
+    // ⚠️ 腿① **不受**此闸门约束：它要求 `msg`/`message` 的值位精确命中，是**强证据**
+    //（上游确实用它报这个错），出现在任何状态码上都应认。
+    if (CHANNEL_VERIFICATION_MSG_FIELD.test(body))
+        return true;
+    if (isChannelVerificationIllegalBody(body))
+        return true;
+    if (status !== undefined && status !== 400 && status !== 403)
+        return false;
+    if (/"m(?:sg|essage)"\s*:/.test(body))
+        return false;
+    if (/^\s*\{/.test(body) && /"code"\s*:/.test(body))
+        return false;
+    return CHANNEL_VERIFICATION_BARE.test(body);
 }
 /**
  * 安全策略拦截的**账号冷却时长**（30 分钟）。
@@ -454,13 +1182,176 @@ const BUDDY_POLICY_BLOCK_COOLDOWN_MS = 30 * 60_000;
  * 出路是换号（由本适配器的换号循环负责），不是重试同一个账号。
  */
 function contentRejectionError(productId, status, body, rotated) {
-    // 两条通道的如实描述不同：HTTP 路径试完了全部候选，流内路径只撞到当前账号
-    // （那里不重发，避免「已吐了一半再重放」的重复计费与重复执行工具风险）。
+    /**
+     * 两条通道的如实描述不同：HTTP 路径试完了全部候选，流内路径只撞到当前账号
+     * （那里不重发，避免「已吐了一半再重放」的重复计费与重复执行工具风险）。
+     *
+     * ⚠️⚠️ `rotated: false` 这一格**必须按 `status` 再分一次**（2026-10-17 审计实测）。
+     *
+     * 该参数原本**只为流内路径设计**，`false` 的唯一含义是「流内错误帧下发」。
+     * 后来 HTTP 单凭据路径（无账号池 ⇒ 没有换号发生过）也复用了 `false`，于是
+     * 那一条 **HTTP 响应体**被文案说成「流内错误帧下发」—— 实测产物：
+     * 「当前账号被服务端安全策略拦截（HTTP 400，**流内错误帧下发**）」。
+     *
+     * ⚠️ 判据用 `status === 200` 而不是「是否 HTTP 形态」：本仓既有约定就是
+     * **流内错误帧的 HTTP 状态恒为 200**（下游 `consumeSse` 的流内出口也传 200，
+     * 见 `contentRejectionError(this.product.id, 200, payload, false)`），
+     * 而任何真正的 HTTP 错误响应都带 4xx/5xx ⇒ 该判据可判定、无重叠。
+     */
     const scope = rotated
         ? `全部账号均被服务端安全策略拦截（HTTP ${status}，已逐个换号重试）`
-        : `当前账号被服务端安全策略拦截（HTTP ${status}，流内错误帧下发）`;
+        : status === 200
+            ? `当前账号被服务端安全策略拦截（HTTP ${status}，流内错误帧下发）`
+            : `当前账号被服务端安全策略拦截（HTTP ${status}，没有其他账号可换）`;
     return new LlmError(`${productId}: ${scope}。该拦截按账号生效（同一请求在其他账号可正常返回），`
         + `请在 Jet Hub 停用或更换被拦账号：${errorDetail(body)}`, 'PERMISSION_DENIED', { status });
+}
+/**
+ * 从渠道校验报文里提取**可诊断、但不含行动指引**的上游标识。
+ *
+ * ## ⚠️ 为什么刻意**不用** `errorDetail`
+ *
+ * `errorDetail` 的第一优先级是 `displayMsg.zh`，而本档上游那句正是
+ * 「请求被拦截，**请重新发送**」。本函数存在的全部理由就是**不诱导用户重发**，
+ * 而 `errorDetail` 会把它从后门拼回来 —— 同一句错误文案里前半说「重发无效」、
+ * 后半说「请重新发送」，自相矛盾（2026-10-16 审计实测到该产物）。
+ *
+ * 这里只取 `code` / `msg` 两个**结构化字段**：它们足以让用户拿着报文/日志定位，
+ * 且不含任何行动指引。`error` 包装形态（上游代理）也认。
+ *
+ * ## ⚠️ 非 JSON 报文的边界（**已收敛**，见下）
+ *
+ * `displayMsg` 只存在于 JSON 报文里 ⇒ 「不透传那句误导文案」这条保证在**有 JSON
+ * 结构时 100% 成立**。非 JSON（HTML / 纯文本网关页）**没有**结构化字段可锚，
+ * 原先退回 `body.slice(0, 200)` 原样引用 ⇒ 审计实测 5 种形态（仅 `message` 键 /
+ * `error` 是字符串 / JSON 数组 / HTML / 纯文本）都把「请重新发送」拼回了 message。
+ *
+ * ⚠️ 这与「保留报文以便定位」**并不冲突**：那段被保留的价值是**报错标识**
+ *（code / 该 msg 的措辞），而不是**上游那句行动指引**。⇒ 现在对兜底腿也做一次
+ * {@link redactUpstreamActionHints}：保留诊断信息，抹掉会诱导用户做无效动作的措辞。
+ */
+function channelVerificationUpstreamId(body) {
+    try {
+        const data = JSON.parse(body);
+        const inner = typeof data.error === 'object' && data.error !== null
+            ? data.error
+            : undefined;
+        const asText = (value) => typeof value === 'string' || typeof value === 'number' ? String(value) : undefined;
+        const code = asText(data.code) ?? asText(inner?.code);
+        // ⚠️ 必须与**判据**认的键名一致（判据用 `m(?:sg|essage)`）——否则会出现
+        // 「判据认了 `message`、出口却提不出该字段」⇒ 可诊断性静默降级
+        //（2026-10-16 审计实测：报出来只剩 `code 11128`，那句唯一的定位文本丢了）。
+        const msg = asText(data.msg) ?? asText(data.message)
+            ?? asText(inner?.msg) ?? asText(inner?.message);
+        // ⚠️⚠️ `requestId` **必须**带出来（2026-10-16 第三轮审计实测，本轮修）：
+        // 本文件与 `docs/agent-notes/providers-buddy.md` 共**四处**告诉用户
+        // 「先取 `requestId` 去取证」「它是唯一定位手段」，而此前实现**一个字都没取**
+        // ⇒ 那句纪律对用户**不可执行**（用户唯一能看到的文案里永远没有它）。
+        const requestId = asText(data.requestId) ?? asText(inner?.requestId);
+        const parts = [
+            code === undefined ? undefined : `code ${code}`,
+            msg === undefined ? undefined : `msg ${msg}`,
+            requestId === undefined ? undefined : `requestId ${requestId}`,
+        ].filter((value) => value !== undefined);
+        // ⚠️ `msg` 的**值**本身也可能带那句行动指引（真实形态实测为
+        // `conversation id missing` 这么短，但不能假设上游不会加尾巴）⇒ 同样过一遍
+        // 脱敏；`code` / `msg` 这些**标识**不受影响（脱敏只动行动指引措辞）。
+        if (parts.length > 0)
+            return redactUpstreamActionHints(parts.join(' / '));
+    }
+    catch {
+        // 非 JSON（HTML / 纯文本）错误体：落到下面的截断原文。
+    }
+    // ⚠️ 标注「非 JSON 报文」+ 抹掉行动指引：让用户知道这是**网关原样输出**、
+    // 且不会被上游那句「请重新发送」带走（见上面「非 JSON 报文的边界」）。
+    return `（非 JSON 报文）${redactUpstreamActionHints(body).slice(0, 200)}`;
+}
+/**
+ * 抹掉上游报文里**会诱导用户做无效动作**的措辞（本档语境下已实测重发无效）。
+ *
+ * ⚠️ 只抹**行动指引**，绝不动报错标识（`code` / `msg` / `requestId`）——
+ * 后者是本档「报文是唯一定位手段」那条纪律的载体。
+ *
+ * ## ⚠️⚠️ 判据必须锚到**真实上游原句**，不能只锚作者在注释里的**转述**
+ *（2026-10-16 第三轮审计实测，本轮修）
+ *
+ * 前一轮只写了「请重新发送」＋英文 `send again`，而**真实报文的两句都漏网**：
+ * | 来源 | 真实原句 | 前一轮 | 现版 |
+ * |---|---|---|---|
+ * | `displayMsg.zh` | `请求被拦截，请重新发送` | ✅ | ✅ |
+ * | `displayTips.zh` | `…请用官方版本重新发送。` | ❌（`请` 后紧跟 `用`） | ✅ |
+ * | `displayTips.en` | `…Please resend from the official client.` | ❌（**无 `again`**） | ✅ |
+ *
+ * ⇒ 中文腿放宽到「`请` + 至多 12 字 + 重发类动词」，英文腿放宽到
+ * 「`send`/`resend` + 至多 20 字 + `again` **或** `from the official client`」。
+ * ⚠️ 收紧方向同样要守：`请稍后重试`（**不含**「重新/再次/重发」）**不得**被抹 ——
+ * 它是有效指引（服务端可能真的会恢复），有专门用例锁住。
+ */
+function redactUpstreamActionHints(text) {
+    const REDACTED = '（已抹去上游的行动指引）';
+    return text
+        // 中文：`请` + 短间隔 + **重发**类动词。
+        // ⚠️ 动词表**只收「重发」语义**（重新发送 / 重新传 / 重发 / 重新傳送），
+        // **刻意排除「重试」** —— `请稍后重试` 是**有效**指引（服务端可能真的会恢复），
+        // 抹掉它等于把有用的建议也吞了。实测教训：初版把「重试」并进来 ⇒
+        // 「请稍后重试」被误抹。
+        .replace(/请[^。；\n]{0,12}?(?:重新发送|重新傳送|重新传|重发)/g, REDACTED)
+        // 英文：`send`/`resend` + 短间隔 + 「again」**或**「from the official client」。
+        .replace(/\b(?:please\s+)?(?:re)?send\b[^.\n]{0,20}?(?:\bagain\b|from the official client)/gi, REDACTED);
+}
+/**
+ * 「渠道校验」拒绝的错误出口（见 `isChannelVerificationRejection`）。
+ *
+ * ## 为什么文案必须自己写，不能透传上游 `displayMsg`
+ *
+ * 上游那句是「**请求被拦截，请重新发送**」，而实测**重发必然继续失败**
+ * （同一账号不带三头跨 19 分钟共 10 次全 400），且上游自己的 `actions` 里
+ * **根本没有 `RETRY`**。原样透传等于**诱导用户做无效动作** —— 用户会不断重发，
+ * 而这正是原始报障里的行为。
+ * ⚠️ 该目标**必须落在实现上**：上游标识走 {@link channelVerificationUpstreamId}
+ *（只取 code/msg），**不得**改回 `errorDetail` —— 后者会把 `displayMsg` 拼回来。
+ *
+ * ## 文案要素（都对应一条实测）
+ * - **指向账号**（实测按账号生效：一个号 0/3、另两个号 3/3）；
+ * - **说明重发无效**（跨 19 分钟 10 次全败）；
+ * - **给出真正可行的出路**：换号（Jet Hub 里停用该账号 / 调序）或切 provider。
+ *
+ * ⚠️ 文案里**不得**出现 Markdown 强调符：错误 message 是**纯文本**渲染，
+ * `**重发无效**` 会原样显示成四个星号。
+ *
+ * ## `rotated`：两条通道的如实描述（与 `contentRejectionError` 同参数语义）
+ * - HTTP 路径（`rotated: true`）：确实试完了全部候选；
+ * - 流内路径（`rotated: false`，`consumeSse` 的 200 + 内嵌错误帧）：只撞到**当前**
+ *   账号，且那里**刻意不重发**（重发需要「尚未产出内容」的判据 + 外层循环，
+ *   属结构性改造）。⇒ 不能说「已逐个换号重试」。
+ *
+ * ⚠️ 错误码取 `PERMISSION_DENIED`，与 `contentRejectionError` 同口径：
+ * - 它**不在** harness 的 `DEFAULT_RETRYABLE_CODES`
+ *   （`EMPTY_RESPONSE / RATE_LIMIT / SERVER / TIMEOUT / TRANSPORT`）⇒ 不让 harness
+ *   白退避重试同一个坏形态的请求。
+ *   ⚠️ 流内通道**尤其**依赖这一条：本档接入前，那条通道的 11128 帧会掉进
+ *   `EMPTY_RESPONSE`（**在**可重试集合里）⇒ 白退避至多 5 次，每次重撞同一个
+ *   被拒账号（2026-10-16 审计实测）；
+ * - 它**在** `dead-model-store` 的 `IGNORED_CODES` 里 ⇒ 不会被误记成
+ *   「该模型已失效」而把可用模型藏起来（本档与模型无关，实测只与账号/请求形态有关）；
+ * - 也不取 `AUTH`（UI 会说「API 密钥无效」，实测 3 个 token 全部有效）/
+ *   `QUOTA` / `ACCOUNT_QUOTA`（这两个码会弹全局额度 Toast 并替换文案，实际与额度无关）/
+ *   `RATE_LIMIT`（会引导用户等待）。
+ *   ⚠️ 易混：本文件兜底用的字面量是 **`'QUOTA_EXCEEDED'`**，而 harness 的
+ *   `QUOTA_EXCEEDED_CODE` 字面值是 **`'QUOTA'`**（见 `llm-adapter.ts` 的 IKJVCW 注释）
+ *   ⇒ 客户端**不会**为 `'QUOTA_EXCEEDED'` 弹 Toast、也不替换 message。
+ *   故单账号池那次误落（见下）的症状是**误导文案原样透传**，不是全局 Toast。
+ *   ⚠️ 单账号池形态曾误落到 `QUOTA_EXCEEDED`「所有账号均受限」—— 那正是本档
+ *   要消灭的误导，根因与修法见 `sawChannelVerification` 的初始化注释。
+ */
+function channelVerificationError(productId, status, body, rotated) {
+    const scope = rotated
+        ? `全部账号均未通过渠道校验（HTTP ${status}，已逐个换号重试）`
+        : `当前账号未通过渠道校验（HTTP ${status}，流内错误帧下发）`;
+    return new LlmError(`${productId}: ${scope}。`
+        + `该拒绝按账号生效（同一请求在其他账号可正常返回），且重发无效 —— `
+        + `请在 Jet Hub 停用或调整该账号的顺序后重试，或改用其它 provider。`
+        + `上游：${channelVerificationUpstreamId(body)}`, 'PERMISSION_DENIED', { status });
 }
 /**
  * 纯函数：由「现在」算出策略拦截冷却的到期时刻。
@@ -533,6 +1424,9 @@ function errorDetail(body) {
             // 腾讯系用 `msg` 而非 `message`。
             typeof data.msg === 'string' ? data.msg : undefined,
             typeof data.message === 'string' ? data.message : undefined,
+            // ⚠️ 上游代理的 `{"error":"…","detail":"<真实原因>"}` 形态（IKLBSH A1）。
+            // 判据只留一份实现（`openai-compat.ts` 的 `detailFieldText`）；必须是最后一条腿。
+            detailFieldText(data),
         ].filter((value) => value !== undefined);
         if (parts.length > 0)
             return parts.join(' ');
@@ -805,6 +1699,16 @@ export class BuddyAdapter extends LlmAdapter {
      */
     remoteComplete = false;
     /**
+     * ⚠️ 上次**成功**读到远端目录的时刻（0 = 从未成功过 / 被 `refreshCatalog` 强制清零）。
+     *
+     * ⚠️ 与 `remoteModels` **并存**、不是替代：`remoteModels` 存「有哪些模型」，
+     *    本字段存「何时读到的」。只有 `remoteModels` 时目录**永不刷新**（原行为）。
+     *
+     * ⚠️⚠️ **`refreshCatalog()` 会把它置 0** —— 那不是「作废数据」，而是
+     *    **强制下一次 `ensureRemoteModels` 重新拉取**的手段（见该方法）。
+     */
+    catalogAt = 0;
+    /**
      * 目录加载闸门：并发去重 + 失败/空结果冷却。
      * 依据见 `src/remote-catalog-gate.ts`（首屏「加载模型巨长」的实测归因）。
      */
@@ -854,6 +1758,17 @@ export class BuddyAdapter extends LlmAdapter {
             product: this.product,
             loadCatalog: () => this.loadCatalogEntries(),
             syncCatalog: () => this.syncCatalogEntries(),
+            /**
+             * ★ **强制重拉**（供后台 20 分钟刷新器与「用户改设置」）。
+             *
+             * ⚠️ 与 `loadCatalog` 的差别：后者内部有 `isCatalogFresh` 判据 ⇒ 新鲜时**不拉**。
+             * 本回调要的是「无视新鲜度，强制拉一次」，故先清时刻再调同一个方法 ——
+             * **不另写一份拉取逻辑**（那会让两条路的上游行为分叉）。
+             */
+            refresh: async () => {
+                this.catalogAt = 0;
+                await this.ensureRemoteModels();
+            },
             // ⚠️ **本家是唯一真正使用「未知」语义的家**：`inputModalitiesFor` 用
             // `imageCapabilityKnown` 区分「远端明确 false」与「全都没查到」，
             // 后者**只报未知**（省略该字段）交给宿主判断。
@@ -864,6 +1779,57 @@ export class BuddyAdapter extends LlmAdapter {
             // ⚠️ 若给它写 `['text']`，DSH 会按「确认是纯文本模型」把图片**静默投影成
             // 占位文本** ⇒ 图片能力被关掉（宿主契约：absent means unknown）。
         });
+    }
+    /**
+     * 复用本适配器**同一套**选号编排解析凭据（供插件内部的原生搜索使用）。
+     *
+     * ## 为什么需要这个转发方法
+     *
+     * `options` 是构造器的 `private readonly`，插件其余模块（`web-native.ts`）
+     * 从外部读 `adapter.options.resolveCredential` 会**编译失败**（`strict: true`）。
+     * 而原生搜索**必须**与聊天链路用同一个 `resolveCredential` 实例 ——
+     * 另建一份会让「enabled 过滤 / 模型级限流 / 免费判定 / 余额分档 / 池兜底 /
+     * 账本回报」这六步在两条链路上漂移（见 `credential-resolver.ts` 的模块头）。
+     *
+     * 故这里只开一个**窄接口**：转发到同一个函数，不放松 `options` 的封装。
+     *
+     * ⚠️ `modelId` **必须透传**：它同时决定模型级限流过滤与免费判定，
+     * 吞掉会让搜索选到聊天链路不会选的号（例如正在限流期的号）。
+     *
+     * @param modelId - 本次请求的模型 id（取自当前会话路由）。
+     * @returns 选中账号的凭据；无可用账号时为 `undefined`。
+     */
+    async resolveCredentialFor(modelId) {
+        return await this.options.resolveCredential(modelId);
+    }
+    /**
+     * 原生搜索：执行**一次单 query**，返回投影成官方 `sources[]` 形态的结果。
+     *
+     * ## 这份实现是从 `web-native.ts` 搬过来的（2026-10-14 架构改造）
+     *
+     * 原先 `web-native.ts` 里写死了腾讯的取数逻辑（`Bearer` + `/agenttool/v1/search`
+     * + `results[]` 投影），Qoder 渠道接不进来（它的鉴权是 WASM 签名、字段名是
+     * `pageItems[].link`）。现把「取数」下沉到各适配器，`web-native.ts` 只保留
+     * 「官方语义」（入参校验 / 并发中止 / rank 轮转合并 / cap）。
+     *
+     * ## 契约（对齐 `NativeSearchAdapter.searchOnce`）
+     *
+     * - **自己校验凭据**：腾讯的判据是 `access_token` 为非空字符串。凭据是
+     *   `JSON.parse` 出来的外部数据，形状不可信（缺字段 / 类型错都可能）——
+     *   只判 `credential === undefined` 会让坏凭据抛
+     *   `TypeError: Cannot read properties of undefined (reading 'length')`，
+     *   模型看到的是无意义的 JS 报错，而不是「去登录」的指引。
+     * - **投影在这一层做掉**：`results[].{title,url,snippet}` → `NativeSource[]`，
+     *   并且**丢弃无 url 的条目**（`url` 是官方 schema 必填项，
+     *   `additionalProperties: false` —— 整条调用会因一个坏条目失败）。
+     * - **不做多 query 合并**：那是 `web-native.ts` 的职责。
+     *
+     * @param query - 单个查询串（已由调用方 trim + 去重）。
+     * @param credential - `resolveCredentialFor` 的返回值（本方法自己收窄）。
+     * @param signal - 取消信号（调用方传多 query 的 batch signal）。
+     */
+    async searchOnce(query, credential, signal) {
+        return await performBuddySearch(query, credential, signal, this.product);
     }
     /**
      * 该模型此刻是否**免费**（消耗 0 积分）。
@@ -956,16 +1922,33 @@ export class BuddyAdapter extends LlmAdapter {
     }
     async ensureRemoteModels() {
         const fetchRemote = this.options.fetchRemoteModels;
+        // ⚠️ `fetchRemote === undefined` 那半边**原样保留** —— 它判的是「有没有远端
+        //    可拉」（无凭据/无接线），与新鲜度是两件事。
         if (fetchRemote === undefined)
             return;
-        // ⚠️⚠️ **短路判据是「已完整」，不是「已定义」**（issue IKJVTF 复审，审计 I3）。
+        // ⚠️⚠️ **短路判据是「已完整」+「未超 20 分钟」，不是「已定义」**
+        //    （issue IKJVTF 复审，审计 I3；TTL 由 `isCatalogFresh` 给出）。
         //
         // buddy 是**双端点** provider（scoped + `/v3/config`，id 集合不同、必须取并集），
         // 残缺目录**也**要落 `remoteModels`（展示需要），但那时**不能**短路 ——
         // `RemoteCatalogGate` 的冷却在生产里只有闸门自己那一处调用点，而它排在
         // 短路**之后** ⇒ 残缺一旦落缓存，冷却永远读不到、残缺永远补不齐。
-        if (this.remoteComplete)
+        //
+        // ⚠️⚠️ **加 TTL 为什么不会破坏残缺恢复**（加 TTL 前逐行核实）：
+        // TTL 那一腿是 `&&` 的**后半截**，前半截 `remoteComplete` 未变。残缺时
+        // `remoteComplete === false` ⇒ 短路判据恒为假 ⇒ **残缺目录不会被判为
+        // 「新鲜」，闸门冷却与补齐逻辑原样生效**。
+        // ⇒ 两条路径的分工见 `refreshCatalog` 的注释。
+        //
+        // ⚠️ **TTL 那一腿用 `isCatalogFreshFor`**（带「用户主动失效」）：用户在 Jet Hub
+        //    改开关后要**立即**重拉（规格 §6 的正确性要求，见 `invalidateCatalogCache`）。
+        //    失效腿与完整性腿是 `&&` ⇒ 失效会让整条合取为假、照常进闸门拉取；
+        //    拉取失败时**保留**旧 `remoteModels`（本方法全程不清它）⇒ 用户看到的仍是
+        //    上次那份完整列表，不会退化成兜底**子集**（规格 §7 的核心取舍）。
+        if (this.remoteComplete
+            && isCatalogFreshFor(this.product.id, this.catalogAt, this.options.now?.() ?? Date.now())) {
             return;
+        }
         // 闸门：并发去重 + 失败/空结果冷却（详见 src/remote-catalog-gate.ts 的
         // 实测依据）。Buddy 的目录端点超时上限 60s，失败不冷却会让首屏在
         // 「每个模型重试一次」的放大下长时间空转。
@@ -978,6 +1961,9 @@ export class BuddyAdapter extends LlmAdapter {
             // 能力字段（supportsImages / reasoning.supportedEfforts）同理。
             const reconciled = this.reconcileWithFallback(models);
             this.remoteModels = reconciled;
+            // ⚠️ **只在成功赋值后**记时刻：失败/空结果不写，否则一次抖动会把上界
+            //    刷新掉、下轮还要等满 20 分钟才发现上游没恢复。
+            this.catalogAt = this.options.now?.() ?? Date.now();
             this.remoteMeta = new Map(reconciled.map((model) => [model.id, model]));
             this.remoteContextWindows = new Map(reconciled
                 .filter((model) => model.contextWindow !== undefined)
@@ -1010,14 +1996,56 @@ export class BuddyAdapter extends LlmAdapter {
      * ⚠️ **只放宽冷却、不清 `remoteModels`**：目录已成功时 `ensureRemoteModels`
      * 本就直接返回，无需也不能重拉（重拉会把成功结果丢掉）。
      *
+     * ⚠️⚠️ **2026-10-18：上一条已改** —— 目录 TTL（`isCatalogFresh`）上线后，
+     *    本方法**不再复用「已定义就不重拉」那条判据**，而是**无视 TTL 强制重拉**。
+     *    理由：这里的语义是「用户/贴图门禁主动**重测图片能力**」，与
+     *    `ensureRemoteModels` 的「日常保鲜」是两条不同的路。实现是「置
+     *    `catalogAt = 0` + 复用既有取数路径」，**不是**另写一份拉取逻辑。
+     *    上面那条「只放宽冷却」的旧约束**仅对冷却期本身**仍然成立。
+     *
      * ⚠️ 冷却期整体仍以 `cooldownMs`（30s）为准 —— 放宽的是**图片门禁这一次**
      * 的评估，不是把闸门的冷却期改短，故其他调用方仍受 30 秒保护。
      */
     async refreshCatalog() {
         if (this.options.fetchRemoteModels === undefined)
             return;
-        if (this.remoteModels !== undefined)
-            return;
+        // ⚠️⚠️ **这里必须无视 TTL**（2026-10-18）：本方法的语义是「**用户主动重测
+        //    图片能力**」⇒ **强制重拉目录**，与 `ensureRemoteModels` 的「日常保鲜」
+        //    是**两条不同的路**。若也给它加 TTL，用户点「重测」会因 `remoteModels`
+        //    已定义而直接 return ⇒ **按钮变哑、零日志**（实测症状）。
+        //
+        // ⚠️ 强制重拉的实现是「**清时刻 + 复用既有取数路径**」，**不是**另写一份
+        //    拉取逻辑（那会让两条路的上游行为分叉）。
+        //
+        // ⚠️ **判据的等价性**：原判据是 `if (this.remoteModels !== undefined) return`
+        //    （有值就不重拉）。加 TTL 后「有值」的等价条件是
+        //    `remoteComplete && isCatalogFresh(catalogAt, now)` —— 本方法要**无视**
+        //    这两条中**任意一条**成立时的短路，故两条都不判，改清这两个字段。
+        //
+        // ⚠️⚠️ **当前形态下 `remoteComplete = false` 是「严格冗余」**（2026-10-18 复审核实）：
+        //    `ensureRemoteModels` 的短路是
+        //    `if (this.remoteComplete && isCatalogFresh(this.catalogAt, now)) return`
+        //    —— `&&` 要求**两腿同时为真**才 return，而 `catalogAt = 0` 时
+        //    `isCatalogFresh(0, …)` 第一行就 `return false` ⇒ **整条合取恒为假**
+        //    ⇒ 完整性腿为 true 也拦不住任何东西。
+        //    ⇒ 「只清 `catalogAt` 不够」或「前半腿会独立短路」这类说法**是错的**，
+        //    早期版本的注释就是这么写的，现已更正。
+        //
+        //    **两行都保留的理由不是「当前需要」，而是给假想的未来改动兜底**：
+        //    将来若有人把完整性判据从 `&&` 改成 `||`
+        //    （`if (isCatalogFresh(...) || this.remoteComplete) return`），
+        //    只清 `catalogAt` 时 `false || true` ⇒ 直接 return ⇒ 重测变哑。
+        //    ⚠️⚠️ **实测（反向验证 2026-10-18）：当前形态下删掉任一行该用例仍全绿**
+        //    —— 这是冗余的**已知代价**，不是疏漏。
+        //    ⇒ **删任一行前先跑反向验证**确认那条假想改动确实会发生，
+        //    并同步更新本注释（否则注释会开始描述一个不存在的必要性）。
+        this.catalogAt = 0;
+        this.remoteComplete = false;
+        // ⚠️ **冷却顺序与原实现保持等价**（原代码：**判冷却 → `reset()` → 拉取**）。
+        //    距上次尝试不足 `BUDDY_IMAGE_CAPABILITY_RETRY_MS` 时**照样直接 return**
+        //    —— 这条 10 秒节流是用户定的规则（issue IKJQ3M），不能被「重测」绕过：
+        //    目录端点超时上限 60s，无节流的「贴图就重拉」会把每次带图请求都放大成
+        //    一次远端拉取，那正是 `RemoteCatalogGate` 当初要挡的放大。
         const since = this.catalogGate.sinceLastAttemptMs();
         if (since !== undefined && since < BUDDY_IMAGE_CAPABILITY_RETRY_MS)
             return;
@@ -1248,6 +2276,20 @@ export class BuddyAdapter extends LlmAdapter {
      * ⚠️ **2026-10-08 Task 7c**：骨架（含上面这条理由）已上移到共享实现
      * `src/model-catalog.ts`，此处只剩委托。
      */
+    /**
+     * ★ **后台目录刷新器入口**（`src/index.ts` 的 `refreshOf` 调 `adapter.refresh?.()`）。
+     *
+     * ⚠️⚠️ 必须由适配器**显式转发** `catalog.refresh`：`ModelCatalog`（`model-catalog.ts`）
+     *    上的这个成员**不会**自动变成适配器的成员 —— `pruned()` 的 Proxy 只透传
+     *    **适配器自己的**成员（`dead-model-store.ts:748-749`）。
+     *    漏转发 ⇒ 刷新器「已武装」却对这家**空转**，且**零日志**（`refreshOf` 返回
+     *    `undefined` 时静默跳过 —— `index.ts` 的装配注释写着这件事）。
+     *    ⚠️ 与 `options.refresh`（HTTP 401 后的**凭据**重取）**不是同一件事**，
+     *    两者同名纯属巧合，**不得合并**。
+     */
+    async refresh() {
+        await this.catalog.refresh?.();
+    }
     listAllModels() {
         return this.catalog.listAllModels();
     }
@@ -1627,6 +2669,15 @@ export class BuddyAdapter extends LlmAdapter {
             // 必须让它和 401/403 一样进入下面的换号循环。
             const rejectedBody = await response.clone().text().catch(() => '');
             const contentRejected = isContentRejection(rejectedBody);
+            // ⚠️⚠️ **同一个渠道校验拒绝也会以 HTTP 403 出现**（2026-10-16 审计实测）。
+            //
+            // 上游同一族拒绝**同时用 400 与 403 两种状态码**（本文件上面就有成文记录：
+            // 11140「也回 HTTP 403」）。此前本档只接 400 与流内 200 ⇒ 403 形态落到
+            // 下面的 `所有账号均被拒绝（HTTP 403）` 分支，码为 `httpErrorCode(403)` = **`AUTH`**，
+            // 后果与本仓库既有红线**逐字相同**（`docs/agent-notes/client-ui.md` 的 IKLBSH）：
+            // **DSH 客户端会把 message 整个换成「API 密钥无效」** ⇒ 本档精心写的
+            // 「重发无效 / 停用该账号」一个字都到不了用户眼前，且 403 实测三个 token 全部有效。
+            const channelRejected = isChannelVerificationRejection(rejectedBody, response.status);
             if (contentRejected) {
                 // 记诊断日志（便于在插件日志里区分「换号」与「被策略拦下」），**不中断**换号，
                 // 同时把这个账号在该模型上冷却 —— 否则它下次仍排第一，每轮都要重撞一遍。
@@ -1654,13 +2705,62 @@ export class BuddyAdapter extends LlmAdapter {
             if (currentAccountId !== '')
                 triedAuth.add(currentAccountId);
             let refreshedCredential;
+            /**
+             * 续期/取号期间抛出的**已分类**异常（Gitee IKQ99X 的真缺陷）。
+             *
+             * ## 缺陷形态（2026-10-25 实测复现，逐格与 issue 一致）
+             *
+             * `resolveCredential` 在**候选被模型级限流筛空**时会抛 `QUOTA_EXCEEDED`
+             * （`credential-resolver.ts` 的 `throwIfAllRateLimited`，文案带解禁时刻）。
+             * 旧实现把这个异常与「续期网络抖动」一起 `catch` + `console.warn` 吞掉 ⇒
+             * `refreshedCredential` 保持 `undefined`；而限流账号已被 `getAvailableAccount`
+             * 过滤掉 ⇒ 换号循环第一跳即 `break`（`rotated` 恒 `false`）⇒ 落到下面的
+             * 兜底分支报：
+             *
+             * ```
+             * buddy: credential expired and refresh failed   (code: AUTH)
+             * ```
+             *
+             * 真实原因（限流 + 解禁时刻）被**完全掩盖**，文案把用户引向「重新登录」；
+             * 而 `AUTH` 又恰好是客户端会**整条替换文案**的那个码（「API 密钥无效」），
+             * 连这句错话都留不全（见 `docs/agent-notes/client-ui.md` 的 IKLBSH）。
+             *
+             * ## ⚠️ 为什么是「记住再抛」而不是当场抛
+             *
+             * 「续期失败**不致命**」这条设计仍然成立：换号仍有机会，单个账号故障不该让
+             * 整轮陪葬（`1077c34` 的依据）。故这里**继续**往下走换号循环——
+             * 只有当**换号也没救回来**（`rotated === false`）、即将落到 AUTH 兜底时，
+             * 才把这个更具体的异常抛出去。这样「能换号就换号」与「换不到就说真话」
+             * 两件事都不牺牲。
+             *
+             * ## ⚠️ 判据为什么只认这几个码
+             *
+             * | 码 | 为什么不能降级成 AUTH |
+             * |---|---|
+             * | `QUOTA_EXCEEDED` | 是**限流**（带解禁时刻），出路是等/换号，不是重新登录 |
+             * | `PERMISSION_DENIED` | 账号级拦截，出路是停用该账号（同一请求换号可用） |
+             * | `RATE_LIMIT` | 同上，且它在 harness 的可重试集合里，降级成 AUTH 会**停掉重试** |
+             * | `MISSING_CREDENTIAL` | 「没登录」与「登录过期」的实际出路不同（前者要去加账号） |
+             *
+             * ⚠️ **刻意不把 `AUTH` 本身列进来**：那与兜底文案同码，透传与不透传对用户
+             * 完全一样，列进来只会让本判据看起来覆盖更宽。
+             *
+             * ⚠️ **本判据只管「凭据解析/续期抛出的异常」，与 `httpErrorCode` 的
+             * 「401/403 先判、恒归认证类」那条铁律不冲突**：那条管的是**上游报文状态码**
+             * （网关故障常捎带余额词，让余额词改写分类会把真凭据失效说成额度用尽）；
+             * 这里管的是**本地池状态**（候选被限流筛空）—— 两者是不同的输入源，
+             * 不存在「同族判据两套口径」。**不要**因为本条去改 `httpErrorCode` 的优先级。
+             */
+            let credentialResolutionError;
             try {
                 await this.options.refresh();
                 refreshedCredential = await this.options.resolveCredential(options.model);
             }
             catch (error) {
                 // 刷新失败**不致命**：换号仍有机会，单个账号故障不该让整轮陪葬。
-                console.warn(`[${this.product.id}] 刷新当前账号凭据失败，改用换号重试：${String(error)}`);
+                credentialResolutionError = error;
+                console.warn(`[${this.product.id}] 刷新当前账号凭据失败，改用换号重试：`
+                    + `${error instanceof LlmError ? `[${error.code}] ${error.message}` : String(error)}`);
             }
             if (refreshedCredential !== undefined && refreshedCredential.access_token.length > 0) {
                 credential = refreshedCredential;
@@ -1682,6 +2782,14 @@ export class BuddyAdapter extends LlmAdapter {
              */
             let rejectionStatus = contentRejected ? authStatus : 0;
             let rejectionBody = contentRejected ? rejectedBody : '';
+            /**
+             * 换号途中是否撞到过「渠道校验」拒绝（见 `isChannelVerificationRejection`）。
+             * ⚠️ 与 `sawContentRejection` 一样**用入口值初始化**（首发那次也必须记账，
+             * 否则单账号池时专用出口不命中，退回 `AUTH` 误导文案）。
+             */
+            let sawChannelVerification = channelRejected;
+            let channelVerificationStatus = channelRejected ? authStatus : 0;
+            let channelVerificationBody = channelRejected ? rejectedBody : '';
             if ((response.status === 401 || response.status === 403) && this.options.accountPool !== undefined) {
                 for (;;) {
                     // modelId 参与过滤：正在限流期的账号不会被选中（与限流换号同语义）。
@@ -1708,12 +2816,53 @@ export class BuddyAdapter extends LlmAdapter {
                         // 刚换到就是这个账号被拦：同样要冷却，否则下一轮它还是第一候选。
                         await markPolicyBlockedAccount(this.options.accountPool, this.product.id, currentAccountId, options.model);
                     }
+                    // ⚠️ 渠道校验拒绝（403 形态）同样继续换号、且**刻意不写冷却**
+                    //（写 30 分钟账号级冷却在任何解释下都过重，理由见
+                    // `isChannelVerificationRejection` 的「为什么不写账号冷却」）。
+                    // 判据必须**先于**下面的「仅 401/403 才继续」检查，否则会被 break 掉。
+                    if (isChannelVerificationRejection(rotatedBody, response.status)) {
+                        sawChannelVerification = true;
+                        channelVerificationStatus = response.status;
+                        channelVerificationBody = rotatedBody;
+                    }
                     // 只有认证类失败（含安全策略拦截）才继续换号；
                     // 429/5xx/400 交给下面的既有分类逻辑。
                     if (response.status !== 401 && response.status !== 403)
                         break;
                 }
             }
+            /**
+             * 若「续期/取号」抛的是**已分类**异常，原样抛出；否则返回（让调用方走原兜底）。
+             *
+             * ⚠️⚠️ **抽成函数是因为它有**两个**调用点，不是洁癖**（对抗审计实测的真缺陷）：
+             * 第一版把判据内联在早退分支里，于是 `rotated === true`（换号循环真的换过号）
+             * 那条路径**完全看不到**这个异常 ⇒ 仍然报 `AUTH`。而 issue 描述的「限流账号被
+             * `getAvailableAccount` 过滤 ⇒ 第一跳 break」只是到达 `rotated === false` 的**其中一条**
+             * 路径；`rotated === true` 同样结构可达（池里还有别的号、但换过去也是 401/403）。
+             * 实测对照（同一份 resolveCredential，唯一差别是池里第二个号是否可解析）：
+             * | 条件 | 修前 | 修后 |
+             * |---|---|---|
+             * | `rotated = false` | `AUTH` | `QUOTA_EXCEEDED` |
+             * | `rotated = true` | `AUTH` | `QUOTA_EXCEEDED` |
+             *
+             * ⚠️ 透传时**必须补 `{ status: authStatus }`**（对抗审计发现的网关侧净回归）：
+             * `openai-gateway` 的 `failureToOpenAiError` 对**没有 `status`** 的 `LlmError` 走
+             * `upstreamStatusOrFallback(undefined)` ⇒ **502**。而修前那条 `AUTH` 带 `{ status: 401 }`
+             * ⇒ 网关给 401。502 在 OpenAI 客户端眼里**可重试**，而「所有账号在该模型上都在
+             * 限流」是确定性结论 —— 正是本仓库反复防的那种「白重试」。
+             * 实测三格：修前 `status=401 code=AUTH` / 修后 `status=502 code=QUOTA_EXCEEDED` /
+             * 补 status 后 `status=403 code=QUOTA_EXCEEDED` ⇒ 只有第三格两头都对。
+             *
+             * ⚠️ 用 `cause` 保留原异常（不丢栈）：`LlmError` 继承 `HarnessError`，
+             * `super(message, options)` 会把 `cause` 交给原生 `Error`。
+             */
+            const throwIfPreservedCredentialError = () => {
+                if (!(credentialResolutionError instanceof LlmError))
+                    return;
+                if (!PRESERVED_CREDENTIAL_ERROR_CODES.has(credentialResolutionError.code))
+                    return;
+                throw new LlmError(credentialResolutionError.message, credentialResolutionError.code, { status: authStatus, cause: credentialResolutionError });
+            };
             // 刷新既没产出凭据、也没换到别的账号：保留原有的可诊断报错。
             if (refreshedCredential === undefined && !rotated) {
                 // ⚠️ **必须先排除安全策略拦截**（补修，2026-09-28）：这条早退只看
@@ -1725,6 +2874,26 @@ export class BuddyAdapter extends LlmAdapter {
                 if (sawContentRejection) {
                     throw contentRejectionError(this.product.id, rejectionStatus === 0 ? authStatus : rejectionStatus, rejectionBody.length === 0 ? rejectedBody : rejectionBody, true);
                 }
+                // ⚠️ 同一早退分支也必须先排除**渠道校验拒绝**（与上面 11140 同款理由）：
+                // 单账号池 + 403 形态恰好必然走到这里，若只排 11140，就会把渠道校验
+                // 报成「credential expired and refresh failed」+ `AUTH`（UI 只显示
+                // 「API 密钥无效」，实测 token 有效）。
+                if (sawChannelVerification) {
+                    throw channelVerificationError(this.product.id, channelVerificationStatus === 0 ? authStatus : channelVerificationStatus, channelVerificationBody.length === 0 ? rejectedBody : channelVerificationBody, true);
+                }
+                // ⚠️⚠️ **续期/取号抛出的已分类异常必须原样抛出**（真实缺陷，Gitee IKQ99X）。
+                //
+                // 走到这里说明「续期没拿到凭据 + 换号也没换到」；若是
+                // `throwIfAllRateLimited` 因**候选被模型级限流筛空**抛的 `QUOTA_EXCEEDED`
+                // （文案带解禁时刻），把它降级成 `AUTH` 会：
+                // ① 丢掉解禁时刻与「无需重新登录」这句唯一出路；
+                // ② 落进客户端会**整条替换文案**的码（「API 密钥无效」）。
+                // 判据与理由见 `credentialResolutionError` 的注释。
+                //
+                // ⚠️ 位置在 `sawContentRejection` / `sawChannelVerification` **之后**：
+                // 那两个是**上游报文**证明的、更贴近本次失败的结论；本条是**本地池状态**
+                // 的结论，只在「上游没给出更具体的说法」时才用它。
+                throwIfPreservedCredentialError();
                 throw new LlmError(`${this.product.id}: credential expired and refresh failed`, 'AUTH', { status: authStatus });
             }
             if (response.status === 401 || response.status === 403) {
@@ -1742,6 +2911,22 @@ export class BuddyAdapter extends LlmAdapter {
                     // 免得「首发 401 + 途中 403/11140」报出一个对不上的 HTTP 401。
                     throw contentRejectionError(this.product.id, rejectionStatus === 0 ? authStatus : rejectionStatus, rejectionBody.length === 0 ? detail : rejectionBody, true);
                 }
+                // ⚠️ 渠道校验拒绝（403 形态）：报本档文案，**绝不**落到下面的
+                // 「所有账号均被拒绝」——那个码是 `httpErrorCode(403)` = `AUTH`，
+                // 客户端会把 message 换成「API 密钥无效」，把用户引向重新登录
+                //（实测三个 token 全部有效）。
+                // ⚠️ 顺序：放在 `sawContentRejection` **之后**（11140 语义更强、要写冷却，
+                // 且它在换号途中已按 `rejectionStatus` 记账）。
+                if (sawChannelVerification || isChannelVerificationRejection(detail, authStatus)) {
+                    throw channelVerificationError(this.product.id, channelVerificationStatus === 0 ? authStatus : channelVerificationStatus, channelVerificationBody.length === 0 ? detail : channelVerificationBody, true);
+                }
+                // ⚠️⚠️ 与上面的早退分支**共用同一判据**（真实缺陷，对抗审计实测）：
+                // 第一版只把它挂在 `refreshedCredential === undefined && !rotated` 里 ⇒
+                // **只要换号循环真的换过一次号（rotated = true），这个异常就永远不被看**，
+                // 请求照旧落成 `AUTH`。实测对照（同一份 resolveCredential，唯一差别是池里
+                // 第二个号是否可解析）：rotated=false ⇒ QUOTA_EXCEEDED；rotated=true ⇒ AUTH。
+                // ⇒ 判据必须提到**两个 AUTH 出口共用**处，且**只留一份实现**。
+                throwIfPreservedCredentialError();
                 throw new LlmError(`${this.product.id}: 所有账号均被拒绝`
                     + `（HTTP ${authStatus}${authStatus === 401 ? '，请在 Jet Hub 重新登录' : ''}）：${errorDetail(detail)}`, httpErrorCode(authStatus, detail), { status: authStatus });
             }
@@ -1749,6 +2934,189 @@ export class BuddyAdapter extends LlmAdapter {
         }
         if (!response.ok) {
             let errorText = await response.text().catch(() => '');
+            // ⚠️ 11140 安全策略拦截可能回 HTTP 400（2026-10-16 实测后端行为变更，
+            // 之前回 403）。403 在上面的 401/403 分支已处理；400 走到这里。
+            // 拦截按账号生效（同一请求在其他账号可 200），与 403 路径同一语义：
+            // 标记冷却 + 逐个换号，全部被拦才报 PERMISSION_DENIED。
+            if (response.status === 400 && isContentRejection(errorText)) {
+                console.warn(`[${this.product.id}] 账号 ${currentAccountId || '(current)'} 被安全策略拦截`
+                    + `（HTTP 400，code 11140），换号重试`);
+                await markPolicyBlockedAccount(this.options.accountPool, this.product.id, currentAccountId, options.model);
+                if (this.options.accountPool !== undefined) {
+                    const triedPolicy = new Set();
+                    if (currentAccountId)
+                        triedPolicy.add(currentAccountId);
+                    /**
+                     * 换号途中**最后一次**撞到的拦截与其响应体（报错时的 HTTP 状态与报文都取它）。
+                     *
+                     * ⚠️ 与 401/403 路径的 `rejectionStatus` / `rejectionBody` 是**同一纪律**：
+                     * 首发恒为 400，而换号后可能是 403 形态（上游两种都发），报「HTTP 400」
+                     * 与实际被拦的那一次对不上，排查时会被引向错误的方向。
+                     */
+                    let policyStatus = response.status;
+                    let policyBody = errorText;
+                    /**
+                     * 本轮是否撞到过安全策略拦截。**用入口值 `true` 初始化**（首发那一发
+                     * 本块已经判过 `isContentRejection`，它就是拦截）。
+                     *
+                     * ⚠️⚠️ 这条是**阻断级真缺陷**的修法（2026-10-17 对抗审计实测）：
+                     * 出口判据原先只读**循环结束后最后一次**的 `errorText`，而循环里的
+                     * 401/403/饱和 `continue` 腿都会把 `errorText` 刷成别的内容 ⇒ 已记账的
+                     * `policyStatus` / `policyBody` 变成死变量，11140 这个真因被整段丢弃。
+                     *
+                     * 实测（AT1 `400/11140` → AT2 `403 forbidden quota`，池耗尽）：
+                     * | | 修复前 | 修复后 |
+                     * |---|---|---|
+                     * | 错误码 | `AUTH` | `PERMISSION_DENIED` |
+                     * | message | 「buddy: forbidden quota」 | 「buddy: 全部账号均被服务端安全策略拦截…」 |
+                     *
+                     * ⚠️ `AUTH` 正是本仓 IKLBSH 红线：**DSH 客户端会把 message 整个换成
+                     * 「API 密钥无效」** ⇒ 用户既看不到「根因是账号被安全策略拦截、该去
+                     * Jet Hub 停用它」这句唯一出路，也会被引向重新登录（实测 token 全有效）。
+                     *
+                     * ⚠️ 与 401/403 路径的 `sawContentRejection` 是**完全同型**的写法 ——
+                     * 那条同样是用入口值初始化，目的就是堵这个洞；本块先前漏了这腿。
+                     */
+                    let sawPolicyRejection = true;
+                    for (;;) {
+                        const next = await this.options.accountPool.getAvailableAccount(this.product.id, options.model, triedPolicy);
+                        if (!next || triedPolicy.has(next.entry.id))
+                            break;
+                        triedPolicy.add(next.entry.id);
+                        credential = next.credential;
+                        currentAccountId = next.entry.id;
+                        response = await this.send(credential, body, options);
+                        if (response.ok) {
+                            yield* this.consumeSse(response, options, currentAccountId);
+                            return;
+                        }
+                        errorText = await response.text().catch(() => '');
+                        // ⚠️⚠️ 判据**不能**绑状态码（2026-10-17 审计实测的真缺陷）。
+                        //
+                        // 上游这一族拒绝**同时用 400 与 403 两种状态码**（本文件 401/403 分支的
+                        // 注释就记录着「11140 也回 HTTP 403」）。原实现写死 `status === 400`，
+                        // 于是「400 起 → 换号撞到 403 形态拦截」会在此 `break`，把池里
+                        // **后面那些完全可用的账号**直接判死。
+                        //
+                        // 实测（真实池同形替身，池 = 3 个账号）：
+                        // | 账号 | 响应 | 修复前 | 修复后 |
+                        // |---|---|---|---|
+                        // | AT1 | `400` + 11140 | 发起 | 发起 |
+                        // | AT2 | `403` + 11140 | **break，不试** | 继续换号 |
+                        // | AT3 | `200` 可用 | ❌ **从未被试**，报 `AUTH` 失败 | ✅ 成功 |
+                        //
+                        // ⇒ 这正是本块要修的那类故障（池里有可用账号却用不上）的**镜像版**：
+                        // 它自己又造了一遍，且错误码 `AUTH` 会被 DSH 客户端换成「API 密钥无效」
+                        // （`docs/agent-notes/client-ui.md` 的 IKLBSH 红线）⇒ 实测 token 全有效
+                        // 却把用户引向重新登录。
+                        if (isContentRejection(errorText)) {
+                            policyStatus = response.status;
+                            policyBody = errorText;
+                            sawPolicyRejection = true;
+                            console.warn(`[${this.product.id}] 换号后账号 ${currentAccountId || '(current)'} 被安全策略拦截`
+                                + `（HTTP ${response.status}，code 11140），继续换号：`
+                                + `${errorDetail(errorText).slice(0, 200)}`);
+                            // 刚换到就被拦：同样要冷却，否则下一轮它还是第一候选。
+                            await markPolicyBlockedAccount(this.options.accountPool, this.product.id, currentAccountId, options.model);
+                            continue;
+                        }
+                        // ⚠️⚠️ 换号途中撞到 **401/403**（凭据真失效）**必须继续换号**：
+                        // 它按账号生效，与 11140 无关；而池里后面的账号完全可用，break 会把
+                        // 整轮判死。与 401/403 路径的换号循环、以及限流路径的「② 认证类失败」
+                        // 分支**保持同一语义**（三处都只把「非账号级错误」当 break 理由）。
+                        //
+                        // 实测同上：AT1 `400/11140` → AT2 `401` → AT3 `200`，
+                        // 修复前只发 2 次即报 `AUTH`，AT3 从未被试。
+                        if (response.status === 401 || response.status === 403) {
+                            console.warn(`[${this.product.id}] 换号后账号 ${currentAccountId || '(current)'} 认证失败`
+                                + `（HTTP ${response.status}），继续换号`);
+                            continue;
+                        }
+                        // ⚠️⚠️ **模型饱和（14003 / 429）也必须换号**，且**刻意不写冷却**
+                        //（2026-10-17 第一轮独立审计实测的真缺陷）。
+                        //
+                        // 下方那条饱和分支的处置是「留在本账号退避重试、绝不换号」，它的
+                        // 前提写在饱和分支的注释里：「饱和是模型级，池里其它账号会撞同一堵墙」。
+                        // ⚠️ 但那个前提在**上游按账号做过负载均衡**时未必成立，而本块恰恰证明
+                        // 11140 是**按账号**生效的 ⇒ 同一模型下不同账号的繁忙度可以不同。
+                        //
+                        // 实测（AT1 `400/11140` → AT2 `429/14003` → AT3 完全可用）：
+                        // | 观测 | 走饱和分支（修复前） | 换号（修复后） |
+                        // |---|---|---|
+                        // | 发过的凭据 | `AT1, AT2, AT2, AT2`（**AT3 从未被试**） | 逐个换号 |
+                        // | 结果 | ❌ `RATE_LIMIT`「换账号无效」 | ✅ 用上 AT3 |
+                        //
+                        // ⇒ 修复前会给用户一条**错误的行动指引**（「换账号无效，请改用其它模型」），
+                        // 而池里明明有可用账号 —— 正是本块要消灭的那类故障。
+                        //
+                        // ⚠️ **不写冷却**：饱和与 11140 不同，它是**模型级**的，写 30 分钟账号级
+                        // 冷却会把一批好账号封死（饱和分支的注释正是为此反对复用限流标记）。
+                        // 「换个号也许能用」只需 try 一次，不必留下持久痕迹。
+                        //
+                        // ⚠️⚠️ **判据本体已做结构化降级，这里不得再加 `!isRateLimited` 护栏**
+                        //（2026-10-17 对抗审计实测的教训，两次都踩过）。
+                        //
+                        // 上游的**账号额度限流**（`code: 6004`）正文里可能带「请求量饱和」
+                        // 一类措辞，与模型饱和 `14003` 在**文案兜底**上无法区分。
+                        // 曾在这里加 `&& !isRateLimited(...)` 想把它们分开，结果：
+                        // | 报文 | `isRateLimited` | 结果 |
+                        // |---|---|---|
+                        // | `429/14003`（真饱和） | **恒真**（判据对 429 无条件返回 true） | ❌ 被护栏挡掉，退回下方饱和分支 ⇒ 上一轮修的「饱和也换号」**完全失效** |
+                        // | `429/6004`（额度限流） | 恒真 | ✅ 被挡住（这本是对的方向） |
+                        // ⇒ 一条护栏想拦两件事，实际只拦对了那个**本来就不该走这条腿**的，
+                        // 反而把**该走的**也拦了 —— 判据太宽时，正确的修法是**收窄判据**
+                        // （`isModelSaturationError` 本体的结构化降级），不是在调用点打补丁。
+                        if (isModelSaturationError(response.status, errorText)) {
+                            console.warn(`[${this.product.id}] 换号后模型 ${options.model} 请求量饱和（14003），`
+                                + `换号重试（不写冷却：饱和是模型级的，换号只是「也许这个号不忙」）`);
+                            continue;
+                        }
+                        // 其余（限流 / 上下文超限 / 渠道校验 …）：交给下面的既有分类逻辑，
+                        // 那里的换号循环与错误码各自有正确语义（不重复换号，见下方注释）。
+                        break;
+                    }
+                    // ⚠️⚠️ 出口判据（2026-10-17 对抗审计实测的阻断级缺陷的修法）。
+                    //
+                    // 循环里的 401/403/饱和 `continue` 腿都会把 `errorText` 刷成别的内容，
+                    // 于是出口若只读最后一次响应，已记账的 11140 根因会被整段丢弃。
+                    // 实测（`AT1 400/11140 → AT2 403 forbidden quota`，池耗尽）：
+                    //   错误码 `AUTH`、message「buddy: forbidden quota」—— **11140 消失**。
+                    // 而 `AUTH` 正是本仓 IKLBSH 红线：**DSH 客户端把 message 整个换成
+                    // 「API 密钥无效」** ⇒ 用户看不到「根因是账号被安全策略拦截、该去 Jet Hub
+                    // 停用它」这句唯一出路（实测 token 全部有效）。
+                    //
+                    // ⚠️⚠️ 但判据**不能**只看 `sawPolicyRejection`（那是另一个方向的错）：
+                    // 末位若是**限流**，它有各自正确的下游语义（写标记 + 换号 + 「所有账号均受限」），
+                    // 此时误报成「全部账号均被安全策略拦截」反而是说谎。实测（修复过程中的回归）：
+                    // `AT1 400/11140 → AT2 429/6004 额度限流` 误报「全部账号均被拦截」，
+                    // 且额度标记丢失。
+                    //
+                    // ⇒ 判据是「**撞过拦截，且末位属于「message 会被客户端吞掉」的那一档**」：
+                    // | 末位 | 处理 | 理由 |
+                    // |---|---|---|
+                    // | 仍是拦截 | 报拦截 | 原语义 |
+                    // | `401` / `403` | **报拦截**（保留 11140 根因） | 它们的码会被客户端吞成「API 密钥无效」 |
+                    // | 限流 / 饱和 / 上下文超限 / 渠道校验 | 交给下方既有逻辑 | 各有正确语义与换号循环 |
+                    //
+                    // ⚠️ 与 401/403 路径的 `sawContentRejection` 同源：那条同样是用入口值
+                    // 初始化、且同样优先于 AUTH 出口，目的就是不让 11140 被认证类错误吞掉。
+                    const lastIsAuthFailure = response.status === 401 || response.status === 403;
+                    if (!response.ok && sawPolicyRejection
+                        && (isContentRejection(errorText) || lastIsAuthFailure)) {
+                        throw contentRejectionError(this.product.id, policyStatus, policyBody, true);
+                    }
+                }
+                // 单凭据路径（无账号池可换）：如实报「当前账号」。
+                //
+                // ⚠️ 必须走**单凭据出口**（`rotated: false` ⇒ 文案是「当前账号被…」）而不是
+                // 谎称「全部账号均…（已逐个换号重试）」—— 没有池就没有换号发生过，
+                // 旧写法把 `rotated` 绑成「池是否配置」，在「有池但换号后变成非拦截错误」
+                // 那条路径上也会谎报（该路径已由上面的出口覆盖，但两出口并存时必须各自诚实）。
+                if (!response.ok && response.status === 400 && isContentRejection(errorText)) {
+                    throw contentRejectionError(this.product.id, 400, errorText, false);
+                }
+                // 换号后变成其他错误（限流 / 饱和 / 认证）：继续走下面的既有逻辑
+            }
             // ⚠️⚠️ **模型饱和必须**先于**限流分支判定**（真实缺陷，2026-10-05）
             //
             // `14003 model busy` **也是 HTTP 429**，而 `isRateLimited` 对 429
@@ -1808,7 +3176,14 @@ export class BuddyAdapter extends LlmAdapter {
             // ⚠️ 必须把 `response.status` 一并传入：服务端可能返回**空体**的 429，
             // 而只按正文判定时对空体恒为 false → 整段换号逻辑被跳过，本可自愈的限流
             // 被直接抛给用户（表现为「池里明明还有可用账号，插件却报错且不换号」）。
-            if (this.options.accountPool && isRateLimited(errorText, response.status)) {
+            // ⚠️⚠️ 「渠道校验」拒绝（`11128 conversation id missing`）**也按账号生效**，
+            // 必须与限流一样进入本换号循环（2026-10-16 真实报障：整条渠道全灭）。
+            //
+            // 它**不满足** `isRateLimited`（实测对真实报文返回 `false`），故修复前落到
+            // 下面「其余非限流错误 ⇒ 换号无益 ⇒ 直接抛」那一支，池里其余可用账号
+            // 一个都试不到；而被拒账号恰是池里 workbuddy 首位 ⇒ 每轮都撞它。
+            const channelRejected = isChannelVerificationRejection(errorText, response.status);
+            if (this.options.accountPool && (isRateLimited(errorText, response.status) || channelRejected)) {
                 const tried = new Set();
                 if (currentAccountId)
                     tried.add(currentAccountId);
@@ -1829,6 +3204,30 @@ export class BuddyAdapter extends LlmAdapter {
                 let contentRejectionStatus = 0;
                 let contentRejectionBody = '';
                 /**
+                 * 换号途中是否撞到过「渠道校验」拒绝（`11128 conversation id missing`）。
+                 *
+                 * 与 `sawContentRejection` **分开计**：两者虽然都是「全部试完要报专门提示」，
+                 * 但文案、冷却语义都不同（本档不写冷却），合并会让报错口径漂移。
+                 *
+                 * ⚠️⚠️ **必须用入口的 `channelRejected` 初始化，而不是 `false`**
+                 *（真实缺陷，2026-10-16 审计实测；与 401/403 路径的
+                 * `let sawContentRejection = contentRejected` 是**同一写法**）。
+                 *
+                 * 循环内的那一档只在「**换到下一个账号**后又被拒」时置位，故从 `false`
+                 * 起算会漏掉**首发**那一次失败 —— 而入口 `channelRejected` 早已算出它。
+                 * 后果（实测）：池里没有第二个候选时（单账号池，或候选全被限流标记
+                 * 过滤掉），循环第一跳就 `break`，两个专用出口一个都不命中，直接落到
+                 * 下面的「所有账号均受限，请稍后再试」+ `QUOTA_EXCEEDED` ——
+                 * **本档存在的理由被自己的实现原样推翻**（把渠道校验误报成额度受限，
+                 * 让用户白等一个重置时刻）。
+                 *
+                 * 实测对照：`[acct-1]` 单账号池被拒 ⇒ 修复前 `QUOTA_EXCEEDED`；
+                 * 用 `channelRejected` 初始化后 ⇒ 走本档出口 `PERMISSION_DENIED`。
+                 */
+                let sawChannelVerification = channelRejected;
+                let channelVerificationStatus = channelRejected ? response.status : 0;
+                let channelVerificationBody = channelRejected ? errorText : '';
+                /**
                  * 已经写过限流标记的账号：避免同一个账号被重复记账（换号途中可能取回它）。
                  * 标记是「账号 × 模型」的快照，写两次没有意义，日志也会重复。
                  */
@@ -1846,11 +3245,44 @@ export class BuddyAdapter extends LlmAdapter {
                     // ⚠️ `parseRateLimitError` 仍然优先：它能把**服务端声明的**真实重置
                     // 时刻抠出来（有就绝不用兜底的 1 小时）。换号后 `errorText` 可能是
                     // 11140 等非限流体 —— 那种情况下面①的分支会先 continue，走不到这里。
+                    //
+                    // ⚠️⚠️ **额度耗尽（14018 Credits exhausted）必须走自然日终点**
+                    // （真实缺陷，Gitee IKQ6HJ，2026-10-25 修）：它与频率限流共用 HTTP 429，
+                    // 但恢复方式完全不同 —— 上游报文里**一个时间字段都没有**（实测原文：
+                    // `{"error":{"data":{"code":14018,"msg":"Credits exhausted. Please visit
+                    // the link below to purchase add-on packs…","requestId":"5f0cfd4f-…"}}}`），
+                    // 故 `RESET_TIME_PATTERN` 必然不命中 ⇒ 落到 `RATE_LIMIT_FALLBACK_MS`（1h）
+                    // ⇒ **每小时被重新选中一次、必然再失败一次**，用户看到的是「面板说可以
+                    // 用了，一试又不行」，而真实出路是等次日配额或充值。
+                    //
+                    // 判据与终点都取共享层（`isCreditExhausted` / `explicitRateResetAtMs` /
+                    // `creditExhaustedResetAtMs`），**不在本文件另写一份** ——
+                    // `account-probe.ts` 的重测回写要的是**同一个**时刻。
+                    // 服务端若真给了时刻仍以它为准（`explicitRateResetAtMs` 优先）。
+                    //
+                    // ⚠️⚠️ **饱和必须排除在记账之外**（2026-10-17 对抗审计实测的真缺陷）。
+                    //
+                    // 本循环**每轮开头**都给当前账号记限流标记，而 `isRateLimited` 对 429
+                    // **无条件返回 true** —— 于是「换号途中撞到 14003 模型饱和」的账号会被
+                    // 写上**整 1 小时**的「限额重置」标记。
+                    //
+                    // 实测（AT1 `429/14002` 额度限流 → AT2 `429/14003 模型饱和` → AT3 `200`）：
+                    // 标记 = `[acc-1: 60 分钟, acc-2: 60 分钟]` —— 而 acc-2 是**模型级**饱和，
+                    // 一次瞬时繁忙不该让账号被藏一小时。
+                    //
+                    // ⚠️ 这与本文件下方那条「饱和必须先于限流分支判定，否则整池锁死」的守卫
+                    // **直接矛盾**：那道守卫只在**循环外**生效（决定是否进入限流分支），
+                    // 而换号**途中**新撞到的饱和会从这条记账腿漏过去 —— 同一缺陷的
+                    // 「限流路径版本」。`8294b0b` 修了 400 路径那一处，本条是它的对偶。
                     if (currentAccountId !== '' && isRateLimited(errorText, response.status)
+                        && !isModelSaturationError(response.status, errorText)
                         && !rateLimitMarked.has(currentAccountId)) {
                         rateLimitMarked.add(currentAccountId);
                         const parsed = parseRateLimitError(errorText, options.model, response.status);
-                        await this.options.accountPool.updateModelRateLimit(currentAccountId, parsed?.modelId ?? options.model, parsed?.resetTimeMs ?? Date.now() + RATE_LIMIT_FALLBACK_MS);
+                        const resetAtMs = isCreditExhausted(errorText)
+                            ? explicitRateResetAtMs(errorText) ?? creditExhaustedResetAtMs()
+                            : parsed?.resetTimeMs ?? Date.now() + RATE_LIMIT_FALLBACK_MS;
+                        await this.options.accountPool.updateModelRateLimit(currentAccountId, parsed?.modelId ?? options.model, resetAtMs);
                     }
                     // 取下一个未尝试过的可用账号（同样按本产品 id 过滤，否则 WorkBuddy
                     // 永远取不到候选账号，限流后无法自动切换）。
@@ -1886,21 +3318,71 @@ export class BuddyAdapter extends LlmAdapter {
                         await markPolicyBlockedAccount(this.options.accountPool, this.product.id, currentAccountId, options.model);
                         continue;
                     }
+                    // ⚠️⚠️⚠️ **③ 必须排在 ② 之前**（2026-10-18 独立审计实测的真缺陷，本轮修）。
+                    //
+                    // 上游对渠道校验**同时用 400 与 403**，而 ② 把 403 **全部**短路 ⇒
+                    // ③ 在 403 形态上**一次都不会执行** ⇒ `sawChannelVerification` 置不了位。
+                    //
+                    // ## 触发条件（必须**从限流进来**，否则复现不了 —— 这里最容易搞错）
+                    //
+                    // 只有入口 `isRateLimited || channelRejected` 为真才进这个换号循环。
+                    // ⚠️ 若入口**本身就是**渠道校验（400/403），`channelRejected` 为 `true`
+                    // ⇒ `sawChannelVerification` **已由入口值初始化** ⇒ ③ 一次不跑也照样
+                    // 出口正确。⇒ 「混合 400/403 池」复现**全部通过**，就是这个原因。
+                    //
+                    // 真实触发：**入口 429 限流**（`channelRejected=false`）→ 循环内某账号
+                    // 回 **403 形态**渠道校验：
+                    // | 入口 429，循环内 | 修复前 | 现版 |
+                    // |---|---|---|
+                    // | AT2/AT3 = **403** 渠道校验 | ❌ `QUOTA_EXCEEDED`「所有账号均受限」 | ✅ `PERMISSION_DENIED` |
+                    // | AT2/AT3 = **400** 渠道校验 | ✅ 已正确 | ✅ |
+                    //
+                    // ## 后果（正是本组注释写「必须先于 QUOTA_EXCEEDED」要消灭的形态）
+                    //
+                    // 用户看到「模型 X 所有账号均受限，请稍后再试」⇒ 以为在限额、**白等一个
+                    // 根本不存在的重置时刻**；而真实出路是「换号 / 停用该账号 / 换 provider」。
+                    //
+                    // ⚠️ **顺序纪律与 400 路径那条换号循环一致**：那里把 `isContentRejection`
+                    // 放在 401/403 腿**之前**（可观察的顺序纪律），本循环原先却相反 ⇒
+                    // 两条路径**判据同型、顺序相反**。本轮对齐。
+                    if (isChannelVerificationRejection(errorText, response.status)) {
+                        sawChannelVerification = true;
+                        channelVerificationStatus = response.status;
+                        channelVerificationBody = errorText;
+                        // ⚠️ 日志**不写死** `msg` 那句措辞：实测它在同一 code 下有多种形态
+                        //（`conversation id missing` / `request illegal` / …），写死会让日志
+                        // 与上游实际回报不符、误导排查。原始报文在后面的 detail 里。
+                        console.warn(`[${this.product.id}] 账号 ${currentAccountId || '(current)'} 未通过渠道校验`
+                            + `（HTTP ${response.status}，code 11128），继续换号`
+                            + `（不写冷却）：${errorDetail(errorText).slice(0, 200)}`);
+                        continue;
+                    }
                     // ② 认证类失败：该账号凭据不可用，与路径 A 一致继续换号。
+                    // ⚠️ 排在本档（③）**之后**：渠道校验的 403 形态必须由 ③ 认领，
+                    // 否则会被这里短路 ⇒ 出口谎报「所有账号均受限」（见上）。
                     if (response.status === 401 || response.status === 403)
                         continue;
-                    // ③ 其余非限流错误：请求本身有问题，换号无益，按原错误分类抛出。
+                    // ④ 其余非限流错误：请求本身有问题，换号无益，按原错误分类抛出。
                     //    ⚠️ 同样必须传状态码：否则空体 429 会被当成「非限流」而在换号
                     //    途中**中断**，池里其余可用账号一个都试不到。
                     if (!isRateLimited(errorText, response.status)) {
                         // 新账号失败但不是限流：按原错误分类抛出，不要再吞成"均受限"
                         throw new LlmError(`${this.product.id}: ${errorDetail(errorText)}`, httpErrorCode(response.status, errorText), { status: response.status });
                     }
-                    // ④ 仍是限流 → 继续下一轮（重置时间已在上方记录）。
+                    // ⑤ 仍是限流 → 继续下一轮（重置时间已在上方记录）。
                 }
                 // 全部候选试完：若途中撞过安全策略拦截，报专门的提示（指向账号而非内容）。
                 if (sawContentRejection) {
                     throw contentRejectionError(this.product.id, contentRejectionStatus || 403, contentRejectionBody, true);
+                }
+                // 全部候选都未通过渠道校验：报专门的「按账号 + 重发无效」提示。
+                // ⚠️ 必须先于下面的 QUOTA_EXCEEDED —— 否则会把渠道校验误报成「全部账号受限」，
+                // 让用户以为在限额、白等一个重置时刻。
+                //
+                // ⚠️ 本出口靠 `sawChannelVerification` 用**入口的 `channelRejected`** 初始化
+                // 才覆盖「首发即被拒且没有第二个候选」的形态（单账号池）。见该变量的注释。
+                if (sawChannelVerification) {
+                    throw channelVerificationError(this.product.id, channelVerificationStatus || 400, channelVerificationBody, true);
                 }
                 throw new LlmError(`${this.product.id}: 模型 ${options.model} 所有账号均受限，请稍后再试`, 'QUOTA_EXCEEDED');
             }
@@ -1934,6 +3416,151 @@ export class BuddyAdapter extends LlmAdapter {
         // 注意 X-Product 是**归属名**（产品名），不是部署类型 —— 历史实现发成
         // `SaaS` 导致后台归因不到产品。
         headers.set('X-Agent-Purpose', 'conversation');
+        // ⚠️ `X-Conversation-*` 三头 —— **准入必要性**在**多数账号**上已被实测证伪，
+        // 但在**特定账号**上是**真的**（2026-10-16；后者见 IKM7SG）。
+        //
+        // ## 背景（真实报障 issue IKM73W）
+        // workbuddy 渠道曾**整条不可用**，每轮报
+        // `workbuddy: 请求被拦截，请重新发送 conversation id missing`（INVALID_REQUEST）。
+        // 上游原始报文（HTTP 400）：
+        // ```json
+        // {"code":11128,"msg":"conversation id missing",
+        //  "displayMsg":{"zh":"请求被拦截，请重新发送"},
+        //  "displayTips":{"zh":"这次调用没通过渠道校验，可能不是官方客户端发出的。请用官方版本重新发送。"}}
+        // ```
+        //
+        // ## ⚠️⚠️ 本注释的两版结论**都不完整** —— 真相是「**按账号**」（IKM7SG）
+        //
+        // - **第一版**（原注释）：「三头必须同时存在，缺任一即 400/11128」——
+        //   这是在**单账号**上验证后推广到全局，属**过度概括**；
+        // - **第二版**（此前改正过的）：「三头**不是**准入必需」—— 维护者约 90 次
+        //   真机复测得出，方向对，但**同样是全局断言**。
+        //
+        // **2026-10-16 IKM7SG 用本仓库自己的 e2e（`pnpm test:e2e:buddy-conv`）、
+        // 只换 `WB_REF`，把边界定位到了「账号」这个控制变量**：
+        //
+        // | `WB_REF` | 基线（全头） | 删任一枚 | 三枚全删 |
+        // |---|---|---|---|
+        // | `D87606B1`（IKM7SG） | ✅ 200 | ✅ 200 | ✅ 200 |
+        // | **`66E05E7C`（IKM7SG）** | ✅ 200 | ❌ **400/11128** | ❌ **400/11128** |
+        // | 3 个 workbuddy 账号（2026-10-17 复验） | ✅ 200 | ✅ 200 | ✅ 200 |
+        // | **另 2 个 workbuddy 账号（2026-10-17 复验）** | ✅ 200 | ❌ **400/11128** | ❌ **400/11128** |
+        //
+        // ⇒ **下面那张 14/14 消融表与 IKM7SG 的分叉表都对，差的是账号。**
+        //    准确表述是：**「在多数账号上不是；在特定账号上是」**（2026-10-17 复验为 3/5 与 2/5）。
+        //    ⚠️ 下表的结果**只在参与实验的那个账号上成立** —— 别再加「全局」二字。
+        // ⚠️⚠️ **2026-10-17 复验的重大修正**：这些被拒格子的 `msg` 实测是
+        // **`request illegal`**，不是 `conversation id missing`（后者本机零命中）。
+        //   而 `request illegal` **与 11140 共用** ⇒ 本档与 `isContentRejection`
+        //   必须**同时**按 `code` 精确值收窄，详见 `isChannelVerificationRejection`。
+        //
+        // | 实验 | 规模 | 结果（**在参与实验的那个账号上**） |
+        // |---|---|---|
+        // | 适配器 A/B（剥三头 vs 带三头） | 5 模型 × 各 5 次 | 剥三头 **15/15 成功**，两组**完全一致** |
+        // | **逐枚消融 14 枚头** | 每枚单独删一次 | **14/14 全部仍 200**（含这三枚） |
+        // | 裸 fetch 头形态矩阵 | 5 种头形态 × 2 种 system × 3 次 | 干净 system **全 200**；带指纹 system **全 400** ⇒ **变量是 system，不是头** |
+        // | 真模型线 × 请求形状 | 6 模型 × 4 形状 = 48 格 | 三头与响应状态**零关联** |
+        // | 逐级剥头阶梯（连 UA/鉴权/身份头都删） | 8 级 | **全 200** |
+        //
+        // ⇒ **在该账号上，同一份请求连鉴权头、身份头、UA 全删掉，上游照样回 200。**
+        // `conversation id missing` 这句 msg 在上述全部实验里**零次复现**
+        // （同批实测复现了另两句：`first message is not system prompt`、
+        // `Illegal API invocation from an unapproved channel` —— 见
+        // `src/openai-gateway/tencent-fingerprint.ts` 与 `src/account-probe.ts`）。
+        //
+        // ## ⚠️ IKM7SG 在「要求三头」那个账号上穷举出的**判据**
+        // `X-User-Id` / `X-Session-ID` / `X-Agent-Intent` / `X-Request-Id` / `X-Trace-Id`
+        // / `X-Client-Platform` **全 400**（都不是判据）；**仅补一枚** Conv 头仍 400；
+        // **三枚同值 / 各自不同 / 填 `abc-123`** 全 200（**不校验值语义、不要求三者一致**）；
+        // **三枚填空串** 400；带三头 → 紧接无头 `200→400` ⇒ **逐请求**判定
+        //（**非账号封禁、非状态粘性**）；换 system / 换最简 body 仍 400（**内容无关**）。
+        // ⇒ 判据 = 「**三枚 Conv 头同时存在且非空**」，**但只对该账号生效**。
+        //
+        // ⚠️ **为什么只有该账号：IKM7SG 明确未定论。** 唯一可观测差异是那个账号的 token
+        // 缺 `name`/`family_name`/`given_name`（1321 vs 1414 字符，即一次未走完整 profile
+        // 流程的凭据）—— **n=1、无因果证据、仅作线索**。别据此写断言。
+        //
+        // ## ⚠️ 本实现**满足**该判据（三条出站路径都发三枚非空头）
+        // 主链路（下面三行）、`buddy-growth.ts` 的两条旁路（`conversationHeaders`）、
+        // 以及探测路径（复用 `BuddyAdapter.stream()`）**都发三枚非空且同值的头**。
+        // ⇒ 对「要求三头」那类账号，本实现本就通得过。
+        //
+        // ## 上游究竟怎么用这三枚头
+        // **回显**。实测三轮连发，回包 `"id"` 的前缀 **3/3 命中**所发的三头值；
+        // 另一次把三头填 `abc-123`，上游直接回 `"id":"abc-123"`。
+        // ⇒ 上游认得这三枚头，但**至少在那个账号上**只拿它当 **completion id 的种子**
+        // 与**准入判据并存**（IKM7SG：既回显种子、又要求三枚齐全）
+        // —— 故「从机制上不可能是闸门」这句**对多数账号成立、对那个账号不成立**。
+        //
+        // ## ⚠️ 为什么保留这三行（理由已按 IKM7SG 更新）
+        // 1. **对「要求三头」那类账号是必需的**（IKM7SG 实测：三枚齐全才 200）——
+        //    这是**硬需求**，不再是「无害所以留着」。
+        // 2. **对多数账号无害**（无三头也 200，两组实测完全一致）。
+        // 3. **贴近官方客户端形态**：官方客户端确实带这三枚
+        //    （`docs/workbuddy-native-search-research.md` §4.4 有真值表；§4.5 只是
+        //    常量名表、不含取值），补上让后台归因与上游行为对齐。
+        // 4. **修掉报错文案的误导性**：见下方「⚠️ 触发条件的现状」。
+        // ⚠️ 结论：**三条出站路径都必须继续发三枚非空头** —— 删任何一枚都会让
+        //    「要求三头」的账号整条渠道不可用（IKM7SG 的 14/14 消融数据**不能**用来
+        //    证明「可以删」，那批数据只在**不要求三头**的账号上取得）。
+        //
+        // ## ⚠️ 触发条件的现状（本条已按 2026-10-17 独立复验重写）
+        // 该拒绝的**成因**已定位到字段级：「三枚 Conv 头同时存在且非空」，
+        // **但仅对特定账号生效**（IKM7SG；本机复现为 2/5）。
+        // - 对**多数账号**：三头非必需，缺了也 200；
+        // - 对**特定账号**：三头**必需**，缺任一枚即 400/11128。
+        // ⚠️ **为何只有那些账号、生效范围如何演进，IKM7SG 明确未定论**；本轮复验
+        // **未获支持**那条「缺 `name` 系列 claim」的线索（本机 5 个账号 claim 键集
+        // 完全相同，两个受限账号互不相同）⇒ 别据此写断言。
+        // ⚠️⚠️ **报文里的 `msg` 其实是 `request illegal`**（2026-10-17 实测），
+        // `conversation id missing` 本机零命中 ⇒ 见文件头 `isChannelVerificationRejection`。
+        // 若用户再次看到这类报错：**先取失败报文的 `requestId`**（本档出口已带上它），
+        // 并**优先核对「那个账号」**——不要按「内容」方向排查（实测内容无关）。
+        //
+        // ## ⚠️⚠️ 语义：三头是**逐请求一次性 id**，不是「会话身份」
+        // 本实现的 `conversationId` 在**每次 `send()` 调用时新生成**
+        // （`send()` 当前有 **6** 个调用点，含换号重试与饱和退避重试；2026-10-18 审计
+        //   实测原注释写「5 个」已漂移，结论「逐请求新值」不受影响）⇒ **零轮稳定性**。
+        // 官方真值对照（§4.4）：
+        // | 头 | 官方取值 | 本实现 | 是否对齐 |
+        // |---|---|---|---|
+        // | `X-Conversation-ID` | `context.id`（**会话稳定**） | 逐请求新 UUID | ❌ **语义相反** |
+        // | `X-Conversation-Request-ID` | `context.conversationRequestId \|\| ""`（**官方默认空串**） | 逐请求新 UUID | ❌ 不一致 |
+        // | `X-Conversation-Message-ID` | 32 位无横线 uuid（**逐消息**） | 逐请求新 UUID | ✅ 同型 |
+        // 只有 Message-ID 对得上。**一个每轮都变的值在语义上不是会话身份** ——
+        // 原注释那句「混用会把缓存分桶与会话身份绑死」因此不成立（复用 `sessionId`
+        // 绑死的其实是「缓存分桶」与「一次性 id」，同样是两件事，但轻重不同）。
+        // ⚠️ 实测上游**不做**跨轮状态机（同一 `prompt_cache_key` 连发三轮、每轮换
+        // 三头值，上游 3/3 接受），故当前**无害**；若上游将来按 conversation id 做
+        // 跨轮归并，本实现会让每轮成为新会话。真要对齐官方需另派生会话级常量。
+        //
+        // ## ⚠️ 刻意不复用 `this.sessionId`
+        // 那是 `prompt_cache_key` 的语义（**前缀缓存的分桶键**）。本仓库登记过多次
+        // 「两处语义不同的东西共用一个值」导致的漂移缺陷，故分开。
+        // ⚠️ `sessionId` 的作用域（本仓**代码可证**的部分）：`this.sessionId =
+        // options.sessionId ?? crypto.randomUUID()...` 在**构造器**里赋值，而
+        // `registerBuddyLlm` 在 `index.ts` 的 `apply()` 内**每个产品造一个 adapter**
+        // ⇒ 它是**每产品一个值、该产品的所有会话与账号共用**，既不是每轮也不是每会话。
+        // ⚠️ **另有一条路径**：`index.ts` 的 `probeById.createProbeAdapter` **每次探测
+        // 另建一个 adapter** ⇒ 探测路径的 `sessionId` 是每次新的（同样非每轮）。
+        // ⚠️ 刻意**不断言**它「是插件进程级」—— 宿主何时重建插件实例，本仓无任何
+        // 证据，属推断，不写成断言句。
+        //
+        // ## ⚠️ 刻意不按 `product.id` 分支
+        // buddy（CodeBuddy 中国站）带上这三头实测**仍 200**（2026-10-16 复核），
+        // 即无害。加分支会制造两条出站路径，而两者在本项上并无真实差异 ——
+        // 未来只改一条就会静默漂移。
+        //
+        // ## 两条旁路（`src/buddy-growth.ts`）也打同一端点
+        // 原注释称「`buddy-growth.ts` 早已携带 `X-Conversation-ID` ⇒ 属补一致性缺口」，
+        // 这条论证**已撤回**（它恰恰是「一枚就够」的反证）。
+        // 现状（2026-10-16 起）：两条旁路已同步补齐三枚，**理由按 IKM7SG 更新为
+        // 「对『要求三头』的账号是硬需求 + 与主链路形态一致」**（不再是「反正无害」）
+        // —— 与本处同源，见该文件内的对应注释。
+        const conversationId = crypto.randomUUID().replace(/-/g, '');
+        headers.set('X-Conversation-ID', conversationId);
+        headers.set('X-Conversation-Request-ID', conversationId);
+        headers.set('X-Conversation-Message-ID', conversationId);
         headers.set('X-IDE-Name', this.product.attributionName);
         headers.set('X-IDE-Type', this.product.attributionName);
         headers.set('X-IDE-Version', this.product.clientVersion);
@@ -2106,6 +3733,42 @@ export class BuddyAdapter extends LlmAdapter {
                         // 账号标了冷却，下一轮选号就会绕开它，不再反复重撞。
                         await markPolicyBlockedAccount(this.options.accountPool, this.product.id, policyBlockedAccountId, options.model);
                         throw contentRejectionError(this.product.id, 200, payload, false);
+                    }
+                    // ⚠️⚠️ **流内的「渠道校验」拒绝**（HTTP 200 + SSE 内嵌 11128
+                    // `conversation id missing` 帧）—— 与上面 11140 那条**并列**，
+                    // 同样受 `choices === undefined` 门禁保护（有效内容帧一定带 choices，
+                    // 故不会把讨论该措辞的正文误判成拒绝）。
+                    //
+                    // ## 真实缺陷（本档第一版漏掉了这条通道，2026-10-16 审计实测）
+                    //
+                    // `isContentRejection` 的注释早就记着「同一报文在 CodeArts 侧就以
+                    // HTTP 200 + 内嵌错误帧的形式出现」，而第一版只改了 HTTP 通道 ⇒
+                    // 该形态下：① **不换号**（`consumeSse` 里根本没有这条判据）；
+                    // ② 帧既无 `choices` 也无 `error` ⇒ 一路走到收尾 ⇒ 零内容块 ⇒
+                    // 被 `resolveEmptyResponseReason` 改写成 `EMPTY_RESPONSE`；
+                    // ③ 而 `EMPTY_RESPONSE` **在** harness 的 `DEFAULT_RETRYABLE_CODES`
+                    // 里（`retry-policy.js`，`DEFAULT_MAX_RETRIES = 5`）⇒ **白退避重试
+                    // 至多 5 次**，每次重撞同一个被拒账号，且用户看到的是
+                    // 「模型没返回内容」—— 原因完全错位。
+                    //
+                    // 实测（修复前）：`sent=["AT1"]`、下发 `finish(error)` 帧、
+                    // code `EMPTY_RESPONSE`。
+                    //
+                    // ## 处置：与 11140 流内档同型 —— **不重发**，但口径必须正确
+                    //
+                    // 流内重发需要「尚未产出内容」的判据 + 外层循环（trae 3823133 那种
+                    // 结构改造），故这里只做两件事：**如实报错** + 归到不在可重试集合的码。
+                    // ⇒ `rotated: false`（只撞到当前账号，不能说「已逐个换号重试」）。
+                    // ⚠️ 与 11140 的差异：**不写冷却**（理由见 `isChannelVerificationRejection`
+                    // —— 写 30 分钟账号级冷却会把一份「换请求形态就能用」的账号凭空封禁）。
+                    // ⚠️ 必须传 `response.status`（流内通道恒为 200）：腿② 的状态码闸门因此
+                    // 不在此通道启用，而腿①（`msg`/`message` 值位）**照常生效** —— 真实的
+                    // 流内 11128 错误帧就是 `{"code":11128,"msg":"conversation id missing"}`，
+                    // 走腿①。反过来，一个**正常 200 报文**里若恰好出现该措辞（模型复述等），
+                    // 闸门正好挡住腿②的误命中。
+                    if (data.choices === undefined
+                        && isChannelVerificationRejection(payload, response.status)) {
+                        throw channelVerificationError(this.product.id, 200, payload, false);
                     }
                     if (data.error !== undefined) {
                         throw new LlmError(`${this.product.id}: ${data.error.message ?? 'unknown error'}`, 'SERVER');
@@ -2420,6 +4083,37 @@ export class BuddyAdapter extends LlmAdapter {
         //   并陷入重试循环。判定为截断后 dsh 丢弃残缺调用并重试，实测一次即恢复。
         const argsTruncated = [...toolCalls.values()].some(block => isTruncatedArguments(block.text));
         /**
+         * **模型把工具参数写坏**（结构闭合配平、引号成对，但 JSON 非法）——
+         * 与「流被掐断」是两种病理，必须分开处置（真实缺陷，Gitee IKQ8Y1）。
+         *
+         * ⚠️ `argsTruncated` 仍是 `isTruncatedArguments` 的产物（**语义未改**）：
+         * 其它调用点（`arguments:` 那一格决定「残缺参数不补 `{}`」）仍靠它。
+         * 本判据只回答「哪些块是**闭合但非法**」。
+         *
+         * ⚠️ 只收**名字可用**的块：无名块的参数没有意义（它本来就会被丢弃，
+         * 见 `droppedUnnamedCalls`），把它的 JSON 问题报成「模型写坏参数」
+         * 会把真实病因（缺 name）盖掉 —— 与 `toolOrder` 只收名字可用的块同一条纪律。
+         */
+        const invalidArgBlocks = [...toolCalls.values()]
+            .filter(block => hasUsableToolName(block.name))
+            .map(block => ({ block, kind: classifyToolArguments(block.text) }))
+            .filter(entry => entry.kind === 'invalid');
+        /**
+         * 「参数写坏」是否**是本步唯一的产出** —— 与 `reasoningLoopIsSoleOutput`
+         * **同一道门禁**（见其注释：`error` 路径**不落 `assistant/message`**，
+         * 实测 219 会话里 222 例）。
+         *
+         * 三条同时成立才报 `error`：
+         * 1. 至少一个块被判 `invalid`；
+         * 2. **零正文**（有正文就保住正文，退化成 max-tokens）；
+         * 3. **没有另一个参数可解析的可用调用**（有就照常执行它，别一起作废）。
+         *
+         * ⚠️ 判据 3 的 `hasUsableToolName` 腿不可省：一个**无名**且参数合法的块
+         * 本就会被丢弃（见 `droppedUnnamedCalls`），不该让它把整步从 `error`
+         * 拽回 `max-tokens`。
+         */
+        const argsInvalidIsSoleOutput = toolArgsInvalidIsSoleOutput(invalidArgBlocks.length, emittedProse, toolCalls.values(), finishReason === 'length' || (finishReason === undefined && !streamEnded));
+        /**
          * 是否丢弃过**名称不可用**的 tool-call 块（见上方 tool_calls 分支）。
          *
          * 丢弃是对的（无名调用无法执行、留着会污染会话），但不能让它**静默地以
@@ -2459,15 +4153,22 @@ export class BuddyAdapter extends LlmAdapter {
             // 循环命中但另有可见产出：只能报 max-tokens（保住内容），不能报 error。
             : loopDetected
                 ? { kind: 'max-tokens' }
-                : finishReason === 'length'
-                    || finishReason === undefined && toolOrder.length > 0
-                    || argsTruncated
-                    || proseCutByStopString
-                    || droppedUnnamedCalls && toolOrder.length === 0
-                    ? { kind: 'max-tokens' }
-                    : finishReason === 'tool_calls' || toolOrder.length > 0
-                        ? { kind: 'tool-calls' }
-                        : { kind: 'stop' };
+                // ⚠️ **工具参数写坏必须有自己的码**（真实缺陷，Gitee IKQ8Y1）：
+                // 放在 `loopDetected` **之后**、`max-tokens` 家族**之前**。
+                // 报 max-tokens 会让 UI 说「已达到输出 token 上限」（固定 i18n，不读
+                // 我们的 message），而实测该轮 `outputTokens` 只用了 2516/128000。
+                // 门禁三条见 `argsInvalidIsSoleOutput` 的注释。
+                : argsInvalidIsSoleOutput
+                    ? { kind: 'error', failure: toolArgsInvalidFailure(toolArgsInvalidBlocks(invalidArgBlocks)) }
+                    : finishReason === 'length'
+                        || finishReason === undefined && toolOrder.length > 0
+                        || argsTruncated
+                        || proseCutByStopString
+                        || droppedUnnamedCalls && toolOrder.length === 0
+                        ? { kind: 'max-tokens' }
+                        : finishReason === 'tool_calls' || toolOrder.length > 0
+                            ? { kind: 'tool-calls' }
+                            : { kind: 'stop' };
         // 零内容块响应（例如本次只收到过那个被压制的空白 reasoning）否则会以
         // `stop` 收场 —— 那是 DSH `EMPTY_RESPONSE` 契约明令禁止的静默结束。
         // ⚠️ 传入的是**上面已算好的** `reason`（含 loopDetected / length /
@@ -2475,6 +4176,38 @@ export class BuddyAdapter extends LlmAdapter {
         yield { type: 'finish', reason: resolveEmptyResponseReason(reason, blockCount) };
     }
 }
+/**
+ * 续期/取号（`refresh()` / `resolveCredential()`）抛出的、**不得降级成 `AUTH`**
+ * 的错误码（Gitee IKQ99X）。
+ *
+ * ## 为什么需要这张表
+ *
+ * 401/403 分支的兜底文案是「credential expired and refresh failed」+ `AUTH`。
+ * 而 `resolveCredential` 在**候选被模型级限流筛空**时会抛 `QUOTA_EXCEEDED`
+ * （`credential-resolver.ts` 的 `throwIfAllRateLimited`，文案带解禁时刻）——
+ * 把它降级成 `AUTH` 会同时丢掉「解禁时刻」与「无需重新登录」这两条唯一出路，
+ * 且 `AUTH` 是客户端会整条替换文案的码（「API 密钥无效」）。
+ *
+ * ## 每一格的依据
+ *
+ * | 码 | 真实语义 | 为什么不能降级 |
+ * |---|---|---|
+ * | `QUOTA_EXCEEDED` | 该模型上全部启用账号在限流中（带解禁时刻） | 出路是等/换号，不是重新登录 |
+ * | `PERMISSION_DENIED` | 账号级拒绝（渠道校验收窄后的形态） | 出路是停用该账号；同一请求换号可用 |
+ * | `RATE_LIMIT` | 频率类 | 它在 harness 的 `DEFAULT_RETRYABLE_CODES` 里，降级成 `AUTH` 会**停掉重试** |
+ * | `MISSING_CREDENTIAL` | 压根没有账号 | 「去加账号」与「登录过期」是两种动作 |
+ *
+ * ⚠️ **刻意不含 `AUTH`**：与兜底同码，透传与否对用户完全一样。
+ * ⚠️ **不要往这里加 `SERVER` / `TIMEOUT` / `TRANSPORT`**：那三类是**瞬时**故障，
+ * 而 `resolveCredential` 抛它们时「换号重试」仍然是对的默认动作 ——
+ * 原实现那句「刷新失败不致命」正是为它们写的。
+ */
+const PRESERVED_CREDENTIAL_ERROR_CODES = new Set([
+    'QUOTA_EXCEEDED',
+    'PERMISSION_DENIED',
+    'RATE_LIMIT',
+    'MISSING_CREDENTIAL',
+]);
 /** 凭据是否已过期；无法解析过期时间时不判定过期（与 Rust is_expired 一致）。 */
 function isCredentialExpired(credential) {
     const expiresAt = credentialExpiresAtMs(credential);
@@ -2578,5 +4311,159 @@ export function registerBuddyLlm(ctx, options) {
     // 返回实例：Jet Hub「显示列表」需要 `listAllModels()`（不受黑名单影响、
     // 带最终展示名/倍率）。`ctx.llm` 不透传自定义方法，须由调用方持有引用。
     return adapter;
+}
+// ─────────────────────── 原生搜索（`searchOnce` 的支撑） ───────────────────────
+//
+// ⚠️ 这些是从 `web-native.ts` 搬过来的（2026-10-14 架构改造）。搬家的理由见
+// `BuddyAdapter.searchOnce` 的注释：取数逻辑各渠道不同（腾讯 `Bearer` + `results[]`、
+// Qoder WASM 签名 + `pageItems[].link`），故下沉到适配器；`web-native.ts` 只留
+// 「官方语义」（入参校验 / 并发中止 / rank 轮转合并 / cap）。
+/**
+ * 单次搜索请求的 `max_results`。
+ *
+ * ⚠️ **写死 8**：与官方 `WEB_SEARCH_MAX_RESULTS = 8` 一致，且**实测就是上游上限**
+ * —— 1/3/5/8 原样返回、>8 一律封顶 8（见 `docs/workbuddy-native-search-research.md` §6.5）。
+ */
+const NATIVE_SEARCH_MAX_RESULTS = 8;
+/**
+ * 执行一次腾讯原生搜索（**模块级导出**，供单测直接驱动）。
+ *
+ * ⚠️ 之所以抽成独立函数而不是全塞在 `BuddyAdapter.searchOnce` 里：单测要用
+ * 真 `product` 配置（端点前缀随产品变）驱动它，而构造一个完整 `BuddyAdapter`
+ * 需要 `AccountPool` 等重依赖。抽出来后测试可以直接传 `CODEBUDDY` / `WORKBUDDY`。
+ *
+ * @param query - 单个查询串。
+ * @param credential - 凭据（本函数自己收窄成 `BuddyCredential`）。
+ * @param signal - 取消信号。
+ * @param product - 产品配置（决定 `{endpoint}/agenttool/v1/search` 的前缀与错误文案里的 id）。
+ * @throws {WebNativeError} 无可用账号 / 上游非 2xx / 响应无法解析 / 超时。
+ */
+export async function performBuddySearch(query, credential, signal, product) {
+    const accessToken = typeof credential?.access_token === 'string'
+        ? credential.access_token
+        : '';
+    if (accessToken.length === 0) {
+        throw new WebNativeError(`${product.id} search has no usable account; sign in to a ${product.id} account `
+            + `from the Jet Hub panel first. The current route is "${product.id}". `
+            + 'Only the user can change accounts.', NativeSearchCodes.noAccount);
+    }
+    const endpoint = `${product.endpoint}/agenttool/v1/search`;
+    const body = { query, type: 'text2text', max_results: NATIVE_SEARCH_MAX_RESULTS };
+    // ⚠️ 响应体先过 `asRecord`：上游返回 JSON `null` 时直接读 `.results` 会抛
+    //    `TypeError: Cannot read properties of null`（对抗性审查 F2），
+    //    而我们想要的是「响应无法解析」这条业务错误。
+    const json = await postBuddySearchJson(endpoint, body, accessToken, product, signal);
+    const results = asRecord(json)?.results;
+    if (!Array.isArray(results)) {
+        throw new WebNativeError(`${product.id} returned an unparseable search response: "results" is not an array.\n\n`
+            + `The request used endpoint ${JSON.stringify(endpoint)}. `
+            + 'Expected { results: [{ title, url, snippet }] }. '
+            + 'This usually means the upstream API changed, or the account lacks search permission.', NativeSearchCodes.badResponse);
+    }
+    const sources = [];
+    for (const raw of results) {
+        // ⚠️ 必须先挡 `null` / 非对象：`results: [null]` 时读 `item.url` 会抛
+        //    `TypeError: Cannot read properties of null`（真实缺陷，对抗性审查 F1）——
+        //    那会让**整条工具调用**失败，与本段的意图（畸形条目**丢弃**、少一条而已）相反。
+        const item = asRecord(raw);
+        if (item === undefined)
+            continue;
+        const url = typeof item.url === 'string' ? item.url : '';
+        // ⚠️ `url` 是官方 schema 的必填项（`additionalProperties: false` + `required`）。
+        //    上游给不出 url 的条目直接丢弃，否则 `createSuccessResult` 会抛
+        //    `ToolOutputError`（整个工具调用失败，而不是少一条结果）。
+        if (url.length === 0)
+            continue;
+        const title = typeof item.title === 'string' && item.title.length > 0 ? item.title : undefined;
+        const snippet = typeof item.snippet === 'string' && item.snippet.length > 0 ? item.snippet : undefined;
+        sources.push({
+            url,
+            ...title === undefined ? {} : { title },
+            ...snippet === undefined ? {} : { snippet },
+        });
+    }
+    return sources;
+}
+/** 上游 search 请求超时（毫秒）。与客户端 `WEB_SEARCH_TIMEOUT_MS = 2e4` 对齐。 */
+const NATIVE_SEARCH_TIMEOUT_MS = 20_000;
+/**
+ * 发一次搜索 POST 并解析 JSON。
+ *
+ * 错误语义对齐官方：**直接抛**（工具层不包装，由宿主 `toolErrorResult` 统一转
+ * `isError`），且文案带排障指引（端点、下一步动作、给模型的约束）。
+ */
+async function postBuddySearchJson(endpoint, body, accessToken, product, signal) {
+    const timeout = AbortSignal.timeout(NATIVE_SEARCH_TIMEOUT_MS);
+    const composed = AbortSignal.any([signal, timeout]);
+    let response;
+    try {
+        response = await fetch(endpoint, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${accessToken}`,
+                'Content-Type': 'application/json;charset=UTF-8',
+                'Accept': 'application/json',
+            },
+            body: JSON.stringify(body),
+            signal: composed,
+        });
+    }
+    catch (error) {
+        // ⚠️⚠️ **不能先判 `signal.aborted` 就直接归 `aborted`**（PR95 审计修正的
+        //    真实缺陷）：本模块在 cordis waterfall 的**内层**，拿到的 `signal` 已被
+        //    外层 `tool-call-timeout-policy` 换成带 deadline 的信号 ⇒ 外层到期时
+        //    `signal.aborted` 同样为真。旧判据会把**超时**报成「search aborted」
+        //    （像是用户按了停止），文案里那串排障指引全部丢失。
+        //    归因必须读 `signal.reason` 的形状 —— 判据与实测六格对照见
+        //    `native-search-contract.ts` 的 `classifyNativeAbort`。
+        const stop = classifyNativeAbort(composed);
+        if (stop === 'aborted') {
+            throw new WebNativeError(`${product.id} search aborted`, NativeSearchCodes.aborted, { cause: error });
+        }
+        if (stop === 'timeout') {
+            // ⚠️ 文案区分**谁**的预算用尽：本模块自己 arm 的（`timeout.aborted`）
+            //    报我们自己的毫秒数；外层 deadline 到期（`timeout.aborted` 为假）
+            //    则说明是宿主给的工具预算被吃满，不能再谎称「我们的 20s 预算」。
+            const budget = timeout.aborted
+                ? `after ${NATIVE_SEARCH_TIMEOUT_MS}ms`
+                : 'before this search returned (the host tool budget elapsed)';
+            throw new WebNativeError(`${product.id} search timed out ${budget}.\n\n`
+                + `The request used endpoint ${JSON.stringify(endpoint)}. `
+                + 'Web search uses the same account as chat but a separate endpoint. '
+                + 'Retry, or narrow the request; if it keeps timing out the endpoint or network may be unreachable.', NativeSearchCodes.timeout, { cause: error });
+        }
+        throw new WebNativeError(`${product.id} search request failed: ${errorMessage(error)}\n\n`
+            + `The request used endpoint ${JSON.stringify(endpoint)}. `
+            + 'Web search uses the same account as chat but a separate endpoint. '
+            + 'If the network is unreachable or the endpoint is wrong, the user must decide how to proceed.', NativeSearchCodes.upstream, { cause: error });
+    }
+    if (!response.ok) {
+        const detail = await readBuddyErrorDetail(response);
+        throw new WebNativeError(`${product.id} search request failed (HTTP ${response.status})${detail}\n\n`
+            + `The request used endpoint ${JSON.stringify(endpoint)}. `
+            + 'Web search uses the same account as chat but a separate endpoint. '
+            + "If the account's sign-in has expired, guide the user to sign in again from the Jet Hub panel; "
+            + 'the endpoint does not need changing.', NativeSearchCodes.upstream);
+    }
+    try {
+        const json = await response.json();
+        return json;
+    }
+    catch (error) {
+        throw new WebNativeError(`${product.id} returned a non-JSON response.\n\n`
+            + `The request used endpoint ${JSON.stringify(endpoint)}. `
+            + 'Expected a JSON body with { results: [{ title, url, snippet }] }.', NativeSearchCodes.badResponse, { cause: error });
+    }
+}
+/** 从非 2xx 响应里取一段可读的上游说明（截断，且不回显敏感内容）。 */
+async function readBuddyErrorDetail(response) {
+    try {
+        const text = await response.text();
+        const trimmed = text.trim().slice(0, 300);
+        return trimmed.length > 0 ? `: ${trimmed}` : '';
+    }
+    catch {
+        return '';
+    }
 }
 //# sourceMappingURL=buddy-adapter.js.map

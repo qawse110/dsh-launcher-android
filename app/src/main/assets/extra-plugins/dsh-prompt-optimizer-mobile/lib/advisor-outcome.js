@@ -1,13 +1,15 @@
 import { createHash } from 'node:crypto'
 import { revisionMarker } from './advisor-scopes.js'
+import {claimEvidenceState} from './advisor-evidence.js'
 
 // Invocation success is not acceptance; these fields are derived, never model-authored.
 export function reviewOutcome(output) {
   const report = output?.report
-  const evidenceGaps = (output?.materials || []).filter(m => m.status !== 'ready' && m.status !== 'excluded').map(m => ({
-    id: m.id, path: m.path, status: m.status, reason: m.reason || 'partial-material',
-    action: 'provide-evidence',
-  }))
+  const assessed=claimEvidenceState(report)
+  const evidenceGaps = assessed.policy==='legacy' ? (output?.materials || []).filter(m => m.status !== 'ready' && m.status !== 'excluded').map(m => ({
+    id: m.id, path: m.path, status: m.status, reason: m.reason || 'partial-material',action:'provide-evidence'}))
+    : assessed.policy==='invalid' ? [{status:'unverified',reason:assessed.reason,action:'provide-evidence'}]
+    : assessed.checks.filter(c=>!c.complete).map(c=>({checkKey:c.key,status:'unverified',reason:'cited-claim-evidence-incomplete',action:'provide-evidence'}))
   const openIssues = (report?.checks || []).filter(c => c.status !== 'satisfied').map(c => ({
     criterion: c.criterion, status: c.status, evidenceRefs: c.evidenceRefs || [],
     action: c.status === 'failed' ? 'repair-and-review' : 'provide-evidence-or-user-check',

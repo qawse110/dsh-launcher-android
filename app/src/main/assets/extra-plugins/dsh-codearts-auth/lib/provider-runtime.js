@@ -91,6 +91,35 @@ export function runtimeOf(provider) {
     return runtimes.get(provider);
 }
 /**
+ * **共享余额读数缓存**的进程级注册位（2026-10-15，规格 §5.7）。
+ *
+ * ## ⚠️ 为什么走全局注册表而不是给 `registerJetHubRpc` 加形参
+ *
+ * 那个函数的签名有**成文不变式**：只剩 **4 个形参**（`ctx, pool, auths, modelAdapters`），
+ * 且 `tests/unit/zcode-wiring.spec.ts` 有一组「不占形参位的是谁」的守卫。
+ * 加第 5 个可选形参正是那条注释记录的**复发 6 次**的错位形态（在它之前插入任何
+ * 可选形参都会让调用点静默错位）。
+ *
+ * ⇒ 与本文件既有的 `runtimeOf` / 全局注册表同一取向：「拿不到形参的跨模块消费点」
+ * 走注册表（`ProviderRuntime.credits` 的先例就在本文件）。
+ *
+ * ## 生命周期
+ *
+ * ⚠️ 由 `src/index.ts` 的 `apply()` 在建缓存后**立即**注册；`dispose` 时清空
+ *（与 `clearProviderRuntimes` 同处调用，避免用例之间串味）。
+ * ⚠️ 未注册 ⇒ 消费方（`credits.balances`）**走自己的原路径**，行为与升级前一致 ——
+ * 那是刻意保留的降级路径（本仓库对「可选接线缺失」的一贯取向：不得静默改变行为）。
+ */
+let sharedBalanceCache;
+/** 注册共享余额缓存（`src/index.ts` 的 `apply()` 调用）。 */
+export function registerBalanceCache(cache) {
+    sharedBalanceCache = cache;
+}
+/** 取共享余额缓存；未注册返回 `undefined`（调用方回退到自己的原路径）。 */
+export function balanceCacheOf() {
+    return sharedBalanceCache;
+}
+/**
  * 按 provider id 从一张 `expiry` 表里取实现。
  *
  * ⚠️ 用 `Object.hasOwn` 而非 `in` 或下标：`in`/下标会命中**原型链**上的键
@@ -110,6 +139,9 @@ export function expiryOf(table, provider) {
  */
 export function clearProviderRuntimes() {
     runtimes.clear();
+    // ⚠️ 共享缓存注册位也要清：它挂在同一张进程级表上，留着会让**下一个用例**
+    //    读到上一个用例的缓存实例（串味，且症状是「余额读数莫名命中」）。
+    sharedBalanceCache = undefined;
 }
 /**
  * 已注册的 id 列表（诊断与单测用）。

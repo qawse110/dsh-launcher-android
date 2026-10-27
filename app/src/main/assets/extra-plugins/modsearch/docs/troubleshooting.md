@@ -23,7 +23,7 @@ Every engine for the web source failed.
   - firecrawl: ...
 ```
 
-Firecrawl closes the normal search chain with a keyless endpoint, so a bare installation has an engine. This message now means every candidate failed at runtime. Read the attempt lines for the actual causes, commonly no network, a timeout, exhausted anonymous daily limits, or a configured engine's quota.
+Firecrawl and Keenable both search through keyless endpoints, so a bare installation has an engine. This message now means every candidate failed at runtime. Read the attempt lines for the actual causes, commonly no network, a timeout, exhausted anonymous daily limits, Keenable's hourly keyless pool running out, or a configured engine's quota.
 
 ```bash
 curl -fsSL https://antigravity.google/cli/install.sh | bash && agy   # then sign in
@@ -31,6 +31,7 @@ curl -fsSL https://antigravity.google/cli/install.sh | bash && agy   # then sign
 modsearch config set tavily.apiKey <key>
 modsearch config set exa.apiKey <key>
 modsearch config set firecrawl.apiKey <key>
+modsearch config set keenable.apiKey <key>
 ```
 
 Page fetch (`-u`) still ends at the built-in local engine when cloud engines fail.
@@ -44,7 +45,7 @@ Individual quota reached. Please upgrade your subscription ... Resets in 94h19m9
 agy's free tier is one weekly grant shared by the Antigravity desktop app, the CLI, and the SDK, and parallel subagents drain it faster. Three ways out:
 
 - Wait for the reset named in the message.
-- Add a keyed search engine (Tavily, Exa, or Firecrawl). Search then falls through to it automatically, with no further action from you.
+- Add a keyed search engine (Tavily, Exa, Firecrawl, or Keenable). Search then falls through to it automatically, with no further action from you.
 - With cooldown on (the default), agy is remembered as spent and moved to the back of the chain until it resets, so later runs fail over first. See "An engine keeps getting skipped" below.
 
 ## agy not available in your location
@@ -65,24 +66,39 @@ A black console window can pop up and grab focus while the `antigravity-cli` eng
 
 The window closes by itself and does not affect results. To avoid it, move agy off the automatic chain as above. An explicit `-e antigravity-cli` still runs it when you want it.
 
-## Exa or Firecrawl authentication rejected
+## Exa, Firecrawl, or Keenable authentication rejected
 
 ```
 exa rejected the API key (401). Fix it: modsearch config set exa.apiKey <key>
 firecrawl rejected the API key (401). Fix it: modsearch config set firecrawl.apiKey <key>
+keenable rejected the API key (401). Fix it: modsearch config set keenable.apiKey <key>
 firecrawl rejected the keyless request (401). Anonymous access may be unavailable or rate-limited.
 ```
 
-The first two messages mean a configured key is wrong or revoked. Set a valid one with the command in the message, or export `EXA_API_KEY` / `FIRECRAWL_API_KEY`. The keyless message means Firecrawl did not accept anonymous access for this request. Wait for the daily allowance to recover, configure a free key for higher limits, or use another engine. Authentication failures are not put on cooldown.
+The first three messages mean a configured key is wrong or revoked. Set a valid one with the command in the message, or export `EXA_API_KEY` / `FIRECRAWL_API_KEY` / `KEENABLE_API_KEY`. With several keys configured, a rejected key rotates to the next one first. The keyless message means Firecrawl did not accept anonymous access for this request. Wait for the daily allowance to recover, configure a free key for higher limits, or use another engine. Authentication failures are not put on cooldown.
 
-## Exa or Firecrawl out of credits
+## Exa, Firecrawl, or Keenable out of credits
 
 ```
 exa is out of credits: ...
 firecrawl is out of credits: ...
+keenable is out of credits (HTTP 402). ...
 ```
 
-The current budget is spent. For Firecrawl this can be an anonymous daily allowance or an account quota. Another search engine picks up the work on its own, and with cooldown on the spent engine is moved to the back of the chain until it recovers. Add credit, switch engines, or wait for the relevant reset.
+The current budget is spent. For Firecrawl this can be an anonymous daily allowance or an account quota. Another search engine picks up the work on its own, and with cooldown on the spent engine is moved to the back of the chain until it recovers. Add credit, switch engines, or wait for the relevant reset. Keenable's keyed allowance is 100,000 requests a month per organization, managed at https://app.keenable.ai.
+
+## Keenable keyless pool used up for the hour
+
+```
+keenable's keyless pool for this IP is used up for the hour (1,000 requests). Set a free key for your own quota: modsearch config set keenable.apiKey <key> ...
+```
+
+With no key, Keenable allows 1,000 requests an hour per IP, and everyone on that IP shares the pool (an office, a VPN exit, a cloud host). It also caps the pool at 10 requests a second. The next search engine in the chain picks up the work on its own. For a quota of your own, take a free key from https://app.keenable.ai: a keyed Keenable has no hourly cap and gives 100,000 requests a month.
+
+```bash
+modsearch config set keenable.apiKey <key>
+# or: export KEENABLE_API_KEY=<key>
+```
 
 ## Tavily out of monthly quota (432/433)
 

@@ -32,7 +32,7 @@
  * @module src/aggregate-expiry.ts
  */
 import { NEVER, UNUSABLE } from './aggregate-core.js';
-import { fetchCreditBalance } from './credits.js';
+import { fetchCreditBalance, isExclusiveCreditPool } from './credits.js';
 import { LOOMY } from './loomy-product.js';
 import { fetchLoomyCreditDetail } from './loomy-credits.js';
 import { fetchCodeArtsAccountInfoDetailed } from './codearts-credits.js';
@@ -41,8 +41,25 @@ import { nextUtc8DayStartMs } from './model-queue.js';
 import { exhaustedModelsOf, recoveredModelsOf } from './zcode-entitlements.js';
 import { fetchLobsteraiCreditBalance } from './lobsterai-credits.js';
 import { fetchTraeCreditBalance } from './trae-credits.js';
+// ⚠️ **本 fork 独有**（魔搭，2026-10-17）：魔粒余额折算。
+import { fetchModelscopeBalanceDetailed } from './modelscope-credits.js';
+// ⚠️ AutoClaw（智谱）：钱包余额折算（2026-10-17 审计 P0 修复新增）。
+import { fetchAutoclawBalanceDetailed } from './autoclaw-credits.js';
 import { fetchAccioBalanceDetailed } from './accio-credits.js';
+// ⚠️ AStudio（讯飞 AstronStudio）：三池各带 `*NextExpireTime` ⇒ 可精确折算
+//    （2026-10-20 新增）。判据链与 autoclaw 同形，只是时间字段确实存在。
+import { fetchAstudioBalanceDetailed } from './astudio-credits.js';
 import { fetchSubscriptionSummary } from './officeace-auth.js';
+import { officeaceBreakerOpen } from './officeace-credential-health.js';
+// ⚠️ Qoder（中国版 / 国际版）：与 **buddy 系同形**（`CreditPackage` 都带
+//    `deductionEndTime`）⇒ 本原语直接复用 `sharedPackageExpiry`，不另写判据
+//    （2026-10-20 新增）。用 `QoderProduct` 而不是 `typeof QODER`，因为本原语
+//    **两站共用**、`product` 由调用方传入。
+import { fetchQoderCreditBalance } from './qoder-credits.js';
+// ⚠️ MiniMax Code（中国版 / 国际版）：每条积分明细各带 `expire_at_ms` ⇒ 可精确折算
+//    （2026-10-20 新增）。用 `MinimaxProduct` 而不是 `typeof MINIMAX`，
+//    因为本原语**两家共用**、`product` 由调用方传入。
+import { fetchMinimaxCreditBalanceDetailed } from './minimax-credits.js';
 import { runtimeOf } from './provider-runtime.js';
 /**
  * 真实临期探针：**每个渠道折算成一个「最早失效时刻」**。
@@ -160,6 +177,92 @@ export const WIRED_EXPIRY_PROVIDERS = Object.freeze([
     //    ⚠️ 与 accio 同款陷阱：**决定候选表可见性的是这张表、不是
     //    `AGGREGATE_CHANNELS`** —— 只加后者 ⇒ 归一化再对也没用，症状静默。
     'officeace',
+    // ⚠️ **本 fork 独有**（魔搭，2026-10-17，用户明确要求加入）：
+    //    折算原语见 `modelscopeExpiry`，属「**有余额但不下发到期时间**」那一类
+    //    （魔搭余额报文里没有任何时间字段）⇒ 有余额即 `NEVER`、烧光即 `UNUSABLE`。
+    //
+    //    ⚠️⚠️ **代价（用户已知并接受）**：魔粒烧光时**不会被提前剔出轮换** ——
+    //    平台既不下发「配额何时重置」，也没有别的额度端点（`/api/v1/quota/status`
+    //    经实测是**任务奖励**、不是额度）。⇒ 耗尽后仍会被选中并失败一次。
+    //    ⚠️ **不许用「猜一个每日 UTC+8 零点」消除它**：那是凭空造一个上游从未
+    //    承诺的重置时刻（本仓库红线「绝不编造数字」）。
+    //    ⚠️ 与 accio / officeace 同款陷阱：**决定候选表可见性的是这张表、
+    //    不是 `AGGREGATE_CHANNELS`** —— 只加后者等于没接。
+    'modelscope',
+    // ⚠️ **AutoClaw**（智谱，2026-10-17 审计 P0 修复）：折算原语见 `autoclawExpiry`，
+    //    属「**有余额但不下发到期时间**」那一类（钱包报文里没有任何时间字段）
+    //    ⇒ 有余额即 `NEVER`、烧光即 `UNUSABLE`。
+    //    ⚠️⚠️ **这是该陷阱的第 4 次复发**（cline → accio → officeace → autoclaw），
+    //    症状恒定**静默**：PR 只加了 `aggregate-adapter.ts` 的 `AGGREGATE_CHANNELS`
+    //    （模型层归并会发生、看起来接好了），而**决定候选表可见性的是本表**
+    //    —— 漏加它 ⇒ 折算恒 `UNUSABLE`（`aggregate-expiry.ts` 的 `createExpiryProbe`
+    //    与 `aggregate-adapter.ts` 的 4 处过滤都按本表），用户在聚合轮换列表里
+    //    **永远看不到 autoclaw**，且**无报错、无日志**。
+    //    ⚠️ 三处必须同改：本表 + `provider-expiry.ts` 的 `createProviderExpiry()`
+    //    + 折算原语（后两者的一致性由 `expiry-runtime-parity.spec.ts` 真跑
+    //    `apply()` 锁一致）。
+    'autoclaw',
+    // ⚠️ AutoClaw **国际版**（`autoclawintl`，2026-10-20）：与 `autoclaw` 同格
+    //    （同一份 `autoclawExpiry` 折算原语，实测批次带 `deductionEndTime`）。
+    //    ⚠️ 它也是**陷阱复发**的一次：只加 `AGGREGATE_CHANNELS` 而不加本表，
+    //    症状是「模型层归并发生了、看起来接好了，但候选层被这道闸门剔掉」，
+    //    用户在聚合轮换列表里**永远看不到国际版**，且**零报错、零日志**。
+    //    ⚠️ 三处同改：本表 + `provider-expiry.ts` 的 `autoclawintl` 条目
+    //    （⚠️ 那里必须传 `AUTOCLAW_INTL`，否则会用国内基址查国际账号余额）
+    //    + 折算原语（`autoclawExpiry` 本身产品无关，无需改）。
+    'autoclawintl',
+    // ⚠️ **Qoder**（中国版 / 国际版，2026-10-20，用户要求补齐三档分档 + 永久锁）。
+    //    折算原语见 `qoderExpiry`（两站共用，只换 product）。
+    //
+    //    取证（2026-10-20，两个真实 qodercn 账号，`/sash/api/v2/me/usage`）：
+    //    - `userQuota` 只有顶层 `expiresAt`，且恒为**永久哨兵**（见下）；
+    //    - `addOnQuota` **无任何日期字段，只给聚合标量**；
+    //    - `dedicatedResourcePackages` 是**唯一**带真实逐包 `expiresAt` 的字段，
+    //      但本机账号为 `undefined`。
+    //
+    //    - 顶层 `qoderUsage.expiresAt = 253402214400000`（`9999-12-31T00:00:00Z`），
+    //      是 Qoder 给 `userQuota` 下发的**永久哨兵**、**不是**到期时刻。
+    //    - 实际后果：`qoder-credits.ts` 对哨兵**不写** `deductionEndTime`
+    //      （写进去会让客户端渲染出「9999-12-31（约 2900000 天后）」荒谬文案）
+    //      ⇒ 有余额 ⇒ `NEVER`（长期，排最后但可当选）。
+    //    - ⚠️ 国际站 `openapi.qoder.sh` 本机**网络不可达**（`fetch failed` ~10.7s），
+    //      ⇒ 对「取不到」保守：`fetchQoderCreditBalance` 返回 `null` ⇒ `UNUSABLE`。
+    //
+    //    ⚠️⚠️ **这是该陷阱的第 7 次复发**（cline → accio → officeace → autoclaw
+    //    → astudio → minimax → qoder），症状恒定**静默**：**决定候选表可见性的
+    //    是本表**，只改 `aggregate-adapter.ts` 的 `AGGREGATE_CHANNELS` 等于没接 ——
+    //    折算恒 `UNUSABLE`，用户在聚合轮换列表里**永远看不到 qoder / qodercn**。
+    //    ⚠️ 两家**各占一行**：本表按 provider id，漏 `qodercn` 会让中国版单独被剔。
+    'qoder',
+    'qodercn',
+    // ⚠️ **AStudio**（讯飞 AstronStudio，2026-10-20）：折算原语见 `astudioExpiry`。
+    //    三池（会员 / 购买 / 赠送）各下发 `*NextExpireTime`（不带时区的本地时间串），
+    //    已由 `astudio-credits.ts` 的 `astudioLocalTimeMs` 归一化到
+    //    `packages[].deductionEndTime`（毫秒）⇒ 与 buddy 系同一套
+    //    `sharedPackageExpiry` 折算即可，不需要自写原语。
+    //    ⚠️⚠️ **这是该陷阱的第 5 次复发**（cline → accio → officeace → autoclaw
+    //    → astudio），症状恒定**静默**：PR 只加了 `aggregate-adapter.ts` 的
+    //    `AGGREGATE_CHANNELS`（模型层归并会发生、看起来接好了），而**决定候选表
+    //    可见性的是本表** —— 漏加它 ⇒ 折算恒 `UNUSABLE`，用户在聚合轮换列表里
+    //    **永远看不到 astudio**，且**无报错、无日志**。
+    //    ⚠️ 三处必须同改：本表 + `provider-expiry.ts` 的 `createProviderExpiry()`
+    //    + 折算原语（后两者的一致性由 `expiry-runtime-parity.spec.ts` 真跑
+    //    `apply()` 锁一致）。
+    'astudio',
+    // ⚠️ **MiniMax Code**（中国版 / 国际版，2026-10-20，用户报障
+    //    「MiniMax Code 积分也有到期时间，也应当有相同功能」）。
+    //    折算原语见 `minimaxExpiry`（两家共用，只换 product）。
+    //    `/minimax-cloud/api/v1/credit/details` 的每条 `details[]` 都带
+    //    `expire_at_ms`（毫秒时间戳）⇒ 可精确折算，无已知代价。
+    //    ⚠️ 国际站必须透传 `xff`（`pool.minimaxXff()`），否则 `agent.minimax.io`
+    //    307 到中国站、token 不被认 ⇒ 折算恒失败（IKMEVG）。
+    //    ⚠️⚠️ **这是该陷阱的第 6 次复发**（cline → accio → officeace → autoclaw
+    //    → astudio → minimax），症状恒定**静默**：**决定候选表可见性的是本表**，
+    //    只改 `aggregate-adapter.ts` 的 `AGGREGATE_CHANNELS` 等于没接。
+    //    ⚠️ 三处必须同改：本表 + `provider-expiry.ts` 的 `createProviderExpiry()`
+    //    + `provider-registry.ts` 的 `usesExpiryWindow` / `permanentLock`。
+    'minimax',
+    'minimaxintl',
 ]);
 /**
  * 临期折算结果的**缓存时长**（毫秒）。用户 2026-10-07 要求加缓存，TTL 由用户在
@@ -174,6 +277,159 @@ export const WIRED_EXPIRY_PROVIDERS = Object.freeze([
  *  （面板与排序都不是高频路径），却让「刚登录的账号不出现在排序里」的窗口更长。
  */
 export const EXPIRY_CACHE_TTL_MS = 60_000;
+/**
+ * **单渠道折算的总预算**（毫秒）。
+ *
+ * ## 为什么必须封顶
+ *
+ * 本函数内部 `for (const item of credentials)` **串行**折算，而单账号折算自带
+ * 30 s 级的上游超时（各 `*Expiry` 自己的 `*_REQUEST_TIMEOUT_MS`）⇒ 单渠道最坏
+ * 耗时 = **账号数 × 单账号超时**。账号池随用户增删账号线性增长，于是「发一条
+ * 消息 / 打开面板」的等待被账号数线性放大。
+ *
+ * ## ⚠️ 本仓库的**具体取证**（上游 86e3591 把它删了，本仓库保留）
+ *
+ * 上游删掉下面这段的理由，是**他们那份仓库里 `buddy` / `workbuddy` 查无实据**
+ * （`PROVIDER_REGISTRY` 只有 20 个 id、`src/` 下无 `buddy-*.ts`）。
+ * **该理由在本仓库不成立**：这两家就在下面的 {@link WIRED_EXPIRY_PROVIDERS} 里，
+ * 也都在 `provider-expiry.ts` 的 `createProviderExpiry()` 里（`buddyFamilyExpiry`）
+ * ⇒ 走 `buddyExpiry` → `fetchCreditBalance`（`credits.ts` 的
+ * `REQUEST_TIMEOUT_MS = 30_000`）。故这条**真实故障**证据在本仓库成立，按
+ * 「如实登记真实故障证据」保留：
+ *
+ * - 用户报障「重启后配置一直加载不出来」；同机实测 `session/modelCatalog`
+ *   冷启动 **290 000 / 222 000 / 54 000 ms**（中位 **222 秒**），而同一时刻
+ *   `settings/describe` 只要 **68 ms** ⇒ 事件循环没被堵，是本函数在逐账号串行等上游；
+ * - 该机账号池 **workbuddy 7 个号 + buddy 8 个号** ⇒ 最坏 `7×30 + 8×30 = 450 s`；
+ * - 账号数在 2026-10-17 23:00 到 10-18 00:30 之间从 **17 涨到 31**
+ *   ⇒ 用户感受到「昨天还能忍、今天撞墙」。
+ *
+ * ⚠️ 顺带订正上游 commit message 里一条**在本仓库为假**的断言：它说
+ * `credits.ts` 的 `REQUEST_TIMEOUT_MS`「在 `createProviderExpiry()` 里没有消费者
+ * （死路径）」—— 本仓库里 `fetchCreditBalance` **正是** buddy 系的消费者。
+ *
+ * ## ⚠️⚠️ 它封的是哪条路径（别读错 —— 这里已误判过两次）
+ *
+ * 本探针的消费者只有**两处**，且都**不在**目录加载路径上：
+ *
+ * | 消费者 | 何时跑 |
+ * |---|---|
+ * | `aggregate-adapter.ts` 的 `candidatesFor` | **发消息**（`prepareCall`） |
+ * | `aggregate-adapter.ts` 的 `describeExpiryOrder` | 面板「按临期排序」（用户点按钮） |
+ *
+ * ⚠️ `buildModelCatalog` / `resolveModel` / `listModels` / `refreshCatalog`
+ * **一律不调本探针**（前者走 `coldModelInfo` + 后台刷新，后两者只读各渠道目录）
+ * ⇒ **本预算不会缩短模型选择器的冷启动耗时**。想改善那条路径要动的是
+ * `AGGREGATE_BACKGROUND_REFRESH_TIMEOUT_MS` 与 `catalogForListModels`，不是这里。
+ * 把因果链写成「修 `modelCatalog` 冷启动」是**错的**（2026-10-22 审计实测：
+ * 那四个方法体里 `expiryProbe` 出现 0 次）。
+ *
+ * ## 为什么是 8 秒
+ *
+ * - `candidatesFor` 是**发消息**路径（用户按了发送正在等），超过 10 秒已可认为卡死；
+ * - 正常情况下一个渠道折算远低于 8 秒（本仓库排障日志里 codearts / trae / zcode
+ *   均在 1.2 秒内）—— 8 秒只截断「上游在超时边缘」的渠道；
+ * - 被截断的渠道按**保守方向**处理，与本文件铁律
+ *   「宁可少一个候选，不可把未知当可用」一致。
+ *
+ * ## ⚠️⚠️ 预算**按账号均分**，不是「先到先得」（2026-10-22 审计打穿后改）
+ *
+ * 初版是「首号吃满整个预算，耗尽就 `break`」。实测后果：某渠道的**第一个**账号
+ * 稳定慢于 8 秒 ⇒ 后面所有账号**每一轮都轮不到** ⇒ 每轮都 `UNUSABLE` ⇒ 还被
+ * `cacheAndReturn` 缓存 60 秒 ⇒ 该渠道在聚合轮换里**永久不可见**。
+ * 那正是上一版注释自称要避免的故障，被自己的实现从另一个入口做了出来
+ *（`listAvailableCredentials` 的顺序 = `readAccounts()` 固定顺序，无轮转 ⇒ 每轮
+ * 都是同一个「首号」）。
+ *
+ * ⇒ 现在每个账号只拿「**剩余预算 ÷ 剩余账号数**」（见循环处的 `perAccountMs`）：
+ * 总时长仍 ≤ 本预算，但**每个账号都有一次机会**。
+ *
+ * ⚠️ 截断**不是**把结果写成 `NEVER`：那会让一个我们其实没查清的渠道以
+ *   「永久可用」身份参与排序。已成功折算的账号仍按**真实观测值**返回
+ *   （如实登记：那是**部分观测**，不是全量）；一个都没成时才 `UNUSABLE`。
+ */
+export const EXPIRY_PROBE_BUDGET_MS = 8_000;
+/**
+ * 单账号可用的**最低预算下限**（毫秒）。
+ *
+ * ## 为什么必须有下限（2026-10-22 审计打穿后补）
+ *
+ * 预算按「剩余预算 ÷ 剩余账号数」均分后，账号一多，每份就会小到不可用：
+ * 8 秒 ÷ 31 个账号 = **258 ms**，而正常的折算实测在 350 ms ~ 1.2 s 之间 ⇒
+ * **每个账号都会被自己的那份截断** ⇒ 整渠道 `UNUSABLE`，等于把「账号多」直接
+ * 变成「渠道不可见」。那与 {@link EXPIRY_PROBE_BUDGET_MS} 要解决的问题同型。
+ *
+ * ⇒ 每份取 `max(下限, 均分)`：宁可让本渠道**略微超出**总预算，也不让任何一个
+ * 账号因为「排得靠后」或「账号太多」而被跳过。超出量有界（≤ 账号数 × 下限），
+ * 且只在「前几个账号各自吃满自己那份」的病态情形下才叠加。
+ *
+ * ⚠️ 取值理由：1.2 秒是实测里最慢的正常渠道（trae）的耗时量级 ⇒ 取 1.5 秒留余量。
+ * 再小会让正常渠道被误截断；再大则「账号多」时总耗时增长过快。
+ */
+export const EXPIRY_PROBE_MIN_SLICE_MS = 1_500;
+/**
+ * 归一化 {@link ExpiryProbeOptions.budgetMs}（**纯函数，可直接单测**）。
+ *
+ * ## 为什么必须有它（2026-10-22 审计打穿）
+ *
+ * 初版只判 `budgetMs === 0`，其余值原样交给 `setTimeout`。而 `setTimeout` 的
+ * 延迟是 **32 位有符号整数**，越界/`NaN` 会被 Node **钳成 1 ms**（并打一条
+ * `TimeoutOverflowWarning` / `TimeoutNaNWarning` 到 stderr）。实测后果：
+ *
+ * | 传入 | 实测（3 账号全挂死） |
+ * |---|---|
+ * | `Infinity`（「不封顶」最自然的直觉写法） | 每个账号**瞬间** UNUSABLE（计时器 1 ms） |
+ * | `NaN` / `1e10` / 字符串 `'0'` | 同上 |
+ * | `-1` | `deadline` 在过去 ⇒ **0 次 fetch** |
+ *
+ * ⇒ 判据：**只有有限的非负数被采纳**；`0` 保留「不封顶」语义；其余一律回落
+ * 默认值（`Infinity` 也回落 —— 想要不封顶请传 `0`，那是唯一登记的写法）。
+ *
+ * ⚠️ 上界 `2 ** 31 - 1` 是 `setTimeout` 自己的上限，超过它就会被钳成 1 ms ⇒
+ *   必须在**这里**截断，而不是指望 `setTimeout` 帮忙。
+ */
+export function normalizeExpiryProbeBudget(raw) {
+    const max = 2 ** 31 - 1;
+    if (typeof raw !== 'number' || !Number.isFinite(raw) || raw < 0)
+        return EXPIRY_PROBE_BUDGET_MS;
+    if (raw === 0)
+        return 0;
+    return Math.min(raw, max);
+}
+/**
+ * 算出「**当前这个账号**可以等多久」（**纯函数，可直接单测**）。
+ *
+ * ## 为什么把它抽出来（2026-10-22 变异验证的血泪）
+ *
+ * 这段算术原本内联在循环里，于是只能用**耗时**来判它有没有生效。实测：
+ * 「去掉 `min(剩余预算, …)`」这个变异只让 31 个账号的耗时从 8.01 s 变成 9.05 s
+ * —— 而**探测账号数两者完全相同**（都是 6 个）。⇒ 那条用例：
+ * - 用 `toBeLessThan(预算 + 5s)` 时对变异**完全无牙**；
+ * - 用 `toBeLessThan(预算 + 1.2s)` 时又会被 CI 抖动打成**时红时绿**。
+ *
+ * ⇒ 抽成纯函数后，判据变成**确定性的逐格算术**，与时钟无关。
+ *
+ * ## 口径：`min(剩余预算, max(下限, 均分))`
+ *
+ * | 项 | 作用 |
+ * |---|---|
+ * | `均分` = 剩余 ÷ 剩余账号数 | 让**每个账号都有机会**；快账号省下的预算自动滚给后面的 |
+ * | `下限` = {@link EXPIRY_PROBE_MIN_SLICE_MS} | 账号多时均分会小到不可用（8 s ÷ 31 = 258 ms，而正常渠道实测 350 ms~1.2 s）⇒ 没它会把「账号多」直接变成「全被截断」 |
+ * | **`min(剩余预算, …)`** | **总时长硬上界** —— 下限**不得**透支预算 |
+ *
+ * ⚠️ 第三项是必须的：我第一版漏了它，实测 31 个账号全挂跑了 **46.8 秒**（31 × 下限）。
+ *
+ * @param budgetMs - 已归一化的总预算；`0` 表示不封顶。
+ * @param remainingMs - 本渠道**还剩多少预算**（可能为负 / `Infinity`）。
+ * @param remainingAccounts - **含当前账号在内**还有几个没探。
+ * @returns 当前账号可等待的毫秒数（`Infinity` = 不封顶）。
+ */
+export function expiryProbeSliceMs(budgetMs, remainingMs, remainingAccounts) {
+    if (budgetMs === 0)
+        return Number.POSITIVE_INFINITY;
+    const share = Math.floor(remainingMs / Math.max(1, remainingAccounts));
+    return Math.min(remainingMs, Math.max(EXPIRY_PROBE_MIN_SLICE_MS, share));
+}
 export function createExpiryProbe(pool, firstModelIdOf, options = {}) {
     /**
      * 按渠道缓存折算结果（用户要求：排序读缓存，不每次打服务器）。
@@ -435,8 +691,135 @@ export function createExpiryProbe(pool, firstModelIdOf, options = {}) {
         };
         const markModelsExhausted = pool.markModelsExhaustedForExpiry?.bind(pool);
         const clearModelsExhausted = pool.clearModelsExhaustedForExpiry?.bind(pool);
-        for (const item of credentials) {
+        /**
+         * 共享余额读数入口（装配层注入；未注入 ⇒ 全部实现方走自己的回落路径）。
+         *
+         * ⚠️ 签名里的 `credential` 是**本次折算的那个账号的凭据**：缓存按
+         * `(provider, accountId)` 去重，而**取数原语需要凭据** ⇒ 由本层把两者配对后
+         * 传给缓存（`balanceCache.readOne`）。
+         * ⚠️ 不注入时**不传**该字段（而不是传一个恒 `undefined` 的函数）：
+         * 后者会让实现方白走一次「查缓存 → 未命中」的分支（行为相同，但多一层间接）。
+         */
+        const cachedBalanceOf = options.balanceOf;
+        // ⚠️ 必须走归一化：初版直接 `?? EXPIRY_PROBE_BUDGET_MS`，于是 `Infinity`
+        //    （最像「不封顶」的写法）会让 `setTimeout` 溢出被钳成 1 ms ⇒ 全部渠道瞬间
+        //    UNUSABLE。判据与后果见 `normalizeExpiryProbeBudget` 的表。
+        const budgetMs = normalizeExpiryProbeBudget(options.budgetMs ?? EXPIRY_PROBE_BUDGET_MS);
+        /**
+         * 把一次「单账号折算」限制在给定预算内。
+         *
+         * ⚠️ **超时返回哨兵值而不是抛错**：这不是调用方中止，而是我们自己的预算用完。
+         * 抛 `AbortError` 会被上层误判成「用户取消」并冒泡成 `MISSING_CREDENTIAL`；
+         * 返回 `UNUSABLE` 才符合「本轮剔除该账号」的语义。
+         *
+         * ⚠️ **`signal` 是第三个竞争者**（2026-10-22 审计补）。`credentialExpiry` 的
+         * 签名里**没有** `signal`，各 `*Expiry` 用的是自己的 `AbortSignal.timeout(30_000)`
+         * ⇒ 折算层唯一的 abort 防线是循环顶部的 `throwIfAborted()` 与 catch 里的两条，
+         * 而**取消发生在 await 期间时它们全都看不到**。实测（`budgetMs: 0`，即升级前
+         * 语义，取消于 100 ms）：仍等满 1.5 秒才返回 `UNUSABLE`，并把它**缓存 60 秒**
+         * ⇒ 用户取消一次，该渠道对路由消失 60 秒，且报错是「请先登录」式的误导。
+         * 这是**既有缺陷**（非本次改动引入），但修它正好落在本函数里，故顺手补上。
+         *
+         * ⚠️ 超时**不取消**在途的 fetch（各 `*Expiry` 内部自带自己的超时信号，
+         * 它们会在自己的超时后结束）。这里只是**不再等它** —— 让它自然结束，
+         * 避免把上游连接强行掐断引发重试风暴。
+         *
+         * ⚠️ **`Promise.race` 会订阅全部竞争者**，故落败者的 reject 不会变成
+         * `unhandledRejection`（实测确认）。但**早退分支**（`budgetMs === 0`）只
+         * `await task`、不订阅别的 —— 那里必须靠 `task` 自己，别把它改成
+         * 「先建 race 再早退」（那会留下一个没人订阅的 promise）。
+         *
+         * ⚠️ 计时器**不能 `unref()`**（实测踩到）：调用方正 `await` 这次折算，
+         * 若计时器不保持进程活跃，Node 会判定「没有待办」直接退出 ——
+         * 独立验证时进程以 `Warning: Detected unsettled top-level await` 静默结束。
+         * 这与后台写盘的 `unref` 场景不同：这里的计时器是**前台等待**的一部分。
+         *
+         * @param budgetForThisAccount - 该账号可用的毫秒数（**已按剩余账号数均分**，
+         *   见循环处的 `perAccountMs`）；`budgetMs === 0` 时不封顶。
+         */
+        const withinBudget = async (budgetForThisAccount, task, signal) => {
+            if (budgetMs === 0)
+                return await task;
+            let timer;
+            let onAbort;
+            /** 与 `timeout` 同一个哨兵：谁先胜出都只是「不再等」。 */
+            const timeout = new Promise((resolve) => {
+                timer = setTimeout(() => resolve(UNUSABLE), budgetForThisAccount);
+            });
+            /**
+             * 中止竞争者：**抛** `AbortError`（不是 resolve 哨兵）—— 中止必须原样逃逸，
+             * 与循环顶部 `signal?.throwIfAborted()` 同一口径。
+             */
+            const aborted = new Promise((_resolve, reject) => {
+                if (signal === undefined)
+                    return;
+                if (signal.aborted) {
+                    reject(abortErrorOf(signal));
+                    return;
+                }
+                onAbort = () => reject(abortErrorOf(signal));
+                signal.addEventListener('abort', onAbort, { once: true });
+            });
+            try {
+                return await Promise.race([task, timeout, aborted]);
+            }
+            finally {
+                if (timer !== undefined)
+                    clearTimeout(timer);
+                if (onAbort !== undefined)
+                    signal?.removeEventListener('abort', onAbort);
+                // ⚠️ `aborted` 若从未胜出（正常路径），它内部登记的 listener 已被摘掉；
+                //    而 `Promise.race` 已订阅它 ⇒ 不会有未处理的 rejection。
+                //    但若 `signal` 已 aborted 且 `reject` 已发生、race 又先被 task 胜出，
+                //    那个 rejection 仍被 race 消费（实测无 unhandledRejection）。
+            }
+        };
+        // ⚠️ **本渠道的预算起点**（见 `EXPIRY_PROBE_BUDGET_MS` 的长注释）。
+        const deadline = budgetMs === 0 ? Number.POSITIVE_INFINITY : now() + budgetMs;
+        for (let index = 0; index < credentials.length; index += 1) {
+            const item = credentials[index];
             signal?.throwIfAborted();
+            /**
+             * ⚠️⚠️ **预算按「剩余账号数」均分，且**双重封顶**（2026-10-22 审计打穿后改）。
+             *
+             * ## 初版为什么错
+             *
+             * 初版把整个剩余预算交给当前账号、耗尽就 `break`。实测后果（真实报文形状）：
+             * 第 1 号 12 秒后才失败、第 2 号 100 ms 就能成功 ⇒
+             *   `budgetMs: 0` → 真实到期时刻（渠道可用）
+             *   默认 8 秒    → `UNUSABLE`（渠道被判死，第 2 号**一次都没被问**）
+             * 而 `listAvailableCredentials` 的顺序 = `readAccounts()` 的**固定顺序**（无轮转）
+             * ⇒ 只要「首号」稳定慢于 8 秒，**每一轮**都是同一个首号、每一轮都 `UNUSABLE`
+             * ⇒ 再被 `cacheAndReturn` 缓存 60 秒 ⇒ 该渠道在聚合轮换里**永久不可见**。
+             * 这正是本常量上一版注释自称要避免的那件事。
+             *
+             * ## 现在的口径：`min(剩余预算, max(下限, 均分))`
+             *
+             * | 项 | 作用 |
+             * |---|---|
+             * | `均分` = 剩余 ÷ 剩余账号数 | 让**每个账号都有机会**，且快账号省下的预算自动滚给后面的 |
+             * | `下限` = {@link EXPIRY_PROBE_MIN_SLICE_MS} | 账号多时均分会小到不可用（8 s ÷ 31 = 258 ms < 正常渠道的 350 ms~1.2 s）⇒ 没它会把「账号多」直接变成「全被截断」 |
+             * | **`min(剩余预算, …)`** | **总时长硬上界** —— 下限**不得**透支预算 |
+             *
+             * ⚠️ 第三项是**必须**的（我第一版漏了它，实测 31 个账号全挂时跑了 **46.8 秒**
+             * = 31 × 下限）：没有 `min`，下限会在预算耗尽后继续续命 ⇒ 预算形同虚设。
+             * 现在 31 个账号全挂 ≈ 5 × 1500 + 500 = **8 秒**（有界），且**前 6 个账号都
+             * 拿到了一次机会**（不是只有首号）。
+             *
+             * ## 已知代价（如实登记）
+             *
+             * 账号数超过 `预算 ÷ 下限`（默认 8 s ÷ 1.5 s ≈ 5 个）时，**靠后的账号本轮探不到**
+             * ⇒ 若它们里有更早到期的那个，本轮返回的是**偏乐观**的到期时刻。
+             * 这与「未探完 ⇒ 保守 ⇒ UNUSABLE」的铁律**不冲突**：铁律管的是「一个都没成」，
+             * 这里已有一个成 ⇒ 渠道可用的**结论**是真的，只是排序值可能偏乐观。
+             * ⇒ 真要根治得让起点**轮转**（每轮从不同账号开始），那是独立改动，不在本处。
+             */
+            const remainingAccounts = credentials.length - index;
+            const remaining = deadline - now();
+            // ⚠️ 预算真的用完了才停（`budgetMs === 0` 时 `remaining` 恒 Infinity，不会命中）。
+            if (budgetMs !== 0 && remaining <= 0)
+                break;
+            const perAccountMs = expiryProbeSliceMs(budgetMs, remaining, remainingAccounts);
             const credential = item.credential;
             let value;
             try {
@@ -448,7 +831,7 @@ export function createExpiryProbe(pool, firstModelIdOf, options = {}) {
                  * ⚠️ `catalogIds` 在这里**不求值**（传的是个函数）：只有 zcode 会调它，
                  * 其余 6 家每轮因此**零额外目录读取**（那是本仓库反复强调的成本）。
                  */
-                value = await credentialExpiry(provider, credential, {
+                value = await withinBudget(perAccountMs, credentialExpiry(provider, credential, {
                     ...item.entry.id === undefined ? {} : { accountId: item.entry.id },
                     // ⚠️ officeace 的余额查询**必须**拿到 ref 才走云侧直读（见该字段注释）；
                     //    其余家忽略它。
@@ -458,7 +841,17 @@ export function createExpiryProbe(pool, firstModelIdOf, options = {}) {
                     catalogIds,
                     ...markModelsExhausted === undefined ? {} : { markModelsExhausted },
                     ...clearModelsExhausted === undefined ? {} : { clearModelsExhausted },
-                });
+                    // ⚠️ 共享读数入口（2026-10-15，规格 §5.7）：只对**声明了它**的渠道生效 ——
+                    //    buddy 系四家吃同一份读数，其余家忽略（与本上下文里 `catalogIds`
+                    //    同一模式：可选能力由实现自己声明）。
+                    //    ⚠️ 只在装配层真的注入了缓存时给（`options.balanceOf`），否则**不传**
+                    //    ⇒ 实现方走自己的回落路径（那正是「未接线 = 行为不变」）。
+                    ...cachedBalanceOf === undefined || item.entry.id === undefined
+                        ? {}
+                        : {
+                            cachedBalance: () => cachedBalanceOf(provider, item.entry.id, credential),
+                        },
+                }), signal);
             }
             catch (error) {
                 // 中止仍必须逃逸（与上面的 `try` 同一口径）。
@@ -479,6 +872,10 @@ export function createExpiryProbe(pool, firstModelIdOf, options = {}) {
         // ⚠️ 一个都没成功 ⇒ 未知 ⇒ 剔除（不是 NEVER）。
         if (!anyConverted)
             return cacheAndReturn(provider, UNUSABLE, startedAt);
+        // ⚠️ **部分观测也要如实登记**：走到这里可能是「探完全部账号」，也可能是
+        //    「每个账号各吃满自己那份均分预算」。返回的是**已观测到的最小值**，
+        //    不声称它是全量最小值（真实代价：某个排得靠后的账号若更早到期，本轮看不到）。
+        //    这与「一个都没成 ⇒ UNUSABLE」是**两个不同结论**，不要合并。
         return cacheAndReturn(provider, earliest, startedAt);
     }, 
     /**
@@ -574,9 +971,63 @@ function isAbortError(error) {
         return false;
     return error.name === 'AbortError';
 }
+/**
+ * 造一个 `AbortError`（供「预算等待期间被取消」那条腿用）。
+ *
+ * ⚠️ 为什么需要它：`signal.throwIfAborted()` 抛的是**平台自带的** `DOMException`
+ * / `AbortError`，而 `withinBudget` 的 abort 竞争者要自己造一个。两者必须**同类**
+ * ——`isAbortError` 只认 `name === 'AbortError'`，造错了（例如 `new Error()` 后忘了
+ * 改名）会让中止被上层 `catch` 吞成 `UNUSABLE`，正是本文件反复修的形态。
+ *
+ * ⚠️ 优先用 `signal.reason`：取消方可能带了自定义 reason（如上层传了 `DOMException`），
+ * 原样透传比自造更贴近「中止原样逃逸」的铁律。但只在它**确实是中止类**时才用
+ *（自定义 reason 可能是任意值，把它当 AbortError 抛会让 `isAbortError` 判假）。
+ */
+function abortErrorOf(signal) {
+    const reason = signal.reason;
+    if (reason !== null && typeof reason === 'object'
+        && reason.name === 'AbortError') {
+        return reason;
+    }
+    if (typeof DOMException === 'function')
+        return new DOMException('This operation was aborted', 'AbortError');
+    const error = new Error('This operation was aborted');
+    error.name = 'AbortError';
+    return error;
+}
 /** buddy 系：有效资源包 `deductionEndTime` 的最小值；无有效包 → NEVER。 */
-export async function buddyExpiry(product, credential) {
-    return sharedPackageExpiry(() => fetchCreditBalance(credential, product));
+export async function buddyExpiry(product, credential, 
+/**
+ * 共享读数入口（2026-10-15，规格 §5.7 的「buddy 系四家吃同一份读数」）。
+ *
+ * ⚠️ 返回 `undefined` ⇒ **回落到自己发请求**（`fetchCreditBalance`）。
+ *    折算的可用性**不得**依赖它 —— 否则「未接线」会变成「该渠道折算恒 UNUSABLE」
+ *（静默少一个候选，本仓库复发过三次的形态）。
+ */
+cached) {
+    return sharedPackageExpiry(() => fetchBalanceWithCache(cached, () => fetchCreditBalance(credential, product)));
+}
+/**
+ * 「优先吃共享读数、缺席则自己取」的**唯一一份**实现（buddy 系四家共用）。
+ *
+ * ⚠️⚠️ **必须共享**：四家各写一遍这个「先看缓存、没有就自己发请求」的分支，
+ * 任何一侧漏掉回落（或回落时用错原语）都会**静默分叉** —— 正是
+ * `sharedPackageExpiry` 那条注释记录的事故类型（`classifyRaccoonFailure` 与
+ * `classifyLoomyFailure` 的四格判据不一致）。
+ *
+ * ⚠️ 缓存命中的**证明责任在缓存**（`src/balance-cache.ts`）：`undefined` 严格表示
+ * 「本次没有共享读数」，与「读数是 `null`（查询失败）」是两件事 ——
+ * 后者要按既有口径折算成 `UNUSABLE`（`sharedPackageExpiry` 对 `null` 的处理）。
+ */
+async function fetchBalanceWithCache(cached, fallback) {
+    if (cached !== undefined) {
+        const shared = await cached();
+        // ⚠️ 只认**非 undefined**：`null` 是「共享读数说查询失败」，那是**结论**，
+        //    不该转头再自己发一次请求（那会让「失败」变成双倍上游请求）。
+        if (shared !== undefined)
+            return shared;
+    }
+    return await fallback();
 }
 /**
  * **共享的「有效资源包最早到期」折算**（buddy / workbuddy / lobsterai / trae 同形）。
@@ -645,7 +1096,48 @@ async function sharedPackageExpiry(fetchBalance) {
     try {
         balance = await fetchBalance();
     }
-    catch {
+    catch (error) {
+        /**
+         * ⚠️⚠️ **中止必须原样逃逸**（铁律；这是同型缺陷在本文件的**第五处**）。
+         *
+         * ## 为什么必须修（2026-10-19，用户报障）
+         *
+         * 初版是**裸 `catch`** ⇒ 把 `AbortError` 也折算成 `UNUSABLE`。
+         * 而 `UNUSABLE` 会被 `cacheAndReturn` **缓存 60 秒**（`EXPIRY_CACHE_TTL_MS`）
+         * ⇒ **取消一次 = 该渠道对路由消失 60 秒**。
+         *
+         * 用户可见症状（真实会话日志，`aggregate: 「space-bunny」当前没有任何可用候选`）：
+         * - `step/start 1792418663502` → `turn/end 1792418663505` ⇒ **3 毫秒、零网络**；
+         * - 报错前一步是一次 **604 秒的 subagent 调用**（长任务被取消/超时）；
+         * - 该虚拟模型**只有 buddy 一家候选**（无备胎）⇒ 候选一空就直接撞
+         *   `candidatesFor() === []`（`src/aggregate-adapter.ts:1315`）；
+         * - 60 秒后缓存过期 ⇒ 自愈 ⇒ 表现为「发消息继续就又能工作了」。
+         *
+         * ## 可达性：已实测，**如实标注**（别读成「生产已复现」）
+         *
+         * | 探针 | 结果 |
+         * |---|---|
+         * | `buddyExpiry` 的 `cached()` 抛 `AbortError` | **被吞成 `UNUSABLE`** ← 本修法修的接缝 |
+         * | `balanceCache.readOne` 上游抛中止 | **原样上抛**（`src/balance-cache.ts:402`）⇒ 接缝已开口 |
+         * | 真实 buddy 腿 `fetchCreditBalance` | `postJson` 把中止压成 `{ok:false}` ⇒ **该腿不抛中止** |
+         *
+         * ⇒ buddy 当前**不可达**；但共享缓存那条腿（上一行第二条）**已经会抛中止**，
+         *  且 `src/index.ts:3273` 正是把 `readOne` 接到本函数的 `cached()` 上
+         *  ⇒ 这是**接缝安全**，不是「已复现的故障」。旧注释预言的三种情形
+         *  （某家改用 `fetchBalanceDetailed` / `postJson` 改为抛出 / 新增走
+         *  `fetchBalanceWithCache` 的渠道）任一发生，这里就会立刻吃掉中止。
+         *
+         * ⚠️ **判据只认 `isAbortError`，不额外查 signal**：本函数**收不到 `signal`**
+         *   （签名只有 `fetchBalance`，见 `@param`）。入口 signal 已标记的那种情形
+         *   由 `createExpiryProbe` 的循环逐轮 `signal?.throwIfAborted()` 负责 ——
+         *   与该文件 `zcodeExpiry` 分支的登记口径一致。
+         *
+         * ⚠️ 其余错误**仍折算成 `UNUSABLE`**（不改既有裁决）：
+         *   `tests/unit/aggregate-expiry.spec.ts:802` 的「全部账号折算失败 ⇒ UNUSABLE」
+         *   是**有意取舍**（「不能把『不知道』当『可用』」），本次**刻意不动**它。
+         */
+        if (isAbortError(error))
+            throw error;
         return UNUSABLE;
     }
     if (balance === null)
@@ -658,6 +1150,21 @@ async function sharedPackageExpiry(fetchBalance) {
         if (pkg.active !== true)
             continue;
         if (!(typeof pkg.remaining === 'number' && pkg.remaining > 0))
+            continue;
+        /**
+         * ⚠️⚠️ **独立池不进折算**（2026-10-21 合并审计发现）。
+         *
+         * AStudio 的星火池是服务端下发的**独立池**（不参与主池合计、也不能当
+         * 通用积分消耗）。若把它算进来：
+         * ① `hasAnyCredit` 会因它为真 ⇒ 主池全空时也判「有余额」⇒ 账号**不被
+         * 剔除** ⇒ 聚合把请求发给一个只有专属池的账号 ⇒ 上游按主池计费 ⇒ 失败；
+         * ② `earliest` 会取**它**的到期时刻 ⇒ 星火池先过期时整个账号被判「马上
+         * 作废」⇒ 聚合把它排到最前 ⇒ **提前烧掉主池的长期积分**。
+         *
+         * ⚠️ 判据与后端选号侧（`buddy-balance-rank.ts`）同源（同一份
+         * `isExclusiveCreditPool`）⇒ 两侧口径一致。
+         */
+        if (isExclusiveCreditPool(pkg))
             continue;
         hasAnyCredit = true;
         const end = pkg.deductionEndTime;
@@ -680,8 +1187,10 @@ async function sharedPackageExpiry(fetchBalance) {
  * `auto-adapter.ts` 那句「其余 provider 没有跨账号的到期余额探测端点」——
  * **该理由对 lobsterai 不成立**（用户 2026-10-07 质疑后核实）。
  */
-export async function lobsteraiExpiry(credential, product) {
-    return sharedPackageExpiry(() => fetchLobsteraiCreditBalance(credential, product));
+export async function lobsteraiExpiry(credential, product, 
+/** 共享读数入口（见 {@link buddyExpiry} 的同名参数）。 */
+cached) {
+    return sharedPackageExpiry(() => fetchBalanceWithCache(cached, () => fetchLobsteraiCreditBalance(credential, product)));
 }
 /**
  * trae：与 buddy **同形**（`CreditPackage.deductionEndTime` 由
@@ -689,8 +1198,262 @@ export async function lobsteraiExpiry(credential, product) {
  *
  * ⚠️ 同 lobsterai：此前被那句（不成立的）理由排除在白名单外。
  */
-export async function traeExpiry(credential, product) {
-    return sharedPackageExpiry(() => fetchTraeCreditBalance(credential, product));
+export async function traeExpiry(credential, product, 
+/** 共享读数入口（见 {@link buddyExpiry} 的同名参数）。 */
+cached) {
+    return sharedPackageExpiry(() => fetchBalanceWithCache(cached, () => fetchTraeCreditBalance(credential, product)));
+}
+/**
+ * ModelScope（魔搭）：**本 fork 独有**（2026-10-17）。
+ *
+ * ## 它属哪一类
+ *
+ * 「**有余额但不下发到期时间**」那一类 —— 判据直接复用
+ * {@link sharedPackageExpiry}（逐格同构，不另写一套）：
+ *
+ * - `balance.packages` 里存在 `active === true && remaining > 0` 的包
+ *   ⇒ 返回 `NEVER`（**长期可用，排最后，不剔除**）；
+ * - 一个都没有（`available_balance === 0`）⇒ 返回 `UNUSABLE`（**剔除**）。
+ *
+ * ⚠️ 魔搭的 `/openapi/v1/magicubes/balance` 报文里**没有任何时间字段**
+ * （实测：`{"total_balance":277,"available_balance":277,"frozen_amount":0}`）
+ * ⇒ 必然走「有余额但无到期时间」这条，落到 `NEVER`。
+ *
+ * ## ⚠️⚠️ 与其它家的**根本差异**：额度耗尽**不会被自动跳过**
+ *
+ * buddy 系能折算出临期时刻、从而在耗尽前把账号剔出轮换；魔搭**做不到** ——
+ * 它既没有「配额何时重置」字段（每日发放是平台侧行为，实测报文字段里没有），
+ * 也无法查询余额之外的东西（`/api/v1/quota/status` 经实测是**任务奖励**、
+ * 不是额度，详见 `modelscope-credits.ts`）。
+ *
+ * ⇒ **魔粒烧光时，聚合仍会把它排进轮换候选**，用户选中后才失败一次
+ * （报额度用尽）。这是**已知且刻意接受**的代价，由用户在 2026-10-17 明确选择
+ * （选项 B）：宁可在极端情况下多失败一次，也要让魔粒充足时能进轮换。
+ * ⚠️ **不许用「猜一个每日 UTC+8 零点」来消除这个代价** —— 那会凭空造出一个
+ * 上游从未承诺的重置时刻（本仓库红线「绝不编造数字」）。
+ *
+ * ## ⚠️ 为什么**不**直接复用 `fetchTraeCreditBalance` 那套的 `fetchBalance`
+ *
+ * 本家走 `fetchBalanceDetailed`（三种失败的用户动作不同，见
+ * `modelscope-credits.ts`）⇒ 这里必须吃 `balance: null` 的那一支，
+ * **不是** `fetchBalance` 的 `null`。
+ */
+export async function modelscopeExpiry(credential, product, 
+/** 共享读数入口（见 {@link buddyExpiry} 的同名参数）。 */
+cached) {
+    return sharedPackageExpiry(() => fetchBalanceWithCache(cached, async () => {
+        const result = await fetchModelscopeBalanceDetailed(credential, product);
+        // ⚠️ `fetchBalanceDetailed` 用 `balance: null + error` 表达失败
+        //    （见 `ProviderBalanceDetail` 的注释），而 `sharedPackageExpiry`
+        //    认的是「`null` ⇒ UNUSABLE」⇒ 取 `balance` 即可。
+        return result.balance;
+    }));
+}
+/**
+ * AutoClaw（智谱）：**本 fork 独有**（2026-10-17 审计 P0 修复）。
+ *
+ * ## 它属哪一类
+ *
+ * 与 {@link modelscopeExpiry} **同格**：「**有余额但不下发到期时间**」——
+ * `/agent-assetmgr/api/v2/wallets` 的 `wallets[]` 只有 `balance` /
+ * `balance_view` / `priority` / `display`，**没有任何时间字段**
+ * （见 `autoclaw-credits.ts` 的 `AutoclawWalletItem`）。
+ * ⇒ 判据直接复用 `sharedPackageExpiry`（逐格同构，不另写一套）：
+ * 有 `active === true && remaining > 0` 的包 ⇒ `NEVER`；一个都没有 ⇒ `UNUSABLE`。
+ *
+ * ## ⚠️⚠️ 已知且刻意接受的代价
+ *
+ * 积分烧光时**不会被提前剔出轮换** —— 平台既不下发「配额何时重置」，
+ * 也没有别的额度端点可查 ⇒ 耗尽后仍会被选中并失败一次（报额度用尽）。
+ * 与 modelscope 的代价**同型**（用户在 2026-10-17 已就魔搭明确接受这个取舍）。
+ * ⚠️ **不许用「猜一个每日 UTC+8 零点」消除它** —— 那是凭空造一个上游从未
+ * 承诺的重置时刻（本仓库红线「绝不编造数字」）。
+ *
+ * ## 为什么必须走 `cachedBalance`
+ *
+ * 聚合每轮折算会对同一账号反复提问；没有共享读数就会白发大量重复请求
+ * （与 buddy / trae / modelscope 同款理由）。
+ */
+export async function autoclawExpiry(credential, product, 
+/** 共享读数入口（见 {@link buddyExpiry} 的同名参数）。 */
+cached) {
+    return sharedPackageExpiry(() => fetchBalanceWithCache(cached, async () => {
+        const result = await fetchAutoclawBalanceDetailed(credential, { product });
+        // ⚠️ 同上：`fetchBalanceDetailed` 的失败形态是 `balance: null + error`，
+        //    `sharedPackageExpiry` 认「`null` ⇒ UNUSABLE」⇒ 只取 `balance`。
+        return result.balance;
+    }));
+}
+/**
+ * **Qoder**（`qoder` 国际版 / `qodercn` 中国版，**共用**本原语，只换 product）：
+ * 与 **buddy 系同形**（`CreditPackage` 都带 `deductionEndTime`）⇒ 判据直接复用
+ * `sharedPackageExpiry`，**不另写解析逻辑**（两站共用同一个原语，避免同族分叉）。
+ *
+ * ## ⚠️⚠️ **本家与其它「已接入」渠道的本质不同：上游不给逐包到期时刻**
+ *
+ * 2026-10-20 取证（两个真实 qodercn 账号，`GET /sash/api/v2/me/usage`）：
+ *
+ * | 字段 | 实测 | 是否带日期 |
+ * |---|---|---|
+ * | `userQuota`（套餐额度） | `{total:0,used:0,remaining:0}` | 只有顶层 `expiresAt`，且恒为**永久哨兵** |
+ * | `addOnQuota`（资源包） | `{total:2000,…remaining:2000,detailUrl:…}` | **无任何日期字段，只给聚合标量** |
+ * | `dedicatedResourcePackages` | `undefined`（本机账号） | **唯一**带真实逐包 `expiresAt`（字符串）的字段 |
+ *
+ * 顶层 `qoderUsage.expiresAt = 253402214400000`（`9999-12-31T00:00:00Z`）是
+ * Qoder 给 `userQuota` 下发的**永久哨兵**、**不是**到期时刻。权威旁证是官方
+ * 客户端 asar 的 `buildUsageItemGroups()`：`addOnQuota` 那一档**只渲染
+ * used/total/remaining、不给任何日期**；只有 `userQuota.expiresAt` 走
+ * `renewson`（「将于 {{date}} 刷新」= **订阅刷新**），
+ * `dedicatedResourcePackages` 才走 `expiresOn`（「有效期至 {{date}}」）。
+ *
+ * ⇒ `qoder-credits.ts` 的 `toPackage()` 用常量
+ * `QODER_PERMANENT_EXPIRY_MS` 识别哨兵并**不写** `deductionEndTime`
+ * （写进去会让客户端 `formatPackageExpiry` 渲染出
+ * `9999-12-31（约 2900000 天后）` 这种荒谬文案）。
+ *
+ * ## 折算结果（如实，不是打折）
+ *
+ * | 情形 | 折算值 | 依据 |
+ * |---|---|---|
+ * | 有余额但**无**逐包到期（本次实测的账号形态） | `NEVER`（长期：排最后但不剔除） | `sharedPackageExpiry` 的「有余额但无到期时间」那一档 |
+ * | 有余额且有 `dedicatedResourcePackages` 的真实到期 | 该时刻（取最早那包） | 同上（`Math.min`） |
+ * | 一个 `remaining > 0` 的有效包都没有 | `UNUSABLE`（剔除） | 同上 |
+ * | 查询失败（含国际版不可达）/ 未登录 | `UNUSABLE` | 同上（`null` ⇒ 不猜） |
+ *
+ * ⚠️ **已知限制（必须如实标注）**：无 `dedicatedResourcePackages` 时
+ * **临期桶恒为 0** —— 三档分档只剩「永久（未知到期）」一档 + 上游聚合标量。
+ * 这**不是**缺陷，是「上游不下发 ⇒ 我们不编造」的必然结果（本仓库红线）。
+ * 逐包明细端点已穷举失败：`/sash/api/v2/me/*` → 404；
+ * `qoder.cn/api/v1/me/quotas/{key}/histories` →
+ * `/api/v1/me/usages/big_model_credits/histories` → qoder.cn 下 **401**
+ * （需浏览器登录态 cookie，插件 OAuth token 拿不到）、在 openapi 下 **404**。
+ *
+ * ## 为什么必须走 `cachedBalance`
+ *
+ * 聚合每轮折算会对同一账号反复提问；没有共享读数就会白发大量重复请求
+ * （与 buddy / trae / modelscope / autoclaw / astudio / minimax 同款理由）。
+ *
+ * ⚠️ **不加 XFF 需求**：与 minimax 国际站不同，Qoder 没有已知的地理分流，
+ * ⇒ **刻意不加** `minimaxXff` 那类透传参数（凭空多一个参数只会让人以为有分流）。
+ */
+export async function qoderExpiry(credential, product, 
+/** 共享读数入口（见 {@link buddyExpiry} 的同名参数）。 */
+cached, 
+/**
+ * 该账号的出口代理 fetcher（2026-10-25 审计 A2-17）。
+ *
+ * ⚠️⚠️ **折算路径不接代理 ⇒ 墙外环境下该渠道从聚合轮换里静默消失**：
+ * 国际版整站在墙外被 SNI 阻断，只能用 per-账号代理出去。本 PR 把代理接进了
+ * 推理/搜索/选号/登录四条腿，**折算这条漏了** ⇒ 折算恒失败 ⇒ `UNUSABLE`
+ * ⇒ 被 `rankCandidates` 剔除，**零报错、零日志**，而面板看起来正常。
+ *
+ * 省略 ⇒ 回落全局 `fetch`（= 修复前的行为，供不需要代理的调用方使用）。
+ */
+fetcher) {
+    return sharedPackageExpiry(() => fetchBalanceWithCache(cached, () => fetchQoderCreditBalance(credential, product, fetcher)));
+}
+/**
+ * astudio（讯飞 AstronStudio）：三池各带到期时间 ⇒ **可精确折算**，无已知代价。
+ *
+ * ## 与 autoclaw 的差别（为何这里能算出真实时刻）
+ *
+ * autoclaw 的钱包报文里**没有任何时间字段**（只有流水批次才带 `deductionEndTime`），
+ * 故它只能「有余额即 `NEVER`」。astudio 的 `/points/balance` 实测直接下发
+ * `{member,buy,activity}NextExpireTime`（形如 `"2026-11-20T01:50:14"`，
+ * **不带时区的本地时间串**），已由 `astudio-credits.ts` 的
+ * `astudioLocalTimeMs` 用 `Date.parse(raw.replace(' ', 'T'))` 归一化到
+ * `packages[].deductionEndTime`（毫秒）⇒ 直接复用
+ * `sharedPackageExpiry`（取**最早**到期的那一包 = `Math.min`）。
+ *
+ * ## 为什么走 `sharedPackageExpiry` 而不是自己遍历
+ *
+ * 它把三件容易写错的事收敛在一处：①异常按 `isAbortError` 分流（用户取消要
+ * 继续抛，不能吞成 `UNUSABLE`）；②`null` ⇒ `UNUSABLE`；③**所有**候选都折算
+ * 失败时（`anyConverted === false`）返回 `UNUSABLE` 而不是 `NEVER`
+ * —— `NEVER` 意味着「永不过期」，会被聚合排在最后但仍然**可选中**，
+ * 那是把「查不到」谎报成「长期有效」（本仓库红线）。
+ *
+ * ## 为什么必须走 `cachedBalance`
+ *
+ * 聚合每轮折算会对同一账号反复提问；没有共享读数就会白发大量重复请求
+ * （与 buddy / trae / modelscope / autoclaw 同款理由）。
+ */
+export async function astudioExpiry(credential, product, 
+/** 共享读数入口（见 {@link buddyExpiry} 的同名参数）。 */
+cached) {
+    return sharedPackageExpiry(() => fetchBalanceWithCache(cached, async () => {
+        const result = await fetchAstudioBalanceDetailed(credential, { product });
+        // ⚠️ 同 autoclaw：`fetchBalanceDetailed` 的失败形态是 `balance: null + error`，
+        //    `sharedPackageExpiry` 认「`null` ⇒ UNUSABLE」⇒ 只取 `balance`。
+        return result.balance;
+    }));
+}
+/**
+ * minimax（MiniMax Code，中国版 / 国际版共用本原语，只换 product）：
+ * **每条积分明细各带自己的到期时刻** ⇒ 可精确折算，无已知代价。
+ *
+ * ## 与 astudio 的差别（字段形态，判据一致）
+ *
+ * | 渠道 | 到期字段 | 形态 | 是否需要归一化 |
+ * |---|---|---|---|
+ * | astudio | `{member,buy,activity}NextExpireTime` | **不带时区的本地时间串** | 需要（`Date.parse(raw.replace(' ','T'))`） |
+ * | minimax | `details[].expire_at_ms` | **毫秒时间戳** | 不需要（直接是 epoch ms） |
+ *
+ * 两者最终都落到 `packages[].deductionEndTime`（毫秒）⇒ 折算口径逐格一致，
+ * 都复用同一条 `sharedPackageExpiry`（取最早到期的那一包）。
+ *
+ * ## 为什么能算（此前判「不可折算」的依据已被实测推翻）
+ *
+ * 2026-10-20 用户报障「MiniMax Code 积分也有到期时间，也应当有相同功能」，
+ * 并附 AStudio 面板截图作参照。实测（真实凭据，两站各取账号）确认：
+ * `GET /minimax-cloud/api/v1/credit/details` 的**每条** `details[]` 都带
+ * `expire_at_ms`（中国版 20/20 条、15/15 条全部有值），
+ * 且到期时刻 = 发放日 + 30 天的零点（如 2026-10-20 发放 → 2026-11-19 到期）。
+ *
+ * ⚠️ 在此之前 `fetchMinimaxCreditBalance` 把 `packages` **硬编码成 `[]`**，
+ * 聚合侧据此把本家归为「查不到到期时间」一类。那个结论**不是**
+ * 「上游不下发」，而是「我们没解析」—— 这两件事在注释里被混同过，是本次
+ * 报障的根因。
+ *
+ * ## 为什么必须走 `cachedBalance`
+ *
+ * 聚合每轮折算会对同一账号反复提问；没有共享读数就会白发大量重复请求
+ * （与 buddy / trae / modelscope / autoclaw / astudio 同款理由）。
+ */
+export async function minimaxExpiry(credential, product, 
+/** 共享读数入口（见 {@link buddyExpiry} 的同名参数）。 */
+cached, 
+/**
+ * 国际站的 `X-Forwarded-For` 绕行头（见 `src/minimax.ts` 的 `withMinimaxXff`）。
+ *
+ * ⚠️ 必须透传：国际站按出口 IP 做地理分流，`agent.minimax.io` 会 307 到
+ * 中国站，而**跟随后中国站不认国际站 token**（`401 invalid access token`，
+ * 与「凭据真失效」逐字同形，issue IKMEVG）。不带 xff ⇒ 国际站账号的
+ * 到期折算恒失败 ⇒ 该渠道在聚合轮换里被静默剔除。
+ */
+xff, 
+/**
+ * 该账号的出口 fetcher（**仅国际站**需要，PR !145 审计 P0 修法）。
+ *
+ * ## ⚠️⚠️ 为什么折算路径也必须换出口
+ *
+ * 本函数是**聚合轮换候选可见性的闸门**：折算拿不到读数 ⇒ `sharedPackageExpiry`
+ * 返回 `UNUSABLE` ⇒ `rankCandidates` 把该候选剔除。而
+ * `agent.minimax.io` 按出口 IP 国别分流（大陆直连恒 307 → 中国站 → 401），
+ * ⇒ 用户配好代理、对话能用了，**该渠道仍从轮换里静默消失**，零报错。
+ *
+ * PR !145 的注释点了这个症状，但只把 fetcher 接进了选号器与适配器 ——
+ * 本函数当时仍是**裸 `fetch` 字面量**。
+ *
+ * ⚠️ 省略 ⇒ 全局 `fetch`，与修复前**逐字节等价**（中国版永远省略）。
+ */
+fetcher) {
+    return sharedPackageExpiry(() => fetchBalanceWithCache(cached, async () => {
+        const result = await fetchMinimaxCreditBalanceDetailed(credential, fetcher ?? fetch, product, xff);
+        // ⚠️ 同 autoclaw / astudio：失败形态是 `balance: null + error`，
+        //    `sharedPackageExpiry` 认「`null` ⇒ UNUSABLE」⇒ 只取 `balance`。
+        return result.balance;
+    }));
 }
 /** loomy：有今日赠送 → 当日 24:00；只剩永久 → NEVER。 */
 export async function loomyExpiry(credential) {
@@ -705,7 +1468,10 @@ export async function loomyExpiry(credential) {
         return UNUSABLE;
     if (detail.daily > 0)
         return nextUtc8DayStartMs();
-    return detail.permanent > 0 ? NEVER : UNUSABLE;
+    // ⚠️ `permanent` 可能是 `undefined`（上游没给该字段，issue IKMCOO 缺陷 4）。
+    //   **判「大于 0」而不是「非 0」**：`undefined > 0` 为假 ⇒ 落入 `UNUSABLE`
+    //   —— 那正是「有今日额度却被判不可用」的同型故障。
+    return detail.permanent !== undefined && detail.permanent > 0 ? NEVER : UNUSABLE;
 }
 /**
  * accio：与 **loomy 同形**（命名池、无逐包时间戳），但有一条更强的信息。
@@ -788,6 +1554,16 @@ export async function accioExpiry(credential) {
  * `ProviderExpiryContext` 是否携带 ref。
  */
 export async function officeaceExpiry(credential, ref) {
+    // ⚠️ **熔断优先于一切**（Gitee issue IKLTHB 第 ③ 条）：Basic 凭据被华为 MaaS
+    //    连续拒绝时，这里**必须**判 `UNUSABLE`，否则会出现最难看的一种组合 ——
+    //    余额读得到（V11 签名是**另一套鉴权**，它不受影响）⇒ 折算成一个正常值
+    //    ⇒ officeace **留在候选表里甚至排第一** ⇒ 每轮都先撞一次 401 再改道。
+    //
+    // ⚠️ 判据只在这里读，**不写**：熔断的记账点在适配器（只有它看得见 401 报文），
+    //    折算层只消费。这样「什么算凭据拒绝」只有一份实现（`isBasicCredentialRejection`），
+    //    也避免折算探测自己把渠道熔断（余额读失败与推理被拒是两件事）。
+    if (officeaceBreakerOpen(credential))
+        return UNUSABLE;
     let summary;
     try {
         summary = await fetchSubscriptionSummary(48, ref, credential);
@@ -796,6 +1572,35 @@ export async function officeaceExpiry(credential, ref) {
         return UNUSABLE;
     }
     if (summary === undefined)
+        return UNUSABLE;
+    /**
+     * ⚠️⚠️ **只拿到陈旧缓存 ⇒ `UNUSABLE`，不得用历史快照参与排序**
+     * （Gitee issue IKM741 连带修正，2026-10-16 实测确证「注释说一套、实现做另一套」）。
+     *
+     * 本函数上方的判据表（以及 `docs/agent-notes/providers-officeace.md` §5.8 的同表）
+     * **逐字写着**「查询失败 / 未登录 / **只拿到缓存** ⇒ `UNUSABLE`（读不到就不猜）」，
+     * 而修前的实现**没有这一支**：`fetchSubscriptionSummary` 在云侧直读失败时会
+     * 返回 `{ ...readSubscriptionCache(ref), stale: true }`（`officeace-auth.ts`
+     * 的兜底腿），于是**几十小时前的快照**会被折算成一个正常的到期时刻、
+     * 堂堂正正地参与「临期优先」排序。
+     *
+     * 实测（本机探针，隔离目录）：凭据在、云侧不可达、该 ref 有一份
+     * `cachedAt` 为两天前的缓存 ⇒ `officeaceExpiry` 返回
+     * `1792165834998`（一个真实时刻）而**不是** `UNUSABLE(-1)`。
+     *
+     * 危害方向与 issue IKM741 的 C 档**同族**：`stale: true` 的语义就是
+     * 「这不是本次读数，是历史快照」——
+     * - 快照里的桶可能**早已被烧完**（真实余额 0）⇒ 折算成临期 ⇒ 候选排到**最前**，
+     *   抢走本该先用掉的别的渠道额度（正是 `codeartsExpiry` 那节记录的同型缺陷）；
+     * - 也可能**恰好多出**一份已作废的签到桶 ⇒ 让一个实际没额度的账号留在候选表里。
+     *
+     * ⇒ 判据：**只认本次云侧读数**（`stale !== true`）。理由是 `stale` 标记本身
+     * 就是本仓库为「这是缓存」专门加的字段，把它当实时读数用属于**丢字段**。
+     * ⚠️ 代价如实登记：云侧抖动时该渠道会从候选表消失，最长持续
+     * `EXPIRY_CACHE_TTL_MS`（60 秒）—— 这与「读不到就不猜」的既有原则一致，
+     * 也与 IKLTHB 的熔断短路同方向（宁可不用，不可用错）。
+     */
+    if (summary.stale === true)
         return UNUSABLE;
     let earliest = NEVER;
     // ⚠️ 与 `sharedPackageExpiry` 同因：`earliest` 的初值 `NEVER` 无法区分

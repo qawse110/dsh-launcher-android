@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { access, mkdir, readdir, readFile, readlink, writeFile, rm } from "node:fs/promises";
 import { constants } from "node:fs";
 import { isAbsolute, join } from "node:path";
@@ -404,8 +404,87 @@ export async function reapOrphanedBrowsers() {
  * answers, so a lock owner that is still alive is an unreachable orphan of ours
  * — a browser we can no longer drive. Since this profile is single-purpose,
  * that orphan is terminated rather than left to block every future run.
+ *
+ * Windows has no SingletonLock symlink at all: it publishes an empty
+ * `<profile>\lockfile` with no pid, so the owner can only be found by its
+ * command line (issue #70). Without the win32 branch below this function was a
+ * permanent no-op there, and one orphan held --user-data-dir forever.
  */
-async function clearProfileLock(profileDir) {
+async function killWindowsProfileOwners(profileDir) {
+  // The command line is the only place Windows records the owner, so enumerate
+  // it there. Collected first, signalled second: killing the parent
+  // mid-enumeration would otherwise shorten the list. The profile path travels
+  // as an environment variable (UTF-16 end to end) because a non-ASCII user name
+  // would not survive a round trip through the console code page. Bounded by
+  // 10 s: a hung sweep would turn "the launch times out" into "the launch never
+  // returns", which is strictly worse.
+  const script = [
+    "$p = $env:EGO_LINUX_PROFILE_DIR;",
+    "$ids = @(Get-CimInstance Win32_Process |",
+    "Where-Object { $_.Name -eq 'chrome.exe' -and $_.CommandLine -and $_.CommandLine.Contains($p) } |",
+    "Select-Object -ExpandProperty ProcessId);",
+    "$ids | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue };",
+    "$ids -join ','",
+  ].join(" ");
+
+  const stdout = await new Promise((resolve) => {
+    let settled = false;
+    let child = null;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const timer = setTimeout(() => {
+      try {
+        child?.kill();
+      } catch {
+        // already gone
+      }
+      finish("");
+    }, 10000);
+    try {
+      child = spawn("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
+        stdio: ["ignore", "pipe", "ignore"],
+        windowsHide: true,
+        env: { ...process.env, EGO_LINUX_PROFILE_DIR: profileDir },
+      });
+    } catch {
+      finish(""); // a failed sweep must not fail the launch it exists to unblock
+      return;
+    }
+    let out = "";
+    child.stdout.on("data", (chunk) => {
+      out += chunk;
+    });
+    child.on("error", () => finish(""));
+    child.on("close", () => finish(out));
+  });
+
+  const pids = String(stdout)
+    .trim()
+    .split(",")
+    .map((value) => Number(value.trim()))
+    .filter((value) => Number.isInteger(value) && value > 0);
+  if (pids.length === 0) return 0;
+  // TerminateProcess returns before the target is gone; the profile lock is
+  // released a beat later, and launching into a held lock is what fails.
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  return pids.length;
+}
+
+/** @internal exported for the Windows lock test. */
+export async function clearProfileLock(profileDir) {
+  if (process.platform === "win32") {
+    const killed = await killWindowsProfileOwners(profileDir);
+    await Promise.all(
+      ["lockfile", "SingletonLock", "SingletonSocket", "SingletonCookie"].map((name) =>
+        rm(join(profileDir, name), { force: true }),
+      ),
+    );
+    return killed > 0;
+  }
   const lock = join(profileDir, "SingletonLock");
   let target;
   try {
@@ -577,12 +656,19 @@ async function spawnXvfb(num) {
  *   displays are ours to terminate.
  */
 export async function ensureXDisplay({ ignoreEnvDisplay = false } = {}) {
-  // Windows has a desktop session and no X server: Chrome opens a real window
-  // directly (the v0.4.0 Windows adaptation). Returning a pseudo display keeps
-  // the headed path alive without ever touching Xvfb (issue: post-merge cold
-  // start failed with "no X display ... no Xvfb binary on PATH").
-  if (process.platform === "win32") {
-    return { display: process.env.DISPLAY || "win32-desktop", pid: null, launched: false };
+  // Windows and macOS have a desktop session and no X server: Chrome opens a
+  // real window directly (the v0.4.0 Windows adaptation, and the same shape on
+  // macOS). Returning a pseudo display keeps the headed path alive without ever
+  // touching Xvfb (issue: post-merge cold start failed with "no X display ... no
+  // Xvfb binary on PATH").
+  //
+  // macOS is the same shape as Windows in this dimension: the GUI is
+  // Aqua/Quartz, `$DISPLAY` is never exported, Xvfb does not exist in that
+  // ecosystem, and Chrome draws through Cocoa/WindowServer rather than X11
+  // (#65). The pseudo value is harmless — `DISPLAY` is only handed to the child
+  // inside spawnAndAwait(), and Chrome never reads it on darwin.
+  if (process.platform === "win32" || process.platform === "darwin") {
+    return { display: process.env.DISPLAY || `${process.platform}-desktop`, pid: null, launched: false };
   }
   if (!ignoreEnvDisplay && (await displayUsable(process.env.DISPLAY))) {
     return { display: process.env.DISPLAY, pid: null, launched: false };
@@ -640,8 +726,48 @@ async function spawnAndAwait(binary, args, plan, lastError) {
   }
 }
 
+/**
+ * Parse the major version out of `chrome --version` / `chromium --version`
+ * output ("Google Chrome 154.0.1.2", "Chromium 155.0.8059.79", ...). Returns
+ * null when the text does not look like a Chrome version.
+ */
+export function parseChromeVersionMajor(text) {
+  if (typeof text !== "string") return null;
+  const match = text.match(/(?:Chrome|Chromium|HeadlessChrome)[\/ ](\d+)/i);
+  if (!match) return null;
+  const major = Number.parseInt(match[1], 10);
+  return Number.isFinite(major) && major > 0 ? major : null;
+}
+
+/**
+ * Probe the resolved browser binary for its major version so the headless UA
+ * override agrees with Client Hints (`navigator.userAgentData`). Issue #79: an
+ * external Chromium advertises e.g. 155 via UA-CH while the old hardcoded UA
+ * said 152 — a self-contradictory fingerprint. Best effort only: on Windows
+ * `chrome.exe --version` would open a window, so probing is skipped there and
+ * the fallback value is used.
+ */
+const chromeVersionCache = new Map();
+async function detectChromeVersionMajor(binary) {
+  if (process.platform === "win32") return null;
+  if (chromeVersionCache.has(binary)) return chromeVersionCache.get(binary);
+  const major = await new Promise((resolve) => {
+    execFile(binary, ["--version"], { timeout: 2000, windowsHide: true }, (error, stdout, stderr) => {
+      if (error) return resolve(null);
+      resolve(parseChromeVersionMajor(`${stdout}\n${stderr}`));
+    });
+  }).catch(() => null);
+  chromeVersionCache.set(binary, major);
+  return major;
+}
+
+function headlessUserAgent(major) {
+  return `Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`;
+}
+
 async function launch({ headless }) {
   const binary = await resolveBinary();
+  const uaMajor = headless ? ((await detectChromeVersionMajor(binary)) ?? 152) : null;
   await mkdir(PROFILE_DIR, { recursive: true });
   // Ours now exists, so it cannot be mistaken for an orphan below.
   await reapOrphanedBrowsers();
@@ -655,11 +781,11 @@ async function launch({ headless }) {
       // Headless fingerprint stripping (issue #2): the `-headless` UA and
       // navigator.webdriver flag both mark us as automation to high-risk
       // sites (Douyin/Doubao reject agent sessions otherwise). Only inject on
-      // the headless path so a headed window keeps its real UA. The UA version
-      // tracks the bundled Chromium major (152 in this runtime snapshot); if a
-      // future update bumps the vendored Chromium, bump it here too.
+      // the headless path so a headed window keeps its real UA. The major
+      // version is probed from the resolved binary so the UA string matches
+      // Client Hints (issue #79); 152 is only the fallback when probing fails.
       "--disable-blink-features=AutomationControlled",
-      "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+      `--user-agent=${headlessUserAgent(uaMajor)}`,
     ] : []),
     // Optional HTTP proxy for the agent browser, e.g. EGO_LINUX_PROXY=http://host:7890
     // (WSL2 -> Windows Clash). Explicit flags are used instead of relying on
@@ -709,6 +835,16 @@ async function launch({ headless }) {
   let xvfb = plan?.launched ? plan : null;
 
   if (!result && plan && !plan.launched) {
+    // Windows has no X server and no Xvfb: the "virtual framebuffer" fallback
+    // below can only fail there, and it fails slowly (spawnXvfb waits for a
+    // socket that never appears). Fail fast with the real launch error instead;
+    // the caller retries the launch (the usual cause is the previous Chrome
+    // still exiting and holding the profile).
+    if (process.platform === "win32") {
+      throw new Error(
+        `browser failed to come up on display ${plan.display}: ${lastError.error?.message ?? "unknown error"}`,
+      );
+    }
     // The environment display did not bring the browser up. Retry right away
     // on a virtual framebuffer — never hand the same broken display back.
     process.stderr.write(
@@ -856,7 +992,29 @@ export async function stopBrowser() {
   // block the next launch. After a graceful close there is nothing left to
   // clear, and this is a no-op.
   await clearProfileLock(PROFILE_DIR);
+  // A stopped browser must not resurrect its tabs on the next cold start
+  // (issue #67): only touch the restore files when nothing is running, so a
+  // --stop that failed to terminate the browser never edits its live profile.
+  if (stopped || !state) await clearSessionRestore(PROFILE_DIR);
   return stopped;
+}
+
+/**
+ * Forget the tab session so a crashed profile cannot resurrect old tabs.
+ *
+ * Chrome's session-restore data lives in `<profile>/Default/Sessions/`. A stop
+ * that Chrome records as a crash leaves it behind, and the next launch — even
+ * with `--hide-crash-restore-bubble` — silently reopens every tab from the
+ * previous run. Those pages are not in state.spaces, so no pruning pass ever
+ * sees them: the idle reaper frees memory only for Chrome to bring it all back
+ * on the next cold start (issue #67).
+ *
+ * The agent profile is single-purpose and logins live in `Network/Cookies`, so
+ * dropping the tab-restore directory costs nothing but the stale tabs.
+ * Exported for tests.
+ */
+export async function clearSessionRestore(profileDir) {
+  await rm(join(profileDir, "Default", "Sessions"), { recursive: true, force: true });
 }
 
 export async function browserStatus() {

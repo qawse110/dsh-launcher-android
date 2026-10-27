@@ -67,8 +67,13 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 import { DEFAULT_IMAGE_LIMITS } from './images.js';
-import { OpenAiGatewayError, convertTools, createGatewayMessage, parseModelRoute, partsFromContent, textFromContent, tokenValue, } from './messages.js';
+import { OpenAiGatewayError, GATEWAY_SOURCE_KIND, convertTools, createGatewayMessage, gatewayToolResultBlock, parseModelRoute, partsFromContent, textFromContent, tokenValue, } from './messages.js';
 import { normalizeUpstreamFailure } from './model-errors.js';
+// ⚠️ 复用 `src/sse.ts` 的**同一份**「工具名是否可用」判据（各适配器的
+// `resolveToolPairing` 用的是它）。自己再写一条 `name.length > 0` 必然漂移：
+// 那正是本仓库首条红线「同一语义两套判据」的形态，而本缺陷正是两个端点
+// 各自写了一套更严的判据才发生的。
+import { hasUsableToolName } from '../sse.js';
 import { failureToOpenAiError, withSuggestion } from './stream.js';
 import { rewriteTencentContentFingerprints } from './tencent-fingerprint.js';
 import { toOpenAiUsage } from './usage.js';
@@ -350,6 +355,47 @@ function assistantItemSource(provider, model) {
     return { kind: 'model', provider, model };
 }
 /**
+ * 预扫 `function_call`，按 `call_id` 分出「**没有**任何可用调用的 id」。
+ *
+ * ## ⚠️⚠️ 为什么不能只收集「坏调用的 id」（真实回归，对抗审计实测打穿）
+ *
+ * 第一版只收集**坏**调用的 id，结果剔除条件写成「结果 id 在这个集合里」。
+ * 当**同一个 `call_id` 上既有坏调用、又有好调用**时，该集合无法区分两者 ⇒
+ * 好调用的回执被**连带剔掉** ⇒ 留下**孤儿 `tool-call`**（上游照样拒）。
+ * 实测（两端同形）：`tool-calls = ["dup"]`，`results = []`。
+ *
+ * ⇒ 判据必须是「**该 id 是否还有任何可用调用引用它**」，与下游
+ * `resolveToolPairing` 的既有语义**同一份**（它先算 `keepCallIds`，再让结果
+ * 「只在对应调用被保留时才保留」）。故这里同时算出两个集合，剔除条件是
+ * `dropped && !kept`。
+ *
+ * ⚠️ **只剔除「因坏调用而失去配对」的那些**，不剔除「从来就没有配对调用」的
+ * 孤儿结果 —— 后者是既有行为（网关原先不检查配对完整性），本次不扩权。
+ */
+function callIdAvailability(list) {
+    const dropped = new Set();
+    const kept = new Set();
+    for (const raw of list) {
+        if (!isObject(raw) || raw.type !== 'function_call')
+            continue;
+        const bare = normalizeToolName(raw.name);
+        const namespace = normalizeToolName(raw.namespace);
+        const name = bare !== undefined && namespace !== undefined
+            ? flatNamespaceToolName(namespace, bare)
+            : bare;
+        // ⚠️ 与下面 `function_call` 分支**同一份** id 取值口径（`call_id` 优先、
+        // 缺了才退回 `id`）—— 两处不等会让配对结果剔不掉、留下孤儿。
+        const callId = nonEmptyString(raw.call_id) ?? nonEmptyString(raw.id);
+        if (callId === undefined)
+            continue;
+        if (hasUsableToolName(name))
+            kept.add(callId);
+        else
+            dropped.add(callId);
+    }
+    return { dropped, kept };
+}
+/**
  * 把 Responses 的 `input` 转成 DSH 的消息数组。
  *
  * ## 连续 assistant 项**必须合并**（与 Chat 路径的形态对齐）
@@ -360,6 +406,22 @@ function assistantItemSource(provider, model) {
  * 给上游留下「连续两条 assistant 消息」的历史 —— 而 Anthropic 系适配器要求
  * user/assistant 交替，这类历史会被上游拒绝或行为异常。
  * 故这里把连续的 assistant 内容块合并进同一条消息（文本 + 工具调用）。
+ *
+ * ## ⚠️ 名字不可用的 `function_call` 是**剔除**，不是 400（Issue IKLRIK）
+ *
+ * 历史里一条 `name: ""` 的调用**不是参数错误，而是可剔除的坏数据**：下游每一层
+ * （`src/sse.ts` 的 `resolveToolPairing`，九个适配器都调它）对同一份坏数据都是
+ * 「剔除并继续」，判词见该函数：「宁可丢失一轮工具上下文，也好过整条会话死亡」。
+ * 而网关原先站在所有这些剔除防线**之前**，直接回 400
+ * （`function_call requires call_id, name and string arguments`）—— 坏块被客户端
+ * 每轮原样重放 ⇒ **整条会话永久不可用**。网关是最后一道防线（消费者是把历史全部
+ * 回传的 Codex / Claude 系客户端，它们没法自愈），故这里必须与下游同取「剔除」。
+ *
+ * ⚠️ **配对的 `function_call_output` 必须一并剔除**：只剔调用会留下孤儿工具结果，
+ * 上游照样拒（`resolveToolPairing` 两侧都管，同因）。
+ *
+ * ⚠️ `call_id` 缺失、`arguments` 不是字符串**仍报错**：那是真·形状错误，无 id 也
+ * 就无从在两侧配对。判据只放宽「名字」这一格 —— 正是客户端反复重放的那个字段。
  */
 async function toMessages(input, provider, model, bridge, limits) {
     const messages = [];
@@ -368,7 +430,11 @@ async function toMessages(input, provider, model, bridge, limits) {
             return;
         const last = messages[messages.length - 1];
         if (last !== undefined && last.role === 'assistant') {
-            last.content.push(...blocks);
+            // ⚠️ 0.2.0 起 `Message.content` 是 **readonly**，不能再 `last.content.push(...)`。
+            // 改为**整体替换**那条 assistant 消息，并**保留原 id / source** ——
+            // 语义与升级前逐字节等价（仍是「把连续 assistant 的内容块合并进同一条
+            // 消息」，位置不变），且不会引入新的消息身份。
+            messages[messages.length - 1] = { ...last, content: [...last.content, ...blocks] };
             return;
         }
         messages.push(createGatewayMessage('assistant', blocks, assistantItemSource(provider, model)));
@@ -379,6 +445,13 @@ async function toMessages(input, provider, model, bridge, limits) {
     if (typeof input !== 'string' && (!Array.isArray(input) || input.length === 0)) {
         throw new OpenAiGatewayError('input must be a non-empty string or array of items');
     }
+    // ⚠️ 必须在主循环**之前**预扫：配对的 `function_call_output` 排在调用之后，
+    // 逐条处理时已无从知道前面哪些调用被剔除了（与 Chat 路径的
+    // `collectUnusableCallIds` 同款）。
+    // ⚠️ 必须同时拿到 `dropped` **与** `kept` 两个集合：只有「该 id 上没有任何可用
+    // 调用」才剔除配对结果，否则会连带剔掉好调用的回执（见 `callIdAvailability`）。
+    const emptyAvailability = { dropped: new Set(), kept: new Set() };
+    const callIds = typeof input === 'string' ? emptyAvailability : callIdAvailability(list);
     for (const raw of list) {
         if (!isObject(raw))
             throw new OpenAiGatewayError('input entries must be objects');
@@ -404,9 +477,7 @@ async function toMessages(input, provider, model, bridge, limits) {
                 messages.push(createGatewayMessage('system', [{
                         type: 'text',
                         text: rewriteTencentContentFingerprints(textFromContent(content), provider),
-                    }], {
-                    kind: 'plugin', plugin: 'dsh-openai-gateway',
-                }));
+                    }], { kind: GATEWAY_SOURCE_KIND }));
                 continue;
             }
             throw new OpenAiGatewayError(`unsupported message role: ${String(raw.role)}`);
@@ -427,7 +498,19 @@ async function toMessages(input, provider, model, bridge, limits) {
             const name = bare !== undefined && namespace !== undefined
                 ? flatNamespaceToolName(namespace, bare)
                 : bare;
-            if (callId === undefined || name === undefined || typeof raw.arguments !== 'string') {
+            // ⚠️ **名字不可用 ⇒ 剔除该调用**（不是 400），理由见 {@link toMessages}。
+            // 判据用共享的 `hasUsableToolName`（trim 后非空），与九个适配器里的
+            // `resolveToolPairing` 是**同一份**；`name === undefined` 已由
+            // `normalizeToolName` 的 trim 覆盖，这里只补「有名字但全空白」那一格。
+            //
+            // ⚠️ **本判据刻意排在 `callId` 校验之前**（两处都坏时以「剔除」为准）：
+            // 名字不可用的调用本就无法回放给上游，而它正是本 issue 里被客户端每轮重放、
+            // 让会话永久报废的那条数据 ⇒ 对它的**方向必须取「不 400」**。反过来说，
+            // `callId` 缺失的**报错**只在「名字可用」时才需要 —— 那种情况才存在真的
+            // 丢掉一次模型发起的工具调用的风险（见下面的用例）。
+            if (!hasUsableToolName(name))
+                continue;
+            if (callId === undefined || typeof raw.arguments !== 'string') {
                 throw new OpenAiGatewayError('function_call requires call_id, name and string arguments');
             }
             pushAssistant([{ type: 'tool-call', id: callId, name, arguments: raw.arguments }]);
@@ -437,11 +520,14 @@ async function toMessages(input, provider, model, bridge, limits) {
             const callId = nonEmptyString(raw.call_id);
             if (callId === undefined)
                 throw new OpenAiGatewayError('function_call_output requires call_id');
-            messages.push(createGatewayMessage('user', [{
-                    type: 'tool-result',
-                    toolCallId: callId,
-                    content: await outputParts(raw.output, bridge, limits),
-                }], { kind: 'tool', callId: callId }));
+            // ⚠️ 该结果的 id **只**因坏调用而失去配对时才剔除；同一 id 上还有可用调用
+            // 时必须照常保留（否则好调用变孤儿，上游照样拒）。判据见
+            // {@link callIdAvailability}。
+            if (!callIds.kept.has(callId) && callIds.dropped.has(callId))
+                continue;
+            messages.push(createGatewayMessage('user', [
+                gatewayToolResultBlock(callId, await outputParts(raw.output, bridge, limits)),
+            ], { kind: 'tool', callId: callId }));
             continue;
         }
         if (type === 'reasoning') {
@@ -538,9 +624,7 @@ export async function toResponsesGenerateOptions(body, signal, reasoningEffortOv
         messages.push(createGatewayMessage('system', [{
                 type: 'text',
                 text: rewriteTencentContentFingerprints(body.instructions, provider),
-            }], {
-            kind: 'plugin', plugin: 'dsh-openai-gateway',
-        }));
+            }], { kind: GATEWAY_SOURCE_KIND }));
     }
     messages.push(...await toMessages(body.input, provider, model, images.bridge, limits));
     // ⚠️ 判据是 `== null`（同时排除 undefined 与 null）：`null` = 明确不下发。
@@ -557,6 +641,13 @@ export async function toResponsesGenerateOptions(body, signal, reasoningEffortOv
         signal,
     };
 }
+/**
+ * 尚未分配 `output_index` 的哨兵值（见 {@link ResponsesItemState.outputIndex}）。
+ *
+ * ⚠️ 用 `-1` 而非 `undefined`：`outputOf` 要按它排序，`undefined` 参与比较会得到
+ * `NaN` 并让排序结果不确定。`-1` 排在最前，且这些项随后必被 `hasContent` 剔除。
+ */
+const UNASSIGNED_OUTPUT_INDEX = -1;
 function hexId() {
     return randomUUID().replaceAll('-', '');
 }
@@ -584,6 +675,100 @@ function kindOfBlock(type) {
         return 'function_call';
     return 'message';
 }
+/**
+ * 一个**内容帧**隐含的 kind（`block-end` 由 `chunk.block.type` 决定）。
+ *
+ * ⚠️ 与 {@link kindOfBlock} 的分工：那个吃 `ContentBlock['type']`（用于 `block-end`），
+ * 这个吃整个 chunk。两者必须一致，故这里复用 `kindOfBlock` 而不是再映射一遍。
+ */
+function kindOfChunk(chunk) {
+    switch (chunk.type) {
+        case 'text-delta': return 'message';
+        case 'reasoning-delta': return 'reasoning';
+        case 'tool-call-delta': return 'function_call';
+        case 'block-end': return kindOfBlock(chunk.block.type);
+        // block-start / usage / finish 不承载内容，没有隐含 kind。
+        default: return undefined;
+    }
+}
+/**
+ * 内容帧是否与已存在的输出项**同类**。
+ *
+ * ## 为什么需要这条判据（issue IKLRIK 附录点名的 `item.kind` 守卫）
+ *
+ * 一个 `index` 一旦定型成某个 kind，后续同 index 的**异类**帧被忽略。
+ *
+ * 缺了它，异类帧会被灌进既有项并按**该既有项的 id** 发出事件。**实测**三种方向
+ * （本地构造流）：
+ *
+ * | 方向 | 已开项 | 异类帧 | 旧行为（实测输出） |
+ * |---|---|---|---|
+ * | A | `reasoning` | `tool-call-delta` | 用 `rs_…` id 发 `function_call_arguments.delta` |
+ * | B | `function_call` | `text-delta` | 用 `fc_…` id 发 `output_text.delta`，正文凭空消失 |
+ * | C | `reasoning` | `block-end(tool-call)` | 工具名/参数被写进 reasoning 项 |
+ *
+ * ⚠️ **方向 A 有真实报障**（本 issue 正文的现场观察）：客户端据此组装出
+ * `{id:'rs_…', name:''}` 并持久化进会话，之后每轮回传 ⇒ **整条会话报废**，
+ * 正是本次报障会话报废的起点。方向 B 同因同源、无独立报障。
+ *
+ * ## ⚠️⚠️ 证据强度与**已知代价**如实标注（独立审计实测复核，别当同等强度）
+ *
+ * | 方向 | 反向验证（**删掉本守卫**）| 结论 |
+ * |---|---|---|
+ * | A（流式 `tool-call-delta`）| 用例**变红** | **有牙**，真缺陷（有报障） |
+ * | B（流式 `text-delta`）| 用例**变红** | **有牙**，真缺陷 |
+ * | C（`block-end`，流式与非流式）| 用例**仍全绿** | **无牙**，纯防御性 |
+ * | 非流式 delta 两处 | 用例**仍全绿** | **无牙**，纯防御性 |
+ *
+ * 方向 C 与非流式两处**无牙的原因已实测定位**：异类 `block-end` 即使被灌进
+ * reasoning 项，`closeItem` / `outputItemJson` 仍按 `item.kind` 分支输出，于是
+ * `response.output` **逐字节相同**（诊断实测：`output` 仍是同一个 `rs_…` reasoning
+ * 项、`function_call_arguments.done` 计数为 0）。
+ * ⇒ 这几处**没有可观测差异**，故**不写对应用例**（写了就是恒真的虚假安全感）。
+ *
+ * ### ⚠️⚠️ **本守卫与权威实现 `BlockAssembler` 的语义分歧（独立审计指出，已核实）**
+ *
+ * 早期注释曾自称「与 `BlockAssembler` 同语义」，**那是不准确的，已删**。
+ * 实测对照（真实 `BlockAssembler`，`dsh-llm/lib/types/assembler.js`）：
+ *
+ * | 场景（同 index）| `BlockAssembler` | 本网关 |
+ * |---|---|---|
+ * | `reasoning-delta` + 工具块 `block-end` | **`[{tool-call, name:'Bash'}]`** | `['reasoning']` |
+ * | `text-delta` + 工具块 `block-end` | **`[{tool-call, name:'Bash'}]`** | `['message']` |
+ *
+ * 原因：`BlockAssembler` 的 `block-end` 分支用 `ensure(index, chunk.block.type)`，
+ * 而 `ensure()` 只在 index **不存在**时采用传入类型；但它随后把**整个
+ * `chunk.block`** 存进 `partial.block`（`assembler.js:64-71`），于是 `assemble()`
+ * 的 `if (partial.block) return partial.block`（`:95`）**直接返回那个块** ——
+ * 即「**首个 `block-end` 的 block 才是权威**，绕过 `blockType`」。
+ * ⇒ 权威实现对「异类 `block-end`」是**采纳**，本守卫是**忽略**。
+ *
+ * ⚠️ **那为什么不改成采纳？**（不采纳是**有意的代价**，不是疏漏）
+ * 采纳在**流式**路径**不可行**，实测：`reasoning-delta` 先开项时
+ * `output_item.added`（`type:'reasoning'`）**已经发给了客户端**，而该事件
+ * 「发出去就改不了类型」——要采纳就得把已发的 added 撤回来。若不撤，
+ * added 说 reasoning、done 说 function_call，**客户端按 added 建行、按 done 定稿**
+ * ⇒ 整轮失败（正是本文件反复记录的失败形态）。
+ * 非流式单独采纳则会让**两条组装路径分叉**（`output[]` 顺序/类型不一致）——
+ * 那正是刚刚被对抗审计打穿并修掉的 B1 回归。
+ * ⇒ 取舍与 `aggregate-adapter.ts` 的 `openedBlocks` 段**同款**：
+ * 「宁可少切换，不可产出互相矛盾的协议」。
+ *
+ * ⚠️ **代价如实登记**：在「异类 `block-end`」形态下，本守卫会**丢弃一个名字与参数
+ * 都齐全的真实工具调用**。**生产可达性零实测** —— 它依赖上游/聚合层重试时复用
+ * index 并换 kind（`aggregate-adapter.ts` 的 `openedBlocks` 守卫在多数情形会拦住
+ * 切换），且 `zcode-anthropic.ts` 的 `ensureBlock()` 对已存在 index **直接返回既有
+ * 块、不改 kind**（`:527-528`）⇒ 在自家适配器里不可达。故这是**防御性守卫的副作用**。
+ * 若将来出现真实报障，正确的方向是让**两条路径同时**采纳（并使流式的 added
+ * 延迟到 `block-end` 之后才发），而不是只改一条。
+ */
+function sameKind(item, chunk) {
+    const kind = kindOfChunk(chunk);
+    // 无隐含 kind 的帧（理论上不会走到这里）不拦，保持宽松。
+    if (kind === undefined)
+        return true;
+    return item.kind === kind;
+}
 function finishReasonOf(reason) {
     switch (reason.kind) {
         case 'stop': return 'stop';
@@ -604,7 +789,12 @@ function applyItemChunk(item, chunk) {
             // `id` / `name` 只允许**非空**覆盖：分片里偶发空值，覆盖会把已识别的调用打坏。
             if (String(chunk.id).length > 0)
                 item.callId = String(chunk.id);
-            if (chunk.name !== undefined)
+            // ⚠️ 名字的覆盖判据是 `hasUsableToolName`（trim 后非空），**不是**
+            // `!== undefined`：后续分片常带 `name: ""`（它不是 undefined），
+            // 无条件覆盖会把首片解析出的真实名字清空 ⇒ 出站即 `unknown tool ""`。
+            // 这与 `openai-compat.ts` / `llm-adapter.ts` 的 `function.name` 守卫**同因同修**
+            //（那边的判词：表现为 `unknown tool ""`）。
+            if (hasUsableToolName(chunk.name))
                 item.name = chunk.name;
             item.arguments += chunk.argumentsDelta;
             return;
@@ -617,7 +807,11 @@ function applyItemChunk(item, chunk) {
             if (block.type === 'tool-call') {
                 if (String(block.id).length > 0)
                     item.callId = String(block.id);
-                item.name = block.name;
+                // ⚠️ 同款非空守卫：`block-end` 是**权威覆盖**（连参数一起），但它的
+                // `name` 同样可能是空串，而这一格一旦覆盖就再也回不来了 ——
+                // 比 delta 那格更危险（后面不会再有帧来修它）。
+                if (hasUsableToolName(block.name))
+                    item.name = block.name;
                 item.argumentOverride = block.arguments;
             }
             return;
@@ -706,10 +900,18 @@ function outputItemJson(item, nsMap) {
         content: [{ type: 'output_text', text: finalText(item), annotations: [], logprobs: [] }],
     };
 }
-/** 只有真正有产出的项才进 `output[]`（空项会污染客户端的会话历史）。 */
+/**
+ * 只有真正有产出的项才进 `output[]`（空项会污染客户端的会话历史）。
+ *
+ * ⚠️ `function_call` 的判据是**名字可用**，不再是恒 `true`（Issue IKLRIK 第 3 条）：
+ * 名字始终不可用的调用是**坏块**，一旦进 `output[]` 就会被客户端持久化进会话、
+ * 之后每轮原样回传 ⇒ 整条会话报废（正是本次报障的起点）。非流式路径靠这条剔除；
+ * 流式路径另由 `closeItem` 的 `announced` 闸门保证一个事件都不发（两处都管，
+ * 否则「同一语义两套判据」就轮到本函数了）。
+ */
 function hasContent(item) {
     if (item.kind === 'function_call')
-        return true;
+        return hasUsableToolName(item.name);
     return finalText(item).length > 0;
 }
 /**
@@ -825,6 +1027,32 @@ export async function collectResponsesResult(chunks, responseId, model, request,
     // 摊平名 → `{namespace, name}`：响应侧要把 `function_call` 还原成客户端认的形态。
     const nsMap = responsesNamespaceToolMap(request);
     let outputIndex = 0;
+    /**
+     * 给一项分配 `output_index`（**工具项延迟到名字可用那一刻**，见
+     * `ResponsesItemState.outputIndex` 的注释）。
+     *
+     * ⚠️⚠️ **分配时刻必须与流式路径同一份，否则两条组装路径的 `output[]` 顺序会分叉**
+     *（真实回归，对抗审计以并行工具 + 收尾逆序实测打穿：非流式曾产出完全倒序的
+     * `["cC","cB","cA"]`，而流式是 `["cA","cB","cC"]`）。
+     *
+     * 语义是 **`output_index` = 开项顺序**（`outputOf` 按它排序，它就是「本项在
+     * `output[]` 里的下标」）。而各适配器的收尾顺序与开项顺序**相反**（工具块的
+     * `block-end` 集中在流末尾补发，见 `buddy-adapter.ts` 的 `toolOrder` 段），
+     * 故**绝不能按收尾顺序占号** —— 那正是本回归的成因。
+     *
+     * ⇒ 故本函数必须在「名字首次可用」的那一刻被调用（此时才可能占号），
+     * 且**两条路径各只调一次**（幂等：已分配则直接返回）。
+     */
+    const assignOutputIndex = (item) => {
+        if (item.kind !== 'function_call')
+            return;
+        if (item.outputIndex !== UNASSIGNED_OUTPUT_INDEX)
+            return;
+        // 名字不可用的工具项**不占号**：它必被 `hasContent` 剔除，占了就留空洞。
+        if (!hasUsableToolName(item.name))
+            return;
+        item.outputIndex = outputIndex++;
+    };
     try {
         for await (const chunk of chunks) {
             // ⚠️ `block-start` 不做事：块之间**可以并行开启**，各自由自己的
@@ -835,9 +1063,23 @@ export async function collectResponsesResult(chunks, responseId, model, request,
                 // 一个块只允许收尾一次（与 `BlockAssembler` 的「first close wins」同款）。
                 if (closed.has(chunk.index))
                     continue;
-                const item = open.get(chunk.index) ?? newItem(chunk.index, outputIndex++, kindOfBlock(chunk.block.type));
+                const existing = open.get(chunk.index);
+                // ⚠️ 与流式路径**同一份** kind 守卫（见 {@link sameKind}）：异类的
+                // `block-end` 不得灌进既有项。两条组装路径必须同口径，只守一条等于
+                // 「同一份历史在 stream:true 上正确、在 stream:false 上丢内容」。
+                // ⚠️ 如实标注：这一处（以及下面的非流式 delta 判据）在**当前实现**下
+                // **没有可观测差异**（反向验证：删掉它用例仍全绿）。保留是为一致性与防御。
+                if (existing !== undefined && !sameKind(existing, chunk))
+                    continue;
+                // ⚠️ 新建时工具项**不占号**（用哨兵值）：它的号要等 `applyItemChunk` 把
+                // 权威名字写进去之后、由 `assignOutputIndex` 统一分配（见其注释）。
+                const kind = kindOfBlock(chunk.block.type);
+                const item = existing ?? newItem(chunk.index, kind === 'function_call' ? UNASSIGNED_OUTPUT_INDEX : outputIndex++, kind);
                 open.delete(chunk.index);
                 applyItemChunk(item, chunk);
+                // ⚠️ 名字在这一刻成为**权威值**（`block-end` 覆盖）；与流式的
+                // `closeItem` → `toolAddedEvent` 分配时机同口径。非工具项幂等返回。
+                assignOutputIndex(item);
                 closed.add(chunk.index);
                 items.push(item);
                 continue;
@@ -848,10 +1090,21 @@ export async function collectResponsesResult(chunks, responseId, model, request,
                     continue;
                 let item = open.get(chunk.index);
                 if (item === undefined) {
-                    item = newItem(chunk.index, outputIndex++, chunk.type === 'text-delta' ? 'message' : chunk.type === 'reasoning-delta' ? 'reasoning' : 'function_call');
+                    const kind = chunk.type === 'text-delta' ? 'message' : chunk.type === 'reasoning-delta' ? 'reasoning' : 'function_call';
+                    // ⚠️ 工具项延迟分配（同上层 `block-end` 分支的理由）：名字可能始终不可用
+                    // ⇒ 会被 `hasContent` 剔除；提前占号会让 `output[]` 出现空洞。
+                    item = newItem(chunk.index, kind === 'function_call' ? UNASSIGNED_OUTPUT_INDEX : outputIndex++, kind);
                     open.set(chunk.index, item);
                 }
+                // ⚠️ 与流式路径同一份 kind 守卫：异类 delta 不得混进既有项。
+                // ⚠️ 如实标注：当前实现下无可观测差异（见 {@link sameKind} 的证据表）。
+                if (!sameKind(item, chunk))
+                    continue;
                 applyItemChunk(item, chunk);
+                // ⚠️⚠️ **名字一可用就占号**（`assignOutputIndex` 幂等）：这是与流式
+                // `toolAddedEvent` **同一时刻**的分配点，缺了它非流式就只能等到收尾才占号
+                // ⇒ 顺序退化成**收尾顺序**、与流式分叉（真实回归，见 `assignOutputIndex` 的注释）。
+                assignOutputIndex(item);
                 continue;
             }
             applyStateChunk(state, chunk);
@@ -860,8 +1113,13 @@ export async function collectResponsesResult(chunks, responseId, model, request,
     catch (error) {
         throw await toUpstreamError(error, suggest);
     }
-    for (const item of open.values())
+    // 流末尾仍未收尾的项（没有 `block-end`）：照旧收进 `items`。
+    // ⚠️ 其中名字可用的工具项**已在上面每个 delta 处占号**（幂等），这里再兜一次
+    // 只为覆盖「从头到尾一条 delta 都没有、也没 block-end」这种理论形态。
+    for (const item of open.values()) {
+        assignOutputIndex(item);
         items.push(item);
+    }
     if (state.failure !== undefined) {
         // 上游在流里报错：与 Chat 路径同样翻成可识别的错误（含 404 翻译与纠错建议）。
         throw await toUpstreamError(new OpenAiGatewayError(state.failure.message, 502, 'server_error', state.failure.code || 'upstream_error'), suggest);
@@ -903,9 +1161,18 @@ export async function* toResponsesSse(chunks, responseId, model, request, sugges
     const emit = (type, payload) => `event: ${type}\ndata: ${JSON.stringify({ type, sequence_number: sequence++, ...payload })}\n\n`;
     const snapshot = (status, usage, error) => responseJson({ id: responseId, model, request, status, output: status === 'in_progress' ? [] : outputOf(items, nsMap), usage, error });
     const emitStatus = (status, usage, error) => emit(`response.${status}`, { response: snapshot(status, usage, error) });
-    /** 打开一个输出项，并补齐 `output_item.added` 与相应 part 的 `added`。 */
+    /**
+     * 打开一个输出项，并补齐 `output_item.added` 与相应 part 的 `added`。
+     *
+     * ⚠️ `function_call` 项**例外**：名字不可用时**一个事件都不发**（返回空数组），
+     * 项仍留在 `open` 里继续攒参数，等名字可用再由 {@link toolAddedEvent} 补发。
+     * 理由见 tool-call-delta 分支。
+     */
     const openItem = (index, kind, seed) => {
-        const item = newItem(index, outputIndex++, kind);
+        // ⚠️ `function_call` 项**不在开项时分配 output_index**（见 `ResponsesItemState`）：
+        // 它可能因名字始终不可用而一个事件都不发，若此刻占掉下标，`outputOf` 过滤掉它
+        // 后**后续项的下标会与数组下标错位**。真实分配在 `toolAddedEvent` 里做。
+        const item = newItem(index, kind === 'function_call' ? UNASSIGNED_OUTPUT_INDEX : outputIndex++, kind);
         if (seed?.callId !== undefined)
             item.callId = seed.callId;
         if (seed?.name !== undefined)
@@ -939,24 +1206,75 @@ export async function* toResponsesSse(chunks, responseId, model, request, sugges
                 }),
             ];
         }
+        if (!hasUsableToolName(item.name))
+            return [];
+        return [toolAddedEvent(item)];
+    };
+    /**
+     * 工具调用项的 `output_item.added` 事件。
+     *
+     * ⚠️ **只有一份构造**（`openItem` 与 tool-call-delta 的补发路径共用）：两处
+     * 各写一份必然漂移，而这里漂移的后果是「added 里的 name 与 done 里的 name
+     * 不一致」—— 客户端按 added 建行、按 done 定稿，对不上就整轮失败。
+     */
+    const toolAddedEvent = (item) => {
+        // ⚠️ **在这一刻才分配 `output_index`**（见 `ResponsesItemState` 的注释）：
+        // 在此之前的任何一帧都不保证这个名字最终可用，提前占号会让被剔除的坏项
+        // 在 `output[]` 里留下空洞、后续项下标与数组下标错位。
+        // 调用方已保证名字可用（本函数只在那一刻被调），故直接占号。
+        if (item.outputIndex === UNASSIGNED_OUTPUT_INDEX)
+            item.outputIndex = outputIndex++;
+        // 标记已发出：`closeItem` 靠它判断「这条到底发没发过」（见那儿的判据）。
+        item.announced = true;
         const restored = restoreToolName(item, nsMap);
-        return [emit('response.output_item.added', {
-                output_index: item.outputIndex,
-                item: {
-                    id: item.id,
-                    type: 'function_call',
-                    status: 'in_progress',
-                    call_id: item.callId ?? '',
-                    name: restored.name,
-                    ...restored.namespace === undefined ? {} : { namespace: restored.namespace },
-                    arguments: '',
-                },
-            })];
+        return emit('response.output_item.added', {
+            output_index: item.outputIndex,
+            item: {
+                id: item.id,
+                type: 'function_call',
+                status: 'in_progress',
+                call_id: item.callId ?? '',
+                name: restored.name,
+                ...restored.namespace === undefined ? {} : { namespace: restored.namespace },
+                arguments: '',
+            },
+        });
     };
     /** 收尾一个输出项：发完它的 `done` 事件。 */
     const closeItem = (item) => {
         const events = [];
-        if (item.kind === 'message') {
+        if (item.kind === 'function_call') {
+            // ⚠️ **判据必须读「名字现在是否可用」，不能读 `announced`**（真实回归，我第一版
+            // 就是读 `announced` 而写错的）：
+            //
+            // `block-end` 才是名字的**权威来源**（各适配器都在收尾循环里补发它，见
+            // `buddy-adapter.ts` 的 `toolOrder` 段），于是「首帧名字为空、`block-end` 才带
+            // 真名」是**正常形态**而非畸形流。若以 `announced` 为判据，这种「名字与参数
+            // 都齐全」的真实调用会被**整条丢弃** —— 用户看到工具调用凭空消失，比改前的
+            // 坏形态更糟。
+            //
+            // 正确语义：
+            // - 名字**现在**可用但还没发过 added ⇒ **此刻补发 added**（它此前一直没发，
+            //   故 `arguments.delta` 也从未发出，参数不会重复）；随后正常走 done。
+            // - 名字**到现在仍不可用** ⇒ 一个事件都不发（连 done 也不发）：发了 done 就会
+            //   进 `response.completed.output`，客户端把这条坏块持久化进会话、之后每轮
+            //   原样回传 ⇒ **整条会话报废**（issue IKLRIK 第 3 条，这就是报废的起点）。
+            if (!hasUsableToolName(item.name)) {
+                closed.add(item.index);
+                return [];
+            }
+            if (item.announced !== true)
+                events.push(toolAddedEvent(item));
+            const restored = restoreToolName(item, nsMap);
+            events.push(emit('response.function_call_arguments.done', {
+                item_id: item.id,
+                output_index: item.outputIndex,
+                name: restored.name,
+                ...restored.namespace === undefined ? {} : { namespace: restored.namespace },
+                arguments: finalArguments(item),
+            }));
+        }
+        else if (item.kind === 'message') {
             const text = finalText(item);
             events.push(emit('response.output_text.done', {
                 item_id: item.id, output_index: item.outputIndex, content_index: 0, text, logprobs: [],
@@ -967,7 +1285,7 @@ export async function* toResponsesSse(chunks, responseId, model, request, sugges
                 part: { type: 'output_text', text, annotations: [] },
             }));
         }
-        else if (item.kind === 'reasoning') {
+        else {
             const text = finalText(item);
             events.push(emit('response.reasoning_summary_text.done', {
                 item_id: item.id, output_index: item.outputIndex, summary_index: 0, text,
@@ -976,16 +1294,6 @@ export async function* toResponsesSse(chunks, responseId, model, request, sugges
                 output_index: item.outputIndex,
                 summary_index: 0,
                 part: { type: 'summary_text', text },
-            }));
-        }
-        else {
-            const restored = restoreToolName(item, nsMap);
-            events.push(emit('response.function_call_arguments.done', {
-                item_id: item.id,
-                output_index: item.outputIndex,
-                name: restored.name,
-                ...restored.namespace === undefined ? {} : { namespace: restored.namespace },
-                arguments: finalArguments(item),
             }));
         }
         // `added` 与 `done` 必须成对：客户端按 added 建行、按 done 定稿，
@@ -1035,6 +1343,13 @@ export async function* toResponsesSse(chunks, responseId, model, request, sugges
                     continue;
                 const existing = open.get(chunk.index);
                 if (existing !== undefined) {
+                    // ⚠️ **kind 守卫**（方向 C，实测）：异类的 `block-end` 不得灌进既有项。
+                    // 例如 index 上已开着 reasoning 项、随后来了工具块的 `block-end` —— 旧行为
+                    // 会把工具名与参数写进那个 reasoning 项，然后由 reasoning 分支收尾 ⇒
+                    // **工具调用静默消失**（实测 output 里只剩 reasoning）。忽略该帧既保住
+                    // 既有的 reasoning 项，也不凭空多出一个错类型的项。
+                    if (!sameKind(existing, chunk))
+                        continue;
                     applyItemChunk(existing, chunk);
                     for (const event of closeItem(existing))
                         yield event;
@@ -1063,6 +1378,11 @@ export async function* toResponsesSse(chunks, responseId, model, request, sugges
                         yield event;
                 }
                 const item = open.get(chunk.index);
+                // ⚠️ **kind 守卫**（方向 B，实测）：`text-delta` / `reasoning-delta` 落在**异类**
+                // 已开项上时必须忽略 —— 旧行为会用那个项的 id 发出 `output_text.delta`
+                // （实测：`fc_…` id 的 `output_text.delta`，而正文在两处都不出现 ⇒ 静默丢失）。
+                if (!sameKind(item, chunk))
+                    continue;
                 applyItemChunk(item, chunk);
                 yield chunk.type === 'text-delta'
                     ? emit('response.output_text.delta', {
@@ -1078,7 +1398,7 @@ export async function* toResponsesSse(chunks, responseId, model, request, sugges
                 if (closed.has(chunk.index))
                     continue;
                 if (!open.has(chunk.index)) {
-                    // `call_id` / `name` 只在这一帧里出现，故 function_call 项**延迟到这时**
+                    // `call_id` / `name` 常在这一帧才出现，故 function_call 项**延迟到这时**
                     // 才打开 —— `output_item.added` 必须带上它们，否则客户端配不上 call_id。
                     //
                     // ⚠️ **首帧 `id` 为空时的已知边角**：`call_id: ''` 会原样进
@@ -1098,7 +1418,32 @@ export async function* toResponsesSse(chunks, responseId, model, request, sugges
                         yield event;
                 }
                 const item = open.get(chunk.index);
+                // ⚠️⚠️ **kind 守卫**（方向 A，本 issue 正文的现场观察）：同 index 上可能
+                // **已经开着**另一个 kind 的项 —— 上游/聚合层重试时会复用 index
+                //（`aggregate-adapter.ts` 的 `openedBlocks` 段记录了该形态：「重试流的 index
+                // 从 0 重排」）。于是某 index 上先开了 reasoning 项、随后又来
+                // `tool-call-delta`；旧代码**无条件**发出
+                // `function_call_arguments.delta`（用 **reasoning 项的 `rs_…` id**）⇒ 客户端
+                // 组装出 `{id:'rs_…', name:''}`（名字从未出现过）并持久化进会话，之后每轮
+                // 回传就是本 issue 的起点。完整说明见 {@link sameKind}。
+                if (!sameKind(item, chunk))
+                    continue;
                 applyItemChunk(item, chunk);
+                // ⚠️ **名字仍不可用 ⇒ 这一帧的 `arguments.delta` 也不能发**：它引用的
+                // `item_id` 从未随 `output_item.added` 告知客户端，发出去等于凭空出现一个
+                // 未知项的增量（严格客户端会直接判协议错误）。参数已经攒进 item，等名字
+                // 可用时随 `added` **一次性全量补发**（见下）。
+                if (item.announced !== true) {
+                    if (hasUsableToolName(item.name)) {
+                        // 名字在这一帧才到 ⇒ 补发 added，并把此前攒下的参数**全量**补发
+                        //（与 `openai-compat.ts` 的同款做法一致：名字可用的那一刻才发首帧）。
+                        yield toolAddedEvent(item);
+                        yield emit('response.function_call_arguments.delta', {
+                            item_id: item.id, output_index: item.outputIndex, delta: item.arguments,
+                        });
+                    }
+                    continue;
+                }
                 yield emit('response.function_call_arguments.delta', {
                     item_id: item.id, output_index: item.outputIndex, delta: chunk.argumentsDelta,
                 });

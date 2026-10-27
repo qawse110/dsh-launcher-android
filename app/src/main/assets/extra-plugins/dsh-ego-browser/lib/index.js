@@ -1,14 +1,14 @@
 import { defineTool } from "@deepseek-ai/dsh-tools";
-import { constants, createReadStream, createWriteStream, existsSync } from "node:fs";
+import { constants, createReadStream, createWriteStream, existsSync, readdirSync } from "node:fs";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
-import { fileURLToPath } from "node:url";
-import { access, chmod, copyFile, mkdir, open, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
-import { execFile, spawn } from "node:child_process";
-import { promisify } from "node:util";
 import { basename, dirname, join, normalize, resolve, sep } from "node:path";
-import { request } from "node:http";
+import { fileURLToPath } from "node:url";
+import { access, chmod, copyFile, mkdir, open, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { promisify } from "node:util";
+import { createServer, request } from "node:http";
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import z from "@deepseek-ai/schemastery";
-import { createHash, randomUUID } from "node:crypto";
 import { isIP } from "node:net";
 import { pipeline } from "node:stream/promises";
 import { createGunzip } from "node:zlib";
@@ -100,34 +100,31 @@ var CdpClient = class {
 * ego-browser login-import — copy login cookies from the system's daily-use
 * Chromium (Chrome/Edge/Brave) into the running ego agent browser (issue #46).
 *
-* Why CDP passthrough instead of offline decryption: Chrome/Edge 127+ protect
-* cookies with App-Bound Encryption (the `v20` prefix) — the decryption chain
-* is bound to the genuine browser binary AND the original profile location
-* (verified empirically: a copied profile yields zero decryptable cookies
-* even under the genuine binary). So the classic "copy the profile to a temp
-* dir + boot headless" route is dead, as is the older "SQLite + DPAPI" one.
+* #69 made the original design unsafe: it booted the REAL profile through a
+* junction alias and hard-killed the instance, which could wipe extensions /
+* reset settings. That path is gone. There are now two safe routes:
 *
-* What works: when the source browser is CLOSED, launch its genuine binary
-* headless on its REAL profile — reached through a JUNCTION/symlink alias.
-* Two upstream defenses make both halves of this necessary (verified
-* empirically on Edge 140 / Windows):
-*   - Chromium ≥ 136 refuses --remote-debugging-port on the DEFAULT
-*     user-data-dir (anti-scraping). The string comparison does not resolve
-*     junctions, so the alias path passes.
-*   - App-Bound Encryption (v20 cookies) binds decryption to the genuine
-*     binary AND the original profile location: a copied profile yields zero
-*     decryptable cookies, while the junction (which resolves to the real
-*     path) decrypts everything.
-* Then read plaintext cookies over CDP `Storage.getCookies`, filter by
-* domain, and write them into the ego browser's persistent profile with
-* `Storage.setCookies`. closeSource:true gracefully closes a running source
-* browser first (its windows restore on next launch).
+*  1. Extension bridge (recommended, modern Chrome/Edge): the companion
+*     `extension/` folder reads cookies via the browser's `cookies` API and
+*     POSTs them to a loopback receiver. No profile copy, no browser close,
+*     no ABE decryption — see login-extension.ts.
+*
+*  2. Safe copy (legacy browsers / closed browser): copy ONLY `Local State`
+*     and the Cookies DB into a throwaway profile and read it with a headless
+*     browser. The real profile is never opened, so no writes can occur.
+*     Chrome/Edge 127+ use App-Bound Encryption bound to the original profile
+*     path, so this copy reads 0 cookies; the caller reports that explicitly
+*     instead of falling back to the old destructive boot.
+*
+* Then filter by domain and write into the ego browser's persistent profile
+* with `Storage.setCookies`. `closeSource:true` still gracefully closes a
+* running source browser — only because Windows locks the cookie DB for the
+* copy (the browser is not opened on the profile).
 *
 * Security contract:
 *   - cookie VALUES never appear in logs, tool output, or reports — only
 *     domain names and counts;
-*   - nothing is written to the source profile except what a normal headless
-*     boot writes (same as the user opening and closing their browser);
+*   - the source profile is never opened by a browser and never written;
 *   - import is a one-shot snapshot, never a continuous sync.
 */
 const execFile$1 = promisify(execFile);
@@ -365,62 +362,31 @@ async function closeSourceBrowser(browserExe, platform = process.platform) {
 		return false;
 	}
 }
-/** Count v10/v20 encrypted-value markers in a cookie DB (0 = wiped/plain). */
-function countEncryptionMarkers(buf) {
-	const s = typeof buf === "string" ? buf : buf.toString("latin1");
-	let n = 0;
-	for (let i = 0; i < s.length - 3; i++) {
-		const t = s.slice(i, i + 3);
-		if (t === "v10" || t === "v20") n++;
-	}
-	return n;
-}
-/** Best-effort snapshot of the cookie store before we boot the profile. */
-async function backupCookieStore(profileDir, backupRoot) {
-	const src = join(profileDir, "Network", "Cookies");
-	if (!existsSync(src)) return null;
-	try {
-		const dir = join(backupRoot, `backup-${Date.now()}`);
-		await mkdir(dir, { recursive: true });
-		const { copyFile, readdir } = await import("node:fs/promises");
-		await copyFile(src, join(dir, "Cookies"));
-		try {
-			await copyFile(src + "-journal", join(dir, "Cookies-journal"));
-		} catch {}
-		const markers = countEncryptionMarkers(await readFile(src));
-		try {
-			const entries = (await readdir(backupRoot)).filter((e) => e.startsWith("backup-")).sort();
-			for (const old of entries.slice(0, Math.max(0, entries.length - 3))) await rm(join(backupRoot, old), {
-				recursive: true,
-				force: true
-			}).catch(() => null);
-		} catch {}
-		return {
-			dir,
-			markers
-		};
-	} catch {
-		return null;
-	}
-}
-/** [#61] Always restore the pre-boot backup, then VERIFY the store's marker count (one retry on mismatch/lock). */
-async function restoreCookieStore(profileDir, backup) {
-	if (!backup) return false;
-	const src = join(profileDir, "Network", "Cookies");
+const BATCH$1 = 200;
+/** Copy ONLY the files a headless Chrome needs to open the cookie jar. The
+*  source profile is never opened by a browser, so #69's destructive write path
+*  cannot run. ABE-bound cookies (Chrome/Edge 127+) will read as 0; the caller
+*  reports that explicitly instead of booting the real profile. */
+async function copyProfileForImport(browser, profile) {
 	const { copyFile } = await import("node:fs/promises");
-	for (let attempt = 0; attempt < 2; attempt++) {
+	const dest = join(tmpdir(), `ego-login-import-${process.pid}-${Date.now()}`);
+	await mkdir(join(dest, profile.dirName, "Network"), { recursive: true });
+	const localState = join(browser.userDataDir, "Local State");
+	if (existsSync(localState)) await mkdir(dest, { recursive: true }).then(() => copyFile(localState, join(dest, "Local State")));
+	const cookieFiles = [[join(profile.dir, "Network", "Cookies"), join(dest, profile.dirName, "Network", "Cookies")], [join(profile.dir, "Cookies"), join(dest, profile.dirName, "Cookies")]];
+	let copied = false;
+	for (const [src, dst] of cookieFiles) {
+		if (!existsSync(src)) continue;
 		try {
-			await copyFile(join(backup.dir, "Cookies"), src);
-			try {
-				await copyFile(join(backup.dir, "Cookies-journal"), src + "-journal");
-			} catch {}
-			if (countEncryptionMarkers(await readFile(src)) >= backup.markers) return true;
-		} catch {}
-		await sleep(1500);
+			await copyFile(src, dst);
+			copied = true;
+		} catch (err) {
+			throw new Error(`cannot copy the ${browser.label} cookie store (${err?.message || err}); quit ${browser.label} completely and retry`);
+		}
 	}
-	return false;
+	if (!copied) throw new Error(`no Cookies database found in ${browser.label} profile ${profile.dirName}`);
+	return dest;
 }
-const BATCH = 200;
 async function importLoginCookies(opts, deps) {
 	const timeoutMs = opts.timeoutMs ?? 2e4;
 	let browser;
@@ -457,8 +423,6 @@ async function importLoginCookies(opts, deps) {
 	let tempCdp = null;
 	let egoCdp = null;
 	let linkDir = null;
-	let backup = null;
-	let pendingReport = null;
 	try {
 		if ((await sourceBrowserPids(browser.exePath, opts.browserOverride ? browser.userDataDir : null)).length > 0) {
 			if (opts.browserOverride) return {
@@ -475,16 +439,14 @@ async function importLoginCookies(opts, deps) {
 			};
 			closedSource = true;
 		}
-		backup = await backupCookieStore(profile.dir, join(opts.stateDir || resolveEgoStateDir(), "login-import-backups"));
-		linkDir = join(tmpdir(), `ego-login-import-${process.pid}-${Date.now()}`);
-		await symlink(browser.userDataDir, linkDir, process.platform === "win32" ? "junction" : "dir");
+		linkDir = await copyProfileForImport(browser, profile);
 		if (process.platform === "win32") {
 			const ps = [
 				`Get-CimInstance Win32_Process -Filter "Name='${basename(browser.exePath)}'"`,
 				`| Where-Object { $_.CommandLine -match 'ego-login-import-' -and $_.CommandLine -notmatch '--type=' -and $_.CommandLine -notmatch 'crashpad' }`,
 				`| Select-Object -ExpandProperty ProcessId`
 			].join(" ");
-			const drainDeadline = Date.now() + 12e3;
+			const drainDeadline = Date.now() + 8e3;
 			let leftover = [];
 			while (Date.now() < drainDeadline) {
 				try {
@@ -510,18 +472,20 @@ async function importLoginCookies(opts, deps) {
 						"/F"
 					], { timeout: 5e3 }).catch(() => null);
 				}
-				await sleep(1500);
+				await sleep(1e3);
 			}
 		}
 		let port = null;
 		for (let attempt = 0; attempt < 2 && port === null; attempt++) {
 			if (attempt > 0) {
-				await sleep(6e3);
+				await sleep(2e3);
 				try {
-					await rm(linkDir, { force: true });
+					await rm(linkDir, {
+						recursive: true,
+						force: true
+					});
 				} catch {}
-				linkDir = join(tmpdir(), `ego-login-import-${process.pid}-${Date.now()}-r1`);
-				await symlink(browser.userDataDir, linkDir, process.platform === "win32" ? "junction" : "dir");
+				linkDir = await copyProfileForImport(browser, profile);
 			}
 			const portFile = join(linkDir, "DevToolsActivePort");
 			await rm(portFile, { force: true }).catch(() => null);
@@ -539,7 +503,7 @@ async function importLoginCookies(opts, deps) {
 					"--hide-crash-restore-bubble",
 					"about:blank"
 				],
-				cwd: browser.userDataDir,
+				cwd: tmpdir(),
 				env: { ...process.env },
 				stdio: {
 					stdin: { data: "" },
@@ -578,6 +542,18 @@ async function importLoginCookies(opts, deps) {
 			lastCount = all.length;
 			await sleep(800);
 		}
+		if (all.length === 0) return {
+			ok: false,
+			source: browser.label,
+			profile: profile.dirName,
+			dryRun: opts.dryRun === true,
+			closedSource,
+			totalRead: 0,
+			matched: 0,
+			written: 0,
+			domains: [],
+			error: `0 cookies readable from the temporary copy of ${browser.label}. Chrome/Edge 127+ use App-Bound Encryption bound to the original profile path, so a copied profile cannot be decrypted (the source profile was NOT modified). Use the Chrome extension bridge (A) or log in once inside the agent browser; the old real-profile boot path has been removed.`
+		};
 		const matched = all.filter((c) => cookieMatchesDomains(c.domain, opts.domains || []));
 		const byDomain = /* @__PURE__ */ new Map();
 		for (const c of matched) byDomain.set(c.domain, (byDomain.get(c.domain) || 0) + 1);
@@ -585,20 +561,17 @@ async function importLoginCookies(opts, deps) {
 			domain,
 			cookies
 		})).sort((a, b) => b.cookies - a.cookies);
-		if (opts.dryRun) {
-			pendingReport = {
-				ok: true,
-				source: browser.label,
-				profile: profile.dirName,
-				dryRun: true,
-				closedSource,
-				totalRead: all.length,
-				matched: matched.length,
-				written: 0,
-				domains: domainStats
-			};
-			return pendingReport;
-		}
+		if (opts.dryRun) return {
+			ok: true,
+			source: browser.label,
+			profile: profile.dirName,
+			dryRun: true,
+			closedSource,
+			totalRead: all.length,
+			matched: matched.length,
+			written: 0,
+			domains: domainStats
+		};
 		const stateDir = opts.stateDir || resolveEgoStateDir();
 		let egoPort;
 		try {
@@ -627,8 +600,8 @@ async function importLoginCookies(opts, deps) {
 		const jarKey = (domain, name, path) => `${String(name)}|${String(domain).replace(/^\./, "")}|${String(path ?? "/")}`;
 		const writeJar = async (contextId) => {
 			const scoped = contextId === void 0 ? {} : { browserContextId: contextId };
-			for (let i = 0; i < params.length; i += BATCH) await egoClient.call("Storage.setCookies", {
-				cookies: params.slice(i, i + BATCH),
+			for (let i = 0; i < params.length; i += BATCH$1) await egoClient.call("Storage.setCookies", {
+				cookies: params.slice(i, i + BATCH$1),
 				...scoped
 			});
 			const back = await egoClient.call("Storage.getCookies", scoped);
@@ -655,7 +628,7 @@ async function importLoginCookies(opts, deps) {
 			written: 0,
 			error: "the agent browser accepted no cookies — its CDP endpoint may belong to a stale or replaced instance; restart the agent browser (ego_status after closing it) and retry"
 		};
-		pendingReport = {
+		return {
 			ok: true,
 			source: browser.label,
 			profile: profile.dirName,
@@ -666,7 +639,6 @@ async function importLoginCookies(opts, deps) {
 			written,
 			domains: domainStats
 		};
-		return pendingReport;
 	} catch (err) {
 		return {
 			ok: false,
@@ -681,7 +653,7 @@ async function importLoginCookies(opts, deps) {
 		} catch {}
 		if (srcHandle) {
 			try {
-				await Promise.race([srcHandle.done, sleep(25e3)]);
+				await Promise.race([srcHandle.done, sleep(8e3)]);
 			} catch {}
 			if (process.platform === "win32" && linkDir) try {
 				const ps = [
@@ -703,86 +675,1268 @@ async function importLoginCookies(opts, deps) {
 						"/F"
 					], { timeout: 5e3 }).catch(() => null);
 				}
-				if (String(stdout).trim()) await Promise.race([srcHandle.done, sleep(5e3)]);
 			} catch {}
 		}
 		if (linkDir) try {
-			await rm(linkDir, { force: true });
+			await rm(linkDir, {
+				recursive: true,
+				force: true
+			});
 		} catch {}
-		const stillRunning = await sourceBrowserPids(browser.exePath, opts.browserOverride ? browser.userDataDir : null);
-		if (backup && stillRunning.length === 0) {
-			if (await restoreCookieStore(profile.dir, backup)) {
-				if (pendingReport) pendingReport.restoredFromBackup = true;
-			} else if (pendingReport) pendingReport.error = "import ran, but the source cookie store could not be verified restored — the pre-boot backup is kept at " + backup.dir;
-		}
 	}
+}
+const MAX_BODY = 5242880;
+const BATCH = 100;
+function loginExtensionTokenPath(stateDir = resolveEgoStateDir()) {
+	return join(stateDir, "login-extension-token");
+}
+/** Per-install bearer token shared with the companion extension. */
+async function getOrCreateLoginExtensionToken(stateDir = resolveEgoStateDir()) {
+	const file = loginExtensionTokenPath(stateDir);
+	try {
+		const existing = (await readFile(file, "utf8")).trim();
+		if (existing.length >= 16) return existing;
+	} catch {}
+	const token = randomBytes(24).toString("hex");
+	await mkdir(dirname(file), { recursive: true }).catch(() => null);
+	await writeFile(file, token, {
+		encoding: "utf8",
+		mode: 384
+	}).catch(() => null);
+	return token;
+}
+function sendJson$1(res, status, body) {
+	const text = JSON.stringify(body);
+	res.writeHead(status, {
+		"content-type": "application/json; charset=utf-8",
+		"access-control-allow-origin": "*",
+		"access-control-allow-methods": "GET, POST, OPTIONS",
+		"access-control-allow-headers": "content-type, x-ego-token",
+		"cache-control": "no-store"
+	});
+	res.end(text);
+}
+async function readJsonBody$2(req) {
+	const chunks = [];
+	let size = 0;
+	for await (const chunk of req) {
+		const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+		size += buf.length;
+		if (size > MAX_BODY) throw new Error("request body too large");
+		chunks.push(buf);
+	}
+	return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+function tokenMatches(expected, got) {
+	if (typeof got !== "string") return false;
+	const a = Buffer.from(expected);
+	const b = Buffer.from(got);
+	return a.length === b.length && timingSafeEqual(a, b);
+}
+function toCdpCookie(raw) {
+	if (!raw || typeof raw !== "object") return null;
+	const c = raw;
+	if (typeof c.name !== "string" || c.name === "" || typeof c.value !== "string") return null;
+	if (typeof c.domain !== "string" || c.domain === "") return null;
+	const rawSite = c.sameSite;
+	const sameSite = rawSite === "strict" ? "Strict" : rawSite === "lax" ? "Lax" : rawSite === "none" || rawSite === "no_restriction" ? "None" : void 0;
+	const expires = typeof c.expirationDate === "number" ? c.expirationDate : void 0;
+	return {
+		name: c.name,
+		value: c.value,
+		domain: c.domain,
+		path: typeof c.path === "string" && c.path !== "" ? c.path : "/",
+		secure: c.secure === true,
+		httpOnly: c.httpOnly === true,
+		sameSite: sameSite === "Strict" || sameSite === "Lax" || sameSite === "None" ? sameSite : void 0,
+		session: expires === void 0,
+		...expires !== void 0 ? { expires } : {}
+	};
+}
+/** Write CDP cookies into the running agent browser (default jar + spaces). */
+async function writeCookiesToEgo(cookies, stateDir = resolveEgoStateDir()) {
+	let egoPort;
+	try {
+		const bj = JSON.parse(await readFile(join(stateDir, "browser.json"), "utf8"));
+		if (typeof bj.port !== "number" || bj.port <= 0) throw new Error("no port in browser.json");
+		egoPort = bj.port;
+	} catch {
+		return {
+			written: 0,
+			error: "agent browser is not running (no browser.json) — call ego_status or any ego_* tool first, then retry"
+		};
+	}
+	const egoCdp = await connectCdp(await browserWsUrl(egoPort), 5e3);
+	const params = cookies.map(toCookieParam).filter((p) => p !== null);
+	const jarTargets = [void 0];
+	try {
+		const spacesRaw = await readFile(join(stateDir, "task-spaces.json"), "utf8");
+		const parsed = JSON.parse(spacesRaw);
+		for (const space of parsed.spaces ?? []) {
+			const id = space?.browserContextId;
+			if (typeof id === "string" && id !== "") jarTargets.push(id);
+		}
+	} catch {}
+	const jarKey = (domain, name, path) => `${String(name)}|${String(domain).replace(/^\./, "")}|${String(path ?? "/")}`;
+	const writeJar = async (contextId) => {
+		const scoped = contextId === void 0 ? {} : { browserContextId: contextId };
+		for (let i = 0; i < params.length; i += BATCH) await egoCdp.client.call("Storage.setCookies", {
+			cookies: params.slice(i, i + BATCH),
+			...scoped
+		});
+		const back = await egoCdp.client.call("Storage.getCookies", scoped);
+		const have = new Set((back.cookies ?? []).map((c) => jarKey(c.domain, c.name, c.path)));
+		return params.filter((p) => have.has(jarKey(p.domain, p.name, p.path))).length;
+	};
+	try {
+		let written = await writeJar(void 0);
+		for (const contextId of jarTargets.slice(1)) try {
+			await writeJar(contextId);
+		} catch {}
+		if (params.length > 0 && written === 0) return {
+			written: 0,
+			error: "the agent browser accepted no cookies — restart it (ego_status after closing it) and retry"
+		};
+		return { written };
+	} catch (err) {
+		return {
+			written: -1,
+			error: String(err?.message || err)
+		};
+	} finally {
+		try {
+			egoCdp.close();
+		} catch {}
+	}
+}
+/** #69 (A): import cookies from the companion Chrome extension (bridge v2). */
+async function importLoginCookiesFromExtension(opts = {}) {
+	return await (await startLoginExtensionJob(opts)).done;
+}
+let bridge = null;
+let bridgeStarting = null;
+let jobSeq = 0;
+async function buildExtensionReport(cookies, received, dryRun, stateDir) {
+	const byDomain = /* @__PURE__ */ new Map();
+	for (const c of cookies) byDomain.set(c.domain, (byDomain.get(c.domain) || 0) + 1);
+	const domains = [...byDomain.entries()].map(([domain, count]) => ({
+		domain,
+		cookies: count
+	})).sort((a, b) => b.cookies - a.cookies);
+	if (dryRun) return {
+		ok: true,
+		source: "Chrome extension",
+		profile: "extension",
+		dryRun: true,
+		closedSource: false,
+		totalRead: received,
+		matched: cookies.length,
+		written: 0,
+		domains
+	};
+	const write = await writeCookiesToEgo(cookies, stateDir);
+	if (write.error !== void 0) return {
+		ok: false,
+		source: "Chrome extension",
+		profile: "extension",
+		dryRun: false,
+		closedSource: false,
+		totalRead: received,
+		matched: cookies.length,
+		written: write.written,
+		domains,
+		error: write.error
+	};
+	return {
+		ok: true,
+		source: "Chrome extension",
+		profile: "extension",
+		dryRun: false,
+		closedSource: false,
+		totalRead: received,
+		matched: cookies.length,
+		written: write.written,
+		domains
+	};
+}
+function settlement(job, report) {
+	job.state = "done";
+	job.report = report;
+	const waiter = bridge?.waiters.get(job.id);
+	if (waiter) {
+		bridge.waiters.delete(job.id);
+		waiter(report);
+	}
+}
+async function ensureBridge() {
+	if (bridge) return bridge;
+	if (bridgeStarting) return await bridgeStarting;
+	bridgeStarting = (async () => {
+		const port = Number(process.env.EGO_LOGIN_EXTENSION_PORT) || 53820;
+		const token = await getOrCreateLoginExtensionToken(resolveEgoStateDir());
+		const state = {
+			server: createServer(() => {}),
+			token,
+			port,
+			lastSeenAt: 0,
+			pairCode: "",
+			pairExpiresAt: 0,
+			jobs: /* @__PURE__ */ new Map(),
+			waiters: /* @__PURE__ */ new Map(),
+			started: Promise.resolve()
+		};
+		state.server = createServer(async (req, res) => {
+			try {
+				if (req.method === "OPTIONS") {
+					sendJson$1(res, 204, {});
+					return;
+				}
+				const url = new URL(req.url ?? "/", "http://127.0.0.1");
+				if (req.method === "GET" && (url.pathname === "/ping" || url.pathname === "/health")) {
+					sendJson$1(res, 200, {
+						ok: true,
+						app: "ego-browser-login",
+						port: state.port,
+						paired: Date.now() - state.lastSeenAt < 2e4
+					});
+					return;
+				}
+				if (req.method === "POST" && url.pathname === "/pair") {
+					const body = await readJsonBody$2(req);
+					if (typeof body.code !== "string" || body.code !== state.pairCode || Date.now() > state.pairExpiresAt) {
+						sendJson$1(res, 403, {
+							ok: false,
+							error: "pairing code expired or invalid"
+						});
+						return;
+					}
+					state.lastSeenAt = Date.now();
+					sendJson$1(res, 200, {
+						ok: true,
+						token: state.token,
+						port: state.port
+					});
+					return;
+				}
+				if (req.method === "GET" && url.pathname === "/pending") {
+					const token = req.headers["x-ego-token"];
+					if (!tokenMatches(state.token, token)) {
+						sendJson$1(res, 403, {
+							ok: false,
+							error: "bad token"
+						});
+						return;
+					}
+					state.lastSeenAt = Date.now();
+					const job = [...state.jobs.values()].find((j) => j.state === "waiting");
+					if (!job) {
+						sendJson$1(res, 204, {});
+						return;
+					}
+					sendJson$1(res, 200, {
+						jobId: job.id,
+						domains: job.domains,
+						dryRun: job.dryRun
+					});
+					return;
+				}
+				if (req.method === "POST" && url.pathname === "/cookies") {
+					const body = await readJsonBody$2(req);
+					if (!tokenMatches(state.token, body.token)) {
+						sendJson$1(res, 403, {
+							ok: false,
+							error: "bad token"
+						});
+						return;
+					}
+					state.lastSeenAt = Date.now();
+					const jobs = [...state.jobs.values()].filter((j) => j.state === "waiting");
+					const job = (typeof body.jobId === "string" ? state.jobs.get(body.jobId) : void 0) || jobs[0];
+					if (!job || job.state !== "waiting") {
+						sendJson$1(res, 409, {
+							ok: false,
+							error: "no waiting import job"
+						});
+						return;
+					}
+					const cookies = (Array.isArray(body.cookies) ? body.cookies : []).map(toCdpCookie).filter((c) => c !== null);
+					const filtered = cookies.filter((c) => cookieMatchesDomains(c.domain, job.domains));
+					sendJson$1(res, 200, {
+						ok: true,
+						received: cookies.length,
+						matched: filtered.length
+					});
+					buildExtensionReport(filtered, cookies.length, job.dryRun, resolveEgoStateDir()).then((report) => settlement(job, report));
+					return;
+				}
+				sendJson$1(res, 404, {
+					ok: false,
+					error: "not found"
+				});
+			} catch (err) {
+				sendJson$1(res, 400, {
+					ok: false,
+					error: String(err?.message || err)
+				});
+			}
+		});
+		await new Promise((resolve, reject) => {
+			state.server.once("error", (err) => reject(/* @__PURE__ */ new Error(`could not start login-extension bridge on 127.0.0.1:${port}: ${err.message}`)));
+			state.server.listen(port, "127.0.0.1", () => resolve());
+		});
+		bridge = state;
+		return state;
+	})();
+	try {
+		return await bridgeStarting;
+	} catch (err) {
+		bridgeStarting = null;
+		throw err;
+	}
+}
+async function getLoginExtensionHealth() {
+	try {
+		const state = await ensureBridge();
+		return {
+			ok: true,
+			paired: Date.now() - state.lastSeenAt < 2e4,
+			port: state.port,
+			tokenPath: loginExtensionTokenPath(),
+			extensionPath: fileURLToPath(new URL("../extension", import.meta.url))
+		};
+	} catch (err) {
+		return {
+			ok: false,
+			paired: false,
+			port: Number(process.env.EGO_LOGIN_EXTENSION_PORT) || 53820,
+			tokenPath: loginExtensionTokenPath(),
+			extensionPath: fileURLToPath(new URL("../extension", import.meta.url)),
+			error: String(err?.message || err)
+		};
+	}
+}
+async function createLoginExtensionPairingCode() {
+	try {
+		const state = await ensureBridge();
+		state.pairCode = String(Math.floor(1e5 + Math.random() * 9e5));
+		state.pairExpiresAt = Date.now() + 6e5;
+		return {
+			ok: true,
+			code: state.pairCode,
+			expiresAt: state.pairExpiresAt,
+			port: state.port
+		};
+	} catch (err) {
+		return {
+			ok: false,
+			error: String(err?.message || err)
+		};
+	}
+}
+async function startLoginExtensionJob(opts = {}) {
+	const state = await ensureBridge();
+	const timeoutMs = opts.timeoutMs ?? 12e4;
+	const job = {
+		id: "job-" + ++jobSeq,
+		domains: opts.domains ?? [],
+		dryRun: opts.dryRun === true,
+		state: "waiting",
+		createdAt: Date.now()
+	};
+	state.jobs.set(job.id, job);
+	const done = new Promise((resolve) => {
+		state.waiters.set(job.id, resolve);
+		setTimeout(() => {
+			if (job.state !== "waiting") return;
+			settlement(job, {
+				ok: false,
+				source: "Chrome extension",
+				profile: "extension",
+				dryRun: job.dryRun,
+				closedSource: false,
+				totalRead: 0,
+				matched: 0,
+				written: 0,
+				domains: [],
+				error: `the Chrome extension did not pick up the job within ${Math.round(timeoutMs / 1e3)}s — pair it once in the extension popup (code from the panel) and keep Chrome running`
+			});
+		}, timeoutMs).unref?.();
+	});
+	if (state.jobs.size > 20) {
+		for (const [id, old] of state.jobs) if (old.state !== "waiting" && id !== job.id) state.jobs.delete(id);
+	}
+	return {
+		jobId: job.id,
+		done
+	};
+}
+async function getLoginExtensionJob(jobId) {
+	try {
+		const job = (await ensureBridge()).jobs.get(jobId);
+		if (!job) return {
+			ok: false,
+			error: "job not found"
+		};
+		return {
+			ok: true,
+			state: job.state,
+			...job.report ? { report: job.report } : {}
+		};
+	} catch (err) {
+		return {
+			ok: false,
+			error: String(err?.message || err)
+		};
+	}
+}
+function stopLoginExtensionBridge() {
+	try {
+		bridge?.server.close();
+	} catch {}
+	bridge = null;
+	bridgeStarting = null;
 }
 //#endregion
-//#region src/cast-server.ts
-/**
-* ego-browser cast-server — host half of the realtime watch panel.
-*
-* Bridges the client UI (/api/ego/*) to the ego-cast worker
-* (bin/ego-cast-worker.mjs) that attaches to the agent's live browser and
-* streams screencast JPEGs. Everything the agent's own browser does is pushed;
-* this host route only *reads* the worker's loopback JSON. No navigation, no
-* writes, no host env changes — consistent with the plugin's read-only stance.
-*
-* Lifecycle: the worker is launched lazily (only once), on the first request,
-* when a live agent browser is expected. If no browser.json exists yet it
-* exits cleanly; we surface an empty spaces list so the panel says
-* "no live browser right now" instead of erroring.
-*/
-const WORKER_BIN = fileURLToPath(new URL("../bin/ego-cast-worker.mjs", import.meta.url));
-const EGO_SPACES_ROUTE = "/api/ego/spaces";
-const EGO_STREAM_ROUTE = "/api/ego/stream";
-const EGO_HEALTH_ROUTE = "/api/ego/health";
-const EGO_CLOSE_ROUTE = "/api/ego/close";
-const EGO_FLUSH_ROUTE = "/api/ego/flush";
-const EGO_RAISE_ROUTE = "/api/ego/raise";
-const EGO_LOGIN_IMPORT_ROUTE = "/api/ego/login-import";
-const EGO_INPUT_ROUTE = "/api/ego/input";
-const EGO_WATCH_START_ROUTE = "/api/ego/watch/start";
-const EGO_WATCH_SWITCH_ROUTE = "/api/ego/watch/switch";
-const EGO_WATCH_STOP_ROUTE = "/api/ego/watch/stop";
-const EGO_WATCH_STATUS_ROUTE = "/api/ego/watch/status";
-const EGO_VIDEO_ROUTE = "/api/ego/video";
-const EGO_VIDEO_STATUS_ROUTE = "/api/ego/video/status";
-let toolCallCount = 0;
-const sseClients = /* @__PURE__ */ new Set();
-/** Timestamp of the last ego_* tool call — the idle reaper's activity signal. */
-let lastEgoActivity = 0;
-function getLastEgoActivity() {
-	return lastEgoActivity;
+//#region src/tui/text.ts
+/** Remove escape sequences before controls, preserving printable layout spaces. */
+function terminalText(value) {
+	return value.replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\)/g, "").replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").replace(/[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g, " ");
 }
-function markEgoToolCall(sessionId) {
-	toolCallCount += 1;
-	lastEgoActivity = Date.now();
-	const frame = `event: tool-call\ndata: ${JSON.stringify(sessionId === void 0 || sessionId === "" ? { count: toolCallCount } : {
-		count: toolCallCount,
-		sessionId
-	})}\n\n`;
-	for (const res of sseClients) try {
-		res.write(frame);
-	} catch {
-		sseClients.delete(res);
+/** Compact a scalar locator or detail into a single terminal-safe line. */
+function sanitizeText(value) {
+	return terminalText(value).replace(/\s+/g, " ").trim();
+}
+const segmenter = new Intl.Segmenter(void 0, { granularity: "grapheme" });
+function graphemeWidth(value) {
+	if (/\p{Extended_Pictographic}|\p{Regional_Indicator}|\u20e3/u.test(value)) return 2;
+	let width = 0;
+	for (const char of value) {
+		if (/\p{Mark}|\p{Cf}/u.test(char)) continue;
+		const cp = char.codePointAt(0);
+		width += cp >= 4352 && (cp <= 4447 || cp === 9001 || cp === 9002 || cp >= 11904 && cp <= 42191 && cp !== 12351 || cp >= 44032 && cp <= 55203 || cp >= 63744 && cp <= 64255 || cp >= 65040 && cp <= 65049 || cp >= 65072 && cp <= 65135 || cp >= 65280 && cp <= 65376 || cp >= 65504 && cp <= 65510 || cp >= 131072 && cp <= 262141) ? 2 : 1;
 	}
+	return width;
 }
+function displayWidth(text) {
+	return [...segmenter.segment(terminalText(text))].reduce((sum, part) => sum + graphemeWidth(part.segment), 0);
+}
+/** Truncate without splitting combining sequences, emoji or terminal-wide cells. */
+function truncateCells(text, maxCells) {
+	const clean = terminalText(text);
+	const limit = Math.max(0, Math.floor(maxCells));
+	if (!limit) return "";
+	if (displayWidth(clean) <= limit) return clean;
+	let result = "", cells = 0;
+	for (const part of segmenter.segment(clean)) {
+		const width = graphemeWidth(part.segment);
+		if (cells + width > limit - 1) break;
+		cells += width;
+		result += part.segment;
+	}
+	return result + "…";
+}
+//#endregion
+//#region src/browser-state.ts
+/** Pure per-activation state: no process, filesystem, network or timer ownership. */
+var BrowserStateStore = class {
+	snapshot = Object.freeze({
+		version: 0,
+		recent: Object.freeze([]),
+		spaces: Object.freeze([]),
+		frameRelayDisabled: false
+	});
+	listeners = /* @__PURE__ */ new Set();
+	running = /* @__PURE__ */ new Map();
+	nextToken = 0;
+	getSnapshot = () => this.snapshot;
+	subscribe = (listener) => {
+		this.listeners.add(listener);
+		return () => {
+			this.listeners.delete(listener);
+		};
+	};
+	publish(patch) {
+		this.snapshot = Object.freeze({
+			...this.snapshot,
+			...patch,
+			version: this.snapshot.version + 1
+		});
+		for (const listener of [...this.listeners]) try {
+			listener();
+		} catch {}
+	}
+	startTool(name, summary, at = Date.now()) {
+		const token = ++this.nextToken;
+		const activeTool = Object.freeze({
+			name,
+			summary: truncateCells(summary, 48),
+			startedAt: at
+		});
+		this.running.set(token, activeTool);
+		this.publish({ activeTool });
+		return token;
+	}
+	finishTool(token, outcome, at = Date.now()) {
+		const activity = this.running.get(token);
+		if (!activity) return;
+		this.running.delete(token);
+		const error = outcome.error ? truncateCells(outcome.error, 160) : void 0;
+		const item = Object.freeze({
+			name: activity.name,
+			summary: activity.summary,
+			ok: outcome.ok,
+			ms: Math.max(0, at - activity.startedAt),
+			at,
+			...error ? { error } : {}
+		});
+		this.publish({
+			activeTool: [...this.running.values()].at(-1),
+			recent: Object.freeze([...this.snapshot.recent, item].slice(-10)),
+			...error ? { lastError: error } : {}
+		});
+	}
+	update(patch) {
+		const next = { ...patch };
+		if (patch.browser) next.browser = Object.freeze({ ...patch.browser });
+		if (patch.capture) next.capture = Object.freeze({ ...patch.capture });
+		if (patch.spaces) next.spaces = Object.freeze(patch.spaces.map((space) => Object.freeze({
+			name: space.name,
+			tabs: Object.freeze(space.tabs.map((tab) => Object.freeze({
+				...tab,
+				...tab.humanCheck ? { humanCheck: Object.freeze({ ...tab.humanCheck }) } : {}
+			})))
+		})));
+		if (patch.lastError !== void 0) next.lastError = truncateCells(patch.lastError, 160);
+		if (Object.keys(next).every((key) => JSON.stringify(this.snapshot[key]) === JSON.stringify(next[key]))) return;
+		this.publish(next);
+	}
+};
+const tuiSettingsSection = {
+	ns: "ego-browser",
+	title: "Agent Browser",
+	descriptions: { zh: "Agent 浏览器" },
+	page: {
+		id: "ego-browser",
+		title: "Agent Browser",
+		descriptions: { zh: "Agent 浏览器" }
+	},
+	fields: {
+		"commands": [],
+		"x-dsh-tui": [{
+			"apiVersion": "tui.dsh/v1alpha1",
+			"kind": "SettingsSection",
+			"id": "dsh-ego-browser.settings",
+			"name": "ego_browser_settings",
+			"spec": {
+				"namespace": "ego-browser",
+				"title": "Agent 浏览器",
+				"titles": {
+					"en": "Agent Browser",
+					"zh": "Agent 浏览器"
+				},
+				"fields": [
+					{
+						"path": ["isolateSpaces"],
+						"label": "Space isolation",
+						"kind": "boolean",
+						"hint": "Use a temporary isolated profile; off keeps the persistent login profile.",
+						"titles": {
+							"en": "Space isolation",
+							"zh": "任务空间沙盒隔离"
+						},
+						"hintTitles": {
+							"en": "Use a temporary isolated profile; off keeps the persistent login profile.",
+							"zh": "使用临时隔离空间；关闭时使用持久化登录配置。"
+						}
+					},
+					{
+						"path": ["idleTimeoutMin"],
+						"label": "Idle auto-stop (minutes)",
+						"kind": "number",
+						"hint": "Stop the browser after N minutes without tool calls; 0 disables. Watching is not activity.",
+						"titles": {
+							"en": "Idle auto-stop (minutes)",
+							"zh": "空闲自动回收（分钟）"
+						},
+						"hintTitles": {
+							"en": "Stop the browser after N minutes without tool calls; 0 disables. Watching is not activity.",
+							"zh": "N 分钟没有工具调用后关闭浏览器；0 表示关闭回收。观看不算活动。"
+						}
+					},
+					{
+						"path": ["residentExecutor"],
+						"label": "Resident executor",
+						"kind": "boolean",
+						"hint": "Reuse the execution process; default off.",
+						"titles": {
+							"en": "Resident executor",
+							"zh": "常驻执行进程"
+						},
+						"hintTitles": {
+							"en": "Reuse the execution process; default off.",
+							"zh": "复用执行进程；默认关闭。"
+						}
+					},
+					{
+						"path": ["residentIdleMin"],
+						"label": "Resident idle stop (minutes)",
+						"kind": "number",
+						"hint": "Stop the resident executor after N idle minutes; 0 keeps it until unload.",
+						"titles": {
+							"en": "Resident idle stop (minutes)",
+							"zh": "常驻空闲停止（分钟）"
+						},
+						"hintTitles": {
+							"en": "Stop the resident executor after N idle minutes; 0 keeps it until unload.",
+							"zh": "空闲 N 分钟后停止常驻执行进程；0 表示保留到卸载。"
+						}
+					},
+					{
+						"path": ["disableFrameRelay"],
+						"label": "Disable live preview frames",
+						"kind": "boolean",
+						"hint": "No watch panel frames, no screencast capture and no cast worker. Handy in TUI/headless setups. ego_* tools keep working.",
+						"titles": {
+							"en": "Disable live preview frames",
+							"zh": "关闭实时画面传输"
+						},
+						"hintTitles": {
+							"en": "No watch panel frames, no screencast capture and no cast worker. Handy in TUI/headless setups. ego_* tools keep working.",
+							"zh": "不传输观察窗画面、不做 screencast 采集、不启动 cast worker；适合 TUI/无头环境，ego_* 工具不受影响。"
+						}
+					},
+					{
+						"path": ["chromePath"],
+						"label": "Browser binary path",
+						"kind": "text",
+						"hint": "Path to Chrome, Chromium or Edge. Empty means auto-detect.",
+						"titles": {
+							"en": "Browser binary path",
+							"zh": "浏览器程序路径"
+						},
+						"hintTitles": {
+							"en": "Path to Chrome, Chromium or Edge. Empty means auto-detect.",
+							"zh": "Chrome、Chromium 或 Edge 路径；留空自动检测。"
+						}
+					},
+					{
+						"path": ["captureBackend"],
+						"label": "Capture backend",
+						"kind": "select",
+						"options": [
+							{
+								"value": "auto",
+								"label": "Auto"
+							},
+							{
+								"value": "cdp",
+								"label": "CDP"
+							},
+							{
+								"value": "ffmpeg",
+								"label": "FFmpeg"
+							}
+						],
+						"titles": {
+							"en": "Capture backend",
+							"zh": "画面采集后端"
+						},
+						"hint": "Choose automatic detection, CDP or FFmpeg.",
+						"hintTitles": {
+							"en": "Choose automatic detection, CDP or FFmpeg.",
+							"zh": "选择自动检测、CDP 或 FFmpeg。"
+						}
+					},
+					{
+						"path": ["streamProfile"],
+						"label": "Quality profile",
+						"kind": "select",
+						"options": [
+							{
+								"value": "low",
+								"label": "Low",
+								"titles": { "zh": "低" }
+							},
+							{
+								"value": "balanced",
+								"label": "Balanced",
+								"titles": { "zh": "均衡" }
+							},
+							{
+								"value": "high",
+								"label": "High",
+								"titles": { "zh": "高" }
+							}
+						],
+						"titles": {
+							"en": "Quality profile",
+							"zh": "画质预设"
+						},
+						"hint": "Low reduces bandwidth; balanced is the default; high improves detail.",
+						"hintTitles": {
+							"en": "Low reduces bandwidth; balanced is the default; high improves detail.",
+							"zh": "低画质减少带宽；均衡为默认；高画质保留更多细节。"
+						}
+					},
+					{
+						"path": ["ffmpegPath"],
+						"label": "FFmpeg binary path",
+						"kind": "text",
+						"hint": "Path to FFmpeg. Empty means auto-detect or on-demand installation.",
+						"titles": {
+							"en": "FFmpeg binary path",
+							"zh": "FFmpeg 程序路径"
+						},
+						"hintTitles": {
+							"en": "Path to FFmpeg. Empty means auto-detect or on-demand installation.",
+							"zh": "FFmpeg 路径；留空自动检测或按需安装。"
+						}
+					},
+					{
+						"path": ["tuiAutoOpenPanel"],
+						"label": "Auto-open TUI browser panel",
+						"titles": {
+							"en": "Auto-open TUI browser panel",
+							"zh": "自动打开 TUI 浏览器面板"
+						},
+						"kind": "boolean",
+						"hint": "Off by default. Open the panel on the first ego_* call; otherwise show a badge and status only.",
+						"hintTitles": {
+							"en": "Off by default. Open the panel on the first ego_* call; otherwise show a badge and status only.",
+							"zh": "默认关闭。开启后首次 ego_* 调用打开面板；关闭时仅显示角标和状态。"
+						}
+					}
+				]
+			}
+		}]
+	}["x-dsh-tui"].find((section) => section.kind === "SettingsSection").spec.fields.map(({ titles, hintTitles, options, ...field }) => ({
+		...field,
+		...titles ? { descriptions: titles } : {},
+		...hintTitles ? { hintDescriptions: hintTitles } : {},
+		...options ? { options: options.map(({ titles: optionTitles, ...option }) => ({
+			...option,
+			...optionTitles ? { descriptions: optionTitles } : {}
+		})) } : {}
+	}))
+};
+function installTuiSettings(ctx) {
+	ctx.inject?.(["tuiSettingsSections"], (sctx) => {
+		const dispose = sctx.tuiSettingsSections.register(tuiSettingsSection);
+		sctx.effect?.(() => dispose);
+	});
+}
+//#endregion
+//#region src/tui/integration.ts
+/** Service discovery stays inside independently injected activation scopes. */
+function installTui(ctx, store) {
+	installTuiSettings(ctx);
+	let override;
+	let refreshStatus;
+	let deliverToast;
+	ctx.inject?.(["tuiStatus"], (sctx) => {
+		let previous = "";
+		let previousClick;
+		let disposeField;
+		const render = () => {
+			const snapshot = store.getSnapshot();
+			const active = snapshot.activeTool;
+			const lastError = snapshot.lastError ?? snapshot.recent.findLast((result) => result.error)?.error;
+			const text = override?.text ?? (active ? `◎ ${active.name}` : "◎ idle");
+			const tone = override?.tone ?? (active ? "accent" : "dim");
+			const detail = truncateCells(override?.detail ?? (active ? [[active.name, active.summary].filter(Boolean).join(" · "), lastError].filter(Boolean).join(" | ") : lastError ?? "Agent Browser is idle"), 160);
+			const key = JSON.stringify([
+				text,
+				tone,
+				detail
+			]);
+			if (key === previous && previousClick === override?.onClick) return;
+			previous = key;
+			previousClick = override?.onClick;
+			disposeField?.();
+			disposeField = sctx.tuiStatus.setField("ego-browser", text, {
+				slot: "right-head",
+				tone,
+				maxCells: 24,
+				detail,
+				...override?.onClick ? { onClick: override.onClick } : {}
+			});
+		};
+		refreshStatus = render;
+		render();
+		const off = store.subscribe(render);
+		sctx.effect?.(() => () => {
+			off();
+			disposeField?.();
+			if (refreshStatus === render) refreshStatus = void 0;
+		});
+	});
+	ctx.inject?.(["tuiToast"], (sctx) => {
+		let sent = [];
+		const deliver = (text, color) => {
+			const now = Date.now();
+			sent = sent.filter((at) => now - at < 6e4);
+			if (sent.length >= 20) return;
+			sent.push(now);
+			try {
+				sctx.tuiToast.show(truncateCells(text, 200), {
+					color,
+					timeoutMs: 4e3
+				});
+			} catch {}
+		};
+		deliverToast = deliver;
+		sctx.effect?.(() => () => {
+			if (deliverToast === deliver) deliverToast = void 0;
+		});
+	});
+	return {
+		toast: (text, color) => deliverToast?.(text, color),
+		hasToast: () => deliverToast !== void 0,
+		setStatusOverride: (value) => {
+			override = value;
+			refreshStatus?.();
+		}
+	};
+}
+//#endregion
+//#region src/tui/panel-controller.ts
+/** The worker currently calls its flat target list `spaces`; do not invent task spaces. */
+function parseSpaces(value, groups = []) {
+	if (!value || typeof value !== "object") return [];
+	const rows = value.spaces;
+	if (!Array.isArray(rows)) return [];
+	const parseTabs = (values) => values.flatMap((value) => {
+		if (!value || typeof value !== "object") return [];
+		const tab = value;
+		if (typeof tab.targetId !== "string") return [];
+		return [{
+			targetId: tab.targetId,
+			url: sanitizeText(typeof tab.url === "string" ? tab.url : ""),
+			title: sanitizeText(typeof tab.title === "string" ? tab.title : ""),
+			active: tab.active === true,
+			humanCheck: tab.humanCheck && typeof tab.humanCheck === "object" && tab.humanCheck.detected === true ? {
+				detected: true,
+				kind: typeof tab.humanCheck.kind === "string" ? sanitizeText(tab.humanCheck.kind) : void 0
+			} : void 0
+		}];
+	});
+	if (rows.some((row) => row && typeof row === "object" && Array.isArray(row.tabs))) return rows.filter((row) => row && typeof row === "object" && Array.isArray(row.tabs)).map((row) => ({
+		name: sanitizeText(typeof row.name === "string" ? row.name : "Unnamed space"),
+		tabs: parseTabs(row.tabs)
+	}));
+	const tabs = parseTabs(rows);
+	const remaining = new Map(tabs.map((tab) => [tab.targetId, tab]));
+	const spaces = groups.flatMap((group) => {
+		const members = group.targetIds.flatMap((id) => {
+			const tab = remaining.get(id);
+			if (!tab) return [];
+			remaining.delete(id);
+			return [tab];
+		});
+		return members.length ? [{
+			name: sanitizeText(group.name),
+			tabs: members
+		}] : [];
+	});
+	if (!spaces.length) return [{
+		name: "Global/default group",
+		tabs
+	}];
+	if (remaining.size) spaces.push({
+		name: "Unassigned / global",
+		tabs: [...remaining.values()]
+	});
+	return spaces;
+}
+/** Optional capture status comes from the existing spaces response, never a new request. */
+function parseCapture(value) {
+	if (!value || typeof value !== "object") return void 0;
+	const capture = value.capture;
+	if (!capture || typeof capture !== "object") return void 0;
+	const fields = capture;
+	if (typeof fields.backend !== "string" || typeof fields.state !== "string") return void 0;
+	return {
+		backend: truncateCells(sanitizeText(fields.backend), 40),
+		state: truncateCells(sanitizeText(fields.state), 40),
+		...typeof fields.code === "string" ? { code: truncateCells(sanitizeText(fields.code), 40) } : {}
+	};
+}
+/** One lifecycle owner for polling; component hooks stop it immediately on hide/unmount. */
+function createPanelController(store, config, transport) {
+	let disposed = false;
+	let visible = false;
+	let generation = 0;
+	let timer;
+	let pending;
+	let queued = false;
+	const refresh = () => {
+		if (disposed) return Promise.resolve();
+		if (pending) {
+			queued = true;
+			return pending;
+		}
+		const epoch = generation;
+		pending = (async () => {
+			const browser = await transport.readBrowserState();
+			if (disposed || epoch !== generation) return;
+			store.update({
+				browser,
+				frameRelayDisabled: false
+			});
+			if (!browser.running) {
+				store.update({
+					spaces: [],
+					capture: void 0
+				});
+				return;
+			}
+			const port = await transport.ensureWorker();
+			if (disposed || epoch !== generation) return;
+			if (!port) {
+				store.update({ lastError: "Browser worker unavailable" });
+				return;
+			}
+			const payload = await transport.get(port, "/api/spaces");
+			if (disposed || epoch !== generation) return;
+			const groups = payload ? await transport.readTaskSpaceGroups?.() ?? [] : [];
+			if (disposed || epoch !== generation) return;
+			store.update(payload ? {
+				spaces: parseSpaces(payload, groups),
+				capture: parseCapture(payload),
+				lastError: void 0
+			} : { lastError: "Could not refresh browser tabs" });
+		})().catch((error) => {
+			if (!disposed && epoch === generation) store.update({ lastError: sanitizeText(String(error)) });
+		}).finally(() => {
+			pending = void 0;
+			if (queued) {
+				queued = false;
+				refresh();
+			}
+		});
+		return pending;
+	};
+	const post = async (path, body) => {
+		if (disposed) return;
+		const port = await transport.ensureWorker();
+		if (!port || disposed) return;
+		const result = await transport.post(port, path, body);
+		if (disposed) return;
+		if (!result || result.status < 200 || result.status >= 300) {
+			store.update({ lastError: path === "/api/close" ? "Could not close tab" : "Could not flush browser cookies" });
+			return;
+		}
+		await refresh();
+	};
+	let latest = store.getSnapshot().recent.at(-1);
+	const unsubscribe = store.subscribe(() => {
+		const next = store.getSnapshot().recent.at(-1);
+		if (next === latest) return;
+		latest = next;
+		if (next) refresh();
+	});
+	return {
+		setVisible(next) {
+			if (disposed || next === visible) return;
+			visible = next;
+			if (!visible) queued = false;
+			generation++;
+			if (timer) clearInterval(timer);
+			timer = void 0;
+			if (visible) {
+				refresh();
+				timer = setInterval(() => void refresh(), 2e3);
+			}
+		},
+		refresh,
+		close: (targetId) => post("/api/close", { targetId }).catch((error) => {
+			if (!disposed) store.update({ lastError: sanitizeText(String(error)) });
+		}),
+		flush: () => post("/api/flush", {}).catch((error) => {
+			if (!disposed) store.update({ lastError: sanitizeText(String(error)) });
+		}),
+		dispose() {
+			disposed = true;
+			queued = false;
+			generation++;
+			if (timer) clearInterval(timer);
+			unsubscribe();
+		}
+	};
+}
+//#endregion
+//#region src/tui/panel-layout.ts
+/**
+* Host `ui.Text` props for a row. dsh-TUI's themed Text resolves `color` as a
+* theme key (bare names such as 'red' resolve to nothing) and dims via
+* `dimColor`; every non-dim tone here is also a theme key.
+*/
+function rowTextProps(row) {
+	return row.tone === "dim" || row.tone === void 0 ? {
+		dimColor: row.tone === "dim",
+		wrap: "truncate"
+	} : {
+		dimColor: false,
+		color: row.tone,
+		wrap: "truncate"
+	};
+}
+function panelTabs(snapshot) {
+	return (snapshot.spaces ?? []).flatMap((space) => space.tabs);
+}
+function hasHumanCheck(snapshot) {
+	return panelTabs(snapshot).some((tab) => tab.humanCheck?.detected === true);
+}
+/** Pure, cell-bounded text layout. Selection scrolls within the available tab rows. */
+function layoutPanel(snapshot, width, height, selected) {
+	const rows = [];
+	const add = (text, tone) => rows.push({
+		text: truncateCells(text, width),
+		tone
+	});
+	const tabs = panelTabs(snapshot);
+	const active = tabs.find((tab) => tab.active);
+	add(snapshot.spaces?.length === 1 ? `◎ Agent Browser · ${snapshot.spaces[0]?.name ?? ""}` : "◎ Agent Browser", "dim");
+	if (snapshot.browser) add(snapshot.browser.running ? `◎ running${snapshot.browser.headless === void 0 ? "" : snapshot.browser.headless ? " · headless" : " · windowed"}` : "◎ stopped", snapshot.browser.running ? "success" : "dim");
+	if (active) {
+		add(active.title || "(untitled)", "accent");
+		add(active.url, "dim");
+	}
+	if (hasHumanCheck(snapshot)) add("! Human check · o to take over", "warning");
+	if (snapshot.activeTool) add(`▶ ${snapshot.activeTool.name} · ${snapshot.activeTool.summary}`, "accent");
+	if (snapshot.lastError) add(`! ${snapshot.lastError}`, "error");
+	const actions = snapshot.recent.slice(-Math.min(5, Math.max(3, height - rows.length - 6)));
+	const tabBudget = Math.max(0, height - rows.length - actions.length - 3);
+	const flattened = (snapshot.spaces ?? []).flatMap((space) => space.tabs.map((tab) => ({
+		tab,
+		group: space.name
+	})));
+	const tabRows = Math.max(0, tabBudget - 1);
+	const start = Math.max(0, Math.min(selected - tabRows + 1, flattened.length - tabRows));
+	if (tabBudget > 0) {
+		add(`Tabs (${tabs.length}) · ${snapshot.spaces?.length === 1 ? snapshot.spaces[0]?.name : "groups"}`, "dim");
+		for (let i = start; i < Math.min(flattened.length, start + tabRows); i++) {
+			const item = flattened[i];
+			const group = (snapshot.spaces?.length ?? 0) > 1 ? `[${item.group}] ` : "";
+			add(`${i === selected ? "›" : " "} ${item.tab.active ? "*" : " "} ${group}${item.tab.title || item.tab.url}`, i === selected ? "accent" : void 0);
+		}
+	}
+	if (actions.length) add("Recent actions", "dim");
+	for (const action of actions) add(`${action.ok ? "✓" : "✗"} ${action.ms}ms ${action.name} · ${action.summary}`, action.ok ? "success" : "error");
+	const hint = {
+		text: truncateCells("↑↓ select · o open · x close · f login · r refresh", width),
+		tone: "dim"
+	};
+	return [...rows.slice(0, Math.max(0, height - 1)), hint].slice(0, Math.max(0, height));
+}
+//#endregion
+//#region src/tui/panel.ts
+/** All optional services are resolved in their own declared injection scope. */
+function installBrowserPanel(ctx, config, store, tui, dependencies) {
+	let dialogs;
+	ctx.inject?.(["tuiDialogs"], (dctx) => {
+		dialogs = dctx.tuiDialogs;
+		dctx.effect?.(() => () => {
+			dialogs = void 0;
+		});
+	});
+	ctx.inject?.(["tuiPanels"], (pctx) => {
+		const panels = pctx.tuiPanels;
+		if (!panels) return;
+		const controller = createPanelController(store, config, dependencies.createTransport());
+		let host;
+		let disposed = false;
+		let firstTool = false;
+		let previousHuman = false;
+		let lastOpen = -Infinity;
+		let panelId = "";
+		const openPanel = () => {
+			if (!panelId || disposed || Date.now() - lastOpen < 5e3) return;
+			lastOpen = Date.now();
+			panels.open(panelId);
+		};
+		const notify = (level) => {
+			if (host) host.notify(level, 1);
+			else if (panelId) panels.badge(panelId, {
+				level,
+				unread: 1
+			});
+		};
+		const onSnapshot = () => {
+			const snapshot = store.getSnapshot();
+			if (!firstTool && snapshot.activeTool) {
+				firstTool = true;
+				notify("info");
+				if (config.tuiAutoOpenPanel) openPanel();
+			}
+			const human = hasHumanCheck(snapshot);
+			if (human && !previousHuman) {
+				notify("warning");
+				tui.toast("Browser needs human verification. Press o in Agent Browser to take over.", "warning");
+			}
+			if (human !== previousHuman) {
+				previousHuman = human;
+				tui.setStatusOverride(human ? {
+					text: "◎ human check",
+					tone: "warning",
+					detail: "Human verification required. Open Agent Browser, then press o to take over.",
+					onClick: openPanel
+				} : void 0);
+			}
+		};
+		const unsubscribe = store.subscribe(onSnapshot);
+		function BrowserPanel(props) {
+			const { React, ui } = props;
+			const [snapshot, setSnapshot] = React.useState(store.getSnapshot);
+			const [selectedId, setSelectedId] = React.useState(void 0);
+			const [closeArmed, setCloseArmed] = React.useState(void 0);
+			const [message, setMessage] = React.useState("");
+			const closing = React.useRef(false);
+			const mounted = React.useRef(true);
+			React.useEffect(() => {
+				mounted.current = true;
+				return () => {
+					mounted.current = false;
+				};
+			}, []);
+			React.useEffect(() => {
+				if (!props.visible) return;
+				setSnapshot(store.getSnapshot());
+				return store.subscribe(() => setSnapshot(store.getSnapshot()));
+			}, [props.visible]);
+			React.useEffect(() => {
+				host = props.host;
+				return () => {
+					if (host === props.host) host = void 0;
+				};
+			}, [props.host]);
+			React.useEffect(() => {
+				controller.setVisible(props.visible);
+				return () => controller.setVisible(false);
+			}, [props.visible]);
+			const tabs = panelTabs(snapshot);
+			let selection = tabs.findIndex((tab) => tab.targetId === selectedId);
+			if (selection < 0) selection = tabs.findIndex((tab) => tab.active);
+			if (selection < 0) selection = 0;
+			const targetId = tabs[selection]?.targetId;
+			const move = (delta) => {
+				if (tabs.length === 0) return;
+				const next = Math.max(0, Math.min(tabs.length - 1, selection + delta));
+				const id = tabs[next]?.targetId;
+				if (id) setSelectedId(id);
+				setCloseArmed(void 0);
+			};
+			React.useEffect(() => {
+				setCloseArmed(void 0);
+			}, [
+				targetId,
+				props.visible,
+				props.focused
+			]);
+			React.useEffect(() => {
+				if (!props.visible || !props.focused) return;
+				return props.host.onKey((event) => {
+					if (event.key.ctrl || event.key.meta) return;
+					let action;
+					if (event.key.upArrow) action = () => move(-1);
+					else if (event.key.downArrow) action = () => move(1);
+					else if (event.input === "o") action = () => {
+						setCloseArmed(void 0);
+						dependencies.openAgentWindow().then((result) => {
+							if (!disposed && mounted.current && !result.ok) setMessage(result.error || "Could not open browser window");
+						}).catch((error) => {
+							if (!disposed && mounted.current) setMessage(String(error));
+						});
+					};
+					else if (event.input === "r") action = () => {
+						setCloseArmed(void 0);
+						controller.refresh();
+					};
+					else if (event.input === "f") action = () => {
+						setCloseArmed(void 0);
+						controller.flush();
+					};
+					else if (event.input === "x" && targetId) action = () => {
+						if (closing.current) return;
+						if (!dialogs && closeArmed !== targetId) {
+							setCloseArmed(targetId);
+							return;
+						}
+						closing.current = true;
+						(async () => {
+							if ((dialogs ? await dialogs.confirm({
+								title: "Close browser tab?",
+								message: truncateCells(tabs[selection]?.title || tabs[selection]?.url || targetId, 200),
+								confirmLabel: "Close tab",
+								cancelLabel: "Keep tab"
+							}) : true) && !disposed && mounted.current) await controller.close(targetId);
+						})().finally(() => {
+							closing.current = false;
+							if (mounted.current) setCloseArmed(void 0);
+						});
+					};
+					if (!action) {
+						setCloseArmed(void 0);
+						return;
+					}
+					event.preventDefault();
+					action();
+				});
+			}, [
+				props.host,
+				props.visible,
+				props.focused,
+				snapshot,
+				selection,
+				closeArmed,
+				targetId
+			]);
+			const rows = layoutPanel(snapshot, props.width, props.height, selection);
+			if (closeArmed && rows.length) rows[rows.length - 1] = {
+				text: truncateCells("Press x again to close this tab", props.width),
+				tone: "warning"
+			};
+			else if (message && rows.length) rows[rows.length - 1] = {
+				text: truncateCells(message, props.width),
+				tone: "error"
+			};
+			return React.createElement(ui.Box, {
+				flexDirection: "column",
+				width: props.width,
+				height: props.height
+			}, ...rows.map((row, index) => React.createElement(ui.Text, {
+				key: index,
+				...rowTextProps(row)
+			}, row.text)));
+		}
+		const unregister = panels.register({
+			apiVersion: 1,
+			id: "browser",
+			title: "Agent Browser",
+			icon: "◎",
+			minColumns: 28,
+			component: BrowserPanel
+		});
+		panelId = panels.list().find((panel) => panel.id.endsWith(":browser"))?.id ?? "";
+		pctx.effect?.(() => () => {
+			disposed = true;
+			controller.dispose();
+			unsubscribe();
+			tui.setStatusOverride(void 0);
+			if (typeof unregister === "function") unregister();
+		});
+	});
+}
+//#endregion
+//#region src/worker-client.ts
+/** Shared lazy worker client. Importing this module performs no I/O. */
+const WORKER_BIN = fileURLToPath(new URL("../bin/ego-cast-worker.mjs", import.meta.url));
 function castStatePath() {
 	const e = process.env;
 	const isWin = process.platform === "win32";
 	const home = e.HOME || e.USERPROFILE || (isWin ? e.LOCALAPPDATA || "" : "/root");
 	const stateHome = e.EGO_LINUX_STATE_DIR || (isWin ? e.LOCALAPPDATA || `${home}\\AppData\\Local` : e.XDG_STATE_HOME || `${home}/.local/state`);
 	return stateHome.endsWith("ego-lite-linux") ? `${stateHome}/ego-cast.json` : `${stateHome}/ego-lite-linux/ego-cast.json`;
-}
-function sendJson(res, status, body) {
-	const payload = JSON.stringify(body);
-	res.writeHead(status, {
-		"content-type": "application/json",
-		"content-length": Buffer.byteLength(payload),
-		"cache-control": "no-store"
-	});
-	res.end(payload);
 }
 /** Proxy a worker loopback endpoint. Returns null when the worker is unreachable. */
 async function proxyFrom(port, path) {
@@ -814,6 +1968,237 @@ async function proxyPost(port, path, body, timeoutMs = 4e3) {
 		return null;
 	}
 }
+/** Read the worker's { port, pid } from ego-cast.json, if any. */
+async function knownWorkerState() {
+	try {
+		const { readFile } = await import("node:fs/promises");
+		const state = JSON.parse(await readFile(castStatePath(), "utf8"));
+		return {
+			port: typeof state.port === "number" ? state.port : null,
+			pid: typeof state.pid === "number" ? state.pid : null
+		};
+	} catch {
+		return {
+			port: null,
+			pid: null
+		};
+	}
+}
+/** Is a process with this pid alive? (false for our own / empty / signals fail) */
+function isProcessAlive$1(pid) {
+	if (!pid || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (err) {
+		const e = err;
+		return e && e.code === "EPERM";
+	}
+}
+function captureConfig(cfg, ffmpegManager) {
+	const ffmpegStatus = ffmpegManager?.status();
+	const unavailable = cfg.captureBackend === "ffmpeg" && !ffmpegStatus?.canSelectFfmpeg;
+	return {
+		captureBackend: unavailable ? "cdp" : cfg.captureBackend,
+		ffmpegFallbackReason: unavailable ? ffmpegStatus?.reason || "FFmpeg is unavailable" : "",
+		streamProfile: cfg.streamProfile,
+		cdpFps: cfg.cdpFps,
+		cdpQuality: cfg.cdpQuality,
+		cdpMaxWidth: cfg.cdpMaxWidth,
+		cdpBackstopIntervalMs: cfg.cdpBackstopIntervalMs,
+		ffmpegFps: cfg.ffmpegFps,
+		ffmpegMaxWidth: cfg.ffmpegMaxWidth,
+		ffmpegBitrateKbps: cfg.ffmpegBitrateKbps,
+		ffmpegEncoder: cfg.ffmpegEncoder,
+		ffmpegPath: cfg.ffmpegPath,
+		ffmpegResolvedPath: ffmpegStatus?.canSelectFfmpeg ? ffmpegStatus.path || "" : ""
+	};
+}
+/**
+* Ensure a single ego-cast worker is running (idempotent). Launches it via
+* ctx.subprocess. Re-spawns whenever the previous worker is found dead (its
+* pid no longer alive or its /api/health does not answer), so a crashed
+* worker is brought back without a host restart. Spawn is rate-limited to
+* avoid hot-looping while a headless container has no browser yet.
+*/
+function makeEnsureWorker(ctx, cfg, ffmpegManager) {
+	let lastAttempt = 0;
+	async function launchedWorkerPort() {
+		const state = await knownWorkerState();
+		if (state.pid === null || !isProcessAlive$1(state.pid)) return null;
+		return await proxyFrom(state.port, "/api/health") ? state.port : null;
+	}
+	return async function ensureWorker() {
+		const running = await launchedWorkerPort();
+		if (running !== null) return running;
+		const now = Date.now();
+		if (now - lastAttempt > 8e3) {
+			lastAttempt = now;
+			try {
+				await ffmpegManager?.check({
+					configuredPath: cfg.ffmpegPath,
+					requestedEncoder: cfg.ffmpegEncoder
+				}).catch(() => null);
+				const initCfg = JSON.stringify(captureConfig(cfg, ffmpegManager));
+				ctx.subprocess.spawn({
+					argv: [
+						process.execPath,
+						WORKER_BIN,
+						initCfg
+					],
+					cwd: process.cwd(),
+					env: process.versions.electron ? {
+						...process.env,
+						ELECTRON_RUN_AS_NODE: process.env.ELECTRON_RUN_AS_NODE ?? "1"
+					} : void 0,
+					stdio: {
+						stdin: { data: "" },
+						stdout: { maxBytes: 8192 },
+						stderr: { maxBytes: 4096 }
+					},
+					graceMs: 12e3
+				}).done.catch(() => null);
+				const deadline = Date.now() + 8e3;
+				while (Date.now() < deadline) {
+					const ready = await launchedWorkerPort();
+					if (ready !== null) return ready;
+					await new Promise((resolve) => setTimeout(resolve, 100));
+				}
+				return null;
+			} catch {
+				return null;
+			}
+		}
+		return null;
+	};
+}
+/** Read-only membership metadata; never reconcile, prune, or mutate task spaces. */
+async function readTaskSpaceGroups() {
+	try {
+		const { readFile } = await import("node:fs/promises");
+		const state = JSON.parse(await readFile(join(resolveEgoStateDir(), "task-spaces.json"), "utf8"));
+		if (!Array.isArray(state.spaces)) return [];
+		return state.spaces.flatMap((value) => {
+			if (!value || typeof value !== "object" || typeof value.name !== "string" || !Array.isArray(value.targetIds)) return [];
+			return [{
+				name: value.name,
+				targetIds: value.targetIds.filter((id) => typeof id === "string")
+			}];
+		});
+	} catch {
+		return [];
+	}
+}
+/** Read browser metadata without launching the browser or the cast worker. */
+async function readBrowserState() {
+	try {
+		const { readFile } = await import("node:fs/promises");
+		const state = JSON.parse(await readFile(join(resolveEgoStateDir(), "browser.json"), "utf8"));
+		return {
+			running: typeof state.pid === "number" && isProcessAlive$1(state.pid),
+			...typeof state.headless === "boolean" ? { headless: state.headless } : {}
+		};
+	} catch {
+		return { running: false };
+	}
+}
+//#endregion
+//#region src/tui/presentation.ts
+const selectorTools = /* @__PURE__ */ new Set([
+	"ego_click",
+	"ego_fill",
+	"ego_screenshot",
+	"ego_wait_for_selector",
+	"ego_hover",
+	"ego_read_element",
+	"ego_select",
+	"ego_scroll",
+	"ego_upload",
+	"ego_check"
+]);
+const urlTools = /* @__PURE__ */ new Set([
+	"ego_navigate",
+	"ego_http",
+	"ego_wait_for_response"
+]);
+/** Only locator fields are eligible; values, headers, bodies and executable source never are. */
+function safeLocatorSummary(name, value) {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return "";
+	const args = value;
+	let summary = "";
+	if (selectorTools.has(name) && typeof args.selector === "string") summary = args.selector;
+	else if (urlTools.has(name) && typeof args.url === "string") try {
+		const url = new URL(args.url);
+		if (url.protocol === "http:" || url.protocol === "https:") summary = url.host + url.pathname;
+	} catch {}
+	else if (name === "ego_drag" && typeof args.from === "string" && typeof args.to === "string") summary = `${args.from} → ${args.to}`;
+	else if (name === "ego_download" && typeof args.triggerSelector === "string") summary = args.triggerSelector;
+	return truncateCells(sanitizeText(summary), 48);
+}
+function toolCallTitle(name, args) {
+	const summary = safeLocatorSummary(name, args);
+	return summary ? `${name} · ${summary}` : name;
+}
+//#endregion
+//#region src/cast-server.ts
+/**
+* ego-browser cast-server — host half of the realtime watch panel.
+*
+* Bridges the client UI (/api/ego/*) to the ego-cast worker
+* (bin/ego-cast-worker.mjs) that attaches to the agent's live browser and
+* streams screencast JPEGs. Everything the agent's own browser does is pushed;
+* this host route only *reads* the worker's loopback JSON. No navigation, no
+* writes, no host env changes — consistent with the plugin's read-only stance.
+*
+* Lifecycle: the worker is launched lazily (only once), on the first request,
+* when a live agent browser is expected. If no browser.json exists yet it
+* exits cleanly; we surface an empty spaces list so the panel says
+* "no live browser right now" instead of erroring.
+*/
+const EGO_SPACES_ROUTE = "/api/ego/spaces";
+const EGO_STREAM_ROUTE = "/api/ego/stream";
+const EGO_HEALTH_ROUTE = "/api/ego/health";
+const EGO_CLOSE_ROUTE = "/api/ego/close";
+const EGO_FLUSH_ROUTE = "/api/ego/flush";
+const EGO_RAISE_ROUTE = "/api/ego/raise";
+const EGO_LOGIN_IMPORT_ROUTE = "/api/ego/login-import";
+const EGO_INPUT_ROUTE = "/api/ego/input";
+const EGO_WINDOW_SIZE_ROUTE = "/api/ego/window-size";
+const EGO_WATCH_START_ROUTE = "/api/ego/watch/start";
+const EGO_WATCH_SWITCH_ROUTE = "/api/ego/watch/switch";
+const EGO_WATCH_STOP_ROUTE = "/api/ego/watch/stop";
+const EGO_WATCH_STATUS_ROUTE = "/api/ego/watch/status";
+const EGO_VIDEO_ROUTE = "/api/ego/video";
+const EGO_VIDEO_STATUS_ROUTE = "/api/ego/video/status";
+let toolCallCount = 0;
+const sseClients = /* @__PURE__ */ new Set();
+/** Timestamp of the last ego_* tool call — the idle reaper's activity signal. */
+let lastEgoActivity = 0;
+function getLastEgoActivity() {
+	return lastEgoActivity;
+}
+function markEgoToolCall(sessionId) {
+	toolCallCount += 1;
+	lastEgoActivity = Date.now();
+	const frame = `event: tool-call\ndata: ${JSON.stringify(sessionId === void 0 || sessionId === "" ? { count: toolCallCount } : {
+		count: toolCallCount,
+		sessionId
+	})}\n\n`;
+	for (const res of sseClients) try {
+		res.write(frame);
+	} catch {
+		sseClients.delete(res);
+	}
+}
+function sendJson(res, status, body) {
+	const payload = JSON.stringify(body);
+	res.writeHead(status, {
+		"content-type": "application/json",
+		"content-length": Buffer.byteLength(payload),
+		"cache-control": "no-store"
+	});
+	res.end(payload);
+}
 /**
 * Bridge the worker's SSE stream to the DSH watch panel.
 *
@@ -828,9 +2213,11 @@ async function proxyPost(port, path, body, timeoutMs = 4e3) {
 * markEgoToolCall() can inject `tool-call` events directly into the live
 * stream (the sidebar auto-open signal), without the client polling.
 */
-function proxyWorkerStream(port, res, path) {
+function proxyWorkerStream(port, res, path, retry, retryDelayMs = 1500) {
 	let cancelled = false;
 	let ended = false;
+	let timer = null;
+	let upstream = null;
 	const endOnce = () => {
 		if (ended) return;
 		ended = true;
@@ -847,59 +2234,90 @@ function proxyWorkerStream(port, res, path) {
 	});
 	res.write(":ok\n\n");
 	sseClients.add(res);
-	if (!Number.isInteger(port) || port <= 0) {
-		res.on("close", () => {
-			sseClients.delete(res);
-		});
-		return () => {
-			sseClients.delete(res);
-		};
-	}
-	const up = request({
-		host: "127.0.0.1",
-		port,
-		path,
-		method: "GET",
-		headers: { accept: "text/event-stream" }
-	}, (upRes) => {
-		upRes.on("data", (chunk) => {
-			if (cancelled || ended) return;
-			try {
-				if (!res.write(chunk)) {
-					upRes.pause();
-					res.once("drain", () => {
-						if (!cancelled && !ended) upRes.resume();
-					});
-				}
-			} catch {
-				cancelled = true;
-				endOnce();
-			}
-		});
-		upRes.on("end", endOnce);
-		upRes.on("error", endOnce);
-	});
-	up.on("error", endOnce);
-	up.setTimeout(5e3, () => {
-		try {
-			up.destroy();
-		} catch {}
-		endOnce();
-	});
-	up.end();
 	const onClose = () => {
 		cancelled = true;
 		sseClients.delete(res);
 		try {
-			up.destroy();
+			upstream?.destroy();
 		} catch {}
 	};
+	if (!Number.isInteger(port) || port <= 0) {
+		res.on("close", () => {
+			cancelled = true;
+			if (timer !== null) {
+				clearTimeout(timer);
+				timer = null;
+			}
+			sseClients.delete(res);
+		});
+		if (retry) {
+			const attempt = () => {
+				if (cancelled || ended) return;
+				retry().then((next) => {
+					if (cancelled || ended) return;
+					if (typeof next === "number" && next > 0) {
+						res.on("close", onClose);
+						attach(next);
+					} else timer = setTimeout(attempt, Math.max(20, retryDelayMs));
+				}).catch(() => {
+					if (!cancelled && !ended) timer = setTimeout(attempt, Math.max(20, retryDelayMs));
+				});
+			};
+			timer = setTimeout(attempt, Math.max(20, retryDelayMs));
+			return () => {
+				cancelled = true;
+				if (timer !== null) {
+					clearTimeout(timer);
+					timer = null;
+				}
+				sseClients.delete(res);
+			};
+		}
+		return () => {
+			sseClients.delete(res);
+		};
+	}
+	function attach(workerPort) {
+		upstream = request({
+			host: "127.0.0.1",
+			port: workerPort,
+			path,
+			method: "GET",
+			headers: { accept: "text/event-stream" }
+		}, (upRes) => {
+			upRes.on("data", (chunk) => {
+				if (cancelled || ended) return;
+				try {
+					if (!res.write(chunk)) {
+						upRes.pause();
+						res.once("drain", () => {
+							if (!cancelled && !ended) upRes.resume();
+						});
+					}
+				} catch {
+					cancelled = true;
+					endOnce();
+				}
+			});
+			upRes.on("end", endOnce);
+			upRes.on("error", endOnce);
+		});
+		upstream.on("error", endOnce);
+		upstream.setTimeout(5e3, () => {
+			try {
+				upstream?.destroy();
+			} catch {}
+			endOnce();
+		});
+		upstream.end();
+	}
 	res.on("close", onClose);
+	attach(port);
 	return () => {
 		cancelled = true;
 		sseClients.delete(res);
 		try {
-			up.destroy();
+			upstream?.destroy();
 		} catch {}
 	};
 }
@@ -980,33 +2398,6 @@ async function readJsonBody$1(req, maxBytes = 8192) {
 	}
 	return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
 }
-/** Read the worker's { port, pid } from ego-cast.json, if any. */
-async function knownWorkerState() {
-	try {
-		const { readFile } = await import("node:fs/promises");
-		const state = JSON.parse(await readFile(castStatePath(), "utf8"));
-		return {
-			port: typeof state.port === "number" ? state.port : null,
-			pid: typeof state.pid === "number" ? state.pid : null
-		};
-	} catch {
-		return {
-			port: null,
-			pid: null
-		};
-	}
-}
-/** Is a process with this pid alive? (false for our own / empty / signals fail) */
-function isProcessAlive$1(pid) {
-	if (!pid || pid <= 0) return false;
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (err) {
-		const e = err;
-		return e && e.code === "EPERM";
-	}
-}
 /** Reason string every frame-relay route answers with while the relay is off. */
 const FRAME_RELAY_DISABLED = "frame relay disabled";
 /**
@@ -1026,83 +2417,6 @@ async function stopCastWorker() {
 	} catch {
 		return false;
 	}
-}
-function captureConfig(cfg, ffmpegManager) {
-	const ffmpegStatus = ffmpegManager?.status();
-	const unavailable = cfg.captureBackend === "ffmpeg" && !ffmpegStatus?.canSelectFfmpeg;
-	return {
-		captureBackend: unavailable ? "cdp" : cfg.captureBackend,
-		ffmpegFallbackReason: unavailable ? ffmpegStatus?.reason || "FFmpeg is unavailable" : "",
-		streamProfile: cfg.streamProfile,
-		cdpFps: cfg.cdpFps,
-		cdpQuality: cfg.cdpQuality,
-		cdpMaxWidth: cfg.cdpMaxWidth,
-		cdpBackstopIntervalMs: cfg.cdpBackstopIntervalMs,
-		ffmpegFps: cfg.ffmpegFps,
-		ffmpegMaxWidth: cfg.ffmpegMaxWidth,
-		ffmpegBitrateKbps: cfg.ffmpegBitrateKbps,
-		ffmpegEncoder: cfg.ffmpegEncoder,
-		ffmpegPath: cfg.ffmpegPath,
-		ffmpegResolvedPath: ffmpegStatus?.canSelectFfmpeg ? ffmpegStatus.path || "" : ""
-	};
-}
-/**
-* Ensure a single ego-cast worker is running (idempotent). Launches it via
-* ctx.subprocess. Re-spawns whenever the previous worker is found dead (its
-* pid no longer alive or its /api/health does not answer), so a crashed
-* worker is brought back without a host restart. Spawn is rate-limited to
-* avoid hot-looping while a headless container has no browser yet.
-*/
-function makeEnsureWorker(ctx, cfg, ffmpegManager) {
-	let lastAttempt = 0;
-	async function launchedWorkerPort() {
-		const state = await knownWorkerState();
-		if (state.pid === null || !isProcessAlive$1(state.pid)) return null;
-		return await proxyFrom(state.port, "/api/health") ? state.port : null;
-	}
-	return async function ensureWorker() {
-		const running = await launchedWorkerPort();
-		if (running !== null) return running;
-		const now = Date.now();
-		if (now - lastAttempt > 8e3) {
-			lastAttempt = now;
-			try {
-				await ffmpegManager?.check({
-					configuredPath: cfg.ffmpegPath,
-					requestedEncoder: cfg.ffmpegEncoder
-				}).catch(() => null);
-				const initCfg = JSON.stringify(captureConfig(cfg, ffmpegManager));
-				ctx.subprocess.spawn({
-					argv: [
-						process.execPath,
-						WORKER_BIN,
-						initCfg
-					],
-					cwd: process.cwd(),
-					env: process.versions.electron ? {
-						...process.env,
-						ELECTRON_RUN_AS_NODE: process.env.ELECTRON_RUN_AS_NODE ?? "1"
-					} : void 0,
-					stdio: {
-						stdin: { data: "" },
-						stdout: { maxBytes: 8192 },
-						stderr: { maxBytes: 4096 }
-					},
-					graceMs: 12e3
-				}).done.catch(() => null);
-				const deadline = Date.now() + 8e3;
-				while (Date.now() < deadline) {
-					const ready = await launchedWorkerPort();
-					if (ready !== null) return ready;
-					await new Promise((resolve) => setTimeout(resolve, 100));
-				}
-				return null;
-			} catch {
-				return null;
-			}
-		}
-		return null;
-	};
 }
 /**
 * Push the current cast config to a running worker via POST /api/config.
@@ -1141,7 +2455,7 @@ function initCastServer(ctx, cfg, bridge, ffmpegManager, openAgentWindow = async
 }), loginImport = async () => ({
 	ok: false,
 	error: "login import not supported by this host build"
-})) {
+}), getExecutorStatus = () => ({})) {
 	const ensureWorker = makeEnsureWorker(ctx, cfg, ffmpegManager);
 	const pushConfig = makePushConfig(ensureWorker, ffmpegManager);
 	const rawServer = ctx.get?.("webServer");
@@ -1223,12 +2537,7 @@ function initCastServer(ctx, cfg, bridge, ffmpegManager, openAgentWindow = async
 		handler: async (_req, resRaw) => {
 			const res = resRaw;
 			if (relayDisabled()) return refuseFrameRelay(res);
-			const port = await ensureWorker();
-			if (port === null) {
-				proxyWorkerStream(-1, res, "/api/stream");
-				return;
-			}
-			proxyWorkerStream(port, res, "/api/stream");
+			proxyWorkerStream(await ensureWorker() ?? -1, res, "/api/stream", ensureWorker);
 		}
 	});
 	const disposeInput = server.register({
@@ -1247,6 +2556,43 @@ function initCastServer(ctx, cfg, bridge, ffmpegManager, openAgentWindow = async
 			if (!result) return sendJson(res, 502, {
 				ok: false,
 				error: "input worker unavailable"
+			});
+			return sendJson(res, result.status, result.body);
+		}
+	});
+	const disposeWindowSize = server.register({
+		kind: "exact",
+		path: EGO_WINDOW_SIZE_ROUTE,
+		handler: async (reqRaw, resRaw) => {
+			const req = reqRaw;
+			const res = resRaw;
+			if (relayDisabled()) return refuseFrameRelay(res, { error: FRAME_RELAY_DISABLED });
+			const port = await ensureWorker();
+			if (port === null) return sendJson(res, 400, {
+				ok: false,
+				error: "no live agent browser"
+			});
+			const body = await readJsonBody$1(req).catch(() => ({}));
+			const width = Number(body.width);
+			const delta = Number(body.delta);
+			const height = Number(body.height);
+			const dy = Number(body.dy);
+			const aspect = Number(body.aspect);
+			if (!Number.isFinite(width) && !Number.isFinite(delta) && !Number.isFinite(height) && !Number.isFinite(dy) && !Number.isFinite(aspect)) return sendJson(res, 400, {
+				ok: false,
+				error: "width, delta, height, dy or aspect is required"
+			});
+			const result = await proxyPost(port, "/api/window-size", {
+				...Number.isFinite(width) ? { width } : {},
+				...Number.isFinite(delta) ? { delta } : {},
+				...Number.isFinite(height) && height > 0 ? { height } : {},
+				...Number.isFinite(dy) ? { dy } : {},
+				...Number.isFinite(aspect) && aspect > 0 ? { aspect } : {},
+				...typeof body.targetId === "string" && body.targetId ? { targetId: body.targetId } : {}
+			});
+			if (!result) return sendJson(res, 502, {
+				ok: false,
+				error: "window-size worker unavailable"
 			});
 			return sendJson(res, result.status, result.body);
 		}
@@ -1431,6 +2777,99 @@ function initCastServer(ctx, cfg, bridge, ffmpegManager, openAgentWindow = async
 			proxyWorkerVideo(port, req, res);
 		}
 	});
+	const disposeExecutor = server.register({
+		kind: "exact",
+		path: "/api/ego/executor",
+		handler: async (_req, resRaw) => {
+			const res = resRaw;
+			let status = {};
+			try {
+				status = getExecutorStatus();
+			} catch {}
+			return sendJson(res, 200, {
+				ok: true,
+				...status
+			});
+		}
+	});
+	const disposeLoginBridge = [
+		server.register({
+			kind: "exact",
+			path: "/api/ego/login-extension/health",
+			handler: async (_req, resRaw) => {
+				const res = resRaw;
+				try {
+					return sendJson(res, 200, await getLoginExtensionHealth());
+				} catch (err) {
+					return sendJson(res, 500, {
+						ok: false,
+						error: String(err?.message || err)
+					});
+				}
+			}
+		}),
+		server.register({
+			kind: "exact",
+			path: "/api/ego/login-extension/pair-code",
+			handler: async (_req, resRaw) => {
+				const res = resRaw;
+				try {
+					return sendJson(res, 200, await createLoginExtensionPairingCode());
+				} catch (err) {
+					return sendJson(res, 500, {
+						ok: false,
+						error: String(err?.message || err)
+					});
+				}
+			}
+		}),
+		server.register({
+			kind: "exact",
+			path: "/api/ego/login-extension/import",
+			handler: async (reqRaw, resRaw) => {
+				const req = reqRaw;
+				const res = resRaw;
+				try {
+					const body = await readJsonBody$1(req).catch(() => ({}));
+					const domains = Array.isArray(body.domains) ? body.domains.map(String).filter(Boolean) : [];
+					if (domains.length === 0) return sendJson(res, 400, {
+						ok: false,
+						error: "domains is required"
+					});
+					return sendJson(res, 200, {
+						ok: true,
+						jobId: (await startLoginExtensionJob({ domains })).jobId
+					});
+				} catch (err) {
+					return sendJson(res, 500, {
+						ok: false,
+						error: String(err?.message || err)
+					});
+				}
+			}
+		}),
+		server.register({
+			kind: "exact",
+			path: "/api/ego/login-extension/status",
+			handler: async (reqRaw, resRaw) => {
+				const req = reqRaw;
+				const res = resRaw;
+				try {
+					const id = new URL(req.url ?? "/", "http://127.0.0.1").searchParams.get("id") ?? "";
+					if (!id) return sendJson(res, 400, {
+						ok: false,
+						error: "id is required"
+					});
+					return sendJson(res, 200, await getLoginExtensionJob(id));
+				} catch (err) {
+					return sendJson(res, 500, {
+						ok: false,
+						error: String(err?.message || err)
+					});
+				}
+			}
+		})
+	];
 	ctx.effect?.(() => () => {
 		try {
 			disposeSpaces();
@@ -1440,6 +2879,18 @@ function initCastServer(ctx, cfg, bridge, ffmpegManager, openAgentWindow = async
 		} catch {}
 		try {
 			disposeInput();
+		} catch {}
+		try {
+			disposeWindowSize();
+		} catch {}
+		try {
+			disposeExecutor();
+		} catch {}
+		try {
+			disposeLoginBridge.forEach((dispose) => dispose());
+		} catch {}
+		try {
+			stopLoginExtensionBridge();
 		} catch {}
 		try {
 			disposeClose();
@@ -1480,8 +2931,9 @@ function initCastServer(ctx, cfg, bridge, ffmpegManager, openAgentWindow = async
 */
 const EGO_HELP_INDEX = {
 	overview: "ego-browser 结构化浏览器工具。导航/交互/观察/表单/网络/等待/键鼠皆有专项工具，另提供 ego_help(本索引)、ego_doctor(体检)、ego_cli/ego_script(自由脚本逃生舱)。分类见: tools / navigate / observe / input / keyboard-mouse / form / wait / network / login / script / doctor。用 `topic` 查询，或直接给工具名。",
-	tools: "工具清单: ego_status, ego_space_open, ego_space_close, ego_snapshot, ego_navigate, ego_click(+double), ego_fill, ego_js, ego_cdp, ego_screenshot(+selector), ego_page_info, ego_wait, ego_wait_for_selector, ego_wait_for_url, ego_wait_for_response, ego_key(+text/type), ego_hover, ego_read_element, ego_select, ego_drag, ego_scroll, ego_upload, ego_check, ego_dialog, ego_download, ego_http, ego_captcha, ego_auth_flush, ego_login_import, ego_help, ego_doctor, ego_cli, ego_script。",
-	navigate: "ego_navigate: 打开URL或切tab(同任务复用当前tab)。ego_wait_for_url: 等跳转(登录/分页)。",
+	tools: "工具清单: ego_status, ego_space_open, ego_space_close, ego_snapshot, ego_navigate, ego_tabs, ego_click(+double), ego_fill, ego_js, ego_cdp, ego_screenshot(+selector), ego_page_info, ego_wait, ego_wait_for_selector, ego_wait_for_url, ego_wait_for_response, ego_key(+text/type), ego_hover, ego_read_element, ego_select, ego_drag, ego_scroll, ego_upload, ego_check, ego_dialog, ego_download, ego_http, ego_captcha, ego_auth_flush, ego_login_import, ego_help, ego_doctor, ego_cli, ego_script。",
+	navigate: "ego_navigate: 打开URL或切tab(同任务复用当前tab)。ego_wait_for_url: 等跳转(登录/分页)。ego_tabs: 列出/切换/新建/关闭标签页(list/switch/open/close)。",
+	tabs: "ego_tabs: 标签页管理。action=list 列出所有标签(targetId/title/url/active); switch 用 targetId 切换; open 用 url 新建标签(默认 about:blank); close 用 targetId 关闭。targetId 来自 list/open/ego_space_open/ego_navigate 的返回。",
 	observe: "ego_snapshot: 整页语义树(带[ref]/loc供点击); ego_page_info: url/标题/视口/滚动/对话框/人机验证; ego_read_element: 读单元素文本/HTML/值/属性/可见性/计数; ego_screenshot(+selector): 整页或元素截图。",
 	input: "ego_click(selector/坐标, double双击); ego_fill(填框); ego_key(press组合键 或 text连续键入); ego_check(勾选/取消); ego_select(下拉); ego_upload(文件上传); ego_dialog(接受/取消JS对话框)。",
 	"keyboard-mouse": "ego_key: 键盘(press/text); ego_hover: 悬停; ego_drag: 拖拽(元素或坐标); ego_scroll: 滚轮/滚到元素; ego_click: 点击/双击。",
@@ -1490,8 +2942,8 @@ const EGO_HELP_INDEX = {
 	network: "ego_http: 发HTTP请求(默认浏览器上下文 fetch.browser, mode=server走Node fetch.server); ego_wait_for_response: 等并读接口响应。",
 	download: "ego_download: 等下载事件并落到指定路径(triggerSelector/triggerScript + 可选 savePath)。",
 	captcha: "ego_captcha: 检测页面人机验证(CAPTCHA)并返回{detected,kind}; 检测到请让用户去 ego 浏览器完成; ego_page_info 也附带 humanCheck。",
-	login: "ego_auth_flush: 把登录cookie落盘到ego profile; 观察窗登录引导条+『已登录,保存』按钮触发同一动作。ego_login_import: 从系统浏览器(Chrome/Edge/Brave)按域名导入登录cookie(source/domains/dryRun; 先dryRun看可导入项; ego浏览器须已在运行)。",
-	script: "ego_cli / ego_script: 原样运行任意 ego-browser nodejs heredoc脚本(page/browser/taskSpaces/site/fetch/cdp预载)。ego_script额外返回 duration/timedOut。",
+	login: "ego_auth_flush: 把登录cookie落盘到ego profile; 观察窗登录引导条+『已登录,保存』按钮触发同一动作。ego_login_import: 按域名导入系统浏览器登录cookie——现代 Chrome/Edge 用 source=extension：先在 Agent 浏览器面板点「连接 Chrome 登录态」，按 6 位配对码在扩展里配对一次，之后面板按钮/该工具即可自动导入（扩展后台轮询，30 秒内）；旧版或已关闭浏览器用 source=chrome|edge|brave 安全复制（Chrome/Edge 127+ 的 ABE 会读到 0 并明确报错，源 profile 不会被打开/写入）。先 dryRun 看可导入项；ego 浏览器须已在运行。",
+	script: "ego_cli / ego_script: 原样运行任意 ego-browser nodejs heredoc脚本(page/browser/taskSpaces/site/fetch/cdp预载)。ego_script额外返回 duration/timedOut。注意 page 是本 runtime 的页面门面、不是 Playwright API：可用 goto/reload/info/url/title/locator/getByRole/getByText/getByLabel/getByPlaceholder/getByAltText/getByTitle/getByTestId/waitForTimeout/waitForLoadState/waitForSelector/waitForFunction/waitForURL/waitForRequest/waitForResponse/waitForEvent/evaluate/screenshot/snapshot/snapshotRaw/elementCenter/drainEvents/screencast/keyboard/mouse；没有 fill/click/type/press——交互用 ego_fill/ego_click 或 page.locator(...)。page.goto() 不返回 Playwright Response，取状态码用 ego_wait_for_response 或 page.info()。",
 	doctor: "ego_doctor: 体检环境(浏览器候选、vendored runtime、状态目录、CDP端口、任务空间)。"
 };
 //#endregion
@@ -1563,9 +3015,12 @@ const encoder = z.union([
 	"h264_vaapi"
 ]);
 const prefs = {
+	tuiAutoOpenPanel: z.boolean().description("Open the TUI Agent Browser panel on the first ego_* call. Default off; activity still appears in the badge and status."),
 	isolateSpaces: z.boolean().description("Space isolation: false = persistent profile (keep logins across restarts); true = isolated sandbox."),
 	idleTimeoutMin: z.number().min(0).max(1440).step(1).description("Auto-stop the backing browser after N minutes without an ego_* call (0 = off). Relaunches on demand at the next call."),
 	disableFrameRelay: z.boolean().description("Disable the live frame relay (watch panel): no ego-cast worker, no screencast capture and no /api/ego stream routes. ego_* tools keep working."),
+	residentExecutor: z.boolean().description("Reuse one resident `ego-browser --serve` process across ego_* calls: the first call pays startup, later calls skip it (~16ms). Off = spawn per call. A dead resident falls back to a fresh spawn automatically."),
+	residentIdleMin: z.number().min(0).max(1440).step(1).description("Stop the resident process after N minutes without an ego_* call (0 = keep it until the plugin unmounts). The browser itself is unaffected."),
 	chromePath: z.string().description("Path to Chrome/Chromium. Empty = auto-detect."),
 	captureBackend: backend.description("Capture backend: auto, cdp, or ffmpeg."),
 	streamProfile: profile.description("Capture quality profile."),
@@ -1765,7 +3220,7 @@ function resolveConfig(config = {}) {
 		streamProfile: selectedProfile,
 		cdpFps: finiteIn(config.cdpFps, 5, 30) ? config.cdpFps : legacyFps,
 		cdpQuality: finiteIn(config.cdpQuality, 1, 100) ? config.cdpQuality : finiteIn(config.screencastQuality, 1, 100) ? config.screencastQuality : 55,
-		cdpMaxWidth: finiteIn(config.cdpMaxWidth, 320, 1920) ? config.cdpMaxWidth : finiteIn(config.screencastMaxWidth, 320, 1920) ? config.screencastMaxWidth : 960,
+		cdpMaxWidth: finiteIn(config.cdpMaxWidth, 320, 1920) ? config.cdpMaxWidth : finiteIn(config.screencastMaxWidth, 320, 1920) ? config.screencastMaxWidth : 1280,
 		cdpBackstopIntervalMs: finiteIn(config.cdpBackstopIntervalMs, 1e3, 1e4) ? config.cdpBackstopIntervalMs : finiteIn(config.backstopIntervalMs, 200, 1e4) ? Math.max(1e3, config.backstopIntervalMs) : 3e3,
 		ffmpegFps: finiteIn(config.ffmpegFps, 5, 30) ? config.ffmpegFps : profileDefaults.fps,
 		ffmpegMaxWidth: finiteIn(config.ffmpegMaxWidth, 320, 1920) ? config.ffmpegMaxWidth : profileDefaults.width,
@@ -1786,7 +3241,10 @@ function resolveConfig(config = {}) {
 		chromeArgs: typeof config.chromeArgs === "string" ? config.chromeArgs : "",
 		isolateSpaces: typeof config.isolateSpaces === "boolean" ? config.isolateSpaces : config.isolateSpaces === "true" || config.isolateSpaces === "1" || config.isolateSpaces === 1,
 		idleTimeoutMin: finiteIn(config.idleTimeoutMin, 0, 1440) ? config.idleTimeoutMin : 0,
-		disableFrameRelay: typeof config.disableFrameRelay === "boolean" ? config.disableFrameRelay : config.disableFrameRelay === "true" || config.disableFrameRelay === "1" || config.disableFrameRelay === 1
+		disableFrameRelay: typeof config.disableFrameRelay === "boolean" ? config.disableFrameRelay : config.disableFrameRelay === "true" || config.disableFrameRelay === "1" || config.disableFrameRelay === 1,
+		residentExecutor: typeof config.residentExecutor === "boolean" ? config.residentExecutor : config.residentExecutor === "true" || config.residentExecutor === "1" || config.residentExecutor === 1,
+		tuiAutoOpenPanel: typeof config.tuiAutoOpenPanel === "boolean" ? config.tuiAutoOpenPanel : config.tuiAutoOpenPanel === "true" || config.tuiAutoOpenPanel === "1" || config.tuiAutoOpenPanel === 1,
+		residentIdleMin: finiteIn(config.residentIdleMin, 0, 1440) ? config.residentIdleMin : 30
 	};
 }
 //#endregion
@@ -1996,6 +3454,8 @@ const ALLOWED_KEYS = /* @__PURE__ */ new Set([
 	"isolateSpaces",
 	"idleTimeoutMin",
 	"disableFrameRelay",
+	"residentExecutor",
+	"residentIdleMin",
 	"chromePath",
 	"captureBackend",
 	"streamProfile",
@@ -2202,6 +3662,216 @@ function envelopeError(code, message) {
 function isObject(value) {
 	return typeof value === "object" && value !== null;
 }
+//#endregion
+//#region src/resident.ts
+/**
+* Resident `ego-browser --serve` transport (issue #56).
+*
+* The one-shot path pays Node startup + harness import on EVERY tool call
+* (~300-400 ms measured). `--serve` accepts one JSON request per line
+* (`{"id","code"}`) and answers with one JSON line per request
+* (`{"id","ok","stdout","stderr"}`), paying that cost once.
+*
+* This class is only the transport: the plugin keeps the per-call spawn path as
+* the fallback and turns the resident on with an explicit setting, so a host
+* where the resident misbehaves degrades to exactly today's behaviour.
+*
+* Two failure rules matter:
+*
+*  - A request that was never written (process already dead) throws
+*    `ResidentNotRunningError`; the caller MAY retry it through the one-shot
+*    path, because nothing ran.
+*  - A request that was written and then failed/timeout is NOT retryable: the
+*    script may have half-executed, and replaying a click would double-fire it.
+*    The process is killed instead — a wedged resident is worse than none.
+*
+* The CLI restores globals around each request (see the serve loop), so
+* between-call state isolation is the runtime's job, not this class's.
+*/
+/** Thrown when a request was NOT written because the process is not running. */
+var ResidentNotRunningError = class extends Error {
+	constructor(message) {
+		super(message);
+		this.name = "ResidentNotRunningError";
+	}
+};
+const MAX_STDERR_BYTES = 512e3;
+var ResidentProcess = class {
+	opts;
+	pending = /* @__PURE__ */ new Map();
+	child = null;
+	stdoutBuffer = "";
+	stderrText = "";
+	nextId = 1;
+	idleTimer = null;
+	deadReason = null;
+	stopping = false;
+	constructor(opts) {
+		this.opts = opts;
+	}
+	get alive() {
+		return this.child !== null && this.deadReason === null;
+	}
+	/** PID of the live resident (null when stopped/never started). */
+	get pid() {
+		return this.child?.pid ?? null;
+	}
+	/** Spawn the process if it is not running. Idempotent. */
+	start() {
+		if (this.alive || this.stopping) return;
+		this.deadReason = null;
+		this.stdoutBuffer = "";
+		this.stderrText = "";
+		const [executable, ...args] = this.opts.argv;
+		if (executable === void 0) throw new Error("resident: empty argv");
+		const child = spawn(executable, args, {
+			cwd: this.opts.cwd,
+			env: this.opts.env,
+			stdio: "pipe",
+			windowsHide: true
+		});
+		this.child = child;
+		child.stdout.setEncoding("utf8");
+		child.stderr.setEncoding("utf8");
+		child.stdout.on("data", (chunk) => this.onStdout(chunk));
+		child.stderr.on("data", (chunk) => {
+			this.stderrText += chunk;
+			if (this.stderrText.length > MAX_STDERR_BYTES) this.stderrText = this.stderrText.slice(-512e3);
+		});
+		child.on("error", (error) => this.die(`resident process error: ${error.message}`));
+		child.on("exit", (code, signal) => this.die(`resident process exited (${code === null ? `signal ${String(signal)}` : `code ${code}`})`));
+	}
+	/**
+	* Send one script and await its frame.
+	*
+	* @throws ResidentNotRunningError when the request was not written (retryable).
+	* @throws Error on timeout/abort/process death (NOT retryable — the process is
+	*         killed so a half-executed script cannot keep running).
+	*/
+	async run(script, { signal, graceMs } = {}) {
+		this.start();
+		if (!this.alive || this.child === null) throw new ResidentNotRunningError(this.deadReason ?? "resident is not running");
+		const child = this.child;
+		const id = String(this.nextId++);
+		const timeoutMs = graceMs !== void 0 && graceMs > 0 ? graceMs : this.opts.graceMs;
+		return await new Promise((resolve, reject) => {
+			let settled = false;
+			const timer = setTimeout(() => {
+				this.die(`resident request timed out after ${timeoutMs}ms`);
+			}, timeoutMs);
+			const onAbort = () => {
+				this.die("ego-browser tool aborted");
+			};
+			const finish = (fn) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				if (signal !== void 0) signal.removeEventListener("abort", onAbort);
+				if (this.pending.get(id) === entry) this.pending.delete(id);
+				fn();
+			};
+			const entry = {
+				resolve: (frame) => finish(() => {
+					this.touchIdle();
+					resolve(frame);
+				}),
+				reject: (error) => finish(() => reject(error))
+			};
+			this.pending.set(id, entry);
+			if (signal !== void 0) {
+				if (signal.aborted) {
+					finish(() => reject(/* @__PURE__ */ new Error("ego-browser tool aborted")));
+					return;
+				}
+				signal.addEventListener("abort", onAbort, { once: true });
+			}
+			try {
+				child.stdin.write(`${JSON.stringify({
+					id,
+					code: script
+				})}\n`);
+			} catch (error) {
+				finish(() => reject(new ResidentNotRunningError(`could not write to the resident process: ${error?.message ?? String(error)}`)));
+			}
+		});
+	}
+	/** Gracefully end stdin, then force-kill if it ignores that. */
+	stop() {
+		this.stopping = true;
+		this.clearIdle();
+		const child = this.child;
+		this.child = null;
+		this.deadReason = "resident stopped";
+		const pending = [...this.pending.values()];
+		this.pending.clear();
+		for (const entry of pending) entry.reject(/* @__PURE__ */ new Error("resident stopped"));
+		if (child === null) return;
+		try {
+			child.stdin.end();
+		} catch {}
+		setTimeout(() => {
+			try {
+				child.kill();
+			} catch {}
+		}, 1500).unref?.();
+	}
+	onStdout(chunk) {
+		this.stdoutBuffer += chunk;
+		for (;;) {
+			const newline = this.stdoutBuffer.indexOf("\n");
+			if (newline < 0) return;
+			const line = this.stdoutBuffer.slice(0, newline);
+			this.stdoutBuffer = this.stdoutBuffer.slice(newline + 1);
+			if (line.trim() === "") continue;
+			let frame;
+			try {
+				frame = JSON.parse(line);
+			} catch {
+				continue;
+			}
+			if (frame === null || typeof frame !== "object" || typeof frame.id !== "string") continue;
+			const entry = this.pending.get(frame.id);
+			if (entry === void 0) continue;
+			this.pending.delete(frame.id);
+			entry.resolve({
+				id: frame.id,
+				ok: frame.ok === true,
+				stdout: typeof frame.stdout === "string" ? frame.stdout : "",
+				stderr: typeof frame.stderr === "string" ? frame.stderr : "",
+				...typeof frame.error === "string" ? { error: frame.error } : {}
+			});
+		}
+	}
+	die(reason) {
+		if (this.deadReason !== null) return;
+		this.deadReason = reason;
+		this.clearIdle();
+		const child = this.child;
+		this.child = null;
+		try {
+			child?.kill();
+		} catch {}
+		const pending = [...this.pending.values()];
+		this.pending.clear();
+		for (const entry of pending) entry.reject(/* @__PURE__ */ new Error(`${reason}${this.stderrText.trim() === "" ? "" : `: ${this.stderrText.trim().slice(-1e3)}`}`));
+		if (!this.stopping) this.opts.onExit?.(reason);
+	}
+	touchIdle() {
+		this.clearIdle();
+		if (this.opts.idleMs <= 0 || this.pending.size > 0 || !this.alive) return;
+		this.idleTimer = setTimeout(() => {
+			this.idleTimer = null;
+			if (this.pending.size === 0) this.stop();
+		}, this.opts.idleMs);
+		this.idleTimer.unref?.();
+	}
+	clearIdle() {
+		if (this.idleTimer !== null) {
+			clearTimeout(this.idleTimer);
+			this.idleTimer = null;
+		}
+	}
+};
 //#endregion
 //#region src/ffmpeg-probe.ts
 function runFfmpegProbe(path, argv, { spawn: spawn$2 = spawn, timeoutMs = 3e3 } = {}) {
@@ -2947,6 +4617,7 @@ function withEgoLock(fn) {
 */
 const BUNDLED_WRAPPER = fileURLToPath(new URL("../bin/ego-chrome-wrapper.sh", import.meta.url));
 const IS_WIN = process.platform === "win32";
+const IS_DARWIN = process.platform === "darwin";
 const AUTO_ADAPT_OFF = /^(0|false|no)$/i.test(process.env.EGO_BROWSER_AUTO_ADAPT ?? "");
 const COMMON_CHROME_BINS = [
 	"google-chrome-stable",
@@ -2977,6 +4648,27 @@ function windowsChromeCandidates() {
 		b(local) + "\\BraveSoftware\\Brave-Browser\\Application\\brave.exe"
 	].filter(Boolean);
 }
+/**
+* macOS registry-free probe of the usual `.app` bundles (no subprocess).
+*
+* Chrome on macOS is never on PATH: the launcher lives inside the bundle at
+* `<App>.app/Contents/MacOS/<binary>`. Both the system-wide and per-user
+* `/Applications` locations are probed, Chrome first so that a machine with
+* several browsers picks the same one the README documents.
+*/
+function darwinChromeCandidates() {
+	const roots = ["/Applications"];
+	if (process.env.HOME) roots.push(`${process.env.HOME}/Applications`);
+	const bundles = [
+		"Google Chrome.app/Contents/MacOS/Google Chrome",
+		"Chromium.app/Contents/MacOS/Chromium",
+		"Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+		"Brave Browser.app/Contents/MacOS/Brave Browser"
+	];
+	const out = [];
+	for (const root of roots) for (const bundle of bundles) out.push(`${root}/${bundle}`);
+	return out;
+}
 /** Find a usable Chrome binary by scanning PATH + common fixed locations. */
 function findChromeBinary() {
 	if (process.env.EGO_LINUX_CHROME) return process.env.EGO_LINUX_CHROME;
@@ -2992,6 +4684,12 @@ function findChromeBinary() {
 			"brave"
 		]) for (const ext of exts) try {
 			const p = `${dir}\\${name}${ext}`;
+			if (existsSync(p)) return p;
+		} catch {}
+		return;
+	}
+	if (IS_DARWIN) {
+		for (const p of darwinChromeCandidates()) try {
 			if (existsSync(p)) return p;
 		} catch {}
 		return;
@@ -3012,7 +4710,7 @@ function isPosixRoot(platform = process.platform) {
 	const uid = process.getuid?.();
 	return typeof uid === "number" && uid === 0 && platform !== "win32";
 }
-/** No display server → headless is required (Linux/macOS headless servers). */
+/** No display server → headless is required (Linux headless servers). */
 function isHeadlessDetected(platform = process.platform, env = process.env) {
 	if (platform === "win32" || platform === "darwin") return false;
 	return env.DISPLAY === void 0 || env.DISPLAY === "";
@@ -3031,7 +4729,7 @@ function resolveEgoEnv(cfg, { platform = process.platform, baseEnv = process.env
 	const configChrome = cfg?.chromePath;
 	if (env.EGO_LINUX_CHROME === void 0 && configChrome) env.EGO_LINUX_CHROME = configChrome;
 	if (env.EGO_LINUX_CHROME === void 0 && isPosixRoot(platform) && chrome) env.EGO_LINUX_CHROME = BUNDLED_WRAPPER;
-	if (env.EGO_LINUX_CHROME === void 0 && platform === "win32" && chrome) env.EGO_LINUX_CHROME = chrome;
+	if (env.EGO_LINUX_CHROME === void 0 && (platform === "win32" || platform === "darwin") && chrome) env.EGO_LINUX_CHROME = chrome;
 	if (env.EGO_LINUX_HEADLESS === void 0 && isHeadlessDetected(platform, env)) env.EGO_LINUX_HEADLESS = "1";
 	const configChromeArgs = cfg?.chromeArgs;
 	if (env.EGO_LINUX_EXTRA_ARGS === void 0 && typeof configChromeArgs === "string" && configChromeArgs.trim() !== "") env.EGO_LINUX_EXTRA_ARGS = configChromeArgs;
@@ -3064,6 +4762,7 @@ const COLD_START_SIGNS = [
 	/target.*(closed|not found|detached|crashed)/i,
 	/ECONNREFUSED/i
 ];
+/** @internal exported for tests (also the contract the resident error relies on) */
 function isColdStartError(message) {
 	return COLD_START_SIGNS.some((re) => re.test(message));
 }
@@ -3145,6 +4844,7 @@ async function runWithStaleSpaceRetry(ctx, cfg, exec, buildScript, graceOverride
 		cfg.spaceTracker.resetToName();
 		result = await withWarmupRetry(() => runEgoScript(ctx.subprocess, buildScript(), exec, cfg, graceOverrideMs));
 	}
+	if (!result.ok && isColdStartError(result.error ?? "")) cfg.onColdStartFailure?.();
 	return result;
 }
 /** Find the last line carrying the sentinel and JSON-parse its payload. */
@@ -3161,7 +4861,186 @@ function parseSentinel(stdout) {
 		}
 	}
 }
+/**
+* Parse the result of one script run: the sentinel payload when present, else
+* the last parseable JSON line as a rescue path (#71: a script that succeeded
+* but printed plain JSON used to be reported as a hard failure). The sentinel
+* stays the primary contract; `fallback` marks the rescue so callers can say so.
+* Exported for tests.
+*/
+function parseSentinelOrLastJson(stdout) {
+	const sentinel = parseSentinel(stdout);
+	if (sentinel !== void 0) return {
+		value: sentinel,
+		fallback: false
+	};
+	const lines = stdout.split("\n");
+	for (let i = lines.length - 1; i >= 0; i--) {
+		const text = lines[i].trim();
+		if (text === "" || !/^[[{]/.test(text)) continue;
+		try {
+			return {
+				value: JSON.parse(text),
+				fallback: true
+			};
+		} catch {}
+	}
+}
+let residentTransport = null;
+let residentTransportKey = "";
+/**
+* While a resident's CDP channel is dead (browser stopped, relaunch still
+* settling), this timestamp parks the resident and lets the one-shot path do
+* the call — it carries the launch retries. Without it every retry would spawn
+* another doomed resident before the browser is back.
+*/
+let residentCooldownUntil = 0;
+let residentConsecutiveFailures = 0;
+let residentStartedAt = 0;
+let residentLastRebuildReason = "not started";
+let residentParkReason = null;
+/** @internal exported for tests: the supervision state machine. */
+function superviseResidentFailure(failures, error) {
+	const next = failures + 1;
+	return {
+		failures: next,
+		parkReason: next >= 3 ? `resident failed ${next} times in a row; last error: ${error}` : null
+	};
+}
+/** @internal exported for tests (also used by /api/ego/executor + ego_status). */
+function residentDiagnostics(cfg) {
+	const running = residentTransport !== null && residentTransport.alive;
+	const active = cfg.residentExecutor === true && residentParkReason === null && Date.now() >= residentCooldownUntil;
+	return {
+		enabled: cfg.residentExecutor === true,
+		mode: !active ? "one-shot" : running ? "resident" : "starting",
+		running,
+		pid: running ? residentTransport?.pid ?? null : null,
+		ageMs: running && residentStartedAt > 0 ? Date.now() - residentStartedAt : null,
+		consecutiveFailures: residentConsecutiveFailures,
+		lastRebuildReason: residentLastRebuildReason,
+		parked: residentParkReason !== null,
+		parkReason: residentParkReason
+	};
+}
+/** @internal exported for tests */
+function resetResidentTransportForTests() {
+	const transport = residentTransport;
+	residentTransport = null;
+	residentTransportKey = "";
+	residentCooldownUntil = 0;
+	residentConsecutiveFailures = 0;
+	residentStartedAt = 0;
+	residentLastRebuildReason = "not started";
+	residentParkReason = null;
+	transport?.stop();
+}
+function stopResidentTransport() {
+	const transport = residentTransport;
+	residentTransport = null;
+	residentTransportKey = "";
+	transport?.stop();
+}
+/**
+* Return the live resident for this configuration, creating it when needed.
+* @internal exported for tests
+*/
+function ensureResidentTransport(cfg) {
+	const extraCliArgs = filterArgs(cfg.egoCliArgs ?? "", EGO_CLI_BLOCKED);
+	const key = JSON.stringify([cfg.egoBin, extraCliArgs]);
+	if (residentTransport !== null && residentTransportKey === key && residentTransport.alive) return residentTransport;
+	const rebuilding = residentTransport !== null;
+	stopResidentTransport();
+	residentTransportKey = key;
+	residentTransport = new ResidentProcess({
+		argv: [
+			process.execPath,
+			cfg.egoBin,
+			"nodejs",
+			"--serve",
+			...extraCliArgs
+		],
+		env: resolveEgoEnv(cfg),
+		cwd: process.cwd(),
+		graceMs: cfg.graceMs,
+		idleMs: cfg.residentIdleMin > 0 ? cfg.residentIdleMin * 6e4 : 0,
+		onExit: () => {}
+	});
+	residentTransport.start();
+	residentStartedAt = Date.now();
+	residentLastRebuildReason = rebuilding ? "rebuilt: configuration changed" : "created";
+	return residentTransport;
+}
+/** Map a resident frame onto the shape the one-shot spawn path returns. */
+function residentFrameToResult(frame) {
+	const stdout = frame.stdout;
+	const stderr = frame.stderr;
+	if (!frame.ok) return {
+		ok: false,
+		error: `ego-browser script failed: ${frame.error ?? "unknown failure"}${describeStderr(stderr)}`,
+		stdout,
+		stderr
+	};
+	const parsed = parseSentinelOrLastJson(stdout);
+	if (parsed === void 0) return {
+		ok: false,
+		error: `ego-browser finished but no ${SENTINEL} JSON payload was found on stdout${describeStderr(stderr)}`,
+		stdout,
+		stderr
+	};
+	return {
+		ok: true,
+		value: parsed.fallback ? {
+			...parsed.value,
+			fallback: true
+		} : parsed.value,
+		stdout,
+		stderr
+	};
+}
 async function runEgoScript(subprocess, script, exec, cfg, graceOverrideMs) {
+	if (cfg.residentExecutor && Date.now() >= residentCooldownUntil) {
+		let transport = null;
+		try {
+			transport = ensureResidentTransport(cfg);
+		} catch {
+			transport = null;
+		}
+		if (transport !== null) try {
+			const result = residentFrameToResult(await transport.run(script, {
+				...exec.signal !== void 0 ? { signal: exec.signal } : {},
+				...Number.isFinite(graceOverrideMs) && graceOverrideMs > 0 ? { graceMs: graceOverrideMs } : {}
+			}));
+			if (result.ok) {
+				residentConsecutiveFailures = 0;
+				residentParkReason = null;
+				return result;
+			}
+			if (!isColdStartError(result.error ?? "")) return result;
+			const supervision = superviseResidentFailure(residentConsecutiveFailures, result.error ?? "cold start");
+			residentConsecutiveFailures = supervision.failures;
+			residentLastRebuildReason = `cold-start failure: ${result.error ?? "unknown"}`;
+			if (supervision.parkReason !== null) {
+				residentParkReason = supervision.parkReason;
+				residentCooldownUntil = Number.MAX_SAFE_INTEGER;
+			} else residentCooldownUntil = Date.now() + 1e4;
+			stopResidentTransport();
+		} catch (err) {
+			if (!(err instanceof ResidentNotRunningError)) return {
+				ok: false,
+				error: err instanceof Error ? err.message : String(err),
+				stdout: "",
+				stderr: ""
+			};
+		}
+	} else if (!cfg.residentExecutor) {
+		if (residentTransport !== null) stopResidentTransport();
+		if (residentParkReason !== null || residentConsecutiveFailures !== 0) {
+			residentConsecutiveFailures = 0;
+			residentParkReason = null;
+			residentLastRebuildReason = "disabled by setting";
+		}
+	}
 	let handle;
 	try {
 		const extraCliArgs = filterArgs(cfg.egoCliArgs ?? "", EGO_CLI_BLOCKED);
@@ -3221,8 +5100,8 @@ async function runEgoScript(subprocess, script, exec, cfg, graceOverrideMs) {
 		stdout,
 		stderr
 	};
-	const value = parseSentinel(stdout);
-	if (value === void 0) return {
+	const parsed = parseSentinelOrLastJson(stdout);
+	if (parsed === void 0) return {
 		ok: false,
 		error: `ego-browser finished but no ${SENTINEL} JSON payload was found on stdout${describeStderr(stderr)}`,
 		stdout,
@@ -3230,7 +5109,10 @@ async function runEgoScript(subprocess, script, exec, cfg, graceOverrideMs) {
 	};
 	return {
 		ok: true,
-		value,
+		value: parsed.fallback ? {
+			...parsed.value,
+			fallback: true
+		} : parsed.value,
 		stdout,
 		stderr
 	};
@@ -3274,6 +5156,9 @@ function callingSessionId(exec) {
 	const id = (exec?.agent)?.session?.id;
 	return typeof id === "string" && id !== "" ? id : void 0;
 }
+function observeEgoTool(cfg, name, args, run) {
+	return cfg.observeTool ? cfg.observeTool(name, args, run) : Promise.resolve().then(run);
+}
 function defineEgoTool(ctx, cfg, opts) {
 	return defineTool({
 		name: opts.name,
@@ -3284,16 +5169,16 @@ function defineEgoTool(ctx, cfg, opts) {
 			render: renderText
 		},
 		timeoutMs: TOOL_TIMEOUT_MS,
-		execute: async (args, exec) => withEgoLock(async () => {
+		execute: async (args, exec) => withEgoLock(() => observeEgoTool(cfg, opts.name, args, async () => {
 			markEgoToolCall(callingSessionId(exec));
 			const result = await runWithStaleSpaceRetry(ctx, cfg, exec, () => opts.buildScript(args));
 			if (!result.ok) throw new Error(result.error);
 			if (typeof opts.afterExecute === "function") opts.afterExecute(args, result.value);
 			return result.value;
-		}),
-		presentCall: () => ({
+		})),
+		presentCall: (args) => ({
 			card: "generic",
-			title: opts.name,
+			title: toolCallTitle(opts.name, args),
 			kind: "other",
 			rawInput: null
 		})
@@ -3321,7 +5206,10 @@ function apply(ctx, config = {}) {
 		"screencastMaxWidth",
 		"backstopIntervalMs",
 		"idleTimeoutMin",
-		"disableFrameRelay"
+		"disableFrameRelay",
+		"tuiAutoOpenPanel",
+		"residentExecutor",
+		"residentIdleMin"
 	].filter((key) => config[key] !== void 0).map((key) => [key, config[key]])), () => {
 		let live;
 		try {
@@ -3400,9 +5288,60 @@ function apply(ctx, config = {}) {
 		},
 		get disableFrameRelay() {
 			return resolveConfig(bridge.source()).disableFrameRelay;
+		},
+		get tuiAutoOpenPanel() {
+			return resolveConfig(bridge.source()).tuiAutoOpenPanel;
+		},
+		get residentExecutor() {
+			return resolveConfig(bridge.source()).residentExecutor;
+		},
+		get residentIdleMin() {
+			return resolveConfig(bridge.source()).residentIdleMin;
+		}
+	};
+	const browserState = new BrowserStateStore();
+	const tui = installTui(ctx, browserState);
+	installBrowserPanel(ctx, cfg, browserState, tui, {
+		createTransport: () => ({
+			readBrowserState,
+			readTaskSpaceGroups,
+			ensureWorker: makeEnsureWorker(ctx, cfg, ffmpegManager),
+			get: proxyFrom,
+			post: proxyPost
+		}),
+		openAgentWindow: () => openAgentWindow(ctx, cfg)
+	});
+	cfg.onColdStartFailure = () => tui.toast("Agent Browser could not start after retrying. Run ego_doctor for details.", "error");
+	cfg.observeTool = async (name, args, run) => {
+		const token = browserState.startTool(name, safeLocatorSummary(name, args));
+		try {
+			const value = await run();
+			const result = value;
+			const error = typeof result?.error === "string" ? result.error : void 0;
+			browserState.finishTool(token, {
+				ok: result?.ok !== false,
+				error
+			});
+			return value;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			browserState.finishTool(token, {
+				ok: false,
+				error: message
+			});
+			throw error;
 		}
 	};
 	const reg = (tool) => {
+		if ([
+			"ego_cli",
+			"ego_script",
+			"ego_help",
+			"ego_doctor"
+		].includes(tool.name)) {
+			const execute = tool.execute;
+			tool.execute = (args, exec) => observeEgoTool(cfg, tool.name, args, () => execute(args, exec));
+		}
 		const dispose = ctx.tools.register(tool);
 		ctx.effect?.(() => dispose);
 	};
@@ -3413,7 +5352,7 @@ function apply(ctx, config = {}) {
 	registerHelpAndDoctor(ctx, cfg, reg);
 	ctx.inject?.(["webServer"], (wctx) => {
 		try {
-			initCastServer(wctx, cfg, bridge, ffmpegManager, () => openAgentWindow(ctx, cfg), (opts) => importLoginCookies(opts, { subprocess: ctx.subprocess }));
+			initCastServer(wctx, cfg, bridge, ffmpegManager, () => openAgentWindow(ctx, cfg), (opts) => importLoginCookies(opts, { subprocess: ctx.subprocess }), () => residentDiagnostics(cfg));
 		} catch (err) {
 			ctx.logger?.warn?.(`ego-browser: cast server init failed: ${err?.message ?? err}`);
 		}
@@ -3437,8 +5376,16 @@ function apply(ctx, config = {}) {
 					const home = e.HOME || e.USERPROFILE || (isWin ? e.LOCALAPPDATA || "" : homedir());
 					const stateDir = e.EGO_LINUX_STATE_DIR || (isWin ? (e.LOCALAPPDATA || `${home}\\AppData\\Local`) + "\\ego-lite-linux" : `${e.XDG_STATE_HOME || `${home}/.local/state`}/ego-lite-linux`);
 					const { readFile } = await import("node:fs/promises");
+					let reapedPid;
 					try {
-						await readFile(`${stateDir}/browser.json`, "utf8");
+						const stateText = await readFile(`${stateDir}/browser.json`, "utf8");
+						if (tui.hasToast()) try {
+							const pid = JSON.parse(stateText).pid;
+							if (Number.isInteger(pid) && pid > 0) {
+								process.kill(pid, 0);
+								reapedPid = pid;
+							}
+						} catch {}
 					} catch {
 						return;
 					}
@@ -3458,12 +5405,20 @@ function apply(ctx, config = {}) {
 							stderr: { maxBytes: 1024 }
 						},
 						graceMs: 8e3
-					}).done.catch(() => null);
+					}).done.then((outcome) => {
+						if (outcome.exitCode !== 0 || reapedPid === void 0 || !tui.hasToast()) return;
+						try {
+							process.kill(reapedPid, 0);
+						} catch (error) {
+							if (error.code === "ESRCH") tui.toast("Agent Browser stopped after the idle timeout.", "success");
+						}
+					}).catch(() => null);
 				} catch {}
 			})();
 		}, 6e4);
 		return () => clearInterval(timer);
 	}, "ego-browser: idle reaper");
+	ctx.effect?.(() => () => stopResidentTransport(), "ego-browser: resident executor");
 	ctx.effect?.(() => {
 		try {
 			ctx.subprocess.spawn({
@@ -3505,13 +5460,17 @@ function registerEgoStatus(ctx, cfg, reg) {
 						required: true
 					},
 					path: { type: "string" },
-					exitCode: { type: "integer" }
+					exitCode: { type: "integer" },
+					resident: {
+						type: "object",
+						additionalProperties: true
+					}
 				}
 			},
 			render: renderText
 		},
 		timeoutMs: 25e3,
-		execute: async () => withEgoLock(async () => {
+		execute: async (args) => withEgoLock(() => observeEgoTool(cfg, "ego_status", args, async () => {
 			try {
 				const handle = ctx.subprocess.spawn({
 					argv: [
@@ -3534,7 +5493,8 @@ function registerEgoStatus(ctx, cfg, reg) {
 					ok: true,
 					available: outcome.exitCode === 0 && out !== "",
 					path: cfg.egoBin,
-					exitCode: outcome.exitCode
+					exitCode: outcome.exitCode,
+					resident: residentDiagnostics(cfg)
 				};
 			} catch (err) {
 				return {
@@ -3545,10 +5505,10 @@ function registerEgoStatus(ctx, cfg, reg) {
 					error: describeSpawnFailure(err)
 				};
 			}
-		}),
-		presentCall: () => ({
+		})),
+		presentCall: (args) => ({
 			card: "generic",
-			title: "ego_status",
+			title: toolCallTitle("ego_status", args),
 			kind: "other",
 			rawInput: null
 		})
@@ -3577,7 +5537,7 @@ function registerAuthFlush(ctx, cfg, reg) {
 			render: renderText
 		},
 		timeoutMs: 1e4,
-		execute: async () => withEgoLock(async () => {
+		execute: async (args) => withEgoLock(() => observeEgoTool(cfg, "ego_auth_flush", args, async () => {
 			try {
 				const { readFile } = await import("node:fs/promises");
 				const e = process.env;
@@ -3613,24 +5573,77 @@ function registerAuthFlush(ctx, cfg, reg) {
 					error: String(err?.message || err)
 				};
 			}
-		}),
-		presentCall: () => ({
+		})),
+		presentCall: (args) => ({
 			card: "generic",
-			title: "ego_auth_flush",
+			title: toolCallTitle("ego_auth_flush", args),
 			kind: "other",
 			rawInput: null
 		})
 	}));
 }
 /** `ego_login_import` — copy login cookies from the system browser (issue #46). */
+/**
+* #69 policy: `ego_login_import` is unsafe on Windows because the import boots
+* the REAL profile through a junction alias and hard-kills the instance. Chrome
+* App-Bound Encryption (127+) is what makes the data-loss path possible (and
+* the cookie read fail), so the guard covers every ABE-capable build, not only
+* the 155 build where the damage was first observed. Linux/macOS use a different
+* profile-handoff path and stay enabled. The env flag remains a manual override.
+*
+* Exported for tests.
+*/
+function loginImportPolicy({ platform, chromeMajor, force }) {
+	if (force) return { allowed: true };
+	if (platform !== "win32") return { allowed: true };
+	if (chromeMajor === null) return {
+		allowed: false,
+		reason: "could not determine the installed Chrome version on Windows; refusing to risk the source profile (set EGO_LINUX_LOGIN_IMPORT_FORCE=1 to override)"
+	};
+	if (chromeMajor >= 127) return {
+		allowed: false,
+		reason: `Chrome ${chromeMajor} on Windows uses App-Bound Encryption (127+), which makes the current import path both unable to read cookies and potentially destructive to the source profile (#69). Set EGO_LINUX_LOGIN_IMPORT_FORCE=1 to override.`
+	};
+	return { allowed: true };
+}
+/** Is the manual override set? */
+function loginImportForced(env = process.env) {
+	return /^(1|true|yes|on)$/i.test(env.EGO_LINUX_LOGIN_IMPORT_FORCE ?? "");
+}
+/**
+* Best-effort major version of the Chrome-family binary the import would use.
+*
+* Windows: Chrome keeps one `<major>.<minor>.<build>.<patch>` directory under
+* the `Application` directory next to chrome.exe — cheap and reliable. Elsewhere
+* ask the binary itself (`--version`), which is what the platform expects. Any
+* failure returns null; the policy treats null conservatively on Windows.
+* Exported for tests.
+*/
+function detectChromeMajorVersion(binPath) {
+	if (!binPath) return null;
+	try {
+		if (process.platform === "win32") {
+			const versions = readdirSync(dirname(binPath)).filter((entry) => /^\d+\.\d+\.\d+\.\d+$/.test(entry)).map((entry) => Number(entry.split(".")[0])).filter((major) => Number.isInteger(major) && major > 0);
+			return versions.length === 0 ? null : Math.max(...versions);
+		}
+		const out = execFileSync(binPath, ["--version"], {
+			encoding: "utf8",
+			timeout: 5e3
+		});
+		const match = String(out).match(/(\d+)\.\d+\.\d+/);
+		return match ? Number(match[1]) : null;
+	} catch {
+		return null;
+	}
+}
 function registerLoginImport(ctx, cfg, reg) {
 	reg(defineTool({
 		name: "ego_login_import",
-		description: "Import login cookies from the system browser (Chrome/Edge/Brave) into the agent browser, so sites open already logged in. Works via a throwaway headless instance of the REAL system browser (CDP passthrough — no offline decryption; survives Chrome App-Bound Encryption). Run with dryRun=true first to see what is importable, then import with an explicit domains list (e.g. [\"bilibili.com\"]). The agent browser must be running (call ego_status first). Imported logins persist in the on-disk profile across restarts. Cookie values are never shown — only domain names and counts.",
+		description: "Import login cookies from the system browser into the agent browser, so sites open already logged in, with two SAFE routes (#69): (1) source=\"extension\" — load the companion extension/ folder once in Chrome/Edge, keep the browser open, run this with explicit domains and click Export in the extension popup; cookies are read through the browser's own cookies API and POSTed to a loopback receiver (token file: <stateDir>/login-extension-token). This works on modern Chrome/Edge (including Windows 127+ ABE). (2) source=\"chrome\"|\"edge\"|\"brave\"|\"auto\" — the source browser must be closed; the tool copies only Local State + the Cookies DB to a throwaway profile and reads it headless. On Chrome/Edge 127+ (App-Bound Encryption) that copy reads 0 cookies and the tool reports it explicitly; the real profile is never booted or modified. dryRun=true reports what would be imported. The agent browser must be running (call ego_status first). Imported logins persist in the on-disk profile. Cookie values are never shown — only domain names and counts.",
 		parameters: {
 			source: {
 				type: "string",
-				description: "chrome | edge | brave | auto (default: auto = first detected browser)."
+				description: "extension | chrome | edge | brave | auto (default: auto = first detected browser). Use \"extension\" for modern Chrome/Edge without closing it."
 			},
 			domains: {
 				type: "json",
@@ -3666,14 +5679,14 @@ function registerLoginImport(ctx, cfg, reg) {
 					written: { type: "integer" },
 					domains: { type: "json" },
 					closedSource: { type: "boolean" },
-					restoredFromBackup: { type: "boolean" },
+					disabled: { type: "boolean" },
 					error: { type: "string" }
 				}
 			},
 			render: renderText
 		},
-		timeoutMs: 6e4,
-		execute: async (args) => withEgoLock(async () => {
+		timeoutMs: 18e4,
+		execute: async (args) => withEgoLock(() => observeEgoTool(cfg, "ego_login_import", args, async () => {
 			try {
 				const domains = Array.isArray(args.domains) ? args.domains.map(String) : void 0;
 				const source = typeof args.source === "string" && args.source !== "" ? args.source : "auto";
@@ -3681,10 +5694,27 @@ function registerLoginImport(ctx, cfg, reg) {
 					"chrome",
 					"edge",
 					"brave",
-					"auto"
+					"auto",
+					"extension"
 				].includes(source)) return {
 					ok: false,
-					error: `invalid source "${source}" — expected chrome|edge|brave|auto`
+					error: `invalid source "${source}" — expected chrome|edge|brave|auto|extension`
+				};
+				if (source === "extension") return await importLoginCookiesFromExtension({
+					domains,
+					dryRun: args.dryRun === true,
+					timeoutMs: 12e4
+				});
+				const guardBinary = cfg.chromePath || findChromeBinary();
+				const policy = loginImportPolicy({
+					platform: process.platform,
+					chromeMajor: detectChromeMajorVersion(guardBinary),
+					force: loginImportForced()
+				});
+				if (!policy.allowed) return {
+					ok: false,
+					disabled: true,
+					error: `ego_login_import is disabled here: ${policy.reason}`
 				};
 				return await importLoginCookies({
 					source,
@@ -3699,10 +5729,10 @@ function registerLoginImport(ctx, cfg, reg) {
 					error: String(err?.message || err)
 				};
 			}
-		}),
-		presentCall: () => ({
+		})),
+		presentCall: (args) => ({
 			card: "generic",
-			title: "ego_login_import",
+			title: toolCallTitle("ego_login_import", args),
 			kind: "other",
 			rawInput: null
 		})
@@ -3918,6 +5948,43 @@ function registerActionTools(ctx, cfg, reg) {
 		buildScript: (args) => `${useSpace(str(args.space, cfg.defaultSpace))}${ensureRealTab()}const pginfo = await page.info()\nlet __hc = null\ntry { __hc = await page.evaluate(${j(HUMAN_CHECK_PROBE)}).catch(() => null); } catch { __hc = null }\nconsole.log('${SENTINEL}' + JSON.stringify({ ok: true, page: pginfo, humanCheck: __hc }))\n`
 	}));
 	reg(t({
+		name: "ego_tabs",
+		description: "List, switch, open, or close agent-browser tabs. Use it to keep tab hygiene: list the open pages, switch to one, open a new tab for a URL, or close scratch tabs. Tab ids are stable target ids (also returned by ego_space_open / ego_navigate).",
+		parameters: {
+			action: {
+				type: "string",
+				description: "'list' (default) | 'switch' | 'open' | 'close'."
+			},
+			targetId: {
+				type: "string",
+				description: "Tab target id for action=switch / action=close."
+			},
+			url: {
+				type: "string",
+				description: "URL for action=open (default: 'about:blank')."
+			},
+			space: spaceParam
+		},
+		buildScript: (args) => {
+			const action = str(args.action, "list");
+			const targetId = str(args.targetId, "");
+			const url = str(args.url, "");
+			const space = useSpace(str(args.space, cfg.defaultSpace));
+			const done = (extra) => `const __tabs = await browser.listTabs()\nconsole.log('${SENTINEL}' + JSON.stringify({ ok: true${extra}, tabs: __tabs }))\n`;
+			if (action === "switch") {
+				if (!targetId) return `${space}console.log('${SENTINEL}' + JSON.stringify({ ok: false, error: 'targetId is required for action=switch' }))\n`;
+				return `${space}await browser.switchTab(${j(targetId)})\n${done(`, switched: ${j(targetId)}`)}`;
+			}
+			if (action === "open") return `${space}const __created = await ego.createTab(${j(url || "about:blank")})\n${done(`, created: __created && __created.targetId || null`)}`;
+			if (action === "close") {
+				if (!targetId) return `${space}console.log('${SENTINEL}' + JSON.stringify({ ok: false, error: 'targetId is required for action=close' }))\n`;
+				return `${space}await browser.closeTab(${j(targetId)})\n${done(`, closed: ${j(targetId)}`)}`;
+			}
+			if (action !== "list") return `${space}console.log('${SENTINEL}' + JSON.stringify({ ok: false, error: ${j(`unknown action: ${action}`)} }))\n`;
+			return `${space}${done("")}`;
+		}
+	}));
+	reg(t({
 		name: "ego_wait",
 		description: "Pause for a fixed number of milliseconds (e.g. for animations or partial loads). For load waits prefer ego_navigate's wait option.",
 		parameters: { ms: {
@@ -3954,7 +6021,7 @@ function registerActionTools(ctx, cfg, reg) {
 	}));
 	reg(t({
 		name: "ego_wait_for_url",
-		description: "Wait until the page navigates to a URL matching a substring / glob / regex. Use to catch login redirects or pagination.",
+		description: "Wait until the page navigates to a URL matching a substring / glob / regex. Use to catch login redirects or pagination. IMPORTANT: it only observes navigations that happen DURING this call — if the navigation already finished in a previous ego_* call, read ego_page_info instead. Matching is Playwright semantics: a full URL or a ** glob (\"**/search**\"); a bare substring does not match. The result always carries the current URL.",
 		parameters: {
 			pattern: {
 				type: "string",
@@ -3970,12 +6037,12 @@ function registerActionTools(ctx, cfg, reg) {
 		buildScript: (args) => {
 			const p = str(args.pattern, "").trim();
 			if (p === "") return `console.log('${SENTINEL}' + JSON.stringify({ ok: false, reached: false, reason: 'ego_wait_for_url: pattern is required' }))\n`;
-			return `${useSpace(str(args.space, cfg.defaultSpace))}${ensureRealTab()}const __ok = await page.waitForURL(${j(p)}, { timeout: ${num(args.timeout, 1e4)} }).catch(() => false)\nconst __u = await page.url()\nconsole.log('${SENTINEL}' + JSON.stringify({ ok: !!__ok, reached: !!__ok, url: __u }))\n`;
+			return `${useSpace(str(args.space, cfg.defaultSpace))}${ensureRealTab()}const __u0 = await page.url()\nconst __p = ${j(p)}\nconst __isPattern = /[*?[\\\\]]/.test(__p) || __p.startsWith('/')\nconst __already = !__isPattern && __u0.includes(__p)\nconst __ok = __already || await page.waitForURL(__p, { timeout: ${num(args.timeout, 1e4)} }).catch(() => false)\nconst __u = await page.url()\nconsole.log('${SENTINEL}' + JSON.stringify({ ok: !!__ok, reached: !!__ok, url: __u, matchedCurrent: __already, hint: __ok ? undefined : 'waitForURL only sees FUTURE navigations: issue the wait in the same ego_script as the action that navigates, and pass a full URL or a ** glob (a bare substring does not match).' }))\n`;
 		}
 	}));
 	reg(t({
 		name: "ego_wait_for_response",
-		description: "Wait for a network response matching a URL/glob/regex and return it. Optionally return the body (text or JSON) — ideal for scraping API responses or confirming a submission.",
+		description: "Wait for a network response matching a URL/glob/regex and return it. Optionally return the body (text or JSON) — ideal for scraping API responses or confirming a submission. It only observes responses that arrive DURING this call: trigger the request and wait in the same ego_script. On timeout the result carries the current URL and a hint instead of throwing.",
 		parameters: {
 			url: {
 				type: "string",
@@ -3996,7 +6063,7 @@ function registerActionTools(ctx, cfg, reg) {
 			const u = str(args.url, "").trim();
 			const mode = str(args.body, "none");
 			const wantBody = mode === "text" || mode === "json";
-			return `${useSpace(str(args.space, cfg.defaultSpace))}${ensureRealTab()}const __res = await page.waitForResponse(${j(u)}, { timeout: ${num(args.timeout, 1e4)} })\n${wantBody ? `const __body = ${mode === "json" ? "await __res.json().catch(()=>null)" : "await __res.text().catch(()=>null)"}\n` : ""}console.log('${SENTINEL}' + JSON.stringify({ ok: true, url: __res.url(), status: __res.status()${wantBody ? ", body: __body" : ""} }))\n`;
+			return `${useSpace(str(args.space, cfg.defaultSpace))}${ensureRealTab()}let __res = null, __err = null\ntry { __res = await page.waitForResponse(${j(u)}, { timeout: ${num(args.timeout, 1e4)} }) } catch (e) { __err = String(e && e.message || e) }\nif (!__res) {\n  const __u = await page.url().catch(() => null)\n  console.log('${SENTINEL}' + JSON.stringify({ ok: false, reached: false, url: __u, error: __err, hint: 'no matching response arrived during this call. Issue the request and the wait in the same ego_script; the url pattern is a full URL or glob/regex, not a bare substring.' }))\n} else {\n${wantBody ? `  const __body = ${mode === "json" ? "await __res.json().catch(()=>null)" : "await __res.text().catch(()=>null)"}\n` : ""}  console.log('${SENTINEL}' + JSON.stringify({ ok: true, reached: true, url: __res.url(), status: __res.status()${wantBody ? ", body: __body" : ""} }))\n}\n`;
 		}
 	}));
 	reg(t({
@@ -4237,7 +6304,7 @@ function registerActionTools(ctx, cfg, reg) {
 	}));
 	reg(t({
 		name: "ego_dialog",
-		description: "Accept or dismiss a native browser dialog (alert/confirm/prompt), optionally supplying text for a prompt. Use right after the action that triggers the dialog.",
+		description: "Accept or dismiss a native browser dialog (alert/confirm/prompt), optionally supplying text for a prompt. This tool only reaches a dialog that is blocking the page RIGHT NOW — a dialog fired by an earlier ego_* call has already been auto-dismissed across the call boundary. To accept a dialog triggered by a click, do both in one call: page.once(\"dialog\", d => d.accept()); await page.click(selector). If a dialog is blocking the page, page.evaluate/snapshot calls hang until it is handled.",
 		parameters: {
 			accept: {
 				type: "boolean",
@@ -4253,7 +6320,7 @@ function registerActionTools(ctx, cfg, reg) {
 			const accept = bool(args.accept, true);
 			const text = str(args.text, "");
 			const params = `{ accept: ${accept}${text !== "" ? `, promptText: ${j(text)}` : ""} }`;
-			return `${useSpace(str(args.space, cfg.defaultSpace))}${ensureRealTab()}const __r = await cdp("Page.handleJavaScriptDialog", ${params}).catch((e) => ({ error: String(e) }))\nconst __ok = !!(__r && !__r.error)\nconsole.log('${SENTINEL}' + JSON.stringify({ ok: true, handled: __ok, accept: ${accept}, error: __r?.error ?? null }))\n`;
+			return `${useSpace(str(args.space, cfg.defaultSpace))}${ensureRealTab()}const __r = await cdp("Page.handleJavaScriptDialog", ${params}).catch((e) => ({ error: String(e) }))\nconst __ok = !!(__r && !__r.error)\nlet __u = null\nif (!__ok) { try { __u = await page.url() } catch {} }\nconsole.log('${SENTINEL}' + JSON.stringify({ ok: true, handled: __ok, accept: ${accept}, error: __r?.error ?? null, url: __u, hint: __ok ? undefined : 'no dialog was blocking the page. Dialogs do not survive the call that triggered them — trigger and handle in one ego_script: page.once("dialog", d => d.accept()); await page.click(...)' }))\n`;
 		}
 	}));
 	reg(t({
@@ -4306,7 +6373,7 @@ function registerActionTools(ctx, cfg, reg) {
 			parameters: { script: {
 				type: "string",
 				required: true,
-				description: "Full JS script body for the heredoc; ego-browser helpers are preloaded. End with console.log(JSON.stringify(...)) for a parseable sentinel payload."
+				description: "Full JS script body for the heredoc; ego-browser helpers are preloaded. End with console.log('@@DSH_RESULT@@' + JSON.stringify({...})) — the literal @@DSH_RESULT@@ sentinel is required. (A trailing plain JSON line is accepted as a fallback, with result.fallback=true.)"
 			} },
 			output: {
 				schema: {
@@ -4337,12 +6404,12 @@ function registerActionTools(ctx, cfg, reg) {
 					ok: true,
 					stdout: result.stdout,
 					stderr: result.stderr,
-					result: parsed ?? null
+					result: parsed ?? result.value ?? null
 				};
 			},
-			presentCall: () => ({
+			presentCall: (args) => ({
 				card: "generic",
-				title: "ego_cli",
+				title: toolCallTitle("ego_cli", args),
 				kind: "other",
 				rawInput: null
 			})
@@ -4377,7 +6444,7 @@ function registerHelpAndDoctor(ctx, cfg, reg) {
 			render: renderText
 		},
 		timeoutMs: 15e3,
-		execute: async (args, exec) => withEgoLock(async () => {
+		execute: async (args, exec) => withEgoLock(() => observeEgoTool(cfg, "ego_captcha", args, async () => {
 			markEgoToolCall(callingSessionId(exec));
 			const result = await runWithStaleSpaceRetry(ctx, cfg, { signal: exec?.signal }, () => humanCheckScript(str(args.space, cfg.defaultSpace)));
 			if (!result.ok) return {
@@ -4392,10 +6459,10 @@ function registerHelpAndDoctor(ctx, cfg, reg) {
 				detected: !!hc?.detected,
 				kind: hc?.kind ?? null
 			};
-		}),
-		presentCall: () => ({
+		})),
+		presentCall: (args) => ({
 			card: "generic",
-			title: "ego_captcha",
+			title: toolCallTitle("ego_captcha", args),
 			kind: "other",
 			rawInput: null
 		})
@@ -4439,9 +6506,9 @@ function registerHelpAndDoctor(ctx, cfg, reg) {
 				text
 			};
 		},
-		presentCall: () => ({
+		presentCall: (args) => ({
 			card: "generic",
-			title: "ego_help",
+			title: toolCallTitle("ego_help", args),
 			kind: "other",
 			rawInput: null
 		})
@@ -4479,7 +6546,7 @@ function registerHelpAndDoctor(ctx, cfg, reg) {
 			const chrome = findChromeBinary();
 			const configured = cfg.chromePath;
 			if (configured) lines.push(`browser binary: ${configured} (from settings)`);
-			else lines.push(`browser binary: ${chrome || "(none found — set chromePath in settings, or set EGO_LINUX_CHROME, or install Chrome/Edge/Brave)"}`);
+			else lines.push(`browser binary: ${chrome || "(none found — set chromePath in settings, or set EGO_LINUX_CHROME, or install Chrome/Edge/Brave; on Termux/Android: pkg install chromium)"}`);
 			const cliArgs = filterArgs(cfg.egoCliArgs ?? "", EGO_CLI_BLOCKED);
 			const chrArgs = filterArgs(cfg.chromeArgs ?? "", CHROME_BLOCKED);
 			lines.push(`egoCliArgs (effective): ${cliArgs.length ? cliArgs.join(" ") : "(none)"}`);
@@ -4520,9 +6587,9 @@ function registerHelpAndDoctor(ctx, cfg, reg) {
 				report: lines.join("\n")
 			};
 		},
-		presentCall: () => ({
+		presentCall: (args) => ({
 			card: "generic",
-			title: "ego_doctor",
+			title: toolCallTitle("ego_doctor", args),
 			kind: "other",
 			rawInput: null
 		})
@@ -4530,12 +6597,12 @@ function registerHelpAndDoctor(ctx, cfg, reg) {
 	reg((() => {
 		return defineTool({
 			name: "ego_script",
-			description: "Run an arbitrary `ego-browser nodejs` heredoc script in ONE invocation (same runtime/API as ego_cli: page/…locator/browser/taskSpaces/site/fetch/cdp preloaded), and return structured {ok, stdout, stderr, result, durationMs, timedOut}. Use for a full multi-step browser task as a single script.",
+			description: "Run an arbitrary `ego-browser nodejs` heredoc script in ONE invocation (same runtime/API as ego_cli: page/…locator/browser/taskSpaces/site/fetch/cdp preloaded), and return structured {ok, stdout, stderr, result, durationMs, timedOut}. Use for a full multi-step browser task as a single script. NOTE: `page` is the ego runtime page facade, NOT Playwright — it has goto/reload/info/url/title/locator/getBy*/waitFor*/evaluate/screenshot/snapshot/drainEvents/keyboard/mouse but no fill/click/type/press; use ego_fill/ego_click or page.locator(...). page.goto() does not return a Playwright Response; get status via ego_wait_for_response or page.info().",
 			parameters: {
 				script: {
 					type: "string",
 					required: true,
-					description: "Full JS script body; end with console.log(JSON.stringify(...)) for a parseable sentinel payload."
+					description: "Full JS script body; end with console.log('@@DSH_RESULT@@' + JSON.stringify({...})) — the literal @@DSH_RESULT@@ sentinel is required. (A trailing plain JSON line is accepted as a fallback, with result.fallback=true.)"
 				},
 				timeoutMs: {
 					type: "integer",
@@ -4584,14 +6651,14 @@ function registerHelpAndDoctor(ctx, cfg, reg) {
 					ok: true,
 					stdout: result.stdout,
 					stderr: result.stderr,
-					result: parsed ?? null,
+					result: parsed ?? result.value ?? null,
 					durationMs,
 					timedOut: false
 				};
 			},
-			presentCall: () => ({
+			presentCall: (args) => ({
 				card: "generic",
-				title: "ego_script",
+				title: toolCallTitle("ego_script", args),
 				kind: "other",
 				rawInput: null
 			})
@@ -4599,4 +6666,4 @@ function registerHelpAndDoctor(ctx, cfg, reg) {
 	})());
 }
 //#endregion
-export { Config, apply, createActiveSpaceTracker, findChromeBinary, inject, name, resolveEgoEnv, runWithStaleSpaceRetry, shouldReapBrowser };
+export { Config, apply, createActiveSpaceTracker, detectChromeMajorVersion, ensureResidentTransport, findChromeBinary, inject, isColdStartError, loginImportForced, loginImportPolicy, name, parseSentinelOrLastJson, resetResidentTransportForTests, residentDiagnostics, resolveEgoEnv, runWithStaleSpaceRetry, shouldReapBrowser, superviseResidentFailure };

@@ -136,6 +136,14 @@ const CREDIT_METRIC_LABELS = {
 };
 /** 总额 metric 的名字（其余分类明细不参与总额计算，避免重复累加）。 */
 const TOTAL_CREDIT_METRIC = 'usageTotalPackageCredit';
+/**
+ * 基础积分包的 metric 名。
+ *
+ * 只有这个分类能拿到确切的到期时刻 —— 它随**套餐周期**（响应顶层的
+ * `end_date`）重置。赠送包（签到/活动，逐笔「发放日 +30 天」）与按需包
+ * （实时结算）都没有可用的逐包到期字段，故不套用套餐周期。
+ */
+const BASIC_CREDIT_METRIC = 'usageBasicPackageCredit';
 /** 响应体可解析为对象、但缺少必要字段时的统一失败说明。 */
 const UNPARSABLE_RESPONSE_MESSAGE = '请求失败或响应无法解析';
 /**
@@ -181,6 +189,26 @@ function readNumber(source, key) {
             return parsed;
     }
     return 0;
+}
+/**
+ * 从 JSON 安全读取数字，但**区分「缺失」与「0」**（缺失/非法返回 `undefined`）。
+ *
+ * 与 {@link readNumber} 的分工：那个返回 0 是刻意的（`package_credit_amount`
+ * 缺失时按「额度为 0」处理，让「0 额度分类不列为资源包」的判据成立）；
+ * 但 `package_credit_expiring_amount` 缺失表示**上游没给这个口径**，
+ * 与「给了且为 0」是两件事 —— 前者要显示「无此信息」，后者要显示「无临期额度」。
+ * 混用会让没有该字段的账户凭空多出一句「0 即将到期」。
+ */
+function readOptionalNumber(source, key) {
+    const value = source[key];
+    if (typeof value === 'number' && Number.isFinite(value))
+        return value;
+    if (typeof value === 'string' && value.trim().length > 0) {
+        const parsed = Number(value);
+        if (Number.isFinite(parsed))
+            return parsed;
+    }
+    return undefined;
 }
 /** 从 JSON 安全读取字符串。 */
 function readString(source, key) {
@@ -311,12 +339,58 @@ async function signedSnapRequest(method, url, credential, body, fetcher) {
  * 没有任何 credit metric 时返回 `undefined`（= 该账户没有积分口径），
  * 与 `total: 0`（有口径但余额为 0）严格区分。
  */
-function parseCreditBalance(metrics) {
+/**
+ * 把 `YYYY-MM-DD` 形式的日期解析成毫秒时间戳（解析不出返回 `undefined`）。
+ *
+ * ⚠️ 服务端下发的是**纯日期**（`end_date: "2026-10-27"`），不含时刻与时区。
+ * 按 ISO 8601 规范，纯日期形式 `YYYY-MM-DD` **必须**按 UTC 解释
+ * （与 `YYYY-MM-DDTHH:mm:ss` 无时区时按本地时间解释不同）。
+ * 这正好对应服务端的语义：套餐在 `end_date` 当天的 **00:00 UTC**
+ * （= 北京时间 08:00）结束 —— 截图里显示的「2026/10/26 23:59」是
+ * 按另一个时区口径取的前一秒，两者指向同一个时刻边界。
+ *
+ * ⚠️ 解析不出就返回 `undefined`（= 到期时间未知 ⇒ 分档归永久桶），
+ * **绝不**用 `Date.now()` 之类的值兜底。
+ */
+function parseDateMs(value) {
+    const trimmed = value.trim();
+    if (trimmed.length === 0)
+        return undefined;
+    const ms = Date.parse(trimmed);
+    return Number.isFinite(ms) && ms > 0 ? ms : undefined;
+}
+function parseCreditBalance(metrics, packageEndDate) {
     if (!Array.isArray(metrics))
         return undefined;
     const packages = [];
     let totalRemain;
     let sawAnyCreditMetric = false;
+    /**
+     * 「即将到期」的额度（`package_credit_expiring_amount`）。
+     *
+     * ⚠️ **总额口径**：只在总额 metric 上取一次，不累加各分类 —— 实测
+     * `usageTotalPackageCredit` 与 `usageBonusPackageCredit` **同时**带 2000
+     * （2026-10-20 真实账号），累加会得到 4000，凭空翻倍。
+     *
+     * ⚠️ 实测校验：`总额 expiring - 赠送 expiring = 0` ⇒ 总额那个标量
+     * **就是各分类之和**，故下面逐包读取不会重复计数。
+     *
+     * ⚠️ 缺失该键与值为 0 严格区分：缺失 = 上游没给这个口径（`undefined`），
+     * 0 = 给了且当前没有即将到期的额度。
+     */
+    let expiringTotal;
+    /**
+     * 套餐周期结束时刻（`end_date` 的毫秒值；解析不出为 `undefined`）。
+     *
+     * ⚠️ 这个日期**只适用于「基础积分包」**（套餐自带的那 500 分）：
+     * 官方计费文档写明个人体验版「到期系统会自动免费续期，不会产生任何费用」，
+     * 但**基础积分包**确实随套餐周期重置（截图实测：套餐 2026-09-26 →
+     * 2026-10-27，基础包 500 分同期作废）。
+     *
+     * ⚠️ **不能**套到赠送包/按需包上：签到积分的有效期是「发放日 +30 天」
+     * （逐笔各不相同），按需包按消费实时结算。给它们套套餐周期就是编造。
+     */
+    const packageEndMs = packageEndDate === undefined ? undefined : parseDateMs(packageEndDate);
     for (const item of metrics) {
         if (typeof item !== 'object' || item === null)
             continue;
@@ -329,29 +403,78 @@ function parseCreditBalance(metrics) {
         const amount = readNumber(record, 'package_credit_amount');
         const used = readNumber(record, 'package_credit_used');
         const remain = readNumber(record, 'package_credit_remain');
-        if (name === TOTAL_CREDIT_METRIC)
+        if (name === TOTAL_CREDIT_METRIC) {
             totalRemain = remain;
+            // 只认总额 metric 上的那个标量（见上方注释：分类上也有同名字段）。
+            const expiring = readOptionalNumber(record, 'package_credit_expiring_amount');
+            if (expiring !== undefined && expiring > 0)
+                expiringTotal = expiring;
+            /**
+             * ★ **总包不列为资源包**：它是「基础 + 按需 + 赠送」的**汇总行**，
+             * 与下面三个分类是同一批积分的两种视图。
+             *
+             * 把它和分类一起 push 会让 `packages` 求和**翻倍**（实测 2026-10-20：
+             * 总包 25500 + 基础 500 + 赠送 25000 = 51000，而 `total` 是 25500）。
+             * 那不只是数字难看 —— 三档分档（永久/长期/临期）是按 `packages`
+             * 逐包累加的，重复计数会让「永久桶」凭空多出一倍，锁定永久积分时
+             * 就会误判「还有大量永久额度可用」而继续烧临期额度。
+             *
+             * `totalRemain` 已单独记下总额，`total` 不受影响。
+             */
+            continue;
+        }
         // 额度为 0 的分类不列为资源包：列出来只会让「N 个资源包」虚高。
         if (amount <= 0 && remain <= 0)
             continue;
+        /**
+         * 只有**基础积分包**能拿到确切的到期时刻（= 套餐周期结束）。
+         *
+         * 其余分类（按需 / 赠送）如实留空 —— `undefined` 表示「到期时间未知」，
+         * 分档时归入永久桶（保守方向）。绝不拿套餐周期去套它们：签到积分的
+         * 有效期是逐笔「发放日 +30 天」，套错了会让用户以为明天就作废。
+         */
+        const deductionEndTime = name === BASIC_CREDIT_METRIC ? packageEndMs : undefined;
+        /**
+         * 本分类里「即将到期」的额度。
+         *
+         * ⚠️ 只在**没有确切到期时刻**时才需要它（赠送/按需包）：分档拿不到
+         * `deductionEndTime` 就会把整包算进永久桶，那 25000 分里其实有 2000
+         * 快作废 —— 只说「另有 2000 即将到期」而不调整分档，两个数字会打架
+         * （用户 2026-10-20 报障：「2000+500临期不应该是2500嘛」）。
+         *
+         * ⚠️ 基础包已有真实时刻，**不**读本字段：两者同时生效会重复计入临期。
+         */
+        const expiringRaw = deductionEndTime === undefined
+            ? readOptionalNumber(record, 'package_credit_expiring_amount')
+            : undefined;
+        // 夹在 [0, remain] 内：上游若给超（不该发生），宁可少算临期也不让
+        // 「永久 + 临期」超过本包余额（那会让分档合计与 total 脱钩）。
+        const expiringRemaining = expiringRaw === undefined || expiringRaw <= 0
+            ? undefined
+            : Math.min(expiringRaw, remain);
         packages.push({
             name: label,
             unit: 'credit',
             remaining: remain,
             total: amount,
             used,
-            // `statistics/plugin` 不下发资源包的有效性/周期字段（那是腾讯侧的形态）。
-            // 这里如实置为有效、周期留空，而不是臆造一个到期时间。
             active: true,
             cycleStartTime: '',
             cycleEndTime: '',
-            expiredTime: '',
+            expiredTime: deductionEndTime === undefined ? '' : new Date(deductionEndTime).toISOString(),
+            ...deductionEndTime === undefined ? {} : { deductionEndTime },
+            ...expiringRemaining === undefined ? {} : { expiringRemaining },
         });
     }
     if (!sawAnyCreditMetric)
         return undefined;
     const total = roundCredits(totalRemain ?? packages.reduce((sum, pkg) => sum + pkg.remaining, 0));
-    return { total, packages, expiredTotal: 0 };
+    return {
+        total,
+        packages,
+        expiredTotal: 0,
+        ...expiringTotal === undefined ? {} : { expiringTotal },
+    };
 }
 /**
  * 查询账户/套餐信息 —— 含**积分账户检测**。
@@ -390,7 +513,9 @@ export async function fetchCodeArtsAccountInfoDetailed(credential, fetcher = fet
             specCode: readString(pkg, 'spec_code'),
             packageName: packageNameCn.length > 0 ? packageNameCn : packageNameEn,
             packageStatus: readString(pkg, 'status'),
-            credit: parseCreditBalance(data.metrics),
+            // `end_date` 是套餐周期结束日（顶层字段，与 `package` 同级）。
+            // 只有基础积分包跟随它到期，见 `parseCreditBalance` 的注释。
+            credit: parseCreditBalance(data.metrics, readString(data, 'end_date')),
         },
     };
 }

@@ -210,7 +210,7 @@ function promptProjection(prompt, settings = {}) {
   const englishMode = settings.englishMode === true
   const effective = englishMode && prompt.source === 'file'
     ? { version: OPTIMIZER_PROTOCOL_VERSION, language: 'en', chars: null, text: null, reason: 'custom-core-translation-needed' }
-    : composeOptimizerSystem({ language: englishMode ? 'en' : 'zh', core: englishMode ? undefined : prompt.text, tier: settings.tier, toolsEnabled: settings.readTools === true, framing: settings.framing, englishMode })
+    : composeOptimizerSystem({ language: englishMode ? 'en' : 'zh', core: englishMode ? undefined : prompt.text, tier: settings.tier, toolsEnabled: settings.readTools === true, englishMode })
   return { ...prompt, protocolVersion: OPTIMIZER_PROTOCOL_VERSION, effective: { ...effective, preview: true } }
 }
 
@@ -285,7 +285,7 @@ function readTextSafe(path) {
  *                         宿主就不知道政策变了。返回值原样带回给界面（诊断用）。
  * @param opts.now         注入时钟（测试用）
  */
-export function createControlHandler({ home, stateDir, ledgerPath, version = null, resolveEfforts = null, sessionModel = null, listModels = async () => ({ models: [], problems: [] }), listTools = null, toolState = null, now = () => Date.now(), help = {}, interpret = null, setPacket = null, progress = null, advisorProgress = null, rollbackPacket = null, getPacket = null, onSettingsWritten = null, gateSummary = null, registeredCommands = null, advisorStageStatus = null, capabilityStatus = null, inferenceStatus = null, inferenceList = null, inferenceGet = null, inferenceCancel = null,englishStatus=null,englishGet=null,optimizerStatus=null } = {}) {
+export function createControlHandler({ home, stateDir, ledgerPath, version = null, resolveEfforts = null, sessionModel = null, capabilityProbe = null, workingText = null, workingTextInfo = null, listModels = async () => ({ models: [], problems: [] }), listTools = null, toolState = null, now = () => Date.now(), help = {}, interpret = null, setPacket = null, progress = null, advisorProgress = null, rollbackPacket = null, getPacket = null, getInjection = null, getNotice = null, clearNotice = null, clearNotices = null, getPreset = null, inspectPreset = null, presetDismissed = null, getPresetPending = null, getPresetAt = null, clearPresetPending = null, sessionFirstSeen = null, getPresets = null, onSettingsWritten = null, gateSummary = null, registeredCommands = null, advisorStageStatus = null, capabilityStatus = null, inferenceStatus = null, inferenceList = null, inferenceGet = null, inferenceCancel = null,englishStatus=null,englishGet=null,optimizerStatus=null,advisorDelivery=null } = {}) {
   const H = String(home)
   const cfgPath = join(H, 'po06.json')
   const ledger = ledgerPath || join(H, 'po06-wire.jsonl')
@@ -335,8 +335,28 @@ export function createControlHandler({ home, stateDir, ledgerPath, version = nul
         const sid = String(query.get('session') || '').trim()
         if (!sid) return send(400, { ok: false, reason: 'session-required', model: null })
         let m = null
-        try { m = (typeof sessionModel === 'function') ? sessionModel(sid) : null } catch { m = null }
+        // 回调可能是 async（要问宿主“此刻”的选择），这里必须 await，否则拿到的是 Promise
+try { m = (typeof sessionModel === 'function') ? await sessionModel(sid) : null } catch { m = null }
         return send(200, { ok: true, provider: (m && m.provider) || null, model: (m && m.model) || null })
+      }
+      // 只读诊断：这一轮脚手架判断**实际能看见什么能力**（工具名 + 一句作用）。
+      // 为什么要有它：能力清单没送到模型时，输出里看不出原因，只能靠猜；这里可以直接核对。
+      // 只读探针（2026-10-23）：把「这一轮实际会注入什么」原样吐出来，
+      // 用来区分“代码没生效 / 包为空 / 只渲染出壳”三种情况，不必再靠猜。
+      if (method === 'GET' && path === API_PREFIX + '/working-text') {
+        const sid = String(query.get('session') || '').trim()
+        if (!sid) return send(400, { ok: false, reason: 'session-required' })
+        let text = '', extra = {}
+        try { text = (typeof workingText === 'function') ? String(await workingText(sid) || '') : '' } catch { text = '' }
+        try { extra = (typeof workingTextInfo === 'function') ? (await workingTextInfo(sid)) || {} : {} } catch { extra = {} }
+        return send(200, { ok: true, chars: text.length, head: text.slice(0, 400), ...extra })
+      }
+      if (method === 'GET' && path === API_PREFIX + '/capabilities') {
+        const sid = String(query.get('session') || '').trim()
+        if (!sid) return send(400, { ok: false, reason: 'session-required', capabilities: [] })
+        let list = []
+        try { list = (typeof capabilityProbe === 'function') ? await capabilityProbe(sid) : [] } catch { list = [] }
+        return send(200, { ok: true, count: Array.isArray(list) ? list.length : 0, capabilities: Array.isArray(list) ? list : [] })
       }
       // 档位按需查（0.7.5）：宿主仅在 resolveModelInfo 里给 reasoning（listModels 会剥掉它），
       // 27 个模型全量 resolve 太贵 ⇒ 界面选中哪个就查哪个。
@@ -368,6 +388,7 @@ export function createControlHandler({ home, stateDir, ledgerPath, version = nul
       }
       // 界面取证（临时）：记录浏览器实际发来的读写，用于判定"点击没反应"卡在哪一环。
       // 写到独立文件而不是 wire 台账：形状简单、可直接读、不影响既有台账消费方。
+      let lastWatchTraceAt = 0
       const traceApi = (rec) => {
         try {
           const p = join(H, 'po06-api-trace.jsonl')
@@ -391,7 +412,10 @@ export function createControlHandler({ home, stateDir, ledgerPath, version = nul
         //   那个字段只是覆盖里写进来的别名原样，不代表实际生效的档位。
         //   实测过这个坑：覆盖写了 tier=heavy 而三项没展开时，界面会显示"重度"，行为却是 standard。
         const sessDesc = sessEff ? describeSettings(sessEff) : null
-        traceApi({ k: 'status', sid: qsid || null, tier: sessDesc ? sessDesc.tier : null, ua: String(req.headers['user-agent'] || '').slice(0, 40) })
+        // build = 客户端自报的构建标记（2026-10-19）：一条台账就能看出浏览器里跑的是不是最新一版
+        traceApi({ k: 'status', sid: qsid || null, tier: sessDesc ? sessDesc.tier : null,
+          build: String(query.get('build') || '').slice(0, 24) || null,
+          ua: String(req.headers['user-agent'] || '').slice(0, 40) })
         const prompt = resolvePrompt({ home: H })
         return send(200, {
           ok: true, version, home: H,
@@ -451,8 +475,8 @@ export function createControlHandler({ home, stateDir, ledgerPath, version = nul
           // 会话生效值（无 ?session= 时为 null）：界面用它显示"本会话的档位"
           sessionId: qsid || null,
           sessionEffective: sessEff
-            ? { tier: sessDesc.tier, assist: sessEff.assist, detail: sessEff.detail, budget: sessEff.budget, framing: sessEff.framing || 'neutral',
-                reasoningBoost:sessEff.reasoningBoost,reasoningMode:sessEff.reasoningMode,reasoningCandidates:sessEff.reasoningCandidates,reasoningRounds:sessEff.reasoningRounds,reasoningPace:sessEff.reasoningPace,englishMode:sessEff.englishMode }
+            ? { tier: sessDesc.tier, assist: sessEff.assist, detail: sessEff.detail, budget: sessEff.budget,
+                reasoningBoost:sessEff.reasoningBoost,reasoningMode:sessEff.reasoningMode,reasoningCandidates:sessEff.reasoningCandidates,reasoningRounds:sessEff.reasoningRounds,reasoningPace:sessEff.reasoningPace,englishMode:sessEff.englishMode,modelState:sessEff.modelState === 'extreme' ? 'extreme' : 'normal' }
             : null,
           sessionDescribed: sessDesc,
           // ⚠ 启动闸门自己的字段（enabled / rollout / settingsVersion）**不是**"不认识的字段"，
@@ -559,7 +583,7 @@ export function createControlHandler({ home, stateDir, ledgerPath, version = nul
             }
           } catch { /* 同上 */ }
         }
-        const r = await interpret({ sessionId: String(v.sessionId || ''), text: String(v.text || ''), messageId: v.messageId || null, signal: ac ? ac.signal : null })
+        const r = await interpret({ sessionId: String(v.sessionId || ''), text: String(v.text || ''), messageId: v.messageId || null, generation: Number.isSafeInteger(v.generation) ? v.generation : null, signal: ac ? ac.signal : null })
         if (ac && ac.signal.aborted) {
           // 已经断开 ⇒ 不写、不回包（客户端那边世代号也已作废）
           return send(499, { ok: false, reason: 'aborted', note: '客户端已取消（跳过/取消），这一轮不产出' })
@@ -572,13 +596,15 @@ export function createControlHandler({ home, stateDir, ledgerPath, version = nul
         const progForUsage = (typeof progress === 'function') ? progress(String(v.sessionId || '')) : null
         const usageOut = (progForUsage && progForUsage.usage && typeof progForUsage.usage === 'object') ? progForUsage.usage : null
         return send(out.ok === true ? 200 : 400, {
-          ok: out.ok === true, reason: out.reason || null,
+          ok: out.ok === true, reason: out.reason || null, runId: out.runId || null, status: out.status || null,
           packet: typeof out.packet === 'string' ? out.packet : '',
+          // 2026-10-18：第 5 项（注入折叠卡片）的数据出口。真实注入文由 interpret 提供，缺省为 null。
+          injected: typeof out.injected === 'string' ? out.injected.slice(0, 4000) : null,
            englishMode:out.englishMode===true,outgoingText:typeof out.outgoingText==='string'?out.outgoingText:null,translation:out.translation||null,
           understood: out.understood === true, noAddition: out.noAddition === true,
           understanding: out.understanding || null, support: out.support || null,
           chars: typeof out.chars === 'number' ? out.chars : 0,
-          ms: typeof out.ms === 'number' ? out.ms : null,
+          ms: typeof out.ms === 'number' ? out.ms : null, timings: out.timings || null,
           usage: usageOut,
           usageTotal: (usageOut && typeof usageOut.total === 'number') ? usageOut.total : null,
           // 无出处条目数（缺值 = null = "未记录"，界面不许拿 0 冒充"没有"）
@@ -598,9 +624,9 @@ export function createControlHandler({ home, stateDir, ledgerPath, version = nul
         if (typeof setPacket !== 'function') {
           return send(501, { ok: false, reason: 'not-implemented', note: '本 profile 未接上 pipeline，改包无法生效' })
         }
-        const r = await setPacket({ sessionId: String(v.sessionId || ''), text: String(v.text == null ? '' : v.text) })
+        const r = await setPacket({ sessionId: String(v.sessionId || ''), runId: v.runId || null, generation: Number.isSafeInteger(v.generation) ? v.generation : null, disposition: v.disposition || null, originalText: String(v.originalText || ''), outgoingText: String(v.outgoingText || ''), text: String(v.text == null ? '' : v.text) })
         const out = (r && typeof r === 'object') ? r : { ok: false, reason: 'bad-hook-result' }
-        return send(out.ok === true ? 200 : 400, { ok: out.ok === true, reason: out.reason || null, chars: typeof out.chars === 'number' ? out.chars : 0,packet:typeof out.packet==='string'?out.packet:null })
+        return send(out.ok === true ? 200 : 400, { ok: out.ok === true, reason: out.reason || null, runId: out.runId || null, chars: typeof out.chars === 'number' ? out.chars : 0,packet:typeof out.packet==='string'?out.packet:null })
       }
       if(method==='GET'&&path===API_PREFIX+'/english-input'){const sid=String(query.get('session')||'').trim();if(!sid)return send(400,{ok:false,reason:'session-required'});return send(200,{ok:true,value:typeof englishGet==='function'?englishGet(sid):null})}
       if(method==='GET' && path===API_PREFIX+'/inference-runs'){
@@ -618,9 +644,15 @@ export function createControlHandler({ home, stateDir, ledgerPath, version = nul
         const body=await readBody(req)
         if(!body.ok)return send(400,{ok:false,reason:body.reason})
         const sid=String(body.value?.sessionId||''),run=String(body.value?.runId||'')
-        if(!sid||!run)return send(400,{ok:false,reason:'session-and-run-required'})
+        // run 省略 ⇒ 按会话取消（跳过优化时前端只知道会话）
+        if(!sid)return send(400,{ok:false,reason:'session-required'})
         const value=typeof inferenceCancel==='function'?inferenceCancel(sid,run):{ok:false,reason:'not-ready'}
         return send(value.ok?200:400,value)
+      }
+      if(method==='GET'&&path===API_PREFIX+'/advisor-delivery'){
+        const sid=String(query.get('session')||'').trim(),rawSeq=query.get('seq'),seq=Number(rawSeq)
+        if(!/^[A-Za-z0-9._:@-]{1,240}$/.test(sid)||rawSeq===null||rawSeq.trim()===''||!Number.isSafeInteger(seq)||seq<0)return send(400,{ok:false,reason:'session-and-event-seq-required'})
+        return send(200,typeof advisorDelivery==='function'?await advisorDelivery(sid,seq):{ok:true,sessionId:sid,seq,status:'unavailable',checks:[],counts:{},limitations:['delivery-status-unavailable'],completionClaimAllowed:false,scopeOnly:true})
       }
       if (method === 'GET' && path === API_PREFIX + '/advisor-progress') {
         const sid = String(query.get('session') || '').trim()
@@ -651,6 +683,149 @@ export function createControlHandler({ home, stateDir, ledgerPath, version = nul
         const text = String(getPacket({ sessionId: sid }) || '')
         return send(200, { ok: true, chars: text.length, packet: text })
       }
+      if (method === 'GET' && path === API_PREFIX + '/injection') {
+        // 「本次注入」记录：**来自插件自己的内存**，不读会话日志。
+        //   ?id=<记录 id>  → 对话流卡片按命令事件里带的 id 取
+        //   ?session=<sid> → 输入栏胶囊取"这个会话最近一条"
+        const id = String(query.get('id') || '').trim()
+        const sid = String(query.get('session') || '').trim()
+        if (!id && !sid) return send(400, { ok: false, reason: 'id-or-session-required' })
+        const row = typeof getInjection === 'function' ? getInjection(id ? { id } : { sessionId: sid }) : null
+        return send(200, { ok: true, injection: row || null })
+      }
+      if (method === 'GET' && path === API_PREFIX + '/presets') {
+        // 预设登记表（文案 ↔ id）：客户端据此把输入区按钮的文字翻成预设 id
+        let r = { ok: false, presets: [], debug: { missing: true } }
+        try { if (typeof getPresets === 'function') r = (await getPresets()) || r } catch (e) { r = { ok: false, presets: [], debug: { threw: String(e && e.message || e) } } }
+        return send(200, { ok: r.ok === true, presets: Array.isArray(r.presets) ? r.presets : [], debug: r.debug || null })
+      }
+      if (method === 'GET' && path === API_PREFIX + '/preset') {
+        // 预设闸门（2026-10-19）：客户端在**按下回车、开始优化之前**问一次。
+        // 宿主这边优先问 sessionController 拿会话头（最新、最准），拿不到再用事件里记下的。
+        const sid = String(query.get('session') || '').trim()
+        if (!sid) return send(400, { ok: false, reason: 'session-required' })
+        // light=1（客户端 0.5s 的探针）：跳过会话 inspect，只用事件表/pending 判"预设变了没有"，成本极低
+        const lightProbe = String(query.get('light') || '') === '1'
+        let headerPreset = null
+        let debug = null
+        try {
+          if (!lightProbe && typeof inspectPreset === 'function') {
+            const r = await inspectPreset(sid)
+            // 新契约 { preset, debug }；老契约直接给字符串（兼容）
+            if (r && typeof r === 'object' && 'preset' in r) { headerPreset = r.preset || null; debug = r.debug || null }
+            else headerPreset = r || null
+          }
+        } catch { headerPreset = null }
+        // 优先级：会话里切换过（事件）> 最近一次界面选择（先拨预设、后开会话）> 会话头
+        // 2026-10-19 真机：会话头往往是创建时的默认值（ptc），而用户是在开始会话**之前**拨的预设。
+        const eventPreset = typeof getPreset === 'function' ? (getPreset(sid) || null) : null
+        const pending = typeof getPresetPending === 'function' ? getPresetPending() : null
+        // ⚠ 2026-10-19 真机：pending 是"全局最近一次选择"，之前无条件优先 ⇒ **所有会话**都被判成 standard，疯狂弹窗。
+        // 现在只在这两种情况下算数：
+        //   ① 就是在这个会话里选的（pending.sid === sid）；
+        //   ② 选的时候还没有会话（pending.sid 为空），且是 90 秒内的近期选择——并且用一次就消费掉，不会漏到别的会话。
+        //   ③ 或者：这个会话是**在选完预设之后**才第一次出现的（= 新开的会话），且选择发生在 10 分钟内。
+        //      这条是为了"先拨预设、后开会话"——那种会话的会话头仍然是默认值（ptc），只能靠这条认出来。
+        // 会话头只有在"等于默认预设"时才不可信（默认值见 profile 的 agent-preset-registry.selectedDefault）。
+        // 非默认的头（standard / cordis / wish…）是会话自己的真相，**不能被 pending 覆盖**——
+        // 2026-10-19 真机就是 pending(ptc) 把老 standard 会话覆盖成 ptc，于是进入老会话不弹。
+        const DEFAULT_PRESET = 'ptc'
+        const headerIsDefault = !headerPreset || headerPreset === DEFAULT_PRESET
+        const eventCount = debug && debug.inspect ? debug.inspect.eventCount : null
+        const freshSession = typeof eventCount === 'number' ? eventCount <= 1 : false
+        const seenAt = typeof sessionFirstSeen === 'function' ? sessionFirstSeen(sid) : null
+        const recent10 = !!(pending && (Date.now() - Number(pending.at || 0) < 10 * 60 * 1000))
+        const pendingForMe = !!(pending && (
+          String(pending.sid || '') === sid
+          || (recent10 && headerIsDefault && freshSession && seenAt && Number(seenAt) > Number(pending.at || 0))
+        ))
+        const pendingPreset = pendingForMe && pending.preset ? String(pending.preset) : null
+        // 客户端把输入区按钮的**当前文案**带上来（label）：这是唯一能反映"用户眼前这个会话选了什么"的来源。
+        // 磁盘上的会话头永远是 ptc（已核对 session.v4.jsonl），所以这条优先级最高。
+        const label = String(query.get('label') || '').trim().slice(0, 40)
+        let hintPreset = null
+        if (label && typeof getPresets === 'function') {
+          try {
+            const reg = (await getPresets()) || {}
+            const hit = (Array.isArray(reg.presets) ? reg.presets : []).find((p) => p.name === label || p.id === label)
+            if (hit) hintPreset = hit.id
+          } catch { hintPreset = null }
+        }
+        const preset = hintPreset || eventPreset
+          || (headerPreset && headerPreset !== DEFAULT_PRESET ? headerPreset : null)
+          || pendingPreset || headerPreset
+        const presetSource = hintPreset ? 'label' : (eventPreset ? 'event' : (pendingPreset ? 'pending' : (headerPreset ? 'header' : 'unknown')))
+        if (pendingPreset && !pending.sid && typeof clearPresetPending === 'function') {
+          try { clearPresetPending() } catch { /* 消费失败就当没消费 */ }
+        }
+        // 这次"预设真的变了"的时间：客户端用它去重，避免自己维护基线（挂载时机不同会漏事件）
+        const eventAt = typeof getPresetAt === 'function' ? getPresetAt(sid) : null
+        const presetAt = eventAt || (pending && pending.at) || null
+        const dismissed = typeof presetDismissed === 'function' ? presetDismissed() === true : false
+        // 2026-10-19 用户确认口径：**只有非 Wish 且非 PTC 才提醒**（这两个预设本身就是推荐态）。
+        // 注意：PTC 会话按此口径不会弹窗——那不是"没实现"，是设计如此（debug 里 preset 会有值）。
+        const notice = preset && preset !== 'wish' && preset !== 'ptc' && !dismissed ? { preset } : null
+        // via=watch 是"盯着输入区"的探测（打字每几百毫秒一次）⇒ 不进台账；只记真正的回车询问与调试查询
+        const via = String(query.get('via') || 'direct')
+        if (via !== 'watch') {
+          traceApi({ k: 'preset', via, sid: sid.slice(0, 48), preset: preset || null, source: presetSource, presetAt, notice: notice ? notice.preset : null, dismissed })
+        } else if (Date.now() - lastWatchTraceAt > 20000) {
+          // 盯输入区的探测：20 秒最多留一条，用来确认"客户端到底有没有在看"
+          lastWatchTraceAt = Date.now()
+          traceApi({ k: 'preset-watch', sid: sid.slice(0, 48), preset: preset || null, source: presetSource, presetAt, notice: notice ? notice.preset : null })
+        }
+        const payload = { ok: true, preset: preset || null, notice, source: presetSource, presetAt }
+        // ?debug=1 ⇒ 透出"宿主到底看到了什么"（真机上判断为什么没弹窗）
+        if (String(query.get('debug') || '') === '1') {
+          payload.debug = { inspect: debug, header: headerPreset, events: eventPreset, pending: pendingPreset,
+            pendingRaw: pending ? { preset: pending.preset, sid: pending.sid || '', at: pending.at } : null,
+            label: label || null, hintPreset,
+            source: presetSource, dismissed }
+        }
+        return send(200, payload)
+      }
+      if (method === 'GET' && path === API_PREFIX + '/notice') {
+        // 预设提示（2026-10-19）：非 Wish / PTC 预设时给客户端一条提示。
+        const sid = String(query.get('session') || '').trim()
+        if (!sid) return send(400, { ok: false, reason: 'session-required' })
+        const row = typeof getNotice === 'function' ? getNotice({ sessionId: sid }) : null
+        return send(200, { ok: true, notice: row || null })
+      }
+      // 客户端取证（2026-10-19）：弹窗"到底跑没跑、有没有抛错"必须能查，不然只能猜。
+      if (method === 'POST' && path === API_PREFIX + '/client-log') {
+        const body = await readBody(req)
+        if (!body.ok) return send(400, { ok: false, reason: body.reason })
+        const v = body.value || {}
+        traceApi({
+          k: 'client-log',
+          event: String(v.event || '').slice(0, 40),
+          sid: String(v.sid || '').slice(0, 48),
+          preset: String(v.preset || '').slice(0, 24),
+          detail: String(v.detail || '').slice(0, 200),
+        })
+        return send(200, { ok: true })
+      }
+      if (method === 'POST' && path === API_PREFIX + '/notice') {
+        const body = await readBody(req)
+        if (!body.ok) return send(400, { ok: false, reason: body.reason })
+        const v = body.value || {}
+        if (v.forever === true) {
+          // 「以后不再显示」= 一条持久的用户设置（不是会话级），写盘失败要如实报。
+          const r = writeSettings({ path: cfgPath, patch: { presetNoticeDismissed: true }, now: now() })
+          if (!r || r.ok !== true) return send(500, { ok: false, reason: (r && r.reason) || 'settings-write-failed' })
+          if (typeof clearNotices === 'function') clearNotices()
+          return send(200, { ok: true, forever: true })
+        }
+        // 恢复显示（2026-10-23）：用户点了“以后不再显示”之后，得有一条**可逆**的路，
+        // 否则提示一旦关掉就永远回不来（真机上就是这么丢的）。
+        if (v.reset === true) {
+          const rr = writeSettings({ path: cfgPath, patch: { presetNoticeDismissed: false }, now: now() })
+          if (!rr || rr.ok !== true) return send(500, { ok: false, reason: (rr && rr.reason) || 'settings-write-failed' })
+          return send(200, { ok: true, reset: true })
+        }
+        if (typeof clearNotice === 'function') clearNotice(String(v.session || ''))
+        return send(200, { ok: true })
+      }
       if (method === 'POST' && path === API_PREFIX + '/rollback') {
         const body = await readBody(req)
         if (!body.ok) return send(400, { ok: false, reason: body.reason })
@@ -671,9 +846,9 @@ export function createControlHandler({ home, stateDir, ledgerPath, version = nul
           if (typeof rollbackPacket !== 'function') {
             return send(501, { ok: false, reason: 'not-implemented', kind, note: '本 profile 未接上 pipeline，包级回退无法生效' })
           }
-          const r = await rollbackPacket({ sessionId: String((body.value || {}).sessionId || '') })
+          const r = await rollbackPacket({ sessionId: String((body.value || {}).sessionId || ''), runId: (body.value || {}).runId || null })
           const out = (r && typeof r === 'object') ? r : { ok: false, reason: 'bad-hook-result' }
-          return send(out.ok === true ? 200 : 400, { ok: out.ok === true, reason: out.reason || null, chars: out.chars || 0, remaining: out.remaining == null ? null : out.remaining })
+          return send(out.ok === true ? 200 : 400, { ok: out.ok === true, reason: out.reason || null, runId: out.runId || null, packet: typeof out.packet === 'string' ? out.packet : null, chars: out.chars || 0, remaining: out.remaining == null ? null : out.remaining })
         }
         // 条目级回退需要"每条意图的历史版本"，目前没有 —— **如实说没做**，不假装成功
         return send(501, { ok: false, reason: 'not-implemented', kind, note: '条目级回退需要条目级历史（当前只有包级历史），计划在 P9.4 之后（见 po06/P9-UI-PLAN.md）' })

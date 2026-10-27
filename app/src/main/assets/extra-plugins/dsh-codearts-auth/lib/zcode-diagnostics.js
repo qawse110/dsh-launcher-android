@@ -294,6 +294,21 @@ const ZCODE_HTML_DOCUMENT_TAGS = new Set([
     'error', 'fault', 'response', 'result',
 ]);
 /**
+ * 响应是否来自**阿里云 ESA**（ZCode 的上游边缘 CDN）。
+ *
+ * ## 为什么抽成独立导出（2026-10-25，issue IKQ4B4）
+ *
+ * 这个判据原先**内联**在 {@link formatZcodeEdgePageHint} 里，而
+ * `describeUpstreamError` 需要区分「ESA 专属措辞」与「405 风控措辞」
+ * —— 两处都要用同一个判据。若在 `describeUpstreamError` 里再抄一份正则，
+ * 就是「同一语义两套判据」（本仓库红线），将来改一处必漏另一处。
+ *
+ * 特征：`data-spm` 是 ESA 的埋点属性名，`aliyuncs.com` 是它的资源域名。
+ */
+export function looksLikeZcodeEsaPage(body) {
+    return /data-spm/i.test(body) || /aliyuncs\.com/i.test(body);
+}
+/**
  * 边缘/CDN 错误页的**文案** —— 与 {@link looksLikeZcodeHtmlPage} 同源同批维护。
  *
  * ## 三条写作要求（都是被真实事故逼出来的）
@@ -323,9 +338,9 @@ export function formatZcodeEdgePageHint(body, status) {
     const shown = title !== undefined && title !== ''
         ? `（页面标题：${title.slice(0, 40)}${title.length > 40 ? '…' : ''}）`
         : '';
-    // 阿里云 ESA 的特征（`data-spm` 是它的埋点属性名，`aliyuncs.com` 是资源域名）。
-    const isAliyunEsa = /data-spm/i.test(body) || /aliyuncs\.com/i.test(body);
-    if (isAliyunEsa) {
+    // 阿里云 ESA 的特征由 {@link looksLikeZcodeEsaPage} 判定（判据只留一份：
+    // `describeUpstreamError` 的 405 分支也要区分 ESA 与普通页面）。
+    if (looksLikeZcodeEsaPage(body)) {
         return `上游返回的是边缘CDN 的 HTML 错误页${shown}，不是业务层JSON —— `
             + '请求未到达 ZCode 服务端（通常是访问链路被拦截或上游临时故障）。'
             + '此类问题**更换账号无效**，建议稍后重试；若持续出现，请向 ZCode 官方确认服务状态。';
@@ -651,6 +666,14 @@ export function formatZcodeDiagnostic(input) {
     const shapeParts = input.shape === undefined
         ? []
         : [
+            /**
+             * ⚠⚠ **块数必须渲染出来**（2026-10-25 审计打穿）：405 的判据就是
+             * 「system 是否为官方那 3 块」，而 `systemBlocks` 此前只被赋值、
+             * **从没被渲染** ⇒ 3 块与 4 块构造出的诊断行**逐字相同**，
+             * 下一次 405 报障完全看不出「是不是又变 4 块了」。
+             * 这是排查该缺陷**唯一**的现成出口，别删。
+             */
+            `system ${input.shape.systemBlocks} 块`,
             `身份块 ${input.shape.identityChars} 字符(${input.shape.identityBlockChars.length > 0
                 ? input.shape.identityBlockChars.join('+')
                 : '无'})`,

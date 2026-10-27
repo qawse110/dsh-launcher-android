@@ -39,10 +39,10 @@
 import { Service } from '@deepseek-ai/cordis';
 import { isUsableZcodeCredential, phoneFromUserId, } from './zcode.js';
 import { ZCODE } from './zcode-product.js';
-import { ZcodeCaptchaBrowser, ZCODE_CAPTCHA_FALLBACK, validateCaptchaParam, } from './zcode-captcha.js';
+import { ZcodeCaptchaBrowser, ZCODE_CAPTCHA_FALLBACK, isBrowserDeploymentError, validateCaptchaParam, } from './zcode-captcha.js';
 import { CaptchaPool, captchaPoolConfigFromEnv } from './captcha-pool.js';
 import { captchaRequirementObservability } from './captcha-requirement.js';
-import { CaptchaBackoff, captchaBackoffConfigFromEnv, captchaQueueEnabledFromEnv, CAPTCHA_CONFIG_TTL_MS } from './captcha-backoff.js';
+import { CaptchaBackoff, CaptchaCooldownError, captchaBackoffConfigFromEnv, captchaQueueEnabledFromEnv, isCaptchaCooldownError, CAPTCHA_CONFIG_TTL_MS, } from './captcha-backoff.js';
 import { CaptchaCarrier } from './captcha-carrier.js';
 import { CarrierPageServer } from './captcha-carrier-server.js';
 import { buildCarrierPageHtml } from './zcode-carrier-page.js';
@@ -52,7 +52,7 @@ import { TtlCache } from './ttl-cache.js';
 import { generateDeviceMid, runZcodeLogin } from './zcode-login.js';
 import { fetchCodingPlanApiKey } from './zcode-transport.js';
 import { formatZcodeDiagnostic, formatZcodeUnusualActivityMessage, isZcodeUnusualActivityCode, mentionsZcodeUnusualActivity, noteZcodeRequestFailed, noteZcodeRequestOk, noteZcodeRequestSent, } from './zcode-diagnostics.js';
-import { claimZcodePlan, fetchZcodeBalance, fetchZcodeCaptchaConfig, fetchZcodeClaimablePlans, fetchZcodeModels, reportZcodeActivation, } from './zcode-upstream.js';
+import { claimZcodePlan, fetchZcodeBalance, fetchZcodeCaptchaConfig, fetchZcodeClaimablePlans, fetchZcodeMarketingPlans, fetchZcodeModels, mergeZcodeClaimablePlans, reportZcodeActivation, reportZcodeMarketingAction, } from './zcode-upstream.js';
 /**
  * 内部载体（DSH Desktop 的 webview guest 产 param）是否**允许**参与产出。
  *
@@ -720,10 +720,27 @@ export class ZcodeAuth extends Service {
          */
         const remainMs = this.captchaBackoff.remainingMs();
         if (remainMs > 0) {
-            throw new Error(`zcode: captcha 产出处于冷却中（连续 ${this.captchaBackoff.failureStreak()} 次失败），` +
+            /**
+             * ⚠️⚠️ **必须抛可判别的类型**（对抗审计实测的 P0，IKQ4JN 附带修）。
+             *
+             * 闸门在 `ZcodeCaptchaBrowser` 内部，而调用侧那个 catch 包住整个
+             * `mintWithOutcome` ⇒ 闸门抛的普通 `Error` 会**流回那个 catch 并
+             * `noteFailure()` 一次** ⇒ 冷却期内每点一次，`streak` +1、冷却翻倍。
+             *
+             * 实测：真失败 3 次进 60s 冷却后，用户再点 5 次（**一次 mint 都没发出**）
+             * ⇒ streak 4→8、冷却 60s → 120 → 240 → 480 → 960 → **1800s**。
+             * 用户什么也没做错，却把 1 分钟冷静期点成了 30 分钟。
+             *
+             * ⇒ 用 {@link CaptchaCooldownError} 标记它，catch 里**不再计数**
+             * （没有发出请求 = 没有伤到设备信誉，与部署错误同一条理由）。
+             */
+            throw new CaptchaCooldownError(`zcode: captcha 产出处于冷却中（连续 ${this.captchaBackoff.failureStreak()} 次失败），` +
                 `约 ${Math.ceil(remainMs / 1000)} 秒后可重试。` +
-                '这通常意味着设备信誉不足（上游把无感验证降级为滑块），' +
-                '继续重试只会让信誉更差 —— 请稍后再试。');
+                '如果最近从未成功产出过，也可能是本机没装可用的浏览器 —— ' +
+                '此时请先按下面那条「找不到浏览器」的提示装一个（设 ZCODE_CHROME_PATH 亦可），' +
+                '而不是等冷却。' +
+                '若确实产出过、只是偶发失败，那通常是设备信誉临时降级（上游把无感验证降成滑块），' +
+                '继续重试只会让信誉更差 —— 请稍后再试。', remainMs);
         }
         /**
          * ⚠ 串行队列**包住整个「取配置 + 产出」**，而不是只包浏览器那一跳：
@@ -932,6 +949,50 @@ export class ZcodeAuth extends Service {
                 }
                 catch (error) {
                     this.captchaStats.failed += 1;
+                    /**
+                     * ⚠️⚠️ **部署错误不计数、也不进冷却**（Gitee issue IKQ4JN 根因②）。
+                     *
+                     * ## 缺陷原状
+                     *
+                     * 原实现一视同仁 `noteFailure()`，于是「本机没装浏览器」这种
+                     * **确定性、可永久复现、重试一万次也不会好**的部署问题也会累计
+                     * streak，3 次后进入 60s 冷却 ⇒ 用户第 3 次点击看到的是
+                     * 「captcha 产出处于冷却中…这通常意味着**设备信誉不足**」
+                     * —— 把「浏览器没装」说成「设备信誉不足」，**方向完全相反**。
+                     * 报障人原话：「本次排查最耗时的就是这一步：我一开始真去查了设备信誉」。
+                     *
+                     * ## 为什么它落在既有纪律之外
+                     *
+                     * `captcha-backoff.ts` 文件头的纪律是「`mintOnPage` 抛错 ⇒ **本机产出
+                     * 能力**出了问题 ⇒ 计数」。而 `findBrowserExecutable() === undefined`
+                     * 不是产出能力问题（那是浏览器**跑起来之后**的事），也不是上游问题，
+                     * 而是**部署问题**。
+                     *
+                     * ## 为什么「不计数」是对的（而不是「少计数」）
+                     *
+                     * 设备信誉退避的存在理由是「继续请求只会让信誉更差」。
+                     * 而部署错误**根本没发出任何 mint 请求** —— 没有信誉可伤，
+                     * 冷却它只会挡住用户本该看到的那句可执行提示
+                     *（「去装个 chromium / 设 ZCODE_CHROME_PATH」）。
+                     *
+                     * ⚠️ `captchaStats.failed += 1` **仍然保留**：那是纯诊断计数
+                     *（`captchaStats` 只用于日志与面板展示，不参与任何闸门），
+                     * 让它反映「确实失败了一次」是诚实的。
+                     */
+                    /**
+                     * ⚠️ **冷却闸门的拒绝不再计数**（见闸门处的长注释）：
+                     * 那一次请求根本没发出去 ⇒ 没有伤到信誉 ⇒ 不该加重处罚。
+                     * 放在部署错误之前判（两者互斥，顺序不影响语义，但此处更直观）。
+                     */
+                    if (isCaptchaCooldownError(error)) {
+                        throw error;
+                    }
+                    if (isBrowserDeploymentError(error)) {
+                        this.ctx.logger?.warn?.('[jet-hub] zcode captcha 无法产出：本机浏览器不可用（部署问题，'
+                            + '不计入设备信誉退避、不进入冷却）—— '
+                            + `${error instanceof Error ? error.message : String(error)}`);
+                        throw error;
+                    }
                     const until = this.captchaBackoff.noteFailure();
                     if (until > 0) {
                         this.ctx.logger?.warn?.(`[jet-hub] zcode captcha 连续产出失败 ${this.captchaBackoff.failureStreak()} 次，` +
@@ -1058,6 +1119,30 @@ export class ZcodeAuth extends Service {
     }
     // ===== 签到（与 CodeArts / Buddy 等共用 CheckinStatus / ClaimOutcome 形状）=====
     /**
+     * 取「当前可领的全部 plan」—— **两个来源合并**（2026-10-23）。
+     *
+     * ## 为什么要两个来源（用户报障：1024 活动领不到）
+     *
+     * | 来源 | 端点 | 实测（本机 4 账号） |
+     * |---|---|---|
+     * | 每日赠送 | `GET /zcode-plan/billing/preview` | `plans` 里有 `…start-plan-trust-…` |
+     * | **营销投放** | `GET /marketing/touch` | **1024 活动只在这里**（preview 恒为空） |
+     *
+     * ⇒ 只查 preview 时，1024 那 5 亿 token 与「今天没有活动」在 wire 上**同形**
+     * （都是 `plans: []`），签到永远不会去领它。
+     *
+     * ⚠ **顺序与失败隔离**：preview 先（主路径），marketing 后（补充）；
+     *   marketing 失败一律降级为空数组（`fetchZcodeMarketingPlans` 自己兜住），
+     *   **绝不影响** preview 那条既有路径。
+     * ⚠ 串行而非并发：与本文件既有的「一步步发」风格一致（zcode 有反风控纪律，
+     *   见 `model-gate.ts`），且这里只多一跳只读请求。
+     */
+    async fetchAllClaimablePlans(credential) {
+        const preview = await fetchZcodeClaimablePlans(credential, this.fetchImpl);
+        const marketing = await fetchZcodeMarketingPlans(credential, this.fetchImpl);
+        return mergeZcodeClaimablePlans(preview, marketing);
+    }
+    /**
      * 查签到状态。
      *
      * ## ⚠ 判据是「有没有可领的 plan」，**不是**「列表是否为空」
@@ -1076,7 +1161,12 @@ export class ZcodeAuth extends Service {
         }
         // 补活跃信号 —— 不补则 preview 恒为空。
         await reportZcodeActivation(credential, this.fetchImpl);
-        const plans = await fetchZcodeClaimablePlans(credential, this.fetchImpl);
+        /**
+         * ⚠ 这里也必须是**合并后的全量**（不只是 preview）：否则面板会显示
+         * 「今日已领取」而 1024 活动其实还没领（两者都表现为 preview 为空）——
+         * 用户被状态误导，且「一键领取」与状态灯自相矛盾。
+         */
+        const plans = await this.fetchAllClaimablePlans(credential);
         /**
          * ⚠ `active` 恒为 `true`（拿到凭据即 true）—— 与 Qoder 的同款约定：
          * 若按「列表非空」判 `active:false`，`collectClaimResults` 会先命中
@@ -1194,7 +1284,12 @@ export class ZcodeAuth extends Service {
                 return [{ kind: 'failed', code: -1, message: 'captcha 产出不可用（找不到浏览器？）' }];
             }
             await reportZcodeActivation(credential, this.fetchImpl);
-            const plans = await fetchZcodeClaimablePlans(credential, this.fetchImpl);
+            /**
+             * ★ **两个来源合并**（见 {@link fetchAllClaimablePlans}）：1024 这类
+             * **营销投放**的 plan 不在 `preview` 里，只查 preview 会永远看不到它
+             * （用户报障：官方客户端有横幅、插件签到却领不到）。
+             */
+            const plans = await this.fetchAllClaimablePlans(credential);
             /**
              * ⚠ 「没有可领 plan」**不等于**「今天已领」——也可能是活动未投放。
              * 但两种情况下用户的动作都是「明天再来」，故归为 `already-claimed`
@@ -1413,6 +1508,36 @@ export class ZcodeAuth extends Service {
             const mapped = toClaimOutcome(outcome, plan.planId, {
                 plan, accountId, sentAt: diagnosticSentAt, status: outcome.httpStatus, internalRetried,
             });
+            /**
+             * ★ **营销活动的回执**（`confirm`）—— 只在**领取成功 / 已领取**后发。
+             *
+             * ## 为什么必须发（不是可选的记账）
+             *
+             * 官方 renderer 在动作成功后立刻 `p(delivery, 'confirm')`
+             * （`out/renderer/assets/styles-n-UNIiNg.js`）。不发的话**服务端会继续把
+             * 同一个 campaign 反复投放**（实测：`marketing/touch` 每次都返回同一条
+             * `deliveries`，与是否领过无关）⇒ 我们**每一轮签到**都会为一个已经领到的
+             * plan 再 mint 一次 captcha 重发一次 claim。captcha 是**设备级**配额
+             * （阿里云同设备 150 次/小时，见 `captcha-backoff.ts` 开头），
+             * 为已领的 plan 反复消耗它是净负面。
+             *
+             * ⚠ **门控严格**：只在 `outcome.ok`（`code 0` 成功 / `1003` 已领取）时发。
+             *   失败时**绝不**发（更不发 `cancel`）—— 那等于告诉服务端「别再给我看了」，
+             *   用户会**白丢一次领取机会**。`3012` 风控时 `ok` 必为 false，天然被排除。
+             * ⚠ **`await` 而不是 fire-and-forget**：它只有一跳（约数百毫秒），
+             *   而「确定性」更重要 —— 领取流程结束后宿主可能很快关掉浏览器/进程。
+             * ⚠ 它**不参与** `noteZcodeRequest*` 埋点：那套统计的是推理/领取端点的
+             *   风控画像（`zcode-diagnostics.ts`），营销端点不是风控对象。
+             * ⚠ **失败不影响领取结果**：`reportZcodeMarketingAction` 内部把异常与
+             *   非 0 业务码统一兜成 `false`，这里只记一行日志。
+             */
+            if (outcome.ok && plan.marketingCampaignId !== undefined) {
+                const reported = await reportZcodeMarketingAction(credential, plan.marketingCampaignId, 'confirm', this.fetchImpl);
+                if (!reported) {
+                    this.carrierLog?.(`zcode: 营销活动回执（confirm）未成功，campaign=${plan.marketingCampaignId}`
+                        + '（不影响本次领取结果）');
+                }
+            }
             /**
              * ★★ 命中 `3012`（风控）⇒ **终止本账号的领取，不再发后续 plan**。
              *

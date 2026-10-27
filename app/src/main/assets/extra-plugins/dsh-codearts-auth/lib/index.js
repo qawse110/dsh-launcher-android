@@ -1,7 +1,12 @@
 import { credentialRef } from '@deepseek-ai/dsh-credentials';
 import { LlmError } from '@deepseek-ai/dsh-llm';
 import Schema from '@deepseek-ai/schemastery';
-import { registerCodeArtsLlm, PROVIDER as CODEARTS_PROVIDER } from './llm-adapter.js';
+// Codely 的续期服务对象（2026-10-20：推理已走 HTTP 自签，这里只负责续期）
+import { CodelyAuth } from './codely-auth-service.js';
+import { createHash } from 'node:crypto';
+import { codeartsImagePart, codeartsVisionModel, registerCodeArtsLlm, PROVIDER as CODEARTS_PROVIDER } from './llm-adapter.js';
+// ⚠️ `analyzeImage`：让纯文本模型也能看图（2026-10-21）。模块头有完整判据链。
+import { installAnalyzeImage } from './analyze-image.js';
 import { startCatalogPrewarm } from './catalog-prewarm.js';
 import { broadcastCatalogChanged } from './catalog-broadcast.js';
 import { registerBuddyLlm } from './buddy-adapter.js';
@@ -29,6 +34,9 @@ import { registerZcodeLlm } from './zcode-adapter.js';
 import { ZCODE } from './zcode-product.js';
 import { ZCODE_CAPTCHA_FALLBACK } from './zcode-captcha.js';
 import { AccountPool, allAccountsRateLimitedForModel } from './account-pool.js';
+import { geminiFetchForAccount, setGeminiProxyPool } from './gemini-proxy.js';
+import { qoderFetchForAccount, setQoderProxyPool } from './qoder-proxy.js';
+import { foldReasonErrors } from './locked-error-text.js';
 import { MultiAccountRefreshScheduler } from './refresh-scheduler.js';
 import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } from './settings-compat.js';
 import { DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES } from './image-budget.js';
@@ -36,11 +44,12 @@ import { buildRaccoonNickname, registerJetHubRpc } from './jet-hub-rpc.js';
 import { ALL_PRODUCTS, CODEBUDDY, WORKBUDDY } from './product.js';
 import { mountOpenAiGateway } from './openai-gateway/index.js';
 import { installLoopResume } from './loop-recovery.js';
+import { installWebNative } from './web-native.js';
 import { attachTokenLedgerStore, reportLedgerAccount, } from './token-ledger.js';
 import { createTokenLedgerStore } from './token-ledger-store.js';
 import { buddyExpiringWindowDays } from './buddy-balance-rank.js';
 import { BuddyBalanceSelector } from './buddy-balance-selector.js';
-import { createCredentialResolver } from './credential-resolver.js';
+import { createCredentialResolver, NO_FREE_MODEL } from './credential-resolver.js';
 import { LOBSTERAI } from './lobsterai-product.js';
 import { QODER, QODER_CN } from './qoder-product.js';
 import { TRAE } from './trae-product.js';
@@ -49,17 +58,70 @@ import { configureDeadModelStore, withDeadModelPruning } from './dead-model-stor
 // 「锁定永久积分」的余额分档需要各家的余额查询函数：分档判据
 // （`splitBuddyCreditsByExpiry`）只读通用的 `packages[].{active, remaining,
 // deductionEndTime}`，故把各家的 fetch 指给同一个选择器即可（见各自接线处）。
+//
+// ⚠️⚠️ **每条腿都要接两样**（2026-10-21 真实报障，Qoder）：
+//   - `fetchBalance`（薄封装，`CreditBalance | null`）—— 分档器读它算桶；
+//   - `fetchBalanceDetailed`（带 `error`）—— 锁定时那句报错用它说**为什么**查不到。
+//
+// 只接 `fetchBalance` 的后果不是报错，而是**把可操作的原因换成一句无从下手的猜测**：
+// 用户看到「余额查询失败（凭据失效或响应异常）」于是去查凭据，真实原因却是网络不通
+// （Qoder 国际版 `openapi.qoder.sh` 被 SNI 阻断时**每次都**查不到，耗时 ~10.8s）。
+// 而**同一个插件**的 Jet Hub 面板走 `credits.balances`，早就用详细变体报出了
+// 「连不上 https://openapi.qoder.sh（UND_ERR_CONNECT_TIMEOUT）…请导出 HTTPS_PROXY」
+// —— 两条腿口径不一致 = 同一语义两套判据（AGENTS.md 首条红线）。
+//
+// ⚠️ 因此下面每家的注释里那句「**不要**在选号路径上改调 Detailed」已**作废**：
+// 那句话成立的前提是「选号只要余额、不要原因」，而锁定状态下**必须**有原因才能
+// 让报错指向正确方向。详细变体是薄封装的严格超集（同样能拿到 `balance`）。
 import { fetchLobsteraiCreditBalance } from './lobsterai-credits.js';
 import { fetchTraeCreditBalance } from './trae-credits.js';
+// ⚠️ Qoder **两站**的 `fetchQoderCreditBalance`（2026-10-20，同为「永久积分锁定」新增）：
+//    它只吃 `QoderCredential`、且**第三个参数才是 `fetcher`**（与 minimax / astudio
+//    那两份的 `(credential, fetcher, product)` 顺序不同，别照抄）。
+//    ⚠️⚠️ 两站**必须各传自己的 product**：`QODER` 指向 `openapi.qoder.sh`、
+//    `QODER_CN` 指向 `openapi.qoder.com.cn` —— 传错会让选号读到对方站点、
+//    余额恒查不到（未锁定 ⇒ 换号优化静默失效；锁定 ⇒ 永远报「没有可用账号」）。
+//
+//    ⚠️ `fetchQoderBalanceDetailed` 是**同一次请求**的带原因变体（可选 `timeoutMs`），
+//    两家 selector 都接了它 —— 详见上面那段长注释。
+import { fetchQoderBalanceDetailed, fetchQoderCreditBalance } from './qoder-credits.js';
+// ⚠️ astudio 的 `fetchAstudioCreditBalance` 是 2026-10-20 为「永久积分锁定」新增的
+//    薄封装（压平 `fetchAstudioBalanceDetailed` 的 `{balance, error?}` 成
+//    `CreditBalance | null`）。两个变体**都接**（见上方长注释），选号器优先用 Detailed。
+import { fetchAstudioBalanceDetailed, fetchAstudioCreditBalance } from './astudio-credits.js';
+// ⚠️ MiniMax 两站的 `fetchMinimaxCreditBalance`（2026-10-20，同为「永久积分锁定」新增）：
+//    它是 `fetchMinimaxCreditBalanceDetailed` 的薄封装。两个变体**都接**。
+//    ⚠️ 注意两站的 Detailed 签名带 `xff`（国际站要伪造 X-Forwarded-For），
+//       故接线时必须逐站传各自的 `pool.minimaxXff()`，不能照抄一个。
+import { fetchMinimaxCreditBalance, fetchMinimaxCreditBalanceDetailed } from './minimax-credits.js';
+// ⚠️ AutoClaw 两站（2026-10-21，用户要求「补锁定开关」）：`fetchAutoclawCreditBalance`
+//    是 `fetchAutoclawBalanceDetailed` 的薄封装。两个变体**都接**（见上方长注释）。
+//    ⚠️ 它的第二参是 `options?: AutoclawCreditsOptions`（`{ product, fetcher? }`），
+//    与 qoder 那份的 `(credential, product)` 位置顺序**不同**，别照抄。
+import { fetchAutoclawBalanceDetailed, fetchAutoclawCreditBalance } from './autoclaw-credits.js';
 import { MinimaxAuth } from './minimax-auth.js';
 import { registerMinimaxLlm } from './minimax-adapter.js';
-import { MINIMAX } from './minimax-product.js';
+// ⚠️ 2026-10-24 本地试验版：journal 落盘根目录（`~/.dsh`，与 state.json 同源）。
+import { resolveJetHubHome } from './jet-hub-store.js';
+// ⚠️ MiniMax 国际站的**账号出口代理**解析器（与 gemini 同款：实例住在被依赖
+//    方向的下游，避免 `index → jet-hub-rpc → index` 的 ESM 环 —— 那条环会把
+//    引用变成 TDZ ⇒ 静默恒直连）。
+//
+// ⚠️ `minimaxIntlXffForProbe` 也住在那里（PR !145 审计 P1 修法）：初版在**本文件**
+//    另开了一个 `globalThis.__jetHubMinimaxXffPool` 全局槽来给探测槽取 XFF ——
+//    同一个「池在 `apply()` 才就绪」的问题，代理用模块级 ref、XFF 用全局槽，
+//    两套机制。全局槽还有两个模块级 `let` 没有的代价：跨包副本串号
+//    （两个路径的包各有一份模块实例，但 `globalThis` 共享）、以及 dispose 后
+//    永不清理（`setMinimaxProxyPool(undefined)` 清不掉它）。
+//    ⇒ 收敛到 `minimax-proxy.ts` 的同一个 `minimaxPoolRef`，与 gemini 逐格同构。
+import { minimaxIntlFetchForAccount, minimaxIntlXffForProbe, setMinimaxProxyPool, } from './minimax-proxy.js';
+import { MINIMAX, MINIMAX_INTL } from './minimax-product.js';
 // ⚠️ `PROVIDER_REGISTRY` 供 namespace 清单派生（`registerProviderSettings` 的实参）；
 //    `descriptorOf` 供**能力注册表**逐项取元数据（见下面的注册段）。
 //    brief 原稿称「Task 1 已加过 `descriptorOf`，合并进同一行」，实测**没有** ——
 //    故 Task 2 才把它并进本行。
 import { PROVIDER_REGISTRY, descriptorOf } from './provider-registry.js';
-import { registerProviderRuntime, expiryOf, wiredRefreshTargets } from './provider-runtime.js';
+import { registerProviderRuntime, registerBalanceCache, expiryOf, runtimeOf, wiredRefreshTargets } from './provider-runtime.js';
 // ⚠️ Task 8：探测适配器的**构造**从 `account-probe.ts` 搬到本文件（注册处）——
 //    那里已改为查注册表，未登记则抛错（不再有 `else` 兜底交给 CodeArtsAdapter）。
 //    ⇒ 这里需要**全部**会写 `modelRateLimits` 的适配器类（含 loomy / raccoon，
@@ -85,9 +147,26 @@ import { RaccoonAdapter } from './raccoon-adapter.js';
 //    它的信封是 Gemini 风格（snake_case）、token 在 **body**（放 Authorization
 //    头恒流内 402）、且**不需要** SecurityGuard 签名（实测不带 `pctb-x-*` 同样 200）。
 //    详见 `docs/agent-notes/providers-accio.md`。
+import { AutoclawAuth } from './autoclaw-auth.js';
+import { registerAutoclawLlm } from './autoclaw-adapter.js';
+import { AUTOCLAW, AUTOCLAW_INTL } from './autoclaw-product.js';
+import { isAutoclawUuidUserId } from './autoclaw.js';
 import { AccioAuth } from './accio-auth.js';
-import { registerAccioLlm } from './accio-adapter.js';
+import { AccioAdapter, registerAccioLlm } from './accio-adapter.js';
 import { ACCIO } from './accio-product.js';
+// AStudio（讯飞 AstronStudio）：直连上游 MAAS。**没有 OAuth 授权页** —— 推理凭据是
+// 本机客户端登录后明文落盘会话的一份拷贝（见 astudio-auth.ts 模块头）。
+// 本家符号分属四个模块：auth 服务在 astudio-auth.ts、适配器注册在 astudio-adapter.ts、
+// 产品常量在 astudio-product.ts、纯函数与凭据类型在 astudio.ts。
+import { AstudioAuth } from './astudio-auth.js';
+import { registerAstudioLlm } from './astudio-adapter.js';
+import { ASTUDIO } from './astudio-product.js';
+// ⚠️ **本 fork 独有**的 provider（上游 rc.11 仍无 modelscope）。
+// 见 `docs/agent-notes/providers-modelscope.md` 与 `src/modelscope-product.ts` 模块头的逐条出处表。
+import { ModelscopeAuth } from './modelscope-auth.js';
+import { ModelscopeAdapter, registerModelscopeLlm } from './modelscope-adapter.js';
+import { MODELSCOPE } from './modelscope-product.js';
+import { modelscopeModelsUrl, modelscopeHeaders } from './modelscope.js';
 import { GEMINI_DEFAULT_PROJECT, GEMINI_SESSION_LANE_SMOKE } from './gemini.js';
 import { createProviderCredits, creditsOf } from './provider-credits.js';
 import { createProviderOnboarding, onboardingOf } from './provider-onboarding.js';
@@ -99,6 +178,14 @@ import { GEMINI } from './gemini.js';
 import { registerOfficeAceLlm } from './officeace-adapter.js';
 import { OFFICEACE } from './officeace-product.js';
 import * as officeaceAuth from './officeace-auth.js';
+// Codely（Unity 团结引擎）：目录 + 推理都已接通（推理 2026-10-20 起走 HTTP
+// 自签直连，`codely-sign.ts`；`CodelyAdapter` 同时供 `probeById` 探测用）。
+import { CodelyAdapter, registerCodelyLlm } from './codely-adapter.js';
+import { CODERLY } from './codely-product.js';
+import { CODELY_PROVIDER_ID, readCodelyCredential } from './codely-auth.js';
+// 「锁定永久积分」在 officeace 上的**唯一执行实现**（issue IKLTHB 第 ① 条：
+// 该渠道登记了 `permanentLock: true`，而原先全仓没有任何代码读这张锁定表）。
+import { createOfficeAceCredentialProvider } from './officeace-lock.js';
 import { createGeminiSigStore } from './gemini-sigstore.js';
 import { OpencodeAdapter, registerOpencodeLlm } from './opencode-adapter.js';
 import { AUTO_PROVIDER, registerAutoLlm } from './auto-adapter.js';
@@ -106,13 +193,24 @@ import { AGGREGATE_PROVIDER, registerAggregateLlm } from './aggregate-adapter.js
 // ⚠️ `createExpiryProbe` 从**底座**导入，不是从 `aggregate-adapter.js`
 //（它定义在 `aggregate-expiry.ts`，理由见该文件与 Task 7 的 Files 说明）。
 import { createExpiryProbe } from './aggregate-expiry.js';
+// ⚠️ 共享余额读数缓存（2026-10-15，规格 §5.7）：装配层建**一个**实例，
+//    `credits.balances` 端点与 buddy 系四家的折算共用它（见下面 `balanceCache` 的长注释）。
+import { createBalanceCache, createBalanceRefresher, REFRESH_PERIOD_FALLBACK_MS } from './balance-cache.js';
+// ⚠️ 模型目录的后台刷新器（用户 2026-10-18 要求：20 分钟定时更新）。
+//    与余额刷新器**共用同一套骨架**（武装 + 单飞 + 幂等），但**不复用实例** ——
+//    余额缓存 key 是 `(provider, accountId)`、目录的 key 是 provider，语义不同。
+import { createCatalogRefresher } from './model-catalog.js';
+// ⚠️ 中止判据复用适配器的**共享实现**（`aggregate-adapter.ts` 的 `isAbortLike`）：
+//    本仓库已有 4 份同义实现，装配层不该再添第五份。
+import { isAbortLike as isAbortLikeError } from './aggregate-adapter.js';
 import { createProviderExpiry } from './provider-expiry.js';
 // ⚠️ opencode 的 RPC 由 `jet-hub-rpc.ts` 的 handleMethod 统一分派
 // （它调 handleOpencodeRpc），本文件**不再**单独注册端点 —— 详见
 // `opencode-rpc.ts` 模块头「为什么是被主 switch 调用」。
 import { ensureDefaultAnonymousSlot, listIdentitySlots, poolEntrySnapshot, } from './opencode-auth.js';
 import { OPENCODE } from './opencode-product.js';
-import { primeOpencodeCapabilities, refreshOpencodeCapabilities } from './opencode-capability.js';
+import { MODELS_DEV_TTL_MS, primeModelsDev, refreshModelsDev } from './models-dev-cache.js';
+import { invalidateOpencodeCapabilities } from './opencode-capability.js';
 import { closeAllProxyDispatchers } from './opencode-proxy.js';
 import { execFile } from 'node:child_process';
 /**
@@ -290,6 +388,124 @@ export function makeReadImageRequest(ctx) {
     };
 }
 /**
+ * **AutoClaw 存量账号自愈**：先补齐 `user_id`，再按它去重。
+ *
+ * ## 为什么要「先补齐」（两轮失败才换来这一步）
+ *
+ * 用户三次报障「同一账号被加了 3 次」。实测三条凭据的字段形态**不一致**：
+ *
+ * | ref | 凭据 `user_id` | JWT `user_id` | JWT `guid` |
+ * |---|---|---|---|
+ * | `A6539467` | —（无该字段） | `839684` | `""`（空串） |
+ * | `D6BF9EB2` | —（无该字段） | `839684` | `""`（空串） |
+ * | `A3C56DD6` | `7c54a9a…`（UUID） | `839684` | `""`（空串） |
+ *
+ * 即存在两个**互不相通**的 id 空间：
+ *
+ * - **UUID**（`7c54a9acc…`）= 账号主键，服务端 `user-profile` 与凭据字段都用它；
+ * - **`numericUserId`**（`839684`）= JWT 的 `user_id`，纯数字。
+ *
+ * 「字段优先、JWT 兜底」会让前两条落到 `839684`、第三条落到 UUID
+ * ⇒ **分裂成两组、一条都去不掉**（用户二次报障「怎么还是在啊」的直接原因）。
+ *
+ * ## 定稿做法
+ *
+ * 1. 逐条 ref 调 `POST /userapi/v1/user-profile`（实测三条都拿回同一个 UUID），
+ *    把 `user_id` **写回凭据**；
+ * 2. 补齐后全池统一按 `user_id` 分组去重（`dedupeByCredentialField`）。
+ *
+ * ⚠️ 全程**尽力而为**：单条补齐失败只跳过该条、记 warn，绝不让启动失败。
+ * ⚠️ 网络请求按 8s 超时，N 条串行最坏 N×8s —— 但它是 `void` 起的，
+ *    不阻塞插件启动，也不阻塞用户第一条消息。
+ */
+async function autoclawSelfHeal(pool, ctx) {
+    // ⚠️⚠️ **读池本身也会抛**（2026-10-20 合并审计补记，实测有牙）：
+    //    `AccountPool.listAccountsByProvider()` → `readAccounts()` → `ensureLoaded()`
+    //    → `SettingsStore.load()` 在 scope 尚未就绪时抛 `TypeError`。原先只有
+    //    **per-条目** 的 try 包住循环体，读池这一句在 try **之外** ⇒ 一抛就是
+    //    **未捕获 rejection**（Node 默认 `--unhandled-rejections=throw`），
+    //    全量单测实测 52 条 `Unhandled Rejection`。
+    //    自愈是**尽力而为**：任何失败都只能记 warn，绝不能让启动失败。
+    let entries;
+    try {
+        entries = pool.listAccountsByProvider('autoclaw');
+    }
+    catch (error) {
+        ctx.logger?.warn?.(`[autoclaw] 账号自愈读池失败（不影响启动）：`
+            + `${error instanceof Error ? error.message : String(error)}`);
+        return;
+    }
+    if (entries.length < 2)
+        return;
+    // ── ① 补齐 user_id（只补缺的那条）──
+    for (const entry of entries) {
+        try {
+            const raw = await ctx.credentials.resolve(credentialRef(entry.credentialRef));
+            if (raw === undefined || raw.value.length === 0)
+                continue;
+            const cred = JSON.parse(raw.value);
+            // ⚠️⚠️ **跳过条件必须是「已经是 UUID」，不能是「有值」**
+            //    （2026-10-20 审计 P1，实测真缺陷）。
+            //
+            //    登录路径用 `readUserIdFromJwt()` 写回的 `user_id` 是**字符串形态的
+            //    数字 id**（`String(839684)` ⇒ `"839684"`），原判据
+            //    `typeof === 'string' && trim() !== ''` 对它**恒真** ⇒ 自愈从不为
+            //    PR 之后新登录的账号补 UUID ⇒ 池里永久并存 `autoclaw:839684` 与
+            //    `autoclaw:7c54a9a…` 两组 ⇒ 去重对混合池无效（PR 要修的症状原样存在）。
+            //
+            //    ⇒ 只有「已经是 UUID 主键」才算补齐完成。
+            if (isAutoclawUuidUserId(cred.user_id))
+                continue;
+            const token = typeof cred.access_token === 'string' ? cred.access_token : '';
+            const device = typeof cred.device_id === 'string' ? cred.device_id : '';
+            if (token === '' || device === '')
+                continue;
+            const ts = Math.floor(Date.now() / 1000).toString();
+            const sign = createHash('md5').update(`${AUTOCLAW.appId}&${ts}&${AUTOCLAW.appKey}`).digest('hex');
+            const resp = await fetch(`${AUTOCLAW.apiBase}/userapi/v1/user-profile`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Auth-Appid': AUTOCLAW.appId,
+                    'X-Auth-TimeStamp': ts,
+                    'X-Auth-Sign': sign,
+                    'X-Lang': 'zh-CN',
+                    'X-Channel': 'official',
+                    'Authorization': `Bearer ${token}`,
+                    'X-Authorization': `Bearer ${token}`,
+                },
+                body: JSON.stringify({ source_id: 'autoclaw', device_id: device }),
+                signal: AbortSignal.timeout(8000),
+            });
+            if (!resp.ok) {
+                ctx.logger?.warn?.(`[autoclaw] 账号 ${entry.id} 补齐 user_id 失败（HTTP ${resp.status}），跳过该条`);
+                continue;
+            }
+            const json = (await resp.json());
+            const userId = json.data?.user_id;
+            if (json.code !== 0 || typeof userId !== 'string' || userId.trim() === '') {
+                ctx.logger?.warn?.(`[autoclaw] 账号 ${entry.id} 补齐 user_id 失败（code=${json.code}），跳过该条`);
+                continue;
+            }
+            // ⚠️ 只改 `user_id` 一个键，其余凭据字段原样保留
+            //    （access_token/refresh_token/device_id 一个字节都不能动）。
+            await ctx.credentials.set(credentialRef(entry.credentialRef), JSON.stringify({ ...cred, user_id: userId.trim() }));
+            ctx.logger?.info?.(`[autoclaw] 账号 ${entry.id} 已补齐 user_id（${userId.trim().slice(0, 8)}…）`);
+        }
+        catch (error) {
+            ctx.logger?.warn?.(`[autoclaw] 账号 ${entry.id} 自愈异常（不影响启动）：`
+                + `${error instanceof Error ? error.message : String(error)}`);
+        }
+    }
+    // ── ② 按补齐后的 user_id 去重 ──
+    // ⚠️ **不再给兜底解析器**：此时所有 ref 都应当有 UUID，
+    //    若有（网络全失败），跳过总比误删好。
+    const removed = await pool.dedupeByCredentialField('autoclaw', 'user_id');
+    if (removed > 0) {
+        ctx.logger?.warn?.(`[autoclaw] 已清理 ${removed} 条重复账号（同一账号被重复添加导致积分累加翻倍）`);
+    }
+}
+/**
  * 「重测」用的**探测适配器工厂**（Task 8）。
  *
  * ⚠️ 各家代码**逐字**从 `src/account-probe.ts` 的 `else if` 链搬来（含各自的
@@ -372,19 +588,36 @@ export const probeById = {
     // 工具/图片，故除了 product 之外无需注入其它钩子；`uid` 由凭据自身携带
     //（旧凭据缺 uid 时适配器会明确报错，而不是发出必然失败的请求）。
     qoder: {
-        createProbeAdapter: (ref, credential) => new QoderAdapter({
+        // ⚠️ **第三个形参 `entry` 不能丢**（与 gemini 的同款缺口，IKLTZ2 审计 P1-1）：
+        //    探测路径**刻意不传 `accountPool`**（`account-probe.ts` 的既定语义：
+        //    只测这一个账号、且不写任何标记）⇒ 适配器内「按凭据反查账号 id」那条路
+        //    **根本不存在** ⇒ 出口解析器拿到空 id、按「直连」处理 ⇒
+        //    **该账号配的代理被完全绕过**。症状与 issue 原话同形：墙外环境下
+        //    「测试 / 重测」**恒失败**，而这个失败与「账号已失效」在 UI 上完全同形
+        //    ⇒ 用户会去误删好号。
+        //
+        // ⚠️ 用 `currentAccountId` 而不是新加一个 `accountIdOverride`：`QoderAdapter`
+        //    的取号权威本来就是那个回调（推理通道按 `activeAccountId` 现取、原生
+        //    搜索也走它），为探测再造一个 override 字段会让两条路分叉。
+        //    探测只有这一个账号 ⇒ 回调恒返回它，与生产语义一致。
+        createProbeAdapter: (ref, credential, entry) => new QoderAdapter({
             credentialRef: credentialRef(ref),
             resolveCredential: async () => credential,
             refresh: async () => { },
             product: QODER,
+            fetchFor: qoderFetchForAccount,
+            currentAccountId: () => entry?.id ?? '',
         }),
     },
     qodercn: {
-        createProbeAdapter: (ref, credential) => new QoderAdapter({
+        // 同上：两站共用同一个适配器类，只换 product。
+        createProbeAdapter: (ref, credential, entry) => new QoderAdapter({
             credentialRef: credentialRef(ref),
             resolveCredential: async () => credential,
             refresh: async () => { },
             product: QODER_CN,
+            fetchFor: qoderFetchForAccount,
+            currentAccountId: () => entry?.id ?? '',
         }),
     },
     // Cline → WorkOS 凭据 + 自己的端点。
@@ -394,6 +627,21 @@ export const probeById = {
             resolveCredential: async () => credential,
             refresh: async () => { },
             product: CLINE,
+        }),
+    },
+    // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。
+    //
+    // 探测只发一次最小请求（`probe` 走适配器的 `listModels` / 一次最小补全），
+    // 故只需把**这一份凭据**喂进 `slots`（单槽），不需要池 —— 与 cline 同款。
+    // ⚠️ `fetchRemoteCatalog` 留空：目录探测不是「探活」的职责，
+    //    且它会在 `listModels` 里回退兜底表（不会抛）。
+    modelscope: {
+        createProbeAdapter: (ref, credential) => new ModelscopeAdapter({
+            credentialRef: credentialRef(ref),
+            slots: async () => [{ id: MODELSCOPE.id, apiKey: credential.access_token }],
+            product: MODELSCOPE,
+            // ⚠️ 不传 `warn`：`probeById` 是**模块级**常量（在 `apply()` 之前求值），
+            //    此处**没有 `ctx`**。与 cline / lobsterai 的 probe 条目同款。
         }),
     },
     // ZCode（智谱）→ Anthropic Messages 体 + 阿里云 captcha 参数。
@@ -440,13 +688,27 @@ export const probeById = {
     // 会让探测报「项目号探测失败」而不是它真正要报的「账号仍受限」—— 反而掩盖
     // 了用户点「重测」想知道的答案。探测**不写**任何东西（不传 persistProject）。
     gemini: {
-        createProbeAdapter: (ref, credential) => new GeminiAdapter({
+        // ⚠️ **第三个形参 `entry` 不能丢**（IKLTZ2 审计 P1-1，真实缺陷）：
+        // 探测路径**刻意不传 `accountPool`**（`account-probe.ts` 的既定语义：
+        // 只测这一个账号、且不写任何标记）⇒ 适配器内那条「按 access_token 反查
+        // 账号 id」的路**根本不存在** ⇒ 出口解析器拿到空 id、按「直连」处理
+        // ⇒ **该账号的代理被完全绕过**。
+        // 症状与 issue 原话同形：墙外环境下「测试 / 重测」**恒失败**，而这个失败
+        // 与「账号已失效」在 UI 上完全同形 ⇒ 用户会去误删好号。
+        //
+        // ⚠️ 对照 opencode 的 `(ref, credential, entry)`（下方 L649）：它接下了
+        // entry 并把 `entry.opencodeProxy` 喂进槽里，本家原先漏了这一步。
+        createProbeAdapter: (ref, credential, entry) => new GeminiAdapter({
             credentialRef: credentialRef(ref),
             resolveCredential: async () => credential,
             refresh: async () => { },
             sessionLane: GEMINI_SESSION_LANE_SMOKE,
             project: GEMINI_DEFAULT_PROJECT,
             product: GEMINI,
+            // ⚠️ **探测必须走该账号的代理**：账号卡片上的「测试 / 重测」按钮打的是
+            // 真实推理端点，而 Gemini 全部端点都在墙外。
+            fetchFor: geminiFetchForAccount,
+            accountIdOverride: entry?.id ?? '',
         }),
     },
     // CodeArts → 华为云 HMAC 签名（**它自己的**签名方案，不是「兜底」）。
@@ -492,6 +754,52 @@ export const probeById = {
             resolveCredential: async () => credential,
             refresh: async () => { },
             product: MINIMAX,
+        }),
+    },
+    // MiniMax Code 国际版 —— 与中国版同因（它同样会写 `modelRateLimits`），
+    // 只是 product 换成 `MINIMAX_INTL`（探测请求必须打到 `agent.minimax.io`，
+    // 否则国际站账号的「重测」会用国内站主机发凭据、必然 401 ⇒ 标记永远清不掉）。
+    //
+    // ⚠️⚠️ **国际站的探测必须走该账号的出口**（第三个形参 `entry` 不能丢）：
+    // 探测路径**刻意不传 `accountPool`**（`account-probe.ts` 的既定语义：只测
+    // 这一个账号、且不写任何标记）⇒ 适配器内那条「按 access_token 反查账号 id」
+    // 的路**根本不存在** ⇒ 出口解析器拿到空 id、按「直连」处理 ⇒ **该账号的代理
+    // 被完全绕过**。症状与报障同形：国际站「测试 / 重测」恒失败，而这个失败与
+    // 「账号已失效」在 UI 上完全同形 ⇒ 用户会去误删好号（与 Gemini 的
+    // `accountIdOverride` 是同一个缺陷形态）。
+    minimaxintl: {
+        createProbeAdapter: (ref, credential, entry) => new MinimaxAdapter({
+            credentialRef: credentialRef(ref),
+            resolveCredential: async () => credential,
+            refresh: async () => { },
+            product: MINIMAX_INTL,
+            fetchFor: minimaxIntlFetchForAccount,
+            accountIdOverride: entry?.id ?? '',
+            // ⚠️ 探测**无池** ⇒ `send()` 里从池读 `minimaxXff()` 那条腿恒空 ⇒
+            //    用户设好的 XFF 在「测试 / 重测」上不生效，大陆出口的探测恒
+            //    307 → 401（与「凭据失效」同形；2026-10-24 活体实测）。
+            //    这里显式带上池的当前值（只读，不违反「探测不写状态」）。
+            //    ⚠️ probeById 是**模块级常量**（`pool` 在 `apply()` 里才存在），
+            //    故经可后填的取值函数现读（与 `minimaxIntlFetchForAccount` 同一模式），
+            //    池未就绪时返回 undefined = 不附 XFF（与既有行为一致）。
+            xffOverride: minimaxIntlXffForProbe(),
+        }),
+    },
+    // Accio（阿里）→ 自己的网关端点。
+    //
+    // ⚠️ 它**曾经**不必在这里（issue IKM3ZV 之前：适配器不写 `modelRateLimits`，
+    // `provider-registry.ts` 的 `rateLimit: false` 与 `WRITES_RATE_LIMIT_PROVIDERS`
+    // 都据此把它排除）。2026-10-18 接上请求级换号 + 冷却后它**会写**标记
+    // （额度至 UTC+8 当日 24:00 / 限流 1h）⇒ 必须登记，否则标记写进去却清不掉。
+    //
+    // ⚠️ 刻意**不传** `accountPool`（与 minimax 同一理由）：那会让 `stream()` 的
+    // 反查与轮换在探测路径上复活（探测失败若写回限流标记，会把「重测 A 账号」
+    // 变成污染池的副作用）。也**不传** `fetchRemoteModels` / `readImage`。
+    accio: {
+        createProbeAdapter: (ref, credential) => new AccioAdapter({
+            resolveCredential: async () => credential,
+            refresh: async () => { },
+            product: ACCIO,
         }),
     },
     // OpenCode Zen。
@@ -560,6 +868,22 @@ export const probeById = {
             });
         },
     },
+    // Codely（Unity 团结引擎）→ **本 fork 独有**（2026-10-20）。
+    //
+    // 适配器接上了请求级换号 + 冷却（`codely-adapter.ts` 的 `updateModelRateLimit`
+    // 写点：402/预算耗尽 → UTC+8 次日 0 点、429 → 1h）⇒ 必须登记探测适配器，
+    // 否则标记写进去永远清不掉（minimax / accio 同型缺陷第 N 次）。
+    //
+    // 探测只发一次最小请求（`/api/model-status`，Bearer 即可、无需签名）⇒ 单槽
+    // 喂这一份凭据即可，不需要池（与 modelscope / accio 同款）。
+    // ⚠️ 刻意**不传** `accountPool`：那会让 `stream()` 的换号在探测路径上复活
+    //（探测失败若写回限流标记，会把「重测 A 账号」变成污染池的副作用）；
+    // 也不传 `readImage`（探测是轻量存活检查，不为它拉图片通道）。
+    codely: {
+        createProbeAdapter: (_ref, credential) => new CodelyAdapter({
+            credentialProvider: async () => credential,
+        }),
+    },
 };
 /** 注册 codeartsAuth 服务与 codearts LLM 路由（不注册斜杠命令）。 */
 export function apply(ctx) {
@@ -593,6 +917,154 @@ export function apply(ctx) {
         .filter((ns) => ns !== undefined));
     const service = new CodeArtsAuth(ctx);
     const pool = new AccountPool(ctx);
+    /**
+     * **AutoClaw 存量账号去重自愈**（2026-10-19 用户三次报障后定稿）。
+     *
+     * 用户形态：面板里同一个手机号出现 **3 次**，积分被重复累加
+     *（20842 + 20842 + 20842 = 62526，真实余额只有 20842）。
+     *
+     * ## 为什么不能只按凭据字段 `user_id` 去重（两轮失败的原因）
+     *
+     * 实测三条凭据的字段形态**不一致**：
+     *
+     * | ref | 凭据 `user_id` | JWT `user_id` | JWT `guid` |
+     * |---|---|---|---|
+     * | `A6539467` | —（无） | `839684` | `""`（空） |
+     * | `D6BF9EB2` | —（无） | `839684` | `""`（空） |
+     * | `A3C56DD6` | `7c54a9a…`（UUID） | `839684` | `""`（空） |
+     *
+     * ⇒ 有两个**互不相通**的 id 空间：UUID（账号主键，服务端 `user-profile`
+     *    也用它）与 `numericUserId`（JWT 的 `user_id`，纯数字）。
+     *    「字段优先、JWT 兜底」会让前两条落到 `839684`、第三条落到 UUID
+     *    ⇒ **分裂成两组，一条都去不掉**（用户二次报障「怎么还是在啊」）。
+     *
+     * ## 定稿做法：先用服务端把 UUID **补齐**，再按 UUID 去重
+     *
+     * 1. 逐条 ref 调 `user-profile`（实测三条都能拿回同一个 UUID）把
+     *    `user_id` 字段**写回凭据** —— 这一步同时修好了「老凭据缺字段」；
+     * 2. 补齐后全池统一按 `user_id`（UUID）分组去重。
+     *
+     * ⚠️ **异步、不阻塞启动**：`void` 而非 `await`。补齐要走 N 次网络，
+     *    等它会让插件启动慢一拍；失败也只记 warn（自愈是尽力而为）。
+     * ⚠️ **只对 autoclaw 启用**：其他渠道的 `access_token` 会轮换，
+     *    拿它去重会把**不同账号误合并**。这是按渠道逐个放开的白名单。
+     * ⚠️⚠️ `void` 起**必须挂 `.catch`**（双保险）：函数内部已对读池与逐条
+     *    失败各自兜底，但「`void` 一个 async 函数」本身就是未捕获 rejection 的
+     *    入口 —— 将来有人在函数里加一条会抛的新腿，这里仍能兜住并留下日志。
+     */
+    void autoclawSelfHeal(pool, ctx).catch((error) => {
+        ctx.logger?.warn?.(`[autoclaw] 账号自愈失败（不影响启动）：`
+            + `${error instanceof Error ? error.message : String(error)}`);
+    });
+    /**
+     * ★★ **共享余额读数缓存**（2026-10-15 规格 §5.7；2026-10-16 起 loomy 也接入）——
+     * 本进程**唯一**的一份。
+     *
+     * ## ⚠️⚠️ 为什么必须建在**这里**（位置不变式）
+     *
+     * 消费者有三处，定义顺序不能变：
+     * ① loomy 选号器（`loomyBalanceSelector`，约在本段之后）—— 2026-10-16 新增；
+     * ② `credits.balances` 端点（经 `registerBalanceCache` 的进程级注册位）；
+     * ③ 聚合折算（`sharedExpiryProbe` 的 `balanceOf`）。
+     *
+     * ⚠️ 我第一版把它留在文件后段（`sharedExpiryProbe` 旁边）⇒ ① 会读到
+     *   **尚未初始化的 `const`**（TDZ）—— `tsc` 不报错（`const` 在模块作用域
+     *   有块级作用域，闭包里引用合法），只在 loomy 首次选号时抛
+     *   `ReferenceError`。⇒ 位置本身就是一条不变式，登记在此。
+     *
+     * ## 谁在用它（各有各的取舍）
+     *
+     * | 消费者 | 传哪些账号 | 为什么 |
+     * |---|---|---|
+     * | `credits.balances` 端点（积分面板 / 徽标） | **全部**账号（含停用 —— 既有语义） | 用户要在同一个列表里看到每个账号还剩多少 |
+     * | loomy 选号（余额分档） | **候选**账号（已过滤 enabled/限流） | 不该用没资格的号去推断整体 |
+     * | 聚合折算（buddy 系四家） | **可用**账号 | 不可用的账号本来就不该参与候选 |
+     *
+     * ⇒ 「谁该被读」是**调用方的取舍**，「同一账号的读数在 TTL 内复用」才是本缓存
+     * 提供的**基础设施**（用户 2026-10-15 的更正原话见 `balance-cache.ts` 模块头）。
+     *
+     * ⚠️⚠️ **必须是同一个实例**：两次 `createBalanceCache` 会让同一个账号被查两次
+     *（那正是本模块要消除的），且 `clear` 也得分两次 —— 与 `sharedExpiryProbe` 那条
+     * 「初版内联导致两份缓存」的真实缺陷**同型**。
+     *
+     * ⚠️ TTL 120 秒（规格 §5.7.4-3 的诚实登记）：聚合是**多候选回落**结构，
+     *   陈旧 60 秒的代价是「多一次失败尝试后回落」（用户看不到失败），换来上游
+     *   请求不翻倍；面板侧有 5 分钟重探与手动 `force` 兜底。
+     *
+     * ⚠️ 陈旧兼顶上界 15 分钟（`staleTtlMs`）：用户 2026-10-16 要求
+     *   「拿不到新数据就读旧数据」，但必须有上界 —— 见 `balance-cache.ts` 的注释。
+     */
+    const balanceCache = createBalanceCache({
+        ttlMs: 120_000,
+        failureTtlMs: 15_000,
+        // ⚠️ 中止判据**复用**适配器导出的共享实现（它含 `code: 'ABORTED'` 与 499 报文
+        //    两条腿）—— 不要在装配层再写一份（本仓库已有 4 份同义实现，别再添第五份）。
+        isAbort: (error) => isAbortLikeError(error),
+        fetch: (provider, entry) => fetchBalanceReading(pool, provider, entry),
+    });
+    // ⚠️ 注册到**进程级**注册位：`credits.balances` 端点拿不到本函数的局部变量
+    //   （`registerJetHubRpc` 的 4 形参不变式不许加第 5 个），故走与
+    //   `ProviderRuntime.credits` 同一张表（见 `provider-runtime.ts` 的说明）。
+    //   ⚠️ 未注册 ⇒ 端点回退到自己的原路径（行为与升级前一致）—— 那是刻意的降级。
+    registerBalanceCache(balanceCache);
+    /**
+     * ★★ **余额缓存的后台刷新器**（2026-10-18，Task 2）。
+     *
+     * ## 为什么必须有它（用户原话）
+     *
+     * 「这个 2 分钟是 interval 不是 timeout」—— 原实现是 cache-aside（读驱动），
+     * 而读路径在提交 `a725101` 之后陈旧命中**一个请求都不发** ⇒ 没有任何东西会再取
+     * 新数据 ⇒ 缓存会永远陈旧。本刷新器补上「后台保鲜」那一半。
+     *
+     * ## ⚠️ 位置不变式
+     *
+     * 必须建在 `balanceCache` **之后**：它要拿缓存实例（与上面那条位置不变式同源）。
+     *
+     * ## ⚠️ 凭据必须**在装配层解析**
+     *
+     * `fetchBalanceReading`（本文件下方）在 `entry.credential === undefined` 时
+     * 直接抛「凭据未提供」⇒ 刷新器若传空 entry，**每一轮都被记成失败读数**
+     * （外面看「刷新器在跑」，实则永远拿不到新值 —— 零报错的恒绿形态）。
+     * ⇒ 这里按 `credentialRef` 解析（与 `jet-hub-rpc.ts` 的
+     *   `resolveCredentialForCache` **同款**口径）；解析失败返回 undefined，
+     *   刷新器据此**跳过**该账号（那一枪必然失败，纯浪费）。
+     */
+    const balanceRefresher = createBalanceRefresher(balanceCache, {
+        // ⚠️ `listAllAccounts()` 实测是 **async**（`src/account-pool.ts:1308`）；
+        //    刷新器内部一律 `await`，直接传引用即可。
+        // ⚠️ 传**全部**账号（含停用）：停用只影响自动选号（仓库铁律「续期不得按
+        //    `enabled` 过滤」），凭据仍需保鲜 —— 由刷新器自己判低频节奏。
+        listAccounts: () => pool.listAllAccounts(),
+        resolveCredential: async (refName) => {
+            const resolved = await ctx.credentials.resolve(credentialRef(refName));
+            if (resolved === undefined)
+                return undefined;
+            try {
+                return JSON.parse(resolved.value);
+            }
+            catch {
+                return undefined;
+            }
+        },
+        // ⚠️ **引用常量、不要重打 `60_000`**（2026-10-18 复审 Minor 修正）：
+        //    装配层与 `createBalanceRefresher` 各写一份同一个字面量，等于把
+        //    `DEFAULT_STALE_TTL_MS` 刚消灭掉的那类重复又引入了一次。
+        //    ⚠️ **理由（别丢）**：周期 = 共享缓存 `ttlMs`(120s) 的**一半** ——
+        //    周期恰等于 `ttlMs` 时条目在刚过期那一刻才被刷，读路径仍会频繁撞上
+        //    「陈旧且后台刚开始刷」，常新目标落空；取一半 ⇒ 任何时刻至少有半个周期余量。
+        intervalMs: REFRESH_PERIOD_FALLBACK_MS,
+        // ⚠️⚠️ **日志必须接上**：刷新器把失败吞掉并记日志（后台没有调用方可通知）
+        //    ⇒ 不接 logger 就是**完全静默**：面板只显示「查询失败」，用户与维护者
+        //    都看不到「后台刷新器压根没在刷」。这两行同时是接线守卫的判据落点。
+        info: (message) => ctx.logger?.info?.(message),
+        warn: (message) => ctx.logger?.warn?.(message),
+    });
+    // 生命周期挂 `ctx.effect`，与插件一致（释放后停手）—— 与既有 `modelsDevTimer`、
+    // `startCatalogPrewarm` 同款约定。
+    ctx.effect(() => {
+        balanceRefresher.start();
+        return () => { balanceRefresher.stop(); };
+    });
     // CodeArts 目录的**各来源成败**出参（issue IKJVTF 复审，审计 I3）：
     // `service.refreshModels` 每轮原地写入，适配器的 `catalogComplete` 读它。
     // 初值两个 false —— 在首轮真正拉取之前，**没有**任何来源可算「取到」。
@@ -681,7 +1153,69 @@ export function apply(ctx) {
             return outcome === undefined ? undefined : isRemoteCatalogComplete(outcome);
         },
         accountPool: pool,
+        // 图片字节桥接（2026-10-21 接通）。
+        //
+        // ⚠️ 复用**同一个** `makeReadImage(ctx)` —— 不另写第二套（其余 14 家全走它）。
+        //
+        // ⚠️ 只有 VL 模型（`kimi-k2.6-vl` / `Qwen3-VL-235B`）能收图，实测文本模型
+        //    发图回 `InferHub.001001020.406 The request model is not multimodal`。
+        //    适配器内部按 `codeartsAcceptsImage(model)` 判定，非 VL 模型**根本不读字节**
+        //    （见 `stream()` 的注释），故这里不必再加一层判据。
+        readImage: makeReadImage(ctx),
     });
+    /**
+     * `analyzeImage`：让**纯文本模型**也能看图（2026-10-21，用户诉求）。
+     *
+     * ## 为什么走适配器自己的 `stream()` 而不是 `ctx.llm.stream()`
+     *
+     * 直接用本适配器实例有三个好处，且都是**必须**的：
+     * 1. 复用同一套凭据解析与**请求级换号**（池里哪个号能用、撞额度怎么换）；
+     * 2. 复用 `codeartsAcceptsImage` 的读图闸门与 `image_url` 序列化（同一份实现）；
+     * 3. 不经过 `ctx.llm` 的路由投影 —— 那条路会按**目标模型**的模态再判一遍。
+     *
+     * ## ⚠️ 每次识图是**一次独立的、非会话的**上游请求
+     *
+     * 它不写进会话历史、不占会话的 tool 轮次，与 IDE 的 `analyzeImage` 同构。
+     * 故这里手工构造 `messages`（不传 `tools`、不传 system）。
+     */
+    const describeWithVision = async (imageDataUrls, prompt, signal) => {
+        const visionModel = codeartsVisionModel();
+        const parts = [
+            ...imageDataUrls.map((url) => codeartsImagePart(url)),
+            { type: 'text', text: prompt },
+        ];
+        let text = '';
+        for await (const chunk of codearts.stream({
+            provider: CODEARTS_PROVIDER,
+            model: visionModel,
+            messages: [{ role: 'user', content: parts }],
+            signal,
+        })) {
+            const typed = chunk;
+            if (typed.type === 'text-delta' && typeof typed.text === 'string')
+                text += typed.text;
+        }
+        if (text.trim().length === 0) {
+            // ⚠️ 空正文要**明确报错**而不是返回空串：空串会让主模型以为"图上什么都没有"，
+            // 从而给用户一个自信的错误答案（本仓对「空响应」一贯如此处理）。
+            throw new Error(`analyzeImage: 识图模型（${visionModel}）没有返回任何文字；`
+                + '可能是上游排队或图片格式不被接受，请稍后重试。');
+        }
+        return text;
+    };
+    installAnalyzeImage(ctx, { readImage: makeReadImage(ctx), describe: describeWithVision }, (exec) => {
+        // 与官方 `read_image` 的 `assertImageCapableRoute` 同一手法：
+        // 先读会话已折叠的 `request/header` 路由，再回退到 agent options。
+        const agent = exec.agent;
+        const routed = agent?.session?.requestHeader?.()?.config;
+        return {
+            provider: routed?.provider ?? agent?.options?.provider,
+            model: routed?.model ?? agent?.options?.model,
+        };
+    }, 
+    // ⚠️ 传 logger：`DSH_DISABLE_ANALYZE_IMAGE` 关闸时必须**留一条日志**，
+    //    否则「工具不见了」与「注册静默失败」同形（后者是本工具栽过的坑）。
+    { info: (message) => ctx.logger?.info?.(message) });
     // ===== Buddy (腾讯 CodeBuddy) 服务 =====
     // 不注册斜杠命令：登录/状态/续期都在 Jet Hub 设置页完成（多账号 + 账号池），
     // 命令式的单凭据入口已无必要。
@@ -773,10 +1307,27 @@ export function apply(ctx) {
     /**
      * 「锁定永久积分 + 无可用账号」的报错文案（buddy / workbuddy / lobsterai / trae 共用）。
      *
-     * ## ⚠️ 必须**分两种原因**报（与 Loomy 那条同型缺陷）
+     * ## ⚠️ 必须**分四种原因**报（与 Loomy 那条同型缺陷）
      *
      * 把「余额查询失败（一次网络抖动）」混成「额度已用尽」，用户会去解锁、
      * 或白等到明天 —— 而号其实有钱。故 `kind === 'unknown'` 单独一条文案。
+     *
+     * 同理，`kind === 'no-candidates'`（**一个候选都没筛出来**，余额分档压根
+     * 没跑）也绝不能报「积分都已用尽」：那是在替服务端断言一件我们从没查过的
+     * 事（真实报障 2026-10-13，CodeBuddy：`明明有积分却显示不可用`）。
+     * ⚠️ 全被模型限流这一支已在 `credential-resolver.ts` 用
+     * `throwIfAllRateLimited` 提前拦下（报出解禁时刻），故走到本分支的
+     * `no-candidates` 主要是「没有任何启用中的账号」——但文案仍**并列**两种
+     * 可能，不把话说死：判定本身依赖 `throwIfAllRateLimited` 被接线，
+     * 谎报一个确定原因会把用户指向错误的方向。
+     *
+     * ⚠️ `kind === 'credential-only'`（**余额分档确实选出了有可用积分的号，
+     * 只是那些号的凭据读不出来**）同样**绝不能**报「积分都已用尽」——
+     * 那是**自相矛盾**（分档刚证明它有钱），且会把用户推向「解锁永久积分」
+     * （不可撤回地烧钱）。这是 2026-10-14 审计实测打穿的漏网路径：
+     * `pickBuddyAccount` 的 `reason` 在「候选非空但凭据全坏」时曾保持 `undefined`，
+     * 被调用方的 `?? { kind: 'exhausted' }` 兜成「已用尽」。
+     * 该文案必须**正向点名凭据**，并**明确劝阻解锁**。
      *
      * ## 为什么抽成函数而不是四家各写一遍
      *
@@ -788,28 +1339,530 @@ export function apply(ctx) {
     const buddyLockedError = (displayName) => (reason) => {
         const days = buddyExpiringWindowDays();
         if (reason.kind === 'unknown') {
-            return new Error(`${displayName}：无法确认是否有可用账号。已锁定永久积分，而部分账号的余额查询失败`
-                + `（${reason.errors.slice(0, 2).join('；')}）。这些账号**可能仍有**「${days} 天内到期」`
-                + '的积分 —— 请重试，或在 Jet Hub 对应面板检查凭据是否失效。');
+            return new LlmError(`${displayName}：无法确认是否有可用账号。已锁定永久积分，而本次余额查询未能全部完成`
+                + `（${foldReasonErrors(reason.errors)}）。这些账号**可能仍有**「${days} 天内到期」`
+                + '的积分 —— 请重试，或在 Jet Hub 对应面板检查凭据是否失效。', 'QUOTA_EXCEEDED');
         }
-        return new Error(`${displayName}：没有可用账号。已锁定永久积分，而所有账号的「${days} 天内到期」`
+        if (reason.kind === 'no-candidates') {
+            return new LlmError(`${displayName}：没有可用账号。已锁定永久积分，而本次**没有任何候选账号**`
+                + '（该 provider 下没有启用中的账号，或全部账号都在本次请求的模型上受限）。'
+                + `请在 Jet Hub 的 ${displayName} 面板确认账号已启用、且未全部处于限流中；`
+                + '或改用其它 provider / 模型，或解锁永久积分后重试。', 'QUOTA_EXCEEDED');
+        }
+        if (reason.kind === 'credential-only') {
+            // ⚠️ **必须与「积分用尽」逐字分开**，且要**明确劝阻解锁**：解锁会不可
+            //    撤回地烧掉永久积分，而本情形的根因在凭据、与积分无关。
+            return new LlmError(`${displayName}：无法使用任何账号。已锁定永久积分，而余额分档**确实选出了**`
+                + '有可用积分的账号 —— 但它们的**凭据读不出来**（凭据缺失 / 已失效 / 被并发续期覆盖）。'
+                + '⚠️ 这与「积分用尽」是两件事，**不要去解锁永久积分**（解锁会不可撤回地烧掉它们）。'
+                + `请在 Jet Hub 的 ${displayName} 面板检查这些账号的凭据，必要时重新登录。`, 'QUOTA_EXCEEDED');
+        }
+        /**
+         * ⚠️⚠️ **穷尽性守卫**（2026-10-14 审计新增）：走到这里**只允许**是
+         * `{ kind: 'exhausted' }` —— 它是**唯一**有事实依据可以说「积分用尽」的一档
+         * （余额分档真的查过，且每个候选的可用积分都确实是 0）。
+         *
+         * 这里以前是**裸 `return`** 当兜底。将来给 `BuddyNoAccountReason` 再加一档时，
+         * 它会**静默**落进「积分都已用尽」的文案 —— 而那句文案会把用户推向
+         * 「解锁永久积分」（**不可撤回地烧钱**）。本 PR 修的 `no-candidates` 正是
+         * 这个形态（它曾落进这里），故补一道**编译期**闸门，不再靠人记得改文案。
+         *
+         * 判据：把 `reason` 赋给**只剩 `exhausted` 那一档**的类型。若上面少接住一档
+         * （`reason` 的联合里多出别的成员），`tsc` 当场报 `TS2322`
+         * （联合类型不可赋给单成员类型），而不是静默退回「已用尽」文案。
+         */
+        const exhaustedOnly = reason;
+        void exhaustedOnly;
+        return new LlmError(`${displayName}：没有可用账号。已锁定永久积分，而所有账号的「${days} 天内到期」`
             + '积分都已用尽。请在 Jet Hub 的 '
-            + `${displayName} 面板解锁永久积分，或等待资源包到期后重新发放额度。`);
+            + `${displayName} 面板解锁永久积分，或等待资源包到期后重新发放额度。`, 'QUOTA_EXCEEDED');
     };
     /**
-     * Loomy 的「锁定永久积分 + 无可用账号」报错文案。
+     * Qoder（`qoder` 国际版 / `qodercn` 中国版）的
+     * 「锁定永久积分 + 无可用账号」报错文案。
+     *
+     * ⚠️ **不是漏抽 `buddyLockedError`，而是本家口径**必须**不同**：buddy 系的
+     * 「临期」指服务端**资源包**（`DeductionEndTime`），而 Qoder
+     * **逐包到期时刻根本拿不到**（见下）。照抄它会让用户按一个**在本家不存在**
+     * 的判据去排查。
+     *
+     * ## ⚠️⚠️ 本家最关键的事实：**Qoder 的「临期桶」恒为 0**
+     *
+     * 这是本函数每一档文案都必须自洽的前提，先说清机制：
+     *
+     * | 事实 | 取证来源 |
+     * |---|---|
+     * | 上游只下发**聚合标量**（`userQuota` / `addOnQuota` 各一个 `total/used/remaining`），**没有逐包明细** | `/sash/api/v2/me/usage` 真机实测（见 `qoder-credits.ts` 文件头） |
+     * | 逐包明细端点**不可用**：`/api/v1/me/quotas/{key}/histories`、`/api/v1/me/usages/big_model_credits/histories` 在 **qoder.cn 域 401**（只对浏览器登录态开放）、在 **openapi 域 404**；`/sash/*` 逐包端点全 404 | 2026-10-20 端点探测 |
+     * | `usage.expiresAt` 是**永久哨兵**（`253402214400000` = `9999-12-31`），**不是**真实到期时刻 | 真机实测（同上） |
+     * | 本机账号 `dedicatedResourcePackages` = `undefined`（那一路径目前取不到任何带日期的包） | 真机实测 |
+     * | 到期**语义**是「领取后 30 天」（`benefit.validity = {mode:'RELATIVE_DAYS', days:30}`），但那是**活动声明**，不是某个包的**时刻** | `/sash/api/v1/me/campaigns` 真机实测 |
+     *
+     * ⇒ 聚合侧 `toPackage` 对**拿不到时刻**的包**不写 `deductionEndTime`**，
+     * 于是 `splitBuddyCreditsByExpiry` 按**保守方向**把它们全归入**永久桶**：
+     * **expiring 恒为 0**。锁定永久积分时，这样的账号一定被判 `none`（不可用）——
+     * 这是**正确**行为（我们确实只能证明它只有永久积分）。
+     *
+     * ## 由此推出两条**文案纪律**（违反即误导）
+     *
+     * 1. **不得写「N 天内到期」「15 天内」这类绑定天数的说法**。Qoder 拿不到
+     *    逐包时刻，任何天数都是**编造**；宿主的窗口（`buddyExpiringWindowDays()`，
+     *    默认 15 天、可被 `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 覆盖）对本家**不产生
+     *    任何筛选效果**，写进文案只会让用户以为「等几天就会有临期额度可用」。
+     *    ⚠️ 注意前端 `permanentLockCopy` 那一侧因为 registry 的
+     *    `usesExpiryWindow: true` 会渲染出**带天数**的通用面板文案 —— 那是面板
+     *    对「按到期分桶」这一能力的统一表述，**与本函数无关**；本函数是**真出
+     *    故障时**用户看到的那句，必须写实际机制。
+     * 2. **必须明说「解锁才能继续用」**。因为本家的临期桶恒为 0，
+     *    「等一会儿就有临期额度」是**不可能发生**的事 —— 用户唯一的下一步是
+     *    解锁（会消耗长期/永久积分，须如实告知）。
+     *
+     * ## 四档（与 buddy 同形，但措辞逐档按本家重写）
+     *
+     * `unknown` / `no-candidates` / `credential-only` / `exhausted`
+     * —— 四者的**必要性**见 `BuddyNoAccountReason` 的定义注释，不在本处重复。
+     *
+     * ⚠️ **两站共用本函数，只换 `displayName`**：两站协议与端点形状逐字相同
+     *（同一个 `QoderAdapter` 类、同一个 `fetchQoderCreditBalance`，差异全在
+     * `QODER` / `QODER_CN` 的主机与 client_id），各写一遍 = 改一处漏一处。
+     * 但 `displayName` **必须**逐站区分：两站账号不互通，用户要知道去哪个面板解锁。
+     *
+     * ⚠️ **本家没有 XFF / 地理分流问题**（与 MiniMax 国际站的关键差异）：
+     * Qoder 两站各自有独立域名且互不 307，故**不要**照抄 minimax 文案里那段
+     * 「填 `X-Forwarded-For`」的指引（照抄会让用户去改一个**不生效**的设置）。
+     *
+     * ⚠️ **错误码取 `QUOTA_EXCEEDED`**（与 buddy / Loomy 一致）：
+     * 这确实是额度问题；且它**不在**宿主 `DEFAULT_RETRYABLE_CODES` 里，
+     * 故不会被白重试 —— 锁定是**确定性**结果，重试无用。
+     */
+    const qoderLockedError = (displayName) => (reason) => {
+        if (reason.kind === 'unknown') {
+            return new LlmError(
+            // ⚠️⚠️ **不得声称「部分账号」**（2026-10-25 审计 A3-2）：
+            // `BuddyNoAccountReason` 的 `unknown` 只带 `errors`、**没有候选总数**
+            // ⇒ 无法区分「部分失败」与「全部失败」，而实测 3 个账号全失败时这里
+            // 照样写「而**部分**账号的余额查询失败」——**事实性错误**，用户会以为
+            // 还有账号没查（于是去等 / 反复重试）。改成中性措辞。
+            //
+            // ⚠️ 另一处（A3-1）：`errors` 是**逐账号**的，同一故障在每个账号上各
+            // 产生一条**逐字相同**的串；旧实现 `slice(0, 2).join('；')` 让第二条
+            // 信息量为零、并挤掉「唯一不同的线索」⇒ 经 {@link foldReasonErrors}
+            // **先去重、再折叠、后截断**。
+            `${displayName}：无法确认是否有可用账号。已锁定永久积分，而有账号的余额查询失败`
+                + `（${foldReasonErrors(reason.errors)}）。`
+                + '这些账号**可能仍有**可消耗的额度 —— 请重试，'
+                + `或在 Jet Hub 的 ${displayName} 面板检查凭据是否失效`
+                + '（Qoder 的凭据有有效期，失效后需要重新登录该账号）。'
+                + '⚠️ 国际版（`openapi.qoder.sh`）本机网络不通时会**每次都**查不到余额，'
+                + '若你用的是国际版请先确认该域名可达。', 'QUOTA_EXCEEDED');
+        }
+        if (reason.kind === 'no-candidates') {
+            return new LlmError(`${displayName}：没有可用账号。已锁定永久积分，而本次**没有任何候选账号**`
+                + '（该 provider 下没有启用中的账号，或全部账号都在本次请求的模型上受限）。'
+                + `请在 Jet Hub 的 ${displayName} 面板确认账号已启用、且未全部处于限流中；`
+                + '或改用其它 provider / 模型，或解锁永久积分后重试。', 'QUOTA_EXCEEDED');
+        }
+        if (reason.kind === 'credential-only') {
+            // ⚠️ **必须与「积分用尽」逐字分开**，且要**明确劝阻解锁**：解锁会不可
+            //    撤回地消耗长期积分，而本情形的根因在凭据、与积分无关。
+            return new LlmError(`${displayName}：无法使用任何账号。已锁定永久积分，而余额分档**确实选出了**`
+                + '有可用额度的账号 —— 但它们的**凭据读不出来**（凭据缺失 / 已失效 / 被并发续期覆盖）。'
+                + '⚠️ 这与「额度用尽」是两件事，**不要去解锁永久积分**（解锁会不可撤回地消耗它们）。'
+                + `请在 Jet Hub 的 ${displayName} 面板检查这些账号的凭据，必要时重新登录。`, 'QUOTA_EXCEEDED');
+        }
+        /**
+         * ⚠️⚠️ **穷尽性守卫**（与 buddy / Loomy 两份同型）：
+         * 走到这里**只允许**是 `{ kind: 'exhausted' }`。把 `reason` 赋给单成员类型，
+         * 将来 `BuddyNoAccountReason` 加了新档位却忘写文案时，`tsc` 当场报
+         * `TS2322`，而不是静默落进「额度都已用尽」—— 那句会把用户推向
+         * **不可撤回**的解锁操作。
+         */
+        const exhaustedOnly = reason;
+        void exhaustedOnly;
+        /**
+         * ⚠️⚠️ **本档文案已按事实重写**（2026-10-21 对抗性审计发现：原文案与代码行为**相反**）。
+         *
+         * ## 原文案错在哪
+         *
+         * 旧文案逐字声称：
+         * > 「Qoder 上游**只下发聚合额度、不给逐包到期时刻**，插件因此**无法确认**
+         * >  哪些额度是临期的」
+         * > 「说「等临期积分到期后重新发放」会让用户白等（**本家根本没有那个临期池**）」
+         *
+         * **两句都不成立**：`qoder-credits.ts` **确实**解析
+         * `dedicatedResourcePackages[].expiresAt` 并写进 `deductionEndTime`
+         *（支路 B，`e1d9bf1` + `1e1b6bb` 还专门加了旗标/哨兵判据）⇒
+         * 一旦上游下发该字段，插件**完全能确认**哪些额度是临期的。
+         *
+         * 实测反例（构造报文，本机）：
+         * ```
+         * dedicatedResourcePackages: [{ remaining: 800, expiresAt: NOW + 60d }]
+         * → split = { expiring: 0, permanent: 2500 }
+         * ```
+         * 该账号被判 `none`（正确，60 天后才到期、超出 15 天窗口），但**再等约 45 天**
+         * 这个包就会自己进入临期档、账号自动恢复可用 ——「白等」这句恰好说反了：
+         * 用户等下去**真的会**有临期额度。
+         *
+         * ## 为什么原文案会写成那样
+         *
+         * 它把「**本机两个账号**的 `dedicatedResourcePackages` 恰好是 `undefined`」
+         * （一个**样本偶然**）写成了「上游**从不**下发」（一个**通用前提**）。
+         * 这正是本仓库反复登记的那类错误：**样本缺失 ≠ 字段不存在**。
+         *
+         * ## 新文案的口径（三条纪律）
+         *
+         * 1. **不声称「拿不到逐包到期」** —— 拿到了就用；没拿到才落永久桶。
+         * 2. **不写死天数**：15 天窗口可被 `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 覆盖，
+         *    写死数字会在用户改配置后自相矛盾。
+         * 3. **必须给出「解锁」这条确定的出路**（这是唯一能立即恢复的操作），
+         *    同时**如实提示**「若你的账号有带到期日的资源包，等它进入窗口后会自愈」
+         *    —— 那是事实，不是安抚。
+         */
+        return new LlmError(`${displayName}：没有可用账号。已锁定永久积分，而当前账号的额度都属于`
+            + '**长期 / 永久**那一类（要么上游没给逐包到期时刻，要么到期日还在'
+            + '「临期窗口」之外 —— 窗口默认 15 天，可由 `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 调整）。'
+            + '⚠️ 锁定永久积分时，**无法证明有临期额度**的账号会被判为不可用'
+            + '（宁可少用一个号，也不要把长期额度误当临期烧掉）—— 这是锁定的**预期效果**。'
+            + `请在 Jet Hub 的 ${displayName} 面板**解锁**永久积分后继续使用`
+            + '（解锁会真的消耗那些长期/永久额度）；'
+            + '若你的账号确实有带到期日的资源包（`dedicatedResourcePackages`），'
+            + '等它进入临期窗口后本账号会自动恢复可用，无需其它操作。', 'QUOTA_EXCEEDED');
+    };
+    /**
+     * AStudio 的「锁定永久积分 + 无可用账号」报错文案。
+     *
+     * ⚠️ **不是漏抽 `buddyLockedError`**，而是本家口径**必须**不同：
+     * buddy 系的「临期」指「服务端资源包 `DeductionEndTime` 距今 < 15 天」，
+     * 而 AStudio 的三个池语义是**会员 / 购买 / 赠送（活动）积分**，
+     * 只有「赠送积分」实测带 `activityNextExpireTime`（会员与购买两池实测
+     * 为 `null`，即长期有效）。用户按 buddy 那句「等待资源包到期后重新发放额度」
+     * 去排查会找不到对应的东西。
+     *
+     * ⚠️ 若将来 `astudio-credits.ts` 的池分类变了（例如会员池也开始下发改期），
+     * 本函数里的池名要跟着改 —— 它是**唯一**被用户看到的池名清单。
+     *
+     * ⚠️ 错误码取 `QUOTA_EXCEEDED`（与 buddy 系一致：这确实是额度问题，
+     * 且不会像 `AUTH` 那样在部分客户端把 message 吞掉）。
+     *
+     * ⚠️ **本函数放在这里（`buddyLockedError` 之后、`loomyLockedError` 之前）是
+     *    历史的偶然，不是约束**：它只用 `BuddyNoAccountReason`，与 buddy 三份同族，
+     *    放哪都不影响正确性。**不要**为了让某个按位置切片做断言的既有用例通过而
+     *    调整本函数的声明顺序 —— 2026-10-20 我一度这么做（那时
+     *    `loomy-balance-error-contract.spec.ts` 的 `lockedErrorBody()` 用
+     *    `indexOf('const buddy = new BuddyAuth')` 当切片终点，恰好把本函数圈了进去，
+     *    于是本家 `QUOTA_EXCEEDED` 被当成 Loomy 的码核对而变红）。
+     *    正确修法是**把那条断言的切片终点改精确**（改成「下一个同级 `const`」），
+     *    已在该 spec 里改并写明理由。断言描述的是「这个函数用了哪些码」，
+     *    不是「这个函数后面跟着谁」。
+     */
+    const astudioLockedError = (displayName) => (reason) => {
+        const days = buddyExpiringWindowDays();
+        if (reason.kind === 'unknown') {
+            return new LlmError(`${displayName}：无法确认是否有可用账号。已锁定永久积分，而本次余额查询未能全部完成`
+                + `（${foldReasonErrors(reason.errors)}）。这些账号**可能仍有**「${days} 天内到期」`
+                + '的积分 —— 请重试，或在 Jet Hub 的 AStudio 面板检查凭据是否失效'
+                + '（AStudio 的凭据是本机客户端会话的拷贝，客户端退出登录会让它失效）。', 'QUOTA_EXCEEDED');
+        }
+        if (reason.kind === 'no-candidates') {
+            return new LlmError(`${displayName}：没有可用账号。已锁定永久积分，而本次**没有任何候选账号**`
+                + '（该 provider 下没有启用中的账号，或全部账号都在本次请求的模型上受限）。'
+                + `请在 Jet Hub 的 ${displayName} 面板确认账号已启用、且未全部处于限流中；`
+                + '或改用其它 provider / 模型，或解锁永久积分后重试。', 'QUOTA_EXCEEDED');
+        }
+        if (reason.kind === 'credential-only') {
+            // ⚠️ **必须与「积分用尽」逐字分开**，且要**明确劝阻解锁**：解锁会不可
+            //    撤回地烧掉永久积分，而本情形的根因在凭据、与积分无关。
+            return new LlmError(`${displayName}：无法使用任何账号。已锁定永久积分，而余额分档**确实选出了**`
+                + '有可用积分的账号 —— 但它们的**凭据读不出来**（凭据缺失 / 已失效 / 被并发续期覆盖）。'
+                + '⚠️ 这与「积分用尽」是两件事，**不要去解锁永久积分**（解锁会不可撤回地烧掉它们）。'
+                + `请在 Jet Hub 的 ${displayName} 面板检查这些账号的凭据；AStudio 没有 OAuth 授权页，`
+                + '需要在 AStudio 客户端登录后用「导入本机会话」重建凭据。', 'QUOTA_EXCEEDED');
+        }
+        /**
+         * ⚠️⚠️ **穷尽性守卫**（与 buddy / Loomy 两份同型）：走到这里**只允许**是
+         * `{ kind: 'exhausted' }`。把 `reason` 赋给单成员类型，将来
+         * `BuddyNoAccountReason` 加了新档位却忘写文案时，`tsc` 当场报 `TS2322`，
+         * 而不是静默落进「积分都已用尽」—— 那句会把用户推向不可撤回的解锁操作。
+         */
+        const exhaustedOnly = reason;
+        void exhaustedOnly;
+        /**
+         * ⚠️⚠️ **本段文案已按代码实际行为重写**（2026-10-21 对抗性审计发现）。
+         *
+         * ## 原文案错在哪
+         *
+         * 旧文案把「临期」**唯一归给赠送池**：
+         * > 「所有账号的「N 天内到期」积分（AStudio 的**赠送/活动积分**池）都已用尽。
+         * >  会员积分与购买积分**通常是长期有效的**，锁定状态下动不到它们。」
+         *
+         * 而 `astudio-credits.ts` 的三个池（会员 / 购买 / 赠送）**同等地**走
+         * `pushPool(...)`，各自把自己的 `{member,buy,activity}NextExpireTime`
+         * 归一化进 `deductionEndTime` ⇒ **任何一个池**有窗口内到期都会被算进临期桶。
+         *
+         * 实测反例（构造报文，本机）：
+         * ```
+         * { memberBalance: 800, memberNextExpireTime: NOW+4d,
+         *   buyBalance: 1000,   buyNextExpireTime: null,
+         *   activityBalance: 0 }
+         * → split = { expiring: 800, permanent: 1000 }
+         *    ↑ 临期 800 **全部来自会员池**，赠送池一分没有
+         * ```
+         * ⇒ 用户拿着旧文案去「查赠送池」会一无所获，而真正快到期的在**会员池**。
+         *
+         * ## 旧文案为什么会写成那样
+         *
+         * 它把「本机实测时会员/购买两池的 `NextExpireTime` 恰好是 `null`」
+         * 写成了「通常是长期有效的」这个**通用结论**。同一个错误的另一形态：
+         * **样本偶然 ≠ 字段语义**。
+         *
+         * ## 新文案的口径
+         *
+         * 1. **三个池平等列出**（会员 / 购买 / 赠送），不猜哪个有到期；
+         * 2. 保留 `days`（本家 `usesExpiryWindow: true`，那个天数**确实**是筛选判据，
+         *    与 Qoder 不同 —— 那里拿不到逐包时刻、写天数才是编造）；
+         * 3. 给出两条出路：解锁（确定可行）／等下一笔活动积分发放（若确因活动池用尽）。
+         */
+        return new LlmError(`${displayName}：没有可用账号。已锁定永久积分，而所有账号的「${days} 天内到期」`
+            + '积分都已用尽。⚠️ AStudio 的**会员 / 购买 / 赠送（活动）**三个积分池'
+            + '都会各自下发到期时间、都被计入临期判据 —— 不限于赠送池，'
+            + '请在该账号的「资源包」明细里逐个核对（而不是只看赠送池）。'
+            + `请在 Jet Hub 的 ${displayName} 面板解锁永久积分`
+            + '（解锁后长期有效的部分才可用），或等待下一次活动积分发放。', 'QUOTA_EXCEEDED');
+    };
+    /**
+     * MiniMax Code 的「锁定永久积分 + 无可用账号」报错文案。
+     *
+     * ⚠️ **不是漏抽 `buddyLockedError`**，而是本家口径**必须**不同：
+     * buddy 系的「临期」指服务端**资源包**（`DeductionEndTime`），
+     * 而 MiniMax 的到期来自 `/minimax-cloud/api/v1/credit/details` 的
+     * **每条明细各自带 `expire_at_ms`**（2026-10-20 实测真实账号 20 条全部有值，
+     * 到期时刻 = 发放时刻 + 30 天）。buddy 那句「等待资源包到期后重新发放额度」
+     * 在 MiniMax **没有对应物** —— 它的额度来自**每日签到**与活动发放，
+     * 用户按 buddy 的口径去排查会找不到那个「资源包」。
+     *
+     * ⚠️ 两个产品（`minimax` / `minimaxintl`）**共用本函数**，只换 `displayName`：
+     * 两站的积分语义与端点形状逐字相同（同一个 `fetchMinimaxCreditBalanceDetailed`，
+     * 差异只在 `MINIMAX_INTL` 的主机与 ref 前缀），各写一遍 = 改一处漏一处。
+     * 但 `displayName` **必须**逐站区分：两站账号不互通，用户要知道去哪个面板解锁。
+     */
+    const minimaxLockedError = (displayName) => (reason) => {
+        const days = buddyExpiringWindowDays();
+        if (reason.kind === 'unknown') {
+            return new LlmError(`${displayName}：无法确认是否有可用账号。已锁定永久积分，而本次余额查询未能全部完成`
+                + `（${foldReasonErrors(reason.errors)}）。这些账号**可能仍有**「${days} 天内到期」`
+                + '的积分 —— 请重试，或在 Jet Hub 的对应面板检查凭据是否失效。'
+                + '⚠️ **国际站**另有地理分流风险：`agent.minimax.io` 会按出口 IP 把大陆来源'
+                + ' 307 到中国站，而中国站不认国际站 token ⇒ 表现为余额查询恒失败'
+                + '（issue IKMEVG）；可在面板设置里填 `X-Forwarded-For`。', 'QUOTA_EXCEEDED');
+        }
+        if (reason.kind === 'no-candidates') {
+            return new LlmError(`${displayName}：没有可用账号。已锁定永久积分，而本次**没有任何候选账号**`
+                + '（该 provider 下没有启用中的账号，或全部账号都在本次请求的模型上受限）。'
+                + `请在 Jet Hub 的 ${displayName} 面板确认账号已启用、且未全部处于限流中；`
+                + '或改用其它 provider / 模型，或解锁永久积分后重试。', 'QUOTA_EXCEEDED');
+        }
+        if (reason.kind === 'credential-only') {
+            // ⚠️ **必须与「积分用尽」逐字分开**，且要**明确劝阻解锁**：解锁会不可
+            //    撤回地烧掉永久积分，而本情形的根因在凭据、与积分无关。
+            return new LlmError(`${displayName}：无法使用任何账号。已锁定永久积分，而余额分档**确实选出了**`
+                + '有可用积分的账号 —— 但它们的**凭据读不出来**（凭据缺失 / 已失效 / 被并发续期覆盖）。'
+                + '⚠️ 这与「积分用尽」是两件事，**不要去解锁永久积分**（解锁会不可撤回地烧掉它们）。'
+                + `请在 Jet Hub 的 ${displayName} 面板检查这些账号的凭据，必要时重新登录。`, 'QUOTA_EXCEEDED');
+        }
+        /**
+         * ⚠️⚠️ **穷尽性守卫**（与 buddy / Loomy / AStudio 三份同型）：走到这里
+         * **只允许**是 `{ kind: 'exhausted' }`。把 `reason` 赋给单成员类型，
+         * 将来 `BuddyNoAccountReason` 加了新档位却忘写文案时，`tsc` 当场报
+         * `TS2322`，而不是静默落进「积分都已用尽」—— 那句会把用户推向
+         * **不可撤回**的解锁操作。
+         */
+        const exhaustedOnly = reason;
+        void exhaustedOnly;
+        return new LlmError(`${displayName}：没有可用账号。已锁定永久积分，而所有账号的「${days} 天内到期」`
+            + '积分（MiniMax 的**签到 / 活动发放**额度，每条明细自带 30 天有效期）都已用尽。'
+            + '长期有效的部分在锁定状态下动不到它们。'
+            + `请在 Jet Hub 的 ${displayName} 面板解锁永久积分，或等待下一次签到 / 活动发放。`, 'QUOTA_EXCEEDED');
+    };
+    /**
+     * AutoClaw（国内站 / 国际版）的「锁定永久积分 + 无可用账号」报错文案。
+     *
+     * ⚠️ **不是漏抽 `buddyLockedError`**，而是本家池名**必须**不同：
+     * buddy 系的「临期」指**服务端资源包**（`DeductionEndTime`），而 AutoClaw 的
+     * 批次来自**钱包流水**（`wallets` + `wallet_expires_at`），且**永久桶按描述分组**
+     * （`autoclaw-credits.ts` 的 `permanentByLabel`）—— 上游给什么描述就是什么包名。
+     * 照抄 buddy 那句会让用户去钱包里找一个叫「资源包」的东西，而
+     * AutoClaw 面板上根本没这个名字。
+     *
+     * ⚠️⚠️ **本函数文案不得点名具体池名**（2026-10-21 二轮审计，P1）：
+     * 初版写过「活动赠送」「注册奖励」，那两个名字**没有任何实测来源**（详见
+     * `exhausted` 档的注释）。仓库内实测到的真实包名是
+     * 「`AutoClaw 用户登录奖励积分，7天有效`」「`每日签到`」这类**上游原样字符串**，
+     * 编一个分组名会让用户照着去找、一无所获。
+     *
+     * ## 四档（与 buddy / minimax 同形，措辞按本家重写）
+     *
+     * `unknown` / `no-candidates` / `credential-only` / `exhausted` ——
+     * 四者的**必要性**见 `BuddyNoAccountReason` 的定义注释，不在本处重复。
+     *
+     * ## ⚠️ 与 minimax 的关键差别：**没有 XFF / 地理分流**
+     *
+     * AutoClaw 两站各有独立域名（国内 `autoglm-api`、国际 `autoglm-api.autoglm.ai`），
+     * **互不 307** ⇒ 本家文案**不得**照抄 minimax 那段「填 X-Forwarded-For」的指引
+     * （照抄会让用户去改一个**不生效**的设置）。这句已写进 `unknown` 档的反面：
+     * 只说「检查凭据」，不说 XFF。
+     *
+     * ## 错误码取 `QUOTA_EXCEEDED`
+     *
+     * 与 buddy / Loomy / minimax 一致：这确实是额度问题，且它**不在**宿主
+     * `DEFAULT_RETRYABLE_CODES` 里 ⇒ 不会被白重试（锁定是**确定性**结果）。
+     *
+     * ⚠️⚠️ **但 `unknown` 档存在一处全仓既有的自相矛盾**（2026-10-21 二轮审计指出，登记不修）：
+     *
+     * 该档文案写「**请重试**」，而错误码 `QUOTA_EXCEEDED` **不可重试** ⇒ 用户按文案
+     * 去重试，宿主不会自动重试、手动重试大概率仍是同一失败。
+     *
+     * 实测全仓口径（`grep` 六份 `lockedError` 的 `unknown` 档）：
+     *
+     * | 函数 | 码 | 可重试 | 文案 |
+     * |---|---|---|---|
+     * | `buddyLockedError` / `qoderLockedError` / `astudioLockedError` / `minimaxLockedError` / **`autoclawLockedError`** | `QUOTA_EXCEEDED` | ❌ | 「请重试」 |
+     * | `loomyLockedError` | **`TRANSPORT`** | ✅ | 「请稍后重试」 |
+     *
+     * ⇒ **五家一致、Loomy 独异**。这不是本次引入的回归（本函数只是跟随了多数派），
+     *   而是**既有的一致性缺口**。
+     *
+     * **为什么不修**：改错误码要碰红线 —— `AUTH` / `QUOTA` 类码在部分客户端会
+     * **连 message 一起吞掉**（IKLBSH 复发形态），`QUOTA_EXCEEDED` 是刻意选的
+     * （`QUOTA` 会被 harness 换成固定文案）。改文案（去掉「请重试」）又要同步五家
+     * + 相关断言，属独立任务。⇒ 登记，不捎带。
+     *
+     * ⚠️ 两站共用本函数，只换 `displayName`；`displayName` **必须**逐站区分
+     * （两站账号不互通，用户要知道去哪个面板解锁）。
+     *
+     * ## ⚠️ 位置约束（与 astudio 那处同理）
+     *
+     * 本函数放在 `loomyLockedError` **之前**是有意的：`loomy-balance-error-contract.spec.ts`
+     * 用「`const loomyLockedError` 到 `const buddy = new BuddyAuth`」切片来核对 Loomy 的
+     * 错误码（Loomy 用可重试的 `TRANSPORT`，本家必须用不可重试的 `QUOTA_EXCEEDED`）。
+     * 插进那个区间会让该用例把本家的码当成 Loomy 的核对而**必然变红**。
+     */
+    const autoclawLockedError = (displayName) => (reason) => {
+        const days = buddyExpiringWindowDays();
+        if (reason.kind === 'unknown') {
+            return new LlmError(`${displayName}：无法确认是否有可用账号。已锁定永久积分，而本次余额查询未能全部完成`
+                + `（${foldReasonErrors(reason.errors)}）。这些账号**可能仍有**「${days} 天内到期」`
+                + '的积分 —— 请重试。'
+                + `⚠️ 若持续失败，请在 Jet Hub 的 ${displayName} 面板检查凭据是否失效`
+                + '（AutoClaw 的 access_token 是**明文 JWT、寿命恒 24h**，过期后需要重新登录）。', 'QUOTA_EXCEEDED');
+        }
+        if (reason.kind === 'no-candidates') {
+            return new LlmError(`${displayName}：没有可用账号。已锁定永久积分，而本次**没有任何候选账号**`
+                + '（该 provider 下没有启用中的账号，或全部账号都在本次请求的模型上受限）。'
+                + `请在 Jet Hub 的 ${displayName} 面板确认账号已启用、且未全部处于限流中；`
+                + '或改用其它 provider / 模型，或解锁永久积分后重试。', 'QUOTA_EXCEEDED');
+        }
+        if (reason.kind === 'credential-only') {
+            // ⚠️ **必须与「积分用尽」逐字分开**，且要**明确劝阻解锁**：解锁会不可
+            //    撤回地消耗永久积分（流水里那些**不带到期时间**的发放批次），
+            //    而本情形的根因在凭据、与积分无关。
+            return new LlmError(`${displayName}：无法使用任何账号。已锁定永久积分，而余额分档**确实选出了**`
+                + '有可用积分的账号 —— 但它们的**凭据读不出来**（凭据缺失 / 已失效 / 被并发续期覆盖）。'
+                + '⚠️ 这与「积分用尽」是两件事，**不要去解锁永久积分**（解锁会不可撤回地消耗它们）。'
+                + `请在 Jet Hub 的 ${displayName} 面板检查这些账号的凭据，必要时重新登录。`, 'QUOTA_EXCEEDED');
+        }
+        /**
+         * ⚠️⚠️ **穷尽性守卫**（与 buddy / Loomy / AStudio / MiniMax 四份同型）：
+         * 走到这里**只允许**是 `{ kind: 'exhausted' }`。把 `reason` 赋给单成员类型，
+         * 将来 `BuddyNoAccountReason` 加了新档位却忘写文案时，`tsc` 当场报
+         * `TS2322`，而不是静默落进「积分都已用尽」—— 那句会把用户推向
+         * **不可撤回**的解锁操作。
+         */
+        const exhaustedOnly = reason;
+        void exhaustedOnly;
+        /**
+         * ⚠️⚠️ **本档文案已按「可核实的池名」重写**（2026-10-21 二轮审计，P1 文案失实）。
+         *
+         * ## 原文案错在哪
+         *
+         * 初版写「**永久桶**（**「活动赠送」「注册奖励」** 等不带到期时间的批次）」。
+         * 审计员逐层考古后确认：**这两个名字没有任何实测来源**，是编的。
+         *
+         * 事实链：
+         * - `parseAutoclawLedgerBatches` 的包名取 `metadata.description > description > source`，
+         *   即**上游给什么就是什么**，可能是任意字符串；
+         * - 仓库内**唯一**的实测包名样本是「`AutoClaw 用户登录奖励积分，7天有效`」
+         *   与「`每日签到`」（`tests/unit/autoclaw-credits.spec.ts` 的 fixture 注明为实测形状）；
+         * - 「活动赠送 / 注册奖励」的最早出处是 `autoclaw-credits.ts` 里**描述代码分支**的
+         *   一句注释（「无到期字段的发放（活动赠送的永久分）」），随后经
+         *   registry 注释 → 审计报告 → 本次提交 → 本函数文案 **五层转述**，
+         *   从未有一次报文支撑。
+         *
+         * ## 用户可见后果（改前）
+         *
+         * 用户拿着「去找叫『活动赠送』『注册奖励』的分组」去翻钱包流水，
+         * **一无所获**（真实名字是「AutoClaw 用户登录奖励积分，7天有效」这类长句）。
+         *
+         * ## 改法
+         *
+         * **不再点名任何具体池名**，改为描述**判据本身**（「流水里不带到期时间的发放」）
+         * —— 判据是代码里可核实的，池名不是。
+         */
+        return new LlmError(`${displayName}：没有可用账号。已锁定永久积分，而所有账号的「${days} 天内到期」`
+            + '积分（AutoClaw 的**带到期时间的发放批次** —— 钱包流水里那些'
+            + '带有效期的「每日签到 / 登录奖励」等发放）都已用尽。'
+            + '**永久桶**（流水里**不带到期时间**的那些发放）在锁定状态下动不到它们'
+            + ' —— 这是锁定的预期效果。'
+            + `请在 Jet Hub 的 ${displayName} 面板解锁永久积分，或等待下一次签到 / 活动发放。`, 'QUOTA_EXCEEDED');
+    };
+    /**
+     * Loomy 的「锁定永久积分 + 无可用账号」报错文案（issue IKMCOO 缺陷 2/3）。
      *
      * ⚠️ **与 buddy 那份分开**（不是漏抽）：Loomy 的口径是「**今日赠送额度**」
      * （服务端每日刷新的那个池），而 buddy 系是「N 天内到期的资源包」——
      * 两者是不同的业务概念，合并成一句会让用户按错误的判据去排查。
-     * 同样必须分「真的用尽」与「查不到」两种原因（真实缺陷，用户报障 2026-09-29）。
+     *
+     * ⚠️⚠️ **必须分「全部查不到」与「部分查不到」**（issue IKMCOO 缺陷 2，
+     *   2026-10-16）：原实现只有一档 `unknown`，判据是「有任一候选失败」，
+     *   于是 **3 个号全查不到**也被报成「**部分**账号的余额查询失败」，
+     *   并建议「检查凭据是否失效」—— 而本机实测（4 个账号 `/points/records`
+     *   全部 200、字段完整）凭据**全部有效**，照着做完全无效。
+     *
+     * ⚠️⚠️ **错误码用 `TRANSPORT`，不用自定义码**（issue IKMCOO 缺陷 3，
+     *   2026-10-16 实测修正）：原判据里我先写的是新增码 `BALANCE_UNAVAILABLE`，
+     *   实读宿主 `@deepseek-ai/dsh-llm/lib/types/retry-policy.js` 的
+     *   `DEFAULT_RETRYABLE_CODES` 发现它是
+     *   `['EMPTY_RESPONSE','RATE_LIMIT','SERVER','TIMEOUT','TRANSPORT']`
+     *   —— **自定义码不在其中** ⇒ 宿主照样不重试，缺陷 3 **根本没被修好**
+     *   （症状与原来逐字相同：整轮被打断）。
+     *   ⇒ 语义最贴近且**确在**默认可重试集合里的是 `TRANSPORT`
+     *   （本故障就是「一次取数往返没能完成」），具体分类靠 message 表达。
+     *
+     * ⚠️ **刻意不用 `AUTH` / `QUOTA`**：那两类在部分客户端会连 message 一起
+     *   吞掉（见 AGENTS.md 的 IKLBSH 复发形态），而本故障**需要**用户看到
+     *   「换渠道 / 稍后再试」这句指路文案。
      */
     const loomyLockedError = (reason) => {
-        if (reason.kind === 'unknown') {
-            return new Error('Loomy：无法确认是否有可用账号。已锁定永久积分，而部分账号的余额查询失败'
-                + `（${reason.errors.slice(0, 2).join('；')}）。这些账号**可能仍有**今日额度 —— `
-                + '请重试，或在 Jet Hub 的 Loomy 面板检查凭据是否失效。');
+        const details = reason.kind === 'exhausted' ? '' : `（${foldReasonErrors(reason.errors)}）`;
+        if (reason.kind === 'all-unknown') {
+            return new LlmError('Loomy：无法确认是否有可用账号。已锁定永久积分，而**所有**账号的余额查询都失败了'
+                + `${details}。这通常是上游限流 / 风控 / 网络中断，**不是**凭据失效 —— `
+                + '无需重新登录。可稍后重试，或改用其它 provider / 模型；'
+                + '若急于继续，可在 Jet Hub 的 Loomy 面板**临时解锁永久积分**（会消耗永久积分）。', 'TRANSPORT');
         }
+        if (reason.kind === 'partial') {
+            return new LlmError('Loomy：无法确认是否有可用账号。已锁定永久积分，而**部分**账号的余额查询失败'
+                + `${details}。其余账号的今日额度已确认用尽；这些账号**可能仍有**今日额度 —— `
+                + '请稍后重试，或在 Jet Hub 的 Loomy 面板核对这些账号的凭据。', 'TRANSPORT');
+        }
+        /**
+         * ⚠️⚠️ **穷尽性守卫**（与 buddy 那份同型，2026-10-14 审计引入）：
+         * 走到这里**只允许**是 `{ kind: 'exhausted' }` —— 它是唯一有事实依据
+         * 可以说「今日额度已用尽」的一档（余额分档真的查过，且每个候选的今日
+         * 额度确实都是 0）。把 `reason` 赋给单成员类型，将来加了新档位却
+         * 忘了写文案时，`tsc` 当场报 `TS2322`，而不是静默落进「已用尽」。
+         */
+        const exhaustedOnly = reason;
+        void exhaustedOnly;
         return new Error('Loomy：没有可用账号。已锁定永久积分，而所有账号的今日赠送额度都已用尽。'
             + '请在 Jet Hub 的 Loomy 面板解锁永久积分，或等待明日额度刷新。');
     };
@@ -979,8 +2032,12 @@ export function apply(ctx) {
                 kind: 'buddy',
                 selector: lobsteraiBalanceSelector,
                 lockedError: buddyLockedError('LobsterAI'),
-                // ⚠️ LobsterAI **没有** `isFreeModel`（只有 buddy / trae 的适配器有）：
-                // 它的模型表不带倍率字段，判不出「免费」—— 缺省即「从不跳过锁定」。
+                // ⚠️ LobsterAI 的「免费」是**钱包**概念不是**模型**概念，没有模型级免费：
+                //   `lobsterai-credits.ts:340` 的 `/api/user/quota` 只给
+                //   `freeCreditsTotal=300`（免费**积分额度**），`lobsterai-errors.ts`
+                //   里的 `freecreditsused` 是**错误码**。模型表本身不带倍率字段
+                //   ⇒ 判不出、也不该判（见 `NO_FREE_MODEL` 的说明）。
+                isFreeModel: NO_FREE_MODEL,
             },
             fallback: { kind: 'ref', refName: LOBSTERAI.defaultCredentialRef },
             // 退到单凭据 ref 之前先证明失败原因（见 `throwIfAllAccountsRateLimited`
@@ -1020,7 +2077,112 @@ export function apply(ctx) {
     // （不起本地回调服务器，见 src/qoder-oauth.ts）。
     // 服务名由产品 id 派生，注册为 ctx.qoderAuth。
     // 与其它 provider 一样不注册斜杠命令：入口在 Jet Hub 的 Qoder 面板。
-    const qoder = new QoderAuth(ctx);
+    // ⚠️ **必须在建 QoderAuth / 适配器之前注入池子**（真实报障 2026-10-21）：
+    //    国际版 `openapi.qoder.sh` 被 SNI 阻断，推理与余额两条腿都要按账号取代理。
+    //    本调用在 `apply()` 里，而模块级常量（如 `probeById.qoder`）会在它之前求值
+    //    ⇒ 那之前解析器读到的是 `undefined` 池子、退直连；那是**可接受**的
+    //    （探测目标是中国版直连就够，而国际版探测本来也得先配代理才能测）。
+    setQoderProxyPool(pool);
+    const qoder = new QoderAuth(ctx, { fetchFor: qoderFetchForAccount });
+    /**
+     * 按凭据 ref 解析 Qoder 凭据（供选号器查余额与最终取凭据共用）。
+     *
+     * ⚠️ **两站共用这一份**（`qoder` / `qodercn` 的凭据形状逐字相同：同一套
+     * OAuth 实现，差异只在主机与 ref 前缀）—— 与 minimax 那份同因，
+     * 各写一遍 = 改一处漏一处。
+     *
+     * ⚠️ **逐字保留历史上的裸 `JSON.parse` 形态**（不在此处加形状校验）：
+     * 加校验是一次**行为变更**（此前被接受的损坏凭据会变成被拒），
+     * 不在本 Task 范围内。历史形态见 git 历史里 qoder / qodercn 两段
+     * `readCredential` 里那两份**逐字重复**的内联箭头。
+     */
+    const resolveQoderCredentialByRef = async (refName) => {
+        const resolved = await ctx.credentials.resolve(credentialRef(refName));
+        if (!resolved)
+            return undefined;
+        try {
+            return JSON.parse(resolved.value);
+        }
+        catch {
+            return undefined;
+        }
+    };
+    /**
+     * 按**凭据**解析该账号该走的 fetcher（余额查询专用，真实报障 2026-10-21）。
+     *
+     * ## 为什么要反查账号
+     *
+     * 余额查询的入口是 `fetchQoderCreditBalance(credential, product, fetcher)` ——
+     * 手上只有凭据、没有账号 id。而出口代理是**账号维度**的（`AccountPool.qoderProxyFor`）。
+     * 故用池的既有能力 `findAccountIdByCredential` 反查（Gemini 那份同款）。
+     *
+     * ⚠️ **反查不到 ⇒ 空串**，`qoderFetchForAccount('')` 会再试
+     * `QODER_PENDING_PROXY_KEY`（登录预置那条），都没有就直连。
+     * **绝不**回落到「随便挑一个配了代理的账号」—— 那会把 A 的出口用于 B，
+     * 症状是「偶尔能通偶尔超时」，比失败更难查。
+     *
+     * ⚠️ **本函数是异步的，调用方必须 `await`**（余额查询本身就是 async，
+     * 顺理成章）。不要试图把它塞进同步的 `typeof fetch` 形参 —— 那只能靠
+     * 「先返回一个假 fetcher，内部再补」之类的花招，而花招会引入
+     * 「第一次发请求时账号还没查出来」的竞态。
+     *
+     * ⚠️ 两站都查：`findAccountIdByCredential` 按 provider 过滤，传错一家会
+     * 静默返回空串（退直连）。同一个凭据只可能属于一站，故顺序试、谁命中用谁。
+     */
+    const fetcherForQoderCredential = async (credential) => {
+        const identity = typeof credential.access_token === 'string' ? credential.access_token : '';
+        if (identity.length === 0)
+            return qoderFetchForAccount('');
+        const hit = await pool.findAccountIdByCredential(QODER.id, identity).catch(() => '');
+        if (hit.length > 0)
+            return qoderFetchForAccount(hit);
+        const hitCn = await pool.findAccountIdByCredential(QODER_CN.id, identity).catch(() => '');
+        return qoderFetchForAccount(hitCn);
+    };
+    /**
+     * Qoder 两站的**按「额度何时作废」分档选号器**（为「锁定永久积分」提供依据）。
+     *
+     * ⚠️ 复用 `BuddyBalanceSelector` 而不是新写一个：分档判据
+     * （`splitBuddyCreditsByExpiry`）只读通用的
+     * `packages[].{ active, remaining, deductionEndTime }`，**与 provider 无关**。
+     *
+     * ⚠️ **两家各建一个实例，不得合并**：选择器内含**按账号 id 的缓存**，
+     * 跨站共用会让一站的读数污染另一站（与 minimax 两站同因）。
+     *
+     * ⚠️⚠️ **必须各传自己的 `product`**：`QODER` 指向 `openapi.qoder.sh`、
+     * `QODER_CN` 指向 `openapi.qoder.com.cn` —— 互换的后果**不是报错**而是静默：
+     * 对方站点不认本站 token ⇒ 余额恒 `null` ⇒ 未锁定时换号优化失效、
+     * 锁定时永远报「没有可用账号」。
+     */
+    const qoderBalanceSelector = new BuddyBalanceSelector({
+        product: QODER,
+        resolveCredential: resolveQoderCredentialByRef,
+        // ⚠️ **余额查询也必须走该账号的出口代理**（真实报障 2026-10-21）：
+        //    国际版 `openapi.qoder.sh` 被 SNI 阻断，直连恒 10.7s 超时 ⇒ 余额恒 null
+        //    ⇒ 锁定时永远报「无法确认是否有可用账号」，即使配了代理也一样
+        //    （因为这里不读代理）。中国版直连 160ms 就通，故判据必须**按账号**取。
+        fetchBalance: async (credential, product) => fetchQoderCreditBalance(credential, product, await fetcherForQoderCredential(credential)),
+        // ⚠️⚠️ **必须两条腿都接**（真实报障 2026-10-21）：面板走的 `credits.balances`
+        //    早已改用 `fetchQoderBalanceDetailed`，会对国际版报出
+        //    「连不上 https://openapi.qoder.sh（UND_ERR_CONNECT_TIMEOUT）…请导出 HTTPS_PROXY」；
+        //    而**选号这条腿**原先只用丢原因的 `fetchQoderCreditBalance` ⇒ 锁定时报
+        //    「余额查询失败（凭据失效或响应异常）」，用户于是去查凭据，真实原因是网络。
+        //    同一语义两套判据 = AGENTS.md 首条红线；且症状是最坏的一种：把**可操作**的
+        //    原因换成一句**无从下手**的猜测。
+        fetchBalanceDetailed: async (credential, product) => fetchQoderBalanceDetailed(credential, product, {
+            fetcher: await fetcherForQoderCredential(credential),
+        }),
+    });
+    const qoderCnBalanceSelector = new BuddyBalanceSelector({
+        product: QODER_CN,
+        resolveCredential: resolveQoderCredentialByRef,
+        fetchBalance: async (credential, product) => fetchQoderCreditBalance(credential, product, await fetcherForQoderCredential(credential)),
+        // ⚠️ 中国版同样要接（同因）；它通常查得到，但**401 / 响应缺 qoderUsage** 时
+        //    同样只有详细变体能说清是哪一种。
+        fetchBalanceDetailed: async (credential, product) => fetchQoderBalanceDetailed(credential, product, {
+            fetcher: await fetcherForQoderCredential(credential),
+        }),
+    });
     /**
      * 「本次实际使用的账号 id」跟踪表（provider id → 账号 id）。
      *
@@ -1068,6 +2230,28 @@ export function apply(ctx) {
                     return undefined;
                 }
             },
+            // 优先按「快到期额度」分档选号（锁定永久积分时只挑有快到期额度的号）。
+            // ⚠️ `qoderLockedError` **本家独有**（不共用 buddy 系那份）：buddy 的
+            //    「临期」指资源包 `DeductionEndTime`，而本家逐包到期时刻拿不到 ——
+            //    照抄会让用户按一个不存在的判据去排查（见该函数的长注释）。
+            // ⚠️ `reportPickedAccount: true` 是**必须的**（与 minimax 两站同因）：
+            //    本家的旧闭包是纯池选号、账本**一直在回报**；接上 `balance` 后
+            //    「分档选中」那一支若不回报 ⇒ token 用量记不到本渠道上（静默）。
+            balance: {
+                kind: 'buddy',
+                selector: qoderBalanceSelector,
+                lockedError: qoderLockedError('Qoder'),
+                reportPickedAccount: true,
+                // ⚠️ 免费模型**必须**跳过「锁定 + 临期积分」这道门（与 buddy / trae
+                //    同因，见 `credential-resolver.ts:359-365` 的长注释）：
+                //    锁定保护的是永久积分，而免费模型既不扣临时也不扣永久积分 ——
+                //    不传这个钩子，免费模型会和付费模型走同一条余额分档路，锁定期间
+                //    被 `allowPermanent=false` 一并拦下，报出「额度都属于永久」这种
+                //    与事实相反的错误（真实报障 2026-10-21）。
+                // ⚠️ 判据在适配器里（读远端目录的 `is_free`，远端/兜底同源），
+                //    本处只透传 —— 不要在这里另写一份。
+                isFreeModel: (modelId) => qoderAdapter.isFreeModel(modelId),
+            },
             fallback: { kind: 'ref', refName: QODER.defaultCredentialRef },
             // 区分「全部限流」与「没登录」（见该助手的说明）—— 否则用户会去
             // 重新登录，而凭据其实是好的（真实缺陷，Gitee IKJOZ9）。
@@ -1097,8 +2281,19 @@ export function apply(ctx) {
         readImageRequest: makeReadImageRequest(ctx),
         accountPool: pool,
         product: QODER,
+        // 远端模型目录（2026-10-20）：**由 auth 服务取数**，只做池的只读读取。
+        // ⚠️ 刻意**不**走 `resolveCredential` —— 它选中账号时会 reportAccount，
+        //    而目录请求是周期性的（20 分钟刷新器），会把「本次实际使用的账号」
+        //    改写成目录用的账号 ⇒ 额度标记落到无辜账号上（见 `QoderAdapterOptions.fetchRemoteModels`）。
+        fetchRemoteModels: () => qoder.fetchModels(pool),
         // 额度受限时标记「本次实际使用的账号」（理由见 `activeQoderAccountId` 注释）。
         currentAccountId: () => activeQoderAccountId.get(QODER.id),
+        // ⚠️ **推理通道也必须走该账号的出口代理**（真实报障 2026-10-21）：
+        //    国际版整站被 SNI 阻断，实测推理同样 10.7s `TRANSPORT: fetch failed`
+        //    ⇒ 只接余额不接推理的话，面板显示正常但一发请求就超时。
+        //    适配器内部会按**循环里当前账号**（换号后跟着变）现取，见其
+        //    `fetcherForCurrentAccount`。
+        fetchFor: qoderFetchForAccount,
     });
     // ===== Qoder 中国版（qodercn）=====
     // 与上面的国际版是**同一套协议实现**的第二个实例（差异全在 QODER_CN 配置里：
@@ -1109,7 +2304,7 @@ export function apply(ctx) {
     // 服务名由 `${product.id}Auth` 派生，注册为 `ctx.qodercnAuth`（product id
     // `qodercn` 全小写、不带连字符 —— 按变量名驼峰惯例拼会得到大小写不符的名字）。
     // 不注册斜杠命令：入口在 Jet Hub 的「Qoder (中国版)」面板。
-    const qoderCn = new QoderAuth(ctx, { product: QODER_CN });
+    const qoderCn = new QoderAuth(ctx, { product: QODER_CN, fetchFor: qoderFetchForAccount });
     const qoderCnAdapter = registerQoderLlm(ctx, {
         credentialRef: credentialRef(QODER_CN.defaultCredentialRef),
         // 只取中国版自己账号池的账号，回退到 QODERCN_ACCESS_TOKEN。
@@ -1137,6 +2332,17 @@ export function apply(ctx) {
                     return undefined;
                 }
             },
+            // 同国际版：分档选号 + 本家独有文案 + 回报实际选中的账号。
+            // ⚠️ `displayName` **必须**逐站区分（两站账号不互通，用户要知道去哪个
+            //    面板解锁）；`selector` 也必须是中国版自己那一个（缓存不跨站共用）。
+            balance: {
+                kind: 'buddy',
+                selector: qoderCnBalanceSelector,
+                lockedError: qoderLockedError('Qoder (中国版)'),
+                reportPickedAccount: true,
+                // 同国际版：免费模型不受「锁定永久积分」约束（判据在适配器里）。
+                isFreeModel: (modelId) => qoderCnAdapter.isFreeModel(modelId),
+            },
             fallback: { kind: 'ref', refName: QODER_CN.defaultCredentialRef },
             // 同国际版：区分「全部限流」与「没登录」（见该助手的说明，IKJOZ9）。
             throwIfAllRateLimited: throwIfAllAccountsRateLimited,
@@ -1158,10 +2364,14 @@ export function apply(ctx) {
         readImageRequest: makeReadImageRequest(ctx),
         accountPool: pool,
         product: QODER_CN,
+        // 远端模型目录：同国际版（两站共用同一套实现，差异只在产品配置）。
+        fetchRemoteModels: () => qoderCn.fetchModels(pool),
         // 额度受限时用它标记「当前账号」（见 `QoderAdapter.switchAccountOnQuota`）。
         // ⚠️ 取「**本次实际使用**的账号」而非池里默认那一个：池的默认账号可能与之
         // 不同（例如本账号被限流、池已切到别的账号），标错就会让标记落在无辜账号上。
         currentAccountId: () => activeQoderAccountId.get(QODER_CN.id),
+        // 同国际版：推理通道也要走该账号的出口代理（两站共用同一个适配器类）。
+        fetchFor: qoderFetchForAccount,
     });
     // ===== TRAE（字节 TRAE IDE）服务 =====
     // 第六个产品线，协议与前面几者**完全不同**：认证用 ExchangeToken（轮换 refreshToken），
@@ -1359,6 +2569,42 @@ export function apply(ctx) {
         }
     };
     /**
+     * 把共享读数里的 `CreditBalance` 拆成 loomy 选号要的两个数。
+     *
+     * ⚠️⚠️ **按包名映射，只此一处**：`provider-credits.ts` 的 `makePackage` 写的
+     *   包名是「永久积分」/「每日赠送」，共享缓存里存的就是那个形状。
+     *   ⚠️ **判据用 `includes` 而非 `===`**：包名带「（陈旧）」之类后缀时
+     *   仍要认得出来 —— 用等值会在文案微调后静默变成「读不到余额」，
+     *   那正是本 issue 的症状形态。
+     * ⚠️ 两池都认不出时返回 `{}`（**不编造 0**）：上层据此判「没有可用读数」。
+     */
+    const loomyPoolsOf = (balance) => {
+        let daily;
+        let permanent;
+        for (const pkg of balance.packages ?? []) {
+            if (pkg.name.includes('每日'))
+                daily = pkg.remaining;
+            else if (pkg.name.includes('永久'))
+                permanent = pkg.remaining;
+        }
+        return {
+            ...daily === undefined ? {} : { daily },
+            ...permanent === undefined ? {} : { permanent },
+        };
+    };
+    /**
+     * 按账号池 id 取一份已解析的 loomy 凭据（共享读数的槽需要它）。
+     *
+     * ⚠️ 读不到（账号已删 / 凭据损坏）返回 `undefined` ⇒ 缓存记成失败读数 ⇒
+     *   选号器照常回落自己取数（并得到它自己的「凭据未配置或已失效」结论）。
+     */
+    const readLoomyCredentialFor = async (accountId) => {
+        const entry = pool.listAccountsByProvider(LOOMY.id).find((a) => a.id === accountId);
+        if (entry === undefined)
+            return undefined;
+        return await resolveLoomyCredentialByRef(entry.credentialRef);
+    };
+    /**
      * Loomy 的**按余额优先选号器**（负载均衡）。
      *
      * ⚠️ **为什么需要它**（真实缺陷）：实测 Loomy 的今日赠送额度（每天 5000）
@@ -1372,6 +2618,39 @@ export function apply(ctx) {
     const loomyBalanceSelector = new LoomyBalanceSelector({
         product: LOOMY,
         resolveCredential: resolveLoomyCredentialByRef,
+        /**
+         * ★ 吃**共享余额读数**（2026-10-16，issue IKMCOO 缺陷 1）。
+         *
+         * ## 为什么必须接（用户报障的核心矛盾）
+         *
+         * 「面板显示三个账号都有余额，但对话一直报『余额查询失败』」—— 两条路径
+         * 各发各的请求、各存各的缓存，于是**可以同时成立且互相矛盾**。
+         * ⇒ 这里让选号与面板**看同一份读数**，矛盾从根上消失。
+         *
+         * ⚠️ **`LOOMY_CREDIT_DETAIL` 从共享读数里取**：`CreditBalance` 有两池
+         *   （`packages`），而选号器要的是 `permanent` / `daily` 两个数 ——
+         *   由**包名**映射（`provider-credits.ts` 造包时写的就是「永久积分」/
+         *   「每日赠送」）。⚠️ 这层映射**只此一处**，不得在别处再写一份。
+         *
+         * ⚠️ **陈旧读数按成功处理**：兼顶值确实可用（`ok: true`），只是标了
+         *   `error` 让 UI 能显示数据时间。标成失败会把「有今日额度的号」踢出候选 ——
+         *   那正是本 issue 的症状。
+         *
+         * ⚠️ 共享缓存**未注册**时返回 `undefined` ⇒ 选号器照常自己取数（逐字节同旧）。
+         */
+        sharedReading: async (accountId) => {
+            const reading = await balanceCache.readStale(LOOMY.id, accountId, {
+                credential: await readLoomyCredentialFor(accountId),
+            });
+            if (reading.value === undefined)
+                return undefined;
+            return {
+                ...loomyPoolsOf(reading.value),
+                stale: reading.stale,
+                at: reading.at,
+                ...reading.error === undefined ? {} : { error: reading.error },
+            };
+        },
     });
     const loomyAdapter = registerLoomyLlm(ctx, {
         credentialRef: credentialRef(LOOMY.defaultCredentialRef),
@@ -1404,18 +2683,43 @@ export function apply(ctx) {
             // 被该模型限流时，候选在筛选里已被筛空 —— 那不是「没登录」。
             throwIfAllRateLimited: throwIfAllAccountsRateLimited,
         }),
-        refresh: async () => {
+        refresh: async (forCredential) => {
             // ⚠️ Loomy **没有 refresh 端点**，这里的 `refresh` 语义是
             // 「探测凭据是否仍有效」，失效时抛错提示重新登录。
             //
             // 仍须刷新**解析凭据时所用的那一个**账号，而不是默认单凭据 ref ——
             // 否则探测的是另一份凭据，用户会看到「刚登录好却一直认证失败」。
+            //
+            // ⚠️⚠️ **优先探测调用方指定的那一份凭据**（2026-10-20 审计 E-2）。
+            //
+            // 适配器在热路径上用它裁决「**本轮要用的那份**凭据还能不能用」，
+            // 而这里原先恒探测 `pool.getAvailableAccount(LOOMY.id, '')` = **池默认号**
+            // ⇒ 二者可能不是同一个号 ⇒ **另一个号的终态会打死本轮**
+            //（实测：本轮号完全可用，仍整轮失败、业务请求 0 次）。
+            //
+            // ⚠️ 反查失败时**退回原行为**（探测默认号）而不是跳过探测：
+            //    「宁可退化成旧行为，也不要凭空少做一次健康检查」。
+            const target = forCredential === undefined
+                ? undefined
+                : await pool.findAccountIdByCredential(LOOMY.id, forCredential.access_token).catch(() => undefined);
+            // ⚠️ 从池里取**该账号自己的** `credentialRef`，不自己拼 `LOOMY_ACCOUNT_` 前缀
+            //    —— 前缀是记账格式，拼错会静默探测到另一份/不存在的凭据。
+            const targetEntry = target === undefined || target.length === 0
+                ? undefined
+                : pool.listAccountsByProvider(LOOMY.id).find((entry) => entry.id === target);
+            if (targetEntry !== undefined) {
+                await loomy.refreshAccountCredential(targetEntry.credentialRef, pool, targetEntry.id);
+                return;
+            }
             const available = await pool.getAvailableAccount(LOOMY.id, '');
             if (available)
                 await loomy.refreshAccountCredential(available.entry.credentialRef, pool, available.entry.id);
             else
                 await loomy.refresh();
         },
+        // ⚠️ 必须注入：适配器在热路径上把「非终态探测失败」降级为告警而不是抛错，
+        // 没有这个出口就等于静默（本仓库反复记录过的失败形态）。
+        warn: (message) => ctx.logger?.warn?.(message),
         // 远端模型目录：GET /api/v1/models。
         // ⚠️ 必须用 **token 头**（业务端点），不是 Bearer —— 带错会得到
         // `100002 缺少 token`，表现为「模型列表永远停在兜底表」。
@@ -1530,28 +2834,124 @@ export function apply(ctx) {
     //
     // 服务名由 MinimaxAuth 依 product.id 派生，注册为 ctx.minimaxAuth。
     // 不注册斜杠命令：入口在 Jet Hub 的 MiniMax 面板。
-    const minimax = new MinimaxAuth(ctx);
+    /**
+     * 按凭据 ref 解析 MiniMax 凭据（**两个产品共用**）。
+     *
+     * ⚠️ 拆成具名函数（原先是两处内联的匿名箭头，逐字重复）：选号器的
+     * `resolveCredential` 与注册项的 `readCredential` 必须是**同一个**解析器 ——
+     * 写两份、强度不一致 = 改一处漏一处（本仓库在 LobsterAI / TRAE / AStudio
+     * 三处都踩过这个形态）。
+     *
+     * ⚠️ **保持裸 `JSON.parse` 的历史形态，不在此处加形状校验**：那会是行为变更
+     * （与 raccoon / gemini 同款）；本函数只做「抽出来共用」这一件事。
+     */
+    const resolveMinimaxCredentialByRef = async (refName) => {
+        const resolved = await ctx.credentials.resolve(credentialRef(refName));
+        if (!resolved)
+            return undefined;
+        try {
+            return JSON.parse(resolved.value);
+        }
+        catch {
+            return undefined;
+        }
+    };
+    /**
+     * MiniMax 两站的**按「积分何时作废」分档选号器**（为「锁定永久积分」提供依据）。
+     *
+     * ⚠️ 复用 `BuddyBalanceSelector` 而不是新写一个：分档判据
+     * （`splitBuddyCreditsByExpiry`）只读通用的
+     * `packages[].{ active, remaining, deductionEndTime }`，**与 provider 无关**。
+     * `fetchMinimaxCreditBalanceDetailed` 自 2026-10-20 起把每条明细的
+     * `expire_at_ms`（毫秒时间戳，实测无需 ×1000）归一化到 `deductionEndTime`。
+     *
+     * ⚠️ **两站各一个实例**：选择器内含按账号 id 的余额缓存，共用会串味
+     *（两站账号不互通、主机也不同）。
+     *
+     * ⚠️⚠️ **国际站必须透传 XFF**（与 `creditsTable` / `expiryTable` 那两处同因）：
+     * `agent.minimax.io` 按出口 IP 把大陆来源 307 到中国站，而中国站不认国际站
+     * token ⇒ 折算恒失败 ⇒ 该渠道在聚合轮换里被**静默**剔除（面板却还能刷新，
+     * 因为那走的是另一条带了 XFF 的链路）。`pool.minimaxXff()` **每次现读**，
+     * 不固化成字符串 —— 用户随时可能改设置。
+     */
+    const minimaxBalanceSelector = new BuddyBalanceSelector({
+        product: MINIMAX,
+        resolveCredential: resolveMinimaxCredentialByRef,
+        fetchBalance: (credential, product) => fetchMinimaxCreditBalance(credential, fetch, product),
+        // ⚠️ 带原因变体（见文件头长注释）。中国站不传 xff（那是国际站的地理分流）。
+        fetchBalanceDetailed: (credential, product) => fetchMinimaxCreditBalanceDetailed(credential, fetch, product),
+    });
+    const minimaxIntlBalanceSelector = new BuddyBalanceSelector({
+        product: MINIMAX_INTL,
+        resolveCredential: resolveMinimaxCredentialByRef,
+        // ⚠️ `fetchFor`：余额端点也在 `agent.minimax.io` 上 ⇒ 大陆出口恒 307
+        //    ⇒ 折算恒失败 ⇒ 该渠道在聚合轮换里被**静默剔除**（面板却还能刷新，
+        //    因为那走的是另一条带了 XFF 的链路）。
+        fetchFor: minimaxIntlFetchForAccount,
+        fetchBalance: (credential, product, ctx) => fetchMinimaxCreditBalance(credential, ctx?.fetchFor?.(ctx.accountId ?? '') ?? fetch, product, pool.minimaxXff()),
+        // ⚠️ **必须逐站传各自的 `xff`**：国际站的余额端点按 X-Forwarded-For 分流，
+        //    不传会让请求落到别的区域 ⇒ 余额恒查不到（与 fetchBalance 那条腿同因）。
+        // ⚠️ 出口代理由第三参 `ctx.fetchFor` 传入：详细变体**优先于** `fetchBalance`，
+        //    若这里仍用裸 `fetch`，上面那条 `fetchFor` 会被整体短路 ⇒ 上游修的
+        //    「大陆出口恒 307 静默剔除」在本分支复发（两处必须同时接）。
+        fetchBalanceDetailed: (credential, product, ctx) => fetchMinimaxCreditBalanceDetailed(credential, ctx?.fetchFor?.(ctx.accountId ?? '') ?? fetch, product, pool.minimaxXff()),
+    });
+    const minimax = new MinimaxAuth(ctx, {
+        // ⚠️ 2026-10-24 本地试验版：续期/身份 journal（`refresh-journal.jsonl`）。
+        journalHome: resolveJetHubHome(ctx),
+    });
+    // ⚠️ 2026-10-24 本地试验版：记住「上一次选中的账号」，401/临期续期时
+    //    **精准续它** —— 旧写法续的是「池内第一个可用账号」，那可能是另一个号
+    //    （选号器与 401 时刻之间隔着一整轮请求，池序没变但账号状态变了）。
+    let lastPickedMinimaxAccount = '';
     const minimaxAdapter = registerMinimaxLlm(ctx, {
         credentialRef: credentialRef(MINIMAX.defaultCredentialRef),
         // provider 实参用 MINIMAX 而非字面量：写死字面量在改名/多产品场景下
         // 会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
         // ⚠️ 只从 minimax 自己的账号池取账号，回退到自己的单凭据 ref，
         // 保证不会串用其它 provider 的凭据。
-        resolveCredential: createCredentialResolver({ pool, reportAccount: (id) => { if (id !== undefined)
-                reportLedgerAccount(MINIMAX.id, id); } }, {
+        resolveCredential: createCredentialResolver({ pool, reportAccount: (id) => {
+                if (id !== undefined)
+                    lastPickedMinimaxAccount = id;
+                if (id !== undefined)
+                    reportLedgerAccount(MINIMAX.id, id);
+            } }, {
             product: MINIMAX,
-            // ⚠️ 与 raccoon / gemini 同款：兜底是**裸 `JSON.parse`**（历史形态，
-            // 本 Task 逐字保留，不在此处加形状校验 —— 那会是行为变更）。
-            readCredential: async (refName) => {
-                const resolved = await ctx.credentials.resolve(credentialRef(refName));
-                if (!resolved)
-                    return undefined;
-                try {
-                    return JSON.parse(resolved.value);
-                }
-                catch {
-                    return undefined;
-                }
+            // ⚠️ 与选号器**共用同一个**解析器（原先这里是一份内联的匿名箭头，
+            //    与下面 MINIMAX_INTL 那份逐字重复 ⇒ 改一处漏一处；已抽成
+            //    `resolveMinimaxCredentialByRef`）。历史形态是**裸 `JSON.parse`**，
+            //    逐字保留，不在此处加形状校验（那会是行为变更）。
+            readCredential: resolveMinimaxCredentialByRef,
+            /**
+             * ⚠️ **2026-10-20 新增**（用户报障：「MiniMax Code 积分也有到期时间，
+             * 也应当有相同功能」）。
+             *
+             * 此前本家**不传 `balance`** ⇒ 走 `getAvailableAccount` 的「手动序第一个
+             * 启用账号」，**与到期时间无关** ⇒ 既没有「临期优先」，也没有任何东西
+             * 可供「锁定永久积分」判断 ⇒ 锁上了也不知道该不该拦。
+             *
+             * ⚠️ 本家**没有**免费模型概念（`MinimaxAdapter` 不实现 `isFreeModel`），
+             * 故不传该字段 —— 缺省 `undefined` 走常规分档路径（正确行为）。
+             */
+            balance: {
+                kind: 'buddy',
+                selector: minimaxBalanceSelector,
+                lockedError: minimaxLockedError('MiniMax Code (中国版)'),
+                // ⚠️ 本家没有模型级免费概念（产品表零 `isFree` 字段，上游目录也不返回）。
+                isFreeModel: NO_FREE_MODEL,
+                /**
+                 * ⚠️⚠️ **刻意不写 `reportPickedAccount: false`**（与 buddy 系那两处**相反**）。
+                 *
+                 * `reportPickedAccount: false` 是**buddy 系旧闭包的历史不对称**
+                 *（它们只在池兜底那一支回报），本 Task 逐字保留。而 MiniMax 的旧闭包
+                 * 是**纯池选号**（本就无余额分档）⇒ 它的账本**一直在回报**。
+                 * 若照抄 buddy 写 `false`，本节新增的 `balance` 会让「分档选中」那支
+                 * 不再回报 ⇒ **账本归属静默丢失**（token 用量记不到这个渠道上）。
+                 * 该形态由 `tests/unit/credential-resolver.spec.ts` 的
+                 * 「<provider>：池命中时回报 token 账本」逐家驱动 `apply()` 守着 ——
+                 * minimax / minimaxintl 正在那份名单里（它们此前**可达**）。
+                 */
+                reportPickedAccount: true,
             },
             fallback: { kind: 'ref', refName: MINIMAX.defaultCredentialRef },
             // 区分「全部限流」与「没登录」（见该助手的说明，IKJOZ9）。
@@ -1561,19 +2961,21 @@ export function apply(ctx) {
             // ⚠️ MiniMax **有** refresh 端点（`/oauth2/token` 的 refresh_token 授权），
             // 这里是真续期（与 Loomy 的「只能探测有效性」不同）。
             //
-            // 仍须刷新**解析凭据时所用的那一个**账号，而不是默认单凭据 ref ——
-            // 否则续期的是另一份凭据，用户会看到「刚登录好却一直认证失败」。
-            const available = await pool.getAvailableAccount(MINIMAX.id, '');
-            if (available) {
+            // ⚠️ 2026-10-24 本地试验版：**精准续期** —— 优先续「上一次选中的账号」
+            //（401/临期预判都发生在它身上），找不到才退「池内第一个可用账号」。
+            //
+            // ⚠️ 走 `refreshAccountCredential`（lead-aware，1h 窗口）而不是
+            //    `renewEntry(force)`：① 它是 H2 契约的桩点（`refreshAccountCredential`
+            //    被替换成记录器时本闭包必须仍可驱动）；② 1h lead 窗口在巡检
+            //    （5-15min margin ⇒ 续后剩余恒 ~60min）下**恒命中**，401 时必发 grant，
+            //    与旧行为逐字节等价。抢断式强刷已由 `renewEntry` 的巡逻/兜底承担。
+            const entries = await pool.listAccounts(MINIMAX.id);
+            const target = entries.find((e) => e.id === lastPickedMinimaxAccount)
+                ?? (await pool.getAvailableAccount(MINIMAX.id, ''))?.entry;
+            if (target !== undefined) {
                 // ⚠️ **必须传 pool + entry.id**：续期成功后要把新的 `expiresAt` 写回
-                // 账号池，否则 UI 会一直显示「已过期」而实际能正常发消息
-                //（真实缺陷：JWT 已续到 15:09、账号池仍是 12:02，相差 3.1 小时）。
-                //
-                // ⚠️ `getAvailableAccount` 返回 **`{ entry, credential }`** 两层 ——
-                // 账号 id 与 credentialRef 在 **`available.entry`** 里，**不是**
-                // `available.id` / `available.credentialRef`（那是 `undefined`，
-                // 会让续期**静默写不回账号池**）。
-                await minimax.refreshAccountCredential(available.entry.credentialRef, pool, available.entry.id);
+                // 账号池，否则 UI 会一直显示「已过期」而实际能正常发消息。
+                await minimax.refreshAccountCredential(target.credentialRef, pool, target.id);
             }
             else {
                 await minimax.refresh();
@@ -1595,6 +2997,90 @@ export function apply(ctx) {
         readImage: makeReadImage(ctx),
         accountPool: pool,
         product: MINIMAX,
+    });
+    // ===== MiniMax Code 国际版（minimaxintl）=====
+    //
+    // 与中国版是**同一套协议实现**的第二个实例（差异全在 `MINIMAX_INTL` 配置里：
+    // 主机 `account.minimax.io` / `agent.minimax.io`、目录 region `en`、
+    // 凭据 ref 前缀 `MINIMAXINTL_`）。刻意**不复制**任何 `src/minimax*.ts`
+    // 实现文件 —— 协议同源，复制会让同类缺陷（SSE 收尾丢帧、换号记账、
+    // 思考档位）修两遍。
+    //
+    // 服务名由 `${product.id}Auth` 派生，注册为 `ctx.minimaxintlAuth`
+    //（product id 全小写、不带连字符 —— 按变量名驼峰惯例拼会得到大小写不符的名字）。
+    //
+    // ⚠️ **两站账号不互通、API 主机也不同** ⇒ 它们是两个 provider 而不是
+    //    「一个 provider 加一个站点参数」（理由见 `src/minimax-product.ts` 文件头）。
+    // ⚠️ **验证状态如实标注**（2026-10-16 合并审计修正 —— 原文写「三项未真机验证」，
+    //    已被本 PR 后续的真机取证推翻，见 `src/minimax-product.ts` 文件头的实测表）：
+    //    推理路径与签到端点形状**已真机验证通过**（2026-10-15，真实国际站账号，
+    //    推理 200 + 真实 SSE、签到/积分 200）；**只有兜底模型表**未按国际站远端采集
+    //   （它与国内站共用同一份，只在远端失败时兜底）。
+    //
+    // ⚠️ **国际站是唯一需要「按账号换出口」的那一站**：`agent.minimax.io` 按出口
+    //    IP 国别分流，大陆来源恒 307 到中国站 ⇒ 与「凭据失效」同形的 401。
+    //    ⇒ 登录 / 续期 / 目录 / 身份 / 推理 / 积分**六条链路**都要走
+    //    `minimaxIntlFetchForAccount`（中国站**刻意不注入**：它直连才是最优，
+    //    出海反而更慢且可能被引导到国际站）。
+    const minimaxIntl = new MinimaxAuth(ctx, {
+        product: MINIMAX_INTL,
+        fetchFor: minimaxIntlFetchForAccount,
+        journalHome: resolveJetHubHome(ctx),
+    });
+    // ⚠️ 与中国版同因（2026-10-24）：记住「上一次选中的账号」，精准续期。
+    let lastPickedMinimaxIntlAccount = '';
+    const minimaxIntlAdapter = registerMinimaxLlm(ctx, {
+        credentialRef: credentialRef(MINIMAX_INTL.defaultCredentialRef),
+        // ⚠️ provider 实参必须是 MINIMAX_INTL：写死 MINIMAX 会让国际站永远查不到
+        // 自己的账号（本插件在 workbuddy 上踩过同类坑）。
+        resolveCredential: createCredentialResolver({ pool, reportAccount: (id) => {
+                if (id !== undefined)
+                    lastPickedMinimaxIntlAccount = id;
+                if (id !== undefined)
+                    reportLedgerAccount(MINIMAX_INTL.id, id);
+            } }, {
+            product: MINIMAX_INTL,
+            // ⚠️ 与中国版**共用同一个**解析器（见 `resolveMinimaxCredentialByRef` 的说明）。
+            //    两站凭据形状逐字相同（同一套 OAuth 实现，只换主机与 ref 前缀）。
+            readCredential: resolveMinimaxCredentialByRef,
+            // ⚠️ 与中国版**同因同日**新增（2026-10-20）：两站共用同一个
+            //    `fetchMinimaxCreditBalanceDetailed`。
+            //    ⚠️⚠️ 但**选号器必须是国际站那一个实例** —— 它透传 `pool.minimaxXff()`
+            //    （绕地理分流，issue IKMEVG）；误用国内站实例会让国际站余额查询
+            //    恒失败 ⇒ 该渠道在聚合轮换里被静默剔除。
+            balance: {
+                kind: 'buddy',
+                selector: minimaxIntlBalanceSelector,
+                lockedError: minimaxLockedError('MiniMax Code (国际版)'),
+                // ⚠️ 本家没有模型级免费概念（产品表零 `isFree` 字段，上游目录也不返回）。
+                isFreeModel: NO_FREE_MODEL,
+                // ⚠️ 与中国版**同因**：本家旧闭包是纯池选号、账本一直在回报 ⇒
+                //    必须 `true`，写 `false` 会让 token 用量记不到国际站上（见中国版处说明）。
+                reportPickedAccount: true,
+            },
+            fallback: { kind: 'ref', refName: MINIMAX_INTL.defaultCredentialRef },
+            throwIfAllRateLimited: throwIfAllAccountsRateLimited,
+        }),
+        refresh: async () => {
+            // 同中国版（2026-10-24 本地试验版）：**精准续期** —— 优先续「上一次选中
+            // 的账号」，走 `refreshAccountCredential`（lead-aware + 抢救链），理由见上。
+            const entries = await pool.listAccounts(MINIMAX_INTL.id);
+            const target = entries.find((e) => e.id === lastPickedMinimaxIntlAccount)
+                ?? (await pool.getAvailableAccount(MINIMAX_INTL.id, ''))?.entry;
+            if (target !== undefined) {
+                await minimaxIntl.refreshAccountCredential(target.credentialRef, pool, target.id);
+            }
+            else {
+                await minimaxIntl.refresh();
+            }
+        },
+        fetchRemoteModels: () => minimaxIntl.fetchRemoteModelsOnly(pool),
+        readImage: makeReadImage(ctx),
+        accountPool: pool,
+        // ⚠️ **推理主路径必须走该账号的出口**（国际站代理）。适配器会在换号后
+        // 按 `activeAccountId` **每次现取**，故传的是**解析器**而不是一份 fetcher。
+        fetchFor: minimaxIntlFetchForAccount,
+        product: MINIMAX_INTL,
     });
     // ===== Gemini（Google Cloud Code Assist 免费线）=====
     //
@@ -1619,7 +3105,22 @@ export function apply(ctx) {
     //
     // 服务名由 GeminiAuth 依 product.id 派生，注册为 ctx.geminiAuth。
     // 不注册斜杠命令：入口在 Jet Hub 的 Gemini 面板。
-    const gemini = new GeminiAuth(ctx);
+    //
+    // ⚠️ Gitee issue IKLTZ2：Gemini 全部端点都在墙外，而 undici 既不读 Windows
+    // 系统代理、也不读 `HTTP(S)_PROXY` ⇒ 「浏览器授权成功、面板里账号一直不出现」。
+    // 这里接上**按账号取 fetcher** 的解析器（与 `probeById` 共用同一份）。
+    // ⚠️ 与 Gemini 同款：池子在 `apply()` 里才就绪，而 `probeById` 是模块级常量
+    //    （可能在 `apply()` 之前就被求值）⇒ 走可变引用，未注入时恒直连。
+    //
+    // ⚠️ 一次注入同时喂**两条腿**（PR !145 审计 P1 修法）：
+    //    ① 按账号取出口（`minimaxIntlFetchForAccount`）；
+    //    ② 探测槽的 XFF（`minimaxIntlXffForProbe`）。
+    //    初版给 ② 另开了 `globalThis.__jetHubMinimaxXffPool`，两套机制、且 dispose
+    //    后不清理。现在两者共用 `minimaxPoolRef` —— **传 `undefined` 即可整体重置**
+    //    （插件卸载路径若将来需要，直接调 `setMinimaxProxyPool(undefined)`）。
+    setMinimaxProxyPool(pool);
+    setGeminiProxyPool(pool);
+    const gemini = new GeminiAuth(ctx, { fetchFor: geminiFetchForAccount });
     const geminiSigStore = createGeminiSigStore(ctx);
     // ⚠️ 项目号探测缓存必须**在这里建一次、长期复用** —— 每次 `stream()` 现造
     // 等于没有跨请求缓存，每轮推理都会多打一次 `loadCodeAssist`。
@@ -1679,6 +3180,8 @@ export function apply(ctx) {
         // 项目号：缺省**自动探测**（`loadCodeAssist` 的 `cloudaicompanionProject`），
         // 不是恒为 `aicode-consumers`（那只是探测为空时的兜底）。
         projectCache: geminiProjectCache,
+        // ⚠️ **推理主路径的出口**（IKLTZ2）：此前这里只有裸 `fetch`（连 seam 都没有）。
+        fetchFor: geminiFetchForAccount,
         persistProject: async (value) => {
             // ⚠️ 回写到**解析凭据时所用的那个账号**，不是默认单凭据 ref ——
             // 写错对象会让另一个账号的凭据被污染。
@@ -1703,6 +3206,341 @@ export function apply(ctx) {
     //
     // 服务名由 AccioAuth 依 product.id 派生，注册为 ctx.accioAuth。
     // 不注册斜杠命令：入口在 Jet Hub 的 Accio 面板。
+    // ===== AutoClaw（智谱清言）=====
+    /**
+     * 按凭据 ref 解析 AutoClaw 凭据（供选号器查余额与最终取凭据共用）。
+     *
+     * ⚠️ **两站共用这一份**（`autoclaw` / `autoclawintl` 的凭据形状逐字相同：
+     * 同一套协议实现，差异只在主机与 ref 前缀）—— 与 qoder 那份同因，
+     * 各写一遍 = 改一处漏一处。
+     *
+     * ⚠️ **逐字保留历史上的裸 `JSON.parse` 形态**（不在此处加形状校验）：
+     * 加校验是一次**行为变更**（此前被接受的损坏凭据会变成被拒），不在本任务范围内。
+     */
+    const resolveAutoclawCredentialByRef = async (refName) => {
+        const resolved = await ctx.credentials.resolve(credentialRef(refName));
+        if (!resolved)
+            return undefined;
+        try {
+            return JSON.parse(resolved.value);
+        }
+        catch {
+            return undefined;
+        }
+    };
+    /**
+     * AutoClaw 两站的**按「额度何时作废」分档选号器**（2026-10-21，
+     * 用户要求「补锁定开关」）。
+     *
+     * ## 为什么本家需要它
+     *
+     * `autoclaw-credits.ts` 的批次映射里有一条**代码分支**：`wallet_expires_at`
+     * 缺失 / `<= 0` 的发放 ⇒ 进 `permanentByLabel` ⇒ **不带 `deductionEndTime`**
+     * （= 永久桶）。⇒ 只要上游下发那种条目，用户钱包里就会有永不作废的积分，
+     * 需要能保护它们。补登记 `permanentLock` **必须同时接上本选号器**，
+     * 否则就是**假开关**（按钮在、点了不拦 —— `credential-resolver.ts` 的
+     * `allowPermanent` 只在 `balance` 计划存在时才被读到）。
+     *
+     * ⚠️⚠️ **前提强度如实标注（2026-10-21 二轮审计）**：上述「永久桶」分支
+     * **结构上可达、但零实测**。仓库内唯一一次针对流水字段完整性的实测
+     *（`5fbe7ab` 的 commit message）结论是「**28/28 全带 `wallet_expires_at`**」——
+     * 方向上**否定**该形态存在。若上游确实恒带到期字段，则本家的永久桶**恒为空**
+     * ⇒ `allowPermanent` 为 true/false 行为完全相同 ⇒ 这个开关**永不产生实际效果**
+     *（但也不会出错：它只是把「已存在的分档能力」接上）。
+     *
+     * ⇒ 保留本接线（成本为零、与仓库 11 家同构、上游一旦下发无到期条目即生效），
+     *   但**不得**声称「本家确实有永久桶」。可核实的验证方法见审计报告 §十三。
+     *
+     * ## 为什么复用 `BuddyBalanceSelector`
+     *
+     * 分档判据（`splitBuddyCreditsByExpiry`）只读通用的
+     * `packages[].{active, remaining, deductionEndTime}`，**与 provider 无关**；
+     * `autoclaw-credits.ts` 的批次包正是这个形状（`deductionEndTime` 由
+     * `wallet_expires_at` 秒级归一成毫秒）。
+     *
+     * ## ⚠️ 与 buddy 系的**关键差异**（别照抄那两行）
+     *
+     * | | buddy 系 | AutoClaw |
+     * |---|---|---|
+     * | `rateLimit` | 省缺 true | **false**（不写 `modelRateLimits`、不在 `probeById`）|
+     * | 请求级换号 | 有 | **刻意没有** |
+     * | 「每日红」池语义 | 有 | **不适用**（签到积分是发放进余额、按批次到期）|
+     *
+     * ⇒ 本家的锁定只作用于「按余额分档选号」这一层，不涉及换号冷却（本来就没有）。
+     *
+     * ## ⚠️ 两家各建一个实例，不得合并
+     *
+     * 选择器内含**按账号 id 的缓存**，跨站共用会让一站的读数污染另一站
+     * （与 minimax / qoder 两站同因）。
+     *
+     * ## ⚠️ 必须各传自己的 `product`
+     *
+     * `AUTOCLAW` 指向国内基址、`AUTOCLAW_INTL` 指向国际基址（`autoglm-api.autoglm.ai`）
+     * —— 互换的后果**不是报错**而是静默：对方站点不认本站 token ⇒ 余额恒 `null`
+     * ⇒ 未锁定时换号优化失效、锁定时永远报「没有可用账号」。
+     */
+    const autoclawBalanceSelector = new BuddyBalanceSelector({
+        product: AUTOCLAW,
+        resolveCredential: resolveAutoclawCredentialByRef,
+        fetchBalance: (credential, product) => fetchAutoclawCreditBalance(credential, { product }),
+        // ⚠️ 带原因变体（见文件头长注释）。
+        fetchBalanceDetailed: (credential, product) => fetchAutoclawBalanceDetailed(credential, { product }),
+    });
+    const autoclawIntlBalanceSelector = new BuddyBalanceSelector({
+        product: AUTOCLAW_INTL,
+        resolveCredential: resolveAutoclawCredentialByRef,
+        fetchBalance: (credential, product) => fetchAutoclawCreditBalance(credential, { product }),
+        // ⚠️ 两站各建实例、各传自己的 product（缓存与端点都必须分开）。
+        fetchBalanceDetailed: (credential, product) => fetchAutoclawBalanceDetailed(credential, { product }),
+    });
+    const autoclaw = new AutoclawAuth(ctx);
+    const autoclawAdapter = registerAutoclawLlm(ctx, {
+        resolveCredential: createCredentialResolver({ pool, reportAccount: (id) => { if (id !== undefined)
+                reportLedgerAccount(AUTOCLAW.id, id); } }, {
+            product: AUTOCLAW,
+            // ⚠️ 2026-10-21：改用上面共用的 `resolveAutoclawCredentialByRef`
+            //    （原先这里是一份内联的逐字重复实现，两站各一份）。
+            readCredential: resolveAutoclawCredentialByRef,
+            fallback: { kind: 'ref', refName: AUTOCLAW.defaultCredentialRef },
+            /**
+             * ⚠️ **必须接 `balance`**（2026-10-21，用户要求「补锁定开关」）。
+             *
+             * registry 里登记 `permanentLock: true` 只让**按钮渲染**、RPC 放行；
+             * 真正的拦截在 `credential-resolver.ts` 读
+             * `pool.permanentLocked(providerId)` ⇒ 传给 `pickBuddyAccount`
+             * 的 `allowPermanent`。**没有本段就是假开关**：按钮在、点了不拦。
+             *
+             * ⚠️ `reportPickedAccount: true` 是**必须的**（与 qoder / minimax 同因）：
+             * 本家的旧闭包是**纯池选号**、账本**一直在回报**（见下面
+             * `reportAccount` 那行）。接上 `balance` 后「分档选中」那一支若不回报
+             * ⇒ token 用量记不到本渠道上（静默）。
+             */
+            balance: {
+                kind: 'buddy',
+                selector: autoclawBalanceSelector,
+                // ⚠️ 本家独有文案（池名是「钱包流水批次」而不是 buddy 的「资源包」）。
+                lockedError: autoclawLockedError('AutoClaw'),
+                // ⚠️⚠️ 本家**曾**标过 `isFree: true`，那是**错的**（2026-10-21 二轮审计订正）：
+                //   初版把「远端目录里没有它、但直接调用能用」误当成「不扣费」，而真机
+                //   实测它**每次都扣积分**（`docs/autoclaw-models.md:25`）。现有 4 个模型
+                //   全是 `isFree: false` ⇒ 本家确实没有模型级免费，显式表态即可。
+                isFreeModel: NO_FREE_MODEL,
+                reportPickedAccount: true,
+            },
+            // ⚠️ **必须接**（与 accio 同因）：本工厂的兜底是**固定 ref**
+            //    （`AUTOCLAW_ACCESS_TOKEN`），而 Jet Hub 登录只写
+            //    `AUTOCLAW_ACCOUNT_XXX` ⇒ 池被筛空时它会退到那个**从不被写入**的
+            //    ref，报出误导性的「请先登录」（issue IKJOZ9 的形态）。
+            //    ⚠️ 今天它是**恒不命中的死代码**（`autoclaw-adapter.ts` 不写
+            //    `modelRateLimits` —— `provider-runtime-wiring.spec.ts` 的
+            //    `WRITE_SITE_FILES` 把这一点登记为空并**验证**了「确实没有写点」）。
+            //    保留它是有意的：判据是「兜底形态是否会让池被筛空时报错」，
+            //    而不是「今天有没有标记」。
+            throwIfAllRateLimited: throwIfAllAccountsRateLimited,
+        }),
+        product: AUTOCLAW,
+        // ⚠️⚠️ **必须接 `readImage`**（2026-10-17 审计 P0 修复）。
+        //    `zai_auto-fast` 的 `supportsImage: true` 有实测依据
+        //    （`docs/autoclaw-models.md:42`：AutoClaw 体系内唯一支持图文多模态
+        //    的通道），`resolveModel` 已据此向宿主声明 `['text','image']`
+        //    ⇒ 宿主**不投影**图片、**原样**下发（`dsh-llm/lib/index.js:2311`）。
+        //    ⚠️ **漏了它这条路径恒抛 `UNSUPPORTED_CONTENT`**：声明支持图片却
+        //    必然失败，正是「声明即承诺」被破坏的形态（与 modelscope / opencode
+        //    同约定：不传 `readImage` 时带图请求抛 `UNSUPPORTED_CONTENT`，而不是
+        //    静默丢图让用户以为模型看到了图）。
+        //    ⚠️ 刻意**不接** `readImageRequest` 缩放桥接：智谱侧对单图字节上限
+        //    无实测依据，编一个预算是凭空造数字（同 modelscope 的取舍）。
+        readImage: makeReadImage(ctx),
+        // ⚠️⚠️ **2026-10-23 迁移：黑名单与「关闭供应商」已由共享骨架从账号池读走**
+        //
+        // 本家此前**手写** `listModels`，故需要分别传 `disabledModels` / `providerClosed`
+        // 两个回调（2026-10-20 那次就是靠这两行兜住的）。用户定稿「实体 provider 一律走
+        // 共享骨架」后，那两个字段**已删除** —— 现在唯一入口是本行传进去的池。
+        // ⚠️ **不要把它们加回来**：那会重现「同一语义两套判据」（本仓库红线）。
+        accountPool: pool,
+        /**
+         * ⚠️⚠️ **2026-10-25 补：401 按需续期这条腿此前完全缺失**（真实缺陷）。
+         *
+         * ## 缺陷与证据
+         *
+         * `autoclaw-adapter.ts:636` 的 401 重试判据是
+         * `if (!response.ok && (401 || 403) && this.options.refresh)` ——
+         * **没有本回调时整段不执行**（既不续期、也不重发）。
+         * 而本实例（与国际版）自 `6da5505`（AutoClaw 首次接入）起**从未传过它**
+         * （`git log -S"autoclawAdapter"` 只命中那一个提交）。
+         *
+         * ⇒ 401 直接落到 `isAutoclawAuthError` 命中 `'invalid token'` ⇒ 归 `AUTH`
+         *   ⇒ 而 `AUTH` 会被 DSH 客户端**换成固定文案「API 密钥无效」并丢掉原文**
+         *   （本仓库自记：`autoclaw.ts:555-556` / `docs/agent-notes/client-ui.md`）。
+         *   这正是用户报「模型经常报错 API 密钥无效」的**直接来源**。
+         *
+         * ## 为什么「经常」（触发窗口）
+         *
+         * 定时 `refreshAll`（注册表派生，覆盖本家）本身是工作的 —— 实测凭据
+         * AT 的 `iat` 已刷新、RT 还剩 24.5 天，说明续期成功过。但定时器有 **30 分钟
+         * 粒度**：AT 过期到下一轮成功续期之间存在窗口（宿主关闭/重启、某一轮失败
+         * 都会拉长它），窗口内任何请求都 401 且**无按需自愈** ⇒ 每次过期边界附近
+         * 都可能撞上。补上本回调后，401 会先续期再原样重发一次，请求级自愈。
+         *
+         * ## 形态（⚠️ 2026-10-27 审计修：**不再自己问池要号**）
+         *
+         * 修前是 `pool.getAvailableAccount(AUTOCLAW.id, '')` —— 续到的号与请求实际
+         * 用的号**不是同一个**，而这是本 PR **目标没达成**的直接原因：
+         *
+         * | 判据 | 请求用的号（`createCredentialResolver` + `balance` 分档） | 修前的续期号 |
+         * |---|---|---|
+         * | 排序 | 按到期档位（`pickBuddyAccount`） | 用户手动序第一个 |
+         * | 限流过滤 | 按真 `modelId` | 传 `''` ⇒ **整体短路** |
+         *
+         * 实测（真跑 `createCredentialResolver` + 复刻池逻辑）：分档选中 B 号，
+         * 而 `getAvailableAccount` 返回 A 号 ⇒ 续 A、重发仍用 B 的旧 token ⇒
+         * 401 原样复现，A 被白轮换一把 RT。端到端三次请求 `["AUTH","AUTH","AUTH"]`。
+         *
+         * ⇒ 现在用适配器传进来的 `used`（**本次实际发请求的那份凭据**）：
+         *   ① 按 `access_token` 反查它在池里的条目（与适配器自己的记账判据同源）；
+         *   ② 续它、并**把新凭据返回给适配器重发**（不再 `resolveCredential` 重选号）。
+         *
+         * ⚠️ 反查不到（单凭据路径 / 池里没有这个 token）⇒ 退默认单凭据 ref。
+         * ⚠️ 仍传 `pool + entry.id`，否则新 `expiresAt` 写不回池（issue !IKIRTT）。
+         */
+        refresh: async (used) => {
+            const token = used?.access_token ?? '';
+            // ⚠️ 反查的第二参是**凭据内容**（access_token）而不是 ref 名 ——
+            //    传 ref 名会恒匹配失败且**静默**（本仓库已复发多次）。
+            const accountId = token.length > 0
+                ? await pool.findAccountIdByCredential(AUTOCLAW.id, token).catch(() => '')
+                : '';
+            const entry = accountId.length > 0
+                ? (await pool.listAccounts(AUTOCLAW.id)).find((item) => item.id === accountId)
+                : undefined;
+            if (entry !== undefined) {
+                return await autoclaw.renewCredentialForRef(entry.credentialRef, pool, entry.id);
+            }
+            /**
+             * ⚠️⚠️ **反查失败必须当场留痕**（2026-10-27 第二轮审计打穿的 P0，两位审计员独立命中）。
+             *
+             * ## 为什么诊断要写在这里而不是下面那条「退默认 ref」的分支
+             *
+             * 修前把 warn 放在 `renewCredentialForRef(defaultCredentialRef)` 返回
+             * `undefined` 之后 —— 但那条分支**几乎不可达**：该 ref 全仓无写入点，
+             * 而 `renewCredentialForRef` 在「凭据未配置」时是**抛错**（不是返回
+             * `undefined`）⇒ 真正发生的是「抛错被适配器的 `catch` 静默吃掉」，
+             * 那条精心写好的 warn **一次都不会执行**（实测确认）。
+             *
+             * ⇒ 现在把诊断**前移到反查失败当场**：无论后续走哪条分支（抛错 / 空转 /
+             *   退默认 ref），日志里都已经有「为什么找不到可续期的账号」。
+             *
+             * ⚠️ 这条路径**可达**：`pool.findAccountIdByCredential` 会 `continue` 掉
+             *   `!entry.enabled` 的条目 ⇒ 请求用的账号若在 grant 期间被停用，
+             *   反查返回 `''` 就落到这里。
+             */
+            if (token.length > 0) {
+                ctx.logger.warn('[autoclaw] 401 后按 access_token 反查不到账号：'
+                    + '池里没有一把匹配的凭据（可能该账号已被删除，或已停用 ⇒ 反查跳过 enabled:false）'
+                    + ' ⇒ 本次只能退默认单凭据 ref（它通常未配置，即本次不重发，按首次 401 报错）');
+            }
+            /**
+             * 池里没有这个 token（单凭据路径 / 账号被删）⇒ 退默认单凭据 ref。
+             *
+             * ⚠️ **不能抛错**（第二轮审计打穿的 P0）：适配器那一侧的 401 重发是
+             * `try { … } catch { /* 忽略重试失败 *\/ }` —— 抛出去的异常被**静默吃掉**。
+             * 现在只记日志 + 让 `renewCredentialForRef` 自己决定抛或返回；
+             * 适配器那侧的 `catch` 也已补 warn，两处合起来保证**不再静默**。
+             */
+            return await autoclaw.renewCredentialForRef(AUTOCLAW.defaultCredentialRef).catch((error) => {
+                ctx.logger.warn('[autoclaw] 401 后无可续期的账号（默认单凭据 ref 未配置或不可用）：'
+                    + `${error instanceof Error ? error.message : String(error)} ⇒ 本次不重发，按首次 401 报错`);
+                return undefined;
+            });
+        },
+    });
+    // ===== AutoClaw 国际版（autoclawintl）=====
+    //
+    // 与国内版是**同一套协议实现**的第二个实例（差异全在 `AUTOCLAW_INTL` 配置里：
+    // 基址 `autoglm-api.autoglm.ai` / 凭据 ref 前缀 `AUTOCLAWINTL_`）。
+    // 刻意**不复制**任何 `src/autoclaw*.ts` 实现文件 —— 协议同源，复制会让同类
+    // 缺陷（净额批次、临期分档、签到判据）修两遍（与 `minimaxintl` 同纪律）。
+    //
+    // ⚠️⚠️ **为什么是独立 provider**（三条判据全中，见 `autoclaw-product.ts`
+    //    `AutoclawProduct` 的注释表）：
+    //    ① 账号体系不互通（国内手机号 `7c54a9ac…` / 国际邮箱 `2c99dc99…`）；
+    //    ② API 主机不同；
+    //    ③ **登录方式不同**（国内短信验证码 / 国际 Z.ai OAuth）。
+    //
+    //    实测佐证：拿国内签发的 token 打国际基址，`wallets` / `user-profile`
+    //    一律 `410000 用户未登录`、推理 `401 Invalid token` ⇒ 用户体系物理隔离。
+    //
+    // ⚠️ **当前登录**：Z.ai OAuth 尚未接入（`state.nh` 来源未知，
+    //    见 `AUTOCLAW_INTL` 的注释）⇒ 本 provider 目前只能手工注入 token 使用。
+    //    接入后它会自己有一条 `login.startOAuth` 分支。
+    const autoclawIntl = new AutoclawAuth(ctx, { product: AUTOCLAW_INTL });
+    const autoclawIntlAdapter = registerAutoclawLlm(ctx, {
+        resolveCredential: createCredentialResolver({ pool, reportAccount: (id) => { if (id !== undefined)
+                reportLedgerAccount(AUTOCLAW_INTL.id, id); } }, {
+            product: AUTOCLAW_INTL,
+            // ⚠️ 与国内版共用同一个解析器（两站凭据形状逐字相同）。
+            readCredential: resolveAutoclawCredentialByRef,
+            fallback: { kind: 'ref', refName: AUTOCLAW_INTL.defaultCredentialRef },
+            // ⚠️ **必须接 `balance`**（与国内版同因同日，见那一段的长注释）。
+            //    ⚠️ `selector` 必须是**国际站自己**那个实例（缓存不跨站共用）；
+            //    `displayName` **必须**逐站区分（两站账号不互通，用户要知道去哪个面板解锁）。
+            balance: {
+                kind: 'buddy',
+                selector: autoclawIntlBalanceSelector,
+                lockedError: autoclawLockedError('AutoClaw (国际版)'),
+                // ⚠️ 同国内版：本家无模型级免费（`isFree` 全为 false，见那处说明）。
+                isFreeModel: NO_FREE_MODEL,
+                reportPickedAccount: true,
+            },
+            throwIfAllRateLimited: throwIfAllAccountsRateLimited,
+        }),
+        // ⚠️ provider 实参必须是 AUTOCLAW_INTL：写死 AUTOCLAW 会让国际站永远
+        //    查不到自己的账号（本插件在 workbuddy 上踩过同类坑）。
+        product: AUTOCLAW_INTL,
+        readImage: makeReadImage(ctx),
+        // ⚠️⚠️ 同国内版（2026-10-23 迁移）：黑名单与关闭意图由共享骨架从账号池读。
+        //    两个站点**各一条** `accountPool`，漏一处即该站静默失效（本仓库的既有纪律）。
+        accountPool: pool,
+        /**
+         * ⚠️⚠️ **2026-10-25 补：401 按需续期这条腿此前完全缺失**（与国内版同因同源）。
+         *
+         * 证据与形态**逐字同国内版那条**（见上）：`autoclaw-adapter.ts` 的 401
+         * 重试判据带 `&& this.options.refresh`，而两个实例自 `6da5505` 起都没传它
+         * ⇒ 401 不续期不重发 ⇒ 归 `AUTH` ⇒ 客户端换成「API 密钥无效」。
+         * 两个站点**各补一条**（本仓库既有纪律：双站点每处都要到位）。
+         *
+         * ⚠️ 形态与国内版**逐字同构**（含「按 `used.access_token` 反查」与
+         * 「返回新凭据供重发」）：两站的选号规则差异（都接了 `balance` 分档）
+         * 完全一样，照抄国内版才是同一条纪律；各写一套必然漂移。
+         */
+        refresh: async (used) => {
+            const token = used?.access_token ?? '';
+            const accountId = token.length > 0
+                ? await pool.findAccountIdByCredential(AUTOCLAW_INTL.id, token).catch(() => '')
+                : '';
+            const entry = accountId.length > 0
+                ? (await pool.listAccounts(AUTOCLAW_INTL.id)).find((item) => item.id === accountId)
+                : undefined;
+            if (entry !== undefined) {
+                return await autoclawIntl.renewCredentialForRef(entry.credentialRef, pool, entry.id);
+            }
+            // ⚠️ 同国内版：**诊断前移到反查失败当场**（那条「退默认 ref 后看返回值」
+            //    的分支几乎不可达 —— `renewCredentialForRef` 在未配置时是抛错不是返回
+            //    `undefined`，故旧写法里那段 warn 一次都不会执行，实测确认）。
+            if (token.length > 0) {
+                ctx.logger.warn('[autoclawintl] 401 后按 access_token 反查不到账号：'
+                    + '池里没有一把匹配的凭据（可能该账号已被删除，或已停用 ⇒ 反查跳过 enabled:false）'
+                    + ' ⇒ 本次只能退默认单凭据 ref（它通常未配置，即本次不重发，按首次 401 报错）');
+            }
+            // ⚠️ 同国内版：**不得抛错**（抛出去会被适配器的 catch 静默吃掉 ⇒
+            //    「一次上游都不发 + 日志零字」）。只记日志并返回 undefined。
+            return await autoclawIntl.renewCredentialForRef(AUTOCLAW_INTL.defaultCredentialRef).catch((error) => {
+                ctx.logger.warn('[autoclawintl] 401 后无可续期的账号（默认单凭据 ref 未配置或不可用）：'
+                    + `${error instanceof Error ? error.message : String(error)} ⇒ 本次不重发，按首次 401 报错`);
+                return undefined;
+            });
+        },
+    });
     const accio = new AccioAuth(ctx);
     const accioAdapter = registerAccioLlm(ctx, {
         // ⚠️ **不传 `credentialRef`**：`AccioAdapterOptions` 里没有这一项 —— 该适配器
@@ -1767,11 +3605,277 @@ export function apply(ctx) {
         fetchRemoteModels: () => accio.fetchModels(pool),
         accountPool: pool,
         product: ACCIO,
-        // ⚠️ **刻意不接 `readImage` / `readImageRequest`**：Accio 的图片通路**未实测**
-        //    （`serializeAccioMessages` 的 `flattenText` 只保留 text 块），故适配器的
-        //    `inputModalities` 恒**省略**（= 未知），并在收到图片时显式抛
-        //    `UNSUPPORTED_CONTENT`（绝不静默丢弃）。接上字节桥接等于放行一条
-        //    没有任何实测支撑的通路 —— 见 `accio-adapter.ts` 的 `toCatalogEntry` 注释。
+        // ⚠️ **图片通路已接通**（issue IKLR7V，2026-10-14 真机实测）：
+        //    上游原生收图（Gemini 风格的 `parts[].inline_data`），且 `multimodal: true`
+        //    的模型四色全对、`multimodal: false` 的模型**静默忽略图片**（含一家会幻觉）。
+        //    故这里接上字节桥接，`inputModalities` 按**逐模型**的 `supportsImage` 如实声明。
+        //    ⚠️ 泛型参数（`AccioCredential`）与上面 `resolveCredential` 一致。
+        readImage: makeReadImage(ctx),
+        readImageRequest: makeReadImageRequest(ctx),
+    });
+    // ===== AStudio（讯飞 AstronStudio，云端直连上游 MAAS）=====
+    //
+    // 形态与 OfficeAce / Accio 同类：进程内 LlmAdapter 直发远端，无子进程、无端口。
+    // 独有语义：**没有 OAuth 授权页**，凭据来自本机 AStudio 客户端的明文会话文件；
+    // Jet Hub 的 account.create 因此走 importLocalSession（见 jet-hub-rpc.ts）。
+    //
+    // 服务名由 AstudioAuth 依 product.id 派生（astudioAuth）并在构造时自注册，
+    // 故这里**不需要**再 ctx.provide('astudioAuth' / 'astudioLlm')。
+    // 不注册斜杠命令：入口在 Jet Hub 的 AStudio 面板。
+    const astudio = new AstudioAuth(ctx);
+    /**
+     * 按凭据 ref 解析 AStudio 凭据（供**选号器查余额**与最终取凭据共用）。
+     *
+     * ⚠️ 形状校验必须与 `astudio-auth.ts` 的 `parseAstudioCredential` 对齐
+     *（判 `typeof access_token === 'string'`）。裸 `JSON.parse` 会让
+     * `{"foo":1}` 这种损坏凭据被当成有效凭据返回，随后适配器的
+     * `credential.access_token.length` 抛 **TypeError**（不可诊断），
+     * 且发生在选号之后 —— 不在余额查询的 try/catch 覆盖范围内。
+     * 这条注释与 LobsterAI / TRAE 那两处同因（写两遍、强度不一致 = 改一处漏一处）。
+     *
+     * 实测凭据字段（两个账号，2026-10-20）：`access_token`(65 字符) /
+     * `account_id` / `uid` / `nickname` / `sso_session_id` / `token` /
+     * `login_method` / `logged_in_at` / `source`。分档判据只用到
+     * `access_token`（作为 `Cookie: ssoSessionId=` 的值去查 `/points/balance`）。
+     */
+    const resolveAstudioCredentialByRef = async (refName) => {
+        const resolved = await ctx.credentials.resolve(credentialRef(refName));
+        if (!resolved)
+            return undefined;
+        try {
+            const parsed = JSON.parse(resolved.value);
+            return typeof parsed === 'object' && parsed !== null && typeof parsed.access_token === 'string'
+                ? parsed
+                : undefined;
+        }
+        catch {
+            return undefined;
+        }
+    };
+    /**
+     * AStudio 的**按「积分何时作废」分档选号器**（为「锁定永久积分」提供依据）。
+     *
+     * ⚠️ 复用 `BuddyBalanceSelector` 而不是新写一个：分档判据
+     * （`splitBuddyCreditsByExpiry`）只读通用的
+     * `packages[].{ active, remaining, deductionEndTime }`，**与 provider 无关**。
+     * AStudio 的 `buildAstudioBalance` 自 2026-10-20 起把
+     * `{member,buy,activity}NextExpireTime`（不带时区的本地时间串，实测形如
+     * `"2026-11-20T01:50:14"`）归一化到 `deductionEndTime`（毫秒），故结构一致。
+     *
+     * ⚠️ **缓存不能跨站共用**（选择器内含按账号 id 的缓存），故每家一个实例。
+     *
+     * ⚠️ 到期时间缺失的包归入**永久桶**（`splitBuddyCreditsByExpiry` 的保守方向）：
+     * 宁用锁定时少用一个号，也不要把长期积分误当快到期烧掉。
+     */
+    const astudioBalanceSelector = new BuddyBalanceSelector({
+        product: ASTUDIO,
+        resolveCredential: resolveAstudioCredentialByRef,
+        fetchBalance: (credential, product) => fetchAstudioCreditBalance(credential, product),
+        // ⚠️ 带原因变体（见文件头那段长注释）：AStudio 的失败分流有四档
+        // （未登录 / 会话失效需重登 / 服务不可用 / 响应缺字段），薄封装全压成 `null`
+        // ⇒ 锁定时只能报「凭据失效或响应异常」，而那四档的处置**完全不同**。
+        fetchBalanceDetailed: (credential, product) => fetchAstudioBalanceDetailed(credential, product === undefined ? {} : { product }),
+    });
+    /**
+     * AStudio 的凭据编排（候选筛选 → 余额分档 → 取凭据 → 回退）。
+     *
+     * ⚠️ 单独取名而不是内联，因为下面 `registerAstudioLlm` 的 `resolveCredential`
+     * 是**零参**签名，必须先拿到这个带参函数再包一层（见那处注释）。
+     */
+    const astudioCredentialPlan = createCredentialResolver({
+        pool,
+        reportAccount: (id) => {
+            if (id !== undefined)
+                reportLedgerAccount(ASTUDIO.id, id);
+        },
+    }, {
+        product: ASTUDIO,
+        // ⚠️ 必须传 ASTUDIO 自己的解析器（buddy 系那份虽然形状恰好兼容 ——
+        //    同样判 `access_token` 是字符串 —— 但两家凭据字段不同：astudio 带
+        //    `sso_session_id` / `login_method` / `source`，且将来任一方加校验就会分叉）。
+        readCredential: resolveAstudioCredentialByRef,
+        balance: {
+            kind: 'buddy',
+            selector: astudioBalanceSelector,
+            // ⚠️ 本家**没有**免费模型概念（`AstudioAdapter` 只在 `listAllModels`
+            //    的返回类型里声明了 `isFree?`，兜底表零个 `isFree: true`，
+            //    上游目录也不返回该字段）⇒ 显式表态，不要删字段（见 `NO_FREE_MODEL`）。
+            isFreeModel: NO_FREE_MODEL,
+            lockedError: astudioLockedError('AStudio'),
+            // ⚠️⚠️ **必须是 `true`**（2026-10-21 合并审计发现：PR !119 原写的 `false`
+            //    让上面 `reportAccount` 成了**不可达的死接线**）。
+            //
+            // **原注释错在哪**：原文「与 buddy 系一致：本家旧闭包也没有回报」是**类比错误** ——
+            // buddy 系能写 `false` 是因为它们的**适配器自己回报**（`buddy-adapter.ts` /
+            // `trae-adapter.ts` / `lobsterai-adapter.ts` 都调 `reportLedgerAccount`），
+            // 而 **AStudio 适配器全文零回报**（grep 实测 0 处），且 master 上它压根没有
+            // `reportAccount` 接线 ⇒「旧闭包也没有回报」描述的是**一个缺陷状态**。
+            //
+            // **实测这行是死代码**（`credential-resolver.ts` 三条回报点：①免费短路 ——
+            // astudio 无 `isFreeModel` 不进；②分档选中 `:388` 被 `!== false` 拦住；
+            // ③池选号 `:454` —— ②里已 `return picked.credential`，走不到）：
+            // ```
+            // reportPickedAccount=false     → cred=true reports=[]     poolReached=false
+            // reportPickedAccount=true      → cred=true reports=["a1"] poolReached=false
+            // reportPickedAccount=undefined → cred=true reports=["a1"] poolReached=false
+            // ```
+            // ⇒ `false` 时**零回报**，而那正是 `reportAccount: (id) => reportLedgerAccount(...)`
+            // 唯一的调用来源 ⇒ 那行接线永不执行。
+            //
+            // **后果**：`token-ledger.ts` 拿不到 `accountId` ⇒ 整笔用量归到 `'-'`（未归属）桶
+            // ⇒ AStudio 账号卡片看不到自己的 token 用量，多账号时无法区分谁在烧。零报错零日志。
+            //
+            // **为什么改 `true` 是纯增益**：master 上 astudio 走 `auth.currentCredential()`
+            // （单凭据、从未回报归属）⇒「有归属」是新增能力不是回退，它**没有旧闭包要保真**
+            // （该分支在 master 上根本不存在）。⚠️ 与 buddy 系的取舍**不同源**，别照抄那两行。
+            reportPickedAccount: true,
+        },
+        fallback: { kind: 'ref', refName: ASTUDIO.defaultCredentialRef },
+        // 退到单凭据 ref 之前先证明失败原因：全被模型限流时报明确的限流错误，
+        // 而不是降级成误导性的 MISSING_CREDENTIAL（见 throwIfAllAccountsRateLimited）。
+        throwIfAllRateLimited: throwIfAllAccountsRateLimited,
+    });
+    const astudioAdapter = registerAstudioLlm(ctx, {
+        // ⚠️⚠️ **`accountPool` 必须传**（Gitee issue IKP8OF 审计发现，真实缺陷）：
+        //    本家此前是**唯一**把 `createModelCatalog` 的 deps 传成 `{}` 的适配器
+        //    （其余各家都传 `{ accountPool }`）⇒ 骨架里 `deps.accountPool?.disabledModelsFor`
+        //    与 `providerClosedFor?.(...)` 全部因 `?.` **静默跳过** ⇒
+        //    **用户在 Jet Hub 里关掉的 astudio 模型照样出现在选择器里**，
+        //    关闭整个供应商也无效。症状与 modelscope 那次「接线层漏实参」逐字相同。
+        // ⚠️ 仍**不传** `readImage`（实测六个模型的 input_modalities 全是 text，
+        //    图片通路不成立），且本家刻意不做请求级换号。
+        accountPool: pool,
+        // ⚠️ **2026-10-20 新增**：此前本家不传 `resolveCredential`，适配器走
+        //    `auth.currentCredential()` ⇒ **单凭据、无选号**，于是：
+        //    · 「锁定永久积分」开关即使打开也**毫无作用**（没有选号层可拦）；
+        //    · 多账号时永远只用池里「第一个可用」的那个，第二个号的临期额度用不上。
+        //    接上 `createCredentialResolver`（与 buddy/lobsterai/trae 同一套编排）后，
+        //    候选先按 `enabled` + 模型限流筛，再按「15 天内到期优先」分档。
+        //
+        // ⚠️⚠️ **必须包一层转成零参签名**：`createCredentialResolver` 返回的是
+        //    `(modelId?: string) => Promise<TCredential | undefined>`，而
+        //    `AstudioAdapterOptions.resolveCredential` 声明的是
+        //    `() => Promise<AstudioCredential | undefined>`（**零参**）。
+        //    直接把带参函数传过去会 TS2322（参数个数不兼容）。
+        //    ⚠️ 传 `''` 而不是省参数：空串意味着「不按模型筛候选」——
+        //    `candidatesOf` 对空 `modelId` 跳过 `modelRateLimits` 过滤，
+        //    这与本家适配器（`requestLevelRotation` 关闭、不按模型换号）的语义一致；
+        //    若将来接上请求级换号，这里应改为透传真实 modelId。
+        resolveCredential: () => astudioCredentialPlan(''),
+        // ⚠️ AstudioAdapterOptions 原本只有 product / fetchImpl / auth / resolveCredential /
+        //    refresh / fetchRemoteModels / onCatalogLoaded / warn 八项 —— **没有**
+        //    accountPool 与 readImage。⚠️ **但 `accountPool` 已于 2026-10-20 补上**
+        //    （Gitee issue IKP8OF：缺它会让黑名单与「供应商整体关闭」静默失效，
+        //    见上面那一段），故本块与它**并存**、不是二选一。
+        //    仍**没有** `readImage`：实测六个模型的 input_modalities 全是 text，
+        //    图片通路不成立，多传必 TS2353。
+        //    ⚠️ 同样**没有** `credentialRef`：`registerAstudioLlm` 内部会用
+        //    `auth.currentCredential()` 作为「池里无账号」时的回退，不需要外部传 ref
+        //    （传了必 TS2353，2026-10-20 实测踩到）。
+        //    ⚠️ 但「请求级换号」与「按余额分档选号」是**两件事**：前者是 429 后换号
+        //    （本家确实没有），后者是「该用哪个号」（上面刚接上）。两者互不依赖。
+        // ⚠️ **不传 onCatalogLoaded**：registerAstudioLlm 内部已注入唯一的
+        //    broadcastCatalogChanged(ctx)，这里再传就是第二份广播。
+        // ⚠️ 传 auth 即可拿到三个默认回调（currentCredential / refreshOnce /
+        //    fetchCatalogModels），下面只覆盖确实需要定制的那一个。
+        auth: astudio,
+        product: ASTUDIO,
+        refresh: async () => {
+            // ⚠️ 必须返回 AstudioRefreshOutcome：本家 401 的唯一入口是 refreshOnce
+            //    （**不抛**，以 credential/terminal/reason 回传），**不是**返回
+            //    Promise<void> 的 refreshAccountCredential —— 后者的签名与语义都不匹配
+            //    该形参（TS2322），且它会把终态错误抛进适配器。
+            // ⚠️ 刷的必须是「解析凭据时所用的那一个」账号（同上面 accio 处说明）；
+            //    池里没有账号时退到默认单凭据 ref。
+            const available = await pool.getAvailableAccount(ASTUDIO.id, '');
+            return await astudio.refreshOnce(available?.entry.credentialRef ?? ASTUDIO.defaultCredentialRef);
+        },
+        warn: (message) => { ctx.logger?.warn?.(message); },
+    });
+    // ===== ModelScope（魔搭）—— **本 fork 独有** =====
+    //
+    // ⚠️ 迁移说明（2026-10-16）：本 provider 在 rc.3 时代按「槽制 + 自建反代」形态实现，
+    //    rc.11 引入 `provider-registry` / `provider-runtime` / `credential-resolver`
+    //    三套抽象后，接入点收敛到「注册表声明 + 一次 `registerProviderRuntime`」。
+    //    ⚠️ **`ModelscopeAdapterOptions` 仍是槽制（`slots`）**，与 accio 的
+    //    `resolveCredential` 形态不同 —— 那是有意的：魔搭的凭据是**多枚 key 轮转**
+    //    （旧 fork 的 `PROXY_UPSTREAM_MODELSCOPE` 存的就是 JSON 数组），
+    //    而 `createCredentialResolver` 的契约是「一个 ref 一份凭据」。
+    //    详见 `src/modelscope-rpc.ts` 的 `modelscopeSlotNamesOf`。
+    //
+    // 服务名由 ModelscopeAuth 依 product.id 派生，注册为 ctx.modelscopeAuth。
+    const modelscope = new ModelscopeAuth(ctx);
+    const modelscopeAdapter = registerModelscopeLlm(ctx, {
+        // 单凭据回退 ref：池里没有 modelscope 账号时用它（与其余 provider 同约定）。
+        credentialRef: credentialRef(MODELSCOPE.defaultCredentialRef),
+        // ⚠️ 槽序列由**接线层**解析好传进来（适配器不直接读凭据）。
+        //    `modelId` 透传：接线层据此过滤「该模型正处于限流窗口」的账号
+        //    （与其余 provider 的 `getAvailableAccount` 同语义）。
+        slots: async (modelId) => {
+            const entries = await pool.listAccounts(MODELSCOPE.id);
+            const usable = await Promise.all(entries.map(async (entry) => {
+                // 与其余 provider 同款：停用账号不参与自动选号。
+                if (!entry.enabled)
+                    return undefined;
+                // ⚠️ 模型级限流标记：`modelId` 缺省时**不查**（目录路径刻意不传，
+                //    见适配器的模块头说明 —— 传了会让被限流的账号把整个目录拖空）。
+                if (modelId !== undefined && modelId.length > 0) {
+                    const resetAt = entry.modelRateLimits?.[modelId];
+                    if (typeof resetAt === 'number' && resetAt > Date.now())
+                        return undefined;
+                }
+                const resolved = await ctx.credentials.resolve(credentialRef(entry.credentialRef));
+                if (!resolved)
+                    return undefined;
+                try {
+                    const parsed = JSON.parse(resolved.value);
+                    if (typeof parsed.access_token !== 'string' || parsed.access_token.length === 0)
+                        return undefined;
+                    return { id: entry.id, apiKey: parsed.access_token };
+                }
+                catch {
+                    return undefined;
+                }
+            }));
+            return usable.filter((s) => s !== undefined);
+        },
+        accountPool: pool,
+        product: MODELSCOPE,
+        // ⚠️ **本 fork 独有**（2026-10-17 审计 P1 修复）：限流标记的**写入端**。
+        //    ⚠️ 本回调此前**没有注入**，而上面 `slots()` 里却在**主动读**
+        //    `entry.modelRateLimits?.[modelId]` 来跳过受限账号 —— 读端存在、写端缺失
+        //    ⇒ 那段判据恒不命中（死代码），适配器里的 `this.options.markLimited?.()`
+        //    也恒为 no-op ⇒ **限流标记永远写不进池**。
+        //    守卫为什么没抓住：`provider-runtime-wiring.spec.ts` 只检查**适配器文件里
+        //    有没有调用形**（`.markLimited?.(` 确实存在 ⇒ 绿），**从不检查接线层有没有
+        //    注入该回调** ⇒ 「适配器写了调用、接线层没注入」这一形态打不穿。
+        //    与 opencode（`index.ts:2940`）同款实现。
+        markLimited: async (slotId, modelId, resetAtMs) => {
+            await pool.updateModelRateLimit(slotId, modelId, resetAtMs);
+        },
+        // 远端目录：`GET {base}/v1/models`。失败回退 `MODELSCOPE_FALLBACK_MODELS`
+        // （适配器的 `loadModelscopeCatalog` 内部兜底，不会抛）。
+        // ⚠️ **必须带超时**：桌面版到外部域名的 fetch 可能永不 settle
+        //（opencode 的真机事故 2026-10-02：没有超时 ⇒ listModels 永不返回 ⇒
+        //  模型列表与徽标同时空白）。超时后回退兜底表，UI 立刻可用。
+        fetchRemoteCatalog: (apiKey, signal) => fetch(modelscopeModelsUrl(MODELSCOPE), {
+            headers: modelscopeHeaders(apiKey),
+            signal: signal ?? AbortSignal.timeout(10_000),
+        }),
+        // ⚠️ **刻意不接 `readImageRequest`**：`ModelscopeAdapterOptions` 没有该字段
+        //    （它按「像素预算发请求版本」的形态只在 opencode / accio 那几家实现）。
+        //    魔搭的图片走 `readImage` 单一路径，逐模型按 `supportsImage` 声明模态。
+        readImage: makeReadImage(ctx),
+        // ⚠️⚠️ **2026-10-23 迁移：黑名单与「关闭供应商」已由共享骨架从账号池读走**
+        //
+        // 本家此前**手写** `listModels`，故需要在这里分别传 `disabledModels` 与
+        // `providerClosed` 两个回调（2026-10-17 / IKP8OF 两次实测都栽在「漏传实参」
+        // 上：适配器支持该能力、消费点也对，只是接线层漏了 ⇒ 纯静默失效）。
+        //
+        // 用户定稿「实体 provider 一律走共享骨架」后，那两个回调**已删除**：
+        // `ModelscopeAdapter.listModels` 改为委托 `createModelCatalog`，黑名单与
+        // 关闭意图统一从上面那个 `accountPool` 读。⚠️ **不要把回调加回来** ——
+        // 那会让「同一语义两套判据」重现（本仓库红线），且会掩盖池没接上的缺陷。
     });
     // 一次性修复**老账号**的昵称与凭据字段（与上面 WorkBuddy 的启动清理同类）。
     //
@@ -2099,6 +4203,56 @@ export function apply(ctx) {
     }).catch((error) => {
         ctx.logger.warn(`[jet-hub] 修正 Gemini 账号显示名失败：${String(error)}`);
     });
+    // 一次性修复**老 MiniMax 账号**的展示名（Gitee issue IKP8UA 修法 ③）。
+    //
+    // 成因见 `minimax-auth.ts` 的 `repairAccountNicknames`：MiniMax 的
+    // `access_token` **不是 JWT**，而旧昵称判据走 `decodeJwtSub` ⇒ 恒空 ⇒
+    // 账号卡片恒显示插件内部 id（`minimax-6395cf64`），多账号无法分辨。
+    // 光改登录路径**不会自愈存量账号**（本机实测 7 条全是内部 id），故补这一次。
+    //
+    // ⚠️ 两个站点**各一条**（它们共用同一个 auth 类、但 product 不同 ⇒
+    //    `apiHost` 与 XFF 判据都不同，见 `minimax-identity.ts`）。
+    //    漏一处即该站静默不自愈（本仓库的既有纪律：双站点每处都要到位）。
+    // ⚠️ 幂等 + 失败不阻塞启动（`repairAccountNicknames` 内部逐账号 catch）。
+    void minimax.repairAccountNicknames(pool).then((repaired) => {
+        if (repaired.length > 0) {
+            ctx.logger.info(`[jet-hub] 已修正 ${repaired.length} 个 MiniMax 账号的显示名（改用上游账号名）：${repaired.join(', ')}`);
+        }
+    }).catch((error) => {
+        ctx.logger.warn(`[jet-hub] 修正 MiniMax 账号显示名失败：${String(error)}`);
+    });
+    void minimaxIntl.repairAccountNicknames(pool).then((repaired) => {
+        if (repaired.length > 0) {
+            ctx.logger.info(`[jet-hub] 已修正 ${repaired.length} 个 MiniMax 国际版账号的显示名（改用上游账号名）：${repaired.join(', ')}`);
+        }
+    }).catch((error) => {
+        ctx.logger.warn(`[jet-hub] 修正 MiniMax 国际版账号显示名失败：${String(error)}`);
+    });
+    // ===== MiniMax 专属 60s 续期巡检 =====
+    //
+    // ⚠️⚠️ **这是本次重构的核心**：全局 30min 调度器对 MiniMax 已改为
+    // **只对账**（`MinimaxAuth.refreshAll` 不再发 grant，见该方法注释），
+    // MiniMax 的轮换改由这里承担 —— margin 5min + 账号散列抖动 ⇒
+    // 各账号续期时刻天然错开，旧形态「全池同秒过期」的结构性根因被拆除。
+    //
+    // ⚠️ 两个站点**各一条**（同 repair 的双站点纪律，漏一处即该站静默不续期）。
+    //
+    // ⚠️⚠️ **必须挂 `ctx.effect` 回收**（2026-10-27 审计修）。
+    //    修前这两行是裸调用：`startRenewPatrol` 装了一个 60s `setInterval`，
+    //    而**没有任何 clear 路径**（`unref` 只保证「不阻止进程退出」，不保证
+    //    「fiber 卸载后停手」）。实测 `fiber.dispose()` 后推进 130s ⇒ 巡检 tick
+    //    照跑，而旧实例读的是**共享 credentials 后端**（不是快照）⇒ 它会继续对
+    //    **新池**发 grant；插件热重载时旧实例没死 + 新实例已起 ⇒ **两个实例并发
+    //    轮换同一批一次性 RT**，输家拿到 `invalid_grant` 并把好号标死
+    //    （`refreshable:false` 是单向门）—— 恰好是本 PR 自己声称要修的形态。
+    //    ⚠️ 回收点必须与 `refreshScheduler.stop()`（下方 `ctx.effect`）同处：
+    //    那是本文件既有的生命周期约定，别另开一套。
+    ctx.effect(() => () => {
+        minimax.stopRenewPatrol();
+        minimaxIntl.stopRenewPatrol();
+    });
+    void minimax.startRenewPatrol(pool);
+    void minimaxIntl.startRenewPatrol(pool);
     // ===== 多账号静默续期调度 =====
     // 替代原有的单账号 scheduleRefresh()，使用 refreshAll() 遍历所有账号续期
     const REFRESH_INTERVAL_MS = 30 * 60 * 1000; // 每 30 分钟检查一次
@@ -2250,6 +4404,8 @@ export function apply(ctx) {
         // ⚠ 必须 dispose captcha 浏览器 —— 否则会留下孤儿 chromium
         //（约 200-400 MB，且用户没有界面能关掉它）。
         zcodeAdapter.stop();
+        // AStudio（讯飞）的 stop() 置 active=false，阻止在途刷新回写凭据。
+        astudio.stop();
     }, 'jet-hub: multi-account refresh scheduler');
     // 保留旧的 stop scheduler（兼容旧命令）
     ctx.effect(() => () => {
@@ -2265,6 +4421,8 @@ export function apply(ctx) {
         zcode.stop();
         // 同上：captcha 浏览器必须随插件一起回收。
         zcodeAdapter.stop();
+        // 同上：AStudio 的在途刷新必须随插件一起回收。
+        astudio.stop();
     }, 'codearts-auth.scheduler (legacy)');
     // ===== OfficeAce（华为 ModelArts MaaS，云端直连）=====
     //
@@ -2274,19 +4432,82 @@ export function apply(ctx) {
     // `model_app_key:secret` 的 Basic 鉴权，STS 用 refresh_token 续期（30 天），
     // 积分余额与倍率经 V11 签名直读云侧。全程**不经过 OfficeAce 客户端**
     //（协议逆向见 `officeace-auth.ts` 模块头）。
+    /**
+     * 「启用中的 OfficeAce 账号」清单（**顺序 = 用户拖拽的手动优先级**，与
+     * `getAvailableAccount` 的候选序同一份）。
+     *
+     * ⚠️ 锁定判定（逐账号看余额）与未锁定取号（取第一个）**必须共用这一份**：
+     *    各写一遍会让「锁定遍历了谁」与「未锁定用了谁」悄悄漂移 —— 而
+     *    `officeace-refresh-all.spec.ts` 的调用点普查刻意「新增即红」，正是要求
+     *    每新增一处取池都要先证明它**不是第二份遍历**。这里抽成一处即为此
+     *    （纯重构 ⇒ 那个普查的调用点计数**保持不变**）。
+     */
+    const enabledOfficeAceAccounts = () => pool.listAccountsByProvider(OFFICEACE.id)
+        .filter((entry) => entry.enabled !== false);
+    /**
+     * 「不理会锁定」的取号路径 = **锁定前的那条原路径，逐字保留**。
+     *
+     * 两个用途（**同一份实现**，刻意不写第二份）：
+     * 1. 未锁定态的推理取号 —— 即 `credentialProvider` 的 `resolveUnlocked`；
+     * 2. **只读目录探测**（`/v2/models` + 倍率）—— 它们不扣积分，**绝不能被锁定
+     *    牵连**（否则面板报「读取模型列表失败」、供应商关不掉、分组消失）。
+     */
+    const resolveOfficeAceCredential = async () => {
+        const available = await pool.getAvailableAccount(OFFICEACE.id, '');
+        const ref = available?.entry?.credentialRef
+            ?? enabledOfficeAceAccounts()[0]?.credentialRef;
+        if (ref === undefined)
+            return officeaceAuth.readStoredCredential();
+        return officeaceAuth.readCredential(ref, ctx.credentials);
+    };
     const officeAceAdapter = registerOfficeAceLlm(ctx, {
-        disabledModels: () => pool.disabledModelsFor(OFFICEACE.id),
+        // ⚠️⚠️ **2026-10-23 迁移：黑名单与「关闭供应商」已由共享骨架从账号池读走**
+        //
+        // 本家此前**手写** `listModels`，故需要分别传 `disabledModels` / `providerClosed`
+        // 两个回调（IKP8OF 那次就是靠这两行兜住的）。用户定稿「实体 provider 一律走
+        // 共享骨架」后，那两个字段**已删除** —— 现在唯一入口是本行传进去的池。
+        // ⚠️ **不要把它们加回来**：那会重现「同一语义两套判据」（本仓库红线）。
+        accountPool: pool,
         // ⚠️ **按当前选中账号的 ref 取凭据**（2026-10-13）：凭据存在 DSH 凭据库里
         //    按 `credentialRef` 索引（与 gemini / raccoon 同款）。缺省会读兼容文件
         //    `session.json`，那份是**所有账号共用**的 ⇒ 号池轮换形同虚设。
-        credentialProvider: async () => {
-            const available = await pool.getAvailableAccount(OFFICEACE.id, '');
-            const ref = available?.entry?.credentialRef
-                ?? pool.listAccountsByProvider(OFFICEACE.id).find((e) => e.enabled !== false)?.credentialRef;
-            if (ref === undefined)
-                return officeaceAuth.readStoredCredential();
-            return officeaceAuth.readCredential(ref, ctx.credentials);
-        },
+        //
+        // ⚠️⚠️ **锁定态必须在这里分道**（Gitee issue IKLTHB 第 ① 条，2026-10-12 起
+        //     一直是哑锁）：`permanentLocked()` 在全仓只有 `credential-resolver.ts`
+        //     的 buddy / loomy 两个分支读过，而 officeace 走的是**适配器自己的**
+        //     `credentialProvider` ⇒ 面板上那个开关写进了 `permanent-locks.json`
+        //     却没有任何执行代码。判定逻辑全部在 `officeace-lock.ts`（纯函数 + 注入），
+        //     这里只负责装配：**未锁定态逐字保留原路径**（即上面那份
+        //     `resolveOfficeAceCredential`），锁定态**绝不回落池**。
+        credentialProvider: createOfficeAceCredentialProvider({
+            permanentLocked: () => pool.permanentLocked(OFFICEACE.id),
+            // 锁定判定要**逐账号**看余额 ⇒ 取全部启用账号（与未锁定取号同一份清单）。
+            accounts: () => enabledOfficeAceAccounts()
+                .map((entry) => ({ id: entry.id, credentialRef: entry.credentialRef })),
+            resolveUnlocked: resolveOfficeAceCredential,
+            readCredential: (ref) => officeaceAuth.readCredential(ref, ctx.credentials),
+            readStoredCredential: () => officeaceAuth.readStoredCredential(),
+            // ⚠️ **必须带 ref**（云侧 V11 直读；缺了会回落果办客户端的全局单 cookie
+            //    ⇒ 多账号判成同一份余额 ⇒ 按错误的余额决定「能不能烧永久积分」）。
+            summaryOf: async (credential, ref) => {
+                try {
+                    const summary = await officeaceAuth.fetchSubscriptionSummary(48, ref, credential);
+                    return summary === undefined
+                        ? { ok: false, error: '读不到订阅摘要（未登录 / 云侧查询失败）' }
+                        : { ok: true, summary };
+                }
+                catch (error) {
+                    return { ok: false, error: `订阅摘要查询失败：${String(error)}` };
+                }
+            },
+        }),
+        // ⚠️ **目录探测必须绕开锁定**（Gitee issue IKLTHB 第 ① 条的自查连带发现）：
+        //    `credentialProvider` 在「锁定 + 只剩永久桶」时会抛错，而
+        //    `listModels` 的调用方全都不接这个错（`dsh-llm` 直接 `await`）⇒
+        //    症状是一串与锁定无关的：面板「读取模型列表失败」、`关闭供应商` 被
+        //    `remoteError` 拒、聚合静默少一个候选、模型选择器分组消失。
+        //    只读端点不扣积分，没有理由被锁定牵连；见适配器 `probeCredential` 的表。
+        probeCredential: resolveOfficeAceCredential,
         // ⚠️ **图片输入桥**（2026-10-13）：deepseek-v4.1-flash / kimi-k2.6 实测支持
         //    多模态（1×1 PNG 探针通过）。漏接 = 用户发图后适配器报
         //    「需要附件服务」—— 图根本到不了模型。
@@ -2327,13 +4548,64 @@ export function apply(ctx) {
         //    里**看不到分组**（真实症状 2026-10-12）。
         onCatalogLoaded: () => { ctx.emit('llm/adapters-updated'); },
     });
+    // ── Codely（Unity 团结引擎）──
+    // ✅ **目录 + 推理都已接通**（2026-10-20）：推理走 HTTP 自签直连
+    //    （`codely-sign.ts`，与官方 npm 包源码逐字节对拍通过），**不需要任何客户端**。
+    //    目录侧 `GET /api/model-status`（Bearer）实测 200、8 个模型组，同样无需签名。
+    //    ⚠️ 适配器**有账号池** ⇒ 推理初始选号与失败换号都走
+    //    `pool.getAvailableAccount`（手动顺序 + 跳过限流中账号），下面的
+    //    `credentialProvider` 只是池缺席时的兜底（测试桩路径）。
+    const codelyAdapter = registerCodelyLlm(ctx, {
+        // ⚠️ 门控 + 黑名单都走账号池（共享目录骨架 `createModelCatalog` 读它）：
+        //    没有已登录的 Codely 账号 ⇒ `listModels` 如实返回空目录。
+        accountPool: pool,
+        // ⚠️ 兜底凭据源：按账号池里第一个启用账号的 ref 取（与 officeace / gemini
+        //    同款）。凭据按 `credentialRef` 索引存于 DSH 凭据库，多账号才不会共用一份。
+        //    读不到（未登录 / 解析失败）一律 `undefined` ⇒ 目录回退兜底表，不抛错。
+        //    ⚠️ 生产路径（推理）走的是适配器内的池选号，这里只服务「无池」场景。
+        credentialProvider: async () => {
+            const entries = pool.listAccountsByProvider(CODERLY.id);
+            const first = entries.find((entry) => entry.enabled !== false) ?? entries[0];
+            if (first === undefined)
+                return undefined;
+            return readCodelyCredential(credentialRef(first.credentialRef), ctx.credentials);
+        },
+        onCatalogLoaded: () => { ctx.emit('llm/adapters-updated'); },
+        // 图片字节桥接：上游**确实收图**（2026-10-20 实测 `codely-basic` 认得出 1×1 PNG
+        // 的颜色）。接上 `readImage` 后带图请求走 `image_url` parts；不接则明确报
+        // `UNSUPPORTED_CONTENT`（不静默丢图）。
+        readImage: makeReadImage(ctx),
+    });
     // 冷启动也广播一次：首次目录在注册后异步就绪，不补这一发就只能等用户重启。
     ctx.emit('llm/adapters-updated');
+    /**
+     * Codely 的续期实例（2026-10-22 A6 接线）。
+     *
+     * ⚠️⚠️ **三个必选依赖都必须传**，少一个都是静默失效：
+     * - `credentials`：不传 ⇒ `refreshAccountCredential` 第一行就 `return`（续期一次都不发）；
+     * - `writebackExpiry`：不传 ⇒ 池里 `expiresAt` 不回写，界面「有效期」停在旧值
+     *   （officeace 记过同款）；
+     * - `fetcher`：传真实 `fetch` 即可（默认值就是），故省略。
+     *
+     * ⚠️ `writebackExpiry` 必须走 `pool.updateAccount`（与各家同形）—— 直接写
+     *   `credentialRef` 对应的凭据不行：那份凭据已在 `refreshAccountCredential`
+     *   里写回过，这里只补「池条目的有效期字段」。
+     */
+    const codelyAuth = new CodelyAuth(ctx, {
+        credentials: ctx.credentials,
+        writebackExpiry: async (accountId, expiresAtMs) => {
+            await pool.updateAccount(accountId, {
+                // ⚠️ `ProviderAccountEntry.expiresAt` 是**毫秒数值**（`number`），不是 ISO 字符串
+                //    —— 写成 `toISOString()` 会直接编译失败（TS2345）。
+                ...expiresAtMs === undefined ? {} : { expiresAt: expiresAtMs },
+            });
+        },
+    });
     // ===== OpenCode Zen（账号槽 + 匿名槽平权混合池）=====
     //
     // 形态与前面所有 provider 相同：进程内 LlmAdapter 直发远端，无子进程、无端口。
     // 两处独有语义：
-    // 1. **身份 = 槽**：账号槽（手动粘贴的 `sk-` key，可各配代理）+ 匿名槽
+    // 1. **身份 = 槽**：账号槽（手动粘贴的 API key，可各配代理）+ 匿名槽
     //    （凭证就是字面量 `public`，永远本机出口）。免费模型下全槽**平权**轮换，
     //    收费模型只走账号槽（匿名凭证只被服务端认作免费通道）。
     // 2. **每账号可配代理**：NAT 后的多台 PC 共享一个出口 IP，而 Zen 的匿名通道
@@ -2395,7 +4667,14 @@ export function apply(ctx) {
                 ? AbortSignal.timeout(OPENCODE_CATALOG_TIMEOUT_MS)
                 : AbortSignal.any([signal, AbortSignal.timeout(OPENCODE_CATALOG_TIMEOUT_MS)]),
         }),
-        disabledModels: () => pool.disabledModelsFor(OPENCODE.id),
+        // ⚠️⚠️ **2026-10-23 迁移：黑名单与「关闭供应商」已由共享骨架从账号池读走**
+        //
+        // 本家此前**手写** `listModels`，故需要分别传 `disabledModels` / `providerClosed`
+        // 两个回调（IKP8OF 那次就是靠这两行兜住的）。用户定稿「实体 provider 一律走
+        // 共享骨架」后，那两个字段**已删除** —— 现在唯一入口是本行传进去的池。
+        // ⚠️ **不要把它们加回来**：那会重现「同一语义两套判据」（本仓库红线），
+        // 并掩盖池没接上这类缺陷。
+        accountPool: pool,
         markLimited: async (slotId, modelId, resetAtMs) => {
             // 匿名条目同样落盘：它是池里的一条普通条目，限额标记在面板可见、
             // 可用「重测/清除」恢复（早期把匿名槽当进程内状态，重启即丢）。
@@ -2425,23 +4704,47 @@ export function apply(ctx) {
     }).catch((error) => {
         ctx.logger.warn(`[codearts-auth] 创建默认 OpenCode 匿名通道失败：${String(error)}`);
     });
-    // 预热模型能力表（models.dev）。
+    // models.dev 本地缓存：启动预热 + **定期刷新**（用户 2026-10-17）。
     //
-    // ⚠️⚠️ **两条硬约定**（真机事故 2026-10-02）：
+    // ⚠️⚠️ 三条硬约定（第一条是 2026-10-02 的真机事故）：
     // 1. 渲染路径上**只读同步缓存**，永不 await 网络 —— 我最初在 `listModels`
     //    里 await 这个拉取，而它 5 MB / 慢则 1.4s、宿主网络异常时**永不返回**，
     //    于是模型选择器一直空白（用户报障「一直卡着」）。
     // 2. 拉取完成要**广播目录变更**：能力表是能力判定的来源，DSH 已经用
     //    「纯文本」渲染过一帧，不广播它不会重算（免费模型会一直显示不支持图片）。
+    // 3. **全仓唯一直读点**是 `src/models-dev-cache.ts`：opencode 的能力表与
+    //    cline 的目录补全都只读它那份磁盘缓存，不再各自直连（此前两处各一套
+    //    直连 + TTL + ETag，既重复又让 5 MB 的请求在插件里发生两次）。
     //
-    // 首次运行磁盘没缓存时，本次刷新可能晚于首帧几十秒；那段时间能力按纯文本
-    // 保守处理（见 opencode-capability.ts 的模块头）。
-    primeOpencodeCapabilities();
+    // 首次运行磁盘没缓存时，本次刷新可能晚于首帧几十秒；那段时间能力按纯文本、
+    // 目录按本地兜底表保守处理（见各模块的降级注释）。
+    primeModelsDev();
     // ⚠️ 走**唯一**的广播实现（`src/catalog-broadcast.ts`）：能力表是能力判定的
     // 来源，它一变就必须让客户端重读目录 —— 与十个适配器的「目录落地」同一语义，
     // 不该各写一份 emit（审计指出此处曾是内联实现，且 `ctx.logger.warn` 缺两级
     // 可选链：logger 缺席时会抛、仅被 catch 吞）。
-    refreshOpencodeCapabilities(() => { broadcastCatalogChanged(ctx); });
+    //
+    // ⚠️ 归一缓存（`opencode-capability.ts` 的 `normalized`）必须在刷新后作废，
+    // 否则它会继续用旧的归一结果 —— 那是「改了没用，重启才好」的形态。
+    refreshModelsDev(() => { broadcastCatalogChanged(ctx); }, {
+        onUpdated: () => { invalidateOpencodeCapabilities(); },
+        warn: (message) => ctx.logger?.warn?.(message),
+    });
+    // ⚠️⚠️ **定期刷新**（用户要求「定期读取 models.dev」）：改前只有启动时那一次，
+    //   上游新增模型后**必须重启进程**才看得见（`TtlCache` 模块头记的就是这条
+    //   缺陷的同型）。周期取 TTL 的一半（3 小时）—— 比 TTL 短才能保证「最坏
+    //   情况下也只落后半个 TTL」，比 TTL 长则会让每次刷新都撞在 TTL 判据上而
+    //   **真的发出请求**前就返回（那样等于没有周期刷新）。
+    const modelsDevTimer = setInterval(() => {
+        refreshModelsDev(() => { broadcastCatalogChanged(ctx); }, {
+            onUpdated: () => { invalidateOpencodeCapabilities(); },
+            warn: (message) => ctx.logger?.warn?.(message),
+        });
+    }, Math.floor(MODELS_DEV_TTL_MS / 2));
+    modelsDevTimer.unref?.();
+    // ⚠️ 回收：定时器必须随插件卸载而停，否则进程退出会被它挂住
+    //   （与上面 `closeAllProxyDispatchers` 的回收并列，同款约定）。
+    ctx.effect(() => () => { clearInterval(modelsDevTimer); });
     // ⚠️ 这里**不再**调 `registerOpencodeRpc`：opencode 的端点已并入
     // `registerJetHubRpc` 内部的 handleMethod（见 `opencode-rpc.ts` 模块头）。
     // 代理 dispatcher 是常驻连接池：插件卸载必须回收，否则进程退出会挂住。
@@ -2497,6 +4800,78 @@ export function apply(ctx) {
      *    ⚠️ 若将来有人让折算逻辑**依赖** `probeModel` 的**具体取值**
      *   （如「按最便宜的模型查额度」），仍需让两个消费者各自传自己的实现。
      */
+    /**
+     * **静态回退积分表**（无 deps 版工厂）—— 供 {@link fetchBalanceReading} 在
+     * runtime 缺席时兜底。模块级常量：工厂是纯函数，表在进程内不变。
+     *
+     * ⚠️ 与端点侧（`jet-hub-rpc.ts`）/runtime 侧（下方 `creditsTable`）**同源同构**
+     *（同一个 `createProviderCredits`），差异只在 deps：本表无 deps，loomy /
+     * raccoon / zcode 的条目会退到「自由函数 + 全局 fetch」—— 但这三家**有**
+     * runtime，永远先命中 runtime，实际走不到这里；本表实际服务的只有
+     * 「balance:true 且无 runtime」的渠道（现役仅 codely）。一致性由
+     * `credits-runtime-parity.spec.ts` 的「表键集合 === registry 派生」守卫兜住。
+     */
+    const FALLBACK_CREDITS_TABLE = createProviderCredits();
+    /**
+     * 共享缓存的**取数原语**（从 `credits.balances` 的查表分派里抽出的那一半）。
+     *
+     * ## ⚠️ 为什么必须与 `credits.balances` 用同一个函数（规格 §11-1 的核实结论）
+     *
+     * 两条路径（面板端点 / 聚合折算）取的是**同一个数**：只有共用同一份取数实现，
+     * 「面板显示的余额」与「折算据此排序的余额」才不可能分叉。若各写一份，两边
+     * 对同一份报文可能得出不同的 `error` / `extra` 口径（本仓库首条红线）。
+     *
+     * ⚠️ 取数**不含 self-heal**：续期留在 `credits.balances` / `credits.claimAll` 的
+     * **端点入口**（规格 §5.7.1 末行）—— 折算路径触发填充时不该把续期开销带进发消息路径。
+     * ⚠️ opencode / qoder 族 / officeace 的**特例短路仍在端点里**（它们不走本原语）：
+     * 本函数只处理「查表分派」那一段（`creditsOf` + `fetchBalance(Detailed)`）。
+     *
+     * @returns 解析出的 `CreditBalance`（失败时抛错 ⇒ 缓存记成 `error` 读数）。
+     */
+    async function fetchBalanceReading(pool, provider, entry) {
+        const runtime = runtimeOf(provider);
+        // ⚠️⚠️ **runtime 缺席时回退到静态积分表**（真实缺陷，2026-10-19 实测打穿）：
+        //    codely 是全仓首例「balance:true + 无 runtime」的渠道（channel:false、
+        //    无 auth 服务 ⇒ `src/index.ts` 的注册循环里没有它 ⇒ 没有 ProviderRuntime）。
+        //    本原语原先只认 runtime ⇒ 对 codely 恒抛 `unsupported provider: codely` ⇒
+        //    缓存记成失败读数并**兼顶旧值 15 分钟**，面板积分行显示
+        //    「本次查询失败，显示的是 … 的数据（unsupported provider: codely）」——
+        //    而端点侧的表里明明有它（首次成功的那次读数正是端点表查出来的）。
+        //
+        //    回退表用**无 deps** 的工厂：codely 的原语是纯自由函数，不依赖任何
+        //    auth 实例。⚠️ 有 runtime 的渠道**永远先命中 runtime**（含 loomy /
+        //    raccoon / zcode 的实例 fetchImpl 路径），本回退只在「该声明了余额能力
+        //    却没注册 runtime」的渠道上生效 —— 那正是本函数原本完全无法服务的形态。
+        const impl = runtime?.credits ?? creditsOf(FALLBACK_CREDITS_TABLE, provider);
+        if (impl === undefined)
+            throw new Error(`unsupported provider: ${provider}`);
+        if (entry.credential === undefined)
+            throw new Error('凭据未提供');
+        // ⚠️ `ProviderCallContext` 的三个字段与 `jet-hub-rpc.ts` 里那份**同形**
+        //（那里是端点闭包内的注册实例，这里是装配层的实例；实现侧只需一个形状）。
+        // ⚠️ 必须与端点那份**指向同一个池**，否则折算拿到的账号集合与面板看到的不一致。
+        // ⚠️ `accountId` **必须带上**（Gitee issue IKLTZ2）：Gemini 折算路径要按账号
+        // 取出口代理；漏了它 ⇒ 这条路径恒直连，症状是「面板能刷新、聚合折算却失败」。
+        const callContext = {
+            resolveCredential: (refName) => ctx.credentials.resolve(credentialRef(refName)),
+            warn: (message) => ctx.logger?.warn?.(message),
+            accountPool: pool,
+            accountId: entry.id,
+        };
+        // ⚠️ `fetchBalanceDetailed` 优先（它带 `error` / `extra`，是既有端点的口径）。
+        if (impl.fetchBalanceDetailed !== undefined) {
+            const detailed = await impl.fetchBalanceDetailed(entry.credential, callContext);
+            if (detailed.balance === null)
+                throw new Error(detailed.error ?? '余额查询失败');
+            return detailed.balance;
+        }
+        if (impl.fetchBalance === undefined)
+            throw new Error(`unsupported provider: ${provider}`);
+        const balance = await impl.fetchBalance(entry.credential, callContext);
+        if (balance === null)
+            throw new Error('余额查询失败');
+        return balance;
+    }
     const sharedExpiryProbe = createExpiryProbe(pool, async (provider) => {
         const models = await ctx.llm.listModels(provider);
         return models[0]?.id;
@@ -2527,6 +4902,56 @@ export function apply(ctx) {
             const models = await ctx.llm.listModels(provider);
             return models.map((model) => model.id);
         },
+        /**
+         * ★★ **共享余额读数**（2026-10-15，规格 §5.7）。
+         *
+         * ## 用户原话（本模块存在的理由）
+         *
+         * 「为什么不能更新账号积分用共享缓存，取号逻辑只是在调用缓存的时候取舍的问题，
+         * 不影响刷新账号积分缓存呢，账号积分缓存是更底层基础设置，计算怎么取号是
+         * 基础设施上的使用逻辑」
+         *
+         * ⇒ 这里注入的是**同一个** `balanceCache` 实例（`credits.balances` 端点用的是
+         * 它）—— 于是 buddy 系四家的折算**吃同一份读数**，而不是各自再打一次上游。
+         * 「只给可用账号」这一取舍由 `createExpiryProbe` 自己的取号逻辑决定
+         *（它本来就只遍历可用账号），与缓存无关。
+         *
+         * ⚠️ 返回 `undefined` ⇒ **本次没有共享读数** ⇒ 实现方回落到自己发请求
+         * （`fetchBalanceWithCache`，见 `aggregate-expiry.ts:275` 的契约）：
+         * 折算的**可用性**不得依赖本缓存（否则缓存不可用会静默变成「该渠道折算恒 UNUSABLE」）。
+         * ⇒ 而返回 **`null`** 是「结论：这个账号现在不可用」（`sharedPackageExpiry`
+         * 对 `null` 判 `UNUSABLE`，且**不**回落重查）—— 下面那条正是这一格。
+         */
+        balanceOf: async (provider, accountId, credential) => {
+            const reading = await balanceCache.readOne(provider, accountId, { credential });
+            // ★★ **陈旧读数不得参与折算**（2026-10-18）。
+            //
+            // 读路径改成 stale-while-revalidate 后，缓存陈旧时折算会拿到**旧值**，
+            // 而 `stale` 字段原先只在 `readStale` 里判（`balance-cache.ts` 的注释记着
+            // 那个限制）⇒ 折算会**静默地长期用 10 分钟前的数字排序**。
+            //
+            // ⚠️⚠️ **必须返回 `null` 而不是 `undefined`**（实测确证，2026-10-18）：
+            //   契约（`aggregate-expiry.ts:275`）与实现（`fetchBalanceWithCache`）都规定
+            //   `undefined` = 「**本次没有共享读数**⇒ 回落到自己发请求」，`null` 才是
+            //   「结论：不可用」。实测（mock `fetchCreditBalance` 成功）：
+            //     - 返回 `undefined` ⇒ fallback **被调用 1 次**，折算返回**上游的值**（≠ UNUSABLE）
+            //     - 返回 `null`      ⇒ fallback **0 次**，折算返回 `-1`（UNUSABLE）
+            //   ⇒ 写 `undefined` 会得到「陈旧账号每次折算**多打一次上游请求**」，
+            //     恰恰是本条要消灭的行为（且与「读路径一个请求都不发」相悖）。
+            //
+            // ⚠️ 与 officeace 分支的既有约定同构（`aggregate-expiry.ts:1141`：
+            // 「`summary.stale === true` ⇒ 判 `UNUSABLE`」）。同一次改动在别处新增了
+            // 这条、而面板出口把两天前的快照当实时余额显示，被审计记为
+            // 「**同一份数据两层结论相反**」（`jet-hub-rpc.ts:5462`）——
+            // 本行就是避免复发的那一腿。
+            //
+            // ⚠️ **有意的行为代价（如实登记）**：折算可能因陈旧读数而少一个候选渠道，
+            // 用户表现为**聚合轮换里某个渠道暂时不出现**。这比「用 10 分钟前的数字
+            // 排序」安全，且与 officeace 既有行为一致（用户 2026-10-18 明确接受）。
+            if (reading.stale === true)
+                return null;
+            return reading.error === undefined ? reading.value : undefined;
+        },
     });
     // ⚠️ 赋给上面的可变引用 ⇒ 账号入库时清空折算缓存（见那里的注释）。
     sharedExpiryProbeRef = sharedExpiryProbe;
@@ -2537,6 +4962,13 @@ export function apply(ctx) {
         //    传快照会让用户以为开关坏了（要重启插件才生效）。
         //    `pool.listAggregateRejections()` 返回进程内权威副本（与 state.json 同步）。
         rejections: () => pool.listAggregateRejections(),
+        // ⚠️ 同样是**函数**（不是快照），理由与 `rejections` 完全相同：面板改完开关，
+        //    下一次请求就要生效。三张表都是「同一枚开关的不同域」，故接线必须一起给
+        //   （漏一个 ⇒ 该功能整个不生效，且**完全静默**：例如漏 `allowed` 时，
+        //   用户手工打开的未接入候选仍会被判成「默认不参与」）。
+        allowed: () => pool.listAggregateAllowed(),
+        order: () => pool.listAggregateOrder(),
+        orderMode: () => pool.listAggregateOrderMode(),
     });
     // ⚠️ 赋给上面的可变引用 ⇒ 账号入库时**也**清候选序缓存（见那里的长注释：
     //    两个缓存不同，只清折算缓存会让「刚登录的账号」在 60 秒内仍不进候选序）。
@@ -2596,12 +5028,39 @@ export function apply(ctx) {
         loomy: pruned(LOOMY.id, loomyAdapter),
         raccoon: pruned(RACCOON.id, raccoonAdapter),
         minimax: pruned(MINIMAX.id, minimaxAdapter),
+        minimaxintl: pruned(MINIMAX_INTL.id, minimaxIntlAdapter),
+        autoclaw: pruned(AUTOCLAW.id, autoclawAdapter),
+        // ⚠️ 国际版与国内版**同一套实现的两个实例**，但 provider id 不同 ⇒
+        //    必须各自一条（与 minimaxintl 同款）。键是 provider id `autoclawintl`
+        //    （全小写），值是变量 `autoclawIntlAdapter`（驼峰）。
+        autoclawintl: pruned(AUTOCLAW_INTL.id, autoclawIntlAdapter),
         accio: pruned(ACCIO.id, accioAdapter),
         gemini: pruned(GEMINI.id, geminiAdapter),
         zcode: pruned(ZCODE.id, zcodeAdapter),
         opencode: pruned(OPENCODE.id, opencodeAdapter),
+        // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。必须进这张表：
+        //    `provider.status` 的「已关闭」判据是 `total > 0 && disabled === total`，
+        //    它读的是 `listAllModels()` 那份**不套黑名单**的全量目录。表里缺它 ⇒
+        //    退化到 `llm.listModels`（已按黑名单过滤）⇒ 「关闭整个 provider」时
+        //    漏写黑名单 ⇒ 出现「provider 显示已关闭、模型却仍可选用」的矛盾态。
+        modelscope: pruned(MODELSCOPE.id, modelscopeAdapter),
         // OfficeAce（华为 MaaS 云端直连）：目录静态 + 平台侧可用性，同其余渠道。
         officeace: pruned(OFFICEACE.id, officeAceAdapter),
+        // AStudio（上游 MAAS 云端直连）：目录来自 model-manager 远端 + 兜底表，同其余渠道。
+        astudio: pruned(ASTUDIO.id, astudioAdapter),
+        // ⚠️ **codely 进本表但 `channel` 保持 `false`**（2026-10-20 修订，用户报障
+        //    「面板模型 0」后的复核结论）：本表键守卫（`refresh-targets-derived.spec.ts`
+        //    ⑦）允许 `EXTRA_KEYS` 显式例外（`aggregate` 是先例），而本渠道**必须**进表
+        //    —— 与 modelscope 那条同因：`provider.status` 的「模型数 / 已关闭」判据读
+        //    本表的 `listAllModels()`；「关闭整个 provider」也要靠它拿全量目录写黑名单。
+        //    表里缺它 ⇒ 面板恒「模型 0」，且**模型选择器里的 8 个模型关不掉**（矛盾态）。
+        //    进表 ≠ 假桩：适配器是真实的（目录来自实测 200 的 `/api/model-status`，
+        //    `stream()` 显式报「推理通道尚未接通」）——守卫禁的是「用假实现应付判据」，
+        //    不是「有目录没推理」这个真实过渡态本身。
+        //    ① 键守卫侧：已在用例 ⑦ 的 `EXTRA_KEYS` 登记理由（channel:false 例外）；
+        //    ② 推理侧：`channel: true` 会被三张派生守卫当成「应有 auth / 应进聚合
+        //       目录 / 应可续期」，在推理与续期落地前**仍然不翻**（那是真要假桩的地方）。
+        codely: pruned(CODERLY.id, codelyAdapter),
         // ⚠️ 聚合 provider 也必须进这张表（设计文档 §5.2 的必改点）：`jet-hub-rpc.ts` 的
         // `fullCatalogIds` **优先**用本表的 `listAllModels()`（不套黑名单的全量目录），
         // 缺失时才退化到 `llm.listModels(provider)` —— 后者已被适配器按黑名单过滤。
@@ -2632,6 +5091,55 @@ export function apply(ctx) {
         //    「编译期兜底快照跟不上上游下架」那套记录/过滤机制对它没有意义。
         'jet-hub-auto': pruned(AUTO_PROVIDER, autoAdapter, { enabled: false }),
     };
+    /**
+     * ★ **模型目录的后台刷新器**（用户 2026-10-18 的要求）。
+     *
+     * 「各个模型的模型列表缓存也要带定时更新，20 分钟更新一次，如果不更新随高峰低谷
+     * 变化的积分消耗倍率是更新不到实际的倍率」
+     *
+     * ## ⚠️ 为什么必须建在 `modelAdapters` **之后**（位置不变式）
+     *
+     * 它要读那张表拿实例。早于建表 ⇒ 空表 ⇒ **目录永不刷新、且零日志**
+     * （与 `wiredRefreshTargets()` 前身在 2026-10-15 踩的坑同型）。
+     *
+     * ## ⚠️ 为什么走 `modelAdapters` 而不是 `ctx.llm`
+     *
+     * `ctx.llm` 是 DSH 的公开面，**不认识** `refresh()`（那是本插件给目录契约加的可选成员）。
+     * 而 `modelAdapters` 的每一项都是 `pruned()` 的 Proxy —— 它对**其余成员原样透传并绑定
+     * `this`**（`src/dead-model-store.ts:748-749`），故新加的 `refresh()` 能自动透出来。
+     *
+     * ## ⚠️ 未实现 `refresh` 的 provider 必须跳过
+     *
+     * `opencode` 这类本地派生渠道（零网络）本就没有远端可拉。对它们空转会让
+     * 「刷新器说跑了 9 家、实际只刷了 3 家」**完全静默**。
+     */
+    const catalogRefresher = createCatalogRefresher({
+        listProviders: () => Object.keys(modelAdapters),
+        refreshOf: (provider) => {
+            const adapter = modelAdapters[provider];
+            const refresh = adapter?.refresh;
+            // ⚠️⚠️ **`undefined` 只能表示「这家没有该成员」**（2026-10-20 修正）：
+            //    刷新器据此统计「本轮几家真的参与」，**零参与即 warn**
+            //    （见 `createCatalogRefresher` 的注释）。故**不要**写成
+            //    `return adapter?.refresh?.()` —— 那会让「成员存在但同步返回 void」
+            //    与「成员根本不存在」不可区分，统计随之失真。
+            //    ⚠️ 而本仓库实测的失效形态恰恰是「成员根本不存在」：`be42b25` 给
+            //    `createModelCatalog` 的 config 加了 `refresh` 回调，却**没有**把它
+            //    转发成适配器实例的成员，而该提交的注释误以为 `pruned()` 的 Proxy
+            //    会把它透出来（Proxy 只透传适配器**自己的**成员）。
+            if (typeof refresh !== 'function')
+                return undefined;
+            return Promise.resolve(refresh.call(adapter)).then(() => undefined);
+        },
+        info: (message) => ctx.logger?.info?.(message),
+        warn: (message) => ctx.logger?.warn?.(message),
+    });
+    // ⚠️ 生命周期挂 `ctx.effect`，与插件一致（释放后停手）——
+    //    与既有 `modelsDevTimer`、余额刷新器同款约定。
+    ctx.effect(() => {
+        catalogRefresher.start();
+        return () => { catalogRefresher.stop(); };
+    });
     // 插件卸载前把签名缓存落盘：`stream()` 每次结束都 flush，但用户可能
     // 直接关掉 DSH 而上一轮的 flush 还在排队 —— 落一次盘几乎零成本，
     // 丢的却是「下一轮工具调用能不能带上签名」。
@@ -2704,6 +5212,29 @@ export function apply(ctx) {
         //    —— 故传**惰性**解析器，不能先 await 成一个常量（那会让「缓存过期后拿到
         //    新版本」失效）。见 `ProviderCreditsDeps.lobsteraiClientVersion`。
         lobsteraiClientVersion: () => lobsterai.resolveClientVersion(),
+        // ⚠️⚠️ **MiniMax 国际站的 XFF 必须在这里也接上**（真实缺陷，2026-10-17 审计打穿）。
+        //
+        // 本文件与 `jet-hub-rpc.ts` 是**两个独立的 `createProviderCredits` 调用**
+        //（上面那段注释正是为此而写），而 `ProviderRuntime.credits` 被
+        // `fetchBalanceReading`（本文件 L≈3136）消费 —— 后者是 `balanceCache` 的
+        // **取数原语**：`collectCreditBalances` 命中缓存前会先走它，失败才回落到端点表。
+        //
+        // ⇒ 只接端点表的话，**面板第一次查国际站余额走的正是这条无 XFF 的路径**，
+        //   失败后还要吃满 failureTtl（15s）才可能重试 —— 症状就是「设了 XFF，
+        //   积分行仍然查询失败」。本次只改了一处，正是那份注释警告的形态。
+        //
+        // ⚠️ 惰性读（用户随时可能改设置），不能固化成字符串。
+        minimaxXff: () => pool.minimaxXff(),
+        // ⚠️ Gemini 的按账号 fetcher（Gitee issue IKLTZ2）：**折算路径**也要走代理，
+        // 否则「面板能刷新、聚合候选却恒折算失败」—— 与上面 minimaxXff 同型陷阱
+        // （这里也正是它第一次被引入的同一个 `createProviderCredits` 调用）。
+        geminiFetchFor: geminiFetchForAccount,
+        // ⚠️⚠️ **MiniMax 国际站的按账号 fetcher**（PR !145 审计 P0 修法，真实缺陷）：
+        // 与上面 `geminiFetchFor` **逐格同因** —— 积分行是用户点一下就等的主路径，
+        // 而 `agent.minimax.io` 按出口 IP 国别分流（大陆直连恒 307 → 中国站 → 401）。
+        // 不接它 ⇒ 用户配好代理后对话能用、**积分行却仍报「余额查询失败」**，
+        // 症状与 issue IKMEVG 逐字相同（PR !145 当时只接了选号器，本文件这处漏了）。
+        minimaxIntlFetchFor: minimaxIntlFetchForAccount,
     });
     /**
      * **一次性奖励**能力表（Loomy 新手任务 / raccoon 登录奖励）。
@@ -2726,9 +5257,10 @@ export function apply(ctx) {
      *    有**真实**实现。表若内联在此，那些用例只能各写一份自己的映射 ⇒
      *    「同一语义两套判据」（本仓库首条红线）。生产与单测**共用同一份**。
      *
-     * ⚠️ **只挂「已接入临期折算」的 7 家**（`expiry` 域存在即已接入，
-     *    `WIRED_EXPIRY_PROVIDERS` 与它的一致性由
-     *    `tests/unit/expiry-runtime-parity.spec.ts` 真跑 `apply()` 锁死）：
+     * ⚠️ **只挂「已接入临期折算」的渠道**（`expiry` 域存在即已接入）——
+     *    **刻意不在此写数字、也不抄名单**：同一事实的多份抄写必然漂移（见本文件下方
+     *    `probeById` 那段教训）。`WIRED_EXPIRY_PROVIDERS` 与它的一致性由
+     *    `tests/unit/expiry-runtime-parity.spec.ts` 真跑 `apply()` 锁死：
      *    未接入的渠道**不该**出现在聚合候选里。返回 `UNUSABLE` 也会被剔除，
      *    但让它压根不进目录更诚实 —— 见 `aggregate-expiry.ts` 的长注释。
      *
@@ -2738,7 +5270,34 @@ export function apply(ctx) {
      *
      * ⚠️ 用 `expiryOf` 而非下标（原型链键误判），与 `creditsOf` 同因。
      */
-    const expiryTable = createProviderExpiry();
+    const expiryTable = createProviderExpiry({
+        // ⚠️⚠️ **MiniMax 国际站的 XFF 必须在这里也接上**（2026-10-20，与 L3858 那处
+        //    `creditsTable` 的 `minimaxXff` **同因**）。
+        //
+        // `ProviderRuntime.credits` 与 `ProviderRuntime.expiry` 是**两个独立消费域**
+        //（前者喂积分面板，后者喂聚合候选排序），两者的 xff 通道**各走各的**：
+        // 只接 credits 那处的话，症状正是「面板能刷新、聚合候选却恒折算失败」
+        //（本仓库在 2026-10-17 审计里已对 `creditsTable` 记录过同型缺陷）。
+        //
+        // ⚠️ 惰性读（用户随时可能改设置），不能固化成字符串。
+        minimaxXff: () => pool.minimaxXff(),
+        // ⚠️⚠️ **按账号出口也必须在这里接**（PR !145 审计 P0 修法，与上面
+        //    `minimaxXff` **逐格同因**）。`credits` 与 `expiry` 是两个独立消费域，
+        //    通道各走各的：只接 credits 那处 ⇒ 积分行能刷新、**聚合候选却恒折算失败**；
+        //    只接 expiry 那处 ⇒ 反过来。
+        //    ⇒ 两条腿缺一不可，这正是本仓库记过 6 次的那类静默陷阱。
+        //    ⚠️ 惰性（按 `accountId` 现取），不能固化成一份 fetcher。
+        minimaxIntlFetchFor: minimaxIntlFetchForAccount,
+        // ⚠️⚠️ **Qoder 的按账号出口同样必须在这里接**（2026-10-25 审计 A2-17）。
+        //    上面那条注释讲的「两条腿缺一不可」，本 PR（`618a090` 的四条腿）恰好
+        //    又漏了这一处：推理/搜索/选号/登录都接了代理，**折算这处没接**
+        //    ⇒ 国际版在墙外折算恒失败 ⇒ `UNUSABLE` ⇒ 被 `rankCandidates` 剔除
+        //    ⇒ **用户在聚合轮换列表里永远看不到 qoder / qodercn**，零报错、零日志，
+        //    而面板（走选号器那条腿）看起来完全正常。
+        //    ⚠️ 与 minimax 分两个键（两家的解析器是不同实例，合成一个会让
+        //    「只接了一家」静默通过）。
+        qoderFetchFor: qoderFetchForAccount,
+    });
     // ===== 能力注册表（设计文档 §3.3）=====
     //
     // ⚠️ **本段是前瞻接线**（2026-10-08 调序后修正）：`account.refresh` 的分派
@@ -2782,36 +5341,24 @@ export function apply(ctx) {
     Object.assign(officeaceAuthService, {
         refreshAccountCredential: (refName, pool, accountId) => officeaceAuth.refreshAccountCredential(refName, pool, accountId, ctx.credentials),
         /**
-         * ⚠️ `refreshAll` **内部必须走本对象的 `refreshAccountCredential`**，不能直接调
-         * 模块函数：守卫用例（`provider-runtime-wiring.spec.ts`）的判据是「布桩在
-         * `ctx.officeaceAuth.refreshAccountCredential` 上，然后断言 `refreshAll` 打到它」。
-         * 绕开本对象走模块函数 ⇒ spy 收不到，用例静默少一家覆盖。
-         */
-        /**
-         * ⚠️ `refreshAll` **内部必须走本对象的 `refreshAccountCredential`**，不能直接调
-         * 模块函数：守卫用例（`provider-runtime-wiring.spec.ts`）的判据是「布桩在
-         * `ctx.officeaceAuth.refreshAccountCredential` 上，然后断言 `refreshAll` 打到它」。
-         * 绕开本对象走模块函数 ⇒ spy 收不到，用例静默少一家覆盖。
+         * 批量续期：**复用 `officeace-auth.ts` 的 `refreshAccountList`**，
+         * 只把「续期某一个账号」分派到本对象的 `refreshAccountCredential`。
          *
-         * ⚠️ 这是**唯一**需要覆盖的转发方法：其余导出（含 `startLogin` /
-         * `completeLogin` / `persistLogin` / `fetchSubscriptionSummary` …）由
-         * 上面的展开复制直接提供，无需再抄一遍 —— 抄了就会漂移。
+         * ⚠️⚠️ **不要再抄一份遍历逻辑**（IKLPTZ 的真实成因）：这里原先逐字复制了
+         * 模块里的那份，连注释都一样，于是「把同步的 `listAccountsByProvider`
+         * 当 Promise 用」这个误判被**复制了两遍**，一个 bug 要修两处、测试也要
+         * 覆盖两处。收成一份之后，`refreshAccountList` 的签名就是唯一真源。
+         *
+         * ⚠️ **不得直接挂模块函数 `officeaceAuth.refreshAll`**：那份走的是**没有
+         * `ctx.credentials`** 的兼容文件腿，多账号下会串号（2026-10-13 改造）。
+         * 这里必须走本对象 —— 它的 `refreshAccountCredential` 才注入了凭据库。
+         *
+         * ⚠️ 守卫用例（`provider-runtime-wiring.spec.ts`）的判据是「布桩在
+         * `ctx.officeaceAuth.refreshAccountCredential` 上，然后断言 `refreshAll`
+         * 打到它」。故这里**必须**经 `officeaceAuthService` 取方法（走本对象），
+         * 绕开它去调模块函数 ⇒ spy 收不到，用例静默少一家覆盖。
          */
-        refreshAll: async (pool) => {
-            const p = pool;
-            if (p?.listAccountsByProvider === undefined) {
-                await officeaceAuth.refreshStoredCredential().catch(() => undefined);
-                return;
-            }
-            const accounts = await p.listAccountsByProvider('officeace').catch(() => []);
-            if (accounts.length === 0) {
-                await officeaceAuth.refreshStoredCredential().catch(() => undefined);
-                return;
-            }
-            for (const account of accounts) {
-                await officeaceAuthService.refreshAccountCredential(account.credentialRef, pool, account.id);
-            }
-        },
+        refreshAll: (pool) => officeaceAuth.refreshAccountList(pool, (account) => officeaceAuthService.refreshAccountCredential(account.credentialRef, pool, account.id)),
     });
     {
         /**
@@ -2832,6 +5379,10 @@ export function apply(ctx) {
             ['loomy', loomy],
             ['raccoon', raccoon],
             ['minimax', minimax],
+            // ⚠️ MiniMax Code 国际版：与 `minimax` **共用同一个 `MinimaxAuth` 类**，
+            //    故键与值都是它自己那个实例（`minimaxintl`）。写成 `minimax: minimaxIntl`
+            //    这类错位会让国际站账号的续期去刷国内站凭据（同族串接，本仓库复发过 6 次）。
+            ['minimaxintl', minimaxIntl],
             ['zcode', zcode],
             ['gemini', gemini],
             // OfficeAce（华为 MaaS 云端直连）：值是 **auth 服务形状的包装对象**
@@ -2840,7 +5391,24 @@ export function apply(ctx) {
             // `auths.officeace` 是**同一个对象**，否则守卫用例布在 ctx 上的 spy
             // 收不到本循环的调用（实测症状：`续期没有分派到它自己的实例（实际：无）`）。
             ['officeace', officeaceAuthService],
+            ['autoclaw', autoclaw],
+            // ⚠️ AutoClaw 国际版：与 `autoclaw` **共用同一个 `AutoclawAuth` 类**，
+            //    故键与值都是它自己那个实例（`autoclawIntl`）。写成 `autoclaw: autoclawIntl`
+            //    这类错位会让国际站账号的续期去刷国内站凭据（同族串接，本仓库复发过 6 次）。
+            //    漏加这一行 = 它不进注册表 ⇒ 续期/积分/探测三条链路**全部静默失效**
+            //    （`provider-runtime-wiring.spec.ts` 会点名 `autoclawintl 未注册`）。
+            ['autoclawintl', autoclawIntl],
             ['accio', accio],
+            // AStudio（讯飞 AstronStudio）：值是 AstudioAuth 服务实例 —— 它已在构造时
+            // provide 自己（服务名 astudioAuth），必须与 registerJetHubRpc 的 auths.astudio
+            // 是**同一个对象**，否则守卫用例布在该实例上的 spy 收不到本循环的调用。
+            // 实测签名可结构化匹配 JetHubAuthLike（refreshAccountCredential(refName, pool?,
+            // accountId?) 的可选形参可接收必填实参；refreshAll(pool) 完全一致），
+            // 故**不需要**上面 officeace 那样的 as unknown as JetHubAuthLike 包装。
+            ['astudio', astudio],
+            // ⚠️ **本 fork 独有**的 provider（上游 rc.11 仍无 modelscope）。
+            //    漏加这一行 = 它不出现在注册表里 ⇒ 续期/积分/探测三条链路全部静默失效。
+            ['modelscope', modelscope],
         ];
         for (const [id, auth] of registry) {
             const descriptor = descriptorOf(id);
@@ -2883,7 +5451,7 @@ export function apply(ctx) {
                 // ⚠️ 只有 loomy / raccoon 有条目 —— 其余如实为 `undefined`。
                 onboarding: onboardingOf(onboardingTable, id),
                 // ⚠️ 与 credits / onboarding 同法：`expiryOf` 而非下标（原型链键误判）。
-                // ⚠️ 只有**已接入临期折算**的 7 家有条目 —— 其余如实为 `undefined`
+                // ⚠️ 只有**已接入临期折算**的渠道有条目 —— 其余如实为 `undefined`
                 //    （那是「未接入」的诚实表达：`credentialExpiry` 据此返回 `UNUSABLE`）。
                 //    ⚠️ `WIRED_EXPIRY_PROVIDERS` **不**从这里派生（它是编译期常量），
                 //    两者的一致性由 `expiry-runtime-parity.spec.ts` 真跑 `apply()` 锁死。
@@ -2907,6 +5475,65 @@ export function apply(ctx) {
             if (!registered) {
                 ctx.logger?.info?.(`[jet-hub] provider runtime "${id}" 已注册（插件 fiber 重启竞态），跳过本次`);
             }
+        }
+        /**
+         * ⚠️⚠️ **codely 的 runtime 必须单独注册**（2026-10-22 合并审计修，真实可达缺陷）。
+         *
+         * ## 缺陷（实测）
+         *
+         * `probeById.codely` 已登记（上面那个模块级常量里键存在），但 `probe` 域
+         * **只在上面的 `for (const [id, auth] of registry)` 循环体内**被挂上
+         * （`...Object.hasOwn(probeById, id) ? { probe: probeById[id] } : {}`），
+         * 而 codely **不在**那个 20 项 `registry` 数组里（它是 `channel:false`、无 auth 服务）
+         * ⇒ `runtimeOf('codely') === undefined` ⇒ `adapterForProbe()` 抛
+         * 「codely 没有探测适配器（该 provider 不支持重测）」。
+         *
+         * 实测后果：
+         * - `account.retest`（重测）**恒抛错**，冒泡成「操作失败：codely 没有探测适配器」；
+         * - `account.test`（测试）返回 `{"ok":false,"message":"无法确认：codely 没有探测适配器…"}`；
+         * - 只有 `account.reset` 能用（它不需要 probe）。
+         *
+         * ⚠️ 而 `probeById.codely` 的头注释与 `provider-registry.ts` 的 codely 条目
+         * 都写着「『重测 / 重置』有真实作用对象」—— **只有「重置」成立**，本次一并订正。
+         *
+         * ## 为什么不在 `registry` 数组里加一行
+         *
+         * 那个数组元素类型是 `readonly [string, JetHubAuthLike]`，而 codely **没有 auth
+         * 服务**（登录与余额都是自由函数）。硬塞一个假 auth 会让 `auths.codely` 出现、
+         * 进而让 `expectedProviderIdsWithAuth()` 派生出的**一批**守卫变红，且
+         * `account.refresh` 会对一个没有 refresh 实现的渠道开绿灯。
+         * ⇒ 用「**只注册 runtime、不带 auth**」这一最小形态：`ProviderRuntime.auth` 本就是
+         * 可选字段（`provider-runtime.ts` 的 `readonly auth?:`），opencode 同样没有它。
+         *
+         * ## ⚠️ 守卫（本次一并补）
+         *
+         * `provider-runtime-wiring.spec.ts` 新增「`probeById` 的每一项都真的挂到了
+         * runtime」—— 原来的存在性守卫只比 `Object.keys(probeById)` 与期望集合，
+         * **不查「这一项是否真被挂上」** ⇒ `probeById.codely` 存在即算通过，尽管它
+         * 永远不可达（`opencode` 是同一盲区的**存量**受害者，本次一并覆盖）。
+         */
+        const codelyRuntimeDescriptor = descriptorOf(CODELY_PROVIDER_ID);
+        if (codelyRuntimeDescriptor !== undefined && Object.hasOwn(probeById, CODELY_PROVIDER_ID)) {
+            registerProviderRuntime({
+                descriptor: codelyRuntimeDescriptor,
+                // ✅ **给 `auth`**（2026-10-22 A6）：`CodelyAuth` 已改为 `extends Service`、签名已符合
+                //    `JetHubAuthLike`（单参 `refreshAll(pool)`），且真有 refresh 端点。
+                //    ⚠️ **必须给**：`wiredRefreshTargets()` 遍历的是 runtime 里的 `auth.refreshAll`，
+                //    不给它 ⇒ codely 永不进批量续期表 ⇒ 凭据过期后积分行报「未登录」且日志零字
+                //    （issue IKKHL5 形态）。
+                auth: {
+                    // ⚠️ 必须包一层（与上面主循环同因）：直接挂方法引用会丢 `this`。
+                    refreshAccount: (refName, pool, accountId) => codelyAuth.refreshAccountCredential(refName, pool, accountId),
+                    refreshAll: (pool) => codelyAuth.refreshAll(pool),
+                },
+                // ⚠️ 这两行不能少：`creditsOf` 返回 `undefined` 时，
+                //    `provider-runtime-wiring` 那条「声明了 balance 就必须挂 credits 域」就会点名。
+                credits: creditsOf(creditsTable, CODELY_PROVIDER_ID),
+                // ⚠️ codely **未接临期折算**（上游不下发到期时间）⇒ 本行取到 `undefined`。
+                //    这与 `expiry-runtime-parity.spec.ts` 的显式豁免表一致。
+                expiry: expiryOf(expiryTable, CODELY_PROVIDER_ID),
+                probe: probeById[CODELY_PROVIDER_ID],
+            });
         }
     }
     /**
@@ -2932,11 +5559,33 @@ export function apply(ctx) {
         codearts: service,
         buddy, workbuddy, lobsterai, qoder,
         qodercn: qoderCn,
-        trae, cline, loomy, raccoon, minimax, zcode, gemini,
+        trae, cline, loomy, raccoon, minimax,
+        // ⚠️ 键是 **provider id** `minimaxintl`，值是变量 `minimaxIntl`
+        //（两者大小写不同：id 全小写、变量名带驼峰）—— 写成简写 `minimaxintl,`
+        // 会去引用一个不存在的变量。与上面 `qodercn: qoderCn` 同因。
+        minimaxintl: minimaxIntl,
+        zcode, gemini,
         // OfficeAce（华为 ModelArts MaaS 云端直连）：值是 **auth 服务形状的包装对象**
         //（纯函数集合 + 统一 auth 契约），不是 Service 实例。
         officeace: officeaceAuthService,
+        // ✅ **Codely 的续期对象已接**（2026-10-22 A6）：`CodelyAuth` 签名已改成
+        //    契约的**单参** `refreshAll(pool)`（与各家同形，见 A5 的修）。
+        //    ⚠️ 它同时进了 `SELF_HEAL_REFRESHABLE_PROVIDERS`（`jet-hub-rpc.ts`）——
+        //    两处**缺一不可**：只挂 auths 而不进自愈表 ⇒ 积分行过期后报「未登录」
+        //    且日志零字（issue IKKHL5 形态，均已复发四次）。
+        codely: codelyAuth,
+        autoclaw,
+        // ⚠️ 键是 **provider id** `autoclawintl`，值是变量 `autoclawIntl` ——
+        //    两者不同名（id 全小写、变量带驼峰），写成简写会引用不存在的变量。
+        //    ⚠️ 值必须是**国际版实例**：写成 `autoclaw` 会让国际站账号的续期
+        //    去刷国内站凭据（与 minimaxintl 的同类风险完全一致）。
+        autoclawintl: autoclawIntl,
         accio,
+        astudio,
+        // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。漏加 = 客户端把它当
+        //    「客户端已登记但宿主没有同名键」⇒ zcode-wiring 的守卫会红，
+        //    且 Jet Hub 的 modelscope 面板所有 RPC 全部 `unknown provider`。
+        modelscope,
     }, modelAdapters);
     // 网关是旁路功能：这里传 `pool` 只为读设置页里的开关，其内部任何失败都已
     // 自行降级为日志，绝不会让插件 apply() 失败。
@@ -2946,10 +5595,34 @@ export function apply(ctx) {
     // ⚠️ 它依赖 `agents` 服务，故内部用 `ctx.inject(['agents'], …)` 挂载：
     // 该服务缺席的 profile 里本功能整体不生效，不会让插件永久 pending。
     installLoopResume(ctx);
+    // 官方 `web_search` 在**支持原生搜索的渠道**下改走渠道自带后端
+    //（其余渠道 `next()` 放行，官方链路逐字节不变）。
+    //
+    // | 渠道 | 原生后端 |
+    // |---|---|
+    // | buddy / workbuddy | 腾讯 `/agenttool/v1/search`（Bearer） |
+    // | qoder / qodercn | Qoder `/api/v1/webSearch/oneSearch`（WASM 签名） |
+    //
+    // ⚠️ 传**聊天链路用的那些适配器实例**：搜索与聊天因此共用同一个
+    // `resolveCredential`（enabled / 模型级限流 / 免费判定 / 余额分档 / 池兜底
+    // 六步完全一致，见 `web-native.ts` 模块头）。
+    // ⚠️ **不接管 `web_fetch`**：官方 fetch 走 `http` 提供方、不发送凭据、零配置，
+    // 接管它是净损失（2026-10-14 实测，理由见 `web-native.ts` 模块头）。
+    // ⚠️ 总开关传**函数**而不是布尔值：用户在 Jet Hub 面板里切换后必须立即生效，
+    // 不能被启动时的快照钉死。
+    installWebNative(ctx, {
+        buddy: buddyAdapter,
+        workbuddy: workbuddyAdapter,
+        qoder: qoderAdapter,
+        qodercn: qoderCnAdapter,
+    }, () => pool.nativeWebSearchEnabled());
     ctx.provide('accountPool', pool);
     // ⚠️ 与 `registerJetHubRpc` 的 `auths.officeace` 是**同一个对象**
     //（理由见上面 `officeaceAuthService` 的注释：两处各建一个会让守卫用例的
     //  spy 收不到调用）。
     ctx.provide('officeaceAuth', officeaceAuthService);
+    // ⚠️ **本 fork 独有**（modelscope）：`ModelscopeAuth extends Service`，
+    //    构造时已由 cordis 自动注册为 `ctx.modelscopeAuth`（`super(ctx, `${product.id}Auth`)`），
+    //    故这里**不需要**再 provide —— 与 accio 同款（它也没有 provide 行）。
 }
 //# sourceMappingURL=index.js.map

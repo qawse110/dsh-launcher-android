@@ -1,11 +1,11 @@
 /**
- * OpenCode Zen 模型能力元数据（远端下发 + 磁盘缓存 + **非阻塞**读取）。
+ * OpenCode Zen 模型能力元数据（**读共享缓存**，不再自己直连）。
  *
- * ## 数据源：models.dev 的 `opencode` 条目
+ * ## 数据源：models.dev 的 `opencode` 条目，**经共享本地缓存**
  *
  * `/zen/v1/models` **只返回 4 个字段**（`id` / `object` / `created` /
  * `owned_by`，实测 85 条全如此），**不含任何能力信息**。能力在 models.dev
- * （`https://models.dev/api.json` 的 `opencode` 键，实测 115 个模型），官方
+ * （`https://models.dev/api.json` 的 `opencode` 键，实测 127 个模型），官方
  * CLI 自己就用它（`packages/core/src/models-dev.ts`）。
  *
  * | 字段 | 用途 |
@@ -13,29 +13,54 @@
  * | `modalities.input` | 能力主源：`['text']` / `['text','image']` … |
  * | `cost.input` / `cost.output` | **免费判定的权威来源**（0 = 免费） |
  * | `limit.context` / `limit.output` | 上下文窗口与输出上限 |
+ * | `reasoning_options` | 思考档位（见 {@link OpencodeModelCapability.efforts}） |
+ * | **`provider.api`** | **协议可达性**（见下方「为什么必须采它」） |
  *
- * ## ⚠️⚠️ 为什么读取**必须非阻塞**（真机事故 2026-10-02）
+ * ## ⚠️⚠️ 读取路径：只读共享缓存，**永不**自己 fetch（用户 2026-10-17）
  *
- * `https://models.dev/api.json` 实测 **5.05 MB / 首字节 720ms / 下载 1.4s**
- * （轻量端点 `api/v1/opencode.json` 返回的是 HTML 404 页，不可用）。
+ * 本模块改前**自己** `fetch('https://models.dev/api.json')`，并维护独立的
+ * TTL / 在飞去重 / 磁盘缓存（与 `cline-models-dev.ts` 各一套，那是本仓库
+ * 明令禁止的「一文件两套同义判据」形态）。那份数据**解压后 ~5 MB**、实测
+ * 「要么 ~2 秒、要么整段挂死」，而本仓库已有一次真机事故：渲染路径上 await
+ * 这个拉取 ⇒ **模型选择器一直空白**（2026-10-02）。
  *
- * 我最初在 `listModels` / `resolveModel` 里**直接 await** 这个拉取，于是
- * DSH 的模型选择器必须等 1.4s+ 才能拿到列表 → **点开是一片空白**，
- * 用户报障「选择模型还是点击没弹出列表」。
+ * ⇒ 现在一切取数都走 `src/models-dev-cache.ts`：**本模块不再持有 URL，
+ * 也不发起任何请求**；`readProviderModelsSync()` 只做 `readFileSync`。
+ * 「全仓唯一直读点」由 `tests/unit/models-dev-cache.spec.ts` 的扫描用例守住。
  *
- * ⇒ 三条硬约定（改动前先读）：
- * 1. **渲染路径上只能读同步缓存**，永不 await 网络；
- * 2. 磁盘缓存落 `$DSH_HOME/cache/opencode-capabilities.json`，冷启动直接命中；
- * 3. 拉取在**后台**进行，完成后广播 `llm/adapters-updated` 让 DSH 重读目录。
+ * ## ⚠️ 为什么必须采 `provider.api`（Issue IKM9LR 的根因）
  *
- * 缓存拿不到时**保守回退纯文本**（声明支持就必须真支持），徽标与图片能力
- * 会在后台刷新后自动补上。
+ * 改前 `opencode-product.ts` 的 `OPENCODE_FALLBACK_MODELS` 兜底表**同时**当
+ * 「网络失败的兜底目录」与「协议可达性白名单」两个职责，而后者是硬编码的
+ * ⇒ Zen 新上线的模型（issue 里的 `deepseek-v4.1-flash-free` /
+ * `glm-5.3-flash-free`）**远端 `/v1/models` 明明下发了，却被本地表挡掉**，
+ * 用户在选择器里根本看不到（症状与「上游没这模型」完全同形）。
+ *
+ * models.dev 的 `provider.api` 正是**协议端点**的权威字段。实测按它分组与
+ * 「我们实现了哪些协议」逐格吻合（`openai/v1` 56 条 / `anthropic/v1` 17 条 /
+ * `google/v1beta` 8 条 / 无条目 4 条），且改前的 14 条兜底表条目**全部**落在
+ * `openai/v1` 内、零反例。
+ *
+ * ⚠️ 它**不能**替代的三样（目录层无从预知，只能靠运行时错误分类兜）：
+ * ① 地域封锁（`beam-free` 的 api 就是 openai/v1，实测 403 RegionError）；
+ * ② 上游不稳定（`glm-5.3-flash-free` 约 2/5 概率 429）；
+ * ③ 废弃（`mimo-v2.5-free` 回 410，但只要远端还下发，目录层就挡不住）。
  */
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
-import { OPENCODE_MODELS_DEV_URL, OPENCODE_MODELS_DEV_TTL_MS } from './opencode-product.js';
+import { clearModelsDevCache, readProviderModelsSync, refreshModelsDev, } from './models-dev-cache.js';
+import { OPENCODE_CHAT_PROTOCOL_API, setOpencodeCapabilityHook, setRemoteOpencodeFreeFlags, setRemoteOpencodeReachability, } from './opencode-product.js';
+// ⚠️⚠️ **模块加载期**注册「读能力表」钩子（独立审计 P1 的根治）。
+//
+// `opencode-product.ts` 的两个判据（`isFreeOpencodeModel` /
+// `isReachableOpencodeModel`）在表为 `undefined` 时会回调它，就地完成注入 ——
+// 于是判据**自给自足**，不再依赖「每个调用点都先读一次能力表」这种跨文件的
+// 隐式顺序约定。
+//
+// ⚠️ **必须是模块加载期**（不是首次归一后）：冷启动首帧能力表还没被任何
+//   路径读过，若那时钩子未注册，判据就会退回本地表。
+//
+// ⚠️ 回调里**不缓存**结果：`readNormalized()` 自身按共享缓存的 provider 块
+//   身份记忆化，重复调用极廉价，而缓存一份反而会在后台刷新后读到旧值。
+setOpencodeCapabilityHook(() => { readNormalized(); });
 /**
  * 实测校准表：**只**覆盖与 models.dev 不一致的视觉能力。
  *
@@ -145,194 +170,146 @@ function normalizeEntry(id, raw) {
         toolCall: entry.tool_call !== false,
         isFree: isFiniteNumber(entry.cost?.input) && entry.cost.input === 0
             && isFiniteNumber(entry.cost?.output) && entry.cost.output === 0,
+        // ⚠️⚠️ 协议可达性（issue IKM9LR）。**缺字段 = 不知道**，不是「不可达」：
+        //   实测 `jev-1.13-free` 连 models.dev 条目都没有，而 `claude-*` / `gemini-*`
+        //   的 `api` 指向本插件**未实现**的协议（实测 `/v1/messages` 恒 500）。
+        chatProtocol: typeof entry.provider?.api === 'string'
+            ? entry.provider.api === OPENCODE_CHAT_PROTOCOL_API
+            : undefined,
     };
 }
-/** 能力表缓存文件路径（`$DSH_HOME/cache` 下，与宿主缓存同处）。 */
-function cacheFilePath() {
-    const home = process.env.DSH_HOME?.trim() || join(homedir(), '.dsh');
-    return join(home, 'cache', 'opencode-capabilities.json');
-}
-/** 进程内同步可读的缓存（渲染路径只读它，绝不 await）。 */
-let memory = [];
-/** 磁盘缓存的写入时刻（0 = 无缓存），供 TTL 判定。 */
-let cacheFileAt = 0;
-/** 后台拉取是否已在进行（去重，避免并发重复下载 5 MB）。 */
-let refreshing;
-/** 磁盘缓存读一次（冷启动路径）。 */
-let diskLoaded = false;
-async function ensureDiskLoaded() {
-    if (diskLoaded)
-        return;
-    diskLoaded = true;
-    try {
-        const raw = await readFile(cacheFilePath(), 'utf8');
-        const parsed = JSON.parse(raw);
-        if (parsed?.version === 2 && Array.isArray(parsed.entries) && parsed.entries.length > 0) {
-            memory = parsed.entries;
-            cacheFileAt = typeof parsed.at === 'number' ? parsed.at : 0;
-        }
-    }
-    catch {
-        // 首次运行没有缓存文件是**正常**的（不是错误），走纯文本兜底。
-    }
-}
 /**
- * **同步**读磁盘缓存（模块加载时执行一次）。
+ * 内存里归一好的能力表（**派生自共享缓存**，不单独持有 I/O 状态）。
  *
- * ## ⚠️⚠️ 为什么必须有这一步（真机报障 2026-10-02，根因）
- *
- * DSH 内核在 `prompt` 准入阶段校验图片：
- * ```js
- * const model = await this.ctx.llm.resolveModelInfo(current.provider, current.model)
- * if (model.inputModalities !== void 0 && !model.inputModalities.includes("image"))
- *   throw new RemoteError(..., "Model ... does not support image input.")
- * ```
- * （见 `dsh-api-session-controller/lib/index.js`）
- *
- * 那次校验**紧贴用户操作**发生，而能力表此前只靠 `ensureDiskLoaded()` 的
- * **异步** `await readFile` 填充 ⇒ 冷启动后有一段窗口里
- * `getOpencodeCapabilitiesSync()` 恒返回 `[]` ⇒ `inputModalities` 报 `['text']`
- * ⇒ **网关发图被内核拒绝**，报「模型不支持图片输入」。
- *
- * 「后台刷新后广播 `llm/adapters-updated`」救不了：广播只触发 UI 重渲染，
- * 不会重新走一次准入校验。
- *
- * ⇒ 模块加载时**同步**把磁盘缓存读进内存（缓存文件 ~19KB，`readFileSync`
- * 代价可忽略），保证 `resolveModel` 第一次被调用就拿到完整能力表。
- * 代价是插件加载多一次同步 IO，可接受。
+ * ⚠️ 归一结果按「共享缓存的版本」记忆化：缓存没变就不重算（归一 127 条
+ * 虽然便宜，但每次 `listModels` 都重算一遍是纯浪费），变了就整体作废。
  */
-function loadDiskCacheSync() {
-    if (diskLoaded)
-        return;
-    diskLoaded = true;
-    try {
-        const raw = readFileSync(cacheFilePath(), 'utf8');
-        const parsed = JSON.parse(raw);
-        if (parsed?.version === 2 && Array.isArray(parsed.entries) && parsed.entries.length > 0) {
-            memory = parsed.entries;
-            cacheFileAt = typeof parsed.at === 'number' ? parsed.at : 0;
-        }
-    }
-    catch {
-        // 没有缓存文件是正常的（首次运行），后台会补齐。
-    }
-}
-async function writeDiskCache(entries) {
-    try {
-        const path = cacheFilePath();
-        await mkdir(join(path, '..'), { recursive: true });
-        const payload = { version: 2, at: Date.now(), entries };
-        await writeFile(path, JSON.stringify(payload), 'utf8');
-    }
-    catch {
-        // 缓存写失败不影响功能（下次仍会从网络补齐）
-    }
-}
-/** 单次拉取的超时（毫秒）。
+let normalized = [];
+/** 归一结果对应的缓存指纹（provider 块的对象身份变化即作废）。 */
+let normalizedFrom = undefined;
+/**
+ * 从共享缓存同步读出**归一后**的能力表。
  *
- * ⚠️ **必须有**：`fetch` 在某些宿主网络环境（代理未起、TUN 未连通）下
- * 会**永不 settle**（用户报障「模型选择一直卡着」，实测非慢而是挂死）。
- * 没有超时 = 后台任务永久悬挂，且它还占着 `refreshing` 去重位，
- * 导致后续所有刷新请求都被跳过。
+ * ⚠️ 全程**同步**、零 I/O 之外的等待：共享缓存内部只做一次 `readFileSync`
+ * （见 `models-dev-cache.ts` 的 `loadDiskCacheSync`）。
  */
-const FETCH_TIMEOUT_MS = 20_000;
-async function fetchAndCache() {
-    const response = await fetch(OPENCODE_MODELS_DEV_URL, {
-        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-    });
-    if (!response.ok)
-        throw new Error(`HTTP ${response.status}`);
-    const body = (await response.json());
-    const models = body['opencode']?.models;
-    if (typeof models !== 'object' || models === null)
-        throw new Error('缺少 opencode 条目');
+function readNormalized() {
+    const block = readProviderModelsSync('opencode');
+    if (normalizedFrom === block)
+        return normalized;
     const out = [];
-    for (const [id, raw] of Object.entries(models)) {
+    for (const [id, raw] of Object.entries(block)) {
         const entry = normalizeEntry(id, raw);
         if (entry !== null)
             out.push(entry);
     }
-    if (out.length === 0)
-        throw new Error('解析结果为空');
-    memory = out;
-    await writeDiskCache(out);
+    normalized = out;
+    normalizedFrom = block;
+    publishRemoteTables(out);
+    return out;
 }
 /**
- * 后台刷新能力表（**永不阻塞**调用方）。
+ * 把归一结果里的**协议可达性**与**免费判定**回灌给 `opencode-product.ts`。
  *
- * @param onUpdated 刷新成功后的回调（接线层用它广播 `llm/adapters-updated`，
- *                  让 DSH 重读目录并按新能力重渲染）。
- * @param force 忽略 TTL 强制刷新（「刷新目录」按钮用）。
+ * ## ⚠️ 为什么必须在这里做（而不是让 product 反向依赖本模块）
+ *
+ * `isReachableOpencodeModel` / `isFreeOpencodeModel` 在 `opencode-adapter.ts`
+ * 的热路径上被逐条调用，而那两个函数住在 `opencode-product.ts`（一个**不该
+ * 依赖能力表**的纯常量模块 —— 那会形成 `product ← capability` 的反向依赖）。
+ * ⇒ 由本模块归一完之后**主动注入**，product 侧只留两个 setter。
+ *
+ * ⚠️ **三态必须原样传递**：`chatProtocol` 为 `undefined`（不知道）时
+ * **不放进 map** —— map 的 `has` 语义是「有权威结论」，缺键即「不知道，
+ * 退回本地表」。直接把 `undefined` 塞成 `false` 会让所有无条目模型被判死。
  */
-export function refreshOpencodeCapabilities(onUpdated, force = false) {
-    // ⚠️ 上一次拉取若**卡住**（fetch 永不 settle 且超时信号未生效的极端情况），
-    // `refreshing` 会被永久占住，之后所有刷新都被跳过、缓存也永远补不上。
-    // 故超过两倍超时即视为「上一次已死」，允许重新发起。
-    if (refreshing !== undefined && Date.now() - refreshingStartedAt > FETCH_TIMEOUT_MS * 2) {
-        refreshing = undefined;
+function publishRemoteTables(entries) {
+    const reachability = new Map();
+    const freeFlags = new Map();
+    for (const entry of entries) {
+        if (entry.chatProtocol !== undefined)
+            reachability.set(entry.id, entry.chatProtocol);
+        // ⚠️ 免费判定的权威来源是 `cost`（实测 `isFree` 已按 `cost.input===0 &&
+        // cost.output===0` 算好），与协议无关 ⇒ **无条件**发布。
+        freeFlags.set(entry.id, entry.isFree);
     }
-    if (refreshing !== undefined)
-        return;
-    refreshingStartedAt = Date.now();
-    refreshing = (async () => {
-        try {
-            await ensureDiskLoaded();
-            // 磁盘缓存足够新就不重复下载 5 MB。
-            if (!force && cacheFileAt > 0 && Date.now() - cacheFileAt < OPENCODE_MODELS_DEV_TTL_MS)
-                return;
-            await fetchAndCache();
-            onUpdated?.();
-        }
-        catch {
-            // 拉取失败（含超时）：保留现有缓存继续用（能力退化为上一次的读数，而不是清空）
-        }
-        finally {
-            refreshing = undefined;
-        }
-    })();
+    setRemoteOpencodeReachability(reachability);
+    setRemoteOpencodeFreeFlags(freeFlags);
 }
-/** 在途拉取的开始时刻（用于识别「卡死」的那一次，见 refreshOpencodeCapabilities）。 */
-let refreshingStartedAt = 0;
 /**
- * **同步**读当前已知的能力表。
+ * **同步**读当前已知的能力表（渲染路径唯一入口）。
  *
  * ⚠️ 刻意**不是** async：调用方在渲染路径上（listModels / resolveModel），
- * await 网络会卡住模型选择器（真机事故）。
+ * await 网络会卡住模型选择器（真机事故 2026-10-02）。
  *
- * ⚠️⚠️ 首次调用会**同步**读磁盘缓存（`readFileSync`，~19KB）—— 不是网络 IO，
+ * ⚠️⚠️ 冷启动首次调用会**同步**读共享缓存文件（`readFileSync`）—— 不是网络 IO，
  * 代价可忽略，却能保证 `resolveModel` 第一次被调用就拿到完整能力表。
  * 少了这一步，内核的 `prompt` 准入校验会读到 `inputModalities: ['text']`
- * 而拒绝图片（详见 {@link loadDiskCacheSync} 的事故记录）。
+ * 而拒绝图片（2026-10-02 的事故，见 `models-dev-cache.ts` 的同款记录）。
  */
 export function getOpencodeCapabilitiesSync() {
-    loadDiskCacheSync();
-    return memory;
+    return readNormalized();
 }
-/** 首次调用：读磁盘缓存（非阻塞，fire-and-forget）。 */
+/**
+ * 作废归一缓存（外部刷新了共享缓存时调用）。
+ *
+ * ⚠️ **必须真的作废**：归一是按「共享缓存里 provider 块的对象身份」记忆化的，
+ * 而成功刷新会**整体换掉**那块对象 —— 所以正常路径靠身份变化自动失效。
+ * 但显式作废是**第二道防线**：万一将来缓存改成增量更新（复用同一个对象），
+ * 身份判据就会静默失效，症状是「改了没用，重启才好」。
+ */
+export function invalidateOpencodeCapabilities() {
+    normalizedFrom = undefined;
+}
+/**
+ * 启动期预热（**保持旧签名**以免改动接线层语义）。
+ *
+ * ⚠️ 现在它**只**触发共享缓存的后台刷新，自身不再读任何文件
+ * —— 同步读已在 `readNormalized()` 里做掉了。多一条 async 读链只会让
+ * 「是否读到缓存」出现两个判据（本仓库红线：同一语义两套判据）。
+ */
 export function primeOpencodeCapabilities() {
-    // 同步读一次，让紧随其后的任何 resolveModel/listModels 都拿得到。
-    loadDiskCacheSync();
-    void ensureDiskLoaded().then(() => {
-        // 有缓存就直接用；没有则在后台补一次。
-        if (memory.length === 0)
-            refreshOpencodeCapabilities();
+    refreshModelsDev();
+}
+/**
+ * 后台刷新能力表（**保持旧签名**以免改动接线层语义）。
+ *
+ * ⚠️ 实际动作发生在共享缓存里；本函数只把 `onUpdated` 转交给它。
+ * 保留这一层是因为**广播时机**是本渠道的事（能力表一变就要让客户端重读目录），
+ * 而拉取细节已不该由本模块掌握。
+ */
+export function refreshOpencodeCapabilities(onUpdated, force = false, warn) {
+    refreshModelsDev(onUpdated, {
+        force,
+        ...warn === undefined ? {} : { warn },
+        onUpdated: invalidateOpencodeCapabilities,
     });
 }
 /** 清空内存与磁盘缓存（单测用）。 */
 export async function clearOpencodeCapabilitiesCache() {
-    memory = [];
-    cacheFileAt = 0;
-    diskLoaded = false;
-    try {
-        const { unlink } = await import('node:fs/promises');
-        await unlink(cacheFilePath());
-    }
-    catch {
-        // 文件不存在是正常的
-    }
+    normalized = [];
+    normalizedFrom = undefined;
+    await clearModelsDevCache();
 }
 /** 某模型是否接受图片输入（未知模型按纯文本处理）。 */
 export function supportsOpencodeImage(capability) {
     return capability?.modalities.includes('image') === true;
+}
+/**
+ * ⚠️ 该模型是否走**本插件实现的** chat 协议（issue IKM9LR）。
+ *
+ * ## 判据口径（三格，缺一不可）
+ *
+ * | 能力表 | 结论 |
+ * |---|---|
+ * | `chatProtocol === true` | **可达** |
+ * | `chatProtocol === false` | **不可达**（`provider.api` 指向 anthropic/google 等未实现的协议） |
+ * | **条目不存在**（`undefined`） | **不知道** ⇒ 交给调用方按本地兜底表决定 |
+ *
+ * ⚠️ 第三格是刻意的：`jev-1.13-free` 连 models.dev 条目都没有，而实测它回
+ * `400 ModelProtocolUnsupported` —— 但「这条实测结论」只属于**那个模型**，
+ * 不能推广成「无条目的都不可达」。判成不可达会让未来新上线的模型凭空消失。
+ */
+export function isOpencodeChatReachable(id) {
+    return readNormalized().find((c) => c.id === id)?.chatProtocol;
 }
 //# sourceMappingURL=opencode-capability.js.map

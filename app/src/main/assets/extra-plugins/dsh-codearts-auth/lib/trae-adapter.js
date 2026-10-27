@@ -18,19 +18,22 @@
  */
 import { CONTEXT_WINDOW_EXCEEDED_CODE, LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 import { ToolCallId } from '@deepseek-ai/dsh-llm';
-import { createModelCatalog } from './model-catalog.js';
+import { createModelCatalog, isCatalogFreshFor } from './model-catalog.js';
 import { reasoningRankOf } from './reasoning-ladder.js';
 import { RemoteCatalogGate } from './remote-catalog-gate.js';
 import { broadcastCatalogChanged } from './catalog-broadcast.js';
 import { TRAE_MAX_CONTEXT_TOKENS, clampTraeMaxTokens, isTraeExpired, parseTraeSSELine, isTraeModelCallable, traeMaxModeFields, traeSOLOHeaders, traeUsageFromTokenUsage, transformToSOLOBody, } from './trae.js';
 import { TRAE } from './trae-product.js';
-import { classifyTraeError, recordsTraeRateLimit, shouldRotateTraeAccount } from './trae-errors.js';
+import { classifyTraeError, classifyTraeStreamCode, isRotatableTraeStreamCode, recordsTraeRateLimit, shouldRotateTraeAccount } from './trae-errors.js';
 import { traeCooldownFor } from './trae-cooldown-table.js';
 import { normalizeHarnessMessages } from './message-shape.js';
-import { createBlankReasoningSuppressor, createDsmlMarkerNormalizer, createReasoningLoopDetector, fixDsmlMarkers, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js';
+import { createBlankReasoningSuppressor, createDsmlMarkerNormalizer, createReasoningLoopDetector, fixDsmlMarkers, hasUsableToolName, classifyToolArguments, toolArgsInvalidBlocks, toolArgsInvalidIsSoleOutput, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled, toolArgsInvalidFailure } from './sse.js';
 import { registerAdapterIdempotent, } from './llm-register-compat.js';
 import { reportLedgerAccount } from './token-ledger.js';
 import { planSessionTitleThinking } from './session-title.js';
+// ⚠️ `detail` 那条腿**只留一份实现**（`openai-compat.ts`）：本仓库 6 份同义的
+// `errorDetail` 各写一条判据必然漂移（IKLBSH A1）。
+import { detailFieldText } from './openai-compat.js';
 /** 本适配器注册的 provider 路由名。 */
 export const PROVIDER = 'trae';
 /**
@@ -171,20 +174,6 @@ class TraeStreamErrorCause extends Error {
         this.code = code;
         this.name = 'TraeStreamErrorCause';
     }
-}
-/**
- * 流内错误是否**值得换号**。
- *
- * 与 HTTP 层共用同一张判据表（{@link classifyTraeError}），避免两处各写一套
- * 而逐渐分叉 —— 这正是本次缺陷的成因（流内分支当年自己写了一套「一律
- * 不可重试」的判据）。
- *
- * 对齐既有类别：`hard-plan`(1005) / `soft-rate`(4011/429) /
- * `quota-exceeded`(4008) 都换号；`4001`（模型不可调用）换号无意义
- * —— 换账号也是同一个模型被拒，故**不换号**，直接如实报错。
- */
-function isRotatableStreamError(code) {
-    return code === 1005 || code === 4008 || code === 4011;
 }
 /**
  * 流内错误码 `4006`：**请求体过大**（上游原文 `content is too large for AI to understand`）。
@@ -403,6 +392,11 @@ function serializeTraeMessages(messages, imageUrls) {
     };
     for (const message of normalized) {
         if (message.role === 'assistant') {
+            // ⚠️ 2026-10-19 修（4027 第三例，多工具调用场景）：
+            // 进入新的 assistant 之前，上一批工具结果**已经全部下发完毕**（tool 消息只会
+            // 紧跟其 assistant），此时 flush 图片是安全的。若不在这里 flush，图片会一直
+            // 挂到整个循环结束，被挤到更后面。
+            flushToolImages();
             // 存量自愈：清洗历史里已持久化的行首 `course` / `课` 泄漏
             // （见 `stripCourseLeakFromHistoryContent`）。只清 assistant ——
             // 判据只对模型自己的输出成立，清洗用户输入等于篡改用户的话。
@@ -487,8 +481,27 @@ function serializeTraeMessages(messages, imageUrls) {
             flushToolImages();
             wire.push({ role: 'user', content: parts ?? text });
         }
-        flushToolImages();
+        // ⚠️⚠️ 2026-10-19 修（4027 真实缺陷 · 多工具调用漏网场景）：
+        // **这里绝不能无条件 flush**。原实现在每条 user 消息末尾都调 `flushToolImages()`，
+        // 而 DSH 0.1.7 起工具结果是**一等 `role:'tool'` 消息**（`normalizeHarnessMessages`
+        // 把每条都转成**独立的** `role:'user'` + 内嵌 tool-result 块）⇒ 当一个 assistant
+        // 发了 **≥2 个 tool_call**、且**不是最后一个**的结果内嵌图片时，图片会在处理第一条
+        // 工具结果的消息末尾就被 flush 成一条 user 消息，**插到下一条 `role:'tool'` 之前**
+        // ⇒ assistant(tool_calls) 与 tool 之间插了 user ⇒ 上游恒定回
+        // `code=4027 Messages with role 'tool' must be a response to a preceding message
+        // with 'tool_calls'`。
+        //
+        // 旧回归用例（trae-adapter.spec.ts「工具结果内嵌图片不得插在 role:tool 之前」）
+        // 只覆盖了 **1 个** tool_call，故这条路径从未被测到 —— 实测在模型一次并发发出
+        // `read_image` + `read` 时即触发，且坏报文落库后会话**永久卡死**。
+        //
+        // 修法：图片挂起**跨消息累积**，只在两处落地 ——
+        //   ① 进入下一条 assistant 之前（`flushToolImages()` 已在循环顶部）；
+        //   ② 整个循环结束后（见函数末尾）。
+        // 这样保证同一批工具结果的全部 `role:'tool'` 消息**紧密相邻**，图片统一排在其后。
     }
+    // 循环收尾：把最后一批挂起的图片发出去（此时所有 tool 消息已下发完毕）。
+    flushToolImages();
     return wire;
 }
 /** 从错误体提取可读 detail 文本。 */
@@ -499,6 +512,9 @@ function errorDetail(body) {
             typeof data.code === 'number' || typeof data.code === 'string' ? `code=${String(data.code)}` : undefined,
             typeof data.message === 'string' ? data.message : undefined,
             typeof data.msg === 'string' ? data.msg : undefined,
+            // ⚠️ 上游代理的 `{"error":"…","detail":"<真实原因>"}` 形态（IKLBSH A1）。
+            // 判据只留一份实现（`openai-compat.ts` 的 `detailFieldText`）；必须是最后一条腿。
+            detailFieldText(data),
         ].filter((value) => value !== undefined);
         if (parts.length > 0)
             return parts.join(' ');
@@ -543,6 +559,26 @@ function traeStreamErrorMessage(code, message, model) {
         // 「体积」，容易被读成模型能力问题，故补一句可操作的指向。
         return `${base} —— 本次请求的内容过大：多为一次携带的图片过多/过大。`
             + '请减少本轮的图片数量或改用更小的截图后重试。';
+    }
+    if (code === 1005) {
+        // ⚠️ **必须给出「换模型」这条出路**（2026-10-25 审计 P2-10）。
+        //
+        // 1005 = **套餐权益不足**：该模型不被这个账号的套餐接受。上游 `message`
+        // 常常是**空串**，于是旧实现给用户的全部信息就是 `trae:  (code=1005)`
+        // —— 一个字都不指向他能做的事。
+        //
+        // ⚠️ 引导必须指向**换模型**，不能指向签到/充值：换号也没用（换账号还是
+        // 同一个模型被拒，故 1005 不在「值得换号」之外的语义里），而额度对
+        // 「套餐不含此模型」是完全无效的解药。这一点审计实测确认过。
+        return `${base} —— 当前账号的套餐不包含模型「${model}」：`
+            + '请换一个模型重试（被拒的是这个模型，不是额度，等额度也不会好）。';
+    }
+    if (code === 4008) {
+        // 4008 = `ide_credits` 日配额耗尽 ⇒ 这条**确实**该引导等重置/签到。
+        // 与 1005 分开写，避免把两种完全不同的成因混成一句（旧实现两者共用
+        // 裸码文案，用户无法区分是该换模型还是该等额度）。
+        return `${base} —— 当前账号的今日额度已用尽：`
+            + '请等额度重置后重试，或改用其它模型/其它账号。';
     }
     if (code !== 4001)
         return base;
@@ -606,6 +642,13 @@ export class TraeAdapter extends LlmAdapter {
     /** 动态模型缓存。 */
     remoteModels;
     /**
+     * ⚠️ 上次**成功**读到远端目录的时刻（0 = 从未成功过）。
+     *
+     * ⚠️ 与 `remoteModels` **并存**、不是替代：`remoteModels` 存「有哪些模型」，
+     *    本字段存「何时读到的」。只有 `remoteModels` 时目录**永不刷新**（原行为）。
+     */
+    catalogAt = 0;
+    /**
      * 目录加载闸门：并发去重 + 失败/空结果冷却。
      * 依据见 `src/remote-catalog-gate.ts`（首屏「加载模型巨长」的实测归因）。
      */
@@ -638,6 +681,17 @@ export class TraeAdapter extends LlmAdapter {
             product: this.product,
             loadCatalog: () => this.loadCatalogEntries(),
             syncCatalog: () => this.syncCatalogEntries(),
+            /**
+             * ★ **强制重拉**（供后台 20 分钟刷新器与「用户改设置」）。
+             *
+             * ⚠️ 与 `loadCatalog` 的差别：后者内部有 `isCatalogFresh` 判据 ⇒ 新鲜时**不拉**。
+             * 本回调要的是「无视新鲜度，强制拉一次」，故先清时刻再调同一个方法 ——
+             * **不另写一份拉取逻辑**（那会让两条路的上游行为分叉）。
+             */
+            refresh: async () => {
+                this.catalogAt = 0;
+                await this.ensureRemoteModels();
+            },
             // ⚠️ 未知 id 保守报 `['text']`（见 `inputModalitiesFor`）。
             unknownModelInputModalities: () => ['text'],
         });
@@ -646,11 +700,25 @@ export class TraeAdapter extends LlmAdapter {
         const id = typeof provider === 'string' && provider.length > 0 ? provider : this.product.id;
         return { id, name: this.product.displayName };
     }
-    /** 懒加载远端模型目录（仅拉取一次）。 */
+    /**
+     * 懒加载远端模型目录（**每 20 分钟**重新拉一次，用户 2026-10-18 的要求）。
+     */
     async ensureRemoteModels() {
         const fetchRemote = this.options.fetchRemoteModels;
-        if (this.remoteModels !== undefined || fetchRemote === undefined)
+        // ⚠️ `fetchRemote === undefined` 那半边**原样保留** —— 它判的是「有没有远端
+        //    可拉」（无凭据/无接线），与新鲜度是两件事。
+        if (fetchRemote === undefined)
             return;
+        // ⚠️ 判据来源：`isCatalogFresh`（`model-catalog.ts` 的**唯一**实现）。
+        // ⚠️ **入口用 `isCatalogFreshFor`**：用户在 Jet Hub 改开关后要**立即**重拉
+        //    （规格 §6 的正确性要求，见 `invalidateCatalogCache`）。本方法只有这一处
+        //    判据，且它在 gate **之前**（拉不到就用旧值），故整条路径都安全。
+        // ⚠️ **不是**照抄 aggregate-adapter.ts 那条 —— 那边另有两处本家没有的前提
+        //    （`force` 与 `options.catalogTtlMs` 覆盖的 60s TTL），本家用 20 分钟默认周期。
+        if (this.remoteModels !== undefined
+            && isCatalogFreshFor(this.product.id, this.catalogAt, this.options.now?.() ?? Date.now())) {
+            return;
+        }
         // 闸门：并发去重 + 失败/空结果冷却（依据见 src/remote-catalog-gate.ts）。
         // Trae 的目录超时上限 30s（src/trae.ts），失败不冷却会被 buildModelCatalog
         // 放大成「每模型一次」。
@@ -660,6 +728,9 @@ export class TraeAdapter extends LlmAdapter {
                 return false;
             this.remoteModels = models;
             this.remoteMeta = new Map(models.map((model) => [model.id, model]));
+            // ⚠️ **只在成功赋值后**记时刻：失败/空结果不写，否则一次抖动会把上界
+            //    刷新掉、下轮还要等满 20 分钟才发现上游没恢复。
+            this.catalogAt = this.options.now?.() ?? Date.now();
             return true;
         });
     }
@@ -828,6 +899,20 @@ export class TraeAdapter extends LlmAdapter {
      * ⚠️ **2026-10-08 Task 7c**：骨架（含上面这条理由）已上移到共享实现
      * `src/model-catalog.ts`，此处只剩委托。
      */
+    /**
+     * ★ **后台目录刷新器入口**（`src/index.ts` 的 `refreshOf` 调 `adapter.refresh?.()`）。
+     *
+     * ⚠️⚠️ 必须由适配器**显式转发** `catalog.refresh`：`ModelCatalog`（`model-catalog.ts`）
+     *    上的这个成员**不会**自动变成适配器的成员 —— `pruned()` 的 Proxy 只透传
+     *    **适配器自己的**成员（`dead-model-store.ts:748-749`）。
+     *    漏转发 ⇒ 刷新器「已武装」却对这家**空转**，且**零日志**（`refreshOf` 返回
+     *    `undefined` 时静默跳过 —— `index.ts` 的装配注释写着这件事）。
+     *    ⚠️ 与 `options.refresh`（HTTP 401 后的**凭据**重取）**不是同一件事**，
+     *    两者同名纯属巧合，**不得合并**。
+     */
+    async refresh() {
+        await this.catalog.refresh?.();
+    }
     listAllModels() {
         return this.catalog.listAllModels();
     }
@@ -1238,6 +1323,18 @@ export class TraeAdapter extends LlmAdapter {
         // 错误只在首个事件前抛；流内错误则由 `!gotAnyContent` 把关。因此不存在
         // 「已经吐了一半再重放」的重复计费与重复执行工具风险（对齐 CN 项目的
         // `TRAE_REMOTE_WORK_FALLBACK` 语义）。
+        //
+        // ⚠️⚠️ **「任何 chunk」是字面意思，不是「正文」**（2026-10-25 审计 P0 修复）：
+        // 旧实现只在 `ev.response` 非空时置 `gotAnyContent`，于是「已发出思考」与
+        // 「已发出工具调用」两种情况仍会被判成「尚未产出」⇒ 换号重发。而重试循环
+        // 在**本函数内部**，harness 只看到一条连续流 ⇒ 第一次 attempt 的
+        // `tool-call-delta` 会变成**幽灵调用**：`BlockAssembler.assembled()` 只在
+        // `max-tokens` 时丢弃 tool-call（**不过滤**没有 `block-end` 的 partial），
+        // `dsh-agent-loop` 也不去重 ⇒ harness 会执行一个模型已经放弃的工具调用。
+        // ⇒ 三个发射点（`text-delta` / `reasoning-delta` / `tool-call-delta`）
+        // **必须都**置真，且只在**真正 yield 之后**（被 suppressor / 死循环守卫 /
+        // 空名字拦下的分片一个 chunk 都没发，重发不产生幽灵调用）。
+        // 守卫：`tests/unit/trae-adapter.spec.ts` 的两条 `★★★ P0` 用例。
         const triedStreamAccounts = new Set();
         if (currentAccountId.length > 0)
             triedStreamAccounts.add(currentAccountId);
@@ -1250,22 +1347,39 @@ export class TraeAdapter extends LlmAdapter {
             catch (error) {
                 // ② 流内可换号错误 → 标记当前账号 + 取下一个账号重发。
                 if (error instanceof LlmError && error.code === TRAE_ROTATABLE_STREAM_ERROR) {
-                    // 无账号池、或换号预算用尽 → 如实抛出（去掉哨兵码，换真实语义）。
-                    if (this.options.accountPool === undefined || rotateBudget <= 0) {
+                    // 无账号池 → 无从换号，如实抛出（去掉哨兵码，换真实语义）。
+                    //
+                    // ⚠️⚠️ **`rotateBudget <= 0` 的抛出不能放在这里**（2026-10-25 审计 P1）：
+                    // 旧实现在此直接 `throw`，于是「预算刚好用尽」的那一次**当前账号
+                    // 一个冷却标记都不写**就抛出了 —— 用 3 个账号的池实测，第一轮只标
+                    // 2 个，那个漏标的账号下次选号时没有任何标记可过滤 ⇒ **立刻又被选回**
+                    // （正是「轮换好像不行」的第三个成因）。故先标记、再判预算。
+                    if (this.options.accountPool === undefined) {
                         throw new LlmError(error.message, 'QUOTA_EXCEEDED');
                     }
                     if (options.signal?.aborted)
                         throw error;
-                    rotateBudget -= 1;
                     // 标记当前账号在本模型上受限（UI 据此亮「限额重置」徽章）。
                     //
                     // ⚠️ 与 HTTP 层同款：只标记**该模型**，该账号在别的模型上仍可用。
                     //
                     // ⚠️ 冷却时长必须**按类别**取（2026-10-05 修）：从哨兵错误的
                     // `cause` 里取回流内 errorCode，重分类后走与 HTTP 层**同一张**
-                    // `traeCooldownFor` 表——quota-exceeded 24h、hard-plan 7d、
-                    // soft-rate 1h。旧实现一律 1h 兜底，额度耗尽的账号 1 小时后被
-                    // 选回、又 4008（同款缺陷的流内第二实例，见抛出点注释）。
+                    // `traeCooldownFor` 表——quota-exceeded 24h、hard-plan 12h、
+                    // soft-rate 60s（取值以 `trae-cooldown-table.ts` 为准，别再凭印象写）。
+                    // 旧实现一律 1h 兜底，额度耗尽的账号 1 小时后被选回、又 4008
+                    // （同款缺陷的流内第二实例，见抛出点注释）。
+                    //
+                    // ⚠️ 重分类必须走 {@link classifyTraeStreamCode}（**结构化码**入口），
+                    // 不能拿 `classifyTraeError` 喂 JSON（2026-10-24 修）：文案表判
+                    // `hard-plan` 还要求 `plan` 关键词，而流内 `message` 可能是**空串**
+                    // ⇒ 判成 `none` ⇒ 冷却 **0ms** ⇒ 标记写不下去、换号形同虚设
+                    // （真实报障：`trae:  (code=1005)`，两个账号同被同一模型拒）。
+                    //
+                    // ⚠️ 该入口**只查码表**（2026-10-25 审计 F-02 起）：它不再接受
+                    // `message`、也不回落文案表 —— 那个回落腿在生成路径上不可达，且
+                    // 复活的正是上面这条缺陷的形态。表外码在这里拿到 `undefined`，
+                    // 由下一行的 `TRAE_RATE_LIMIT_FALLBACK_MS` 兜底。
                     if (currentAccountId.length > 0) {
                         // ⚠️ instanceof 收窄一次、两个字段都从收窄后的引用取（PR #64 审查 1）：
                         // 对 `unknown` 的行内可选链不做窄化，`cause?.message` 会报 TS2339 挡构建。
@@ -1273,11 +1387,17 @@ export class TraeAdapter extends LlmAdapter {
                             ? error.cause
                             : undefined;
                         const kind = streamErr !== undefined
-                            ? classifyTraeError(0, JSON.stringify({ code: streamErr.code, message: streamErr.message }))
+                            ? classifyTraeStreamCode(streamErr.code)
                             : undefined;
                         const cooldownMs = kind !== undefined ? traeCooldownFor(kind) : TRAE_RATE_LIMIT_FALLBACK_MS;
                         await this.options.accountPool.updateModelRateLimit(currentAccountId, options.model, Date.now() + cooldownMs);
                     }
+                    // ⚠️ **标记之后**才判预算（2026-10-25 审计 P1，见上面那条注释）：
+                    // 预算用尽时当前账号已经写好冷却，此处抛出不会漏标。
+                    if (rotateBudget <= 0) {
+                        throw new LlmError(error.message, 'QUOTA_EXCEEDED');
+                    }
+                    rotateBudget -= 1;
                     // 取下一个账号。
                     //
                     // ⚠️ **必须传真实 modelId 且传 `tried`**：
@@ -1425,7 +1545,29 @@ export class TraeAdapter extends LlmAdapter {
         // SSE 事件累积状态（跨行累积 event + data）
         let currentEvent = '';
         let currentData = '';
-        // 会话 id（从 metadata 事件获取，但非必需）
+        /**
+         * 是否**已经向上游消费者发出过任何模型产出**（正文 / 思考 / 工具调用）。
+         *
+         * ## ⚠️⚠️ P0：它不能只看正文（2026-10-25 审计 B2）
+         *
+         * 旧实现**只在 `ev.response` 非空时**置真（正文分片）。于是「已发出思考」
+         * 与「已发出工具调用」两种情况下本标记仍是 `false` ⇒ 流内 `event:error`
+         * 仍然整轮**换号重发**。而重试循环在 `stream()` **内部**，harness 只看到
+         * **一条连续流** ⇒ 第一次 attempt 的 `tool-call-delta` 会变成**幽灵调用**：
+         *
+         * - `BlockAssembler.assembled()` **只在 `max-tokens` 时**丢弃 tool-call，
+         *   **不过滤**没有 `block-end` 的 partial；
+         * - `dsh-agent-loop` 直接 `filter(b => b.type === 'tool-call')` 后执行，
+         *   **零去重**。
+         *
+         * 后果：模型在第二轮的答话里说「直接回答、不用跑命令」，而 harness 仍会
+         * 执行第一轮那个工具；分片中断时参数还可能是**截断的非法 JSON**。
+         *
+         * ⇒ 判据必须是「**有没有发出过 chunk**」，而不是「有没有正文」。故三处
+         * 发射点（`text-delta` / `reasoning-delta` / `tool-call-delta`）都要置真，
+         * 且**只在真正 yield 之后**（被 suppressor / 死循环守卫 / 空名字拦下的分片
+         * 一个 chunk 都没发，重发不会造成幽灵调用）。
+         */
         let gotAnyContent = false;
         /**
          * 是否收到过**任何**可解析的上游事件。
@@ -1521,6 +1663,7 @@ export class TraeAdapter extends LlmAdapter {
                                                 const fixedDelta = dsmlFix.push(delta.content);
                                                 block.text += fixedDelta;
                                                 if (fixedDelta.length > 0) {
+                                                    gotAnyContent = true;
                                                     yield { type: 'text-delta', index: block.index, text: fixedDelta };
                                                 }
                                             }
@@ -1556,6 +1699,7 @@ export class TraeAdapter extends LlmAdapter {
                                                     }
                                                     // ⚠️ **整块回写**（赋值，不是 `+=`）：helper 内部已累积全部文本。
                                                     block.text = suppressor.text();
+                                                    gotAnyContent = true;
                                                     yield { type: 'reasoning-delta', index: block.index, text: emit };
                                                 }
                                             }
@@ -1589,6 +1733,7 @@ export class TraeAdapter extends LlmAdapter {
                                                         continue;
                                                     block.announced = true;
                                                     toolOrder.push(block.index);
+                                                    gotAnyContent = true;
                                                     yield { type: 'block-start', index: block.index, blockType: 'tool-call' };
                                                     yield {
                                                         type: 'tool-call-delta',
@@ -1641,9 +1786,9 @@ export class TraeAdapter extends LlmAdapter {
                                     // 已有输出则如实抛真实错误码（绝不重放，防重复计费）。
                                     if (ev.errorCode !== undefined && ev.errorMessage !== undefined) {
                                         const message = traeStreamErrorMessage(ev.errorCode, ev.errorMessage, options.model);
-                                        if (isRotatableStreamError(ev.errorCode) && !gotAnyContent) {
+                                        if (isRotatableTraeStreamCode(ev.errorCode) && !gotAnyContent) {
                                             // ⚠️ **errorCode 必须随哨兵带出**（2026-10-05 修）：外层标记
-                                            // 冷却时长按类别取（quota 24h / soft 1h）。`LlmErrorOptions`
+                                            // 冷却时长按类别取（quota 24h / hard-plan 12h / soft 60s）。`LlmErrorOptions`
                                             // 是**官方校验契约**（只有 status/providerRetryAfterMs/requestId，
                                             // 塞自由字段会被 `LlmError` 构造器拒绝）⇒ 走 `cause` 通道：
                                             // Error.cause 本就用于「附加结构化诊断」，把 errorCode 编码进
@@ -1837,6 +1982,16 @@ export class TraeAdapter extends LlmAdapter {
         // 丢弃了无名 tool-call 且没有留下任何可用调用时，报 max-tokens 而非 stop ——
         // 否则模型本意调工具、harness 却认为「正常答完了」（无报错中断）。
         const argsTruncated = [...toolCalls.values()].some(block => isTruncatedArguments(block.text));
+        /**
+         * **模型把工具参数写坏**（结构闭合配平但 JSON 非法）—— 与「流被掐断」
+         * 分开处置（真实缺陷，Gitee IKQ8Y1；与 `buddy-adapter.ts` 同因同修）。
+         *
+         * 只收**名字可用**的块：无名块的参数没有意义（它本来就会被丢弃）。
+         */
+        const invalidArgBlocks = [...toolCalls.values()]
+            .filter(block => hasUsableToolName(block.name))
+            .map(block => ({ block, kind: classifyToolArguments(block.text) }))
+            .filter(entry => entry.kind === 'invalid');
         const droppedUnnamedCalls = [...toolCalls.values()].some(block => !block.announced);
         /**
          * 正文是否被**上游停止串**掐断（见 `isProseTruncatedByStopString`）。
@@ -1867,15 +2022,20 @@ export class TraeAdapter extends LlmAdapter {
             // 循环命中但另有可见产出：只能报 max-tokens（保住内容），不能报 error。
             : loopDetected
                 ? { kind: 'max-tokens' }
-                : finishReason === 'length'
-                    || (finishReason === undefined && toolOrder.length > 0)
-                    || argsTruncated
-                    || proseCutByStopString
-                    || (droppedUnnamedCalls && toolOrder.length === 0)
-                    ? { kind: 'max-tokens' }
-                    : finishReason === 'tool_calls' || toolOrder.length > 0
-                        ? { kind: 'tool-calls' }
-                        : { kind: 'stop' };
+                // ⚠️ 工具参数写坏有自己的码（Gitee IKQ8Y1）：报 max-tokens 会让 UI 说
+                // 「已达到输出 token 上限」（固定 i18n，不读适配器 message）。
+                // 门禁：零正文 + 无另一个参数可解析的可用调用。
+                : toolArgsInvalidIsSoleOutput(invalidArgBlocks.length, emittedProse, toolCalls.values(), finishReason === 'length' || (finishReason === undefined && !streamEnded))
+                    ? { kind: 'error', failure: toolArgsInvalidFailure(toolArgsInvalidBlocks(invalidArgBlocks)) }
+                    : finishReason === 'length'
+                        || (finishReason === undefined && toolOrder.length > 0)
+                        || argsTruncated
+                        || proseCutByStopString
+                        || (droppedUnnamedCalls && toolOrder.length === 0)
+                        ? { kind: 'max-tokens' }
+                        : finishReason === 'tool_calls' || toolOrder.length > 0
+                            ? { kind: 'tool-calls' }
+                            : { kind: 'stop' };
         // 零内容块响应（例如本次只收到过那个被压制的空白 reasoning）否则会以
         // `stop` 收场 —— 那是 DSH `EMPTY_RESPONSE` 契约明令禁止的静默结束。
         // ⚠️ 传入的是**上面已算好的** `reason`（含 loopDetected / length /

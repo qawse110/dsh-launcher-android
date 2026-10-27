@@ -244,9 +244,60 @@ export class AutoAdapter extends LlmAdapter {
      * 但**身份必须改回 auto**：DSH 的 `normalizeModelInfo` 会拒掉 provider/id 与请求
      * 路由不符的元数据。选型不可用时退回到一份保守的通用元数据（不声明档位，任何
      * reasoningEffort 都会被 harness 判为不支持 —— 故这里连 reasoning 字段都不带）。
+     *
+     * ## ⚠️ 已知代价（**产品取舍，不是缺陷修复**，本轮刻意不改行为）
+     *
+     * ### 代价 #1：选择器首次不显示档位与积分倒计时
+     *
+     * 冷缓存时本方法只回保守元数据，而真实 context / 档位要等 `prepareCall` 把缓存
+     * 写好后才有 —— 那是用**实测 70 秒**的目录加载换来的两个小号信息，用户明确
+     * 选择放弃（报障「模型选择列表加载了 1 分多钟」）。
+     *
+     * ### ⚠️⚠️ 代价 #2：OpenAI 网关冷缓存**首轮**会静默丢弃 `reasoning_effort`
+     *
+     * 链路（逐跳已核实，**不改** `messages.ts` 也不改网关行为 —— 那超出本次范围）：
+     *
+     * 1. `src/openai-gateway/server.ts:372`（`/v1/chat/completions`）与 `:411`
+     *    （`/v1/responses`）先 `resolveModelInfo` → `adapter.resolveModel()`；
+     * 2. 冷缓存 ⇒ 走本方法下面的**降级元数据**，它**不带 `reasoning`**；
+     * 3. `src/openai-gateway/messages.ts:221`：`if (declared.length === 0) return null`
+     *    ⇒ **明确不下发**该字段；
+     * 4. 于是 `withTranslatedEffort`（见本文件约 `:745`）拿到 `requested === undefined`
+     *    ⇒ 原样返回 ⇒ **档位彻底丢失**。
+     *
+     * 触发面：进程启动后 **第一个** `jet-hub-auto` 网关请求（之后 `prepareCall` 已写好
+     * 缓存，后续请求带真实档位）。**无报错、无日志** —— 这正是「静默降级」那一类，
+     * 故在此**如实登记**：用户若发现网关首轮档位不生效，先看这里。
+     *
+     * ## 为什么是**零参**签名
+     *
+     * 基类 `LlmAdapter.resolveModel(provider, model, signal?)`（`llm-adapter.ts:1127`）
+     * 与其余适配器都是三参，宿主也**实际按三参调用**；本类**刻意**把它们全忽略 ——
+     * auto 只有一个对外模型 `auto`，真实目标由内部选型决定，入参里的 provider/model
+     * 恒是 `jet-hub-auto` / `auto`，没有任何可用的信息。TS 允许覆写时少声明参数
+     * （函数形参「少了可以、多了不行」），所以这既是事实（方法体一个参数都不用），
+     * 也让**调用方**多传参数变成编译错误。⚠️ 单测必须按零参调用 —— 传 3 参是
+     * `TS2554: Expected 0 arguments, but got 3`。
      */
     async resolveModel() {
-        const resolved = await this.ensureChoice();
+        // ⚠️⚠️ **目录加载路径不得 await 全池选型**（2026-10-18 用户报障「模型选择列表
+        // 加载了 1 分多钟」，实测证据）：
+        //
+        // ```
+        // [buildModelCatalog] provider=jet-hub-auto 全部完成：listModels=1ms，总耗时=70770ms，模型数=1
+        // ```
+        //
+        // `listModels` 只花 1ms —— **70 秒全在 `resolveModelInfo`**，因为原实现
+        // `await this.ensureChoice()` → `selectProvider()` → 遍历全池调 `expiryOf`
+        // → **每渠道一次余额查询**。而目录加载时选型缓存**必空** ⇒ 每一轮都全池重算。
+        //
+        // ⇒ 只有**缓存命中**才同步用（常见情况，零成本）；未命中立刻返回既有的
+        // 「保守通用元数据」，选型**不在本方法里触发**。
+        //
+        // ⚠️ **发消息路径不受影响**：`prepareCall` 仍 `await this.ensureChoice(signal)`
+        //    （见该方法），所以**实际路由行为完全不变**，只是选择器首次不显示档位与
+        //    倒计时（那正是原实现用 70 秒换来的两个小号信息）。
+        const resolved = this.cachedChoiceFresh();
         if (resolved?.info !== undefined) {
             // ⚠️ 身份必须改写回 auto（真实缺陷修复）：DSH 的 normalizeModelInfo 拒绝
             // provider/id 与请求路由不符的元数据 —— 直接返回目标的 info 会让目录加载报
@@ -269,6 +320,10 @@ export class AutoAdapter extends LlmAdapter {
             name: AUTO_MODEL_INFO.name,
             ...(AUTO_MODEL_INFO.description === undefined ? {} : { description: AUTO_MODEL_INFO.description }),
             inputModalities: ['text', 'image'],
+            // ⚠️ 保守通用窗口：**故意**不借用目标真实窗口（冷缓存时拿不到，探测要 70 秒）。
+            // 这个字面量是单测的判别指纹之一（降级路径独有的值）—— **改它必须同改
+            // `tests/unit/auto-adapter.spec.ts` 里钉住它的断言**，否则那几条会静默变恒绿
+            // 或恒红（`REAL_INFO_CONTEXT_WINDOW` 的注释里也记着同一条）。
             context: { contextWindow: 200_000 },
         };
     }
@@ -626,6 +681,44 @@ export class AutoAdapter extends LlmAdapter {
         throw new LlmError('jet-hub-auto: 请通过模型选择器使用 auto', 'INVALID_REQUEST');
     }
     /**
+     * 同步读「新鲜的选型缓存」，**绝不触发任何网络**。
+     *
+     * ## 与 `ensureChoice` 的差别是决定性的
+     *
+     * `ensureChoice` 在缓存未命中时会**同步探测全池**（实测 70 秒：每个渠道一次
+     * 余额查询），而本方法在未命中时一律返回 `undefined` —— 让调用方走
+     * 「保守元数据」，把选型留给真正需要它的 `prepareCall`。
+     *
+     * ## ⚠️ 冷却中的缓存项视为过期（复用同款判据）
+     *
+     * 判据与 `ensureChoice` 的缓存分支**逐格同构**：「缓存时长」+「目标是否在冷却中」
+     * 两个条件，任一条不满足即视为过期。缓存时长是 `AUTO_CHOICE_TTL_MS`（默认 60 秒；
+     * **数字随常量变化，改常量时同改本注释**），而目标级冷却 10 分钟 —— 不复核则冷却
+     * 形同虚设（`resolveModel` 会把一个**已确认撞墙**的目标当成正常目标播报给宿主）。
+     *
+     * ⚠️⚠️ **改本处的 TTL 语义必须同步改 `ensureChoice` 的缓存分支**（以及本注释），
+     *    两处是「同一份新鲜度判据」的**两份实现**：只改一处 ⇒ `resolveModel` 与
+     *    `prepareCall` 对「同一份缓存是否新鲜」给出相反结论（选择器播报目标 A、
+     *    实际派发 B）。单测第 5 条（TTL 半零守卫）守的正是这条同步要求。
+     *
+     * ⚠️ 判据复用 `isTargetCoolingDown`（**唯一权威**在 `zero-output-guard.ts`），
+     *    不在这里另写一份时刻比较（本仓库红线：同一语义不得两套实现）。
+     *
+     * ⚠️ 时刻取 `this.options.now?.()`（与 `ensureChoice` / `dispatch` 同一注入时钟），
+     *    否则单测无法精确控制 TTL 与冷却的边界。
+     */
+    cachedChoiceFresh() {
+        const cached = this.cached;
+        if (cached === undefined)
+            return undefined;
+        const now = this.options.now?.() ?? Date.now();
+        if (isTargetCoolingDown(this.zeroOutputCooldowns, cached.choice.provider, cached.choice.model, now))
+            return undefined;
+        if (now - cached.at >= (this.options.ttlMs ?? AUTO_CHOICE_TTL_MS))
+            return undefined;
+        return { choice: cached.choice, info: this.cachedInfo };
+    }
+    /**
      * 取选型（命中缓存直接回；否则重新探测全池）。
      *
      * 与 {@link resolveModel} / {@link prepareCall} 共用同一份缓存，保证「本轮能力」与
@@ -643,10 +736,18 @@ export class AutoAdapter extends LlmAdapter {
         /**
          * ⚠️⚠️ 缓存命中前必须复核「该目标是否已进零输出冷却」（issue IKJW31 的 B 方案）。
          *
-         * 不查的后果是**冷却形同虚设**：选型缓存 60 秒，而冷却 10 分钟 ⇒ 每个请求都会
+         * 不查的后果是**冷却形同虚设**：选型缓存 60 秒（`AUTO_CHOICE_TTL_MS`，**数字随
+         * 常量变化，改常量时同改本注释**），而冷却 10 分钟 ⇒ 每个请求都会
          * 先按缓存**撞一次同一堵墙**（撞完才在 `dispatch` 里改道）。报障实测的
          * t14/t15/t16 三连撞正是这个形态 —— 而「别再撞同一堵墙」正是本方案的**全部
          * 价值**。⇒ 冷却中的缓存项**视为过期**，落到下面重新选型。
+         *
+         * ⚠️⚠️ **改本处的 TTL 语义必须同步改 `cachedChoiceFresh`**（以及本注释）：
+         *    两处是「同一份新鲜度判据」的**两份实现**（本处与之逐格同构）。
+         *    `cachedChoiceFresh` 是 `resolveModel`（目录加载路径）用的**同步**版本，
+         *    不能 await 选型；只改一处 ⇒ 「选择器播报的能力元数据」与「`prepareCall`
+         *    实际派发的目标」对**同一份缓存**得出相反结论（选择器显示 A、实际发往 B），
+         *    而且**没有任何报错**。单测第 5 条（TTL 半零守卫）锁的就是这条同步要求。
          *
          * ⚠️ 判据复用 `isTargetCoolingDown`（**唯一权威**在 `zero-output-guard.ts`），
          *    不在这里另写一份时刻比较。

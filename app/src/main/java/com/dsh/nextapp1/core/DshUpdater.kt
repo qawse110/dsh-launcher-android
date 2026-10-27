@@ -85,6 +85,32 @@ object DshUpdater {
     fun checkRemoteNext(ctx: Context, force: Boolean, log: (String) -> Unit): String? =
         checkRemoteTag(ctx, "next", force, log)
 
+    /**
+     * 按「当前所在通道」检查更新：已装版本是预发布（含 '-'，本仓跟随 next 线，
+     * 见 assets/dsh-pin.json 的 distTag=next）就查 dist-tag=next，否则查 latest。
+     * 主通道无更新时，额外读一次 dist-tags 提示另一条线是否有更新（只提示，不自动跨线安装）。
+     *
+     * 为什么需要它（真机可复现）：本仓钉死版本 0.2.1-rc.2 落在 next 线，而 npm 的
+     * latest 稳定线仍是同一个 0.2.1-rc.2 —— 若「检查更新」只查 latest，就会回一句「已是新版」，
+     * 用户看到的是「检查不到最新更新」，而 next 线其时已有 0.2.1-rc.4。
+     */
+    fun checkRemoteForChannel(ctx: Context, force: Boolean, log: (String) -> Unit): String? {
+        val cur = installedVersion(ctx) ?: return null
+        val primary = if (cur.contains('-')) "next" else "latest"
+        val secondary = if (primary == "next") "latest" else "next"
+        val found = checkRemoteTag(ctx, primary, force, log)
+        if (found != null) return found
+        try {
+            val tags = fetchDistTags() ?: return null
+            val other = JSONObject(tags).optString(secondary).takeIf { it.isNotBlank() } ?: return null
+            if (compareVersions(other, cur) > 0) {
+                log("提示：$secondary 线有更新 v$other（本地 $cur），可点「更新 next」安装")
+            }
+        } catch (_: Throwable) {
+        }
+        return null
+    }
+
     private fun checkRemoteTag(ctx: Context, tag: String, force: Boolean, log: (String) -> Unit): String? {
         val state = readState(ctx)
         val interval = if (state.lastOk) AUTO_CHECK_INTERVAL_MS else FAILED_CHECK_BACKOFF_MS

@@ -52,21 +52,21 @@
  * 的旧结论，已被 `zcode-captcha.ts` 的 `CAPTCHA_PAGE_ORIGIN` 修正推翻，两者无关。
  */
 import { EMPTY_RESPONSE_CODE, LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
-import { createModelCatalog } from './model-catalog.js';
+import { createModelCatalog, isCatalogFresh, isCatalogFreshFor } from './model-catalog.js';
 import { RemoteCatalogGate } from './remote-catalog-gate.js';
 import { broadcastCatalogChanged } from './catalog-broadcast.js';
 import { collectImages, serializeMessages } from './openai-compat.js';
 import { projectRequestImage } from './image-budget.js';
 import { ZCODE } from './zcode-product.js';
 import { buildChannelRequest, describeChannels, resolveChannelFor, shouldFallbackToOtherChannel, } from './zcode-transport.js';
-import { buildZcodeSystemBlocks, withContextPrefix, } from './zcode-identity.js';
+import { buildZcodeSystemBlocks, withCallerSystem, withContextPrefix, } from './zcode-identity.js';
 import { consumeAnthropicSse, toAnthropicMessages, toAnthropicTools, } from './zcode-anthropic.js';
 import { ZcodeCaptchaBrowser, ZCODE_CAPTCHA_FALLBACK, requiresCaptchaUpfront, } from './zcode-captcha.js';
 import { GateAbortedError, ModelGate } from './model-gate.js';
 import { nextUtc8DayStartMs } from './model-queue.js';
 import { registerAdapterIdempotent, } from './llm-register-compat.js';
 import { captchaRequirementKey, clearCaptchaRequirement, isCaptchaKnownRequired, noteCaptchaRequired, noteKnownRequiredHit, noteProbeFirst, noteUpfrontCaptcha, } from './captcha-requirement.js';
-import { describeZcodeRequestShape, extractZcodeLogId, formatZcodeDiagnostic, formatZcodeEdgePageHint, formatZcodeUnusualActivityMessage, hasZcodeUnusualActivity, looksLikeZcodeHtmlPage, noteZcodeRequestFailed, noteZcodeRequestOk, noteZcodeRequestSent, readZcodeBusinessCodeFromBody, } from './zcode-diagnostics.js';
+import { describeZcodeRequestShape, extractZcodeLogId, formatZcodeDiagnostic, formatZcodeEdgePageHint, formatZcodeUnusualActivityMessage, hasZcodeUnusualActivity, looksLikeZcodeEsaPage, looksLikeZcodeHtmlPage, noteZcodeRequestFailed, noteZcodeRequestOk, noteZcodeRequestSent, readZcodeBusinessCodeFromBody, } from './zcode-diagnostics.js';
 import { planSessionTitleThinking } from './session-title.js';
 /** 本适配器注册的 provider 路由名（等价于 `ZCODE.id`）。 */
 export const PROVIDER = 'zcode';
@@ -154,6 +154,14 @@ export class ZcodeAdapter extends LlmAdapter {
     /** 兜底模型索引（id → 条目）。 */
     fallbackIndex;
     remoteModels;
+    /**
+     * ⚠️ 上次**成功**读到远端目录的时刻（0 = 从未成功过）。
+     *
+     * ⚠️ 与 `remoteModels` **并存**、不是替代：`remoteModels` 存「有哪些模型」，
+     *    本字段存「何时读到的」。两者缺一都会坏：只有 `remoteModels` 则目录永不更新
+     *    （现状）；只有 `catalogAt` 则无内容可展示。
+     */
+    catalogAt = 0;
     /** 目录加载闸门：并发去重 + 失败/空结果冷却（见 `remote-catalog-gate.ts`）。 */
     catalogGate;
     /**
@@ -198,6 +206,17 @@ export class ZcodeAdapter extends LlmAdapter {
             product: this.product,
             loadCatalog: () => this.loadCatalogEntries(),
             syncCatalog: () => this.syncCatalogEntries(),
+            /**
+             * ★ **强制重拉**（供后台 20 分钟刷新器与「用户改设置」）。
+             *
+             * ⚠️ 与 `loadCatalog` 的差别：后者内部有 `isCatalogFresh` 判据 ⇒ 新鲜时**不拉**。
+             * 本回调要的是「无视新鲜度，强制拉一次」，故先清时刻再调同一个方法 ——
+             * **不另写一份拉取逻辑**（那会让两条路的上游行为分叉）。
+             */
+            refresh: async () => {
+                this.catalogAt = 0;
+                await this.loadModels();
+            },
             // ⚠️ 未知 id 保守报 `['text']`（见 `inputModalitiesFor`）。
             unknownModelInputModalities: () => ['text'],
         });
@@ -224,6 +243,20 @@ export class ZcodeAdapter extends LlmAdapter {
      * ⚠️ **2026-10-08 Task 7d**：骨架（含上面这条理由）已上移到共享实现
      * `src/model-catalog.ts`，此处只剩委托。
      */
+    /**
+     * ★ **后台目录刷新器入口**（`src/index.ts` 的 `refreshOf` 调 `adapter.refresh?.()`）。
+     *
+     * ⚠️⚠️ 必须由适配器**显式转发** `catalog.refresh`：`ModelCatalog`（`model-catalog.ts`）
+     *    上的这个成员**不会**自动变成适配器的成员 —— `pruned()` 的 Proxy 只透传
+     *    **适配器自己的**成员（`dead-model-store.ts:748-749`）。
+     *    漏转发 ⇒ 刷新器「已武装」却对这家**空转**，且**零日志**（`refreshOf` 返回
+     *    `undefined` 时静默跳过 —— `index.ts` 的装配注释写着这件事）。
+     *    ⚠️ 与 `options.refresh`（HTTP 401 后的**凭据**重取）**不是同一件事**，
+     *    两者同名纯属巧合，**不得合并**。
+     */
+    async refresh() {
+        await this.catalog.refresh?.();
+    }
     listAllModels() {
         return this.catalog.listAllModels();
     }
@@ -320,8 +353,28 @@ export class ZcodeAdapter extends LlmAdapter {
      * 并用 {@link RemoteCatalogGate} 的冷却挡住「每模型重试一次」的放大。
      */
     async loadModels() {
-        if (this.remoteModels !== undefined)
+        // ⚠️⚠️ **两处判据都要改**（方法入口 + gate 后复查）。只改入口的话，
+        //    第二次复查会把「刚拉到的」当成陈旧而再拉一次（放大成每轮两次上游请求）。
+        //
+        // ⚠️ 判据来源：`isCatalogFresh`（`model-catalog.ts` 的**唯一**实现）；聚合
+        //    那条缓存短路（`aggregate-adapter.ts` 的 `refreshCatalog`）也走它。
+        //    ⚠️ **不是「逐字相同」**：那边另有两处本家没有的前提（`force` 与
+        //    `options.catalogTtlMs` 覆盖的 60s TTL），本家用的是 20 分钟默认周期。
+        //
+        // ⚠️⚠️ **结构与另三家不同**：本家已有 `this.nowImpl`（构造时从 `options.now`
+        //    归一而来，`options.now ?? (() => Date.now())`）⇒ 这里**复用 `nowImpl()`**
+        //    而不是照抄 loomy 的 `options.now?.() ?? Date.now()`。
+        //    两者取值**逐值相同**，但再造一份 `options.now?.() ?? Date.now()` 就是
+        //    「同一语义两套写法」，将来改归一方式必漏一处。
+        // ⚠️ 第 ① 处（方法入口）用 `isCatalogFreshFor`：用户在 Jet Hub 改开关后要
+        //    **立即**重拉（规格 §6 的正确性要求，见 `invalidateCatalogCache`）。
+        //    ⚠️ 第 ② 处（gate 之后复查）**刻意仍用 `isCatalogFresh`**：那里问的是
+        //    「手上这份旧读数还能不能用」—— 若也判失效，一次失败的拉取会把**完整旧
+        //    目录**判成不可用 ⇒ 回落兜底表（子集）⇒ 用户看到「模型反而变少」。
+        if (this.remoteModels !== undefined
+            && isCatalogFreshFor(this.product.id, this.catalogAt, this.nowImpl())) {
             return this.remoteModels;
+        }
         const fetchRemote = this.options.fetchRemoteModels;
         if (fetchRemote !== undefined) {
             await this.catalogGate.run(async () => {
@@ -329,10 +382,15 @@ export class ZcodeAdapter extends LlmAdapter {
                 if (fetched.length === 0)
                     return false;
                 this.remoteModels = fetched;
+                // ⚠️ **只在成功时**记时刻：失败不写，否则一次抖动会把上界刷新掉、
+                //    下轮还要等满 20 分钟才发现上游没恢复。
+                this.catalogAt = this.nowImpl();
                 return true;
             });
-            if (this.remoteModels !== undefined)
+            if (this.remoteModels !== undefined
+                && isCatalogFresh(this.catalogAt, this.nowImpl())) {
                 return this.remoteModels;
+            }
         }
         return this.product.fallbackModels.map(fallbackToRemote);
     }
@@ -612,8 +670,14 @@ export class ZcodeAdapter extends LlmAdapter {
          *   - `tools` 是**扁平** `input_schema` 形态（不是 OpenAI 的嵌套 `function`）
          */
         const wire = serializeMessages(options.messages, imageUrls);
-        const messages = withContextPrefix(toAnthropicMessages(wire));
-        const system = buildZcodeSystemBlocks(options.system, {
+        /**
+         * ⚠ **`options.system` 不进 `system`，而是注入首轮 user 消息**
+         * （2026-10-25 实测修复）：追加成 `system[3]` 会让请求**必然**收到
+         * `405 + 3012`，与它多长无关。详见 `zcode-identity.ts` 的
+         * `buildZcodeSystemBlocks` 头注释对照实验表。
+         */
+        const messages = withCallerSystem(withContextPrefix(toAnthropicMessages(wire)), options.system);
+        const system = buildZcodeSystemBlocks({
             cwd: process.cwd(),
             provider: this.product.id,
             model: options.model,
@@ -1679,6 +1743,39 @@ export function describeUpstreamError(status, body, diagnostic) {
     if (code === undefined
         && !hasZcodeUnusualActivity(trimmed)
         && looksLikeZcodeHtmlPage(trimmed)) {
+        /**
+         * ★ **`405` 要说清「不会重试」**（2026-10-25，issue IKQ4B4）。
+         *
+         * 归类侧（{@link httpErrorCodeForZcode}）已把 405 单开成
+         * `PERMISSION_DENIED`（**不在** `DEFAULT_RETRYABLE_CODES` 里）
+         * ⇒ harness **不会**再重试。若文案仍走 {@link formatZcodeEdgePageHint}
+         * 那句「建议稍后重试」，就是**归类与文案分叉** —— 用户按文案等了、
+         * 重试了，什么都不会发生（本机实测「重试了 3 个 5 次都没用」）。
+         *
+         * ⚠ 这正是本仓库记录过的家族形态：`IKLBSH`（`AUTH` 吞 message）、
+         *   `!IKIZNK`（思考死循环复用 `max-tokens`）—— **文案本身就是出路**的
+         *   错误，码与文案必须同轴。
+         *
+         * ⚠⚠ **ESA 专属措辞让位**：`formatZcodeEdgePageHint` 里的「边缘CDN」
+         *   是 ESA 页（带 `data-spm` 特征）的专属词，守卫
+         *   「ESA 分支与通用分支必须可区分」钉住「普通 405 页不得含边缘CDN」。
+         *   故这里**刻意不含**那个词 —— 405 的风控口径是**所有** 405 页共用的，
+         *   把它写成 ESA 专属会让非 ESA 的 405 页退化成通用分支。
+         *   （两条 405 文案守卫的诉求同时满足：既说「未到达 + 更换账号无效」，
+         *     又不冒充 ESA。）
+         *
+         * ⚠ 只覆盖 **405**：其它状态码的边缘页仍是「上游/网络层」口径
+         *   （5xx 瞬断确实该稍后重试，2026-10-07 那次修复的正面价值在这里保留）。
+         */
+        if (status === 405 && !looksLikeZcodeEsaPage(trimmed)) {
+            return (`HTTP 405：上游风控拦截（请求未到达 ZCode 服务端，返回的是 HTML 错误页）——` +
+                `该错误**不会自动重试**：405 在 ZCode 是风控拦截的专属状态码，` +
+                `重试会加重账号冷却惩罚（30 分钟起，反复触发升级到 24 小时乃至停用）。` +
+                `**更换账号无效**（与账号余额、凭据有效性无关），请更换出口网络或稍后再试。` +
+                `${extractZcodeLogId(trimmed, undefined) !== undefined
+                    ? ` logid：${extractZcodeLogId(trimmed, undefined)}`
+                    : ''}`);
+        }
         return `HTTP ${status}：${formatZcodeEdgePageHint(trimmed, status)}`;
     }
     const suffix = typeof message === 'string' && message.length > 0
@@ -1793,6 +1890,40 @@ export function httpErrorCodeForZcode(status, body) {
      * 「有权威码 ⇒ 只信码；无码但有风控语义 ⇒ 也不是页面」。
      * ⚠ 这两处条件必须一致 —— 分叉就是又一次「只改了一半」。
      */
+    /**
+     * ★ **`405` 恒不可重试**（2026-10-25，Gitee issue IKQ4B4 + 本机实测）。
+     *
+     * ## 位置：必须在 HTML 短路**之前**，但在「有权威业务码」**之后**
+     *
+     * 两个邻位都不能错：
+     * - 放在 HTML 短路**之后** ⇒ 405 最常见的形态就是边缘 HTML 页
+     *   （`<title>405</title>`，无码无语义），那一格会先返回 `SERVER`
+     *   ⇒ 本格永不可达（初版正是这么放的，5 条用例实测全红）；
+     * - 放在业务码解析**之前** ⇒ `{"code":1005}` + 405 会被误判成
+     *   `PERMISSION`，而它本该是 `QUOTA_EXCEEDED`（真实回归，
+     *   本仓库「只改了一半」陷阱的又一次现身 —— 实测 1 条用例红）。
+     *
+     * ⇒ 判据与 {@link hasZcodeUnusualActivity} 的优先级约定同轴：
+     *   **有权威码 ⇒ 只信码；无码 ⇒ 405 才是风控**。
+     *
+     * ⚠⚠ 第三个邻位：**码不能取 `PERMISSION`**（那会破坏一条仓库铁律）。
+     * `tests/unit/zcode-claim-3012.spec.ts` 有一条等价守卫：
+     * 「`httpErrorCodeForZcode(...) === 'PERMISSION'` ⟺
+     *   `hasZcodeUnusualActivity(...)`」—— 它钉的是「PERMISSION 就是风控」。
+     * 而 405 的边缘页**没有风控语义**（`hasZcodeUnusualActivity` 判 false）
+     * ⇒ 归 `PERMISSION` 会让这条守卫红，且语义上也是冒名
+     *   （用户看到的是风控文案，实际是链路拦截）。
+     *
+     * ⇒ 取 **`PERMISSION_DENIED`**：与 `cline-adapter` 的地域限制、
+     *   `buddy-adapter` 的渠道校验同口径 —— 都是「账号/链路级拦截、
+     *   不可重试、但不冒充具体某一种上游错误」。它**不在**
+     *   harness 的 `DEFAULT_RETRYABLE_CODES` 里 ⇒ 不会白重试，正是目的。
+     */
+    if (readZcodeBusinessCodeFromBody(trimmed) === undefined
+        && !hasZcodeUnusualActivity(trimmed)
+        && status === 405) {
+        return 'PERMISSION_DENIED';
+    }
     if (readZcodeBusinessCodeFromBody(trimmed) === undefined
         && !hasZcodeUnusualActivity(trimmed)
         && looksLikeZcodeHtmlPage(trimmed))
@@ -1817,6 +1948,8 @@ export function httpErrorCodeForZcode(status, body) {
         return 'SERVER';
     if (status === 400)
         return 'INVALID_REQUEST';
+    // ⚠ `405` 已在函数**开头**单开（见那里的长注释）—— 这里不能再放一份，
+    //   否则是「同一语义两处判据」（本仓库红线），且开头那格会让这格永不可达。
     return 'SERVER';
 }
 /**

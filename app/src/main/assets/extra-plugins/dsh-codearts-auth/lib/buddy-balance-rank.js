@@ -45,6 +45,7 @@
  *
  * ⚠️ 本模块是**纯函数**，不碰网络与凭据 —— 余额由调用方查好后传入。
  */
+import { isExclusiveCreditPool } from './credits.js';
 /**
  * 「临时积分」的时间窗口：距扣费截止不足 **15 天**的积分算临时（会很快作废），
  * 其余算永久。用户 2026-09-29 定的判据。
@@ -133,14 +134,147 @@ export function splitBuddyCreditsByExpiry(balance, now = Date.now(), windowMs = 
     let expiring = 0;
     let permanent = 0;
     for (const pkg of balance.packages) {
+        /**
+         * ⚠️ **必须挡 `null`/`undefined` 元素**（2026-10-21 对抗性审计发现，P2）。
+         *
+         * 前端 `splitCreditsByExpiry`（`credit-expiry.js`）第一句就是
+         * `if (!pkg || pkg.active !== true) continue`，而这里原来直接读
+         * `pkg.active` ⇒ `packages: [null]` 会让本函数抛**裸 TypeError**
+         *（`Cannot read properties of null (reading 'active')`）。
+         *
+         * 后果不是「无可用账号」那句文案，而是一个未捕获异常穿出 `select()`
+         *（`BuddyBalanceSelector.select` 没有 try/catch）⇒ 用户看到的是
+         * 内部错误，而池里可能还有别的健康账号。
+         *
+         * 可达性：各 provider 目前都在 push 前过滤了非对象条目，故**当前不可达**；
+         * 但这是**防御缺口**，且与前端**判据不对称**（同一份数据，前端跳过、后端抛错）。
+         * ⇒ 按「同一语义两侧同判」补齐。
+         */
+        if (!pkg)
+            continue;
         if (pkg.active !== true)
             continue;
         const remaining = positiveOrZero(pkg.remaining);
         if (remaining <= 0)
             continue;
+        /**
+         * ⚠️⚠️ **独立池不进任何一桶**（2026-10-21 合并审计发现，阻断级）。
+         *
+         * AStudio 的星火池是服务端下发的**独立池**（不参与主池合计、也不能当
+         * 通用积分消耗）。前端 `splitCreditsByExpiry`（PR !134）已把它从三档里
+         * 摘出，而这里原先**完全不看 `pkg.name`** ⇒ 两侧口径分叉：
+         * 同一份数据前端说「永久 0」、后端说「永久 25000」。
+         *
+         * ⇒ 用户可见症状：AStudio 账号只剩星火池时，面板显示「另有 25000 专属
+         * （不计入）」而三档不渲染（看起来「没积分」），但后端把 25000 算成
+         * **临期** ⇒ `buddyBalanceTier` 判 `expiring` ⇒ **锁定永久积分时该账号
+         * 仍被判「可用」** ⇒ 选号把请求发给一个只有专属池的账号 ⇒ 上游按主池
+         * 计费 ⇒ 请求失败。
+         *
+         * ⚠️ 判据用**宿主侧唯一持有点** `isExclusiveCreditPool`（`src/credits.ts`），
+         * 客户端那份由单测锁死一致 —— 两侧不共享模块图，靠那条同步锁防漂移。
+         */
+        if (isExclusiveCreditPool(pkg))
+            continue;
         const endTime = pkg.deductionEndTime;
-        const known = typeof endTime === 'number' && Number.isFinite(endTime) && endTime > 0;
-        if (known && endTime - now < windowMs)
+        /**
+         * ⚠️⚠️ **判据必须用 `Number()`，不能用 `typeof === 'number'`**
+         * （2026-10-21 对抗性审计发现，P2：这是**前后端分档对账**这条链路上唯一一处
+         * 真正的「同一语义两套判据」）。
+         *
+         * ⚠️ **措辞更正（同日二轮审计自查）**：初版这里写的是「全仓**唯一**一处」，
+         *    那是**过度声称** —— 全仓还有多处 `Date.parse` 型同义判据
+         *   （`astudio-credits.ts` 的 `astudioLocalTimeMs` 与前端 `packageExpiryMs`
+         *    都是 `Date.parse(raw.replace(' ', 'T'))`；`credits.ts` 的失效判定、
+         *    `buddy.ts` / `cline.ts` / `codearts-credits.ts` 各有 `Date.parse`）。
+         *    准确的说法是：**在「同一份 `packages[]` 被前端展示与后端选号各读一遍」
+         *    这条特定链路上**，只有这一处判据不一致。
+         *    ⇒ 「唯一」这类断言必须先**全仓清点**，不能凭本轮改到的范围下结论。
+         *
+         * ## 两侧原来不同判
+         *
+         * | 输入 `deductionEndTime` | 前端 `splitCreditsByExpiry` | 后端（旧） |
+         * |---|---|---|
+         * | `1760432000000`（number） | 临期 | 临期 |
+         * | `"1760432000000"`（**数字字符串**） | **临期**（用 `Number()`） | **永久**（`typeof` 不是 number）|
+         *
+         * 实测（`packages: [{remaining:100, active:true, deductionEndTime:"1760432000000"}]`）：
+         * ```
+         * 前端: { expiring: 100, longTerm: 0, permanent: 0 }
+         * 后端: { expiring: 0,   permanent: 100 }
+         * ```
+         * ⇒ 用户可见症状正是本仓库反复要防的那条：**面板说「临期 100」，
+         *   而锁定永久积分时选号判 `none`、报「积分已用尽」**。
+         *
+         * ## 可达性（如实标注：低但非零）
+         *
+         * 三个 PR 新接的 provider（qoder / astudio / minimax / codearts）全部经
+         * `Number()` / `Date.parse` 归一化后才写该字段，**都是 number** ⇒ 生产主路径
+         * 不可达。可达的是**外部写进 `credits.balances` 的数据**：旧缓存、
+         * 备份导入、用户手工编辑 `state.json`。
+         *
+         * ## 为什么改后端而不是改前端
+         *
+         * `Number()` 更宽容且**方向保守**：字符串数字本来就是「有确切到期时刻」，
+         * 认出来才能正确分档；认不出会把它当成「永久」—— 那正是**误烧长期积分**
+         * 的方向（`allowPermanent:false` 时永久桶被拦 ⇒ 该号被判不可用）。
+         * 前端已经是 `Number()`，后端跟上即两侧一致，且**不放松任何现有判据**
+         *（`Number(null)===0`、`Number('')===0`、`Number('abc')===NaN` 都会被
+         * `Number.isFinite(...) && > 0` 挡住，与旧行为同判）。
+         *
+         * ⚠️ 注意 `Number(null) === 0`：**不能**只写 `Number.isFinite(Number(x))`，
+         *    必须同时保留 `> 0`（否则 `null` 会被当成「时刻 0」）。已保留。
+         *
+         * ## ⚠️⚠️ **但 `Number()` 有两格意外翻转 —— 必须显式挡掉**（2026-10-21 二轮审计自查）
+         *
+         * 逐格比对「旧 `typeof` vs 新 `Number()`」时实测出**两格**从「未知」翻成「已知」，
+         * 而它们**不是**「数字字符串」那种合法输入：
+         *
+         * | 输入 | `Number(x)` | 旧（`typeof`） | 新（仅 `Number()`） | 后果 |
+         * |---|---|---|---|---|
+         * | `true` | **1** | 未知 ⇒ 永久桶 | **已知 ⇒ 时刻 1ms（1970）** | ★ 误判成「早已过期」⇒ 进 `expiring` 桶 |
+         * | `[1760432000000]` | **1760432000000** | 未知 ⇒ 永久桶 | **已知** | ★ 单元素数组被当成数字 |
+         *
+         * 两格的**共同方向都是「把非数字**放宽**成已知」** —— 与「认数字字符串」那个
+         * 有意变更**不同源**（后者是合法的序列化形态，前者是类型污染）。
+         * ⇒ 判据收窄为「**只接受 number 或数字字符串**」，其余一律当未知：
+         *    `typeof === 'number'` **或** `typeof === 'string'`（且 `Number()` 后有效）。
+         *    这样 `true` / `[]` / `{}` / `false` / `null` 全部回到「未知 ⇒ 永久桶」，
+         *    与旧行为**逐格同判**，同时保留「数字字符串」这一个有意变更。
+         */
+        const endIsNumeric = typeof endTime === 'number' || typeof endTime === 'string';
+        const endMs = endIsNumeric ? Number(endTime) : Number.NaN;
+        const known = Number.isFinite(endMs) && endMs > 0;
+        if (!known) {
+            /**
+             * 没有逐包到期时刻 ⇒ 默认算永久（保守：宁可少用，不可误烧长期积分）。
+             *
+             * ⚠️ **但 CodeArts 的赠送/按需包是例外**（2026-10-20）：上游不给逐笔
+             * 日期，只在该分类 metric 上给「其中 N 即将到期」的标量，已被解析成
+             * `pkg.expiringRemaining`。必须与前端 `splitCreditsByExpiry` **同规则**
+             * 拆开，否则前后端漂移：
+             *
+             * - 前端把整包算永久 ⇒ 卡片显示「永久 25000」与新加的「临期 2500」矛盾；
+             * - 后端若也整包算永久 ⇒ **锁定永久积分时该账号被判 `none` 不可用**，
+             *   尽管它其实有 2500 临期积分能撑 —— 直接报「积分已用尽」。
+             *
+             * ⇒ 临期桶 += `expiringRemaining`，永久桶 += 余下部分。
+             */
+            const expiringPart = positiveOrZero(pkg.expiringRemaining);
+            if (expiringPart > 0) {
+                const capped = Math.min(expiringPart, remaining);
+                expiring += capped;
+                permanent += remaining - capped;
+            }
+            else {
+                permanent += remaining;
+            }
+            continue;
+        }
+        // ⚠️ 用 `endMs`（已归一）而不是原始 `endTime` —— 后者可能是**数字字符串**，
+        //    而 `"1760432000000" - now` 会走 JS 的字符串减数字转换（恰好也能算对），
+        //    但那是隐式依赖、且与上面的 `known` 判据不同源。显式用 `endMs` 消除歧义。
+        if (endMs - now < windowMs)
             expiring += remaining;
         else
             permanent += remaining;

@@ -61,6 +61,34 @@ export function buildUserMessage(input) {
 }
 
 /** 从模型输出里抽出 JSON（容忍 ```json 围栏与前后废话）。 */
+/**
+ * Bracket-balancing repair: fix a mismatched closer or append missing closers.
+ * Only structural repair — it never invents content. Refuses half-written strings, so a
+ * truncated response stays a failure instead of turning into a plausible-but-fake object.
+ * Real case (2026-10-21): model closed `"ask":[…]` with `}`; the whole turn was discarded.
+ */
+export function repairJsonBrackets(raw) {
+  const s = String(raw == null ? '' : raw)
+  const stack = []
+  let inStr = false, esc = false, out = '', touched = 0
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]
+    if (inStr) { out += c; if (esc) esc = false; else if (c === '\\') esc = true; else if (c === '"') inStr = false; continue }
+    if (c === '"') { inStr = true; out += c; continue }
+    if (c === '{' || c === '[') { stack.push(c === '{' ? '}' : ']'); out += c; continue }
+    if (c === '}' || c === ']') {
+      const want = stack.length ? stack[stack.length - 1] : null
+      if (want && want !== c) { out += want; touched += 1; stack.pop(); i -= 1; continue }
+      if (!want) { touched += 1; continue }
+      stack.pop(); out += c; continue
+    }
+    out += c
+  }
+  if (inStr) return { ok: false, reason: 'unterminated-string' }
+  const missing = stack.slice().reverse().join('')
+  if (missing) { out += missing; touched += missing.length }
+  return touched ? { ok: true, text: out, touched } : { ok: false, reason: 'already-balanced' }
+}
 export function extractJson(raw) {
   const text = String(raw == null ? '' : raw)
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i)
@@ -71,8 +99,57 @@ export function extractJson(raw) {
   try {
     return { ok: true, value: JSON.parse(candidate.slice(start, end + 1)) }
   } catch (e) {
-    return { ok: false, code: 'BAD_JSON', reason: String((e && e.message) || e) }
+    const balanced = extractBalancedObject(candidate)
+    if (balanced.ok) return { ok: true, value: balanced.value, recovered: 'balanced-scan' }
+    // Structural repair is a **recorded** recovery, never silent: callers surface it as a warning.
+    const repaired = repairJsonBrackets(candidate.slice(start))
+    if (repaired.ok) {
+      try { return { ok: true, value: JSON.parse(repaired.text), recovered: 'bracket-repair', repairedBrackets: repaired.touched } } catch { /* fall through to failure */ }
+    }
+    return { ok: false, code: 'BAD_JSON', reason: String((e && e.message) || e), repairRefused: repaired.reason || null }
   }
+}
+
+/**
+ * 文本里**第一段配平**的 JSON 对象（字符串内部的 `{}` 不计数）。
+ *
+ * 为什么需要它（2026-10-12 真机）：`extractJson` 原本取「首个 `{` 到最后一个 `}`」，
+ * 模型多写一段 JSON、或末尾多写一句带花括号的话，整段就解析不动。英文模式当时**直接抛错**，
+ * 于是一次 9691 字符的响应让整轮辅助消失（只剩保真译文兜底）。
+ * 配平扫描只认第一段完整对象，对「多段 JSON」「前后夹带散文」都成立。
+ */
+export function extractBalancedObject(raw) {
+  const s = String(raw == null ? '' : raw)
+  let depth = 0, start = -1, inStr = false, esc = false
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]
+    if (inStr) { if (esc) esc = false; else if (c === '\\') esc = true; else if (c === '"') inStr = false; continue }
+    if (c === '"') { inStr = true; continue }
+    if (c === '{') { if (depth === 0) start = i; depth += 1; continue }
+    if (c === '}') {
+      if (depth === 0) continue
+      depth -= 1
+      if (depth === 0 && start >= 0) {
+        try { return { ok: true, value: JSON.parse(s.slice(start, i + 1)) } } catch { start = -1 }
+      }
+    }
+  }
+  return { ok: false, code: 'BAD_JSON', reason: 'no balanced JSON object found' }
+}
+
+/**
+ * 英文模式读取解释层响应：**只做判定，绝不抛**。
+ *
+ * 真机教训（2026-10-12）：英文分支原在提取失败时 `throw new Error('english-interpretation-invalid-json')`，
+ * 而抛出点在 `input.interpret` 回调内部 ⇒ 管线记 `interpret-threw` 并**立刻返回**，
+ * 把「空产出有界重试」「宿主兜底」「台账归因」三层保护全部绕过：用户只看到
+ * 「辅助未生成，本次只发送保真译文」，日志里也没有可修的线索。
+ * 现在把判定交回调用方：可以重试一次，也可以降级返回原文让管线按既有规则继续处理。
+ */
+export function readEnglishInterpretation(raw) {
+  const ex = extractJson(raw)
+  if (!ex.ok) return { ok: false, code: ex.code, reason: String(ex.reason || '').slice(0, 200), textChars: String(raw == null ? '' : raw).length }
+  return { ok: true, value: ex.value, ...(ex.recovered ? { recovered: ex.recovered } : {}) }
 }
 
 /**
@@ -139,62 +216,19 @@ export function validateProvenance(ops, userText, contextText, stateText) {
  * 解析并校验模型输出，产出可交给 reducer 的候选 patch。
  * @returns {{ok:true, patch:object, warnings:string[]}} | {{ok:false, code:string, reason:string, problems?:string[]}}
  */
-/**
- * 硬邦邦加码的生成规则（只在协作基调 = hard 时拼进系统提示词）。
- *
- * 三条要求各自对应一个真实风险：
- *   · **语域**：写成正式条目就等于没有效果（正式语域采样"专业助手"簇）——这一档全部价值在语域上；
- *   · **定点爆破**：通用口号放在任何任务都成立，等于没打中；要点名这一单的交付物与最可能做歪的点；
- *   · **引用**：不许发明新要求；`hardOn` 写不出真实条目 id 时整段不予采用。
- * 长度**不设上限**（用户 2026-09-27 明确要求由模型按实际情况定），只要求不灌水。
- */
-/**
- * 硬邦邦模式：**整份辅助包的写法**（不只是加一段口号）。用户 2026-09-27 反馈：
- * "硬邦邦效果占比太少"——只加一个块、其余条目仍是正式体，语域就被稀释了。
- *
- * 所以这一档改的是**写法**，三条内容纪律原样保留：
- *   · 条目集合不许因口气改变；每条仍带逐字依据；不许新增原话里没有的需求；
- *   · **未决项**保持严肃清楚（没拍板的事必须说准）；
- *   · **防御性限制**（不许做什么、范围边界、安全与授权）照字面写——一修辞就漏语义。
- */
-export const HARD_NOTE_SYSTEM = [
-  '',
-  '',
-  '【硬邦邦模式 · 整份辅助包的写法（本轮协作基调 = 硬邦邦）】',
-  '这一轮**整份辅助上下文都用这个口气写**，不是只在最后加一句口号。读者是工作 AI；',
-  '语域本身就是效果来源（正式语域会把整包带回"专业助手"那一簇，等于白开这一档）。',
-  '',
-  '**要写成硬邦邦的**：解释用户原话、质量阐述、实现选项、建议——都用口语、直给、带劲的写法。',
-  '允许"贼拉牛逼""硬邦邦""别整那些虚的""给我往猛了造"这类口水话（它们不是脏话，是语域）。',
-  '要接地气：像兄弟催你干活，不像甲方发需求文档。',
-  '',
-  '**必须保持字面、不加修辞的**（一修辞就漏语义，代价比收益大）：',
-  '  · **未决项**：没拍板的事要说清楚说准（谁来拍板、影响什么），不许用口气词糊过去；',
-  '  · **防御性限制**：不许做什么、范围边界、安全与授权类要求（如"不许读其它文件""不许替我拍板"）',
-  '    照字面写，别改成顺口溜。',
-  '',
-  '**不许因为口气变了而改动内容**：',
-  '  · 条目集合一个字都不许增减——口语化只改**写法**，不改"该有哪些要求"；',
-  '  · 每条仍然必须带逐字依据（来源规则不变）；',
-  '  · 不许新增原话里没有的需求（型号、联网、加功能、改交付形态等）。',
-  '',
-  '**即使这一轮 `ops` 是空的**（例如只是接着往下聊、没有新的要求要记），也照常给 `hardNote`——',
-  '后续对话同样需要这份口气，别让第二轮起就只剩模板。',
-  '',
-  '另外照旧返回两个字段：',
-  '- `hardNote`：一段"打气 + 定点爆破"的话，放在包最前面。点名这一单的交付物与最可能做歪的点，',
-  '  不要铺开写放之四海皆准的口号；**长度自己定**（不设句数/字数上限），宁可短而准，不要凑长度灌水。',
-  '- `hardOn`：字符串数组，列出 `hardNote` 依据的**已有条目 id**（如 ["req-1","qi-1"]）。',
-  '  一条真实 id 都写不出 ⇒ 整段不予采用（退回纯骨架），所以别编 id。',
-].join('\n')
-
 export function parseInterpreterOutput(raw, { userText, contextText, stateText, sessionId, messageId, baseRevision, baseInputRevision, causeId,englishMode=false,translatedText=null }) {
   const ex = extractJson(raw)
-  if (!ex.ok) return { ok: false, code: ex.code, reason: ex.reason }
+  if (!ex.ok) return { ok: false, code: ex.code, reason: ex.reason, ...(ex.repairRefused ? { repairRefused: ex.repairRefused } : {}) }
   const obj = ex.value
   // v3 is adapted by the host, without legacy item truncation or user-authority promotion.
   if (obj && typeof obj === 'object' && Object.hasOwn(obj, 'intent')) {
-    return parseOptimizerValue(obj, { sessionId, messageId, baseRevision, baseInputRevision, causeId })
+    const parsed = parseOptimizerValue(obj, { sessionId, messageId, baseRevision, baseInputRevision, causeId })
+    if (ex.recovered === 'bracket-repair') {
+      // Structural repair is recorded, never silent: the caller and the ledger can see it.
+      parsed.warnings = [...(parsed.warnings || []), 'json-bracket-repair:' + ex.repairedBrackets]
+      parsed.recovered = ex.recovered
+    }
+    return parsed
   }
   if (!obj || typeof obj !== 'object' || !Array.isArray(obj.ops)) {
     return { ok: false, code: 'BAD_SHAPE', reason: 'expected {"ops":[...]}' }
@@ -202,11 +236,6 @@ export function parseInterpreterOutput(raw, { userText, contextText, stateText, 
   const warnings = []
   const collaboration = normalizeCollaboration(obj)
   const claims = []
-  // 0.7.8 · 硬邦邦加码（模型生成；仅 hard 档会要求它）。
-  // ⚠ **必须带引用**：这段文本会进工作模型上下文，最大的风险是"语气里夹带新要求"。
-  //    引用（hardOn = 已有条目 id）是机器可核的，校验在 pipeline 做——写不出引用就不采用。
-  const hardNote = typeof obj.hardNote === 'string' ? obj.hardNote.trim() : ''
-  const hardOn = Array.isArray(obj.hardOn) ? obj.hardOn.filter((x) => typeof x === 'string' && x) : []
   const truncatedItems = []      // 超过单轮上限被截断丢弃的条目（并进 dropped 记账）
   const ops = []
   let itemCount = 0
@@ -422,8 +451,6 @@ export function parseInterpreterOutput(raw, { userText, contextText, stateText, 
         ? ['no ops: nothing to add']
         : [...warnings, ...dropped.map((d) => '丢弃条目 ' + d.id + '：' + d.reason)],
       dropped: [...dropped, ...truncatedItems],
-      hardNote,
-      hardOn,
     }
   }
 
@@ -431,8 +458,6 @@ export function parseInterpreterOutput(raw, { userText, contextText, stateText, 
     ok: true,
     ...collaboration, claims,
     warnings,
-    hardNote,
-    hardOn,
     dropped: [...dropped, ...truncatedItems],
     patch: {
       causeId: String(causeId || 'interpret'),

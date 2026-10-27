@@ -90,6 +90,57 @@ const CLINE_FALLBACK_MODELS = [
         description: 'Meta\u2019s multimodal reasoning model for experimentation, learning, '
             + 'and early-stage agentic, multi-agent, and coding workflows.',
     },
+    {
+        // ⚠️ 这条是「**只补元数据**」的条目，不是「新增一个模型」（2026-10-21）。
+        //
+        // ## 为什么必须补
+        //
+        // 远端 `recommended-models` 的 `free` 数组**不下发 `maxTokens`**
+        // （实测 2026-10-21：6 个 free 模型全部只有 `{id,name,description,tags}`），
+        // 而 `mergeClineModels` 的 `build()` 里 `maxTokens` **只**取自本兜底表
+        // （`fallback?.maxTokens`）⇒ 该模型拿不到 `maxTokens` ⇒ catalog entry 没有它
+        // ⇒ 宿主 `model-catalog.ts` 桥接不出 `defaultMaxTokens`
+        // ⇒ 宿主 `resolveCallWithInfo` 不做兜底 ⇒ `options.maxTokens` 是 `undefined`
+        // ⇒ 报文里 **`max_tokens` 整个字段不发** ⇒ 退回 cline 网关自己的默认值。
+        //
+        // ## 网关默认值是 4096，且会静默截断（实测 2026-10-21）
+        //
+        // 直连 `https://api.cline.bot/api/v1/chat/completions`，同一模型同一提示词：
+        //   · 不传 `max_tokens` → `finish_reason=length`，`completion_tokens=4096`
+        //   · `max_tokens=4096`  → `finish_reason=length`，`completion_tokens=4096`
+        //   · `max_tokens=32768` → `finish_reason=stop`，  `completion_tokens=8894`
+        // ⇒ 4096 不是模型能力上限（注册表标 512000），只是网关的保守缺省。
+        // ⇒ 撞上它的后果是**长回答被静默砍断**（`finish=length`），用户看不到报错，
+        //    只看到「回答说到一半断了」——实测命中 5 个 turn 全部颗粒无收，
+        //    且 13KB 的 `write` 载荷正好被这个上限卡死。
+        //
+        // ## 为什么填 131_072
+        //
+        // 与同表 `cline-free/mimo-v2.6-flash` 的 131_072 同量级（128K），
+        // 且与 `minimax-product.ts` 兜底表给 MiniMax-M3.1 系列的 128_000 一致 ——
+        // **同一家模型的两条通道给同一个量级**，避免「M3.1 走 minimax 给 128K、
+        // 走 cline 网关给 4K」这种同模型不同待遇的割裂。
+        //
+        // 实测依据（2026-10-21，直连 `https://api.cline.bot/api/v1/chat/completions`）：
+        //   · 不传 `max_tokens` → `finish_reason=length`，`completion_tokens=4096`
+        //   · `max_tokens=32768` → `finish_reason=stop`，  `completion_tokens=8894`
+        //   ⇒ 网关至少接受到 32768；取 131_072 是按「同族同量级」对齐，
+        //     也给长推理留足余量（13KB 的 `write` 载荷实测正好卡死 4096）。
+        //
+        // ⚠️ 这不是「模型单次输出上限」而是「**默认输出预算**」：宿主契约是
+        // 「用户未指定 `max_tokens` 时直接拿它填请求」，故每轮都会按这个值请求。
+        // 取 128K 而非注册表的 512000，是为了不让每轮都按上限走
+        // （同 `opencode-capability.ts` 的取舍：上限值当默认值荒谬）。
+        //
+        // `contextWindow` 取 1_048_576，与表内同族的 `cline-free/mimo-v2.6-flash`
+        // 同规格（网关注册表给该模型标 1000000，此处取同族的 1048576 整数规格）。
+        id: 'cline-free/minimax-m3.1-flash',
+        name: 'Minimax M3.1 Flash',
+        contextWindow: 1_048_576,
+        maxTokens: 131_072,
+        isFree: true,
+        description: 'Next-generation Flash model',
+    },
 ];
 /**
  * Cline 全 provider 统一的思考档位（**顺序即 UI 展示顺序**）。

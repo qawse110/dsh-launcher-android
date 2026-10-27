@@ -1,6 +1,21 @@
 import { createUserMessage, LlmError } from '@deepseek-ai/dsh-llm';
 import { REASONING_LOOP_CODE, resolveReasoningLoopGuardFlag } from './sse.js';
 /**
+ * 自动续跑消息的**自有来源标识**。
+ *
+ * ⚠️⚠️ **绝不能再用 `{ kind: 'user' }`**（Issue IKLEOW 根因 3）。按 harness 的
+ * 既有约定，`source.kind === 'user'` 是**宿主对「直接人类输入」的证明**，
+ * 不是一个渲染标签：`tool-goal` 的 create / edit / pause / resume 都要求
+ * 「当前轮次存在直接人类消息」才放行（见 `packages/goal/tool-goal/README.md`
+ * 的「Host attestation of human input」）。伪造成 `user` 会让自动续跑**冒用
+ * 人类授权**，模型据此可以创建 / 改写 / 恢复目标；UI 也会把它渲染成用户发言。
+ *
+ * ⚠️ 0.1.7 之前的 `MessageSourceMap` 只有一个共享的 `plugin` 包装，本插件当时
+ * 因此只能借用 `user`；**0.2.0 起 source kind 由**生产者自己**声明**
+ * （`MessageSourceMap` 已删除 `plugin`，改为合并扩展），故现在可以如实署名。
+ */
+export const LOOP_RESUME_SOURCE_KIND = 'loop-resume';
+/**
  * 自动续跑时投递的 user 消息正文。
  *
  * ⚠️ 它是**模型可见且会落盘**的文本（不是日志），故按「给模型的指令」写：
@@ -74,6 +89,88 @@ export function isReasoningLoopFailure(error) {
         return false;
     return error.code === REASONING_LOOP_CODE;
 }
+const defaultSchedule = (task) => { queueMicrotask(task); };
+/**
+ * 判断一条消息是否由本插件的自动续跑投出。
+ *
+ * ⚠️ 按 **`source.kind`** 认，而不是按 message id：id 只在单进程内有效，
+ * 而 source 会随消息落盘，重放 / 重启后仍可辨认。
+ *
+ * @param source - 消息的 `source` 字段（未知形状按「不是」处理）。
+ * @returns 是否为自动续跑消息。
+ */
+export function isLoopResumeSource(source) {
+    return typeof source === 'object' && source !== null
+        && source.kind === LOOP_RESUME_SOURCE_KIND;
+}
+/**
+ * 「**别人真的介入了**」的来源词表 —— 只有这些清零连续续跑预算。
+ *
+ * ## 为什么需要一张显式的白名单，而不是「除我之外都算」
+ *
+ * 收件箱里除了人类与会话级参与者的输入，还有大量**自动注入的上下文通知**。
+ * 全量会话取证（721 个会话，扫 `agent/inbox/spliced` 的 `inserted[].source.kind`）
+ * 得到的真实词表与频次：
+ *
+ * | kind | 会话数 | 总次数 | 性质 |
+ * |---|---|---|---|
+ * | `user` | 712 | 2945 | **人类输入**（宿主证明）|
+ * | `tool-jobs` | 130 | 320 | 后台任务通知（自动）|
+ * | `agent-message` | 122 | 436 | **别的 agent 发来的** |
+ * | `agent-instructions` | 97 | 305 | 工作区指令刷新（自动）|
+ * | `subagent-settled` | 68 | 349 | **子代理收尾** |
+ * | `goal` | 13 | 315 | **目标驱动器排的下一轮** |
+ * | `repeat-tool-reminder` | 11 | 12 | 重复工具提醒（自动）|
+ * | `tool-goal` | 10 | 14 | 目标工具的收尾说明（自动）|
+ * | `user-approval` | 5 | 5 | **人工审批结果** |
+ *
+ * 「连续续跑上限」的语义是「**在没有任何新的人类 / 会话级输入的情况下**，
+ * 我们最多替模型续跑几次」。自动通知不构成这种输入 —— 若把它们也算介入，
+ * 一个每步都注入通知的插件就能**架空**这个上限（这正是 issue IKLEOW 根因 2
+ * 担心的形态；⚠️ 但**它描述的 `runtime-context` 路径并不成立**，见下）。
+ *
+ * ## ⚠️ 如实说明：这是**健壮性**修正，真实会话未显现
+ *
+ * issue 根因 2 声称「harness 自身的 `runtime-context` 注入会把预算反复清零，
+ * 导致自动续跑**无界**」。实测**推翻了这条归因**：
+ *
+ * 1. `runtime-context` **根本不走 `agent/inbox/inserted`** —— 它是 `preStep`
+ *    里经 `runtimeContext.project()` 直接拼进本次请求的（见
+ *    `packages/core/agent-loop/src/agent.ts` 的 `preStep`），故从不出现在
+ *    上面那张词表里（721 个会话零命中）。
+ * 2. 全量回放 13 个含循环中止的会话，**连续续跑从未超过 2**（= 默认上限），
+ *    也从未触发过上限告警。
+ * 3. 把判据从「宽」（除我之外都清零）换成「窄」（只有真介入才清零），
+ *    **13 个会话的结果逐个相同**（投出次数、上限告警数完全一致）。
+ *
+ * ⇒ 本白名单**不是**修复一个已发生的缺陷，而是**防止**「某个每步注入通知的
+ * 插件把上限架空」这一形态（防御性收窄）。写在这里是为了让后来者**不必**
+ * 再靠猜：真实词表与「无行为差异」的结论都已实测。
+ */
+const INTERVENTION_SOURCE_KINDS = new Set([
+    'user', // 人类输入（宿主证明，见 LOOP_RESUME_SOURCE_KIND 的注释）
+    'goal', // 目标驱动器排的下一轮 —— 目标由用户设定
+    'agent-message', // 别的 agent 发来的消息
+    'subagent-settled', // 子代理收尾
+    'subagent-report',
+    'user-approval', // 人工审批结果
+]);
+/**
+ * 判断一条收件箱插入是否代表「别人真的介入了」。
+ *
+ * @param source - 消息的 `source` 字段。
+ * @returns 是否清零连续续跑预算。
+ */
+export function isInterventionSource(source) {
+    if (typeof source !== 'object' || source === null)
+        return false;
+    const kind = source.kind;
+    return typeof kind === 'string' && INTERVENTION_SOURCE_KINDS.has(kind);
+}
+/** 收件箱是否有待处理输入（`hasPending` 的契约内等价写法）。 */
+function inboxHasPending(inbox) {
+    return inbox.nextTurn.length > 0 || inbox.nextStep.length > 0;
+}
 /**
  * 创建自动续跑控制器。
  * @param options - 策略、日志出口与投递动作。
@@ -82,14 +179,71 @@ export function isReasoningLoopFailure(error) {
 export function createLoopResumeController(options) {
     const { policy, log } = options;
     const deliver = options.deliver ?? ((agent, message) => { agent.followup(message); });
+    const schedule = options.schedule ?? defaultSchedule;
     const states = new Map();
     function stateFor(agent) {
         const existing = states.get(agent.id);
         if (existing !== undefined)
             return existing;
-        const state = { attempts: 0, pending: false, injected: new Set() };
+        const state = { attempts: 0, pending: false, scheduled: false, injected: new Set() };
         states.set(agent.id, state);
         return state;
+    }
+    /**
+     * 真正投递。**必须只在排定的任务里调用**（此时已脱离 `agent/status` 派发栈）。
+     *
+     * ⚠️⚠️ **本函数绝不能在 `agent/status` 的同步派发栈内执行**（Issue IKLEOW
+     * 根因 1）：`agent.followup()` 会经 `wakeDriver()` 把相位改回 `running` 并
+     * **再次同步派发 `agent/status`**，而那一次派发是嵌套在「派发 idle」的
+     * 栈里的。于是同一次 idle 转换产生两个方向相反的信号，客户端最终采用哪
+     * 一个取决于监听器注册顺序 —— 若本插件的监听器排在 `session-controller`
+     * 之前，外层那条**陈旧的 `idle`** 会覆盖嵌套的 `running`，表现为
+     * **agent 正在跑新一轮而客户端 `running = false`**：Stop 按钮消失、插话
+     * 被置灰且在服务端被 `session/steer-unavailable` 拒绝（三者共用同一个
+     * running 位）。真实复现实测（本机 `0.2.0-rc.2` 运行时）：
+     * `plugin-first` 顺序下序列为 `[true,true,false,false]`，且第 2 次请求
+     * 开始时 `agent=running` 而 `clientRunning=false`；`controller-first`
+     * 顺序下则是 `[true,false,true,false]` 且全程一致。
+     *
+     * @param agent - 目标 agent。
+     * @param state - 该 agent 的进程内状态（已确认仍属于当前注册表）。
+     * @returns 是否真的投出去了。
+     */
+    function deliverNow(agent, state) {
+        // ⚠️ **脱离派发栈之后重新校验**（Issue IKLEOW 建议 2）：排队期间相位可能
+        // 已被别的监听器改回 running，或已有别人排了活。这里读到的是**权威值**，
+        // 而 `observeIdle` 里那次读取只是便宜的前置过滤。
+        if (agent.status !== 'idle')
+            return false;
+        if (inboxHasPending(agent.inbox))
+            return false;
+        // 上限在 `observeIdle` 已判过（并会告警）；这里只做无告警的复核，防止
+        // 「排定之后又失败」的交错。重复告警会把有用信息埋掉，故不在此再 warn。
+        if (state.attempts > policy.maxResumes)
+            return false;
+        let injectedId;
+        try {
+            const message = createUserMessage({
+                content: [{ type: 'text', text: LOOP_RESUME_PROMPT }],
+                // ⚠️⚠️ **自有 source kind，绝不伪造成 `'user'`**（Issue IKLEOW 根因 3）：
+                // `source.kind === 'user'` 是宿主对「直接人类输入」的**证明**，
+                // `tool-goal` 的 create / edit / pause / resume 都据此授权。详细理由见
+                // `LOOP_RESUME_SOURCE_KIND` 的注释。
+                source: { kind: LOOP_RESUME_SOURCE_KIND },
+            });
+            injectedId = message.id;
+            state.injected.add(message.id);
+            deliver(agent, message);
+        }
+        catch (error) {
+            if (injectedId !== undefined)
+                state.injected.delete(injectedId);
+            log.warn(`[codearts-auth] 自动续跑投递失败（${agent.id}）：${String(error)}`);
+            return false;
+        }
+        log.info(`[codearts-auth] ${agent.id} 思考陷入重复被中止，已自动续跑`
+            + `（第 ${state.attempts}/${policy.maxResumes} 次）。`);
+        return true;
     }
     return {
         observeFailure(agent, error) {
@@ -118,37 +272,33 @@ export function createLoopResumeController(options) {
                     + '建议降低思考档位或更换模型。');
                 return false;
             }
-            // 防御性再确认：本函数由 `agent/status` 的 idle 分支调用，但状态可能
-            // 在该事件与本次调用之间被别的监听器改回 running。
+            // 便宜的前置过滤（真正的判据在 `deliverNow` 里，见其注释）。
             if (agent.status !== 'idle')
                 return false;
-            // 已经有人排了活（用户手打了、目标驱动器排了下一轮）→ 让它跑，
-            // 我们插一脚只会多烧一轮。
-            if (agent.inbox.hasPending)
+            if (inboxHasPending(agent.inbox))
                 return false;
-            // ⚠️ 构造 + 投递整体兜住：本函数跑在宿主的 `agent/status` 派发里，让异常
-            // 冒到派发方会污染宿主的事件链，而我们只是「额外帮忙」，失败必须是降级。
-            let injectedId;
-            try {
-                const message = createUserMessage({
-                    content: [{ type: 'text', text: LOOP_RESUME_PROMPT }],
-                    // `kind: 'user'`：这就是一条普通用户指令（与用户手打「继续」同形），
-                    // 故 UI 显示、落盘、重放全部走既有路径，无需任何格式变更。
-                    source: { kind: 'user' },
-                });
-                injectedId = message.id;
-                state.injected.add(message.id);
-                deliver(agent, message);
-            }
-            catch (error) {
-                if (injectedId !== undefined)
-                    state.injected.delete(injectedId);
-                log.warn(`[codearts-auth] 自动续跑投递失败（${agent.id}）：${String(error)}`);
+            if (state.scheduled)
                 return false;
-            }
-            log.info(`[codearts-auth] ${agent.id} 思考陷入重复被中止，已自动续跑`
-                + `（第 ${state.attempts}/${policy.maxResumes} 次）。`);
-            return true;
+            state.scheduled = true;
+            // ⚠️ **脱离当前派发栈**再投递 —— 这是本函数**唯一**的投递路径。
+            //
+            // 返回值语义：同步调度器（单测注入 `task => task()`）下投递当场完成，
+            // 故如实返回**投递结果**；生产默认的 `queueMicrotask` 下投递尚未发生，
+            // 只能如实返回「**已排定**」。调用方（`agent/status` 监听器）不依赖
+            // 这个返回值做判断，它只用于测试与诊断。
+            let delivered = false;
+            let settled = false;
+            schedule(() => {
+                state.scheduled = false;
+                // agent 可能已被 dispose（`forget` 删掉了状态）：那时不再投递。
+                if (states.get(agent.id) !== state) {
+                    settled = true;
+                    return;
+                }
+                delivered = deliverNow(agent, state);
+                settled = true;
+            });
+            return settled ? delivered : true;
         },
         observeInput(agent, message) {
             const state = states.get(agent.id);
@@ -157,7 +307,18 @@ export function createLoopResumeController(options) {
             // 我们自己投的那条：既不算「别人介入」，也不该占着标记不放。
             if (state.injected.delete(message.id))
                 return;
-            // 别人（用户 / 目标驱动器 / 子代理）投了消息 → 预算清零。
+            // ⚠️ 再按**来源标识**认一次：单进程内 id 已经够用，但重放 / 跨进程时
+            // id 对不上而 source 仍在日志里，故这条判据更稳（0.2.0 起本插件已有
+            // 自有的 source kind，见 `LOOP_RESUME_SOURCE_KIND`）。
+            if (isLoopResumeSource(message.source))
+                return;
+            // ⚠️ **只有「别人真的介入」才清零**（Issue IKLEOW 建议 3）：自动注入的
+            // 上下文通知（`agent-instructions` / `tool-jobs` / `repeat-tool-reminder` …）
+            // 不构成「有人替模型说话了」，把它们算成介入会让上限被架空。
+            // 真实词表、频次与「这是健壮性修正而非已发生缺陷」的实测结论见
+            // `INTERVENTION_SOURCE_KINDS` 的注释。
+            if (!isInterventionSource(message.source))
+                return;
             state.attempts = 0;
             state.pending = false;
         },
@@ -189,9 +350,13 @@ export function installLoopResume(ctx) {
         const controller = createLoopResumeController({
             policy,
             log: ctx.logger,
-            // ⚠️ 用 `withoutInitiator()` 排队：这几行跑在别的 agent 的事件派发里
-            // （`agent/status` / `agent/error`），排队动作不该继承「当时恰好是谁在
+            // ⚠️ 用 `withoutInitiator()` 排队：排队动作不该继承「当时恰好是谁在
             // 运行」的发起者归属 —— 与 harness 自己的 `goal-round-driver` 同一手法。
+            //
+            // ⚠️ 虽然投递已由控制器挪出 `agent/status` 派发栈（见 `deliverNow` 的
+            // 注释），这里**仍然保留** `withoutInitiator()`：投递时刻虽已不是
+            // 「正在派发状态事件」，但微任务之间仍可能夹着别的 agent 的驱动，而
+            // 「自动续跑不是任何人的子任务」这条语义与调用时机无关。
             deliver: (agent, message) => { scope.agents.withoutInitiator(() => { agent.followup(message); }); },
         });
         scope.on('agent/error', ({ agent, error }) => { controller.observeFailure(agent, error); });

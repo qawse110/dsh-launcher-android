@@ -8,8 +8,6 @@
 //   ② **不写无信息章节**：某类没有有效条目就不出现该节。
 //   ③ **超预算时按固定顺序丢弃，并写明丢了什么**；绝不静默截断。
 import { activeItems } from './reducer.js'
-// 0.7.8 协作基调：语域块（见 framing.js 的说明）。neutral 时是空串，等于不存在。
-import { framingBlock } from './framing.js'
 import { EN_SECTION_LABELS } from './english-prompts.js'
 import { validateEnglishExcerpt } from './english-mode.js'
 
@@ -101,19 +99,15 @@ export function compile(state, opts = {}) {
   if (extras.length > 0) included.checks = included.checks.concat(extras)
   const dropped = []
 
-  // 协作基调块（0.7.8）：放在**最前**，先入为主地设定这一轮的语域。
-  // ⚠ 它不参与丢弃（不是条目），但**计入预算**——诚实起见，它花的字符和别的块一样要算。
-  // ⚠ 只有存在其它内容时才注入：没有条目时不该凭空冒出一段语气，那会变成"只有口号没有内容"。
-  const framingText = framingBlock(opts.framing, opts.framingNote,opts.language)
   const render = () => {
     const blocks = []
     for (const s of SECTIONS) {
       const items = included[s.key]
       if (!items || items.length === 0) continue
-      blocks.push('【' + (opts.language==='en'?EN_SECTION_LABELS[s.key]:s.label) + '】\n' + items.map(it=>lineFor(it,opts.language)).join('\n'))
+      const label = opts.language==='en' ? EN_SECTION_LABELS[s.key] : s.label
+      blocks.push('【' + label + '】\n' + items.map(it=>lineFor(it,opts.language)).join('\n'))
     }
-    if (blocks.length === 0) return blocks
-    return framingText ? [framingText].concat(blocks) : blocks
+    return blocks
   }
 
   // 丢弃循环：**把"省略声明"本身也算进预算**。

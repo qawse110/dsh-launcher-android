@@ -53,10 +53,15 @@
  * 4. **失败绝不抛到调用方**：拿不到就保持「未知」（退回本地兜底表），
  *    绝不能让一次目录抖动把**所有**模型的图片能力打回原形。
  */
-import { TtlCache } from './ttl-cache.js';
-/** 社区模型目录（公开、无需认证）。与参考实现的 `MODELS_DEV_URL` 同源。 */
+import { readProviderModelsSync, refreshModelsDevAsync } from './models-dev-cache.js';
+/**
+ * 社区模型目录（公开、无需认证）。与参考实现的 `MODELS_DEV_URL` 同源。
+ *
+ * ⚠️ **保留字面量只为文档可读性**（用户 2026-10-17）：真正的直连点已收敛到
+ * `src/models-dev-cache.ts`，本模块不再发起请求。要改地址**改那一个模块**。
+ */
 export const CLINE_MODELS_DEV_URL = 'https://models.dev/api.json';
-/** 单次目录请求超时（毫秒）。 */
+/** 单次目录请求超时（毫秒）。同 `models-dev-cache.ts` 的口径（那里才是真源）。 */
 export const CLINE_MODELS_DEV_TIMEOUT_MS = 60_000;
 /**
  * ⚠️ 20s → 60s（issue IKKZUG，2026-10-12）。
@@ -221,61 +226,66 @@ export function applyModelsDevCatalog(models, dev) {
     return out;
 }
 /**
- * 造一个「取 models.dev 目录」的加载器：**带 TTL 与在飞去重**，失败**向上抛**。
+ * 造一个「取 models.dev 目录」的加载器：**读共享本地缓存**，失败**向上抛**。
  *
- * ⚠️ 失败必须抛（而不是返回空表）：`TtlCache` 只在成功时写入缓存，
- * 抛错才能让下一次调用**重试**，也才能让调用方区分「没读到」与
- * 「读到了且不支持」—— 把失败记成空表会把所有模型的图片能力永久打回纯文本。
+ * ## ⚠️⚠️ 改前本模块**自己直连** models.dev（用户 2026-10-17）
+ *
+ * 改前它持有一套完整的直连实现（`TtlCache` + ETag 条件请求 + 独立超时），
+ * 而 `opencode-capability.ts` 另有一套 —— **两处各连同一个 5 MB 的外部站点**，
+ * 既是本仓库明令禁止的「一文件两套同义判据」，也让「拉 models.dev」这件事
+ * 在插件里发生两次。
+ *
+ * ⇒ 现在直连收敛到 `src/models-dev-cache.ts`（全仓唯一直读点）：本加载器
+ * 只做两件事 —— ① **同步**读共享缓存；② 缓存为空时**触发一次刷新并等它**。
+ *
+ * ## 为什么仍要「等一次刷新」而不是纯同步读（issue IKKZUG 的自愈闸门）
+ *
+ * `cline-pass/*` 的模型条目与图片能力**只有 models.dev 提供**，而
+ * `ClineAdapter.remoteComplete` 用「本次是否读到」来判目录完整性与是否重试。
+ * 纯同步读会让「首次运行」永远读到空表 ⇒ 该闸门**永久**认为残缺 ⇒ 每轮都重试，
+ * 而重试本身又成了等待网络 —— 正好回到 2026-10-02「模型选择一直卡着」那条事故。
+ *
+ * ⇒ 折中：**先同步读**（有缓存就立刻返回，不付任何代价），**只在读不到时**
+ * 才 await 一次刷新。冷启动命中缓存的用户与完全不受影响。
+ *
+ * ⚠️ 失败必须抛（而不是返回空表）：调用方据此区分「没读到」与「读到了且
+ * 不支持」—— 把失败记成空表会把所有模型的图片能力永久打回纯文本。
  */
 export function makeClineModelsDevLoader(options = {}) {
-    const fetcher = options.fetcher ?? fetch;
-    /**
-     * 上次成功拿到的 ETag 与结果（供条件请求 + 304 回退）。
-     *
-     * ⚠️ **不能**指望 `TtlCache` 承担回退：它只缓存**本次** `load()` 的返回值，
-     * 而 304 分支必须**返回上一次的结果** —— 那时 `load()` 拿不到新 body。
-     * 故这两份状态由本闭包自己持有。
-     */
-    let lastEtag;
-    let lastResult;
-    const cache = new TtlCache({
-        ttlMs: options.ttlMs ?? CLINE_MODELS_DEV_TTL_MS,
-        ...options.now === undefined ? {} : { now: options.now },
-        load: async () => {
-            const response = await fetcher(CLINE_MODELS_DEV_URL, {
-                method: 'GET',
-                headers: {
-                    Accept: 'application/json',
-                    // ⚠️ **必须显式声明**（issue IKKZUG）：服务端支持 Brotli，而
-                    // Node 原生 `fetch` **默认不带** `Accept-Encoding` ⇒ 每次都在下
-                    // **解压后 5.39 MB** 的明文。代价不只是慢，而是**极易撞上超时上限**
-                    // （成功那次只用 1.9 秒，失败的都是整段卡死）。
-                    'Accept-Encoding': 'br, gzip',
-                    // 条件请求：带上次的 ETag，命中就只回一个 304 而不重下 5.39MB。
-                    ...lastEtag === undefined ? {} : { 'If-None-Match': lastEtag },
-                },
-                signal: AbortSignal.timeout(CLINE_MODELS_DEV_TIMEOUT_MS),
-            });
-            // ⚠️ 304 必须**回落成上次的结果**，绝不能当成「空目录」——
-            // 那会把所有模型的图片能力一次性打回纯文本（正是本模块要防的形态）。
-            if (response.status === 304) {
-                if (lastResult !== undefined)
-                    return lastResult;
-                // ⚠️ 没有上次结果却收到 304：协议上不该发生，但**不能**返回空表，
-                // 那正是「把没读到说成不支持」。抛错让调用方按「未就绪」处理。
-                throw new Error('models.dev 返回 304 但本地没有可回落的结果');
-            }
-            if (!response.ok)
-                throw new Error(`models.dev HTTP ${response.status}`);
-            const parsed = parseClineModelsDev(await response.json());
-            lastResult = parsed;
-            const etag = response.headers.get('etag');
-            // ⚠️ 服务端**撤掉** ETag 时必须清空，否则会一直带着一个失效的
-            // If-None-Match 请求（服务端不再回 304，白白多一个请求头）。
-            lastEtag = etag ?? undefined;
-            return parsed;
-        },
-    });
-    return async () => await cache.get();
+    return async () => {
+        // ① 同步读共享缓存：命中就直接返回，**零 await、零网络**。
+        const cached = readProviderModelsSync('cline-pass');
+        if (Object.keys(cached).length > 0)
+            return parseClineModelsDev(envelopeOf(cached));
+        // ② 没有缓存才触发一次刷新并等它（共享同一个在途槽，不会重复下载）。
+        const ok = await refreshModelsDevAsync({
+            ...options.fetcher === undefined ? {} : { fetcher: options.fetcher },
+            // ⚠️ **必须透传退避 sleep**：否则失败路径真等 2s+4s，本模块的失败用例
+            //   会直接撞上 vitest 的 5s 超时（实测踩过：5022ms 超时失败）。
+            ...options.sleep === undefined ? {} : { sleep: options.sleep },
+        });
+        const after = readProviderModelsSync('cline-pass');
+        if (Object.keys(after).length === 0) {
+            // ⚠️ 刷新失败或上游确实没有 `cline-pass` 块：**向上抛**，让调用方的
+            //   「未就绪」闸门照旧工作（它靠这个区分残缺与完整，issue IKKZUG）。
+            throw new Error(ok ? 'models.dev 未提供 cline-pass 块' : 'models.dev 缓存不可用');
+        }
+        return parseClineModelsDev(envelopeOf(after));
+    };
+}
+/**
+ * 把共享缓存里**已投影**的条目包成 {@link parseClineModelsDev} 认识的信封。
+ *
+ * ## ⚠️ 为什么绕这一下，而不是给解析器加第二种入参形态
+ *
+ * 直接写一个「从投影条目解析」的函数，等于让本模块有**两套**字段归一逻辑
+ * （`name` / `limit.context` / `modalities.input` 各读一遍）—— 那是本仓库
+ * 明令禁止的「一文件两套同义判据」，且必然随字段演进而漂移。
+ *
+ * ⇒ 合成出与原始响应**同形**的信封，交给唯一那���解析器。
+ * 成本是构造一个小对象（18 条量级），换来「字段归一只有一处」。
+ */
+function envelopeOf(models) {
+    return { 'cline-pass': { models } };
 }
 //# sourceMappingURL=cline-models-dev.js.map

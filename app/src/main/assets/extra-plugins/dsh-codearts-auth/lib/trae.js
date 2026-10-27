@@ -58,6 +58,22 @@ export const TRAE_CHECKIN_STATUS_PATH = '/trae/api/v2/ug/checkin_credits/status'
 export const TRAE_CHECKIN_CLAIM_PATH = '/trae/api/v2/ug/checkin_credits/claim';
 /** 积分余额。 */
 export const TRAE_ENT_USAGE_PATH = '/trae/api/v2/pay/ide_user_ent_usage';
+/**
+ * 商业活动信息（**含 1024 打卡抽奖的活动状态**）。
+ *
+ * ⚠️ 与签到端点**同一 API 面**（`/trae/api/v2/ug/…`、同一 host、同一套头）。
+ * ⚠️⚠️ 必须带 body `{ version_code, req_source }` —— 实测空 body 只回 **6** 个通用活动，
+ *    带齐后回 **8** 个（多出 `checkin_1024` 与 `code_fission_202609` 两个**账号级**活动）
+ *    ⇒ 缺参数会把「有资格」误判成「没有这个活动」。详见 `trae-lottery.ts`。
+ */
+export const TRAE_UG_ACTIVITY_INFO_PATH = '/trae/api/v2/ug/activity/info';
+/**
+ * 商业活动动作（**参与抽奖走这里**）。
+ *
+ * ⚠️ 是**不可逆的写操作**：客户端对 `activity_id === 'checkin_1024'` 显式传 `retry: 0`
+ *    ⇒ 本仓库同样**不重试**（重试可能白烧当天的机会）。调用入口见 `trae-lottery.ts`。
+ */
+export const TRAE_UG_ACTIVITY_ACTION_PATH = '/trae/api/v2/ug/activity/action';
 /** 登录回调路径（对齐 Go 端 `authorizeCallback` 与 TRAE 登录页强制回传）。 */
 export const TRAE_CALLBACK_PATH = '/authorize';
 /** 控制面请求超时（毫秒）；对话流式请求不适用。 */

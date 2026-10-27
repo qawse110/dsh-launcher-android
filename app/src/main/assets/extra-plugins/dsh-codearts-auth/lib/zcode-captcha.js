@@ -79,7 +79,7 @@ import { CdpConnection, ChromiumSession, sleep } from './chromium-session.js';
  *    `chromium-session.ts` —— 那是**代码真正所在**的文件，否则断言会打空、
  *    变成假绿。
  */
-export { browserCandidates, browserNotFoundMessage, buildLinuxSkipTaskbarArgs, buildMacosMiniaturizeArgs, findBrowserExecutable, isEdgeExecutable, parseWmctrlList, } from './chromium-session.js';
+export { browserCandidates, browserNotFoundMessage, buildLinuxSkipTaskbarArgs, buildMacosMiniaturizeArgs, findBrowserExecutable, isBrowserDeploymentError, isEdgeExecutable, parseWmctrlList, } from './chromium-session.js';
 /**
  * 上游是否**明确要求**推理请求带 captcha —— 即「首发就该带，别再先探」。
  *

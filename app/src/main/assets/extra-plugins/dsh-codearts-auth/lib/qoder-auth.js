@@ -17,6 +17,7 @@ import { Service } from '@deepseek-ai/cordis';
 import { credentialRef } from '@deepseek-ai/dsh-credentials';
 import { QODER_REQUEST_TIMEOUT_MS, QODER_REFRESH_PATH, applyQoderRefresh, isQoderExpired, isQoderRefreshable, parseQoderTokenPayload, qoderCredentialExpiresAtMs, qoderRefreshBody, } from './qoder.js';
 import { QODER } from './qoder-product.js';
+import { fetchQoderRemoteModels } from './qoder-catalog.js';
 import { runQoderLoginFlow, startQoderLoginFlow, } from './qoder-oauth.js';
 import { RefreshScheduler } from './refresh.js';
 import { refreshAccountWithReconcile, syncAccountExpiry, } from './expiry-sync.js';
@@ -100,9 +101,41 @@ export class QoderAuth extends Service {
         this.product = product;
         this.credentialRefName = this.product.defaultCredentialRef;
     }
-    /** 注入的 fetch（测试用）；默认为全局 fetch。 */
-    get fetchImpl() {
-        return this.options.fetcher ?? fetch;
+    /**
+     * 按**账号**取出口 fetcher（真实报障 2026-10-21）。
+     *
+     * ⚠️ 优先级与 `GeminiAdapter` 同款：`fetcher`（单测替身）> `fetchFor`（生产代理）
+     * > 全局 `fetch`。单测想拦上游时只需传 `fetcher`，不必关心代理。
+     *
+     * ⚠️ **每次调用现取**而不是构造期固化：续期循环会在账号之间移动
+     * （`refreshAll` 逐个账号），出口必须跟着换。
+     *
+     * ⚠️ `accountId` 允许为 `undefined`（登录流程还没有账号）：此时解析器会去查
+     * `QODER_PENDING_PROXY_KEY`，那是墙外环境下「新建账号」的唯一出路。
+     */
+    fetcherForAccount(accountId) {
+        if (this.options.fetcher !== undefined)
+            return this.options.fetcher;
+        if (this.options.fetchFor !== undefined)
+            return this.options.fetchFor(accountId ?? '');
+        return fetch;
+    }
+    /**
+     * 同 {@link fetcherForAccount}，但**没有专门出口时返回 `undefined`**。
+     *
+     * 存在的理由：登录流程的两个 `runQoderLoginFlow` / `startQoderLoginFlow`
+     * 调用点要把 fetcher **作为可选字段透传**（它们的 `fetcher` 缺省即全局
+     * fetch）。若这里硬塞一个 `globalThis.fetch`，那些「未传即用默认」的
+     * 分支会被改成「显式传入」，虽然行为等价，但会让替身注入的优先级
+     * 与 `GeminiAdapter` 的写法不再对称，也让单测里「没传 fetcher」这件事
+     * 变得不可表达。
+     */
+    fetcherForAccountOrUndefined(accountId) {
+        if (this.options.fetcher !== undefined)
+            return this.options.fetcher;
+        if (this.options.fetchFor !== undefined)
+            return this.options.fetchFor(accountId ?? '');
+        return undefined;
     }
     /** 标记 refresh_token 已失效：停止重试，并向 status() 暴露 refreshable: false。 */
     markRefreshTokenInvalid() {
@@ -117,9 +150,14 @@ export class QoderAuth extends Service {
      */
     async login(flowOptions = {}) {
         this.active = true;
+        // ⚠️ 登录流程本身也要出口：`startQoderLoginFlow` 会先打设备码端点，
+        // 墙外环境下没代理连登录都起不来（死锁：登录要代理，代理按已存在账号配）。
+        // 此时 `accountId` 可能还是空的 ⇒ `fetcherForAccount('')` 会去查
+        // `QODER_PENDING_PROXY_KEY`（见 `src/qoder-proxy.ts`）。
+        const loginFetcher = this.fetcherForAccountOrUndefined(flowOptions.accountId);
         const flow = await runQoderLoginFlow({
             product: this.product,
-            ...this.options.fetcher === undefined ? {} : { fetcher: this.options.fetcher },
+            ...loginFetcher === undefined ? {} : { fetcher: loginFetcher },
             ...flowOptions,
         });
         return this.persistLogin(flow, flowOptions);
@@ -138,9 +176,10 @@ export class QoderAuth extends Service {
      */
     async startLogin(flowOptions = {}) {
         this.active = true;
+        const loginFetcher = this.fetcherForAccountOrUndefined(flowOptions.accountId);
         const started = await startQoderLoginFlow({
             product: this.product,
-            ...this.options.fetcher === undefined ? {} : { fetcher: this.options.fetcher },
+            ...loginFetcher === undefined ? {} : { fetcher: loginFetcher },
             ...flowOptions,
         });
         const result = started.result.then((flow) => this.persistLogin(flow, flowOptions));
@@ -277,7 +316,7 @@ export class QoderAuth extends Service {
         if (!isQoderRefreshable(credential)) {
             throw new RefreshTokenExpiredError('无 refresh_token，请重新登录');
         }
-        const refreshed = await this.refreshCredential(credential);
+        const refreshed = await this.refreshCredential(credential, accountId);
         await this.ctx.credentials.set(ref, JSON.stringify(refreshed));
         await syncAccountExpiry({
             pool,
@@ -294,11 +333,14 @@ export class QoderAuth extends Service {
      *
      * 抽出来供 `refresh()` 与 `refreshAll()` 共用，避免两处各写一遍
      * 「发请求 → 判终态 → 合并字段」的逻辑而逐渐分叉。
+     *
+     * @param accountId 该凭据所属的账号 id（**决定走哪条出口代理**）。
+     *   不传 ⇒ 登录预置那条（`QODER_PENDING_PROXY_KEY`）或直连。
      */
-    async refreshCredential(credential) {
+    async refreshCredential(credential, accountId) {
         let response;
         try {
-            response = await this.fetchImpl(`${this.product.openApiBase}${QODER_REFRESH_PATH}`, {
+            response = await this.fetcherForAccount(accountId)(`${this.product.openApiBase}${QODER_REFRESH_PATH}`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -377,7 +419,12 @@ export class QoderAuth extends Service {
                     credential,
                     accessors: QODER_EXPIRY_ACCESSORS,
                     current: entry,
-                    refresh: (c) => this.refreshCredential(c),
+                    // ⚠️ **必须把 `entry.id` 传下去**（真实缺口，2026-10-21 随代理接线发现）：
+                    //    `refreshCredential` 用它选出口代理。漏传 ⇒ 每次续期都退到
+                    //    `QODER_PENDING_PROXY_KEY` 或直连 ⇒ 墙外环境下**续期恒失败**，
+                    //    而失败被归为「可重试」⇒ 用户看到的是「账号一直显示可续期却永远
+                    //    刷不动」，与代理完全无关的表象（最难查的一类）。
+                    refresh: (c) => this.refreshCredential(c, entry.id),
                     save: (c) => this.ctx.credentials.set(ref, JSON.stringify(c)),
                     warn: (message) => this.ctx.logger?.warn?.(message),
                 });
@@ -402,7 +449,70 @@ export class QoderAuth extends Service {
             }
         }
     }
-    /** 移除已存储的凭据并停止任何待处理的刷新。 */
+    /**
+     * 拉取**远端模型目录**（`/api/v2/model/list?Encode=1`）。
+     *
+     * ## 为什么由 auth 服务做，而不是让适配器自己解析凭据
+     *
+     * 适配器手上的取凭据入口是 `resolveCredential`，而它**有副作用**：
+     * 选中账号时会 `reportAccount(id)`（`index.ts` 的接线把它写成
+     * `activeQoderAccountId.set(...)`，用于额度报错时标记「本次实际使用的账号」）。
+     * 目录请求是**周期性**的（20 分钟刷新器 + 冷启动预热 + 每次列模型），
+     * 若走同一条路，它会在聊天请求选号之后把那个 Map **改写成目录用的账号**
+     * ⇒ 额度标记可能落到**无辜账号**上（`index.ts` 那段注释逐字警告过这个后果）。
+     *
+     * 故照其余 11 家的形态：目录取数只做**池的只读读取**
+     * （`getAvailableAccount`，不写任何账），池空时回退本实例的默认 ref。
+     *
+     * ## 语义
+     *
+     * - 失败 / 未登录 / 形状不符一律返回 **`[]`**，由调用方回退编译期兜底表
+     *   （与 `AccioAuth.fetchModels` / `TraeAuth.fetchModels` 同语义）；
+     * - 「没有凭据」**不打日志**（未登录用户每次列模型都会走到这里）；
+     * - 真正的失败（HTTP 非 2xx / 网络异常 / WASM trap）必须留痕 ——
+     *   否则「倍率不更新」这个症状没有任何可查的证据。
+     *
+     * ⚠️ **整段（含取凭据）都必须在 `try` 内**（缺陷，2026-10-20 对抗审计）：
+     * 原先只有「拉目录」被 `try` 罩住，而 `pool.getAvailableAccount` 的 `await`
+     * 在它**外面** —— 池读一旦 reject（存储损坏 / 并发写坏档），rejection 会
+     * **直接抛穿 `fetchModels`**，绕开「失败即回退兜底表」这条契约，把一次目录
+     * 读取失败升级成 `listModels` 抛错（DSH 侧表现为 provider 报错）。
+     * 变异验证：删掉那一行 `.catch(() => null)` 后 111 条用例**全绿** ⇒ 这条腿
+     * 当时**零守卫**；现已补「池读 reject」用例并把整段收进 `try`。
+     */
+    async fetchModels(pool) {
+        try {
+            let credential;
+            let accountId;
+            if (pool !== undefined) {
+                const available = await pool
+                    .getAvailableAccount(this.product.id, '')
+                    .catch(() => null);
+                if (available !== null) {
+                    credential = available.credential;
+                    accountId = available.entry.id;
+                }
+            }
+            credential ??= await this.resolveStoredCredential();
+            if (credential === undefined)
+                return [];
+            // ⚠️ 模型目录端点也在 `openapi.qoder.sh` 上 ⇒ 墙外环境下没有代理时
+            // 恒失败、列表退用内置兜底表（看上去像「倍率从不更新」）。
+            // 代理按**账号**取：池里可能同时有国际版（需要）与中国版（不需要）。
+            const modelFetcher = this.fetcherForAccountOrUndefined(accountId);
+            return await fetchQoderRemoteModels(credential, this.product, {
+                ...modelFetcher === undefined ? {} : { fetcher: modelFetcher },
+            });
+        }
+        catch (error) {
+            this.ctx.logger?.warn?.(`[${this.product.id}] 远端模型目录读取失败，模型列表将退用内置兜底表：`
+                + (error instanceof Error ? error.message : String(error)));
+            return [];
+        }
+    }
+    /**
+     * 移除已存储的凭据并停止任何待处理的刷新。
+     */
     async logout() {
         // 先置 inactive，再清凭据：在途刷新完成后不得回写/重新武装调度。
         this.active = false;

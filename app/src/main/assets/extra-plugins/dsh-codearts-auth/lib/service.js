@@ -1,9 +1,9 @@
 import { Service } from '@deepseek-ai/cordis';
 import { credentialRef } from '@deepseek-ai/dsh-credentials';
 import { runLoginFlow, runOAuthFlow, startOAuthFlow } from './login.js';
-import { RefreshTokenExpiredError, credentialFromTokenResponse, exchangeRefreshToken, keyPairFromStoredJwk, } from './oauth.js';
+import { RefreshTokenExpiredError, credentialFromTokenResponse, exchangeRefreshToken, keyPairFromStoredJwk, refreshTokenExpiresAt, } from './oauth.js';
 import { SerialQueue } from './serial-queue.js';
-import { refreshAccountWithReconcile, shouldRefreshNow, syncAccountExpiry, } from './expiry-sync.js';
+import { refreshAccountWithReconcile, shouldRefreshNowWithRefreshExpiry, syncAccountExpiry, } from './expiry-sync.js';
 /**
  * CodeArts 凭据是否具备**静默续期所需的全部材料**。
  *
@@ -34,6 +34,14 @@ const CODEARTS_EXPIRY_ACCESSORS = {
         return Number.isFinite(parsed) ? parsed : undefined;
     },
     refreshableOf: isCodeArtsRefreshable,
+    // ⚠️ refresh_token 的到期是 CodeArts **独有的**失效面：华为 STS 给的
+    // refresh_token 寿命恒为「登录时刻 + 30 天」且**续期不延长它**，而 access
+    // 恒为 2 小时 ⇒ 最后一天 access 与 refresh 的到期严重不对称。
+    // 2026-10-18 实测：lead-time 只看 access ⇒ 放行时刻晚于 refresh 死线 ⇒
+    // 两个同日登录的账号在 30 天整同时报废（且池内 `refreshable` 仍为 true）。
+    // 补这条腿后，refresh 剩余不足一个 lead 周期时提前续期。
+    // 其余八家不提供本腿 ⇒ 行为与从前逐字节一致。
+    refreshExpiresAtOf: refreshTokenExpiresAt,
     identityOf: (credential) => credential.access_key_id ?? '',
 };
 import { fetchCodeArtsRemoteModels, saveModelsCache, setMemoryCache, } from './models.js';
@@ -245,7 +253,12 @@ export class CodeArtsAuth extends Service {
                 throw new Error('无 refresh_token，请重新登录');
             // 排队等锁期间，别处（另一条续期入口）可能已经把它续好了：
             // 有效期内就直接对账返回，不再发第二次请求。
-            if (!shouldRefreshNow(CODEARTS_EXPIRY_ACCESSORS.expiresAtOf(credential))) {
+            // ⚠️ 必须走**带 refresh 腿**的判据：只读 access 会在 refresh 已进
+            // 最后窗口时误判成「还早」而跳过，把账号推过死线（2026-10-18 实测事故）。
+            if (!shouldRefreshNowWithRefreshExpiry({
+                expiresAtMs: CODEARTS_EXPIRY_ACCESSORS.expiresAtOf(credential),
+                refreshExpiresAtMs: refreshTokenExpiresAt(credential),
+            })) {
                 await syncAccountExpiry({
                     pool,
                     provider: 'codearts',
@@ -285,7 +298,10 @@ export class CodeArtsAuth extends Service {
         return await this.queueFor(refName).run(async () => {
             const latest = (await this.readCredential(refName)) ?? credential;
             if (!this.sameCredential(latest, credential)
-                && !shouldRefreshNow(CODEARTS_EXPIRY_ACCESSORS.expiresAtOf(latest))) {
+                && !shouldRefreshNowWithRefreshExpiry({
+                    expiresAtMs: CODEARTS_EXPIRY_ACCESSORS.expiresAtOf(latest),
+                    refreshExpiresAtMs: refreshTokenExpiresAt(latest),
+                })) {
                 this.ctx.logger?.info?.(`[codearts] 凭据已被他处续期，跳过本次续期请求（避免重复消费 refresh_token）`);
                 return latest;
             }
@@ -433,8 +449,41 @@ export class CodeArtsAuth extends Service {
                 else {
                     // 非终态失败（网络抖动、5xx、429、DPoP 校验没过…）也必须留日志：静默会让账号
                     // 在 UI 上永远显示「可续期」却刷不动，无从排查。
-                    this.ctx.logger?.warn?.(`[codearts] 账号 ${entry.id} 续期失败：`
-                        + `${error instanceof Error ? error.message : String(error)}`);
+                    const detail = error instanceof Error ? error.message : String(error);
+                    this.ctx.logger?.warn?.(`[codearts] 账号 ${entry.id} 续期失败：${detail}`);
+                    // ⚠️⚠️ **本地已判定的终态不依赖服务端回包**（2026-10-18 实测缺陷②）。
+                    //
+                    // 现象：两个账号的 refresh_token 在「登录 + 30 天」当天到期，续期再也
+                    // 换不回新凭据，但池里 `refreshable` **仍是 `true`** ⇒ 面板照常显示
+                    // 「· 自动续期」，而账号实际已死、且**永远不会自愈**。
+                    //
+                    // 为什么已有那条 `RefreshTokenExpiredError` 分支救不了：它要求服务端把
+                    // 拒绝**分类成** `invalid_grant` / `ExpiredRefreshToken`。只要回包是别的
+                    // 形状（代理改写、5xx、报文解析失败），就落进上面的非终态分支 ——
+                    // 而本例的 refresh 是**永久**过期，重试再多次也不会成功。
+                    //
+                    // ⇒ 判据用**本地**就能确定的事实：refresh_token 的 `exp` 已过 **且**
+                    // 这一次尝试失败了。两腿同时成立时，继续重试没有任何意义，如实写成
+                    // `refreshable: false`，让面板停止谎报。
+                    //
+                    // ⚠️ **必须两腿同时成立**：只看「本地已过期」会误伤「多端登录重签过
+                    // refresh、云端其实还能续」的好账号 —— 所以仍先真发一次请求，让成功
+                    // 把它救回来（上面的 try 分支），失败才落终态。
+                    if (credential !== undefined) {
+                        const rtExp = refreshTokenExpiresAt(credential);
+                        if (rtExp !== undefined && rtExp <= Date.now()) {
+                            await pool.updateAccount(entry.id, { refreshable: false }).catch(() => {
+                                // 写盘失败不影响「凭据确实已死」这个结论，忽略。
+                            });
+                            const lastRt = this.terminalWarned.get(`${entry.credentialRef}:expired`);
+                            if (lastRt !== detail) {
+                                this.terminalWarned.set(`${entry.credentialRef}:expired`, detail);
+                                this.ctx.logger?.warn?.(`[codearts] 账号 ${entry.id} 的 refresh_token 已于本地过期时间之后仍无法续期，`
+                                    + `已标记为需重新登录（refresh_token 有效期为登录后 30 天，续期不会延长它）；`
+                                    + `失败详情：${detail}`);
+                            }
+                        }
+                    }
                 }
                 // 单账号失败不中断循环
             }
@@ -460,6 +509,14 @@ export class CodeArtsAuth extends Service {
      * 为什么用「可用账号」而不是遍历全部账号：模型目录是**账号无关**的（同一个
      * 华为云账号体系下发同一份目录），取第一个能解析出 AK/SK 的账号即可，
      * 无需为每个账号各拉一次。
+     */
+    /**
+     * ⚠️ 返回**完整 `RemoteModel`**（含 `rateLabel`），不是只有 `{id, name}`。
+     *
+     * 2026-10-21 修：此前签名写死 `Array<{id,name}>` ⇒ 即使
+     * `fetchCodeArtsRemoteModels` 解析出了倍率，也会在**这一层被丢弃**
+     * （TS 结构类型允许「少字段」赋值，编译不报错、运行期静默丢字段 ——
+     * 正是「目录里明明有倍率却显示不出来」的根因）。
      */
     async refreshModels(pool) {
         if (!this.active)

@@ -1,0 +1,259 @@
+/**
+ * OfficeAce（华为 MaaS）的**「锁定永久积分」唯一执行实现**。
+ *
+ * ## 为什么需要这个文件（Gitee issue IKLTHB 的第 ① 条，真实缺陷）
+ *
+ * `provider-registry.ts` 给 officeace 登记了 `permanentLock: true`，Jet Hub 据此
+ * 渲染出「锁定永久积分」开关，并在提示里**逐字承诺**：
+ *
+ * > 锁定永久积分后只消耗「N 天内到期」的积分包（那部分再不用就作废）。
+ * > 这类积分用尽后将没有可用账号。
+ *
+ * 而在本文件之前，**那句承诺没有任何执行代码**：
+ *
+ * | 判据 | 改前的现状 |
+ * |---|---|
+ * | `permanentLocked()` 的调用点 | 全仓**只有两处**，都在 `credential-resolver.ts` 的 buddy / loomy 分支里 |
+ * | officeace 取凭据 | `index.ts` 的闭包里直接 `pool.getAvailableAccount(OFFICEACE.id, '')`，**从不读锁定表** |
+ * | `officeaceExpiry`（聚合折算） | 无锁定语义：只剩永久桶 ⇒ 折算成 `NEVER`（排最后，但**不剔除**） |
+ *
+ * ⇒ 锁定开关打开后行为与关闭**完全一致**，写入 `permanent-locks.json` 的那个
+ * `officeace: true` 是一把**哑锁**。用户的真实后果：每天都在**烧永久套餐包**，
+ * 而面板上那句「今日额度用尽后将没有可用账号」永远不会出现。
+ *
+ * 用户在 issue 里给的两条修法我们选了**完整实现**（另一条是「摘掉
+ * `permanentLock: true`，让按钮消失」）—— 因为该承诺在 officeace 上是**可兑现的**：
+ * 服务端会给每个积分桶下发到期时间（`creditGroups[].expiresAt`），
+ * 「只剩不会近期作废的桶」是**本地就能判定**的事实。
+ *
+ * ⚠️ 上表是**改前**的现状快照，别当成现行事实：本文件落地后
+ *    `permanentLocked('officeace')` 的调用点变成**三处**（本文件经 `index.ts` 的装配、
+ *    以及 `jet-hub-rpc.ts` 里「只读展示开关状态」那一处）。
+ *
+ * ## ⚠️ 锁能做到什么、做不到什么（别把它宣传成「不扣永久积分」）
+ *
+ * **扣减顺序是服务端定的，插件无法干预**。锁定**只能**做一件事：
+ * **拒绝**那些「已经没有任何会近期作废的额度」的账号（并如实报错）。
+ * 因此 `splitOfficeAceCreditsByExpiry` 的判据是「**有没有**近期作废的桶」，
+ * 而**不是**「这一轮会不会扣到永久桶」—— 后者本地无从得知。
+ * 这个边界在 issue 里已被用户明确确认（他正是这么描述 buddy 的行为的）。
+ *
+ * ## 判据：与 buddy 系**逐格同构**（本仓库红线：同族判据不得各写一份）
+ *
+ * | 情形 | 归属 |
+ * |---|---|
+ * | `expired === true` 的桶 | **跳过**（服务端仍会返回余额，计入会虚增可用额度） |
+ * | `remaining <= 0` 的桶 | **跳过** |
+ * | `expiresAt` 可解析，且 `expiresAt - now < 窗口` | 「临期」桶（锁定期间**唯一**可消耗的额度） |
+ * | 其余（到期时间 ≥ 窗口，或**没给**到期时间） | 「永久」桶 —— ⚠️ **拿不到到期时间时归永久是保守方向**：最坏结果是锁定时少用一个号，而不是把长期积分误当临期烧掉（与 `splitBuddyCreditsByExpiry` 同款取舍） |
+ *
+ * ⚠️ 窗口复用 `buddyExpiringWindowMs()`（`DSH_BUDDY_EXPIRING_WINDOW_DAYS`，默认 15 天）：
+ *    Jet Hub 的 `credits.permanentLock` RPC 对**所有 `usesExpiryWindow: true` 的渠道**
+ *    回传的正是 `buddyExpiringWindowDays()` ⇒ 面板文案与实际筛号必须是**同一个数**。
+ *
+ * ⚠️ **已知取舍：试点包（`.trial` SKU）会被判成「永久」。**
+ *    `fetchCloudSubscriptionFor` 有意丢弃 trial SKU 的到期时间
+ *    （`expiresAt: isTrial ? undefined : expiredAt`）⇒ 这里按「没给到期时间」
+ *    归入永久桶。于是「只有试点包」的账号在锁定期间会被判为不可用（保守方向，
+ *    **不会**烧钱）。要支持它应当改在**归一化那一处**（如实透出 trial 的到期时间），
+ *    而不是在本文件加一条 provider 特例 —— 否则「到期时间」这件事会出现两套口径。
+ *
+ * ## ⚠️ 锁定时**绝不回落**（与 buddy/loomy 逐字同规）
+ *
+ * `pickBuddyAccount` 的注释写得很清楚：锁定时落到池兜底 = 绕过锁定、照样消耗永久
+ * 积分 ⇒ 锁定形同虚设。故本文件在「锁定 + 无临期额度」时**只抛错**，
+ * 连 `resolveUnlocked()` 那条旧路径都不碰（那条路径里有池兜底）。
+ */
+import { buddyExpiringWindowMs } from './buddy-balance-rank.js';
+/**
+ * 把一个订阅读取结果拆成「临期」与「永久」两桶。
+ *
+ * ⚠️ 判据与 `splitBuddyCreditsByExpiry` **逐格同构**（含边界方向
+ * `end - now < windowMs`、含「到期时间未知 ⇒ 永久」）。两处的差异只有**数据形状**
+ * （buddy 读 `packages[].deductionEndTime` 数值，officeace 读 `creditGroups[].expiresAt`
+ * ISO 字符串）：前者是 `active` 布尔，后者是 `expired` 布尔（语义相反，故这里取反）。
+ *
+ * @param summary - 订阅读取结果。
+ * @param now - 当前时刻（毫秒）。
+ * @param windowMs - 本次生效的窗口（毫秒）。⚠️ **必填**：生产上恒由调用方显式传入
+ *   （装配处传 `windowMs()`，也就是与面板、取号**同一个**窗口）。原来这里有
+ *   `= buddyExpiringWindowMs()` 默认值，第二轮对抗性审计实测**把它改成常数 15 天
+ *   仍然全绿** ⇒ 它是死代码，却又是「一条判据两份取值」的潜入口（谁少传一次，
+ *   筛号窗口就与文案窗口分叉，且**不会有任何红**）。删掉默认值让「忘了传」变成
+ *   编译错误。
+ */
+export function splitOfficeAceCreditsByExpiry(summary, now, windowMs) {
+    let expiring = 0;
+    let permanent = 0;
+    for (const group of summary.creditGroups) {
+        // ⚠️ `expired` 与 buddy 的 `active` 语义**相反**：这里是「已失效请跳过」。
+        if (group.expired === true)
+            continue;
+        const remaining = Number(group.remaining);
+        if (!Number.isFinite(remaining) || remaining <= 0)
+            continue;
+        // ⚠️ `expiresAt` 是 ISO 8601 字符串（与 STS 的 `expiration` 同形），
+        //    不是数值时间戳 —— 别顺手加 `> 1e12` 归一化（那是兄弟渠道的坑）。
+        const end = typeof group.expiresAt === 'string' ? Date.parse(group.expiresAt) : Number.NaN;
+        const known = Number.isFinite(end) && end > 0;
+        if (known && end - now < windowMs)
+            expiring += remaining;
+        else
+            permanent += remaining;
+    }
+    return { expiring, permanent };
+}
+/**
+ * 「读不到」结论的缓存时长：**5 秒**。
+ *
+ * 抖动是秒级的，而「读不到」的代价只是多打一次网络请求（且**不会**烧钱）。
+ */
+export const OFFICEACE_LOCK_UNKNOWN_TTL_MS = 5_000;
+/**
+ * 「只剩永久桶」结论的缓存时长：**60 秒**。
+ *
+ * ⚠️ **刻意不给「有临期额度」这个结论做任何缓存**（这是与 buddy 余额选择器的
+ * 唯一一处**有意差异**，别照着 buddy 抄）：
+ *
+ * | 结论 | 是否缓存 | 理由 |
+ * |---|---|---|
+ * | 有临期额度 | **不缓存** | 这个结论接下来要**花掉**那笔额度：一次 GET 换「不会误烧永久积分」，而缓存 60 秒意味着最多 60 秒内都可能烧到永久桶 |
+ * | 只剩永久桶 | 缓存 60 秒 | 这个结论只会导致**拒绝**（不花钱）；缓存它 = 拒绝路径不打网络 |
+ * | 读不到 | 缓存 5 秒 | 同上，抖动期不刷屏 |
+ *
+ * 三个数字都只决定「**多久重问一次服务端**」：缓存的是**结论**（`permanent` /
+ * `unknown`），分桶口径本身每次现算（同一份 `splitOfficeAceCreditsByExpiry`）。
+ */
+export const OFFICEACE_LOCK_PERMANENT_TTL_MS = 60_000;
+/**
+ * 造一个与适配器契约一致的 `credentialProvider`（锁定态走本文件的新路径）。
+ *
+ * @returns 无参函数：`() => Promise<OfficeAceCredential | undefined>`；
+ *          **锁定且无临期额度时抛错**（`officeaceLockedError`），绝不回落池。
+ */
+export function createOfficeAceCredentialProvider(deps) {
+    const now = () => deps.now?.() ?? Date.now();
+    const windowMs = () => deps.windowMs?.() ?? buddyExpiringWindowMs();
+    /** 只存**不花额度**的结论（见 `OFFICEACE_LOCK_PERMANENT_TTL_MS` 的表）。 */
+    const cache = new Map();
+    /** 判定一个账号：`credential` ⇒ 返回它；否则给出结论。 */
+    const classify = async (ref, credential) => {
+        const key = ref ?? '__stored__';
+        const at = now();
+        const cached = cache.get(key);
+        if (cached !== undefined) {
+            const ttl = cached.verdict.kind === 'unknown'
+                ? OFFICEACE_LOCK_UNKNOWN_TTL_MS
+                : OFFICEACE_LOCK_PERMANENT_TTL_MS;
+            if (at - cached.at < ttl)
+                return cached.verdict;
+            cache.delete(key);
+        }
+        let verdict;
+        let read;
+        try {
+            read = await deps.summaryOf(credential, ref);
+        }
+        catch (error) {
+            // ⚠️ 注入实现按契约不抛错；但契约靠不住时**也必须**落到 unknown，
+            //    不能把异常冒上去（那会把一次余额抖动变成整个渠道的硬故障）。
+            read = { ok: false, error: String(error) };
+        }
+        if (!read.ok) {
+            verdict = { kind: 'unknown', errors: [read.error] };
+        }
+        else {
+            const split = splitOfficeAceCreditsByExpiry(read.summary, at, windowMs());
+            if (split.expiring > 0) {
+                // ★ 有临期额度 ⇒ **不缓存**（见 TTL 注释）：这个结论要立刻花掉那笔额度。
+                cache.delete(key);
+                return { kind: 'credential', credential };
+            }
+            verdict = { kind: 'permanent' };
+        }
+        cache.set(key, { at, verdict });
+        return verdict;
+    };
+    return async () => {
+        // ① 未锁定 ⇒ 逐字走旧路径（零行为变化）。
+        if (!deps.permanentLocked())
+            return deps.resolveUnlocked();
+        // ② 锁定 ⇒ 逐个候选账号判定「还有没有会近期作废的额度」。
+        const accounts = deps.accounts();
+        const errors = [];
+        for (const account of accounts) {
+            const credential = await deps.readCredential(account.credentialRef);
+            if (credential === undefined) {
+                // ⚠️ 凭据读不出来**不是**「额度用尽」：归入 unknown（文案会说明）。
+                errors.push(`${account.id}: 凭据读不出来`);
+                continue;
+            }
+            const verdict = await classify(account.credentialRef, credential);
+            if (verdict.kind === 'credential')
+                return verdict.credential;
+            if (verdict.kind === 'unknown')
+                errors.push(`${account.id}: ${verdict.errors.join('；')}`);
+        }
+        // ③ 池里没有任何账号（尚未按账号池登录的老数据）⇒ 用兼容单凭据判一次。
+        //    ⚠️ 这里**没有**池兜底可言，故不需要 `sawCredential` 之类的额外门禁。
+        if (accounts.length === 0) {
+            const credential = deps.readStoredCredential();
+            if (credential === undefined)
+                return undefined;
+            const verdict = await classify(undefined, credential);
+            if (verdict.kind === 'credential')
+                return verdict.credential;
+            if (verdict.kind === 'unknown')
+                errors.push(`本机凭据: ${verdict.errors.join('；')}`);
+        }
+        // ④ 锁定 + 无临期额度 ⇒ **只报错，绝不回落池**（见模块头）。
+        throw officeaceLockedError(errors.length > 0 ? { kind: 'unknown', errors } : { kind: 'exhausted' }, 
+        // ⚠️ 与上面筛号用的是**同一个**取值（本仓库红线：同一条判据不得有第二份取值）。
+        windowMs());
+    };
+}
+/**
+ * 「锁定永久积分 + 无可用账号」的报错文案。
+ *
+ * ## ⚠️ 三条硬要求
+ *
+ * 1. **必须与「额度用尽」分开报「读不到」**：把一次网络抖动说成「用尽」会让用户
+ *    去解锁，而解锁会**不可撤回地**烧掉永久积分（`buddyLockedError` 的同款真实报障）。
+ * 2. **不得建议「重新登录」**：officeace 那条 401 的取证已证明重新登录**改变不了**
+ *    `modelAppKey`/`modelAppSecret`（issue IKLTHB 第 ② 条）—— 把它写进这里就是
+ *    换一个地方重复那条被证伪的指引。
+ * 3. **错误码必须避开 `AUTH`/`QUOTA`/`ACCOUNT_QUOTA`**：DSH 客户端会把这三个码的
+ *    报文**整段替换**成通用文案，于是上面这些指路的话一个字都到不了用户眼前
+ *    （本仓库红线，见 `dead-model-store` 的 `IGNORED_CODES`）。本函数返回的是**裸
+ *    `Error`**（不带 `code`）—— 与 officeace 适配器既有的错误同款，故不会被替换。
+ *
+ * ## ⚠️ 窗口天数**必须由调用方传进来**（不许在本函数里另算一份）
+ *
+ * 本仓库红线「一文件两套同义判据」：筛号用的是 `deps.windowMs()`，若文案自己再调
+ * `buddyExpiringWindowMs()`，注入场景下就会出现「按 1 天窗口拒绝、报文却说 15 天」
+ * —— 用户照着报文去核对会得到相反的结论。故 `windowMs` 是**入参**，
+ * `createOfficeAceCredentialProvider` 把**同一个**取值传进来（第一轮审计「轻微 1」）。
+ *
+ * @param reason - `createOfficeAceCredentialProvider` 的判定结果。
+ * @param windowMs - 本次筛号实际生效的窗口（毫秒）。⚠️ **必填**（第二轮对抗性审计
+ *   实测：这里的默认值改成常数 15 天后 22 条单测**全绿** ⇒ 生产装配恒显式传参，
+ *   默认值纯属死代码，却为「一条判据两份取值」留了后门）。**非法值**（NaN/≤0）
+ *   仍回落到 `buddyExpiringWindowMs()`：那是防御，不是「忘了传」的兜底 —— 由 ⑩ 钉住。
+ */
+export function officeaceLockedError(reason, windowMs) {
+    const effective = Number.isFinite(windowMs) && windowMs > 0 ? windowMs : buddyExpiringWindowMs();
+    const days = Math.round(effective / (24 * 60 * 60 * 1000));
+    if (reason.kind === 'unknown') {
+        return new Error('OfficeAce：无法确认是否有可用账号。已锁定永久积分，而部分账号的余额或凭据读不到'
+            + `（${reason.errors.slice(0, 2).join('；')}）。这些账号**可能仍有**「${days} 天内到期」`
+            + '的积分 —— 请重试；若反复如此，请在 Jet Hub 的 OfficeAce 面板点「刷新积分」'
+            + '确认云侧余额能否读到（本机登录态只影响余额读取，不影响推理用的 Basic 凭据）。');
+    }
+    return new Error('OfficeAce：没有可用账号。已锁定永久积分，而所有账号的积分桶都**不会在'
+        + `${days} 天内到期**（只剩套餐包/长期活动包一类不会很快作废的额度，`
+        + '或积分桶已空）。'
+        + '⚠️ 扣减顺序由服务端决定，插件无法干预 —— 锁定只能**拒绝**这类账号，'
+        + '故这是该开关的预期效果，不是故障。请在 Jet Hub 的 OfficeAce 面板解锁永久积分，'
+        + '或等有临期额度的积分包发放（每日签到赠送的额度当日作废）。');
+}
+//# sourceMappingURL=officeace-lock.js.map

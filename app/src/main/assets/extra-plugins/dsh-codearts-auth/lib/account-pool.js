@@ -1,7 +1,8 @@
 import { credentialRef } from '@deepseek-ai/dsh-credentials';
-import { createJetHubStore, isValidResetAtMs, MAX_DATE_MS, mergeLegacyLoomyLock, sanitizeAccounts, sanitizeDisabledModels, sanitizePermanentLocks } from './jet-hub-store.js';
+import { createJetHubStore, clearRejectionLayer, DEFAULT_PANEL_ENTRY, isValidResetAtMs, MAX_DATE_MS, mergeLegacyLoomyLock, sanitizeAccounts, sanitizeDisabledModels, sanitizeMinimaxXff, sanitizePanelEntry, sanitizePermanentLocks, sanitizeProviderClosed, withAllowed, withoutAllowed } from './jet-hub-store.js';
 import { createPermanentLockStore } from './permanent-lock-store.js';
 import { normalizeOpencodeGeneration } from './opencode-auth.js';
+import { maskProxyPassword } from './proxy-mask.js';
 // ⚠️ `model-queue.ts` **零 import**（纯函数模块，见其模块头）⇒ 不引入环。
 import { nextUtc8DayStartMs } from './model-queue.js';
 // 兼容既有的导入路径：命名空间名与黑名单类型原本定义在本模块。
@@ -199,6 +200,68 @@ export function sinkAccountToProviderEnd(accounts, accountId) {
  * `ctx.settings` 不再允许插件注册 namespace，故改用插件自有状态文档；
  * 两者都不可用时退化为内存态，保证不抛错。
  */
+/**
+ * 把池里的代理字段读成**字符串**（**读取侧的唯一收口**）。
+ *
+ * ## ⚠️ 为什么必须有它（实测的真缺陷，独立于 IKLTZ2 审计发现）
+ *
+ * `opencodeProxy` / `geminiProxy` 都来自**用户可编辑的备份文件**，而
+ * `sanitizeAccounts`（`src/jet-hub-store.ts`）用 `{ ...candidate }` 原样透传、
+ * **不校验这两个字段的形状**（对照 `modelRateLimits`：那个已由 `isValidResetAtMs`
+ * 加固）。于是池里可能存在 `"geminiProxy": 12345`。
+ *
+ * 下游 `normalizeProxy`（`src/opencode.ts`）第一句就是 `input.trim()` ⇒
+ * 非字符串会在那里抛 `TypeError: raw.trim is not a function`：
+ *
+ * - 该账号**永久不可用**（每次请求都抛，且没有自愈路径）；
+ * - 症状与「代理配错了」同形，排障者会去看代理配置，而真因是备份里的脏数据。
+ *
+ * 实测（本机，IKLTZ2 修复期间）：`sanitizeAccounts` 原样透传 `12345`，
+ * 解析器随即抛 `raw.trim is not a function`。
+ *
+ * ## ⚠️ 为什么「读侧兜底」而不是「写侧过滤」
+ *
+ * 写侧过滤（`sanitizeAccounts` 里丢弃非法值）更彻底，但它是**全仓共享**的清洗
+ * 函数，改动会影响十家 provider 的条目落库形态。本函数是**代理专属**的收口，
+ * 影响面精确到两个读方法。
+ *
+ * ⚠️ **刻意不删键、不改盘**：读侧只保证「不崩、行为确定」—— 脏值视为「未配置」
+ * （= 直连）是最保守的降级，用户仍可在面板里重新配一次把它覆盖掉。
+ *
+ * @param value 池字段原始值（可能是任意 JSON 值）。
+ * @returns 字符串原值；非字符串（含 `undefined` / 数字 / 对象 / 数组）一律回退空串。
+ */
+export function asProxyText(value) {
+    return typeof value === 'string' ? value : '';
+}
+/**
+ * 写「代理已更新」日志时的**展示文本**（2026-10-25 审计 A2-02）。
+ *
+ * ## 为什么必须有它
+ *
+ * 四家 `set*Proxy` 原先都把**原始 URL** 拼进日志：
+ * `` `[jet-hub] 账号 ${id} Qoder 代理 → ${proxy}` `` —— 而代理 URL 常含
+ * `user:pass@host` ⇒ **口令明文进日志**，而日志是用户排障时会随手打包、
+ * 粘贴进 issue、上传给别人的东西。
+ *
+ * 对抗审计逐家实测：opencode / gemini / minimaxintl **早已同形**，
+ * qoder 只是第 4 个实例（不是本 PR 新增的机制）⇒ 四家一并修。
+ *
+ * ## ⚠️ 判据复用 `proxy-mask.ts`，不在这里再写一份
+ *
+ * 池**不能** import provider 实现（`opencode.ts` 在依赖图上层，会成环），
+ * 而复制一份正则到这里就正是本仓库的红线——**同一语义两套判据**。
+ * ⇒ 脱敏实现住在双方都能依赖的中立文件里。
+ *
+ * @param value 池字段原始值（可能是脏值 —— 备份文件原样透传）。
+ * @returns 空串 → `直连`；否则脱敏后的 label（保留 scheme/user/host/port）。
+ */
+export function proxyLogText(value) {
+    const raw = asProxyText(value).trim();
+    if (raw.length === 0)
+        return '直连';
+    return maskProxyPassword(raw);
+}
 export class AccountPool {
     ctx;
     /** 持久化后端；两个后端都不可用时是仅内存实现。 */
@@ -219,6 +282,18 @@ export class AccountPool {
      */
     modelCache = {};
     /**
+     * **供应商关闭意图**的权威进程内副本（Gitee issue IKP8OF）。
+     *
+     * ⚠️ 与 {@link modelCache} **语义不同、不可合并**：黑名单是「这个模型被关着」，
+     * 本表是「用户要求这个**供应商**整体关着」。二者由 {@link disabledModelsFor}
+     * 双腿取或后对消费者**同形**（都表现为「这些 id 不可调用」），但判据与生命周期
+     * 完全不同：黑名单会被逐条打开，而本表只在「打开整个供应商」时才清除。
+     *
+     * 详见 `jet-hub-store.ts` 的 `ProviderClosedMap` 注释（含为什么它**不能**
+     * 单独充当 `provider.status.closed` 的权威）。
+     */
+    providerClosedCache = {};
+    /**
      * 聚合「拒绝轮换」表的**权威进程内副本**（与 {@link cache} / {@link modelCache} 同理）。
      *
      * ⚠️ 与 {@link modelCache} **语义不同、不可合并**：黑名单是「关闭这个模型」（它从
@@ -226,6 +301,30 @@ export class AccountPool {
      * 详见 `AggregateRejectionMap` 的注释。
      */
     aggregateRejectionCache = {};
+    /**
+     * 聚合「**显式允许**参与轮换」白名单的权威进程内副本。
+     *
+     * ⚠️ 与 {@link aggregateRejectionCache} **各有各的域、不做归一**（用户 2026-10-15 的修正）：
+     * 已接入临期折算的候选只归**拒绝表**（黑名单语义：默认参与），未接入的只归**白名单**
+     *（默认不参与，「参与」才需显式记录）。两表的键域由渠道级的「是否接入折算」划分 ⇒
+     * **天然不相交** ⇒ 写一侧**不得**改另一侧。
+     * 详见 `jet-hub-store.ts` 的 `AggregateAllowedMap` 注释。
+     */
+    aggregateAllowedCache = {};
+    /**
+     * 聚合「手工排序」表的权威进程内副本。
+     *
+     * ⚠️ 缺键 / 空数组 = 未自定义（与 {@link providerOrderCache} 同语义）：
+     * 展示与轮换都回落临期序。
+     */
+    aggregateOrderCache = {};
+    /**
+     * 聚合候选的排序模式（缺省 `'expiry'` = 升级前行为）。
+     *
+     * ⚠️ 它不是「有没有手工顺序表」的派生量：用户可能切到手工模式但一条都没拖过
+     *（此时行为与临期模式相同，但面板要显示「按手工」）。
+     */
+    aggregateOrderModeCache = 'expiry';
     /**
      * 「锁定永久积分」开关表的**权威进程内副本**（与 {@link cache} 同理）。
      *
@@ -250,6 +349,36 @@ export class AccountPool {
      */
     gatewayEnabledCache = true;
     /**
+     * 「允许局域网访问」开关的进程内副本（2026-10-20）。
+     *
+     * 缺键语义为**关闭**（与 {@link gatewayEnabledCache} 的「缺键即启用」刻意
+     * 相反）：暴露面变大必须是用户的显式选择，任何读取失败/丢键都回到只绑回环。
+     * 丢失后果可逆（重开一次开关），不需要独立文档。
+     */
+    gatewayAllowLanCache = false;
+    /**
+     * 「渠道原生搜索」总开关的进程内副本（`false` = 全部搜索回官方 provider）。
+     *
+     * 缺键语义是**启用**（与 {@link gatewayEnabledCache} 同一方向）：老文档没有
+     * 本键时保持原生搜索，不会因读取失败而静默改走官方（那会让搜索突然开始
+     * 要 API Key，用户看不出是自己关过还是坏了）。
+     *
+     * ⚠️ 与 {@link gatewayEnabledCache} 同级、**不需要**独立文档：丢失本键的
+     * 唯一后果是回到原生搜索，用户再关一次即可。
+     */
+    nativeWebSearchCache = true;
+    /**
+     * 「面板入口」的进程内副本：Jet Hub 的唯一入口位置（两个取值互斥）。
+     *
+     * 缺键语义是 `'sidebar'`「仅侧栏」（与 {@link nativeWebSearchCache} 同一方向）：
+     * 老文档没有本键时保持主导航那一行可见，不会因一次读取失败而让用户以为
+     * 这是某个被删掉的功能。
+     *
+     * ⚠️ 与 {@link gatewayEnabledCache} 同级、**不需要**独立文档：丢失本键的
+     * 唯一后果是入口回到默认「仅侧栏」，用户再改一次即可（可逆）。
+     */
+    panelEntryCache = DEFAULT_PANEL_ENTRY;
+    /**
      * 供应商自定义显示顺序（「供应商开关」弹窗拖拽排序）的进程内副本。
      *
      * ⚠️ 与 {@link gatewayEnabledCache} 同级、**不需要**独立文档：丢失本键的
@@ -257,6 +386,20 @@ export class AccountPool {
      * 数组语义见 `jet-hub-store.ts` 的 `JetHubState.providerOrder`。
      */
     providerOrderCache = [];
+    /**
+     * MiniMax **国际站**绕过分流用的 `X-Forwarded-For` 值（进程内副本）。
+     *
+     * 语义与校验见 `jet-hub-store.ts` 的 `JetHubState.minimaxXff` 与
+     * `sanitizeMinimaxXff`（**同一份判据**，本文件不另写一份）。
+     *
+     * ⚠️ `undefined` / 空串 = **不附头**（行为与修复前逐字节一致）。这是刻意的
+     * 缺省：附 `X-Forwarded-For` 等于声明一个并非本机的来源 IP，不能是默认行为。
+     *
+     * ⚠️ 与 {@link providerOrderCache} 同级、**可以**住在这里：丢失本键的唯一后果
+     * 是国际站用户重新遇到 307（可逆，重填一次即可）。但它**必须**被带进
+     * `queueStoreSave` 的整体写入（否则「任何一次改账号都会静默清掉它」）。
+     */
+    minimaxXffCache;
     /**
      * ★ **由折算观测写下的** `modelRateLimits` 标记集合（键 = `accountId\u0000modelId`）。
      *
@@ -340,10 +483,30 @@ export class AccountPool {
             this.modelCache = state.disabledModels;
             // 聚合拒绝表同理：老文档没有该键 → 保持空表（没有任何拒绝）。
             this.aggregateRejectionCache = state.aggregateRejections ?? {};
+            // 门控白名单 / 手工顺序表 / 排序模式同理：老文档没有这些键 → 缺省值
+            //（空白名单 = 未接入渠道仍不参与、空顺序表 = 未自定义、临期序 = 升级前行为）。
+            this.aggregateAllowedCache = state.aggregateAllowed ?? {};
+            this.aggregateOrderCache = state.aggregateOrder ?? {};
+            this.aggregateOrderModeCache = state.aggregateOrderMode === 'manual' ? 'manual' : 'expiry';
             // 网关开关同理：老文档没有该键 → 保持默认启用。
             this.gatewayEnabledCache = state.gatewayEnabled !== false;
+            // 局域网开关同理：老文档没有该键 → 保持默认关闭（安全默认，暴露面变大
+            // 必须是显式选择）。与 store 侧 `sanitizeGatewayAllowLan` 同一判据。
+            this.gatewayAllowLanCache = state.gatewayAllowLan === true;
+            // 原生搜索总开关同理：老文档没有该键 → 保持默认启用。
+            this.nativeWebSearchCache = state.nativeWebSearchEnabled !== false;
+            // 面板入口同理：老文档没有该键（或值是脏值）→ 回到默认「仅侧栏」。
+            // 过一遍 sanitize：store 层的 load 已归一，这里再判一次是因为老契约
+            // 后端可能绕过 schema 直接给出原始文档。
+            this.panelEntryCache = sanitizePanelEntry(state.panelEntry);
             // 供应商顺序同理：老文档没有该键 → 空数组（未自定义）。
             this.providerOrderCache = state.providerOrder ?? [];
+            // MiniMax 国际站 XFF 同理：老文档没有该键 → `undefined`（不附头，
+            // 与修复前行为逐字节一致）。**过一遍 sanitize**：老文档里可能有脏值。
+            this.minimaxXffCache = sanitizeMinimaxXff(state.minimaxXff);
+            // 供应商关闭意图同理：老文档没有该键 → 空表（没有任何供应商被关闭，
+            // 与升级前行为一致）。**过一遍 sanitize**：老文档里可能有脏值。
+            this.providerClosedCache = sanitizeProviderClosed(state.providerClosed);
         }
         this.loadLocks(state);
     }
@@ -422,11 +585,35 @@ export class AccountPool {
                 disabledModels: this.modelCache,
                 // 与上面两份同源快照（见本方法注释：分两次快照会让同一份文档里的字段互相矛盾）。
                 aggregateRejections: this.aggregateRejectionCache,
+                // ⚠️⚠️ 三个新键**必须**与上面取自**同一时刻**的快照（`replace` 是整体替换语义）：
+                //    漏一个 ⇒ 该键永不落盘，且**任何**账号/黑名单写入都会顺带把它抹掉。
+                //    其中白名单丢失属「静默改路由」（用户手工打开的无临期渠道悄悄回到不参与）。
+                aggregateAllowed: this.aggregateAllowedCache,
+                aggregateOrder: this.aggregateOrderCache,
+                aggregateOrderMode: this.aggregateOrderModeCache,
                 ...this.lockFields(),
                 // ⚠️ 必须与账号、黑名单取自**同一时刻**的快照（见本方法的注释）：
                 // 分两次快照会让同一份文档里的字段互相矛盾。
                 gatewayEnabled: this.gatewayEnabledCache,
+                // ⚠️ 必须与上面取自同一时刻的快照（replace 是整体替换语义）：
+                //    漏键 ⇒ 用户打开的「允许局域网访问」在任何一次其它写入时被抹掉，
+                //    重启后静默回到只绑回环（用户会以为开关坏了）。
+                gatewayAllowLan: this.gatewayAllowLanCache,
+                nativeWebSearchEnabled: this.nativeWebSearchCache,
+                // ⚠️ **必须带上本键**（与 `nativeWebSearchEnabled` 同一个整体替换陷阱）：
+                //    漏键会让用户改过的面板入口在**任何**一次账号/黑名单/网关/顺序写入时
+                //    被静默清掉，重启后入口又变回默认「仅侧栏」。
+                panelEntry: this.panelEntryCache,
                 providerOrder: this.providerOrderCache,
+                // ⚠️ **必须带上本键**（同 `nativeWebSearchEnabled` 的坑）：
+                //    `write` 是整体替换语义 ⇒ 漏键会让用户设的 XFF 在**任何**一次
+                //    改账号 / 改黑名单 / 改网关 / 拖顺序时被静默清掉，
+                //    症状是「国际站明明设好了 XFF，过一阵又开始 307」。
+                minimaxXff: this.minimaxXffCache,
+                // ⚠️⚠️ **必须与上面几份取自同一时刻的快照**（`replace` 是整体替换语义）：
+                //    漏键 ⇒ 关闭意图**永不落盘**，且任何账号/黑名单写入都会把它抹掉
+                //    ⇒ 重启后供应商静默回到「已打开」（Gitee issue IKP8OF 原样复发）。
+                providerClosed: this.providerClosedCache,
             });
         });
         this.storeChain = next.catch(() => { });
@@ -512,6 +699,84 @@ export class AccountPool {
         return { ...(this.modelCache[provider] ?? {}) };
     }
     /**
+     * 该 provider 是否处于「**用户要求整体关闭**」态（Gitee issue IKP8OF）。
+     *
+     * ## ⚠️⚠️ 这是「关闭**意图**」，不是「当前是否真的全关」——两个判据必须分开
+     *
+     * | 判据 | 含义 | 谁用 |
+     * |---|---|---|
+     * | 本方法 | 用户点过「关闭供应商」，且此后没再打开过它 | 过滤（选择器 / 路由）、`provider.status` |
+     * | `disabled === total` | 目录里**每一个**模型都在黑名单里 | 兜底（用户逐条关光也算关闭） |
+     *
+     * 二者取**或**才是 `closed`（见 `provider.status`）。只读本方法会漏掉
+     * 「用户逐条关光」（既有语义，有既有用例锁定）；只读派生判据会漏掉
+     * 「关闭后目录继续变长」（本 issue）。
+     *
+     * ## 为什么它是修「新模型仍可选」的关键
+     *
+     * 关闭供应商时只写入了**当时目录**的黑名单；目录随后变长，新 id 不在黑名单里
+     * ⇒ 它们**可被选中**。本意图表让「该 provider 整体关闭」这件事不再依赖
+     * 目录快照 ⇒ 各适配器的 `listModels` 见它即返回 `[]`，选择器里**一条都不出现**。
+     *
+     * ⚠️ **纯内存同步读、零 IO**：本方法在 `provider.status`（设置页挂载时对
+     * 每个供应商各调一次）与每次 `listModels` 的路径上，不能有 await 或磁盘读。
+     */
+    providerClosedFor(provider) {
+        this.ensureLoaded();
+        return this.providerClosedCache[provider] === true;
+    }
+    /**
+     * 设置/清除某 provider 的「整体关闭」意图（Gitee issue IKP8OF）。
+     *
+     * ⚠️ **只动意图，不动黑名单**：黑名单由 `provider.setEnabled` 按固定顺序
+     * 显式处理（先关模型、再停账号）。本方法只回答「用户要求这个供应商关着吗」。
+     *
+     * ⚠️ 幂等且无变更不落盘（与 `setModelsDisabled` 的「空列表不落盘」同精神）：
+     * 重复点同一个开关不该产生一次文档重写。
+     */
+    async setProviderClosed(provider, closed) {
+        this.ensureLoaded();
+        // ⚠️ 显式括号：`===` 左结合，`a === true === closed` 虽等价于
+        //    `(a === true) === closed`，但读的人要多想一步（易被误读成
+        //    `a === (true === closed)` —— 那在 `closed=false` 时**恒真**，
+        //    会让「打开」变成静默空操作）。
+        if ((this.providerClosedCache[provider] === true) === closed)
+            return;
+        const next = { ...this.providerClosedCache };
+        if (closed)
+            next[provider] = true;
+        else
+            delete next[provider];
+        this.providerClosedCache = next;
+        if (this.store.kind === 'memory') {
+            this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，供应商关闭状态未落盘');
+            return;
+        }
+        await this.queueStoreSave();
+    }
+    /**
+     * 清除「整体关闭」意图 —— **任何**打开方向的操作都必须走这里。
+     *
+     * ## ⚠️⚠️ 为什么必须在「打开」时清除，否则用户点不动
+     *
+     * 意图为 `true` 时，全部模型都被过滤掉（`listModels` 返回 `[]`）、设置页里
+     * 每条模型开关也显示为「已关闭」。此时用户在模型列表里打开**某一个**模型，
+     * 若意图不清除 ⇒ 该模型仍被整体关闭拦掉 ⇒ **点击看起来毫无效果**，
+     * 而界面也不报错。这与本仓库反复修的「开关点了没反应」同型。
+     *
+     * ⇒ 语义定为：**「打开任意一个模型」= 用户想让这个供应商可用** ⇒ 清除意图，
+     * 之后由派生判据（黑名单是否覆盖全目录）如实反映「还剩几个关着」。
+     *
+     * ⚠️ 三个打开入口（`setModelDisabled(false)` / `clearModelsDisabled` /
+     * `clearDisabledModels`）都在**本类内部**调用它 —— 调用方（RPC 层）不需要
+     * 记得清，这正是「收口到一个实现」的目的。
+     */
+    async clearProviderClosed(provider) {
+        if (this.providerClosedCache[provider] !== true)
+            return;
+        await this.setProviderClosed(provider, false);
+    }
+    /**
      * 聚合「拒绝轮换」表的**只读快照**（供适配器与设置面板读取）。
      *
      * ⚠️ 返回**浅拷贝的顶层**（避免调用方改到内部缓存），但内层仍共享引用 ——
@@ -531,13 +796,7 @@ export class AccountPool {
      */
     async setAggregateRejected(canonicalId, provider, realId, rejected) {
         this.ensureLoaded();
-        const next = { ...this.aggregateRejectionCache };
-        const perProvider = { ...(next[canonicalId] ?? {}) };
-        const perRealId = { ...(perProvider[provider] ?? {}) };
-        if (rejected)
-            perRealId[realId] = true;
-        else {
-            delete perRealId[realId];
+        if (!rejected) {
             // ⚠️⚠️ **「重新打开」必须一并清掉该渠道的「漂移兄弟键」**（真实缺陷，
             //    独立审计实测证伪 —— D4 的降级会让拒绝**不可恢复**）。
             //
@@ -545,48 +804,157 @@ export class AccountPool {
             // D4 规定：`(虚拟模型, 渠道)` 下有 `true` 记录、但那些 `realId` **都不在**
             // 当前候选中（id 漂移）⇒ **降级为渠道级拒绝**（该渠道全部候选都被拒）。
             // 而漂移的**旧键会一直留在表里** ⇒ 用户按降级 warn 的指引来面板
-            // 「重新打开」**当前**候选时，上面那行 `delete perRealId[realId]` 删的是
-            // **当前**键，**旧键仍在** ⇒ 降级判据依然成立 ⇒ **降级继续生效**：
+            // 「重新打开」**当前**候选时，只删**当前**键 ⇒ **旧键仍在** ⇒ 降级判据依然
+            // 成立 ⇒ **降级继续生效**：
             //   - 面板用 `isRejected(表, 当前 realId)` 判断显示 ⇒ 显示「参与轮换」；
             //   - 宿主实际**仍拒绝** ⇒ **显示与行为分叉**；
             //   - 于是 warn 指引的那条恢复路径**走不通**（用户怎么点都没用）。
             //
             // ## 修法与判据
             // 用户在面板上「重新打开」某条候选，其**意图**是「让这个渠道在这个模型下
-            // 重新参与轮换」。而 D4 的降级语义本就是**渠道级**的（要么整渠道拒、
-            // 要么整渠道参与）⇒ 故「打开一条」在该渠道处于降级态时，唯一自洽的结果
-            // 就是**整渠道恢复**。保留漂移旧键会让拒绝永远无法撤销，那不是规格要的
-            //（§5.2 与 `jet-hub-store.ts`：「拒绝 ≠ 关闭，可重新打开」）。
+            // 重新参与轮换」。而 D4 的降级语义本就是**渠道级**的 ⇒ 故唯一自洽的结果
+            // 就是**整渠道恢复**。
+            //
+            // ⚠️⚠️ 语义与理由**只留一份实现**：搬到 `jet-hub-store.ts` 的
+            //    `clearRejectionLayer()`（纯函数），本方法与 `setAggregateAllowed` 之外的
+            //    写入路径共用 —— 别在这里再手写一遍（初版曾把 `delete perProvider[provider]`
+            //    与写回的顺序写反 ⇒ 删除被自己覆盖，降级不解除）。
             //
             // ⚠️ 与 `clearAggregateRejected(canonicalId, provider)` 的区别：本分支只在
             //    用户**显式打开某一条**时触发（且只清本渠道，不碰其它渠道）；
             //    那个方法支持按虚拟模型/按渠道批量清（含从未拒绝过的）。语义不同故并存。
-            //
-            // ⚠️ 方向取「清整渠道层」而不是「只删漂移的那几个键」：后者要求这里知道
-            //    **当前候选表**（本层拿不到，它属于适配器），且「用户的意图是让整渠道
-            //    恢复」这一语义判断与删几个键无关 —— 见上方判据。
-            //
-            // ⚠️⚠️ **必须直接 `return`，不能让下面的写回把 `perRealId` 又挂回去**
-            //   （我自己第一版正是如此：`delete perProvider[provider]` 之后紧跟
-            //    `perProvider[provider] = perRealId` ⇒ **删除被自己覆盖**，
-            //    于是旧键仍在、降级不解除 —— 独立审计用真实池实测证伪了这一点）。
-            delete perProvider[provider];
-            if (Object.keys(perProvider).length === 0)
-                delete next[canonicalId];
-            else
-                next[canonicalId] = perProvider;
-            await this.writeAggregateRejections(next);
+            this.aggregateRejectionCache = clearRejectionLayer(this.aggregateRejectionCache, canonicalId, provider);
+            await this.writeAggregateRouting('聚合拒绝表');
             return;
         }
-        if (Object.keys(perRealId).length === 0)
-            delete perProvider[provider];
-        else
-            perProvider[provider] = perRealId;
-        if (Object.keys(perProvider).length === 0)
+        const next = { ...this.aggregateRejectionCache };
+        const perProvider = { ...(next[canonicalId] ?? {}) };
+        const perRealId = { ...(perProvider[provider] ?? {}) };
+        perRealId[realId] = true;
+        // ⚠️ **不动白名单**（用户 2026-10-15 的修正）：写拒绝是**已接入渠道**这条域上的操作，
+        //    白名单是另一条域。初版曾在此「顺手清同键白名单」，那是把「归一」当成了目的 ——
+        //    它会静默改掉另一张表里属于别的操作的用户状态。跨域残留（同键双命中）由
+        //    `resolveCandidateGate` 的优先级兜住（拒绝优先），属纵深防御。
+        perProvider[provider] = perRealId;
+        next[canonicalId] = perProvider;
+        this.aggregateRejectionCache = next;
+        await this.writeAggregateRouting('聚合拒绝表');
+    }
+    /**
+     * 聚合「显式允许」白名单的只读快照（与 {@link listAggregateRejections} 同口径：
+     * 顶层浅拷贝、内层仍共享引用，调用方**只读**）。
+     */
+    listAggregateAllowed() {
+        this.ensureLoaded();
+        return this.aggregateAllowedCache;
+    }
+    /**
+     * 设置某条候选是否**显式允许**参与轮换（用户手工打开 / 关闭）。
+     *
+     * ⚠️ **只动白名单、不碰拒绝表**（见 {@link aggregateAllowedCache} 的说明）：
+     * 白名单服务的是未接入折算的候选（默认不参与），拒绝表服务的是已接入的候选
+     *（默认参与）—— 两表的键域天然不相交。
+     *
+     * ⚠️ `allowed === false` 走**删键**（不留 `false` 噪音，与 `setAggregateRejected` 同口径）：
+     * 表里一旦被 `false` 污染，下次读取就有人按 truthy 判成「允许」= 静默放行一个
+     * 我们没有余额信息的渠道。
+     */
+    async setAggregateAllowed(canonicalId, provider, realId, allowed) {
+        this.ensureLoaded();
+        this.aggregateAllowedCache = allowed
+            ? withAllowed(this.aggregateAllowedCache, canonicalId, provider, realId)
+            : withoutAllowed(this.aggregateAllowedCache, canonicalId, provider, realId);
+        await this.writeAggregateRouting('聚合允许表');
+    }
+    /**
+     * 一键「拒绝非临期」：把 `keepProviders`（= **已接入**临期折算的渠道）**之外**的白名单
+     * 条目全部清掉，让那些渠道回到「默认不参与」的初始态（用户后续仍可逐条手工打开）。
+     *
+     * ⚠️ 池**不知道**「接入临期折算」是什么语义：它只收到一份「要保留哪些 provider」的清单，
+     *    该清单由调用方（RPC 层）从权威常量 `WIRED_EXPIRY_PROVIDERS` 取。这样「谁是未接入渠道」
+     *    的权威仍然只有那一个常量（本仓库「同一事实两处判据」的红线）。
+     *
+     * @returns `cleared` = 清掉的**候选条数**（面板提示要用它）；`aggregateAllowed` = 清后的白名单。
+     * ⚠️ `cleared === 0` 时**不写盘**（幂等；也避免把一次空点击变成一次整体替换）。
+     */
+    async clearAggregateAllowedExcept(keepProviders) {
+        this.ensureLoaded();
+        const keep = new Set(keepProviders);
+        const next = {};
+        let cleared = 0;
+        for (const [canonicalId, byProvider] of Object.entries(this.aggregateAllowedCache)) {
+            const keptProviders = {};
+            for (const [provider, byRealId] of Object.entries(byProvider)) {
+                if (keep.has(provider))
+                    keptProviders[provider] = byRealId;
+                else
+                    cleared += Object.keys(byRealId).length;
+            }
+            if (Object.keys(keptProviders).length > 0)
+                next[canonicalId] = keptProviders;
+        }
+        if (cleared > 0) {
+            this.aggregateAllowedCache = next;
+            await this.writeAggregateRouting('聚合允许表');
+        }
+        return { cleared, aggregateAllowed: this.aggregateAllowedCache };
+    }
+    /** 聚合手工顺序表的只读快照（缺键 = 未自定义）。 */
+    listAggregateOrder() {
+        this.ensureLoaded();
+        return this.aggregateOrderCache;
+    }
+    /**
+     * 写入某虚拟模型的**手工顺序**。
+     *
+     * ⚠️ **过滤与去重必须在这里做**（服务端是权威）：入参是客户端拖动后拼出来的数组，
+     *    可能含「不含 NUL 分隔符的畸形元素」与「重复元素」。重复会让比较器**非确定**
+     *   （同一候选有两个位次）；畸形元素在适配器里解析不出 `(provider, realId)`
+     *    ⇒ 静默失效（顺序表看着有内容却全不生效）。
+     *
+     * ⚠️ 返回**落盘后的权威数组**（不是入参回声）—— 客户端据此校正本地状态，
+     *    否则「客户端以为排好了、服务端丢了一半」会长期分叉。
+     * ⚠️ 空数组 = 未自定义（删键，回落临期序）。
+     */
+    async setAggregateOrder(canonicalId, entries) {
+        this.ensureLoaded();
+        const seen = new Set();
+        const kept = [];
+        for (const entry of entries) {
+            if (typeof entry !== 'string' || !entry.includes('\u0000'))
+                continue;
+            if (seen.has(entry))
+                continue;
+            seen.add(entry);
+            kept.push(entry);
+        }
+        const next = { ...this.aggregateOrderCache };
+        if (kept.length === 0)
             delete next[canonicalId];
         else
-            next[canonicalId] = perProvider;
-        await this.writeAggregateRejections(next);
+            next[canonicalId] = kept;
+        // ⚠️ 必须在写盘**之前**更新缓存：`queueStoreSave` 读的是缓存字段（不是入参），
+        //    顺序反了会让返回值与落盘内容都是旧值（本仓库「写回被自己覆盖」的同型缺陷）。
+        this.aggregateOrderCache = next;
+        await this.writeAggregateRouting('聚合手工顺序');
+        return this.aggregateOrderCache[canonicalId] ?? [];
+    }
+    /** 排序模式（`'expiry'` = 升级前行为）。 */
+    listAggregateOrderMode() {
+        this.ensureLoaded();
+        return this.aggregateOrderModeCache;
+    }
+    /**
+     * 切换排序模式并落盘。
+     *
+     * ⚠️ 幂等：写同一个值**不落盘**（一次空点击不该触发一次整体替换）。
+     */
+    async setAggregateOrderMode(mode) {
+        this.ensureLoaded();
+        if (this.aggregateOrderModeCache === mode)
+            return;
+        this.aggregateOrderModeCache = mode === 'manual' ? 'manual' : 'expiry';
+        await this.writeAggregateRouting('聚合排序模式');
     }
     /**
      * 清空拒绝表（支持按虚拟模型或按渠道清）。
@@ -602,7 +970,8 @@ export class AccountPool {
     async clearAggregateRejected(canonicalId, provider) {
         this.ensureLoaded();
         if (canonicalId === undefined && provider === undefined) {
-            await this.writeAggregateRejections({});
+            this.aggregateRejectionCache = {};
+            await this.writeAggregateRouting('聚合拒绝表');
             return;
         }
         const next = {};
@@ -619,14 +988,23 @@ export class AccountPool {
             if (Object.keys(kept).length > 0)
                 next[key] = kept;
         }
-        await this.writeAggregateRejections(next);
+        this.aggregateRejectionCache = next;
+        await this.writeAggregateRouting('聚合拒绝表');
     }
-    /** 落盘拒绝表（与 {@link writeModels} 对称）。 */
-    async writeAggregateRejections(rejections) {
-        this.aggregateRejectionCache = rejections;
+    /**
+     * 落盘**聚合路由族**的全部状态（拒绝表 / 白名单 / 手工顺序表 / 排序模式）。
+     *
+     * ⚠️ 四份状态**共用一个写方法**：它们是同一份文档里的同一族状态，分开写会让
+     *    「一次用户操作」产生两次整体替换，中间那一刻的快照自相矛盾
+     *   （本仓库已有「分两次快照让同一份文档里的字段互相矛盾」的缺陷史）。
+     * ⚠️ 调用方**必须先把 `this.xxxCache` 换成新值**再调本方法 ——
+     *    `queueStoreSave` 读的是缓存字段，不是入参。
+     * ⚠️ `label` 只用于日志，便于排障时区分是哪张表触发的落盘。
+     */
+    async writeAggregateRouting(label) {
         this.loaded = true;
         if (this.store.kind === 'memory') {
-            this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，聚合拒绝表变更未落盘');
+            this.ctx.logger?.warn?.(`[jet-hub] 无持久化后端，${label}变更未落盘`);
             return;
         }
         await this.queueStoreSave();
@@ -657,6 +1035,97 @@ export class AccountPool {
         this.loaded = true;
         if (this.store.kind === 'memory') {
             this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，网关开关仅本次会话有效');
+            return;
+        }
+        await this.queueStoreSave();
+    }
+    /**
+     * 「允许局域网访问」开关当前是否打开。
+     *
+     * 缺键语义为**关闭**（安全默认：暴露面变大必须是显式选择），见
+     * {@link gatewayAllowLanCache}。
+     */
+    gatewayAllowLan() {
+        this.ensureLoaded();
+        return this.gatewayAllowLanCache;
+    }
+    /**
+     * 打开/关闭「允许局域网访问」并落盘。
+     *
+     * ⚠️ 与 {@link setGatewayEnabled} 同约定：只改状态，不重建 HTTP server ——
+     * 换绑（关旧实例 → 建新实例）由 `src/openai-gateway/runtime.ts` 在调用方
+     * 做完持久化后接手。
+     */
+    async setGatewayAllowLan(allowLan) {
+        this.ensureLoaded();
+        if (this.gatewayAllowLanCache === allowLan)
+            return;
+        this.gatewayAllowLanCache = allowLan;
+        this.loaded = true;
+        if (this.store.kind === 'memory') {
+            this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，局域网开关仅本次会话有效');
+            return;
+        }
+        await this.queueStoreSave();
+    }
+    /**
+     * 「渠道原生搜索」总开关当前是否启用。
+     *
+     * 缺键语义为**启用**（见 {@link nativeWebSearchCache}）。
+     *
+     * ⚠️ 调用方（`web-native.ts` 的监听器）**必须每次现读**，不能缓存返回值：
+     * 用户随时可能在 Jet Hub 面板里切换。
+     */
+    nativeWebSearchEnabled() {
+        this.ensureLoaded();
+        return this.nativeWebSearchCache;
+    }
+    /**
+     * 打开/关闭「渠道原生搜索」并落盘。
+     *
+     * 关闭后，即使 CodeBuddy / WorkBuddy 渠道也改为走 DeepSeek 官方搜索
+     *（需要 `DEEPSEEK_API_KEY`）—— 即所有渠道的搜索行为统一。
+     */
+    async setNativeWebSearchEnabled(enabled) {
+        this.ensureLoaded();
+        if (this.nativeWebSearchCache === enabled)
+            return;
+        this.nativeWebSearchCache = enabled;
+        this.loaded = true;
+        if (this.store.kind === 'memory') {
+            this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，原生搜索开关仅本次会话有效');
+            return;
+        }
+        await this.queueStoreSave();
+    }
+    /**
+     * 「面板入口」的当前取值：Jet Hub 的唯一入口位置。
+     *
+     * 缺键语义为 `'sidebar'`「仅侧栏」（见 {@link panelEntryCache}）。
+     *
+     * ⚠️ 调用方（客户端在 `apply` 里注册两处入口前）**必须每次现读**，不能缓存
+     * 返回值：用户随时可能在插件详情页的卡片里改它，而客户端只在启动时读一次。
+     */
+    panelEntry() {
+        this.ensureLoaded();
+        return this.panelEntryCache;
+    }
+    /**
+     * 改「面板入口」并落盘。
+     *
+     * 两个取值**严格互斥**，任一时刻只有一个入口存在：
+     * - `'sidebar'`：主导航里多一行，`settings.section` 那一节注销；
+     * - `'settings'`：只剩「设置 → 插件 → Jet Hub」，主导航那一行注销。
+     * 两种情况下 Jet Hub 页面本身的功能完全不受影响（同一组件、同一份 rpcCall）。
+     */
+    async setPanelEntry(entry) {
+        this.ensureLoaded();
+        if (this.panelEntryCache === entry)
+            return;
+        this.panelEntryCache = entry;
+        this.loaded = true;
+        if (this.store.kind === 'memory') {
+            this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，面板入口仅本次会话有效');
             return;
         }
         await this.queueStoreSave();
@@ -693,6 +1162,40 @@ export class AccountPool {
         await this.queueStoreSave();
     }
     /**
+     * 当前设置的 MiniMax 国际站 `X-Forwarded-For` 值；`undefined` = 不附头。
+     *
+     * ⚠️ 请求侧（`minimax.ts` 的 `minimaxHeadersFor`）**必须每次现读**，不能缓存：
+     * 用户随时可能在面板里改这个设置。
+     */
+    minimaxXff() {
+        this.ensureLoaded();
+        return this.minimaxXffCache;
+    }
+    /**
+     * 设置（或清除）MiniMax 国际站的 `X-Forwarded-For` 并落盘。
+     *
+     * 传空串 / `undefined` = **清除**（不附头）。校验由 `sanitizeMinimaxXff` 统一做：
+     * 非法值（主机名、XFF 链、含换行等）**不会**被写进缓存 —— 于是「填了个坏值」
+     * 与「没填」等价，不会让请求带上一个可能触发头注入的串。
+     *
+     * ⚠️ 非法值**静默归一为 `undefined`** 而不是抛错：本设置是可选逃生口，
+     * 用户输错一个字符就报错阻断保存只会更糟。但 RPC 层会把**归一后的实际值**
+     * 回给客户端，UI 照它渲染，用户能立刻看出「没生效」。
+     */
+    async setMinimaxXff(value) {
+        this.ensureLoaded();
+        const next = sanitizeMinimaxXff(value);
+        if (this.minimaxXffCache === next)
+            return;
+        this.minimaxXffCache = next;
+        this.loaded = true;
+        if (this.store.kind === 'memory') {
+            this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，MiniMax XFF 设置仅本次会话有效');
+            return;
+        }
+        await this.queueStoreSave();
+    }
+    /**
      * 打开/关闭某个模型。
      *
      * 关闭时写入 `true`；打开时**删除该键**而不是写 `false` —— 保持黑名单
@@ -711,6 +1214,11 @@ export class AccountPool {
         else
             next[provider] = perProvider;
         await this.writeModels(next);
+        // ⚠️ **打开任意一个模型 ⇒ 清除「整体关闭」意图**（Gitee issue IKP8OF）。
+        // 理由见 {@link clearProviderClosed}：意图为真时全部模型都被过滤掉，
+        // 用户此时打开某一个模型若不清意图，会「点了没反应」且零报错。
+        if (!disabled)
+            await this.clearProviderClosed(provider);
     }
     /**
      * 批量关闭一批模型（Jet Hub 模型列表的「关闭全部」）。
@@ -758,8 +1266,18 @@ export class AccountPool {
         // 去判「有没有变更」，进而漏掉磁盘上真实存在的关闭项。
         this.ensureLoaded();
         const perProvider = this.modelCache[provider];
-        if (perProvider === undefined)
+        if (perProvider === undefined) {
+            // ⚠️⚠️ **黑名单里没有该 provider 时也必须清意图**（Gitee issue IKP8OF，
+            // 真实缺陷：独立审计实测本入口是**唯一**漏清的一条）。
+            //
+            // 真实形态：用户关闭了供应商 ⇒ 黑名单 = **当时目录**的 id；目录随后变长
+            // ⇒ 新模型**不在黑名单里**。用户在设置页对「只含这些新模型的分组」点
+            // 「本组全开」⇒ 走到本方法 ⇒ 一个键都删不掉 ⇒ 早期这里直接 `return`
+            // ⇒ 意图永远为真 ⇒ `listModels` 恒返回 `[]`。
+            // 用户看到的是：**点了、没报错、模型列表纹丝不动**。
+            await this.clearProviderClosed(provider);
             return;
+        }
         const nextPerProvider = { ...perProvider };
         let changed = false;
         for (const id of modelIds) {
@@ -768,8 +1286,13 @@ export class AccountPool {
                 changed = true;
             }
         }
-        if (!changed)
+        if (!changed) {
+            // ⚠️⚠️ 同上：`!changed` 是**意图关闭态的必然形态**（要打开的那些 id 恰好
+            // 都不在黑名单里），早期这里直接 `return` ⇒ 意图不清 ⇒ 点击变成死操作。
+            // 与 `clearDisabledModels` 的同名分支**逐字同构**。
+            await this.clearProviderClosed(provider);
             return;
+        }
         const next = { ...this.modelCache };
         // 与 setModelDisabled 同约定：该 provider 一个关闭项都不剩时删掉整个键，
         // 配置文件不随开关操作膨胀。
@@ -778,6 +1301,8 @@ export class AccountPool {
         else
             next[provider] = nextPerProvider;
         await this.writeModels(next);
+        // ⚠️ 打开方向 ⇒ 清除「整体关闭」意图（同 {@link setModelDisabled}）。
+        await this.clearProviderClosed(provider);
     }
     /**
      * 批量启用/停用某 provider 的**全部**账号（Jet Hub 左侧供应商一键开关）。
@@ -850,11 +1375,120 @@ export class AccountPool {
         // 同 setModelsDisabled：写路径必须自己保证已载入，否则「本就为空」的判据
         // 会建立在未载入的空表上（磁盘上有黑名单却被判成无事可做）。
         this.ensureLoaded();
-        if (this.modelCache[provider] === undefined)
+        if (this.modelCache[provider] === undefined) {
+            // ⚠️⚠️ **黑名单本就为空时也必须清意图**（Gitee issue IKP8OF）。
+            // 早期这里直接 `return`，而「关闭供应商」在**目录读失败但并集非空**的
+            // 形态下会写下意图却不写黑名单吗？不会 —— 但反过来成立：
+            // 用户先关（意图 + 黑名单），随后**逐条打开**全部模型（黑名单被逐键删光），
+            // 意图由 `clearModelsDisabled` 清掉；若那条路径没清，这里就是**最后一道**
+            // 能救回来的地方。若本分支直接返回 ⇒ 意图永远为真 ⇒ 模型选择器恒空。
+            await this.clearProviderClosed(provider);
             return;
+        }
         const next = { ...this.modelCache };
         delete next[provider];
         await this.writeModels(next);
+        // ⚠️ 打开方向 ⇒ 清除「整体关闭」意图（同 {@link setModelDisabled}）。
+        await this.clearProviderClosed(provider);
+    }
+    /**
+     * 一次性写入「模型黑名单 + 供应商关闭意图」并落盘**一次**（Gitee issue IKP8OF）。
+     *
+     * ## ⚠️⚠️ 为什么必须合并成一次落盘（真实窗口，已实测）
+     *
+     * `provider.setEnabled(false)` 的语义是「关掉全部模型 + 记下关闭意图」。
+     * 若分两次落盘（先 `setModelsDisabled`、再 `setProviderClosed`），第二次失败时：
+     *
+     * ```
+     * 磁盘: disabledModels = {buddy:{a:true,b:true}}   ← 已写
+     * 磁盘: providerClosed  = {}                        ← 未写（失败）
+     * 内存: providerClosedFor = true                    ← 内存已是 true，本次会话看起来正常
+     * ```
+     *
+     * 后果是**重启后静默复发**：意图丢了 ⇒ 只剩派生判据 ⇒ 目录一变长就翻回
+     * 「已打开」（正是本 issue 的症状），而用户完全不知道「上次关闭其实只成了一半」。
+     *
+     * ⇒ 两者必须**同一份快照、同一次 `save`**：要么都落盘、要么都不落盘。
+     * 这与 `queueStoreSave` 的既有约定（账号 / 黑名单 / 各开关**取自同一时刻**）
+     * 完全同源 —— 那份注释里已写明「分两次快照会让同一份文档里的字段互相矛盾」。
+     *
+     * ## 参数语义：**合并**（与 `setModelsDisabled` 同口径）
+     *
+     * 传「要追加关闭的 id 列表」而不是整张表 —— 这样调用方不必先读全表再拼，
+     * 少一次「读 → 拼 → 写」的往返，也就少一个读到的快照过期的时间窗。
+     *
+     * @param provider - provider id
+     * @param modelIds - 要**追加**进黑名单的 id（已有的关闭项不受影响）
+     * @param closed - 目标关闭意图（`true` 写入 / `false` 删除该键）
+     */
+    async writeModelsWithProviderClosed(provider, modelIds, closed) {
+        this.ensureLoaded();
+        const next = { ...this.modelCache };
+        if (modelIds.length > 0) {
+            const perProvider = { ...(next[provider] ?? {}) };
+            for (const id of modelIds)
+                perProvider[id] = true;
+            next[provider] = perProvider;
+        }
+        this.modelCache = next;
+        const nextClosed = { ...this.providerClosedCache };
+        if (closed)
+            nextClosed[provider] = true;
+        else
+            delete nextClosed[provider];
+        this.providerClosedCache = nextClosed;
+        this.loaded = true;
+        if (this.store.kind === 'memory') {
+            this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，模型黑名单与关闭状态变更未落盘');
+            return;
+        }
+        await this.queueStoreSave();
+    }
+    /**
+     * 一次性**清空**某 provider 的黑名单**并**清除「关闭意图」并落盘**一次**
+     *（Gitee issue IKP8OF，「打开供应商」专用）。
+     *
+     * ## ⚠️⚠️ 为什么必须合并（对抗审计打穿的真实窗口）
+     *
+     * 「打开供应商」原先走两步：`clearDisabledModels`（save #1）→
+     * `setProviderClosed(false)`（save #2）。实测 `saves=2`，两次 `replace` 之间
+     * 磁盘上是「**黑名单空 + 意图真**」。若第二次失败或进程被杀：
+     *
+     * ```
+     * 磁盘: disabledModels = {}            ← 已清
+     * 磁盘: providerClosed  = {buddy:true} ← 仍是「已关闭」
+     * 内存: providerClosedFor = false      ← 本次会话看起来正常
+     * ```
+     *
+     * ⇒ **重启后该供应商的模型选择器恒空**（意图真 + 黑名单空 ⇒ `listModels` 返回
+     * `[]`、`provider.status` 报 `closed:true`），而设置页黑名单里一条关闭项都没有
+     * ⇒ 用户无从归因，只能手工编辑 `state.json`。
+     *
+     * ⚠️ 危险的那条路径恰好是**最常见**的一条：只有「黑名单本来就空」时
+     * `clearDisabledModels` 才会一次写完（它的早退分支）；黑名单非空（= 用户真的
+     * 关过东西、现在要打开）时必然两次。
+     *
+     * ⚠️ 语义与 {@link clearDisabledModels} **逐字相同**（清空该 provider 的全部键，
+     * 含历史死键），只是把「清意图」并进同一次落盘。
+     */
+    async clearModelsWithProviderClosed(provider) {
+        this.ensureLoaded();
+        const next = { ...this.modelCache };
+        const hadModels = next[provider] !== undefined;
+        delete next[provider];
+        const nextClosed = { ...this.providerClosedCache };
+        delete nextClosed[provider];
+        const hadIntent = this.providerClosedCache[provider] === true;
+        // 无实际变更不落盘（与 `clearDisabledModels` / `setProviderClosed` 同精神）。
+        if (!hadModels && !hadIntent)
+            return;
+        this.modelCache = next;
+        this.providerClosedCache = nextClosed;
+        if (this.store.kind === 'memory') {
+            this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，模型黑名单与关闭状态变更未落盘');
+            return;
+        }
+        await this.queueStoreSave();
     }
     /** 持久化模型黑名单（同时更新进程内权威副本）。 */
     async writeModels(disabledModels) {
@@ -1209,6 +1843,115 @@ export class AccountPool {
         // —— 而 `account.create`（登录成功即 addAccount）与 `account.delete` 天然可并发。
         // 重新读之后到 `writeAccounts` 之间没有 `await`，因而这一段是原子的。
         await this.writeAccounts(this.readAccounts().filter(a => a.id !== id));
+    }
+    /**
+     * **启动自愈**：按「身份字段」清理同一账号的重复条目（只留一条）。
+     *
+     * ## 为什么需要它（2026-10-19 真机报障）
+     *
+     * AutoClaw 的 `access_token` 是 JWT、**每次登录/续期都轮换**，而早期实现
+     * 拿它当身份判据 ⇒ 同一账号每续一次就被当成新账号。用户面板里同一个手机号
+     * 出现了 **3 次**，积分被**重复累加**：
+     *
+     * ```
+     * 合计 62416 积分
+     *   187****9406  20838
+     *   187****9406  20789
+     *   187****9406  20789
+     * ```
+     *
+     * 判据侧已修（改用稳定的 `user_id`，见 `autoclawIdentityOf`），但**池里已有的
+     * 重复条目不会自己消失** ⇒ 用户仍看到 62416。本方法负责一次性清掉存量。
+     *
+     * ## 保留哪一条
+     *
+     * 保留**凭据最新**的那一条（`expiresAt` 最大者）；`expiresAt` 相同则保留
+     * **先出现**的（与 `writeAccounts` 的「保留首次」同口径，保证确定性）。
+     * ⚠️ 不按 `id` 字典序 —— 那与「哪个账号能续期」无关。
+     *
+     * ## 边界
+     *
+     * - 身份字段缺失的条目**跳过**（无法判断，不误删）；
+     * - 只处理传入的 `provider`，绝不跨渠道合并；
+     * - 每次只删「确认同身份且非保留项」的条目，删除走 {@link removeAccount}
+     *   （它会一并 `credentials.unset`，不留孤儿凭据）；
+     * - 失败不抛：自愈是**尽力而为**，不能因此让插件启动失败。
+     *
+     * @param provider - provider id（如 `autoclaw`）。
+     * @param field - 凭据里作身份判据的字段名（如 `user_id`）。
+     * @returns 实际删除的条目数。
+     */
+    async dedupeByCredentialField(provider, field) {
+        try {
+            const entries = this.readAccounts().filter((a) => a.provider === provider);
+            if (entries.length < 2)
+                return 0;
+            // identity → 该身份下所有条目（按池顺序）
+            const byIdentity = new Map();
+            for (const entry of entries) {
+                const resolved = await this.resolveCredentialByRef(entry.credentialRef);
+                if (resolved === undefined)
+                    continue;
+                const raw = resolved[field];
+                // ⚠️ 缺失/空值 ⇒ 无法判断，**跳过**（不是「不匹配」）。
+                const identity = typeof raw === 'string'
+                    ? raw.trim()
+                    : typeof raw === 'number' && Number.isFinite(raw) ? String(raw) : '';
+                if (identity === '')
+                    continue;
+                const list = byIdentity.get(identity);
+                if (list === undefined)
+                    byIdentity.set(identity, [entry]);
+                else
+                    list.push(entry);
+            }
+            const toRemove = [];
+            for (const [identity, list] of byIdentity) {
+                if (list.length < 2)
+                    continue;
+                // 保留 expiresAt 最大者；相同则保留先出现的。
+                let keep = list[0];
+                for (const candidate of list.slice(1)) {
+                    const keepAt = keep.expiresAt ?? 0;
+                    const candAt = candidate.expiresAt ?? 0;
+                    if (candAt > keepAt)
+                        keep = candidate;
+                }
+                for (const entry of list) {
+                    if (entry.id !== keep.id)
+                        toRemove.push(entry.id);
+                }
+                this.ctx.logger?.warn?.(`[jet-hub] ${provider} 账号去重：${field}=${identity} 有 ${list.length} 条，`
+                    + `保留 ${keep.id}，删除 ${list.length - 1} 条`);
+            }
+            // ⚠️⚠️ **逐条 try**（2026-10-20 审计 P1，实测真缺陷）。
+            //
+            // 原写法 `for (const id of toRemove) await this.removeAccount(id)` 没有内层
+            // 捕获，外层 `catch` 直接 `return 0` ⇒ 中途某条删失败会：
+            //   ① 让**后面所有条都不再删**（自愈半途而废，且下次启动仍会重试，看似无害）；
+            //   ② **谎报**返回值 0 —— 而实际前面已经删掉若干条，调用方的日志
+            //      「已清理 N 条重复账号」会变成「什么都没删」，排查者据此以为自愈没跑。
+            // 实测：3 条同身份、第 2 次 `unset` 抛错 ⇒ 池里剩 3 条、返回 0。
+            //
+            // ⇒ 每条独立兜底，并**如实累计**真正删掉的条数。
+            let removed = 0;
+            for (const id of toRemove) {
+                try {
+                    await this.removeAccount(id);
+                    removed += 1;
+                }
+                catch (error) {
+                    this.ctx.logger?.warn?.(`[jet-hub] ${provider} 账号去重：删除 ${id} 失败（继续处理其余条目）：`
+                        + (error instanceof Error ? error.message : String(error)));
+                }
+            }
+            return removed;
+        }
+        catch (error) {
+            this.ctx.logger?.warn?.(`[jet-hub] ${provider} 账号自愈失败（不影响启动）：`
+                + (error instanceof Error ? error.message : String(error)));
+            return 0;
+        }
     }
     /**
      * 重排某 provider 下账号的顺序（Jet Hub 拖拽排序）。
@@ -1959,8 +2702,7 @@ export class AccountPool {
      *
      * 与 `updateModelRateLimit` 同款：在**最新快照**上做局部合并后整体写回，
      * 避免与并发的账号操作互相覆盖。
-     */
-    async setOpencodeProxy(accountId, proxy) {
+     */ async setOpencodeProxy(accountId, proxy) {
         const accounts = this.readAccounts();
         const idx = accounts.findIndex(a => a.id === accountId);
         if (idx === -1) {
@@ -1975,12 +2717,144 @@ export class AccountPool {
             entry.opencodeProxy = proxy;
         next[idx] = entry;
         await this.writeAccounts(next);
-        this.ctx.logger?.info?.(`[jet-hub] 账号 ${accountId} 代理 → ${proxy.trim().length === 0 ? '直连' : proxy}`);
+        this.ctx.logger?.info?.(`[jet-hub] 账号 ${accountId} 代理 → ${proxyLogText(proxy)}`);
     }
     /** 读取某 opencode 账号的代理（未设置时为空串）。 */
     opencodeProxyFor(accountId) {
         const entry = this.readAccounts().find(a => a.id === accountId);
-        return entry?.opencodeProxy ?? '';
+        return asProxyText(entry?.opencodeProxy);
+    }
+    /**
+     * 设置/清除某 **gemini** 账号的出口代理（Gitee issue IKLTZ2）。
+     *
+     * ⚠️ **刻意与 `setOpencodeProxy` 分开成两份实现**，理由与字段同款：两者的
+     * **语义不同**（opencode = 分份额度 / Gemini = 能不能连通）。共用一份会让
+     * 「清掉 Gemini 的代理」连带清掉 opencode 的出口配置，且日志/判据也会漂移。
+     *
+     * ⚠️ 空串是合法输入（用户显式清除 → 直连），故**不能**用 `if (!proxy) return`
+     * 早退（与 `setOpencodeProxy` 同款，见其注释）。清除时删键而非写空串。
+     */
+    async setGeminiProxy(accountId, proxy) {
+        const accounts = this.readAccounts();
+        const idx = accounts.findIndex(a => a.id === accountId);
+        if (idx === -1) {
+            this.ctx.logger?.warn?.(`[jet-hub] setGeminiProxy: 账号 ${accountId} 不在账号列表中`);
+            return;
+        }
+        const next = [...accounts];
+        const entry = { ...next[idx] };
+        if (proxy.trim().length === 0)
+            delete entry.geminiProxy;
+        else
+            entry.geminiProxy = proxy;
+        next[idx] = entry;
+        await this.writeAccounts(next);
+        this.ctx.logger?.info?.(`[jet-hub] 账号 ${accountId} Gemini 代理 → ${proxyLogText(proxy)}`);
+    }
+    /**
+     * 读取某 gemini 账号的代理（未设置时为空串 = 直连）。
+     *
+     * ⚠️ **必须过 `asProxyText`**（实测的同族缺陷，独立于 IKLTZ2 审计发现）：
+     * 该字段来自**用户可编辑的备份文件**，而 `sanitizeAccounts` 用 `{...candidate}`
+     * 原样透传、不校验形状 ⇒ 池里可能存在 `"geminiProxy": 12345`。下游
+     * `normalizeProxy` 第一句就是 `input.trim()` ⇒ 非字符串会在那里抛
+     * `TypeError: raw.trim is not a function`，该账号**永久不可用且无自愈**
+     * （症状与「代理配置坏了」同形，日志只有一句 TypeError）。
+     */
+    geminiProxyFor(accountId) {
+        const entry = this.readAccounts().find(a => a.id === accountId);
+        return asProxyText(entry?.geminiProxy);
+    }
+    /**
+     * 设置/清除某 **qoder** 账号的出口代理（真实报障 2026-10-21）。
+     *
+     * ⚠️ **刻意与另外两份分开成三份实现**，理由与字段同款：三者语义不同。
+     * Qoder 这里补的是「国际版整站被 SNI 阻断」—— 在本字段之前，用户唯一出路
+     * 是启动 DSH 前导出环境变量，而那会让中国版（本来直连 160ms）也一起去挤代理。
+     *
+     * ⚠️ 空串是合法输入（用户显式清除 → 直连），故**不能**用 `if (!proxy) return`
+     * 早退（与另两份同款，见 `setOpencodeProxy` 的注释）。清除时删键而非写空串。
+     */
+    async setQoderProxy(accountId, proxy) {
+        const accounts = this.readAccounts();
+        const idx = accounts.findIndex(a => a.id === accountId);
+        if (idx === -1) {
+            this.ctx.logger?.warn?.(`[jet-hub] setQoderProxy: 账号 ${accountId} 不在账号列表中`);
+            return;
+        }
+        const next = [...accounts];
+        const entry = { ...next[idx] };
+        if (proxy.trim().length === 0)
+            delete entry.qoderProxy;
+        else
+            entry.qoderProxy = proxy;
+        next[idx] = entry;
+        await this.writeAccounts(next);
+        this.ctx.logger?.info?.(
+        // ⚠️ **只打脱敏后的 `label`，绝不打原始 `proxy`**（2026-10-25 审计 A2-02）：
+        //    代理 URL 常含 `user:pass@host`，明文进日志等于把口令写进用户
+        //    会随手粘贴/上报的文件；而 `label` 保留 host:port 与用户名、口令打码，
+        //    排查时完全够用。
+        `[jet-hub] 账号 ${accountId} Qoder 代理 → ${proxyLogText(proxy)}`);
+    }
+    /**
+     * 设置/清除某 **minimaxintl**（MiniMax 国际站）账号的出口代理。
+     *
+     * ## 为什么它与 `setGeminiProxy` 形状逐字同构却不共用
+     *
+     * 三家的**存在理由各不相同**：
+     * - opencode = 多账号要**分份额度**（不设代理 = 共用一份配额）；
+     * - Gemini = 墙外**能不能连通**（不设代理 = 根本连不上）；
+     * - minimaxintl = 绕开**按出口 IP 国别的分流**（不设代理 = 被 307 到中国站）。
+     *
+     * 合成一份会让「清掉其中一家的代理」连带清掉别家的出口配置 —— 本仓库
+     * 已反复记录这类「同义判据两份实现」的漂移，故**字段与实现都分开**。
+     *
+     * ⚠️ 空串是合法输入（用户显式清除 → 直连），故**不能**用 `if (!proxy) return`
+     * 早退。清除时**删键**而非写空串（空串与「未设置」在 UI 上是两种状态）。
+     */
+    async setMinimaxIntlProxy(accountId, proxy) {
+        const accounts = this.readAccounts();
+        const idx = accounts.findIndex(a => a.id === accountId);
+        if (idx === -1) {
+            this.ctx.logger?.warn?.(`[jet-hub] setMinimaxIntlProxy: 账号 ${accountId} 不在账号列表中`);
+            return;
+        }
+        const next = [...accounts];
+        const entry = { ...next[idx] };
+        if (proxy.trim().length === 0)
+            delete entry.minimaxIntlProxy;
+        else
+            entry.minimaxIntlProxy = proxy;
+        next[idx] = entry;
+        await this.writeAccounts(next);
+        this.ctx.logger?.info?.(`[jet-hub] 账号 ${accountId} MiniMax 国际站代理 → ${proxyLogText(proxy)}`);
+    }
+    /**
+     * 读取某 qoder 账号的代理（未设置时为空串 = 直连）。
+     *
+     * ⚠️ **必须过 `asProxyText`**（与 `geminiProxyFor` 同因）：该字段来自
+     * **用户可编辑的备份文件**，而 `sanitizeAccounts` 用 `{...candidate}`
+     * 原样透传、不校验形状 ⇒ 池里可能存在 `"qoderProxy": 12345`。下游
+     * `normalizeProxy` 第一句就是 `input.trim()` ⇒ 非字符串会在那里抛
+     * `TypeError: raw.trim is not a function`，该账号**永久不可用且无自愈**。
+     */
+    qoderProxyFor(accountId) {
+        const entry = this.readAccounts().find(a => a.id === accountId);
+        return asProxyText(entry?.qoderProxy);
+    }
+    /**
+     * 读取某 minimaxintl 账号的代理（未设置时为空串 = 直连）。
+     *
+     * ⚠️ **必须过 `asProxyText`**（与 `geminiProxyFor` 同款实测缺陷）：该字段来自
+     * **用户可编辑的备份文件**，而 `sanitizeAccounts` 用 `{...candidate}` 原样透传、
+     * 不校验形状 ⇒ 池里可能存在 `"minimaxIntlProxy": 12345`。下游 `normalizeProxy`
+     * 第一句就是 `input.trim()` ⇒ 非字符串会在那里抛 `TypeError`，该账号
+     * **永久不可用且无自愈**（症状与「代理配置坏了」同形，日志只有一句 TypeError）。
+     */
+    minimaxIntlProxyFor(accountId) {
+        const entry = this.readAccounts().find(a => a.id === accountId);
+        return asProxyText(entry?.minimaxIntlProxy);
     }
     /**
      * 记录 opencode 指纹轮换代次。
@@ -2083,6 +2957,35 @@ export class AccountPool {
         }
         this.cache = next;
         this.modelCache = sanitizeDisabledModels(disabledModels);
+        /**
+         * ⚠️⚠️ **导入备份 ⇒ 清空「供应商关闭意图」**（Gitee issue IKP8OF）。
+         *
+         * ## 为什么不能保留
+         *
+         * 备份载荷（`backup.ts` 的 `BackupPayload`）是「账号 + 黑名单 + 锁定表」的
+         * 完整快照，**不含**意图表 —— 它是在备份格式定型之后才出现的字段，
+         * `getStateSnapshot()` 也不导出它（两处一致，不是漏键）。
+         * 于是「保留旧意图」会让导入结果与载荷**自相矛盾**：
+         * - 导入一份**已打开**该 provider 的备份 ⇒ 旧意图仍为 `true`
+         *   ⇒ 模型选择器恒空，而设置页黑名单里一条关闭项都没有（用户无法归因）；
+         * - 导入一份**全关**的备份 ⇒ 意图缺失，靠派生判据仍然成立（可接受）。
+         *
+         * ## 为什么是「清空」而不是「从黑名单推断」
+         *
+         * 推断需要回答「这份黑名单是整家关闭、还是只关了几个模型」，而备份里
+         * **没有目录**，无从判断。两个方向的误判代价不对称：
+         * - 误判成「整家关闭」⇒ 其余模型**静默消失**（危险方向，用户会以为模型丢了）；
+         * - 误判成「未关闭」⇒ 回到升级前的行为，用户再点一次开关即可（可逆）。
+         * ⇒ 一律取后者：**清空意图，回落派生判据**。
+         *
+         * ## 如实登记的代价
+         *
+         * 导入备份会让「整家关闭」态**静默退化为「逐条关闭」**：目录**不再变长**时
+         * 两者表现相同（派生判据仍报 `closed:true`）；只有目录**继续变长**时，
+         * 新增模型会重新出现（即本 issue 的症状）。用户重新点一次供应商开关即恢复，
+         * 且这是**导入备份**这一显式操作的可预期后果，不是日常路径。
+         */
+        this.providerClosedCache = {};
         // 备份文件可能来自不含该字段的旧版本：`undefined` 时**保持当前值**，
         // 而不是重置为空表 —— 否则导入一份老备份会静默解锁用户的永久积分。
         // 给出表时**整体替换**（备份就是完整状态快照），并同样过滤脏值。

@@ -257,11 +257,27 @@ export class LoomyAuth extends Service {
     async refreshAccountCredential(refName, pool, accountId) {
         const ref = credentialRef(refName);
         const resolved = await this.ctx.credentials.resolve(ref);
+        // ⚠️⚠️ **这两格必须是终态**（2026-10-20 审计实测的真缺陷）。
+        //
+        // 它们与「探测端点不可用」是**两件不同的事**：
+        // - 前者（凭据未配置 / 解析失败）的出路是**用户重新登录**，属终态；
+        // - 后者（超时 / 5xx / `系统内部错误` / 非 JSON）只说明只读端点抖了，非终态。
+        //
+        // 本方法原先对这两格抛**普通 `Error`**，而 `LoomyAdapter` 的终态判据是
+        // `name === 'RefreshTokenExpiredError'` ⇒ 被判成「非终态」⇒ 降级成
+        // 「继续用现有凭据」。而生产热路径在**池里有账号时**走的正是本方法
+        //（`src/index.ts` 的 loomy `refresh`：先 `pool.getAvailableAccount`），
+        // 于是「必须重新登录」这条唯一出路被吞掉 —— 最坏形态实测：池账号凭据缺失、
+        // 单凭据老 ref 还留着一份旧凭据时，会**用另一份凭据继续跑**。
+        //
+        // ⇒ 与单凭据入口 `refresh()`（本文件上方，对「凭据未配置」already 抛
+        //   `RefreshTokenExpiredError`）**口径统一**。这也是 PR !124 声称的
+        //   「同一仓库两套同义判据」那件事的另一半。
         if (!resolved)
-            throw new Error('凭据未配置');
+            throw new RefreshTokenExpiredError('凭据未配置，请先在 Jet Hub 登录 Loomy');
         const credential = parseCredential(resolved.value);
         if (!credential)
-            throw new Error('凭据解析失败');
+            throw new RefreshTokenExpiredError('凭据解析失败，请重新登录 Loomy');
         await this.probeCredential(credential);
         await syncAccountExpiry({
             pool,

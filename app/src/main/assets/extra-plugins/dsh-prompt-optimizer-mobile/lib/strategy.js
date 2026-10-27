@@ -29,10 +29,12 @@ export const QUALITY_DIMS_MIN = Object.freeze({ off: 0, refer: 0, one: 1, two: 2
  * "短消息也必须真调用模型优化"，所以这里不允许把轻度做成"跳过解释"。
  */
 export const TIER_STRATEGY = Object.freeze({
-  off: Object.freeze({ mode: 'single', candidates: 0, maxItems: 0, qualityDims: 'off', depth: 'brief' }),
-  light: Object.freeze({ mode: 'single', candidates: 0, maxItems: 4, qualityDims: 'refer', depth: 'brief' }),
-  standard: Object.freeze({ mode: 'parallel', candidates: 0, maxItems: 8, qualityDims: 'one', depth: 'normal' }),
-  heavy: Object.freeze({ mode: 'branching', candidates: 3, maxItems: 12, qualityDims: 'two', depth: 'deep' }),
+  // subConcepts（2026-10-19）：**档位区分度的第二个轴**——把大概念发散到小概念的力度。
+  // 'off' = 只给方向；'one' = 关键条目带一个「比如…」；'rich' = 每条带 1–2 个「比如…」。它不增加字数配额。
+  off: Object.freeze({ mode: 'single', candidates: 0, maxItems: 0, qualityDims: 'off', depth: 'brief', subConcepts: 'off' }),
+  light: Object.freeze({ mode: 'single', candidates: 0, maxItems: 4, qualityDims: 'refer', depth: 'brief', subConcepts: 'off' }),
+  standard: Object.freeze({ mode: 'parallel', candidates: 0, maxItems: 8, qualityDims: 'one', depth: 'normal', subConcepts: 'one' }),
+  heavy: Object.freeze({ mode: 'branching', candidates: 3, maxItems: 12, qualityDims: 'two', depth: 'deep', subConcepts: 'rich' }),
 })
 
 /** 策略默认值（档位取不到时用它；与 settings 的默认档 `standard` 一致）。 */

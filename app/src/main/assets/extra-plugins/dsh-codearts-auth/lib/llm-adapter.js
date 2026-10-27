@@ -1,18 +1,109 @@
 import { attributionHeaders, CONTEXT_WINDOW_EXCEEDED_CODE, isContextWindowExceededError, isQuotaExceededError, LlmAdapter, LlmError, } from '@deepseek-ai/dsh-llm';
 import { ReasoningEffortId, ToolCallId } from '@deepseek-ai/dsh-llm';
-import { createModelCatalog } from './model-catalog.js';
+import { createModelCatalog, isCatalogFreshFor } from './model-catalog.js';
 import { RemoteCatalogGate } from './remote-catalog-gate.js';
 import { broadcastCatalogChanged } from './catalog-broadcast.js';
 import { nextUtc8DayStartMs } from './model-queue.js';
 import { isCodeArtsBenefitModel } from './models.js';
-import { normalizeHarnessMessages } from './message-shape.js';
 import { signRequestHuawei } from './sign.js';
-import { createBlankReasoningSuppressor, createDsmlMarkerNormalizer, createReasoningLoopDetector, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js';
+// ⚠️ `detailFieldText`（`detail` 那条腿）**只留一份实现** —— 本仓库 6 份同义的
+// `errorDetail` 各写一条判据必然漂移（见 `openai-compat.ts` 的注释，IKLBSH A1）。
+//
+// ⚠️⚠️ **`serializeMessages` / `collectImages` 也改用共享实现**（2026-10-21）：
+// 本文件原有一份**只处理文本**的私有 `serializeMessages`（注释还写着「其余非
+// 文本块（图片）被丢弃」）。接图片时若在私有那份上再加一条腿，就会变成
+// 「同一语义两套实现」—— 而共享实现已经把 12 家的坑（工具结果内嵌图片提升为
+// 独立 user 消息、空 Map 不降级、`[image unavailable]` 占位符、递归深度与
+// `collectImages` 对齐）全部踩过了。**故直接复用，不另写。**
+import { collectImages, detailFieldText, serializeMessages } from './openai-compat.js';
+/**
+ * 重新导出共享的 `serializeMessages`（**只为了让既有调用方与测试的导入路径不变**）。
+ *
+ * ⚠️ 这里**没有**第二份实现 —— 上面那条 import 就是唯一来源。写成
+ * `export { serializeMessages }` 而不是在这里再包一层，是为了让「有两份实现」
+ * 这件事在类型层面就不可能发生。
+ *
+ * ⚠️ 使用者（`tests/unit/session-replay.spec.ts` 等）测的是「0.1.7 形状与
+ * 0.1.5 形状等价」，判据与实现份数无关，故保留原导入路径即可。
+ */
+export { serializeMessages };
+import { createBlankReasoningSuppressor, createDsmlMarkerNormalizer, createReasoningLoopDetector, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, stripCourseLeakIfEnabled } from './sse.js';
 import { planSessionTitleThinking } from './session-title.js';
 import { registerAdapterIdempotent, } from './llm-register-compat.js';
+import { CODEARTS_PROVIDER, codeartsAcceptsImage, codeartsVisionModel } from './codearts-vision.js';
 import { reportLedgerAccount } from './token-ledger.js';
 export const CHAT_API_BASE = 'https://snap-access.cn-north-4.myhuaweicloud.com/api/v2';
-export const PROVIDER = 'codearts';
+/**
+ * codearts 的 provider id。
+ *
+ * ⚠️ 字面量的**唯一定义处在 `codearts-vision.ts`**（叶子模块）—— 注册期包装
+ *（`llm-register-compat.ts` 的 analyzeImage 摘除）与工具层判据必须同源，
+ * 两条腿不一致会让「摘掉」与「执行期断言」分叉。此处只是具名转出。
+ */
+export const PROVIDER = CODEARTS_PROVIDER;
+/**
+ * 本家**恒声明**的两档思考开关 —— 顺序即**强度序（弱 → 强）**（Issue IKLIDV）。
+ *
+ * ## 为什么顺序是「关闭 → 开启」
+ *
+ * DSH 的契约把该数组当作**展示顺序**
+ *（`dsh-llm/lib/types/types.d.ts` 原文：`Supported efforts in adapter-preferred
+ * display order`），而官方客户端**直接 `map`、不排序**
+ *（`dsh-client-ui-model-selection/lib/client.js` 的 `effortChoices`：
+ * `[…, ...reasoning.efforts.map(…)]`）。故任何「把档位数组铺成一条轴」的渲染
+ * —— 官方那个纵向 `menuitemradio` 列表、以及第三方横向滑条 —— 都直接吃这个顺序。
+ *
+ * 原实现写成 `['on','off']`（把默认档排在最前）。那个动机在**纵向列表**里成立，
+ * 一旦铺成**横向轴**就变成「左强右弱」：「开启」贴最左、「关闭」贴最右，
+ * 与「左弱右强」的直觉相反。
+ *
+ * 强度序的**唯一权威**是本仓库的 `reasoning-ladder.ts`
+ *（`REASONING_EFFORT_RANK`：`off: 0` / `on: 5`）⇒ `off` 必须在前。
+ * 三处旁证同向：
+ * - DSH 自家 `dsh-llm-deepseek` 声明 `[off, low, high, max]`；
+ * - DSH 自家 `dsh-llm-pi-ai` 的 `THINKING_LEVELS` 是
+ *   `[off, minimal, low, medium, high, xhigh, max]`；
+ * - 本仓库 `zcode-upstream.ts` 的 `orderReasoningLevels` **主动**把上游的
+ *   乱序（实测插入序 `low, max, high`）排成 `none → minimal → low → … → max`。
+ *
+ * ⚠️ **`defaultEffort` 与数组位置是两件事**：默认档由 {@link CODEARTS_DEFAULT_EFFORT}
+ * 单独表达，**不**靠「排在首位」。故本顺序的调整不改变任何默认行为。
+ *
+ * ⚠️ **本声明的顺序不参与任何语义判断**：关闭思考靠
+ * `thinkingOffEffortOf` 的 `.find(isThinkingOffEffort)`（按 rank 找，不按位置），
+ * `session-title` 那条路径也只用它当集合。
+ *
+ * ⚠️ **本常量是这两档的唯一定义处**：同一文件里原先写了**两份**逐字相同的
+ * 数组（已知模型的 `toCatalogEntry` 与未知模型的 `unknownModelReasoning`）——
+ * 那正是「一文件两套同义判据」的形态，改一处必漏另一处（用户手填模型 id 时会
+ * 看到与已知模型相反方向的档位轴）。现已收敛到这一份。
+ *
+ * ⚠️ 网关的 `openai_efforts` 是这份顺序的**机械投影**
+ *（`openai-gateway/effort-view.ts` 逐个 push `canonical`），故本顺序同时决定
+ * `/v1/models` 里那一列的可读性：升序 ⇒ `["none","high"]`。
+ */
+export const CODEARTS_REASONING_EFFORTS = Object.freeze([
+    { id: ReasoningEffortId('off'), name: '关闭' },
+    { id: ReasoningEffortId('on'), name: '开启' },
+]);
+/**
+ * 默认思考档 = `开启`。
+ *
+ * 依据（实测 2026-09-29）：不传 `thinking` 与服务端默认等价，而服务端**默认就开着**
+ *（`{type:'enabled'}` 与不传的 `reasoning_tokens` 落在同一基线）⇒ 标成 `on`
+ * 是**如实描述**，不是我们强行改变行为。
+ *
+ * ⚠️ 必须落在 {@link CODEARTS_REASONING_EFFORTS} 内：DSH 在 `normalizeModelInfo`
+ * 里校验「`defaultEffort` 必须是被声明过的 id」，不在则抛 **`INVALID_MODEL_REASONING`**
+ *（整轮对话起不来）。
+ * ⚠️ 别与 `UNSUPPORTED_REASONING_EFFORT` 混淆 —— 那个码是**另一回事**：
+ * 指「**请求**里带的档位不在该模型声明内」（`resolveCallWithInfo` 抛）。
+ * 审计实测（2026-10-14，`dsh-llm/lib/index.js`）：`defaultEffort='on'` 而
+ * `efforts=[low,high]` ⇒ code 为 `INVALID_MODEL_REASONING`。本行原写
+ * `UNSUPPORTED_REASONING_EFFORT` 是**张冠李戴**（同型措辞在 `raccoon-adapter.ts`
+ * 与 `trae-adapter.ts` 是既有问题，本次只修这一处新增注释）。
+ */
+export const CODEARTS_DEFAULT_EFFORT = 'on';
 /**
  * 「该账号没有 benefit（免费额度）包」的稳定失败码。
  *
@@ -85,20 +176,132 @@ const DEFAULT_MODELS = [
 ];
 /**
  * 模型上下文窗口（最大合并请求+响应 token 数）。
- * - GLM-5.2：202752（对齐 CodeArts Agent IDE 模型卡标注）。
- * - glm-5.3-flash：1048576（1M，逆向自 IDE gateway/config，对齐 deveco-code-rust 90aeb17d）。
- * - deepseek-v4-flash / deepseek-v4-pro：1048576（1M，UI 标注）。
- * - deepseek-v4.1-flash：1000000（对齐 IDE 下发的 inferhub-provider 模型配置，
- *   2026-09 kernel 日志；对齐 deveco-code-rust fb1b4a2）。
- * - 其余模型未公开上下文容量，留 undefined 让后端默认裁剪。
+ *
+ * ## 权威来源与取证（2026-10-21 重取证）
+ *
+ * ⚠️⚠️ **不是从 HTTP 端点读的** —— 本家两个目录端点**都不下发窗口**：
+ * `snap-access /v1/model/builtin` 的条目键全集实测只有
+ * `channel_source, credit, display_enabled, enable, intervals, model_category,
+ *  model_desc, model_id, model_name, model_sku, provider, supports_images, time_slots`
+ * （**无任何 context/window/length/token 类字段**）；`opengw gateway/config`
+ * 本机 4 个账号全回 `4000 invalid channel, group not found`。
+ *
+ * 权威来源是 **CodeArts Agent IDE 自己下发的 provider 配置**：
+ * 内核日志 `cag-global-server` 的 `provider models replace body is {…}` 里
+ * `provider["inferhub-provider"].models[*].limit.context`。
+ * 本机取证范围 **2026-09-11 ~ 2026-10-21，42 份内核日志**，按日期收敛：
+ *
+ * | 模型 | `limit.context` | 取值历史 |
+ * |---|---|---|
+ * | `GLM-5.2` | **1_048_576** | 09-11~10-20 是 `202_752`，**10-21 起上游改成 1M** |
+ * | `glm-5.3` | **1_048_576** | 同上（09 月表里没有它，10-17 起出现，先 202752 后 1M） |
+ * | `glm-5.2-sft-harmony` | **202_752** | 全期稳定（09-11~10-21） |
+ * | `openpangu-2.0-flash` / `-pro` | **524_288** | 全期稳定 |
+ * | `deepseek-v4.1-flash` | **1_048_576** | 全期稳定（本表原先写 1_000_000，**已按 IDE 权威值改正**） |
+ * | `glm-5.3-flash` | **1_048_576** | 逆向自 IDE gateway/config（对齐 deveco-code-rust 90aeb17d） |
+ * | `deepseek-v4-flash` / `-pro` | **1_048_576** | UI 标注「每日 1000 万免费 Tokens」同批（对齐 fb1b4a2） |
+ *
+ * ⚠️ **`GLM-5.2` 的 202_752 已过期**（那是 10-20 及以前的配置）。留着它有两个
+ * 真实后果，且都是**静默**的：① 占用比被封顶成 100%（分母小 5 倍）；
+ * ② 自动压缩阈值 = `0.8 × 202752 ≈ 162K` ⇒ **1M 的能力永远吃不到**
+ * （与 `officeace-product.ts` 那次「估值偏小 5.3 倍」逐字同因）。
+ *
+ * ⚠️ **本表查不到时不再省略 `context`** —— 见 {@link CODEARTS_FALLBACK_CONTEXT_WINDOW}。
  */
 const CONTEXT_WINDOWS = new Map([
-    ['GLM-5.2', 202752],
+    ['GLM-5.2', 1_048_576],
+    ['glm-5.3', 1_048_576],
     ['glm-5.3-flash', 1_048_576],
-    ['deepseek-v4-flash', 1048576],
-    ['deepseek-v4-pro', 1048576],
-    ['deepseek-v4.1-flash', 1_000_000],
+    ['glm-5.2-sft-harmony', 202_752],
+    ['openpangu-2.0-flash', 524_288],
+    ['openpangu-2.0-pro', 524_288],
+    ['deepseek-v4-flash', 1_048_576],
+    ['deepseek-v4-pro', 1_048_576],
+    ['deepseek-v4.1-flash', 1_048_576],
 ]);
+/**
+ * 本表查不到时**必须**给的那个窗口（`undefined` 在本家是不可接受的）。
+ *
+ * ## 为什么不能「查不到就省略」（真实报障，2026-10-21）
+ *
+ * 用户报障「codearts 对话后，DSH 下方本该显示上下文占用比的地方没有显示」。
+ * 判据链在宿主侧：
+ * 1. `dsh-client-ui-conversation/lib/client.js` 的 `contextOccupancy()`：
+ *    `if (usedTokens === void 0 || pressure?.contextWindow === void 0) return null`，
+ *    而 `ContextMeter` 在 `context === null` 时 **`return null`** ⇒
+ *    整个环 + 百分比 + 弹层**都不渲染**（不是显示 0%，是**根本不出现**）；
+ * 2. 分母 `contextWindow` 来自 `dsh-agent-loop` 写入的 `request/context` 事件，
+ *    值就是适配器 `resolveModel()` 返回的 `context.contextWindow`。
+ *
+ * ⇒ **本家任何一条目录条目缺窗口，用户就少一个占用条**。实测当时 7 条目录里
+ * 只有 2 条有窗口（`glm-5.3` / `openpangu-*` / `glm-5.2-sft-harmony` 全缺）。
+ * 会话落盘对照（`session-fd3e2786`，同一会话内切模型）：
+ * `{"model":"deepseek-v4.1-flash","contextWindow":1000000}` 有 ⇒ 条在；
+ * `{"model":"glm-5.3"}` 无 ⇒ 条消失。
+ *
+ * ## 为什么是「具名兜底」而不是继续省略
+ *
+ * 仓内先例：`aggregate-adapter.ts` 的 `AGGREGATE_COLD_CONTEXT_WINDOW` —— 同一个
+ * 宿主约束（`dsh-compaction-basic` 在 `info.context === undefined` 时抛
+ * `TargetPressureConfigError: no context capacity for …`）⇒ 纪律是
+ * 「**宁给具名兜底，不省略**」。本家是直连适配器，省略即同时丢掉占用条与
+ * 压缩阈值的唯一输入。
+ *
+ * ## 取值 524_288 的取舍（用户 2026-10-21 选定）
+ *
+ * 取**当前目录里最小的真实窗口**（`openpangu-*` 实测值）：
+ * - 偏小 ⇒ 对 1M 模型会**偏早**触发自动压缩（代价：多压一次，不报错）；
+ * - 偏大 ⇒ 若某未知模型其实更小，就变成**上游溢出报错**而不是自动压缩
+ *   （代价：一轮对话报废）。
+ * ⇒ 取偏小一侧。⚠️ **本值不是「实测的该模型窗口」**，只是安全边界；
+ * 命名与注释都不得声称它是真值（与 `AGGREGATE_COLD_CONTEXT_WINDOW` 同纪律）。
+ */
+export const CODEARTS_FALLBACK_CONTEXT_WINDOW = 524_288;
+/**
+ * 取某模型的上下文窗口：**静态表优先、查不到用具名兜底**（恒返回正数）。
+ *
+ * ⚠️ 兜底**必须**在 `resolveModel` 与目录两条路径上都生效 —— 只改一条会让
+ * 「选择器里显示了」与「对话里不显示」分叉（本家目录与 `resolveModel`
+ * 共用 `CONTEXT_WINDOWS`，故收敛到这里）。
+ */
+export function codeartsContextWindow(modelId) {
+    const known = CONTEXT_WINDOWS.get(modelId);
+    return known !== undefined && known > 0 ? known : CODEARTS_FALLBACK_CONTEXT_WINDOW;
+}
+/**
+ * 把上游 `ratio_display` 原串转成**仓内倍率口径**（`x0.7`）。
+ *
+ * ## 为什么必须转（2026-10-21 合并审计发现）
+ *
+ * 上游 `/v1/model/builtin` 的 `ratio_display` 是 `0.7x`（**x 在数字后**），
+ * 而全仓其余各家的展示名是 ` · x{n}`（**x 在数字前**）：buddy（`x0.29`）、
+ * loomy（`x0.1`）、trae（`x0.08`）、accio（`x0.013`）、lobsterai（`x1.08`）。
+ *
+ * ⚠️ 而 `src/aggregate-core.ts` 的 `priceFactorFromName` 是**全仓唯一的倍率解析口**
+ * （聚合的「同临期档内倍率升序」与选择器的 `· 最低 x{n}` 都走它），它的正则
+ * `·\s*[×x]?\s*(\d+(?:\.\d+)?)...$` 把 `[×x]?` 放在数字**之前** ⇒
+ * ` · 0.18x` **匹配不上** ⇒ 恒返回 `Infinity`。
+ *
+ * ⇒ 后果：codearts 是聚合渠道（`AGGREGATE_CHANNELS` 第 1 位），它的候选价格
+ *   恒为 `Infinity` ⇒ 聚合**永远挑不到 codearts**（同临期档内它排最后），
+ *   选择器的「· 最低 x{n}」也漏掉它。
+ *
+ * ## 转换的边界（红线：绝不臆造）
+ *
+ * - **只改形态，不改数值** —— 数值仍逐字取自上游 `ratio_display`；
+ * - **认不出就返回 `undefined`**（调用方据此不显示倍率，**不用占位值冒充**）；
+ * - ⚠️ 上游若改形态（比如也改成 `x0.7`）⇒ 这里认不出 ⇒ 不显示倍率
+ *   （**保守方向**：少显示好过显示一个错的数）。此时应更新本函数与
+ *   `RemoteModel.rateLabel` 的注释。
+ */
+export function codeartsRateSuffix(display) {
+    if (typeof display !== 'string')
+        return undefined;
+    const m = /^\s*(\d+(?:\.\d+)?)\s*x\s*$/i.exec(display);
+    if (m === null)
+        return undefined;
+    return `x${m[1]}`;
+}
 /**
  * 单次请求输出上限的安全边界。
  *
@@ -109,8 +312,10 @@ const CONTEXT_WINDOWS = new Map([
  * 都有该 id，极易张冠李戴）。
  *
  * ⚠️ 这是**全 provider 统一**的边界，不是逐模型表：本适配器的出站点只有一个，
- * 而 `CONTEXT_WINDOWS` 之上方已注明「其余模型未公开上下文容量」——
+ * 而 `CONTEXT_WINDOWS` 之上方已注明「窗口的权威来源是 IDE 下发的 provider 配置」——
  * 拿不到实测就不该臆造更小的值。故凡走本适配器的模型一律收敛到此上限。
+ * ⚠️ 与窗口**不是同一件事**：窗口缺失走的是 `CODEARTS_FALLBACK_CONTEXT_WINDOW`
+ * （有兜底），输出上限这里是**恒定收敛**（无兜底分支）。
  */
 const CODEARTS_MAX_OUTPUT_TOKENS = 65_536;
 /**
@@ -132,97 +337,60 @@ function clampCodeArtsMaxTokens(value) {
     return Math.min(integer, CODEARTS_MAX_OUTPUT_TOKENS);
 }
 /**
- * 将消息内容载荷展平为纯文本字符串。Harness 消息
- * 以 OpenAI 风格的块数组形式携带内容（`[{type:'text',...}]`，且
- * 助手历史可能包含 `{type:'reasoning',...}` 块）；CodeArts
- * 端点会拒绝非 `text` 块类型并返回空流，因此只保留
- * `text` 块并拼接。
- */
-function contentToText(content) {
-    if (typeof content === 'string')
-        return content;
-    if (!Array.isArray(content))
-        return '';
-    return content
-        .filter((block) => typeof block === 'object' && block !== null && block.type === 'text')
-        .map((block) => String(block.text))
-        .join('');
-}
-/**
- * 将 harness 对话消息序列化为 CodeArts chat-completions 的传输
- * 格式。助手的 `tool-call` 块转换为 `tool_calls` 字段；`reasoning`
- * 块折叠为 `reasoning_content` 字段（deepseek-v4 等推理模型的后端
- * 校验要求 assistant 消息必须携带该字段，缺失会报 "Missing
- * `reasoning_content` field"）；工具结果（搭载在 harness 用户消息中）
- * 展开为独立的 `{role: 'tool'}` 消息，使模型能看到其调用的返回值。
- * 其余非文本块（图片）被丢弃，与端点接受的格式一致。
+ * 能**原生收图**的模型（`supports_images: true`，`model_category: 图片理解`）。
  *
- * ⚠️ 入口先做 **DSH 0.1.7 消息形状归一化**（见 `message-shape.ts`）：0.1.7 把工具
- * 结果改为一等 `role:'tool'` 消息，若不归一化，下面的 `type === 'tool-result'`
- * 判据恒不命中 → 工具调用被 `resolveToolPairing` 整体剔除。
+ * ## 实测（2026-10-21，只读探测 `/v1/model/builtin`，8 条目录逐条核对）
+ *
+ * | 模型 | `supports_images` | `model_category` |
+ * |---|---|---|
+ * | `kimi-k2.6-vl` | **true** | **图片理解** |
+ * | `Qwen3-VL-235B` | **true** | **图片理解** |
+ * | `GLM-5.2` / `glm-5.3` / `glm-5.2-sft-harmony` / `openpangu-2.0-flash` / `openpangu-2.0-pro` / `deepseek-v4.1-flash` | false | 文本生成 |
+ *
+ * ⇒ 只有这两条能收图，其余**发图必被上游拒**：
+ * `{"error_code":"InferHub.001001020.406","error_msg":"The request model is not multimodal"}`
+ * （实测 glm-5.3，见 `CODEARTS_VL_MODELS` 的探测记录）。
+ *
+ * ## ⚠️ 与「VL 模型不进目录」的关系（**刻意保留**）
+ *
+ * `toCatalogEntry` / `catalogEntries` 仍**把 VL 模型从对话目录里过滤掉**
+ *（`-VL-` / `-vl` 判据）—— 它们上下文小、不支持工具调用，当 agent 主模型会
+ * 踩别的坑。本表**只用于两件事**：
+ * 1. 判断「某个模型能不能收图」（{@link codeartsAcceptsImage}）；
+ * 2. `analyzeImage` 工具内部挑一个 VL 模型去做识图（{@link codeartsVisionModel}）。
+ *
+ * 即：**用户仍然不能在模型选择器里选 VL 模型，但主模型可以借它识图** ——
+ * 这与 IDE 自己的行为一致（IDE 也是 `fetchMultimodalModelId` 选一个 VL 模型
+ * 去服务 `analyzeImage` 工具，见 `docs/agent-notes/providers-codearts.md`）。
  */
-export function serializeMessages(messages) {
-    const normalized = normalizeHarnessMessages(messages);
-    const wire = [];
-    // 剔除无法配对的工具调用/结果（详见 resolveToolPairing）：孤儿 tool_calls
-    // 会让后端对之后每一条消息都返回 400，整个会话永久报废。
-    const { keepCallIds, keepResultIds } = resolveToolPairing(normalized);
-    for (const message of normalized) {
-        if (message.role === 'assistant') {
-            // 存量自愈：清洗历史里已持久化的行首 `course` / `课` 泄漏
-            // （见 `stripCourseLeakFromHistoryContent`）。只清 assistant ——
-            // 判据只对模型自己的输出成立，清洗用户输入等于篡改用户的话。
-            const content = stripCourseLeakFromHistoryContent(message.role, Array.isArray(message.content) ? message.content : []);
-            const toolCalls = content
-                .filter((block) => typeof block === 'object' && block !== null && block.type === 'tool-call')
-                .filter(block => keepCallIds.has(String(block.id)))
-                .map((block) => ({
-                id: String(block.id),
-                type: 'function',
-                function: { name: String(block.name), arguments: normalizeToolArguments(String(block.arguments)) },
-            }));
-            const reasoning = content
-                .filter((block) => typeof block === 'object' && block !== null && block.type === 'reasoning')
-                .map((block) => String(block.text))
-                .join('');
-            wire.push({
-                role: 'assistant',
-                content: contentToText(content),
-                // 后端（deepseek-v4-flash/pro）校验要求 assistant 消息必须包含
-                // reasoning_content 字段：历史里的推理块在上一轮被持久化，回传时
-                // 若缺失该字段会直接 400（"Missing `reasoning_content` field"）。
-                // 始终携带该字段（无推理时为空串），确保字段存在。
-                reasoning_content: reasoning,
-                ...toolCalls.length > 0 ? { tool_calls: toolCalls } : {},
-            });
-            continue;
-        }
-        if (message.role === 'system') {
-            wire.push({ role: 'system', content: contentToText(message.content) });
-            continue;
-        }
-        // user 角色：工具结果搭载在 harness 用户消息中；将每个展开为
-        // 独立的 role:'tool' 传输消息，与 deepseek 适配器的行为一致。
-        const content = Array.isArray(message.content) ? message.content : [];
-        const toolResults = content.filter((block) => typeof block === 'object' && block !== null && block.type === 'tool-result');
-        // 纯文本 user 消息（字符串 content）需原样传递：contentToText 处理
-        // 字符串时直接返回，但这里不能用 `content`（非数组时为 []）——否则
-        // 字符串 user 消息会被序列化成空串，模型看不到任务指令。
-        const text = contentToText(message.content);
-        if (text.length > 0 || toolResults.length === 0)
-            wire.push({ role: 'user', content: text });
-        for (const result of toolResults) {
-            // 丢弃孤儿工具结果：没有对应 tool_call 其结果同样会让后端 400。
-            if (!keepResultIds.has(String(result.toolCallId)))
-                continue;
-            wire.push({
-                role: 'tool',
-                tool_call_id: String(result.toolCallId),
-                content: contentToText(result.content) || '(no output)',
-            });
-        }
-    }
-    return wire;
+// ⚠️ 「哪个模型能收图」与「analyzeImage 用哪个 VL 模型」的**唯一定义处**在
+//    `codearts-vision.ts`（无依赖叶子模块，理由见其模块头）：那里同时被**注册期包装**
+//    （`llm-register-compat.ts` 逐请求摘除 analyzeImage）与工具层使用，
+//    写在这里会让 `llm-register-compat → llm-adapter → llm-register-compat` 成环。
+//    本文件只**转出**这两个符号，既有导入路径（`from './llm-adapter.js'`）不变。
+export { codeartsAcceptsImage, codeartsVisionModel };
+/**
+ * 把 harness 的图片块转成 CodeArts 接受的 wire 形态。
+ *
+ * ## ⚠️⚠️ 只有一种形态被接受（2026-10-21 实测四选一）
+ *
+ * 对 `kimi-k2.6-vl` 与 `Qwen3-VL-235B` 各发一张 8×8 纯红 PNG、问「是什么颜色」：
+ *
+ * | 形态 | 结果 |
+ * |---|---|
+ * | **`{type:'image_url', image_url:{url:'data:…'}}`** | **HTTP 200，答「红色」** ✅ |
+ * | `{type:'image_url', image_url:'data:…'}`（字符串） | 406 `InferHub.001001046` multimodal content incorrect |
+ * | `{type:'image', source:{type:'base64',…}}`（Anthropic 系） | 400 `ModelArts.81001` unsupported content type |
+ * | `{type:'input_image', image_url:…}`（Responses 系） | 406 `InferHub.001001046` |
+ *
+ * ⇒ **必须是 OpenAI 的「对象套 url」形态**，且 url 是 base64 data URL。
+ * 反向对照：同一份格式发给文本模型 `glm-5.3` 得
+ * `InferHub.001001020.406 The request model is not multimodal` ⇒ 这条判据有判别力。
+ *
+ * @param dataUrl - 已经拼好的 `data:image/…;base64,…` 串
+ */
+export function codeartsImagePart(dataUrl) {
+    return { type: 'image_url', image_url: { url: dataUrl } };
 }
 /**
  * 判断模型是否为 deepseek-v4 系列（flash/pro）。
@@ -282,6 +450,15 @@ export const QUEUE_STATUS_BASE = 'https://snap-access.cn-north-4.myhuaweicloud.c
 const QUEUE_RETRY_DELAY_MS = 10_000;
 /** 轮询上限：180 × 10 秒 = 30 分钟，与 deveco-code 参考实现一致。 */
 const QUEUE_MAX_ATTEMPTS = 180;
+/**
+ * APIG「正文哈希对不上」时**直接重发**的次数上限。
+ *
+ * 取 2：该故障是上游网关侧的瞬时状态，实测两次连续失败后第三次即可成功；
+ * 再多只是把真正的持续故障拖长，反而掩盖问题。
+ */
+const SIGNATURE_RETRY_MAX = 2;
+/** 重发的退避基数：第 n 次等 n × 该值（500ms、1000ms）。 */
+const SIGNATURE_RETRY_DELAY_MS = 500;
 /**
  * SSE 流空闲超时。CodeArts 后端 / APIG 网关对 SSE 连接有 ~60 秒无数据即
  * 断开的策略：当模型生成超长推理或大工具调用参数时，两次 chunk 之间可能
@@ -437,8 +614,24 @@ function isQueueError(status, body) {
  * 才抛 AUTH，避免把可自愈的瞬时鉴权失败暴露给用户。
  */
 function isAuthError(status, body) {
-    if (status === 401 || status === 403)
+    if (status === 401 || status === 403) {
+        // ⚠️ 先排除「网关瞬时签名故障」（`body hash mismatch`），否则会白跑一次
+        // 凭据续期：它与 AK/SK、security_token 都无关，重发就能过（见
+        // {@link isTransientSignatureFailure} 的实测依据）。
+        if (isTransientSignatureFailure(status, body))
+            return false;
+        // ⚠️ 同理排除「本机代理拒发改写请求」（bili，Gitee IKQ7AP）：它与凭据**无关**，
+        // 刷新后压缩仍在、重签凭据仍缺 ⇒ bili 依旧拒发 ⇒ 白跑一次 STS 网络往返，
+        // 然后落 AUTH 把唯一的指路文案吞掉。见 {@link isProxyResignRefusal} 的实测表。
+        //
+        // ⚠️ 这两条排除**不破坏**「401/403 先判、恒归认证类」的铁律：那条管的是
+        // 「上游报文里的**额度/上下文措辞**不得抢在状态码之前改写分类」（网关故障常
+        // 捎带余额词）；这里排除的是**非网关来源**的 401/403 —— 判据锚定的是
+        // bili 独有的三个 marker，与 APIG 的报文形态零重叠。
+        if (isProxyResignRefusal(status, body))
+            return false;
         return true;
+    }
     return body.includes('APIG.0602') || /invalid\s+token|token\s+expired|token\s+is\s+invalid/i.test(body);
 }
 /**
@@ -512,6 +705,40 @@ export function isSseQuotaExhaustedErrorCode(code, message) {
     return code.includes('4291') || /insufficient[\s_-]+quota/i.test(message);
 }
 /**
+ * HTTP **4xx** 报文里是否表示「该账号没有 benefit（免费额度）包」。
+ *
+ * ## 为什么需要它（Gitee issue IKLBSH A6）
+ *
+ * 同一个上游条件走**两条**通道下发：
+ *
+ * | 通道 | 形态 | 修复前 |
+ * |---|---|---|
+ * | SSE | HTTP 200 + `{error_code:"InferHub.4004.200", …}` | ✅ 已接（`consumeSse` 抛 `BENEFIT_NOT_FOUND_CODE`）|
+ * | HTTP | **4xx** + 同一码 | ❌ **未接** ⇒ 去头重试一次也不试，直接归 `INVALID_REQUEST` 抛出 |
+ *
+ * 「SSE 能自愈、4xx 却硬报错」＝同一个语义两套判据，正是本仓库首条红线的形态。
+ *
+ * ⚠️ **该缺陷已被独立锁定**：`origin/issue/IKJOF7-benefit-diagnostics` 分支
+ *（2026-10-05）用 `it.fails` 显式锁死了它（「HTTP 4xx + 正文含
+ * `InferHub.4004.200` 时也应当去头重试」），当时结论是「已确认，但本分支不修」。
+ *
+ * ⚠️ **判据复用同一个码值常量**（`CODEARTS_BENEFIT_NOT_FOUND_ERROR_CODE`），
+ * 不另写第二份 —— 与 SSE 通道的判据（`consumeSse` 的 `===` 比较）**同源**，
+ * 否则两条通道会在上游改码时分别漂移（这正是本缺陷的成因形态）。
+ *
+ * ⚠️ 与 {@link isSseQuotaExhaustedErrorCode} 的 `4291` **刻意不同**：那条腿用
+ * 子串是为了容忍 `InferHub.4291.xxx` 的其它尾号，而 `4004` 这一族里
+ * **没有证据**表明其它尾号是同一语义（`4004.200` 是实测唯一的 benefit 码）。
+ * 按证据收紧到**全等**：放宽成 `InferHub.4004.` 前缀会把该族里未知语义的
+ * 报文也变成可重试，属行为变更。将来真抓到别的尾号**再按实测放宽**。
+ *
+ * ⚠️ 不解析 JSON 而直接判原文：4xx 的报文形态与 SSE 不同（字段名可能不叫
+ * `error_code`），这正是上面那条注释记录的教训。
+ */
+export function isBenefitNotFoundBody(body) {
+    return body.includes(CODEARTS_BENEFIT_NOT_FOUND_ERROR_CODE);
+}
+/**
  * 从错误体提取可分类的 detail 文本（OpenAI 风格 error 或 CodeArts error_code/error_msg）。
  *
  * ⚠️ **本次只「加腿」，且如实标注证据强度**：新增顶层字符串 `error` 一条。
@@ -541,8 +768,42 @@ export function isSseQuotaExhaustedErrorCode(code, message) {
  * 即使字符串腿失效、函数退回整段 JSON，**整段 JSON 里也含该短语** ⇒
  * 额度判据照样命中 ⇒ 那是**假守卫**（实测确认过，第一版就是这么错的）。
  * 直接断言本函数的**返回值**才测得到那条腿。
+ *
+ * ## ⚠️⚠️ 本函数是**展示**出口；分类出口是 {@link errorDetailForClassify}
+ *
+ * 无条件把 `detail` 计入产物会**翻转错误码**（真实净回归，两轮审计独立确证）：
+ *
+ * | 报文 | 只算既有腿 | 加上 detail 腿 |
+ * |---|---|---|
+ * | `{"message":"bad request","detail":"insufficient quota"}` | `INVALID_REQUEST` | **`QUOTA_EXCEEDED`** |
+ * | `{"message":"bad request","detail":"prompt is too long for this model"}` | `INVALID_REQUEST` | **`CONTEXT_WINDOW_EXCEEDED`** |
+ *
+ * 后者还会**触发 DSH 的上下文溢出压缩**。本函数是 `httpErrorCode` 与 4xx 额度判据
+ * 的**唯一分类输入** ⇒ 那两处**必须**改走 {@link errorDetailForClassify}，
+ * 否则一个纯展示改进会静默改变分类行为（且我加的用例只断言返回值，零分类守卫）。
+ *
+ * ⚠️ **本份（codearts）与 `openai-compat.ts` 那份是同名不同实现**，
+ * 两条出口的语义必须两处一致。
  */
 export function errorDetail(body) {
+    return errorDetailImpl(body, true);
+}
+/**
+ * 从错误体提取**分类用**的可读文本 —— **不含**顶层 `detail` 字段。
+ *
+ * ⚠️ 分类调用点（`httpErrorCode` / `isSseQuotaExhaustedErrorCode`）**必须**走本出口：
+ * 它保证分类输入与「加 detail 腿之前」**逐字节相同**（见 {@link errorDetail} 的实测表）。
+ */
+export function errorDetailForClassify(body) {
+    return errorDetailImpl(body, false);
+}
+/**
+ * `errorDetail` 的唯一实现（两条出口共用，**不各写一份** —— 那是本仓库首条红线
+ * 「同一语义两套判据」，且必然漂移）。
+ *
+ * @param includeDetailField - `true` = 展示出口；`false` = 分类出口。
+ */
+function errorDetailImpl(body, includeDetailField) {
     try {
         const data = JSON.parse(body);
         const error = typeof data.error === 'object' && data.error !== null
@@ -558,6 +819,12 @@ export function errorDetail(body) {
             typeof data.error_code === 'string' ? data.error_code : undefined,
             typeof data.error_msg === 'string' ? data.error_msg : undefined,
             typeof data.message === 'string' ? data.message : undefined,
+            // ⚠️ 上游代理的 `{"error":"acp-proxy failure","detail":"<真实原因>"}` 形态
+            //（Gitee issue IKLBSH A1）—— 只认 `error` 会丢掉真正的原因。
+            // 判据**只留一份实现**（`openai-compat.ts` 的 `detailFieldText`）；本仓库
+            // 6 份同义 `errorDetail` 各写一条必然漂移（「同一语义两套判据」）。
+            // ⚠️ **只在展示出口计入**（见上）。
+            includeDetailField ? detailFieldText(data) : undefined,
         ].filter((value) => value !== undefined);
         if (parts.length > 0)
             return parts.join(' ');
@@ -590,9 +857,22 @@ export function errorDetail(body) {
  * 不要据构造的报文改分类顺序。
  */
 function httpErrorCode(status, body) {
+    // ⚠️ bili 拒发改写请求：**非网关来源**的 401/403，必须在 AUTH 短路**之前**单列
+    //（Gitee IKQ7AP）。判据锚定 bili 独有 marker，与 APIG 形态零重叠（见
+    // {@link isProxyResignRefusal}）—— 它不破坏「401/403 先判」的铁律，理由见
+    // {@link isAuthError} 内的同款注释。
+    //
+    // ⚠️ **码绝不能取 `AUTH`**（IKLBSH 同族）：`AUTH` 会被客户端整条替换成
+    // 「API 密钥无效」，而这条错误的 message **本身就是出路**（告诉用户怎么让
+    // bili 拿到重签凭据）⇒ 取 AUTH 等于把唯一的指路句子吞掉。实测修复前 message
+    // 只剩 `model request failed with HTTP 403`，`bili_resign_unavailable` 完全丢失。
+    if (isProxyResignRefusal(status, body))
+        return PROXY_REFUSED_SIGNED_CODE;
     if (status === 401 || status === 403)
         return 'AUTH';
-    const detail = errorDetail(body);
+    // ⚠️ **分类必须走 `errorDetailForClassify`**（不含 detail 腿）—— 用展示出口会让
+    // detail 里的额度/超限措辞**翻转错误码**（实测表见 `errorDetail` 的 doc）。
+    const detail = errorDetailForClassify(body);
     if (isQuotaExceededError(detail))
         return CODEARTS_QUOTA_EXHAUSTED_CODE;
     if (status === 429)
@@ -605,6 +885,132 @@ function httpErrorCode(status, body) {
     if (status >= 500)
         return 'SERVER';
     return `HTTP_${status}`;
+}
+/**
+ * 华为 API 网关（APIG）**瞬时**签名故障的判据。
+ *
+ * 报文形态（用户报障 2026-10-03 的会话日志原文）：
+ * `401 APIG.0301 Incorrect IAM authentication information: calc ak sk
+ *  signature fail:body hash mismatch x-sdk-content-sha256 header`
+ *
+ * 为什么必须单独判它：这句说的是「网关收到的正文哈希 ≠ 我方
+ * `x-sdk-content-sha256` 头」，**与 AK/SK、security_token 都无关**。
+ * 本模块的签名实现（`sign.ts`）用**同一份字节**算哈希与发请求
+ * （`signRequestHuawei(…, new TextEncoder().encode(body), …)` 的入参与
+ * 传给 `fetch` 的 `body` 是同一个字符串）⇒ 本方不存在能把两者算岔的路径。
+ * ⚠️ 这一点是**读码推导**，不是逐请求实测：仓库里没有对应的探针脚本。
+ * 2026-10-19 审计已复核该不变量本身成立（空串 / 中文 / emoji /
+ * 20 万字符 / 组合字符 5 组样本的 `sha256(body)` 与头恒等），但当时引用的
+ * 「已用探针逐请求核对过」在本仓库**不存在** —— 按证据强度如实标注。
+ *
+ * 处置：直接重发（见 `SIGNATURE_RETRY_MAX`），**不要**刷新凭据 ——
+ * 凭据与此故障无关，刷新只是白跑一次网络往返；
+ * 也就不能让它落入 {@link isAuthError} 的「静默 refresh + 重发」分支。
+ *
+ * ⚠️ 判据刻意只认 `body hash mismatch`：`APIG.0301` 的另一半
+ * （`verify ak sk signature fail`）**同时覆盖真实的 AK/SK 错误**
+ * （`AGENTS.md` 记录了把 `Agent-Type` 误当签名头传入也会得到它），
+ * 按它放宽会把真凭据问题误判成瞬时故障、让用户永远等不到「请重新登录」。
+ */
+export function isTransientSignatureFailure(status, body) {
+    if (status !== 401 && status !== 403)
+        return false;
+    return typeof body === 'string' && /body hash mismatch/i.test(body);
+}
+/**
+ * 本机上下文压缩代理（bili / billion-context）按 **compress-or-refuse contract**
+ * 拒发**被改写过**的签名请求。
+ *
+ * 报文形态（真实会话 `session-016866dc` turn 7，逐字，Gitee IKQ7AP）：
+ * ```json
+ * {"error":{"type":"signed_request_requires_resign","code":"bili_resign_unavailable",
+ *  "message":"bili refused to forward this sdk-hmac-sha256 …-signed request:
+ *  the signature covers the request body, and any rewrite (context compression)
+ *  would invalidate it upstream … No re-sign credential was available for this scheme.",
+ *  "type":"session_dead"}}
+ * ```
+ *
+ * ## ⚠️⚠️ 它为什么**绝不能**落进 {@link isAuthError}（真实缺陷，2026-10-25 实测复现）
+ *
+ * 三条根因链逐行成立（行号以 `9f76d46` 为准）：
+ *
+ * 1. {@link isTransientSignatureFailure} 只认 `body hash mismatch`（APIG 网关侧
+ *    瞬时故障）—— bili 的三个 marker 不命中；
+ * 2. {@link isAuthError} 对 401/403 恒真 ⇒ 进入「静默 refresh 一次再重试」分支；
+ * 3. 重试时**压缩仍在、重签凭据仍缺** ⇒ bili 依旧拒发 ⇒ `httpErrorCode` 的
+ *    第一条把 403 归成 `AUTH`。
+ *
+ * 实测四格（真实 `CodeArtsAdapter` + 逐字报文）：
+ *
+ * | 观测 | 修复前 | 修复后 |
+ * |---|---|---|
+ * | 错误码 | `AUTH` | `PROXY_REFUSED_SIGNED` |
+ * | `refresh()` 调用 | **1 次**（白跑一次 STS 网络往返） | **0 次** |
+ * | message | `codearts: model request failed with HTTP 403`（**一句话**） | 保留 bili 原文与可执行出路 |
+ * | `bili_resign_unavailable` 可搜 | **否** | **是** |
+ *
+ * ## 语义与 {@link isTransientSignatureFailure} 的**关键区别**
+ *
+ * | | APIG `body hash mismatch` | bili 拒发 |
+ * |---|---|---|
+ * | 成因 | 网关侧一次性故障 | 代理**有意拒绝**（契约行为） |
+ * | 重发 | **有效**（实测重发即过） | **无效**（压缩仍在、凭据仍缺，必然再撞） |
+ * | 出路 | 等一下再试 | 用户/宿主侧补重签凭据，或临时放行 |
+ *
+ * ⇒ 这条**不是**「重发即可」，是「重发不可，需用户/宿主侧补凭据」——
+ * 与凭据无关：刷新、重试、换号都**不会好**（换号只会让**下一个账号**的凭据
+ * 同样到不了 bili 手里）。
+ *
+ * ## ⚠️ 判据刻意只认 bili 的三个 marker
+ *
+ * `APIG.0301` 的另一半（`verify ak sk signature fail`）**同时覆盖真实的 AK/SK
+ * 错误**（见 {@link isTransientSignatureFailure} 的注释），**绝不**把 `APIG.0301`
+ * 或 `SignatureDoesNotMatch` 加进本判据 —— bili 的 `message` 里**恰好引用了**那
+ * 两个词（描述它为什么拒发），按它们放宽会让真凭据问题误判成代理拒发。
+ * 只认 `signed_request_requires_resign` / `bili_resign_unavailable` /
+ * `bili refused to forward` 三个 **bili 独有**的串。
+ *
+ * @param status - HTTP 状态码；bili 实测回 **403**（issue 原报文），401 一并接
+ *   （代理版本差异时可能换码，同属「拒发」语义）。
+ * @param body - 响应体（可能为空串）。
+ */
+export function isProxyResignRefusal(status, body) {
+    if (status !== 401 && status !== 403)
+        return false;
+    return typeof body === 'string'
+        && /signed_request_requires_resign|bili_resign_unavailable|bili refused to forward/i.test(body);
+}
+/** {@link isProxyResignRefusal} 命中时的错误码。 */
+export const PROXY_REFUSED_SIGNED_CODE = 'PROXY_REFUSED_SIGNED';
+/**
+ * 构造 bili 拒发时的错误文案。
+ *
+ * ## 文案必须回答用户的三个问题（与 `reasoningLoopFailure` 同一条纪律）
+ *
+ * 1. **真实原因**：是本机代理拒发，不是凭据失效 —— 并**显式否认**「重新登录」；
+ * 2. **为什么**：签名覆盖正文、压缩改写了正文、代理拿不到重签凭据（三句因果链）；
+ * 3. **可执行的下一步**（issue 的建议修法 C，逐条保留）：让 bili 能重签（两法），
+ *    或临时放行。
+ *
+ * ⚠️ **必须保留 `bili_resign_unavailable` 字样**（issue 验收标准第 5 条）：
+ * 它是用户可搜索、文档可指路的锚点；`AUTH` 之所以是错误的码，正因为它会把
+ * 整条 message 替换成「API 密钥无效」（IKLBSH 同族）。
+ *
+ * ⚠️ 文案里**不得**出现 Markdown 强调符：错误 message 是纯文本渲染。
+ *
+ * @param body - 响应体原文（把 bili 的解释拼进文案，保住可诊断性）。
+ */
+export function proxyResignRefusalFailure(body) {
+    const detail = body.trim().length > 0 ? body.trim().slice(0, 600) : '(响应体为空)';
+    return {
+        message: '本机上下文压缩代理（bili）拒发了这条签名请求：请求体被压缩改写，而签名覆盖正文，'
+            + '代理拿不到重签凭据（bili_resign_unavailable）。凭据本身有效，重新登录无用。'
+            + '修法二选一：① 让 bili 能重签 —— 在 Jet Hub 保证存在一个 codearts 账号'
+            + '（enabled 且凭据可解析出 access_key_id / secret_access_key），'
+            + '或用 BILI_CODEARTS_REF / resign["sdk-hmac-sha256"].credentialRef 钉一个；'
+            + `② 临时放行 —— BILI_RESIGN_PASSTHROUGH=1（该 scheme 逐字节直穿、不压缩）。上游：${detail}`,
+        code: PROXY_REFUSED_SIGNED_CODE,
+    };
 }
 /** 可中止的休眠；当信号中止时立即 resolve。 */
 function delay(ms, signal) {
@@ -694,21 +1100,63 @@ export class CodeArtsAdapter extends LlmAdapter {
             product: { id: PROVIDER },
             loadCatalog: () => this.catalogEntries(),
             syncCatalog: () => this.syncCatalogEntries(),
-            // ⚠️ 未知 id 恒声明 `['text']`（本家是纯文本网关）。
-            // ⚠️ 这是**用户 2026-10-08 裁定的一处行为变更**：原 `resolveModel` 对未知 id
-            //    **省略**该字段（而 `listModels` 却声明 `['text']`，同一家内部不一致）
-            //    ⇒ 统一为声明。影响面为零：CodeArts 是纯文本网关，VL 模型已被滤掉。
-            unknownModelInputModalities: () => ['text'],
+            // ⚠️ 未知 id 的模态：**VL 模型例外**（2026-10-21 接图片时发现）。
+            //
+            // 历史：这里原写死 `['text']`，理由是「本家是纯文本网关、VL 模型已被滤掉」。
+            // 该理由**只对目录内条目成立** —— VL 模型被 `catalogEntries()` 滤掉后，
+            // `resolveModel('kimi-k2.6-vl')` 走的是**未知 id 分支**（`entry === undefined`），
+            // 于是拿到这里的 `['text']`，而 `toCatalogEntry` 里算出的 `['text','image']`
+            // **根本轮不到**（那条只在目录命中时生效）。
+            // ⇒ 症状：VL 模型声明不了 image ⇒ DSH 在**入库阶段**就拒图（真缺陷，
+            //    由 `codearts-image-input.spec.ts` 的守卫 ① 当场抓住）。
+            // ⇒ 修法：按 id 判能力（`codeartsAcceptsImage`），其余仍恒 `['text']`。
+            //
+            // ⚠️ 这也解释了为什么**不能**把 VL 模型放进目录来解决：那会改变「选择器里
+            //    能选到什么」（用户可见行为），而本次只需要「识图工具能按 id 借它」。
+            unknownModelInputModalities: (modelId) => codeartsAcceptsImage(modelId)
+                ? ['text', 'image']
+                : ['text'],
             // ⚠️ **未知模型也声明思考档位**（7b 曾在此引入回归、7d 补回）：
             // 本网关唯一生效的思考控制是顶层 `thinking.type`，与模型无关 ⇒
             // 原实现对未知 id 同样给这两档。
+            // ⚠️ 顺序规则见 `CODEARTS_REASONING_EFFORTS` 的长注释（**强度序：弱 → 强**）。
+            // 未知模型与已知模型必须同一份顺序，否则用户手填 id 时档位轴会翻向。
             unknownModelReasoning: () => ({
-                efforts: [
-                    { id: ReasoningEffortId('on'), name: '开启' },
-                    { id: ReasoningEffortId('off'), name: '关闭' },
-                ],
-                defaultEffort: ReasoningEffortId('on'),
+                efforts: [...CODEARTS_REASONING_EFFORTS],
+                defaultEffort: ReasoningEffortId(CODEARTS_DEFAULT_EFFORT),
             }),
+            /**
+             * ⚠️ **未知 id 也给窗口**（用户手填模型 id 时否则永远没有上下文占用条）。
+             *
+             * 与 `unknownModelInputModalities` / `unknownModelReasoning` **同一形态**：
+             * 本家这两项都与「具体模型」无关（纯文本网关 / 顶层 `thinking.type`），
+             * 窗口这一项在本家同样有本地兜底可用（目录窗口本就全来自静态表）。
+             *
+             * ⚠️⚠️ **必须走 `codeartsContextWindow(modelId)`，不能直接返回常数兜底**
+             *    （2026-10-21 全量测试实测踩到）：`glm-5.3` 在静态窗口表里是 1M，
+             *    但**不在静态兜底目录**（`DEFAULT_MODELS`）里 ⇒ 远端失败时它算
+             *    「目录外 id」⇒ 直接返回常数会让它拿到 524_288（**分母错 2 倍**），
+             *    而它**正是用户报障的那个模型**。
+             *
+             * ⚠️ **不要推广到别家**：多数家的窗口来自远端该模型的配置，对未知 id
+             *    编一个就是**假窗口**（分母错 ⇒ 占用比与压缩阈值一起错）。
+             *    取值理由见 `CODEARTS_FALLBACK_CONTEXT_WINDOW` 的长注释。
+             */
+            unknownModelContextWindow: (modelId) => codeartsContextWindow(modelId),
+            /**
+             * ★ **强制重拉**（供后台 20 分钟刷新器与「用户改设置」）。
+             *
+             * ⚠️ 与 `loadCatalog` 的差别：后者内部有 `isCatalogFreshFor` 判据
+             *    ⇒ 新鲜时**不拉**。本回调要的是「无视新鲜度，强制拉一次」，
+             *    故先清 `catalogAt` 再调**同一个** `ensureRemoteModels()` ——
+             *    **不另写一份拉取逻辑**（那会让两条路的上游行为分叉）。
+             *    ⚠️ `ensureRemoteModels` 的入口就是 TTL gate ⇒ 清掉 `catalogAt`
+             *    正是让它失效的承重动作（与 loomy / zcode 等家同型）。
+             */
+            refresh: async () => {
+                this.catalogAt = 0;
+                await this.ensureRemoteModels();
+            },
         });
     }
     /**
@@ -733,6 +1181,13 @@ export class CodeArtsAdapter extends LlmAdapter {
      */
     remoteComplete = false;
     /**
+     * ⚠️ 上次**成功**读到远端目录的时刻（0 = 从未成功过）。
+     *
+     * ⚠️ 与 `remoteModels` **并存**、不是替代：`remoteModels` 存「有哪些模型」，
+     *    本字段存「何时读到的」。只有 `remoteModels` 时目录**永不刷新**（原行为）。
+     */
+    catalogAt = 0;
+    /**
      * 目录加载闸门：并发去重 + 失败冷却。
      *
      * ⚠ **不能省**：DSH 的 `buildModelCatalog` 对每个 provider `await listModels()`
@@ -742,22 +1197,43 @@ export class CodeArtsAdapter extends LlmAdapter {
      */
     catalogGate;
     /**
-     * 懒加载远端模型目录。resolveModel 可能先于 listModels 被调用
-     * （如直接进入会话），此时同样触发远端拉取。
+     * 懒加载远端模型目录（**每 20 分钟**重新拉一次，用户 2026-10-18 的要求）。
+     *
+     * resolveModel 可能先于 listModels 被调用（如直接进入会话），此时同样触发远端拉取。
      */
     async ensureRemoteModels() {
         const fetchRemote = this.options.fetchRemoteModels;
+        // ⚠️ `fetchRemote === undefined` 那半边**原样保留** —— 它判的是「有没有远端
+        //    可拉」（无凭据/无接线），与新鲜度是两件事。
         if (fetchRemote === undefined)
             return;
-        // ⚠️⚠️ **短路判据是「已完整」，不是「已定义」**（issue IKJVTF 复审，审计 I3）。
+        // ⚠️⚠️ **短路判据是「已完整」+「未超 20 分钟」，不是「已定义」**
+        //    （issue IKJVTF 复审，审计 I3；TTL 由 `isCatalogFresh` 给出）。
         //
         // CodeArts 有两个独立目录端点，残缺目录**也**要落 `remoteModels`
         //（展示需要 —— 目录服务抖动时用户的模型列表不该整个消失），但那时**不能**
         // 短路：`RemoteCatalogGate` 的冷却（`retryAt` / `cooling()`）在生产里只有
         // 闸门自己那一处调用点，而它排在短路**之后** ⇒ 残缺目录一旦落缓存，
         // 冷却永远读不到、残缺永远补不齐（与 Cline 的缺陷② 完全同构）。
-        if (this.remoteComplete)
+        //
+        // ⚠️⚠️ **加 TTL 为什么不会破坏残缺恢复**（加 TTL 前逐行核实）：
+        // TTL 那一腿是 `&&` 的**后半截**，前半截 `remoteComplete` 未变。残缺时
+        // `remoteComplete === false` ⇒ 短路判据恒为假 ⇒ **残缺目录不会被判为
+        // 「新鲜」，闸门冷却与补齐逻辑原样生效**。TTL 只让「重新拉取」变得可发生
+        // （完整目录满 20 分钟会被重新拉，倍率/目录变化能跟上），不改变残缺的纠正路径。
+        // ⇒ **未改任何合并逻辑**（两个端点各自成败仍由接线层经 `catalogComplete` 上报）。
+        // ⚠️ **TTL 那一腿用 `isCatalogFreshFor`**（带「用户主动失效」）：用户在 Jet Hub
+        //    改开关后要**立即**重拉（规格 §6 的正确性要求，见 `invalidateCatalogCache`）。
+        //    ⚠️ 本家走 `LlmAdapter` 基类、`createModelCatalog` 的 `product` 是
+        //    `{ id: PROVIDER }` ⇒ 登记的 provider id 恒为 `PROVIDER`（`codearts`），
+        //    没有「一个类服务两个站」的情况（qoder / buddy 才有）。
+        //    ⚠️ 失效腿与完整性腿是 `&&` ⇒ 失效让整条合取为假、照常进闸门；
+        //    拉取失败时**保留**旧 `remoteModels`（本方法不清它）⇒ 用户看到的仍是
+        //    上次那份完整列表，不会退化成兜底**子集**（规格 §7 的核心取舍）。
+        if (this.remoteComplete
+            && isCatalogFreshFor(PROVIDER, this.catalogAt, this.options.now?.() ?? Date.now())) {
             return;
+        }
         await this.catalogGate.run(async () => {
             const models = await fetchRemote();
             // 空目录同样算「没拿到」：既不应落缓存（否则再也拉不回来），
@@ -765,6 +1241,9 @@ export class CodeArtsAdapter extends LlmAdapter {
             if (models.length === 0)
                 return false;
             this.remoteModels = models;
+            // ⚠️ **只在成功赋值后**记时刻：失败/空结果不写，否则一次抖动会把上界
+            //    刷新掉、下轮还要等满 20 分钟才发现上游没恢复。
+            this.catalogAt = this.options.now?.() ?? Date.now();
             // ⚠️ 完整性由接线层桥接的数据源上报（两来源各自的成败）。
             // 拿不到判定时退回 `got`（= 旧行为），避免把「判不出」当成「残缺」
             // 而让每个 provider 都反复重拉。
@@ -785,6 +1264,20 @@ export class CodeArtsAdapter extends LlmAdapter {
      * 它在 `listModels` 与 `listAllModels` **两条路径上都要生效** ——
      * 故放在 `toCatalogEntry` 之前的取数回调里（`catalogEntries()`）。
      */
+    /**
+     * ★ **后台目录刷新器入口**（`src/index.ts` 的 `refreshOf` 调 `adapter.refresh?.()`）。
+     *
+     * ⚠️⚠️ 必须由适配器**显式转发** `catalog.refresh`：`ModelCatalog`（`model-catalog.ts`）
+     *    上的这个成员**不会**自动变成适配器的成员 —— `pruned()` 的 Proxy 只透传
+     *    **适配器自己的**成员（`dead-model-store.ts:748-749`）。
+     *    漏转发 ⇒ 刷新器「已武装」却对这家**空转**，且**零日志**（`refreshOf` 返回
+     *    `undefined` 时静默跳过 —— `index.ts` 的装配注释写着这件事）。
+     *    ⚠️ 与 `options.refresh`（HTTP 401 后的**凭据**重取）**不是同一件事**，
+     *    两者同名纯属巧合，**不得合并**。
+     */
+    async refresh() {
+        await this.catalog.refresh?.();
+    }
     listAllModels() {
         return this.catalog.listAllModels();
     }
@@ -794,8 +1287,10 @@ export class CodeArtsAdapter extends LlmAdapter {
      * ⚠️ 本家三处**真实差异**（不要「顺手统一」）：
      * 1. **VL 多模态不参与目录**（`-VL-` / `-VL` 结尾的 id 被滤掉）——
      *    这是本家的可见性判据，骨架不认识；
-     * 2. `contextWindow` 来自静态 `CONTEXT_WINDOWS` 表（不是远端字段）；
-     * 3. `reasoning` 是**恒声明**的两档（开启/关闭），与 entry 无关 ——
+     * 2. `contextWindow` 来自静态 `CONTEXT_WINDOWS` 表（不是远端字段 ——
+     *    本家两个目录端点都**不下发**窗口，取证见该表的注释），表里查不到时
+     *    走具名兜底 {@link CODEARTS_FALLBACK_CONTEXT_WINDOW}（**恒有值**）；
+     * 3. `reasoning` 是**恒声明**的两档（关闭/开启，**强度序**），与 entry 无关 ——
      *    实测（2026-09-29）：本网关**唯一**真正生效的思考控制是顶层
      *    `thinking.type`，`reasoning_effort`（含 low/high/none/minimal）与嵌套
      *    `reasoning.effort` 都被服务端接受但**完全无效果**（判据为服务端上报的
@@ -803,19 +1298,61 @@ export class CodeArtsAdapter extends LlmAdapter {
      *    故**不**臆造 low/high/max 强度阶梯。
      */
     toCatalogEntry(model) {
-        const contextWindow = CONTEXT_WINDOWS.get(model.id);
+        // ⚠️ **恒有值**（表内优先、查不到走具名兜底）—— 缺它用户就没有上下文占用条，
+        //    见 `CODEARTS_FALLBACK_CONTEXT_WINDOW` 的长注释（真实报障 2026-10-21）。
+        const contextWindow = codeartsContextWindow(model.id);
+        // ⚠️ 倍率拼进 `name`（与 officeace / buddy / loomy / raccoon 同款：
+        //    `name` 带倍率、`resolveModel` 用裸名，骨架只认 `name`）。
+        //
+        // ⚠️⚠️ **必须同时给 `bareName`**（2026-10-21 合并审计发现）：共享骨架
+        //    `model-catalog.ts:640` 的取值是 `entry?.bareName ?? entry?.name ?? model`
+        //    ⇒ 省略 `bareName` 就回退到**带倍率**的 `name` ⇒ `resolveModel().name`
+        //    会带上倍率。全仓其余六家拼倍率的渠道（loomy / raccoon / accio /
+        //    lobsterai / trae / buddy）**全部**提供了 `bareName`，本家是唯一例外。
+        //    ⚠️ 本家比别家更严重：倍率**随时间变**（错峰档 21:00–次日 08:00）⇒
+        //    同一个模型的 `resolveModel().name` 一天变两次（`· 0.09x` ↔ `· 0.18x`）。
+        //
+        // ⚠️ **形态必须转成仓内口径 ` · x{n}`**（2026-10-21 合并审计发现）：
+        //    上游 `ratio_display` 原串是 `0.7x`（**x 在数字后**），而全仓其余各家
+        //    是 ` · x{n}`（**x 在数字前**），且 `src/aggregate-core.ts` 的
+        //    `priceFactorFromName` 的正则把 `[×x]?` 放在数字**之前** ⇒ ` · 0.18x`
+        //    **解析不出** ⇒ 恒返回 `Infinity`。
+        //    ⇒ 后果：codearts 是聚合渠道（`AGGREGATE_CHANNELS` 第 1 位），
+        //      它的候选价格恒为 `Infinity` ⇒ `rankCandidates` 的第三判据
+        //      「同临期档内倍率升序」永远挑不到 codearts，`pickerNameOf` 的
+        //      `· 最低 x{n}` 也漏掉它。
+        //    ⚠️ 转换**只改形态、不改数值**（数值仍来自上游 `ratio_display`，
+        //    绝不臆造上游未下发的数 —— 见 `RemoteModel.rateLabel` 的注释）。
+        const rate = model.rateLabel !== undefined
+            ? codeartsRateSuffix(model.rateLabel)
+            : undefined;
+        const name = rate !== undefined ? `${model.name} · ${rate}` : model.name;
         return {
             id: model.id,
-            name: model.name,
-            // ⚠️ 本家恒声明 `['text']`（CodeArts 是纯文本网关；VL 模型上面已滤掉）。
-            inputModalities: ['text'],
-            ...contextWindow !== undefined ? { contextWindow } : {},
+            name,
+            // ⚠️ `resolveModel` 用的**裸名**（不含倍率）—— 价格只属于选择列表语境
+            //    （与 loomy / raccoon / trae / lobsterai 同款，见 `model-catalog.ts`
+            //    的 `bareName` 字段注释）。
+            bareName: model.name,
+            // ⚠️ 模态**逐模型判定**（2026-10-21 接图片时改）：VL 模型声明
+            //    `['text','image']`，其余恒 `['text']`。
+            //
+            //    为什么以前是「恒 `['text']`」：那时 VL 模型全被下面的可见性过滤滤掉，
+            //    目录里一条都不剩，所以写死无害。现在 VL 模型**仍不进目录**（理由见
+            //    `CODEARTS_VL_MODELS` 的注释），但 `analyzeImage` 工具会按 id 直接
+            //    `resolveModel('kimi-k2.6-vl')` —— 那条路径必须看到 `image`，
+            //    否则 DSH 的图片准入闸门会在**发请求之前**就拒掉。
+            inputModalities: codeartsAcceptsImage(model.id) ? ['text', 'image'] : ['text'],
+            // ⚠️ **无条件落键**（`codeartsContextWindow` 恒返回正数）—— 写成
+            //    `...contextWindow !== undefined ? {...} : {}` 就是本缺陷的成因。
+            contextWindow,
             reasoning: {
-                efforts: [
-                    { id: ReasoningEffortId('on'), name: '开启' },
-                    { id: ReasoningEffortId('off'), name: '关闭' },
-                ],
-                defaultEffort: ReasoningEffortId('on'),
+                // ⚠️ 顺序 = **强度序（弱 → 强）**，逐条理由见 `CODEARTS_REASONING_EFFORTS`
+                // 的长注释（Issue IKLIDV）—— 简言之：DSH 把该数组当展示顺序、客户端不排序，
+                // 故 `['on','off']` 会让「开启」落在横向轴的最左。
+                // ⚠️ `defaultEffort` 仍由 `CODEARTS_DEFAULT_EFFORT` 单独表达，与位置无关。
+                efforts: [...CODEARTS_REASONING_EFFORTS],
+                defaultEffort: ReasoningEffortId(CODEARTS_DEFAULT_EFFORT),
             },
         };
     }
@@ -855,8 +1392,14 @@ export class CodeArtsAdapter extends LlmAdapter {
         return this.catalog.resolveModel(provider, model, signal);
     }
     async prepareCall(provider, model, signal) {
+        // ⚠️⚠️ **不得在这里再写一次 `inputModalities`**（2026-10-21 接图片时发现）：
+        // 原代码是 `{ ...await this.resolveModel(...), inputModalities: ['text'] }` ——
+        // 即**硬覆盖**目录里刚算出的模态。那与「同一事实写两处」同型：只要目录里
+        // 开始按模型区分模态（VL 收图、文本模型不收），这行就会**静默把它抹平**，
+        // 症状是「VL 模型明明声明了 image，发图仍被 DSH 在入库阶段拒掉」。
+        // ⇒ 模态只由 `toCatalogEntry` 一处决定，这里原样透传。
         return {
-            model: { ...await this.resolveModel(provider, model, signal), inputModalities: ['text'] },
+            model: await this.resolveModel(provider, model, signal),
             stream: (options) => this.stream(options),
         };
     }
@@ -882,7 +1425,42 @@ export class CodeArtsAdapter extends LlmAdapter {
             if (currentAccountId)
                 reportLedgerAccount(PROVIDER, currentAccountId);
         }
-        const messages = serializeMessages(options.messages);
+        // ⚠️ **图片：只有 VL 模型收，且必须走共享实现**（2026-10-21 实测接线）。
+        //
+        //  - 模态闸门：`codeartsAcceptsImage(model)` 为假时**不读字节、不拼 parts**
+        //    ⇒ 请求与改造前逐字节相同（文本模型发图仍会被上游 406，但我们不会
+        //    先把图内联进去浪费一次请求；真正的准入在 DSH 侧由 `inputModalities`
+        //    拦下，见 `toCatalogEntry`）。
+        //  - `imageUrls === undefined` ⇒ 共享 `serializeMessages` 走**纯文本**老路径，
+        //    与改造前一致；非 undefined（含空 Map）时把 user 消息升级为多模态 parts。
+        //    ⚠️ 空 Map 不能降级为 undefined —— 那会让「图片在但字节读失败」的
+        //    `[image unavailable]` 占位符也被跳过，图片静默消失（与 officeace 同因）。
+        let imageUrls;
+        if (codeartsAcceptsImage(options.model)) {
+            const imageRefs = new Map();
+            for (const message of options.messages) {
+                if (Array.isArray(message.content))
+                    collectImages(message.content, imageRefs);
+            }
+            if (imageRefs.size > 0) {
+                imageUrls = new Map();
+                for (const [id, ref] of imageRefs) {
+                    if (this.options.readImage === undefined) {
+                        // 附件服务没接线：留空 Map（图片显示为 `[image unavailable]`），
+                        // 而不是抛错把整轮对话打死 —— 与其余家同一取向。
+                        continue;
+                    }
+                    try {
+                        const image = await this.options.readImage(ref);
+                        imageUrls.set(id, `data:${image.mediaType};base64,${Buffer.from(image.data).toString('base64')}`);
+                    }
+                    catch {
+                        // 单张读失败不拖垮整轮：其余图片照发，这张落占位符。
+                    }
+                }
+            }
+        }
+        const messages = serializeMessages(options.messages, imageUrls);
         // harness 的 GenerateOptions.system 是独立的系统提示（如标题生成的
         // systemPrompt、agent 的 persona）。后端 chat/completions 只接受
         // messages 数组里的 system 角色，必须显式插入——否则模型看不到
@@ -933,7 +1511,10 @@ export class CodeArtsAdapter extends LlmAdapter {
         const titlePlan = planSessionTitleThinking({
             purpose: options.purpose,
             requestedEffort: options.reasoningEffort === undefined ? undefined : String(options.reasoningEffort),
-            declaredEfforts: ['on', 'off'],
+            // ⚠️ 与 `resolveModel` 声明的档位**同源**（`CODEARTS_REASONING_EFFORTS`）——
+            // 各写一份必然漂移，而漂移的症状是「标题请求挑的关闭档不在声明里」。
+            // ⚠️ `thinkingOffEffortOf` 按 **rank** 找关闭档（不按位置），故顺序调整不影响它。
+            declaredEfforts: CODEARTS_REASONING_EFFORTS.map((effort) => String(effort.id)),
             maxTokens: options.maxTokens,
         });
         const body = JSON.stringify({
@@ -997,6 +1578,9 @@ export class CodeArtsAdapter extends LlmAdapter {
         // 鉴权失败（APIG.0602 / 401 / 403）后已刷新过凭据：避免死循环，
         // 同一次 stream() 调用最多 refresh 一次。
         let authRefreshed = false;
+        // 上游网关瞬时签名故障（正文哈希对不上）已重发的次数：
+        // 与 `authRefreshed` 分开计，它**不是**鉴权失败，不该消耗续期名额。
+        let signatureRetries = 0;
         // 该账号不带 benefit 包时去掉 `maas_type: benefit` 头重试一次：
         // 只试一次，避免与真实失败互相掩盖。
         let benefitHeaderDropped = false;
@@ -1098,6 +1682,49 @@ export class CodeArtsAdapter extends LlmAdapter {
             }
             else {
                 const errorText = await response.text().catch(() => '');
+                // 上游网关瞬时签名故障（`APIG.0301 … body hash mismatch`）：直接重发。
+                //
+                // 为什么值得自动重发：这是用户可见的一次性失败 —— 2026-10-03 用户报障
+                // 「华为的还是用不了」，会话日志里两次 401（13:55、15:23）都带着
+                // `APIG.0301 … body hash mismatch`，而此前同一会话的 135 轮调用全部正常、
+                // 事后同一凭据重放也立刻成功。也就是说这一次失败**本来重发就能过去**，
+                // 原实现却把它当凭据问题（先白刷一次凭据、再报「API 密钥无效」）。
+                if (isTransientSignatureFailure(response.status, errorText) && signatureRetries < SIGNATURE_RETRY_MAX) {
+                    // ⚠️ **abort 后必须立刻停手**（2026-10-19 审计 I1）。`delay()` 在信号
+                    // 中止时是**静默 resolve**（不是 reject），若不判就直接 `continue`，
+                    // 循环会回到顶部**再发一次完整请求** —— 用户已经按了「停止」，网关
+                    // 却还在收请求（实测：基线 abort 后恒 2 次，加了这条重发后涨到 3 次）。
+                    //
+                    // ⚠️ 与下方排队路径 L1571 的 `if (options.signal?.aborted) throw` 是
+                    // **同一处置**，不是两份判据：排队与签名重发都要在退避后复检信号。
+                    if (options.signal?.aborted) {
+                        throw new LlmError('codearts: request aborted while retrying after a transient gateway signature failure', 'ABORTED');
+                    }
+                    signatureRetries += 1;
+                    await delay(SIGNATURE_RETRY_DELAY_MS * signatureRetries, options.signal);
+                    continue;
+                }
+                // ⚠️⚠️ 本机代理拒发改写请求（bili，Gitee IKQ7AP）：**在 AUTH 刷新之前**
+                // 直接抛出，不进入刷新/换号路径。
+                //
+                // 为什么位置在 `isAuthError` 分支之前、且是**独立早退**而不是只靠
+                // `isAuthError` 排除：`isAuthError` 返回 false 只保证「不白刷凭据」，
+                // 但 403 还会继续落到下面的额度/限流/`httpErrorCode` 分类链。
+                // `httpErrorCode` 那格已改成返回 `PROXY_REFUSED_SIGNED`（码正确），
+                // 但**文案**会走通用的 `model request failed with HTTP …` 模板 ——
+                // 那句唯一的指路话（怎么让 bili 拿到重签凭据）仍到不了用户眼前。
+                // ⇒ 在这里直接用 {@link proxyResignRefusalFailure} 抛完整文案。
+                //
+                // ⚠️ **重发无效**：与 `isTransientSignatureFailure` 那条的本质区别
+                //（见其注释的对照表）—— 压缩仍在、重签凭据仍缺，重发/刷新/换号都不会好。
+                // ⚠️ **不换号**：换号只会让下一个账号的凭据同样到不了 bili 手里；
+                // 且与 codearts 不做 permanentLock 的既有决定一致 —— 「代理拒发」不是
+                // 「账号死亡」，任何永久化都不该由这条 403 触发（issue 的反面教材：
+                // 同源缺陷在另一实现上把账号**永久禁用**了）。
+                if (isProxyResignRefusal(response.status, errorText)) {
+                    const failure = proxyResignRefusalFailure(errorText);
+                    throw new LlmError(failure.message, failure.code, { status: response.status });
+                }
                 // 鉴权失败（SecurityToken 过期/被吊销/APIG.0602）：刷新一次凭据后
                 // 重试整个 chat 请求。入口的 expires_at 预判无法覆盖后端提前吊销
                 // 或时钟偏差场景，这里做兜底，避免把可自愈的鉴权失败抛给用户。
@@ -1120,7 +1747,9 @@ export class CodeArtsAdapter extends LlmAdapter {
                 //
                 // ⚠️ 判据用整个错误体（`errorDetail` 会拼出 `error_code` + `error_msg`）：
                 // 4xx 的报文形态与 SSE 不同，不能指望顶层 `error_code` 字段名一致。
-                if (isSseQuotaExhaustedErrorCode(errorDetail(errorText), errorText)) {
+                // ⚠️ **分类必须走 `errorDetailForClassify`**（不含 detail 腿）—— 理由同上，
+                // 用展示出口会让 detail 里的额度措辞翻转这条判据。
+                if (isSseQuotaExhaustedErrorCode(errorDetailForClassify(errorText), errorText)) {
                     const message = codeartsQuotaExhaustedMessage(options.model, nextUtc8DayStartMs());
                     if (this.options.accountPool) {
                         if (currentAccountId) {
@@ -1137,6 +1766,32 @@ export class CodeArtsAdapter extends LlmAdapter {
                         }
                     }
                     throw new LlmError(message, CODEARTS_QUOTA_EXHAUSTED_CODE, { status: response.status });
+                }
+                // ── benefit 去头重试的 **4xx 通道**（Gitee issue IKLBSH A6）──
+                //
+                // 同一个上游条件（该账号没有 benefit 免费额度包）会走**两条**通道下发：
+                // SSE 200（`consumeSse` 已接，见 `CODEARTS_BENEFIT_NOT_FOUND_ERROR_CODE`）
+                // 与 HTTP 4xx。此前**只有 200 那条接上了** —— 4xx 形态会径直落到
+                // `httpErrorCode` 归成 `INVALID_REQUEST` 抛出，**去头重试一次也不试**，
+                // 于是「同一条件下 SSE 能自愈、4xx 却硬报错」。
+                //
+                // ⚠️ 这不是推断：`origin/issue/IKJOF7-benefit-diagnostics` 分支
+                //（2026-10-05 取证提交）用 `it.fails` **显式锁定**了该缺陷
+                //（「HTTP 4xx + 正文含 InferHub.4004.200 时也应当去头重试」），
+                // 当时的结论是「已确认，但本分支不修」——本处即补上那一半。
+                //
+                // 判据复用既有的 `benefitHeaderDropped` 门禁（**只试一次**）——它与
+                // SSE 通道**共享同一个标记**，故两条通道叠加也只会去头一次，不会
+                // 「各试一次」把请求放大成两轮。
+                //
+                // ⚠️ 不采纳 issue 建议的「1s / 2s / 3s 递增退避重试最多 3 次」：
+                // 去头重试是**一次**（`benefitHeaderDropped` 的既有语义，注释写明
+                // 「只试一次，避免与真实失败互相掩盖」），且 issue 自己给的证据是
+                // 「去掉请求头后密集取样 9 次全部 200」——那说明的正是**去头即通**，
+                // 而非「需要多次退避」。按证据改，不按建议改。
+                if (isBenefitModel && !benefitHeaderDropped && isBenefitNotFoundBody(errorText)) {
+                    benefitHeaderDropped = true;
+                    continue;
                 }
                 // 限流处理：记录当前账号在该模型上的重置时间，然后切换账号重试
                 // （外层 for(;;) 会在拿到新凭据后重新签名发请求）。用 tried 集合
@@ -1157,8 +1812,30 @@ export class CodeArtsAdapter extends LlmAdapter {
                     if (parsed) {
                         if (currentAccountId) {
                             await this.options.accountPool.updateModelRateLimit(currentAccountId, parsed.modelId, parsed.resetTimeMs);
+                            /**
+                             * ⚠️⚠️ **必须把首号加进 `rateLimitTried`**（2026-10-18 审计补齐）。
+                             *
+                             * 这一格原先**既没加首号、也没把 `rateLimitTried` 传给池** —— 两处都漏。
+                             * 加首号是**承重**的：它是「本轮已试过」的记账，
+                             * 漏了它 ⇒ 首次 429 换号时排除集为空 ⇒ 池按手动顺序**把刚失败的
+                             * 首号再返回一次** ⇒ `rateLimitTried.has` 命中 → **换号立即终止**
+                             * ⇒ 报「所有账号均受限」而池里其实有可用账号。
+                             *
+                             * ⚠️ 与同文件 `:1323`（SSE 额度格）、`:1393`（HTTP 额度格）**同型** ——
+                             * 那两格一直都有这一行，只有本格漏了。
+                             */
+                            rateLimitTried.add(currentAccountId);
                         }
-                        const next = await this.options.accountPool.getAvailableAccount('codearts', options.model);
+                        // ⚠️ 必须传 `rateLimitTried`（⚠️⚠️ **2026-10-18 修复：这一行原先漏传**）
+                        // —— 池按用户手动顺序返回候选，**刚被标记的账号可能仍排第一**
+                        // （模型级过滤命中时不会，但 `parsed.resetTimeMs` 若落在
+                        // `modelIds` 之外、或标记与本模型键不一致时就挡不住）⇒ 拿回同一个
+                        // ⇒ 命中下面的 `rateLimitTried.has` 而立即放弃换号，报
+                        // 「所有账号均受限」而池里其实有可用账号。
+                        // 与同文件 `:1331`（额度耗尽换号）、`:1395` 两处**同型同修**。
+                        // 该缺陷与 2026-09-17 的 `81706da`（`excludeAccountIds` 的引入
+                        // 动机）逐字同构，只是那一次漏在了这一格。
+                        const next = await this.options.accountPool.getAvailableAccount('codearts', options.model, rateLimitTried);
                         if (next && !rateLimitTried.has(next.entry.id)) {
                             rateLimitTried.add(next.entry.id);
                             credential = next.credential;
@@ -2043,6 +2720,28 @@ export function isModelSaturationError(status, body) {
         if (code === MODEL_SATURATION_BUSINESS_CODE
             || code === String(MODEL_SATURATION_BUSINESS_CODE))
             return true;
+        // ⚠️⚠️ **结构化降级：报文自带「额度限流」业务码时，一律不判模型饱和**
+        // （2026-10-17 对抗审计实测的真缺陷）。
+        //
+        // 本函数的**码值腿是权威的**，文案腿只是「上游可能改用别的码值」的兜底；
+        // 因此当报文**明确给出了另一个已知业务码**时，那才是权威信号。
+        //
+        // 实测（buddy 额度限流）：`{"code":6004,"msg":"请求量饱和，请稍后再试"}`
+        // → `MODEL_SATURATION_PATTERN` 的「请求量饱和」命中 ⇒ 判成**模型级**饱和。
+        // 后果不是措辞问题，而是**行为分叉**（见上表）：
+        // | | 额度限流 6004 | 误判成模型饱和 |
+        // |---|---|---|
+        // | 换号 | 有效 | 退化成「原账号退避重试」 |
+        // | 写限流标记 | 必须 | **绝对不许** |
+        // ⇒ 一个**额度已耗尽**的账号会被判成「换账号无效、换模型吧」，
+        // 而池里其它账号的额度是独立的、可用。
+        //
+        // ⚠️ 为什么要**降级而不是直接 return false**：6004 之外的码还可能是别的语义
+        // （上游新码 / 未知码），此时文案兜底仍有价值。故只在**已知对立法**（额度限流）
+        // 成立时降级，未知码仍走文案腿。
+        if (code === RATE_LIMIT_BUSINESS_CODE || code === String(RATE_LIMIT_BUSINESS_CODE)) {
+            return false;
+        }
     }
     catch {
         // 非 JSON：交给文案兜底。
@@ -2119,6 +2818,193 @@ const RESET_TIME_PATTERN = /(?:将在|reset at)\s+([\d-]+\s+[\d:]+)\s+(UTC[+-]\d
  * 且必须与这里 `parseRateLimitError` 的兜底**同值**，否则两处口径会漂。
  */
 export const RATE_LIMIT_FALLBACK_MS = 3_600_000;
+/**
+ * 额度耗尽的业务码（CodeBuddy 系实测值）。
+ *
+ * ⚠️ 与 {@link RATE_LIMIT_BUSINESS_CODE}（6004 = 频率限流）**不可合并**：
+ * 两者动作相同但**冷却终点相反**（见 {@link isCreditExhausted} 的表）。
+ */
+export const CREDIT_EXHAUSTED_BUSINESS_CODE = 14018;
+/**
+ * 额度耗尽的文案兜底判据（`14018` 的码值腿之外的唯一通道）。
+ *
+ * 上游原话（`www.workbuddy.ai`，HTTP 429）：
+ * `Credits exhausted. Please visit the link below to purchase add-on packs…`
+ *
+ * ⚠️ **关键词必须窄**：`insufficient` 单独出现**过宽**（见
+ * {@link isCreditExhausted} 的说明）。
+ */
+const CREDIT_EXHAUSTED_PATTERN = /credits?\s+exhausted|quota\s+exhausted|积分.{0,4}(?:不足|耗尽|用尽)|额度.{0,4}(?:不足|耗尽|用尽)|余额.{0,4}(?:不足|耗尽|用尽)/i;
+/**
+ * 额度**耗尽**（不是频率限流）的判据 —— 「钱用光了」，不是「发太快」。
+ *
+ * ## ⚠️⚠️ 为什么必须与 {@link isRateLimited} 分开（真实缺陷，Gitee IKQ6HJ）
+ *
+ * 两者的**动作完全相同**（换号 + 写冷却标记），但**冷却终点的语义相反**：
+ *
+ * | | 频率限流（6004 / 429） | 额度耗尽（14018 / Credits exhausted） |
+ * |---|---|---|
+ * | 恢复方式 | 时间到了就恢复（分钟级滚动窗口） | **等次日配额 / 充值** |
+ * | 冷却终点 | 服务端声明时刻，否则 +1h 兜底 | **UTC+8 当日 24:00** |
+ * | 写成 +1h 的后果 | 无（本来就该 1 小时） | **每小时被重新选中一次、必然再失败** |
+ *
+ * 用户侧症状（原始报障）：「面板说可以用了，一试又不行」——面板的『限额重置』
+ * 显示的是失败时刻 + 1 小时，到点后账号被重新选中，必然再失败一次，再写一条
+ * 1 小时标记，**循环往复**。而真实出路是等次日配额或充值。
+ *
+ * ## 为什么是「UTC+8 当日 24:00」而不是「+24h」
+ *
+ * 与 `loomyCooldownResetAtMs`（Gitee IKL80H 那起事故）**同一条纪律**：
+ * 额度按 UTC+8 自然日结算，用滑动 24h 会让 23:50 烧光的账号被封到**次日 23:50**
+ * ——用户 0 点后上游明明已放行、插件仍说「没到重置时间」，白等近一整天。
+ * 四家同口径的既有实现：`loomyCooldownResetAtMs` / `qoder-adapter` /
+ * `zcode-adapter` / `llm-adapter` 的 codearts 分支。
+ *
+ * ## 判据刻意**窄**
+ *
+ * 只认 `14018` 码值与 `credits exhausted` 完整短语。**不收** `insufficient` 这类
+ * 泛词 —— 上下文超长报文里的 `the context window is insufficient for this model`
+ * 会被误伤，而那是「换号无益」的另一类失败（同类误伤在
+ * `classifyLoomyFailure` / `classifyRaccoonFailure` 各踩过一次）；
+ * 中文侧同样只收「额度/积分/余额 + 不足/耗尽」的**确定性组合**。
+ *
+ * ⚠️ **本函数只看响应体，不看状态码**：14018 实测回 **HTTP 429**，但它与
+ * 频率限流共用 429 ⇒ 状态码对这一格**没有判别力**，只能靠码值/文案。
+ *
+ * @param body - 响应体（可能为空串）。
+ */
+export function isCreditExhausted(body) {
+    if (body.length === 0)
+        return false;
+    // ① 结构化业务码：只认 JSON 的 `code` 字段（与 `hasRateLimitBusinessCode` 同一
+    //    取舍 —— 全文搜 `14018` 会被 UUID 里的数字子串误命中）。
+    //
+    //    ⚠️ **必须同时认嵌套形态**：buddy 系的真实报文是
+    //    `{"error":{"data":{"code":14018,"msg":"…"}}}`（码在**第二层**），
+    //    只看顶层 `code` 会让码值腿在这家**恒不命中**、只剩英文文案腿 ——
+    //    而上游一改文案就静默失效（同族教训：`channelVerificationUpstreamId`
+    //    的注释记录了「判据认了某字段、出口却提不出该字段」的漂移）。
+    try {
+        const data = JSON.parse(body);
+        const inner = typeof data.error === 'object' && data.error !== null
+            ? data.error
+            : undefined;
+        const nested = typeof inner?.data === 'object' && inner.data !== null
+            ? inner.data
+            : undefined;
+        const codes = [data.code, inner?.code, nested?.code];
+        if (codes.some(code => code === CREDIT_EXHAUSTED_BUSINESS_CODE
+            || code === String(CREDIT_EXHAUSTED_BUSINESS_CODE))) {
+            return true;
+        }
+    }
+    catch {
+        // 非 JSON：交给文案腿。
+    }
+    // ② 文案腿（网关包装过的 200/400、纯文本错误页、以及 `errorDetail` 产物）。
+    return CREDIT_EXHAUSTED_PATTERN.test(body);
+}
+/**
+ * 额度耗尽的冷却终点：**UTC+8 当日 24:00**。
+ *
+ * 与 {@link isCreditExhausted} 配套，供 `buddy-adapter` 的换号记账分支与
+ * `account-probe` 的重测回写共用 —— **只留一份实现**，两处各算一次必然漂移
+ * （本仓库首条红线「同一语义两套判据」）。
+ *
+ * ⚠️ **必须放在本文件（共享层）而不是某个渠道的适配器里**：`account-probe.ts`
+ * 也要用它（重测时把同一时刻回传给存储），而探测层不得反向依赖某个渠道的
+ * 适配器 —— `tests/unit/account-probe-adapter.spec.ts` 普遍
+ * `vi.mock('../../src/buddy-adapter.js')`，形成依赖后那个 mock 会把该函数
+ * 一起变成 `undefined`（Gitee IKQ6HJ 报告里记录的同一处陷阱）。
+ *
+ * @param nowMs - 当前时刻（注入以便单测）。
+ */
+export function creditExhaustedResetAtMs(nowMs = Date.now()) {
+    return nextUtc8DayStartMs(nowMs);
+}
+/**
+ * 只取**服务端显式声明**的重置时刻；解析不到就返回 `undefined`（**不兜底**）。
+ *
+ * ## 为什么必须与 {@link parseRateLimitError} 并存
+ *
+ * `parseRateLimitError` 的语义是「调用方需要一个可写的标记」，故它**必然**
+ * 给出一个时刻（解析不到就 `+1h`）。而额度耗尽那一格需要区分
+ * 「服务端真给了时刻」与「它压根没给」：
+ *
+ * - 服务端给了 ⇒ **以它为准**（上游比我们更清楚何时恢复）；
+ * - 服务端没给 ⇒ 走 {@link creditExhaustedResetAtMs} 的 UTC+8 自然日，
+ *   **不是** `+1h`。
+ *
+ * 两者混用会让 14018 继续落进 1 小时兜底（正是 Gitee IKQ6HJ 的缺陷形态）。
+ *
+ * @param body - 响应体（可能为空串）。
+ * @returns 服务端声明的重置时刻（epoch ms），无则 `undefined`。
+ */
+export function explicitRateResetAtMs(body) {
+    try {
+        const data = JSON.parse(body);
+        // ⚠️ 只读 `msg`（与 `parseRateLimitError` **同源**：两句真实文案都写在该字段里）。
+        // 若哪天上游把时刻挪到别的字段，两处必须**同批**改，不能只改一处。
+        //
+        // ⚠️ 嵌套形态也要认（`{"error":{"data":{"msg":"… reset at …"}}}`）：
+        // 只读顶层会让本函数在 buddy 系的真实报文形态上恒为 `undefined` —— 那不会
+        // 报错，只会静默退回自然日终点（「服务端给了时刻却不采用」）。
+        const inner = typeof data.error === 'object' && data.error !== null
+            ? data.error
+            : undefined;
+        const nested = typeof inner?.data === 'object' && inner.data !== null
+            ? inner.data
+            : undefined;
+        const candidates = [data.msg, inner?.msg, nested?.msg];
+        for (const candidate of candidates) {
+            if (typeof candidate !== 'string')
+                continue;
+            const resetMatch = RESET_TIME_PATTERN.exec(candidate);
+            if (!resetMatch)
+                continue;
+            const resetMs = Date.parse(`${resetMatch[1]} ${resetMatch[2]}`);
+            if (!Number.isNaN(resetMs))
+                return resetMs;
+        }
+        return undefined;
+    }
+    catch {
+        // ⚠️⚠️ **非 JSON（纯文本）也必须扫一遍** —— 这不是兜底洁癖，是**真实主路径**
+        // （对抗审计实测打穿的缺陷）：
+        //
+        // `account-probe.ts` 拿到的 `message` 是**适配器抛出的 `LlmError.message`**，
+        // 而适配器早已把上游报文压平成纯文本：
+        // `workbuddy: Credits exhausted. Your quota will reset at 2099-12-31 23:59:59 UTC+8`
+        // ⇒ `JSON.parse` 必然失败 ⇒ 本函数恒 `undefined` ⇒ 探测腿永远退回自然日，
+        // 而推理腿（拿**原始报文**）能取到显式时刻 ⇒ 两条腿对同一条报文算出两个值。
+        //
+        // 实测三格（同一份 `14018 + reset at 2099` 报文）：
+        // | 输入形态 | 修前 | 修后 |
+        // |---|---|---|
+        // | 原始 JSON（推理腿） | 2099 | 2099 |
+        // | 压平后的 message（探测腿） | **undefined** ⇒ 自然日 | **2099** |
+        //
+        // ⚠️⚠️ **「正常正文凑不出这个形状」这句断言已被实测证伪，别再引用它**
+        // （对抗审计 2026-10-25 实测）：`'…配额将在 2099-12-31 23:59:59 UTC+8 重置…'`
+        // 与 `'…will reset at 2099-12-31 23:59:59 UTC+8…'` **都能凑出**且 `Date.parse`
+        // 正常解析 ⇒ 纯文本回退本身有误命中面。
+        //
+        // 当前**不可达**：两个调用点（推理腿 `buddy-adapter.ts` / 探测腿
+        // `account-probe.ts`）都在 `isCreditExhausted(body)` 门禁**之内**，
+        // 而上面那句纯限流正文实测 `isCreditExhausted = false` ⇒ 到不了扫描。
+        //
+        // ⚠️ 但这是**结构性**风险：门禁（本函数上方）与扫描（这里）分处两个函数，
+        // 将来任何人放宽/重排门禁、或给第三条腿接 `explicitRateResetAtMs`，误命中会
+        // **静默**打开。**新接调用点前先读这段**，并确认新路径同样有额度门禁。
+        const bareMatch = RESET_TIME_PATTERN.exec(body);
+        if (bareMatch !== null) {
+            const bareMs = Date.parse(`${bareMatch[1]} ${bareMatch[2]}`);
+            if (!Number.isNaN(bareMs))
+                return bareMs;
+        }
+        return undefined;
+    }
+}
 /**
  * 从限流错误中提取重置时间；体里没有时间时返回 {@link RATE_LIMIT_FALLBACK_MS} 兜底。
  *

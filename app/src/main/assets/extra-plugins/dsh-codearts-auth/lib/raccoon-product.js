@@ -80,8 +80,12 @@ export const RACCOON_EFFORT_OFF = 'off';
 /**
  * 档位展示名（DSH 直接渲染 `efforts[].name`，不本地化）。
  *
- * ⚠️ 用「开启 / 关闭」而非「深度思考 / 关闭思考」（用户 2026-09-28 要求：
+ * ⚠️ **用词**取「开启」「关闭」两个词，而不是「深度思考」「关闭思考」（用户 2026-09-28 要求：
  * 「现在开启档位显示的深度思考，就显示开启就行了」）。
+ * （⚠️ 这里说的是**用哪两个词**，不是顺序 —— 顺序见上一段的强度序说明。）
+ *
+ * ⚠️ 本表是**名称映射**、与顺序无关（键是 id）。**声明顺序**在
+ * {@link RACCOON_REASONING_EFFORTS}，那才是「关闭 → 开启」的强度序。
  *
  * 理由是**如实**：我们能表达的只有「思考开 / 关」这一个布尔维度，
  * 没有任何强度档位（`reasoning_effort` 实测无效）。叫「深度思考」会让用户
@@ -92,15 +96,27 @@ export const RACCOON_EFFORT_NAMES = Object.freeze({
     [RACCOON_EFFORT_OFF]: '关闭',
 });
 /**
- * 该模型可选的思考档位（按展示顺序）。
+ * 该模型可选的思考档位（**顺序 = 强度序：弱 → 强**，Issue IKLIDV）。
  *
  * ⚠️ **所有 6 个可见模型都返回这两档** —— 实测 `extra_body.thinking` 是
  * **provider 级方言**，与模型无关（`thinking.type` 的枚举在服务端全局一致）。
  * 故不做 per-model 分派（那会是凭空猜测）。
+ *
+ * ⚠️ **顺序是「关闭 → 开启」，不是「默认档排第一」**：DSH 的契约把该数组当
+ * **展示顺序**（`dsh-llm/lib/types/types.d.ts`：`adapter-preferred display order`），
+ * 客户端**直接 `map` 不排序**（`dsh-client-ui-model-selection/lib/client.js`）
+ * ⇒ 把默认档 `on` 排在最前，会让「开启」落在横向档位轴的最左（左强右弱）。
+ * 强度序的权威是本仓库 `REASONING_EFFORT_RANK`（`off: 0` / `on: 5`）。
+ * ⚠️ `defaultEffort` 与数组位置是**两件事**（见 {@link RACCOON_DEFAULT_EFFORT}）。
+ *
+ * ⚠️ **有代码依赖本数组的顺序吗**：见 `raccoon-adapter.ts` 的
+ * `raccoonReasoningInfo()` —— 它的兜底分支原先读 `[0]`（=「第一项即默认档」），
+ * 调整顺序后**必须**改成读 {@link RACCOON_EFFORT_ON} 字面量，否则该分支会
+ * 静默回退成「关闭思考」。那是一处**方向取反**，比顺序本身严重得多。
  */
 export const RACCOON_REASONING_EFFORTS = Object.freeze([
-    RACCOON_EFFORT_ON,
     RACCOON_EFFORT_OFF,
+    RACCOON_EFFORT_ON,
 ]);
 /**
  * 默认档位 = `on`。
@@ -168,7 +184,8 @@ const RACCOON_FALLBACK_MODELS = [
         name: 'GLM-5-3-Flash · x0.2→x0.1',
         contextWindow: 1_000_000,
         maxTokens: 100_000,
-        // ⚠️ 远端 tags 不含 `vision`，但**实测能看图**（见 RACCOON_IMAGE_CAPABILITY_OVERRIDES）。
+        // ⚠️ 远端 tags 不含 `vision`，但**实测能看图**（tags 不是能力契约，见
+        // `RACCOON_TEXT_ONLY_MODELS` 的注释）。
         supportsImage: true,
     },
     {
@@ -181,26 +198,35 @@ const RACCOON_FALLBACK_MODELS = [
     },
 ];
 /**
- * 远端 `tags` 缺 `vision`、但**实测能看图**的模型。
+ * **实测确认不能读图**的模型（**基础 id**）—— 图片能力「默认支持」策略的唯一刹车。
  *
- * ## ⚠️ 为什么需要它：`tags` 不是能力契约（真实缺陷，用户 2026-10-03 报障）
+ * ## 当前策略（2026-10-21 用户定）：默认支持识图，只禁真正的纯文本模型
  *
- * 症状：给 `sn-deepseek-v4-1-flash` 发图，模型回「无法读取图片 / 不支持图片」。
+ * `raccoonSupportsImage()` 对**不在本集合**的模型一律返回 `true`（声明
+ * `['text','image']`），不再看远端 `tags`。理由链：
  *
- * ### 根因链
+ * 1. 远端**从未下发**任何模态字段：已穷举一次 `model_catalog` 的键并集
+ *    （顶层 14 键、`params` 只有 `context_window` / `max_tokens`），用
+ *    `/modal|vision|image|img|multimodal|media|type|capab|support|input|output/i`
+ *    扫描**命中 0 个**。
+ * 2. 唯一的信号 `tags.vision` 是**客户端「Raccoon-Auto 选模」的偏好标签**，
+ *    不是服务端能力契约：2026-10-03 实测 6 个可见模型**全部**能读图，其中
+ *    `sn-deepseek-v4-1-flash` / `sn-glm-5-3-flash` 的 tags 根本不含 `vision`。
+ * 3. 远端会滚动上架同族版本（`-1017` 等），新 id 的 `tags` 原样继承 ⇒
+ *    白名单式判据**必然腐坏**：2026-10-21 `sn-deepseek-v4-1-flash-1017`
+ *    就被打回 `['text']`，而实测它带图 200、四象限色全对。
  *
- * 1. 我们把「远端 `tags` 含 `vision`」当成了服务端能力声明；
- * 2. `sn-deepseek-v4-1-flash` 的 `tags` 是
- *    `["general","code","html","analysis","reasoning","auto"]` —— **没有** `vision`
- *    （`display_description` 也只写「通用对话、代码开发、复杂分析」，不提图像识别）；
- * 3. ⇒ `inputModalities` 播报 `['text']`；
- * 4. ⇒ **DSH 在 `LlmRuntime` 里把图片替换成文本占位符**
- *    （`dsh-llm/lib/index.js` 的 `projectImagesForTextModel`，产出
- *    `[image omitted because this model accepts text only; attachment sha256:…]`）
- *    —— **图片根本没发出去**；
- * 5. ⇒ 用户看到模型说「读不到图片」，而端点其实完全正常。
+ * ⇒ 判据翻转为「**默认 image**」；真正的纯文本模型登记到本集合里**显式禁掉**。
  *
- * ### 决定性证据：带图实测 6/6 全部读对
+ * ## ⚠️ 代价（必须知道）
+ *
+ * 若远端上线一个**真正的纯文本模型**而我们没及时登记，DSH 会放行图片，
+ * 上游则可能**静默忽略**（不是报错）⇒ 模型凭文字幻觉作答。这与 accio 的
+ * GLM 5.1 实测同型（`multimodal:false` 不报错而是忽略）。
+ * ⇒ 本集合是唯一刹车；**新增条目必须先实测**，判据是「带图请求被明确拒绝
+ * （4xx / 明确错误码），而不是『200 但答非所问』」。
+ *
+ * ## 既有实测证据（保留，便于下次核对）
  *
  * 同一张「随机 6 位数字」图（模型无法猜）打 `POST /api/web/llm/v2/chat/completions`：
  *
@@ -213,48 +239,66 @@ const RACCOON_FALLBACK_MODELS = [
  * | `sn-kimi-k3` | ✅ | ✅ 1/1 |
  * | `sn-glm-5-3` | ✅ | ⚠️ 1/3（**provider 侧节点不一致**，见下） |
  *
- * ### 为什么不能指望远端补字段
+ * 2026-10-21 同一张 16×16 四象限纯色 PNG（左上红/右上绿/左下蓝/右下白）：
  *
- * 已穷举 9 个条目的**键并集**：顶层 14 个键、`params` **只有** `context_window`
- * 与 `max_tokens`。用 `/modal|vision|image|img|multimodal|media|type|capab|support|input|output/i`
- * 扫描，**命中 0 个**。⇒ 远端**从未下发**模态字段，`tags` 是唯一信号，而它被证伪。
+ * | 模型 | 状态 | 正文（ANSWER） |
+ * |---|---|---|
+ * | `sn-deepseek-v4-1-flash` | 200 | `红/绿/蓝/白` |
+ * | `sn-deepseek-v4-1-flash-1017` | 200 | `红/绿/蓝/白` |
  *
- * `tags` 的真实用途是**客户端「Raccoon-Auto 选模」的偏好标签**
- * （`TASK_TAG_PATTERNS` 给消息打 vision 标记后，挑一个带 `vision` 的模型）——
- * 它回答的是「该模型适不适合处理这类任务」，**不是**「能不能吃图」。
- *
- * ### 为什么用显式白名单，而不是「恒 true」
- *
- * 与 `buddy-adapter.ts` 的 `IMAGE_CAPABILITY_OVERRIDES` 同构：只覆盖**实测确认**的
- * 个案，新增条目必须先有真实请求证据。若改成「该家恒支持」，将来上架纯文本模型时
- * 会把图放行、让上游回一个更难懂的 400 —— 错误更晚、更难排查。
- *
- * ### ⚠️ 顺带发现：`sn-glm-5-3` 节点不一致（provider 侧缺陷，不归我们）
+ * ## ⚠️ 顺带发现：`sn-glm-5-3` 节点不一致（provider 侧缺陷，不归我们）
  *
  * 它 3 次里只对 1 次，两次回「当前模型不支持图片或视频输入」。错误体暴露网关有
  * 3 个 fallback 组（`raccoon-4eb26a` / `raccoon-0c119c` / `raccoon-ecc5fd`），
- * **部分节点是纯文本的**。它本来就带 `vision` 标签、我们一直在发图，
- * **本次修复不改变它的行为**，故按「已知 provider 缺陷」记录而不特殊处理。
+ * **部分节点是纯文本的**。这是节点问题、不是模型能力，故**不**登记到本集合
+ * （登记了会把整条模型禁成 text，而正常节点其实能看图）。
  */
-export const RACCOON_IMAGE_CAPABILITY_OVERRIDES = new Set([
-    'sn-deepseek-v4-1-flash',
-    'sn-glm-5-3-flash',
+export const RACCOON_TEXT_ONLY_MODELS = new Set([
+// 当前目录（10 条：3 个 visible:false 内部模型 + 7 个可见模型）里**没有**
+// 实测确认的纯文本模型 ⇒ 空集。新增条目必须先有带图实测证据（见上方「代价」）。
 ]);
 /**
- * 远端目录条目的图片能力判定 —— **远端解析路径专用**。
+ * 远端同族模型的**版本后缀**（如 `sn-deepseek-v4-1-flash-1017` 的 `-1017`）。
+ *
+ * ⚠️ 只在「查纯文本集合」时剥离，**不用于展示名 / 请求 id**：
+ * 请求必须用远端下发的完整 id（剥了会 404），展示名也要保留版本号让用户能区分。
+ * 故这是一条**局部归一化**，不是全局 `normalizeModelId`（codearts 那边剥后缀
+ * 是因为 chat 端点只认无后缀 id，两家的原因相反）。
+ */
+const RACCOON_MODEL_VERSION_SUFFIX = /-\d{4}$/;
+/**
+ * 图片能力判定的**纯函数内核**（入参化，便于单测注入 `textOnly` 集合）。
+ *
+ * ⚠️ 为什么要入参化：集合在生产里是空集（当前没有纯文本模型），如果判据直接
+ * 闭包读常量，**「纯文本模型被禁」这条分支永远测不到**（只能测到恒 true）。
+ * 与 `raccoonDefaultEffort` 的教训同型：不可达分支必须靠注入才测得动。
+ *
+ * @param textOnly 纯文本模型集合（基础 id 或完整 id）。
+ * @param modelId 远端模型 id（可带 `-NNNN` 版本后缀）。
+ */
+export function raccoonSupportsImageWith(textOnly, modelId) {
+    if (textOnly.has(modelId))
+        return false;
+    // 同族滚版本：`sn-deepseek-v4-1-flash-1017` → `sn-deepseek-v4-1-flash`。
+    // 纯文本模型同样会滚版本，必须按基础 id 命中，否则新版会漏禁。
+    const baseId = modelId.replace(RACCOON_MODEL_VERSION_SUFFIX, '');
+    if (baseId !== modelId && textOnly.has(baseId))
+        return false;
+    return true;
+}
+/**
+ * 远端目录条目的图片能力判定 —— **默认支持**，只有 {@link RACCOON_TEXT_ONLY_MODELS}
+ * 里的模型才返回 `false`。
  *
  * ⚠️ 兜底表路径（`fallbackToRemote`）不走本函数：它的真相源是
- * `RACCOON_FALLBACK_MODELS[].supportsImage`（已按同一批实测证据修正为 `true`）。
+ * `RACCOON_FALLBACK_MODELS[].supportsImage`（按同一批实测证据全部为 `true`）。
  * 两个真相源由 `tests/unit/raccoon-product.spec.ts` 的
  * 「兜底表与远端判定必须一致」一条锁死 —— **别让它们悄悄分叉**。
  *
- * @param modelId 模型 id。
- * @param tags 远端 `tags`（`normalizeRemoteModel` 已小写化；无标签时传空数组）。
+ * @param modelId 模型 id（远端下发形态，可带版本后缀）。
  */
-export function raccoonSupportsImage(modelId, tags) {
-    if (RACCOON_IMAGE_CAPABILITY_OVERRIDES.has(modelId))
-        return true;
-    return tags.includes('vision') || tags.includes('image') || tags.includes('image-understanding');
+export function raccoonSupportsImage(modelId) {
+    return raccoonSupportsImageWith(RACCOON_TEXT_ONLY_MODELS, modelId);
 }
 /** Raccoon Work provider 配置。 */
 export const RACCOON = {

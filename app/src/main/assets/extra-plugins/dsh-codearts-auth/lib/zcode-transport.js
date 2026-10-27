@@ -174,7 +174,7 @@ function bizHeaders(token, credential) {
         Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
         'User-Agent': `ZCode/${credential.app_version ?? '3.14.4'}`,
-        'X-Platform': 'win32',
+        'X-Platform': 'win32-x64',
         ...(typeof credential.device_mid === 'string' && credential.device_mid.length > 0
             ? { 'X-Device-Mid': credential.device_mid }
             : {}),

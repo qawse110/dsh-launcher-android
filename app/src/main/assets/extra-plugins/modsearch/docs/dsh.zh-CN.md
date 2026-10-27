@@ -36,7 +36,7 @@ npx -y @deepseek-ai/dsh --profile web --dump-config
 把插件装进实际启动的 profile。浏览器界面通常使用 `web`：
 
 ```sh
-npx -y @deepseek-ai/dsh plugin --profile web add @liustack/modsearch@5.10.6
+npx -y @deepseek-ai/dsh plugin --profile web add @liustack/modsearch@5.10.10
 ```
 
 安装后重启 dsh，再确认真正解析到的包：
@@ -47,11 +47,13 @@ npx -y @deepseek-ai/dsh plugin --profile web list --depth 0
 
 这里故意写精确版本。pnpm 11 可能通过 `minimumReleaseAge` 扣住刚发布的版本，让 `@latest` 解析成旧包。发布流程会让本命令中的版本与 `package.json` 保持同步。
 
+桌面版的 `desktop` profile 只能在桌面版窗口里装，dsh CLI 会以 `profile "desktop" is managed exclusively by the Electron application` 拒绝它。在「添加插件」对话框里，填包名 `@liustack/modsearch`，不要填 GitHub 仓库地址。只有 npm 包带构建好的 CLI。从 GitHub 安装只拿到源码，而 pnpm 会拦下补构建的那一步。
+
 ## bundle 改了什么
 
 bundle 贡献两条 patch：
 
-1. 把 dsh web 接缝的 `searchProvider` 设为 `modsearch`。
+1. 把 dsh web 接缝的 `searchProvider` 设为 `modsearch`，并保留自带的 `fetchProvider: http`（这一行会整体替换宿主的 web 配置）。
 2. 把包根入口挂载为 `modsearch` 插件。
 
 插件随后提供：
@@ -69,7 +71,7 @@ dsh 插件不维护第二份引擎配置。它继承同一组环境变量，并�
 先跑离线体检：
 
 ```sh
-npx -y @liustack/modsearch@5.10.6 doctor
+npx -y @liustack/modsearch@5.10.10 doctor
 ```
 
 常用配置：
@@ -79,11 +81,12 @@ modsearch config set engine antigravity-cli
 modsearch config set tavily.apiKey <key>
 modsearch config set exa.apiKey <key>
 modsearch config set firecrawl.apiKey <key>
+modsearch config set keenable.apiKey <key>
 modsearch config set firecrawl.keylessFetch false
 modsearch config set cooldown off
 ```
 
-不做任何设置就能开跑：搜索和单页抓取默认运行在 Firecrawl 的免注册免费额度上（每月 1,000 免费 credits，无需注册）。免注册公网抓取默认开启，它会把请求的 URL 交给 Firecrawl 的云端爬虫，结果中的 warning 会标明这条路径。`firecrawl.keylessFetch false` 可让自动抓取只走本地。私有或保留地址不会发给 Firecrawl，而会落到本地抓取器。
+不做任何设置就能开跑：搜索和单页抓取默认运行在 Firecrawl 的免注册免费额度上（每月 1,000 免费 credits，无需注册），搜索还能退到 Keenable 的免注册额度（每个 IP 每小时 1,000 次，无需注册）。免注册公网抓取默认开启，它会把请求的 URL 交给 Firecrawl 的云端爬虫，结果中的 warning 会标明这条路径。`firecrawl.keylessFetch false` 可让自动抓取只走本地。私有或保留地址不会发给 Firecrawl，而会落到本地抓取器。
 
 完整说明见[引擎配置手册](../skills/modsearch/references/configure.zh-CN.md)和[安全说明](security.zh-CN.md)。
 
@@ -93,13 +96,13 @@ dsh 网页端没有终端，所以插件自带一张设置卡片。dsh 0.1.6-alp
 
 卡片管三件事：
 
-- 首选引擎：自动，或 `antigravity-cli`、`tavily`、`exa`、`firecrawl`、`grok-cli` 之一。`firecrawl` 一项标注「免注册免费」。`local` 只抓单页不搜索，所以不在这个列表里，除非配置文件当前就把它设成了 `engine`，那时它照常显示，免得界面与文件不一致。
-- 当前所选引擎自己的设置：HTTP 引擎（`tavily`、`exa`、`firecrawl`）显示 API 密钥与接口地址，`antigravity-cli` 显示模型。走自家命令行工具登录的引擎和内置抓取器只显示一行说明，因为它们两样都不需要。选中未配置密钥的 `firecrawl` 时会多一行说明，讲清它默认跑在免注册的免费额度上。
+- 首选引擎：自动，或 `antigravity-cli`、`tavily`、`exa`、`firecrawl`、`keenable`、`grok-cli` 之一。`firecrawl` 和 `keenable` 两项标注「免注册免费」。`local` 只抓单页不搜索，所以不在这个列表里，除非配置文件当前就把它设成了 `engine`，那时它照常显示，免得界面与文件不一致。
+- 当前所选引擎自己的设置：HTTP 引擎（`tavily`、`exa`、`firecrawl`、`keenable`）显示 API 密钥与接口地址，`antigravity-cli` 显示模型。走自家命令行工具登录的引擎和内置抓取器只显示一行说明，因为它们两样都不需要。选中未配置密钥的 `firecrawl` 或 `keenable` 时会多一行说明，讲清它默认跑在免注册的免费额度上。
 - 自动引擎链：只列出 `modsearch doctor` 判定本机已就绪的搜索引擎，每个一个复选框，勾选表示允许自动路由使用它。本机跑不了的引擎不出现在这里，它们不是需要用户做的决定。`local` 是单页抓取，不参与搜索，所以也不在这排里。`grok-cli` 只服务 X 搜索，旁边标注「仅 X 搜索」。读不到 doctor 结果时会列出全部搜索引擎并说明状态未知。保存成功后卡片会重新问一次 doctor，刚配好密钥的引擎马上就能长出复选框。
 
 每个引擎默认都勾选。取消勾选只写入 `enabled: false`，重新勾选会删除这项覆盖，不保存多余的 `true`。取消当前首选引擎时，首选项会回到自动。卡片只改自己列出来的引擎：没有复选框的引擎（本机跑不了的，以及 `local`）的 `enabled` 一律原样带过，改它们只能用 `modsearch config set <engine>.enabled`。本机一个就绪引擎都没有时，这排复选框换成一行提示，说明本机暂无就绪的引擎。
 
-Tavily、Exa、Firecrawl 的官方接口地址内置在 provider 代码里。界面的接口地址只表示覆盖值。留空或清空都会使用内置官方地址，不会把默认 URL 写进配置文件。
+Tavily、Exa、Firecrawl、Keenable 的官方接口地址内置在 provider 代码里。界面的接口地址只表示覆盖值。留空或清空都会使用内置官方地址，不会把默认 URL 写进配置文件。
 
 其余设置仍然只走 CLI，包括 `bin`、`allowPrivateNetwork`、`cooldown` 和 `keylessFetch`。卡片保存时会原样带过这些字段，也无法新建它们。
 
@@ -144,6 +147,7 @@ Tavily、Exa、Firecrawl 的官方接口地址内置在 provider 代码里。界
 - id: web
   config:
     searchProvider: deepseek-official
+    fetchProvider: http
 
 - id: modsearch
   config:
@@ -173,7 +177,7 @@ npx -y @deepseek-ai/dsh --profile web
 用当前精确版本刷新 profile 中记录的请求：
 
 ```sh
-npx -y @deepseek-ai/dsh plugin --profile <name> add @liustack/modsearch@5.10.6
+npx -y @deepseek-ai/dsh plugin --profile <name> add @liustack/modsearch@5.10.10
 ```
 
 卸载命令：
@@ -187,6 +191,7 @@ npx -y @deepseek-ai/dsh plugin --profile <name> remove @liustack/modsearch
 ## 故障定位
 
 - `declares no dsh.bundle`：装到了旧版 ModSearch。按上方精确版本重新安装。
+- `modsearch's CLI build is missing`，或 5.10.6 及更早版本报 `Cannot find module .../dist/main.js`：插件是从 GitHub 仓库装的，没有构建产物。卸载后按包名 `@liustack/modsearch` 重新添加。
 - `web seam has no registerSearchProvider`：dsh 移动了开发预览接口。`x_search` 与 `read_page` 仍会注册，网页搜索则跳过并打印明确日志。修改插件前先检查最新 dsh release。
 - `modsearch failed (exit ...)`：运行 `modsearch doctor`。错误会保留 CLI 尝试过的引擎。
 - `plugin list` 有包但 `--dump-config` 没有：检查 `~/.dsh/profiles/<name>/package.json` 的 `dsh.profile.bundles` 中是否存在该包。

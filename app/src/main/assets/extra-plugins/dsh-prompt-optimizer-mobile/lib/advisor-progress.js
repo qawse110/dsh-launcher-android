@@ -92,7 +92,9 @@ export function createAdvisorProgress({ home, now = Date.now, limit = ADVISOR_UI
       const row = records.get(runId)
       if (!row) return
       row.result = copy(result)
-      row.stage = result.cut === 'advisor-timeout' || result.reason === 'advisor-timeout' ? 'timeout'
+      // 空闲判死（GitHub #34）刻意归入既有的 timeout 终态：新造 stage 名会让客户端的 advisorTerminal
+      // 集合认不出来 ⇒ 卡片永不收尾、一直轮询。区分保留在 reason 里，界面文案另有映射。
+      row.stage = ['advisor-timeout','advisor-stall-timeout'].includes(result.cut) || ['advisor-timeout','advisor-stall-timeout'].includes(result.reason) ? 'timeout'
         : result.cut === 'advisor-cancelled' || result.reason === 'advisor-cancelled' ? 'cancelled'
         : result.ok ? 'done' : 'failed'
       row.finishedAt = now(); row.updatedAt = now()

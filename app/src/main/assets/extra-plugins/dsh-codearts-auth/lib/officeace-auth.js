@@ -41,17 +41,77 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials';
 import { OFFICEACE } from './officeace-product.js';
 import { SerialQueue } from './serial-queue.js';
 import { shouldRefreshNow } from './expiry-sync.js';
+import { markLoginNeedsExternalAction } from './login-failure.js';
 /** 华为云端点（与 OfficeAce green-package 的默认值一致）。 */
 const CLAW_BASE = 'https://agentarts.cn-southwest-2.myhuaweicloud.com';
 const TOKEN_URL = 'https://sts.cn-north-4.myhuaweicloud.com/v1/oauth2/tokens';
 const CLIENT_ID = 'pdp5_for_agentarts';
 const REDIRECT_URI = `${CLAW_BASE}/v1/claw/auth/callback`;
-/** DSH 自有凭据存储。 */
-function storeDir() {
+/**
+ * 本模块所有**用户级**路径的根（凭据 + OfficeAce 客户端遗留物）。
+ *
+ * ⚠️⚠️ **`DSH_OFFICEACE_HOME` 覆盖优先**（2026-10-14 IKLPTZ 修复时补，**安全关键**）。
+ *
+ * 本目录下的 `session.json` 是**用户真实的华为云凭据**，而 OfficeAce 的
+ * `refresh_token` **一次性**（见模块头的 STS5.1806 教训）—— 单测若顺着
+ * 「空池兜底」分支读进来并发一次续期，就会**消费掉用户的一次性 token**，
+ * 用户被迫重新登录。
+ *
+ * 这条路径**真实可达**（实测踩到）：`src/index.ts` 的 `apply()` 里有
+ * `void refreshAllCredentials()` 的 fire-and-forget 首轮，`afterEach` 把
+ * `USERPROFILE` 恢复成真实 home **之后**，那条后台链才跑到本模块的兜底分支，
+ * 于是用真实目录读凭据、真发 STS 请求（vitest 输出里出现真实报文
+ * `STS5.1806 has been used`）。用例自身改 `USERPROFILE` **来不及** ——
+ * 竞态在用例结束之后才发生。
+ *
+ * ⇒ 与 `jet-hub-store.ts` 的 `DSH_JET_HUB_STATE_DIR` **同型**：单测在
+ * `tests/setup-isolation.ts` 里把它指向临时目录，从进程级根除该路径。
+ * `USERPROFILE` / `HOME` 改写仍是第二道防线（对 `os.homedir()` 生效）。
+ *
+ * ## ⚠️ 为什么不叫 `storeDir()` 了（2026-10-14 对抗性审计）
+ *
+ * 它现在同时是**另外两处** `os.homedir()` 的根（下节 `officeAceClientHome()`），
+ * 故名字必须如实反映「这是 home 根，不只是凭据目录」—— 否则下一个读代码的人
+ * 会以为「隔离只覆盖凭据」，从而漏掉 `.office-claw` 那两条腿。
+ */
+function officeaceHome() {
+    const override = process.env.DSH_OFFICEACE_HOME;
+    if (override !== undefined && override.trim().length > 0)
+        return override.trim();
     return path.join(os.homedir(), '.dsh-officeace');
 }
+/**
+ * OfficeAce **桌面客户端**遗留物的根（`.office-claw`）。
+ *
+ * ⚠️⚠️ **2026-10-14 对抗性审计打穿后补**：本模块原先有**两处**直接
+ * `os.homedir()` 拼 `~/.office-claw/...`，**不在** `DSH_OFFICEACE_HOME`
+ * 的覆盖范围内：
+ *
+ * - {@link readSessionCookie} 读 `~/.office-claw/session.cookie`
+ *   （审计实测：**真实存在**、DPAPI 解密成功）；
+ * - `fetchSubscriptionSummary` 的本地腿读 `~/.office-claw/certs/root-ca.pem`。
+ *
+ * 审计同时**实测判定「当前不可达」**：全量 8071 条单测跑完，
+ * `readSessionCookie` 的调用栈只有审计者自己的临时探针，**零生产 spec 触达**
+ * （所有调用点都传了 `ref` ⇒ 走云侧直读，不落本地腿）。
+ *
+ * ⚠️ 但那是**脆弱的绿**：任何新测试调 `readSessionCookie()` /
+ * `fetchModelTokenRates()`，或 `fetchSubscriptionSummary(48)` 不带 ref 的
+ * 老路径被重新启用，就会立刻读到用户真实文件。读 cookie **不会**烧 token
+ * （危害远小于 `session.json`），故属加固而非紧急修复。
+ *
+ * ⇒ 与 {@link officeaceHome} 用**同一个** env 覆盖：隔离要么全覆盖，要么
+ * 留一条谁也不知道的缝。
+ */
+function officeAceClientHome() {
+    const override = process.env.DSH_OFFICEACE_HOME;
+    if (override !== undefined && override.trim().length > 0) {
+        return path.join(override.trim(), '.office-claw');
+    }
+    return path.join(os.homedir(), '.office-claw');
+}
 function storeFile() {
-    return path.join(storeDir(), 'session.json');
+    return path.join(officeaceHome(), 'session.json');
 }
 // ────────────────────────── 存储 ──────────────────────────
 //
@@ -67,7 +127,31 @@ function storeFileFor(ref) {
     if (ref === undefined || ref.length === 0)
         return storeFile();
     const safe = ref.replace(/[^A-Za-z0-9._-]/g, '_');
-    return path.join(storeDir(), `session-${safe}.json`);
+    return path.join(officeaceHome(), `session-${safe}.json`);
+}
+/**
+ * 凭据是否**足以发起云侧签名请求**（`access` + `securityToken` 都在且非空）。
+ *
+ * ⚠️⚠️ **必须用可选链判「缺失」，不能只判「空串」**（2026-10-18 审计实测的 P0）。
+ *
+ * 修前是三处一模一样的 `credential.access.length === 0`（`fetchModelTokenRates`
+ * / `fetchCloudSubscriptionFor` / `claimDailyBonus`），而 `readStoredCredential`
+ * **只校验 `modelAppKey`** ⇒ 一份 `access` 字段**缺失**（`undefined`）的凭据
+ * 能一路读到这里，于是 `.length` 在 `try` 之外抛
+ * `TypeError: Cannot read properties of undefined (reading 'length')`：
+ *
+ * - 在 `claimDailyBonus` 里它 escape 出函数 ⇒ 调用方拿到的不是 `{ok:false}`
+ *   而是 reject ⇒ 异常被 L1206/L1271 的空 `catch` 静默吞掉 ⇒
+ *   **既没有留痕、余额查询也一并被跳过**（面板该次刷新零网络请求）；
+ * - 那正是本 PR 要消灭的「静默 + 阻断」形态，在另一条支路上被原样复现。
+ *
+ * ⚠️ 同义判据只留**这一份**：三处各自写一遍必然漂移（本仓库明列的坑），
+ *   新增第四处时也必须走它。
+ */
+function credentialUsable(credential) {
+    return (credential !== undefined
+        && typeof credential.access === 'string' && credential.access.length > 0
+        && typeof credential.securityToken === 'string' && credential.securityToken.length > 0);
 }
 /** 读当前凭据；不存在/损坏返回 undefined。 */
 export function readStoredCredential(ref) {
@@ -85,7 +169,7 @@ export function readStoredCredential(ref) {
 /** 写凭据（原子替换：先写 tmp 再 rename，防进程中途被杀留下半文件）。 */
 function writeStoredCredential(credential, ref) {
     const target = storeFileFor(ref);
-    fs.mkdirSync(storeDir(), { recursive: true });
+    fs.mkdirSync(officeaceHome(), { recursive: true });
     const payload = { ...credential, savedAt: new Date().toISOString() };
     const tmp = `${target}.tmp-${process.pid}`;
     fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), 'utf8');
@@ -259,6 +343,32 @@ async function exchangeToken(code, codeVerifier, dpopPrivateJwk) {
 }
 /**
  * 步骤 5：用 STS 凭据调 permission-validate，拿 modelInfo（推理凭据）。
+ *
+ * ## ⚠️ 未开通时**必须给出路**（IKM741 追补，2026-10-16 真机取证）
+ *
+ * 同一个华为号（手机号注册的根账号）在果办客户端点「开通」**前后**：
+ * 云侧从 `subscription: null` 变成 `model_auth_info` 齐全（20:57 vs 21:16 实测）。
+ * 而修前插件只回一句「账号可能未订阅 ModelArts MaaS」——**没有告诉用户怎么办**，
+ * 用户为此在客户端里摸索了半天。故本条文案的**出路信息**是判据的一部分
+ * （守卫见 `tests/unit/officeace-unsubscribed-guidance.spec.ts`）。
+ *
+ * ## ⚠️⚠️ 「自动开通」**刻意不做**（2026-10-16 真机证伪 + 用户明确否决依赖 ide）
+ *
+ * 曾经实现过一版自动开通（读果办客户端 CAS 落盘 profile、调 versatile 的
+ * `/v1/agreement` + `/v1/claw/client-subscription`），真机三处请求全部
+ * `401 APIGW.0301 invalid x-security-token` —— **根因是凭据来源**：versatile 只认
+ * **CAS** 凭据，不认插件 OAuth（`client_id=pdp5_for_agentarts`）从 `sts.cn-north-4`
+ * 换来的 STS。而三条可能的替代路径**没有一条能脱离果办客户端**：
+ *
+ * | 路径 | 卡在哪 |
+ * |---|---|
+ * | 借用客户端落盘的 CAS 凭据 + `client-subscription` | 能打通（HTTP 400 而非 401），但**新订阅要邀请码**（`AgentArts.11000008`） |
+ * | `create-order` / `claim-bonus`（用户实际走的那条，**不要邀请码**） | 只有**客户端本地 API**（`127.0.0.1:3003/api/subscription/*`）暴露，需客户端进程与其会话 |
+ * | 复刻 CAS 登录拿 ticket | ticket 只有客户端的**内嵌浏览器拦截导航**才拿得到，插件的系统浏览器拿不到 |
+ *
+ * ⇒ 插件**不读**果办客户端的落盘数据、**不调**它的本地 API、**不**碰 CAS 链条：
+ * 开通这一步留在客户端（或华为云控制台）侧。完整证据链见
+ * `docs/agent-notes/providers-officeace.md` 的「真机实测」一节。
  */
 async function fetchModelInfo(credential) {
     const url = `${CLAW_BASE}/v1/claw/client-permission-validate`;
@@ -278,7 +388,14 @@ async function fetchModelInfo(credential) {
     const modelInfo = j.subscription?.model_info;
     const auth = modelInfo?.model_auth_info;
     if (typeof auth?.model_app_key !== 'string' || typeof auth?.model_app_secret !== 'string') {
-        throw new Error('华为云未返回 MaaS 凭据（账号可能未订阅 ModelArts MaaS）');
+        // ⚠️ 判据：**半截凭据**（只有 key 没有 secret）也算「未开通」——不许写半截凭据进号池。
+        // ⚠️ 文案里的出路信息是**被测行为**，别删（守卫会红）。
+        // ⚠️ **必须打标记**（2026-10-20 用户报障）：这条失败的出路在**果办客户端**
+        //    （用该账号点「开通」并同意授权），重新点「+ 新建账号」只会重走一遍 OAuth
+        //    然后再失败一次 ⇒ 登录收尾处**不得**给它拼「请重新点击「+ 新建账号」」
+        //    那句**假出路**（判据与守卫见 `src/login-failure.ts`）。
+        throw markLoginNeedsExternalAction(new Error('华为云未返回 MaaS 凭据：该账号尚未开通 ModelArts MaaS。'
+            + '请先用该账号在果办客户端里点「开通」并同意授权，再回来重试。'));
     }
     credential.modelAppKey = auth.model_app_key;
     credential.modelAppSecret = auth.model_app_secret;
@@ -302,7 +419,7 @@ export async function fetchModelTokenRates() {
     const out = new Map();
     try {
         const credential = readStoredCredential();
-        if (credential === undefined || credential.access.length === 0 || credential.securityToken.length === 0) {
+        if (!credentialUsable(credential)) {
             return out;
         }
         const raw = await signAndGet(`${OFFICEACE.defaultBaseUrl.replace(/\/+$/, '')}/v1/model-token-rates`, credential);
@@ -334,7 +451,10 @@ export async function fetchModelTokenRates() {
  */
 export function readSessionCookie() {
     try {
-        const file = path.join(os.homedir(), '.office-claw', 'session.cookie');
+        // ⚠️ 走 `officeAceClientHome()`（受 `DSH_OFFICEACE_HOME` 覆盖）而不是直接
+        //    `os.homedir()`：否则单测会读到用户**真实**的 `.office-claw/session.cookie`
+        //    （2026-10-14 对抗性审计实测：该文件真实存在且能解密成功）。
+        const file = path.join(officeAceClientHome(), 'session.cookie');
         const raw = fs.readFileSync(file, 'utf8').trim();
         if (!raw.startsWith('OC-DPAPI-1'))
             return undefined;
@@ -405,10 +525,44 @@ export async function persistLogin(credential, options) {
     return credential.accountId === undefined ? {} : { accountId: credential.accountId };
 }
 /**
- * 按 ref 读凭据（**优先 DSH 凭据库**，回落默认文件）。
+ * 按 ref 读凭据（**优先 DSH 凭据库**，再回落**本 ref** 的兼容文件）。
  *
  * ⚠️ 这个次序不能反：多账号下每个账号的凭据在凭据库里按 ref 索引，
  *    `session.json` 只是老数据的兼容兜底 —— 先读文件会串号。
+ *
+ * ## ⚠️⚠️ 兜底**必须带 `ref`**（Gitee issue IKM741，2026-10-16 实测确证）
+ *
+ * 这里原先写的是 `readStoredCredential()` —— **漏传了 `ref`**，于是它读的是那份
+ * **全局唯一**的 `session.json`（语义 =「最后一次登录的那个账号」）。而本函数
+ * 的**每一个**调用方都传了 ref（`refreshAccountCredential` / `latestAfterFailedRefresh`
+ * / `fetchSubscriptionSummary` / `index.ts` 的两处）⇒ 这个「不带 ref 的兜底」
+ * 没有任何调用方需要它，纯粹是串号源。这正是 AGENTS.md 记的
+ * 「位置/键错位」那一类缺陷的又一次复发（把 ref 丢在调用边上）。
+ *
+ * 实测后果（`~/.dsh` 四个账号三条已无凭据的真实机器）：
+ *
+ * | 情形 | 修前 | 修后 |
+ * |---|---|---|
+ * | 库里**有**该 ref | 用它 | 用它（不变） |
+ * | 库里**无**该 ref，但有 `session-<ref>.json` | 读它（不变） | 读它（不变） |
+ * | 库里**无**该 ref，也没有该 ref 的兼容文件 | **读全局 `session.json`** ⇒ 把**别的账号**的凭据当成本账号的 | `undefined`（如实报「本账号无凭据」） |
+ *
+ * 第三格是三条真实故障的**同一个根因**：
+ *
+ * 1. **跨账号烧一次性 `refresh_token`**：`refresh_token` 是一次性的，而
+ *    `session.json` 是全局单份 ⇒ N 个「有账号无凭据」的账号各自回落到**同一份**
+ *    token、各自拿它去续期 ⇒ 第一个消费掉，其余全部收到
+ *    `STS5.1806 has been used`（issue 补充评论里的三条日志逐字如此）。
+ *    危害是**跨账号**的：一份坏账号能把别的健康账号的路堵掉。
+ * 2. **读数串号**：`fetchSubscriptionSummary(48, ref, …)` 拿全局凭据走云侧直读
+ *    ⇒ 把最后一个登录账号的余额显示成本账号的余额（正是
+ *    `ProviderExpiryContext.credentialRef` 那段注释记录的形态）。
+ * 3. **`expiresAt` 串号**：`account.list` 的逐账号回填读到的是全局那份。
+ *
+ * ⚠️ 兼容性：改成按 ref 后，**单凭据老用户零行为变化** —— 那条路径本来就
+ *    不经过本函数（它由 `readStoredCredential()` 无参调用点承担，如
+ *    `probeOfficeAce` / `readOfficeAceCredential` / `fetchModelTokenRates`）。
+ *    本函数只服务多账号路径，而多账号路径**必须**按 ref。
  */
 export async function readCredential(ref, credentials) {
     if (credentials !== undefined) {
@@ -420,9 +574,9 @@ export async function readCredential(ref, credentials) {
                     return parsed;
             }
         }
-        catch { /* 解析失败 → 回落文件 */ }
+        catch { /* 解析失败 → 回落**本 ref** 的兼容文件（见上方注释） */ }
     }
-    return readStoredCredential();
+    return readStoredCredential(ref);
 }
 // ────────────────────────── 刷新 ──────────────────────────
 /**
@@ -653,32 +807,101 @@ async function writebackExpiry(next, pool, accountId) {
     }
 }
 /**
- * 批量续期（`refreshAll` 形状）。
+ * 遍历账号池逐个续期（`refreshAll` 的**唯一**一份实现）。
  *
- * ⚠️ **必须逐个账号调 {@link refreshAccountCredential}**，不能图省事直接调
- * {@link refreshStoredCredential}：后者绕过了账号池 ⇒「续期后不回写 expiresAt」，
- * 而守卫用例（`trae-model-id-selection.spec.ts` / `provider-runtime-wiring.spec.ts`）
- * 的判据正是「`refreshAll` 打到**每个**账号自己的 ref」。跳过池的版本会让
- * 那些用例静默少跑一家（实测症状：`expected [] to deeply equal [ref]`）。
+ * ## ⚠️⚠️ 为什么抽出来而不是让两处各写一遍（IKLPTZ 的真实成因）
  *
- * ⚠️ 与其余渠道的形状差异：OfficeAce 只有一个账号条目，但**仍要走池** ——
- * 「只有一个账号」是当前事实，「账号池可能有多个」是契约。
+ * 生产里有**两个** `refreshAll`：模块导出的这个，与 `src/index.ts` 里包在
+ * `officeaceAuthService` 上的那个（定时器实际走后者 —— `ctx.credentials`
+ * 只能在那里注入）。两者除「分派目标」外**逐字相同**，于是 IKLPTZ 那个
+ * `.catch()` 误判被**复制了两遍**，修 bug 也要修两处。
+ *
+ * ⇒ 把「取账号 → 判空 → 兜底」收成这里一份，两处只提供各自的
+ * `refreshOne` 分派（这正是 `trae-model-id-selection.spec.ts` 那条守卫
+ * 要断言的语义：续期必须打到**每个账号自己的** ref）。
+ *
+ * ## ⚠️ 形状契约（勿改）
+ *
+ * - **必须逐个账号续期**，不能图省事直接调 {@link refreshStoredCredential}：
+ *   后者绕过账号池 ⇒「续期后不回写 `expiresAt`」，界面有效期停在旧值。
+ * - **不看 `enabled`**（AGENTS.md 既有铁律）：停用只影响自动选号，与凭据
+ *   新鲜度无关。故这里**刻意不过滤**。
+ * - 拿不到池 / 池里 0 个账号 ⇒ 退化为续期本机那一份凭据（老用户兼容路径）。
+ * - 池读取**同步抛错**不阻断：按「0 个账号」处理并走同一条兜底。
+ *
+ * ## ⚠️⚠️ 登记一处**刻意的行为变更**（2026-10-14 复审实测确认，别当等价重构）
+ *
+ * 本函数**不是**对修复前那两段代码的逐格等价重构 —— 有**一格**确实变了：
+ * 「`listAccountsByProvider` **同步抛错**」。
+ *
+ * | | 修复前（`await ….catch(…)`） | 现（`try/catch`） |
+ * |---|---|---|
+ * | 池返回 rejected Promise | 吞成 `[]` ⇒ 走兜底 | 走兜底（等价） |
+ * | 池**同步 throw** | **逃逸出 `refreshAll`** ⇒ 被上层 `refreshAllCredentials` 的逐 provider `try` 记一条 warn | **吞成 `[]`** ⇒ 走兜底 |
+ *
+ * 原因是 `.catch()` 只接 Promise 的 rejection，接不住同步 throw（已实测：
+ * `await p.listAccountsByProvider('x').catch(()=>[])` 在同步 throw 下**抛出**）。
+ *
+ * ⚠️ **这个变更是刻意的、方向正确的**：`refreshAllCredentials` 的语义是
+ * 「单个 provider 失败不阻断其余」，而「读池抖动」不该让 OfficeAce 整条
+ * 从续期表里消失（那正是 IKLPTZ 的可观测症状）。故归入「空池兜底」比逃逸更好。
+ * ⚠️ 但**必须按本仓库惯例登记**（见 `provider-abstraction-g3-exceptions.md`：
+ * 「登记了一处例外」不等于它没有守卫）—— 守卫是 `officeace-refresh-all.spec.ts`
+ * 的用例⑤（断言读池抛错时 `fallbackRefresh` **真的被调用一次**；
+ * 改成静默 `return` 即变红）。
+ *
+ * ## ⚠️ `fallbackRefresh` 为什么是**参数**
+ *
+ * 它的生产默认值就是 {@link refreshStoredCredential}（语义与从前逐字相同）。
+ * 提成参数是为了让单测能**替换掉那个会碰 `~/.dsh-officeace/session.json`
+ * 的入口**：那个文件是用户**真实的华为云凭据**，而 `refresh_token` 是一次性的
+ * —— 用例若顺着兜底分支读进去并发一次 STS，就会**消费掉用户的一次性 token**
+ * （实测踩到过：vitest 输出里出现真实报文 `STS5.1806 has been used`）。
+ * 注入之后，「空池」那几条用例完全不碰文件系统与网络。
  */
-export async function refreshAll(pool) {
-    const p = pool;
-    if (p?.listAccountsByProvider === undefined) {
-        // 拿不到池（极少见：单测桩不完整）⇒ 退化为续期那一份，至少不抛错。
-        await refreshStoredCredential().catch(() => undefined);
-        return;
+export async function refreshAccountList(pool, refreshOne, fallbackRefresh = refreshStoredCredential) {
+    let accounts;
+    try {
+        // ⚠️⚠️ **`await` 一次是必须的，且不能省**（2026-10-14 对抗性审计打穿后修正）：
+        //    生产池是同步的（`await` 数组是恒等操作，无额外开销），而**Promise 形态
+        //    也必须能跑** —— 第一版按「只接受同步」写，于是 Promise 池会掉进
+        //    `for…of` 抛 `TypeError: accounts is not iterable`，**连兜底都绕过**，
+        //    比修复前的行为更糟（旧代码 `await ….catch(…)` 是能处理 Promise 的）。
+        //    实测对照见 `OfficeAceRefreshPool` 接口注释里的表。
+        const listed = pool?.listAccountsByProvider?.('officeace');
+        const resolved = await listed;
+        // ⚠️ 非数组（形状不符 / 桩写错）⇒ 当「没有账号」：走兜底并**不抛**。
+        //    这里刻意不抛 TypeError —— 一个渠道的桩写错不该让整轮续期炸掉。
+        accounts = Array.isArray(resolved) ? resolved : [];
     }
-    const accounts = await p.listAccountsByProvider('officeace').catch(() => []);
+    catch {
+        // 同步 throw 或 rejected Promise ⇒ 与「没有账号」同处理，不阻断整轮续期。
+        // ⚠️ **同步 throw 是一处刻意的行为变更**（修复前它会逃逸出本函数）——
+        //    理由与守卫见上方「登记一处刻意的行为变更」一节，别当等价重构删掉。
+        accounts = [];
+    }
     if (accounts.length === 0) {
-        await refreshStoredCredential().catch(() => undefined);
+        // 拿不到池（极少见：单测桩不完整）或尚未登录 ⇒ 退化为续期那一份。
+        await fallbackRefresh().catch(() => undefined);
         return;
     }
     for (const account of accounts) {
-        await refreshAccountCredential(account.credentialRef, pool, account.id);
+        await refreshOne(account);
     }
+}
+/**
+ * 批量续期（`refreshAll` 形状）。
+ *
+ * ⚠️ 实现见 {@link refreshAccountList} —— 本函数只负责把「续期某一个账号」
+ * 分派到**本模块**的 {@link refreshAccountCredential}（走兼容文件那条腿）。
+ * `src/index.ts` 的服务包装会调同一个 {@link refreshAccountList}，但把
+ * 分派指向**注入了 `ctx.credentials`** 的那一份。
+ *
+ * ⚠️ **把 `pool` 原样透传给 `refreshAccountCredential`**（不能省）：续期成功后
+ * 要靠它回写池里的 `expiresAt`，漏传的症状是卡片有效期永远不更新。
+ */
+export async function refreshAll(pool) {
+    await refreshAccountList(pool, (account) => refreshAccountCredential(account.credentialRef, pool, account.id));
 }
 /**
  * 订阅缓存的落盘路径（余额离线兜底用，与凭据同目录）。
@@ -688,9 +911,9 @@ export async function refreshAll(pool) {
  */
 function subscriptionCacheFile(ref) {
     if (ref === undefined || ref.length === 0) {
-        return path.join(storeDir(), 'subscription-cache.json');
+        return path.join(officeaceHome(), 'subscription-cache.json');
     }
-    return path.join(storeDir(), `subscription-cache-${ref.replace(/[^A-Za-z0-9._-]/g, '_')}.json`);
+    return path.join(officeaceHome(), `subscription-cache-${ref.replace(/[^A-Za-z0-9._-]/g, '_')}.json`);
 }
 function readSubscriptionCache(ref) {
     try {
@@ -705,7 +928,7 @@ function readSubscriptionCache(ref) {
 }
 function writeSubscriptionCache(summary, ref) {
     try {
-        fs.mkdirSync(storeDir(), { recursive: true });
+        fs.mkdirSync(officeaceHome(), { recursive: true });
         const payload = { ...summary, cachedAt: new Date().toISOString() };
         const target = subscriptionCacheFile(ref);
         const tmp = `${target}.tmp-${process.pid}`;
@@ -740,24 +963,45 @@ export async function fetchSubscriptionSummary(staleHours = 48, ref, credential,
     // 0. **多账号路径**：有 ref 时先走云侧直读（本地 cookie 无法区分账号）。
     //    成功即返回，不落到下面的本地 API —— 那会串号。
     if (ref !== undefined && ref.length > 0) {
+        /**
+         * ⚠️⚠️ **凭据不存在 ⇒ 如实报「未登录」，绝不用陈旧缓存充数**
+         * （Gitee issue IKM741 修法 C，2026-10-16 实测确证）。
+         *
+         * 修前这里是一个 `try{}catch{}` 罩住「读凭据 + 云侧直读」，catch 之后
+         * **无条件**落到该 ref 的缓存兜底 ⇒ 三种失败被混成一件事：
+         *
+         * | 情形 | 修前读数 | 修后 |
+         * |---|---|---|
+         * | 凭据在、云侧临时不可达 | 该 ref 的缓存（`stale:true`，合理） | 不变（**保留**，这是「数据截至 hh:mm」的正当用法）|
+         * | **凭据已不存在**（孤儿账号） | **仍报出一个数字** | `undefined` ⇒ 面板显示「未登录」|
+         *
+         * 第二格正是 issue 的核心误导（实测复现）：那 3 条「有账号无凭据」的账号
+         * 面板照样显示 6493.32 / 6500 这类数字，用户据此认为「账号正常、还有额度」，
+         * 而它**已经没有任何凭据**、在聚合里恒 `UNUSABLE`。数字来源是登录时写下的
+         * **快照**（`subscription-cache-<ref>.json`，本机那几份的 `cachedAt` 是
+         * 10-13 / 10-14，而凭据早就没了）。
+         *
+         * ⇒ 判据：**读数必须与凭据绑定** —— 凭据在，读数才有意义（含它的陈旧缓存）；
+         * 凭据不在，唯一诚实的答案是「未登录」，宁可显示失败也不显示一个假数字。
+         */
+        const own = credential ?? await readCredential(ref, credentials).catch(() => undefined);
+        if (own === undefined)
+            return undefined;
         try {
-            const own = credential ?? await readCredential(ref, credentials);
-            if (own !== undefined) {
-                // ⚠️ **先自动签到再查余额**（顺序不能反）：签到会把当日 1000 分打进
-                //    `bonus_skus`，先查就永远少显示那一份 —— 用户会以为没领到。
-                //    `maybeClaimBonus` 内部按小时去重，不会重复打服务端。
-                await maybeClaimBonus(own, ref);
-                const cloud = await fetchCloudSubscriptionFor(own);
-                if (cloud !== undefined) {
-                    writeSubscriptionCache(cloud, ref);
-                    return cloud;
-                }
+            // ⚠️ **先自动签到再查余额**（顺序不能反）：签到会把当日 1000 分打进
+            //    `bonus_skus`，先查就永远少显示那一份 —— 用户会以为没领到。
+            //    `maybeClaimBonus` 内部按小时去重，不会重复打服务端。
+            await maybeClaimBonus(own, ref);
+            const cloud = await fetchCloudSubscriptionFor(own);
+            if (cloud !== undefined) {
+                writeSubscriptionCache(cloud, ref);
+                return cloud;
             }
         }
-        catch { /* 掉到该账号的缓存兜底 */ }
-        const own = readSubscriptionCache(ref);
-        if (own !== undefined)
-            return { ...own, stale: true };
+        catch { /* 凭据在、只是云侧暂时读不到 ⇒ 掉到「本 ref」的缓存兜底 */ }
+        const cached = readSubscriptionCache(ref);
+        if (cached !== undefined)
+            return { ...cached, stale: true };
         return undefined;
     }
     // 1. **主路径：OfficeAce 本地 API**（装了客户端且在运行时可用，实测稳定）
@@ -765,7 +1009,8 @@ export async function fetchSubscriptionSummary(staleHours = 48, ref, credential,
         const sidValue = readSessionCookie();
         if (sidValue !== undefined) {
             const caCandidates = [
-                path.join(os.homedir(), '.office-claw', 'certs', 'root-ca.pem'),
+                // ⚠️ 同上：受 `DSH_OFFICEACE_HOME` 覆盖，避免单测读用户真实证书目录。
+                path.join(officeAceClientHome(), 'certs', 'root-ca.pem'),
                 'D:\\Users\\Z\\AppData\\Local\\Programs\\OfficeAce\\.office-claw\\certs\\root-ca.pem',
             ];
             let ca;
@@ -850,8 +1095,25 @@ export async function fetchSubscriptionSummary(staleHours = 48, ref, credential,
  * （那正是当初 GET 反复 401 的成因）。
  *
  * @param body - 请求体文本；`undefined`（无 body）时按空串计哈希。
+ * @param statusOut - 可选：写入终态 HTTP 状态码。
+ * @param errorBodyOut - 可选：写入**失败响应体原文**（供调用方带出唯一出路信息）。
+ *
+ * ⚠️ **返回值对「失败」是有歧义的**：非 2xx 与「2xx 但响应体为空」都给出空串
+ *    （`r.ok ? await r.text() : ''`）。余额查询可以容忍（空串 ⇒ 解析失败 ⇒
+ *    走缓存兜底），但**签到不能** —— 401 会被读成「今天没有可领的」，
+ *    于是每天白丢 1000 分且日志无痕（2026-10-18 真实报障）。需要区分的调用方
+ *    传 `statusOut` 自行判定。
+ *
+ * ⚠️⚠️ **`errorBodyOut` 不是冗余**（2026-10-18 审计实测的 P1）：
+ *    失败时返回值恒为空串，于是上游那行 `body.slice(0, 120)` **永远切出空串** ——
+ *    实测 401 + `{"error":"IAM_TOKEN_EXPIRED_XYZ"}` 得到的是
+ *    `reason: "HTTP 401："`，**服务端报文全丢**。
+ *    而「报文本身指路」正是本 PR 立论所依赖的东西（同理 IKLBSH 记录的
+ *    `AUTH` 码吞 message：文案就是出路，丢了就无从处置）。
+ *    本文件另有两处**既有先例**是「先 `await r.text()` 再判 `!r.ok`、把报文带进
+ *    错误/日志」（`exchangeIamToken` 与 STS 续期失败）—— 此处照同一口径补齐。
  */
-async function signAndRequest(url, credential, method, body) {
+async function signAndRequest(url, credential, method, body, statusOut, errorBodyOut) {
     const region = 'cn-southwest-2';
     const service = 'apic';
     const pad = (n) => (n >= 10 ? String(n) : `0${n}`);
@@ -914,6 +1176,16 @@ async function signAndRequest(url, credential, method, body) {
         ...body === undefined ? {} : { body },
         signal: AbortSignal.timeout(30_000),
     });
+    if (statusOut !== undefined)
+        statusOut.status = r.status;
+    /**
+     * ⚠️ 失败时**必须把报文读出来**（P1）：返回值对失败恒为空串，
+     * 报文是调用方能拿到的**唯一**失败原因。读失败也不能抛（否则吞掉状态码判据），
+     * 故 `.catch(() => '')`。
+     */
+    if (errorBodyOut !== undefined && !r.ok) {
+        errorBodyOut.text = await r.text().catch(() => '');
+    }
     return r.ok ? await r.text() : '';
 }
 async function signAndGet(url, credential) {
@@ -949,7 +1221,7 @@ async function fetchCloudSubscription(ref) {
  *    多账号下这个猜测必错（实测两个账号都显示第一个账号的余额）。
  */
 async function fetchCloudSubscriptionFor(credential) {
-    if (credential === undefined || credential.access.length === 0 || credential.securityToken.length === 0) {
+    if (!credentialUsable(credential)) {
         return undefined;
     }
     const body = await signAndGet(`${OFFICEACE.defaultBaseUrl.replace(/\/+$/, '')}/v1/subscription`, credential);
@@ -1021,29 +1293,58 @@ async function fetchCloudSubscriptionFor(credential) {
  * ⚠️ **积分当日作废**（实测 2026-10-13）：`expired_time` 是当天 23:59:59。
  *    当天不领就永久失去那 1000 分 —— 这正是自动领取的价值所在。
  *
- * @returns 领取到的活动桶；失败返回空数组（**不抛错**：签到失败不该阻断余额展示）。
+ * ⚠️ **失败的错误文本必须带出来**（2026-10-18 真实报障）：原先这里是一个裸
+ *    `catch { return [] }`，尽管上一行的注释就写着「记日志而不是静默吞」。
+ *    实测后果：凭据过期后**连续三天**每日签到 401 全失败、每天白丢 1000 分，
+ *    而日志与面板**一个字都没有** —— 用户只能从「临期桶不见了」反推。
+ *    ⇒ 本函数改为返回**结果对象**：调用方据此决定记日志与是否重试。
+ *
+ * @returns 领取结果。`ok: true` 时为领到的活动桶；`ok: false` 时带错误原因
+ *（**不抛错**：签到失败绝不阻断余额展示）。
  */
 export async function claimDailyBonus(credential) {
-    if (credential === undefined || credential.access.length === 0 || credential.securityToken.length === 0) {
-        return [];
+    if (!credentialUsable(credential)) {
+        return { ok: false, reason: '凭据缺失（access 或 securityToken 缺失或为空），未发起签到请求' };
     }
     try {
         // ⚠️ **POST 必须带 `Content-Type`**（规则 1 的另一面）：实测不带会得到
         //    HTTP 500 `OfficeAce.11020001 内部服务器错误`；带了才是 200。
         //    body 为空即可 —— 该端点不需要入参（果办也是 `void 0`）。
-        const body = await signAndRequest(`${OFFICEACE.defaultBaseUrl.replace(/\/+$/, '')}/v1/subscription/bonus/claim`, credential, 'POST');
+        const statusOut = { status: 0 };
+        const errorBodyOut = { text: '' };
+        const body = await signAndRequest(`${OFFICEACE.defaultBaseUrl.replace(/\/+$/, '')}/v1/subscription/bonus/claim`, credential, 'POST', undefined, statusOut, errorBodyOut);
+        // ⚠️⚠️ **非 2xx 必须显式判状态码**（2026-10-18）：`signAndRequest` 对失败
+        //    与「空响应体」都返回空串 ⇒ 401 会被读成「今天没有可领的」，于是每天
+        //    白丢 1000 分且日志无痕。这里按状态码如实报失败。
+        //
+        // ⚠️⚠️ **失败原因必须带出服务端报文**（P1）：`body` 在非 2xx 时恒为空串，
+        //    拿它拼 reason 只会得到 `HTTP 401：` —— 而报文往往是**唯一指路信息**
+        //    （`token expired` / `IAM.0011` / 签名过期），丢了就退回「无从处置」。
+        if (!Number.isFinite(statusOut.status) || statusOut.status < 200 || statusOut.status >= 300) {
+            const detail = errorBodyOut.text.trim().slice(0, 200);
+            return {
+                ok: false,
+                reason: `HTTP ${statusOut.status === 0 ? '（未发出/无响应）' : statusOut.status}${detail === '' ? '' : `：${detail}`}`,
+            };
+        }
         if (body.length === 0)
-            return [];
+            return { ok: true, skus: [] };
         const j = JSON.parse(body);
-        return (j.bonus_skus ?? []).map((s) => ({
-            activityId: String(s.activity_id ?? ''),
-            activityName: typeof s.activity_name === 'string' ? s.activity_name : '活动奖励',
-            points: Number(s.points) || 0,
-        }));
+        return {
+            ok: true,
+            skus: (j.bonus_skus ?? []).map((s) => ({
+                activityId: String(s.activity_id ?? ''),
+                activityName: typeof s.activity_name === 'string' ? s.activity_name : '活动奖励',
+                points: Number(s.points) || 0,
+            })),
+        };
     }
-    catch {
-        // ⚠️ 签到失败**绝不阻断**余额查询（还有 LOGGER 约定：记日志而不是静默吞）。
-        return [];
+    catch (error) {
+        // ⚠️ 签到失败**绝不阻断**余额查询，但**必须留痕**（仓库约定：不允许静默吞）。
+        return {
+            ok: false,
+            reason: error instanceof Error ? error.message : String(error),
+        };
     }
 }
 /**
@@ -1054,6 +1355,28 @@ export async function claimDailyBonus(credential) {
  *    请求，且服务端若对重复领取返回异常，日志会被刷屏。
  * ⚠️ 按 ref 而非全局：多账号下每个账号**各自**都要领，共用一把锁会让
  *    第二个账号永远领不到（它的签到分当日作废）。
+ *
+ * ⚠️⚠️ **失败必须撤销占坑**（2026-10-18 真实报障）：原实现是「先 `set` 占坑、
+ *    再领取」，且 `.catch(() => [])` —— 于是**失败那一次也把这一小时钉死了**。
+ *    实测形态：登录是**异步**写凭据库的，面板刷新与 `login.poll` 会赛跑；
+ *    若刷新抢在落盘之前拿到旧/空凭据 ⇒ 401 ⇒ 静默失败 ⇒ 该小时内后续所有
+ *    刷新**全部跳过、不再重试**，直到下一小时才可能领到 —— 而当日积分
+ *    23:59:59 作废，一次钉死就可能是当天 1000 分的永久损失。
+ *
+ *    ⇒ 失败时**撤销**占位，让下一次刷新重试。服务端对重复领取幂等
+ *    （「每日签到有礼」一天只有一份），重试无害。
+ *
+ * ⚠️⚠️ **撤销必须与 `.catch()` 兜底成对出现**（2026-10-18 审计实测的 P0）：
+ *    原实现是 `.then(...)` 而**没有** `.catch` —— 而 `claimDailyBonus` 确实会
+ *    reject（凭据字段缺失时的前置判断抛错）。那条 rejection 路径
+ *    **既进不了 `result.ok` 分支、也拿不到 `.catch(() => [])` 的兜底**，
+ *    异常一路冒到调用方的空 `catch` ⇒ 零留痕 + 余额查询一并被跳过。
+ *    ⇒ 拒绝路径必须与失败路径**同等对待**：撤销占坑 + 留痕。
+ *
+ * ⚠️ **占坑撤销必须按 hourKey 条件删**（P3）：`hourKey` 在**进入时**算，
+ *    而响应回来时可能已跨整点。若那时新一轮刷新已用**新** hourKey 重建了占坑，
+ *    无条件 `delete(ref)` 会把**别人的**占坑删掉 ⇒ 节流失效（多打一次请求）。
+ *    形态轻（多打的仍是幂等签到），但白搭一次往返与一条 warn。
  */
 const lastClaimAt = new Map();
 function maybeClaimBonus(credential, ref) {
@@ -1062,7 +1385,29 @@ function maybeClaimBonus(credential, ref) {
     if (lastClaimAt.get(ref) === hourKey)
         return Promise.resolve([]);
     lastClaimAt.set(ref, hourKey);
-    return claimDailyBonus(credential).catch(() => []);
+    /**
+     * ⚠️ **撤销占坑只删「自己那一格」**（P3，跨整点时别删掉新一轮的占坑）。
+     */
+    const releaseSlot = () => {
+        if (lastClaimAt.get(ref) === hourKey)
+            lastClaimAt.delete(ref);
+    };
+    return claimDailyBonus(credential).then((result) => {
+        if (result.ok)
+            return result.skus;
+        releaseSlot();
+        console.warn(`[officeace] 每日签到失败（ref=${ref}）：${result.reason}`);
+        return [];
+    }).catch((error) => {
+        /**
+         * ⚠️⚠️ **拒绝路径与失败路径同等对待**（P0，见上方长注释）。
+         * 少了这一条：reject 既不留痕、也不撤销占坑 ⇒ 该小时仍被钉死，
+         * 且异常被调用方的空 `catch` 静默吞掉 ⇒ 零留痕 + 余额查询被跳过。
+         */
+        releaseSlot();
+        console.warn(`[officeace] 每日签到异常（ref=${ref}）：${error instanceof Error ? error.message : String(error)}`);
+        return [];
+    });
 }
 /** Basic 授权头值（推理用）。 */
 export function basicAuthorization(credential) {

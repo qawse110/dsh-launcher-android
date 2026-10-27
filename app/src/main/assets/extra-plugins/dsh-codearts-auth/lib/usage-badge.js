@@ -102,21 +102,30 @@ export function createUsageBadge(deps) {
     }
     /** 读取并折算一份快照（缓存未命中时才会被调用；抛错即「失败不缓存」）。 */
     async function loadSnapshot(provider) {
-        const balances = await deps.collectBalances(provider);
+        // ⚠️ **先算启用账号，只查它们**（2026-10-15，规格 §7-8）：停用账号既不进合计、
+        //    也不该被渲染明细 ⇒ 让端点少查几个号（每次渲染省 N 个顺序上游请求）。
+        //    判据与 `provider.status` 一致（`enabled !== false`，老文档缺该字段时语义等同启用）。
+        //
+        //    ⚠️⚠️ **本字段只裁剪余额查询，不影响自愈**：`credits.balances` 入口的
+        //    `healExpiredAccounts` 仍对**全部**账号跑 —— 本仓库铁律「续期不得按
+        //    `enabled` 过滤」（停用期间凭据一路放到失效，用户重启用后只能重新登录）。
+        //    ⚠️ 修订历史：本函数此前是「查全部、再在客户端过滤」，同样的显示结果但多查
+        //    了停用账号；改成传 `accountIds` 后展示语义不变（有一条用例锁它）。
+        const pool = deps.listAccounts(provider);
+        const enabledIds = pool.filter((entry) => entry.enabled !== false).map((entry) => entry.id);
+        const balances = await deps.collectBalances(provider, enabledIds);
         if (!balances.ok)
             throw new BadgeRpcFailure(balances.error);
-        // 只保留**启用**账号：判据与 `provider.status` 一致（`enabled !== false`，
-        // 老文档缺该字段时语义等同启用）。停用账号既不进合计，也不该被渲染明细。
-        const pool = deps.listAccounts(provider);
-        const enabledIds = new Set(pool.filter((entry) => entry.enabled !== false).map((entry) => entry.id));
-        const accounts = balances.value.accounts.filter((row) => enabledIds.has(row.accountId));
+        const accounts = balances.value.accounts;
         const snapshot = {
             at: now(),
             accounts,
-            disabledCount: pool.length - enabledIds.size,
+            disabledCount: pool.length - enabledIds.length,
             ...balances.value.windowDays === undefined ? {} : { windowDays: balances.value.windowDays },
         };
-        const subscription = await subscriptionOf(provider, enabledIds, accounts);
+        // ⚠️ `subscriptionOf` 的第二个参数是 `ReadonlySet`（它按 id 判「这条余额行
+        //    属不属于启用账号」）—— 上面为了传 `accountIds` 用的是数组，这里再包一次。
+        const subscription = await subscriptionOf(provider, new Set(enabledIds), accounts);
         if (subscription !== undefined)
             snapshot.subscription = subscription;
         return snapshot;

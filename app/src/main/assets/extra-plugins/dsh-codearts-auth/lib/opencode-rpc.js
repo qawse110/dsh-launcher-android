@@ -25,7 +25,7 @@
  * **不跳浏览器**的登录方式（手动粘贴 API key）。
  */
 import { credentialRef } from '@deepseek-ai/dsh-credentials';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { OPENCODE } from './opencode-product.js';
 import { newAccountFingerprint, nextFingerprintGeneration } from './opencode-auth.js';
 import { normalizeProxy } from './opencode.js';
@@ -95,21 +95,136 @@ export function describeFetchError(error) {
     return parts.join(' ← ');
 }
 /**
- * key 形状：`sk-` 前缀 + 至少 20 位。
+ * key 形状：**不绑定任何前缀**，只粗筛「像不像一个粘贴过来的密钥串」——
+ * 至少 20 位、无空白、URL-safe 令牌字符集（覆盖 base64url 与
+ * `oc_sk_1a2b3c4d5e6f_…` 这种带分隔符的形态）。
+ *
+ * ⚠️⚠️ 这里**曾经**写死 `^sk-…`。opencode 2026-10-22 起签发的 key 改成
+ * `oc_sk_` 开头（Gitee **IKPLRU**：新 key 被这道闸**全部**挡在门外，报
+ * 「应以 sk- 开头」，用户无法添加任何账号）。**前缀是上游会改的东西**，
+ * 判据只能落在与上游命名无关的共性上 ⇒ **不要把某个具体前缀写回来**
+ * （旧 `sk-` key 仍需可用，故也不能改成「只认 oc_sk_」）。
  *
  * ⚠️ 这只是**形状**校验（挡手滑/占位符），**不是**有效性验证：
  * 真 key 仍要等第一次真实请求才知道。形状校验的价值是让「明显没粘贴对」
  * 在入库前就被挡下，而不是等到发消息时才 401。
  */
-const KEY_PATTERN = /^sk-[A-Za-z0-9_-]{20,}$/;
+const KEY_PATTERN = /^[A-Za-z0-9_.-]{20,}$/;
 /** 出口 IP 查询（公开服务，仅用于「测试代理」按钮，不承载业务流量）。 */
 const EXIT_IP_URL = 'http://ip-api.com/json/?fields=status,query,country';
 /** 探测连接用的超时（测试按钮不能无限等）。 */
 const TEST_TIMEOUT_MS = 10_000;
-/** 账号 id / credentialRef 由 key 尾段派生，使重复 key 落到同一账号。 */
+/**
+ * 匿名通道的 id 前缀 —— **全仓唯一的判据来源**。
+ *
+ * `src/index.ts` 的 `ensureDefaultAnonymousSlot`（「池里已经有匿名槽了吗」）
+ * 与客户端的 `isAnonymousAccountId`（`plugin-src/client/jet-hub.js`）都按这个
+ * 前缀判。三处必须同形，故这里导出常量供守卫用例对拍。
+ */
+export const OPENCODE_ANONYMOUS_ID_PREFIX = `${OPENCODE.id}-anon-`;
+/**
+ * 账号 id / credentialRef 由 key 尾段派生，使重复 key 落到同一账号。
+ *
+ * ⚠️⚠️ **两段必须分开算**：`id` 允许 `-`（只是池里的字符串键），而
+ * `credentialRef` 走 `credentialRef()`，其 `REF_PATTERN` 只认
+ * `[A-Za-z_][A-Za-z0-9_]*` —— 尾段里只要有一个 `-` 或 `.`（base64url 的
+ * key 很常见，实测 `sk-…-d-e-f-g` 就命中），原本会**抛出 TypeError**，
+ * 用户看到的是 `credential ref "OPENCODE_ACCOUNT_-D-E-F-G" must match …`
+ * 这条与 key 毫无关系的报错，且账号**写不进去**（2026-10-22 复现）。
+ *
+ * ⇒ 归一化**只在尾段不合法时**发生：合法尾段的 ref 逐字节不变
+ * （存量账号的凭据引用不能被改动），不合法时才做字符替换，并追加 key 的
+ * 短哈希补足判重信息 —— 纯替换会让 `…ab-cd` 与 `…ab_cd` 撞成同一个 ref，
+ * 后添加的账号会**覆盖**前者的凭据。
+ *
+ * ## ⚠️⚠️ `id` 不得落进**匿名槽命名空间**（2026-10-25 审计 A1-F14 / B1）
+ *
+ * 尾 8 位恰为 `anon-abc` 这类形态的 key 会产出 `opencode-anon-abc` —— 与
+ * 匿名通道**前缀相同**。后果是**静默的功能损失**（零报错）：
+ *
+ * 1. 客户端按该前缀判「这是匿名通道」⇒ 打匿名标签、按匿名口径渲染；
+ * 2. `ensureDefaultAnonymousSlot` 判「已经有匿名槽了」⇒ **永久跳过**创建
+ *    默认匿名槽 ⇒ 零账号的新用户**失去免费通道**。
+ *
+ * 旧实现（本 PR 之前）这条路径**不可达**：含 `-` 的尾段会先在
+ * `credentialRef()` 抛 TypeError、根本进不了池；本 PR 放宽字符集后才成立
+ * ⇒ 属**本 PR 新引入**的可达缺陷，必须在本 PR 内修掉。
+ *
+ * ⇒ 只在**确实会撞前缀**时改派生（加 `key-` 段），合法且不撞的存量 id
+ * **逐字节不变**（否则存量账号会被当成新账号另建一条）。
+ */
 function slotNamesOf(apiKey) {
     const tail = apiKey.slice(-8);
-    return { id: `${OPENCODE.id}-${tail.toLowerCase()}`, refName: `OPENCODE_ACCOUNT_${tail.toUpperCase()}` };
+    const upper = tail.toUpperCase();
+    const refName = /^[A-Z0-9_]*$/.test(upper)
+        ? `OPENCODE_ACCOUNT_${upper}`
+        : `OPENCODE_ACCOUNT_${upper.replace(/[^A-Z0-9_]/g, '')}_${createHash('sha256').update(apiKey).digest('hex').slice(0, 8).toUpperCase()}`;
+    const derived = `${OPENCODE.id}-${tail.toLowerCase()}`;
+    // ⚠️ 只改**会撞**的那一档：多插一个 `key-` 段，使 id 不再以匿名前缀开头。
+    //    不可改为「统一加前缀」—— 那会让全部存量账号的 id 变化。
+    const id = derived.startsWith(OPENCODE_ANONYMOUS_ID_PREFIX)
+        ? `${OPENCODE.id}-key-${tail.toLowerCase()}`
+        : derived;
+    return { id, refName };
+}
+/**
+ * 判断一个 `credentialRef` 名字是否可用（`credentialRef()` 的 `REF_PATTERN`）。
+ *
+ * ⚠️ 与 `@deepseek-ai/dsh-credentials` 的 `REF_PATTERN`（`/^[A-Za-z_][A-Za-z0-9_]*$/`）
+ * **同形**，但这里**不 import 那个常量**（它没导出）。故本判据是「宽松预检」：
+ * 不合法就绕开它，绝不拿它去调 `credentialRef()`（那样会抛 TypeError，而本函数
+ * 的存在意义正是「不要抛」）。真正的不变量仍由 `credentialRef()` 自己守。
+ */
+function isUsableRefName(ref) {
+    return /^[A-Za-z_][A-Za-z0-9_]*$/.test(ref);
+}
+/**
+ * 「这个账号槽的凭据现在还能用吗」—— 供 `opencode.addAccount` 的复用判据使用。
+ *
+ * ## ⚠️ 三态而不是布尔（这是本函数存在的全部理由）
+ *
+ * 两种「不能用」的成因**后果完全相反**，混成一个 `false` 会造成真缺陷：
+ *
+ * | 返回值 | 含义 | 正确处置 |
+ * |---|---|---|
+ * | `'same-key'` | 凭据完好，且 `api_key` 与本次**相同** | 复用（`existed: true`） |
+ * | `'missing'` | 读不到 / 非 JSON / `api_key` 为空 | **坏槽 ⇒ 覆盖写**（修复用户的自救路径） |
+ * | `'other-key'` | 凭据完好，但 `api_key` **不同** | **不得覆盖**（那是同一尾段上的另一把 key，覆盖会改掉别人的号） |
+ *
+ * 把 `'other-key'` 也当成坏槽（= 返回 false 就覆盖）会**改掉用户已有的那个账号**
+ * —— 他以为在加新号，实际把旧号换成了新 key。这正是本函数必须三态的原因。
+ *
+ * ⚠️ `resolve` 抛错也按 `'missing'` 处理：凭据文件不可读时不该让整个
+ * addAccount 崩掉（那会连修复路径一起堵死）。
+ * ⚠️ 入参 `ref` 若形态不合法，直接 `'missing'`，**不要**拿它去 `credentialRef()`
+ * （那里会抛 TypeError；行枚举里也可能留下手工编辑的脏 ref）。
+ */
+async function classifyExistingCredential(ctx, ref, expectedApiKey) {
+    if (!isUsableRefName(ref))
+        return 'missing';
+    let resolved;
+    try {
+        resolved = await ctx.credentials.resolve(credentialRef(ref));
+    }
+    catch {
+        return 'missing';
+    }
+    const raw = resolved?.value;
+    if (typeof raw !== 'string' || raw.length === 0)
+        return 'missing';
+    let parsed;
+    try {
+        parsed = JSON.parse(raw);
+    }
+    catch {
+        return 'missing';
+    }
+    if (typeof parsed !== 'object' || parsed === null)
+        return 'missing';
+    const apiKey = parsed.api_key;
+    if (typeof apiKey !== 'string' || apiKey.length === 0)
+        return 'missing';
+    return apiKey === expectedApiKey ? 'same-key' : 'other-key';
 }
 /**
  * 处理一个 opencode RPC 方法。
@@ -133,13 +248,58 @@ export async function handleOpencodeRpc(ctx, pool, method, payload) {
                 const req = call.payload;
                 const apiKey = typeof req?.apiKey === 'string' ? req.apiKey.trim() : '';
                 if (!KEY_PATTERN.test(apiKey)) {
-                    return fail('API key 形状不对（应以 sk- 开头、至少 20 位；可在 https://opencode.ai/auth 生成）');
+                    return fail('API Key 形状不对（应为 20 位以上、不含空格的密钥串；可在 https://opencode.ai/console/account 生成）');
                 }
                 const { id, refName } = slotNamesOf(apiKey);
                 // ⚠️ 重复 key 必须**复用**同一账号：同 key 加两次会让用户误以为是
                 // 两个独立配额桶，实际请求仍会打到同一份额度上（并在限额时一起被跳过）。
-                if (pool.listAccountsByProvider(OPENCODE.id).some((a) => a.id === id)) {
-                    return done({ accountId: id, existed: true });
+                //
+                // ⚠️⚠️ **但「池里有这个 id」≠「这条账号是好的」**（2026-10-25 审计 P1-1）：
+                // 「账号在、凭据缺」是**产品自己能造出来**的状态 —— `exportBackup`
+                // 遇到凭据缺失的账号时把账号写进备份、凭据从字典里略掉（只留一条
+                // warning），用 replace 模式导回就得到 `credentialsImported=0`。
+                // 旧实现在这里**无条件** `return existed:true`，而源码顺序证明它是
+                // **根本没走到写**（不是写失败）⇒ 用户粘贴正确 key 想修好它，
+                // 看到的是「该 key 已存在，已为你定位到原有账号」（以为修好了），
+                // 而该账号在推理路径被 `api_key ?? OPENCODE.anonymousKey` 降级成
+                // **匿名免费通道** ⇒ 付费 key 完全失效，**面板卡片一切正常、零日志**。
+                // 而 opencode **没有** `setApiKey`（对照 `modelscope.setApiKey`），
+                // 唯一出路是「先删后加」——用户没有任何线索指向它。
+                //
+                // ⇒ 命中同 id 时**先确认凭据真的能读出来**：读不到 / 损坏 /
+                // 空 api_key ⇒ 视为「这个槽是坏的」，覆盖写凭据并如实回报
+                // `existed:false`（不能再说「已存在」）。
+                const existing = pool.listAccountsByProvider(OPENCODE.id).find((a) => a.id === id);
+                if (existing !== undefined) {
+                    const state = await classifyExistingCredential(ctx, existing.credentialRef, apiKey);
+                    if (state === 'same-key') {
+                        return done({ accountId: id, existed: true });
+                    }
+                    // ⚠️ `other-key` **不得覆盖**：同一尾段上是另一把 key，覆盖会改掉
+                    //    用户已有的那个号（他以为在加新号）。如实按「已存在」复用，
+                    //    与旧行为一致 —— 这条是「不要过度修复」的边界。
+                    if (state === 'other-key') {
+                        return done({ accountId: id, existed: true });
+                    }
+                    // 覆盖写：把凭据落到**该条目当前引用的 ref** 上（不新造 ref，
+                    // 否则池里的 credentialRef 与新写的 ref 对不上，等于没修）。
+                    // ⚠️ 若条目自己的 ref 不合法（手工编辑过的 state.json），
+                    // 退回本次算出的 refName 并用 updateAccount 纠正引用。
+                    const targetRef = isUsableRefName(existing.credentialRef)
+                        ? existing.credentialRef
+                        : refName;
+                    const repairNickname = typeof req.nickname === 'string' && req.nickname.trim().length > 0
+                        ? req.nickname.trim()
+                        : `OpenCode ${apiKey.slice(-6)}`;
+                    await ctx.credentials.set(credentialRef(targetRef), JSON.stringify({
+                        api_key: apiKey,
+                        nickname: repairNickname,
+                        fingerprint: newAccountFingerprint(apiKey),
+                    }));
+                    if (targetRef !== existing.credentialRef) {
+                        await pool.updateAccount(id, { credentialRef: targetRef });
+                    }
+                    return done({ accountId: id, existed: false });
                 }
                 const nickname = typeof req.nickname === 'string' && req.nickname.trim().length > 0
                     ? req.nickname.trim()

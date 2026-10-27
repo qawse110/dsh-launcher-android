@@ -32,7 +32,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
-import { basename, isAbsolute, join, posix } from 'node:path';
+import { basename, isAbsolute, join, posix, win32 } from 'node:path';
 /**
  * macOS 的浏览器包名 → 包内可执行文件名。
  *
@@ -45,11 +45,144 @@ const MAC_BROWSER_BUNDLES = [
     ['Microsoft Edge.app', 'Microsoft Edge'],
     ['Brave Browser.app', 'Brave Browser'],
 ];
+/**
+ * 从 `PATH` 里的 scoop shim 反推 scoop 的**真实根目录**（Gitee issue IKQ4JN）。
+ *
+ * ## ⚠️⚠️ 为什么需要它（真实缺陷，报障人实测）
+ *
+ * scoop 的根目录有**四档**解析顺序（`apps/scoop/current/lib/core.ps1`）：
+ *
+ * ```powershell
+ * $scoopdir = $env:SCOOP, (get_config ROOT_PATH), "$PSScriptRoot\..\..\..\..",
+ *             "$([System.Environment]::GetFolderPath('UserProfile'))\scoop" |
+ *             Where-Object { $_ } | Select-Object -First 1 | Get-AbsolutePath
+ * ```
+ *
+ * 而 {@link windowsBrowserCandidates} 原先**只抄了第 1 档与第 4 档**，
+ * 跳过了第 2 档（`ROOT_PATH`，即 `<root>\config.json` 里的 `root_path`）
+ * 与第 3 档（scoop 自身安装位置）。
+ *
+ * ⇒ **用 `root_path` 把根挪到别的盘（`D:\System_Tools\Scoop`）的机器上，
+ * 环境变量是空的、`~/scoop` 也不存在，两条腿同时落空 ⇒ 一个 chromium 都找不到**，
+ * 而报错被包装成「设备信誉不足」（见 `zcode-auth.ts` 的 captcha 退避），
+ * 用户会去查完全无关的方向。
+ *
+ * ## 为什么从 `PATH` 反推，而不是直接读 `<root>\config.json`
+ *
+ * 读 config 需要**先知道 root**（鸡生蛋），而 scoop 的配置可能落在两处：
+ * 默认 `~/.config/scoop/config.json`、便携布局 `<root>\config.json`。
+ * 反过来，**scoop 的 shims 目录一定在 `PATH` 里**（否则 `scoop` 命令都用不了），
+ * 且它恒为 `<root>\shims` ⇒ 这是唯一「不需要先知道 root」的入口。
+ *
+ * ## 判据为什么要求 `scoop.cmd` / `scoop.ps1` 存在
+ *
+ * 只按目录名 `shims` 匹配会误命中**任意**叫 `shims` 的目录（例如某些 SDK 的
+ * `shims` 子目录）。要求该目录里真有 scoop 自己的 shim，才认它是 scoop 根。
+ *
+ * ## ⚠️ 这是本模块**唯一**读文件系统的候选来源
+ *
+ * {@link browserCandidates} 的其余部分都是纯字符串计算（可跨平台断言），
+ * 本函数却必须 `existsSync`。故它**单独成一个函数**、且入参可注入 `env`，
+ * 让「PATH 里有没有 shims」这一格能在任何平台上被单测锁住。
+ *
+ * @param env 环境（注入以便单测；`PATH` 与 `Path` 都认 —— Windows 上两者都出现过）
+ * @param exists 存在性判据（注入以便单测，默认 `existsSync`）
+ */
+export function scoopRootFromPath(env, exists = existsSync) {
+    /**
+     * ⚠️ 分隔符**只按 Windows 语义（`;`）切**：本函数只服务 Windows 分支
+     * （scoop 是 Windows 包管理器），而 `PATH` 在 Windows 上恒为 `;` 分隔。
+     * 若将来有人拿它去解析 POSIX 的 `PATH`（`:` 分隔），必须同时改这里 ——
+     * 否则整串会被当成**一个**路径，恒返回 `undefined`（静默失效）。
+     */
+    const raw = env.PATH ?? env.Path ?? '';
+    for (const dir of raw.split(';')) {
+        // ⚠️ 只 trim 尾部空白/引号：Windows 的 PATH 项可能被引号包住
+        //（`"C:\...\shims"`，常见于安装器写坏的情况）。
+        const cleaned = dir.trim().replace(/^"(.*)"$/, '$1');
+        if (cleaned.length === 0)
+            continue;
+        /**
+         * ⚠️⚠️ **必须用 `win32.*` 而不是默认导出的 `basename` / `dirname` / `join`**
+         * （对抗审计实测打穿，P1 修法）。
+         *
+         * 默认导出跟随**宿主平台**：在 Linux / macOS 上 `basename` 是 `posix.basename`，
+         * 而 `posix.basename('D:\\x\\shims')` 会返回**整串**（反斜杠在 POSIX 里
+         * 不是分隔符）⇒ 永远不等于 `'shims'` ⇒ **本函数在非 Windows 宿主上恒返回
+         * `undefined`**。而本仓库的 CI 与多数开发机是 Windows，这一格会在
+         * 「换到 CI / 换台 Mac」时**静默失效**，与 `macBrowserCandidates` 用
+         * `posix.join` 是同一条纪律（那里记的是反向的同型坑）。
+         *
+         * ⚠️ 同时这也让「跨平台单测」这句话**成立**（本文件/测试在 Linux 上跑也一致）。
+         */
+        if (win32.basename(cleaned).toLowerCase() !== 'shims')
+            continue;
+        // ⚠️ 必须真的有 scoop 自己的 shim（见函数头「判据为什么要求…」）。
+        if (!exists(win32.join(cleaned, 'scoop.cmd')) && !exists(win32.join(cleaned, 'scoop.ps1')))
+            continue;
+        return win32.dirname(cleaned);
+    }
+    return undefined;
+}
+/**
+ * 两个 **Windows 路径**是否指向同一处（忽略大小写与尾分隔符）。
+ *
+ * ⚠️ 只在 Windows 分支用。**不要**拿它比 POSIX 路径 —— `C:\A` 与 `c:\a`
+ * 在 Windows 上是同一个目录，在 POSIX 上是两个（而本函数无条件小写化）。
+ * 本仓库既有教训：把平台专属判据复用给另一平台 = 静默错。
+ *
+ * ⚠️ 不处理 `.` / `..` / 短名（`PROGRA~1`）等规范化：本函数的两个入参都来自
+ * 「同一台机器上的同一种拼法」（`<root>` 与 `join(home,'scoop')`），
+ * 做完整 realpath 需要文件系统访问且会引入 IO 失败分支，不划算。
+ */
+function winPathEquals(a, b) {
+    const norm = (p) => p.trim().replace(/[\\/]+$/, '').toLowerCase();
+    return norm(a) === norm(b);
+}
+/**
+ * 从 scoop 根目录推导 chromium 的候选路径（`<root>\apps\chromium\current\chrome.exe`）。
+ *
+ * ⚠️ 抽出来是因为根目录有**三个来源**（`SCOOP` / `SCOOP_GLOBAL` / PATH 反推），
+ * 每处都要拼同一个后缀 —— 拼错一份就是「那个来源静默失效」。
+ *
+ * ⚠️⚠️ **入参必须是「scoop 根」，不是「家目录」**。默认根那一档要传的是
+ * `join(home, 'scoop')` —— 早期重构时曾直接传 `home`，于是拼出
+ * `<home>\apps\chromium\…`（漏了 `scoop` 这一层）⇒ 默认根这条腿**整条静默失效**，
+ * 而它恰是 `SCOOP` 为空时唯一的兜底。回归用例见
+ * `zcode-browser-detection.spec.ts` 的「scoop 非默认根」组。
+ */
+function scoopChromiumPath(root) {
+    return join(root, 'apps', 'chromium', 'current', 'chrome.exe');
+}
 /** Windows 候选链（逐字保留自重构前，⚠️ 改这里等于动本仓库绝大多数用户）。 */
-function windowsBrowserCandidates(env, home) {
+function windowsBrowserCandidates(env, home, 
+/**
+ * 存在性判据（**仅**用于 PATH 反推 scoop 根，见 {@link scoopRootFromPath}）。
+ *
+ * ⚠️ 本函数的其余部分是纯字符串计算，**不要**把它改成「逐条 existsSync 过滤」——
+ * 那会让候选链变成「只含存在的路径」，而 {@link findBrowserExecutable} 的
+ * 职责正是「挑第一个存在的」。两处都判会让「为什么这条没被选中」无从排查。
+ */
+exists = existsSync) {
     const localAppData = env.LOCALAPPDATA ?? '';
     const programFiles = env.PROGRAMFILES ?? '';
     const programFilesX86 = env['PROGRAMFILES(X86)'] ?? '';
+    const scoopRoot = scoopRootFromPath(env, exists);
+    const defaultScoopRoot = join(home, 'scoop');
+    /**
+     * ⚠️ **反推根与默认根可能是同一个目录**（实测：本机两处都是 `C:\Users\<u>\scoop`）。
+     *
+     * 若两档都加，候选链里会出现**同一条路径两次**。本身无害（
+     * `findBrowserExecutable` 只看第一条命中的），但会让：
+     * - 「找不到浏览器」的报错里同一条路径重复列出（用户会以为扫了两个不同的地方）；
+     * - 既有用例 `list.find(c => c.includes('scoop'))` 这类「取第一条」的判据
+     *   **取到哪一条变得依赖真实环境**（已实测踩到：`zcode-browser-home-source`
+     *   两条用例因此变红）。
+     *
+     * ⇒ 相同就**只保留反推那一档**（同样是这个路径，位置更靠前，语义也正确：
+     * 「实测到的根」优先）。比较时按 Windows 语义忽略大小写与尾分隔符。
+     */
+    const sameAsDefault = scoopRoot !== undefined && winPathEquals(scoopRoot, defaultScoopRoot);
     return [
         /**
          * ① scoop 的 **显式声明的**根目录优先于默认推导。
@@ -59,21 +192,57 @@ function windowsBrowserCandidates(env, home) {
          * 「旧默认路径恰好存在 → 用它，而用户实际在用的那个被忽略」。
          */
         ...(env.SCOOP !== undefined && env.SCOOP.trim().length > 0
-            ? [join(env.SCOOP.trim(), 'apps', 'chromium', 'current', 'chrome.exe')]
+            ? [scoopChromiumPath(env.SCOOP.trim())]
             : []),
         ...(env.SCOOP_GLOBAL !== undefined && env.SCOOP_GLOBAL.trim().length > 0
-            ? [join(env.SCOOP_GLOBAL.trim(), 'apps', 'chromium', 'current', 'chrome.exe')]
+            ? [scoopChromiumPath(env.SCOOP_GLOBAL.trim())]
             : []),
-        // ② scoop 默认根目录（`~/scoop`）。实测可用。
-        join(home, 'scoop', 'apps', 'chromium', 'current', 'chrome.exe'),
-        // ③ 系统 Chrome。
+        /**
+         * ② **从 `PATH` 反推的 scoop 根**（Gitee issue IKQ4JN）。
+         *
+         * ## ⚠️⚠️ 这一档补的是「scoop 用 `root_path` 挪到别的盘」的机器
+         *
+         * 那类机器上 `SCOOP` / `SCOOP_GLOBAL` **都是空的**（实测：
+         * `[Environment]::GetEnvironmentVariable('SCOOP','User')` 回空），
+         * 而 `~/scoop` 也不存在 ⇒ ①与③同时落空 ⇒ **一个 chromium 都找不到**。
+         *
+         * scoop 自己的解析顺序里 `ROOT_PATH` 排在第 2 档，本档正是补它 ——
+         * 但用 PATH 反推而不是读 config.json（理由见 {@link scoopRootFromPath}）。
+         *
+         * ⚠️ **排在 `~/scoop` 之前**：反推出来的是**真实**根，而 `~/scoop` 只是
+         * 「默认推导」。若反过来，一台「根挪到 D 盘、但 `~/scoop` 里恰好留着
+         * 一个旧的 chromium」的机器会选中旧的 —— 与 ① 的注释同一条原则
+         *（「显式声明的根优先于默认推导」，反推出的根同样是**实测到的**根）。
+         */
+        ...(scoopRoot !== undefined ? [scoopChromiumPath(scoopRoot)] : []),
+        // ③ scoop 默认根目录（`~/scoop`）。实测可用。
+        //
+        // ⚠️ **必须 `join(home, 'scoop')`**：`scoopChromiumPath` 收的是 **scoop 根**，
+        //    不是家目录。直接传 `home` 会拼出 `<home>\apps\chromium\…`（漏一层）
+        //    ⇒ 默认根整条失效，而它正是 `SCOOP` 为空时的唯一兜底。
+        //
+        // ⚠️ 与 ② 相同时跳过（见上面 `sameAsDefault` 的注释）。
+        ...(sameAsDefault ? [] : [scoopChromiumPath(defaultScoopRoot)]),
+        // ④ 系统 Chrome。
         join(programFiles, 'Google', 'Chrome', 'Application', 'chrome.exe'),
         join(programFilesX86, 'Google', 'Chrome', 'Application', 'chrome.exe'),
         join(localAppData, 'Google', 'Chrome', 'Application', 'chrome.exe'),
-        // ④ Chromium。
+        // ⑤ Chromium。
         join(localAppData, 'Chromium', 'Application', 'chrome.exe'),
         join(programFiles, 'Chromium', 'Application', 'chrome.exe'),
-        // ⑤ Edge（Chromium 内核，系统普遍自带）。
+        /**
+         * ⑥ Brave（chromium 内核）。
+         *
+         * ⚠️ **本档是 Gitee issue IKQ4JN 的附带建议 4**：`macBrowserCandidates`
+         * 与 `linuxBrowserCandidates` 早就有 Brave，唯独 Windows 这条没有 ——
+         * 国内 Windows 装 Brave 的比例不低，属于顺手补齐。
+         *
+         * ⚠️ 安装位置与 Chrome 同形（`Application\brave.exe`），三档与 Chrome 对齐。
+         */
+        join(programFiles, 'BraveSoftware', 'Brave-Browser', 'Application', 'brave.exe'),
+        join(programFilesX86, 'BraveSoftware', 'Brave-Browser', 'Application', 'brave.exe'),
+        join(localAppData, 'BraveSoftware', 'Brave-Browser', 'Application', 'brave.exe'),
+        // ⑦ Edge（Chromium 内核，系统普遍自带）。
         join(programFilesX86, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
         join(programFiles, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
         join(localAppData, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
@@ -190,7 +359,7 @@ export function browserCandidates(input = {}) {
         candidates = linuxBrowserCandidates(home);
     }
     else {
-        candidates = windowsBrowserCandidates(env, home);
+        candidates = windowsBrowserCandidates(env, home, input.exists ?? existsSync);
     }
     const override = env.ZCODE_CHROME_PATH;
     if (typeof override === 'string' && override.trim().length > 0) {
@@ -230,24 +399,70 @@ export function findBrowserExecutable() {
  *
  * ⚠ 第二个参数（环境变量名）是抽到共享模块时加的，**默认值保持 zcode 的
  * 原样文案**；库库AI 传自己的变量名，用户看到的出路才不会指错。
+ *
+ * ## ⚠️⚠️ 第三参 `detail`：把「已尝试什么」与「本进程看到什么」摊开（IKQ4JN 附带建议 1/3）
+ *
+ * 原文案只说**类别名**（「已尝试 scoop chromium / Chrome / …」），于是：
+ *
+ * - 用户不知道自己机器上的 `~/scoop` 到底解析成了什么；
+ * - 设了 `ZCODE_CHROME_PATH` 却「还是找不到」时，无法判断是**变量没生效**
+ *   （从旧终端重启 ⇒ 新进程继承旧环境快照）还是**路径写错**。
+ *   —— 这一条会让用户陷入死循环（他以为设了，插件以为没设）。
+ *
+ * ⇒ 调用方把 {@link findBrowserExecutable} 的**完整候选数组**与本进程读到的
+ * 变量值传进来，两者一起回显。**只回显，不参与任何判据** —— 判据仍在
+ * `findBrowserExecutable` 一处。
+ *
+ * ⚠️ 省略 `detail` ⇒ 输出与修复前**逐字节相同**（老调用方与既有用例不受影响）。
  */
-export function browserNotFoundMessage(platform = process.platform, overrideEnvName = 'ZCODE_CHROME_PATH') {
+export function browserNotFoundMessage(platform = process.platform, overrideEnvName = 'ZCODE_CHROME_PATH', detail) {
+    let base;
     if (platform === 'darwin') {
-        return '已尝试 /Applications 与 ~/Applications 下的 Google Chrome / Chromium / Microsoft Edge / Brave；' +
+        base = '已尝试 /Applications 与 ~/Applications 下的 Google Chrome / Chromium / Microsoft Edge / Brave；' +
             `可用 ${overrideEnvName} 显式指定可执行文件路径` +
             '（如 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome）。';
     }
-    if (platform === 'win32') {
-        return '已尝试 scoop chromium / Chrome / Chromium / Edge；' +
+    else if (platform === 'win32') {
+        // ⚠️ 文案里必须提 Brave（候选链已补，见 windowsBrowserCandidates 的 ⑥）。
+        base = '已尝试 scoop chromium / Chrome / Chromium / Brave / Edge；' +
             `可用 ${overrideEnvName} 显式指定 chrome.exe 路径。`;
     }
-    if (platform === 'linux') {
-        return '已尝试 /usr/bin 下的 google-chrome / chromium / microsoft-edge / brave-browser' +
+    else if (platform === 'linux') {
+        base = '已尝试 /usr/bin 下的 google-chrome / chromium / microsoft-edge / brave-browser' +
             '（含 /opt/google/chrome、/snap/bin 与 flatpak 导出位置）；' +
             `可用 ${overrideEnvName} 显式指定可执行文件路径（如 /usr/bin/chromium）。`;
     }
-    return '已尝试 Chrome / Chromium / Edge 的常见安装位置；' +
-        `可用 ${overrideEnvName} 显式指定可执行文件路径。`;
+    else {
+        base = '已尝试 Chrome / Chromium / Edge 的常见安装位置；' +
+            `可用 ${overrideEnvName} 显式指定可执行文件路径。`;
+    }
+    if (detail === undefined)
+        return base;
+    const lines = [base];
+    /**
+     * ⚠️ **必须回显「变量在本进程里的值」**，而不是只说「可用 X 指定」：
+     * 用户最常见的死循环是「我设了变量却还是找不到」——
+     * 而从**旧终端**重启 `dsh web` 时，新进程继承的仍是旧 shell 的环境快照，
+     * 变量实际为空。回显这一句能立刻断掉那个循环。
+     */
+    const shown = detail.overrideValue === undefined || detail.overrideValue.trim().length === 0
+        ? '（未设置）'
+        : detail.overrideValue;
+    lines.push(`本进程看到的 ${overrideEnvName} = ${shown}`);
+    /**
+     * ⚠️ 候选**逐条列出**（不截断）：这份列表就是排查的主体 ——
+     * 用户照着它能一眼看出「我的 scoop 根没在里面」。
+     * ⚠️ 空候选链也要说清（而不是留一片空白）：那意味着连平台分支都没进去。
+     */
+    if (detail.tried === undefined || detail.tried.length === 0) {
+        lines.push('本次没有产生任何候选路径（平台分支可能未命中）。');
+    }
+    else {
+        lines.push(`本次已尝试 ${detail.tried.length} 条候选：`);
+        for (const candidate of detail.tried)
+            lines.push(`  - ${candidate}`);
+    }
+    return lines.join('\n');
 }
 /**
  * 该可执行文件是否是**系统 Edge**（候选链的最后几档）。
@@ -278,6 +493,60 @@ function safeRemoveDir(dir) {
         rmSync(dir, { recursive: true, force: true });
     }
     catch { /* 忽略 */ }
+}
+/**
+ * **浏览器部署错误**：本机没配好（找不到可执行文件 / 起不来），
+ * 重试一万次也不会成功。
+ *
+ * ## ⚠️⚠️ 为什么需要把它与其它错误区分开（Gitee issue IKQ4JN 根因②）
+ *
+ * 上层（`zcode-auth.ts`）把 captcha 产出失败记进**设备信誉退避**
+ * （{@link CaptchaBackoff}）—— 那是对的：`mintOnPage` 抛错说明本机产出能力
+ * 出了问题，继续试只会更糟。
+ *
+ * 但**「找不到浏览器」不是产出能力问题，是部署问题**。原实现一视同仁，
+ * 于是第 3 次点击就进入 60s 冷却，用户看到的是
+ * 「captcha 产出处于冷却中…这通常意味着**设备信誉不足**」
+ * —— 把「本机没装浏览器」说成「设备信誉不足」，方向完全相反。
+ * 报障人原话：「本次排查最耗时的就是这一步：我一开始真去查了设备信誉」。
+ *
+ * ## 为什么用**带标记的错误类**而不是字符串匹配
+ *
+ * 本仓库明列「判据必须打在行为上，源码/文案正则有假红假绿」。message 会随
+ * 文案微调漂移（而文案本来就要为可读性改），类与字段不会。
+ *
+ * ## ⚠️ 本模块**不** import `captcha-backoff.ts`
+ *
+ * 那样会让「通用浏览器模块」反向依赖 zcode 的 captcha 语义，且 `captcha-backoff`
+ * 将来若 import 别的东西就可能成环。⇒ 这里只抛一个**自带 `deployKind` 标记**
+ * 的错误，由上层（`zcode-auth.ts`）判它是否要计入退避 —— 判据落在上层，
+ * 本模块保持平台中立。
+ */
+export class BrowserDeploymentError extends Error {
+    /** 机器可读细分类（不参与任何文案判据，仅供上层分流与日志聚合）。 */
+    deployKind;
+    constructor(message, deployKind) {
+        super(message);
+        this.name = 'BrowserDeploymentError';
+        this.deployKind = deployKind;
+    }
+}
+/**
+ * 该错误是否属于「浏览器部署错误」。
+ *
+ * ⚠️ 判据用 **`deployKind` 字段**而不是 `instanceof`：跨模块副本（两个不同
+ * 路径的包各有一份模块实例）时 `instanceof` 会因类身份不同而**假红**
+ * —— 本仓库记过这条教训。字段判据对副本免疫。
+ *
+ * ⚠️ 但仍然要求 `name` 也对，避免恰好也叫 `deployKind` 的第三方错误误判。
+ */
+export function isBrowserDeploymentError(error) {
+    if (typeof error !== 'object' || error === null)
+        return false;
+    const record = error;
+    if (record.name !== 'BrowserDeploymentError')
+        return false;
+    return record.deployKind === 'browser-not-found' || record.deployKind === 'browser-spawn-failed';
 }
 /**
  * 把窗口从**任务栏**移除（按平台分派；整体失败静默）。
@@ -489,6 +758,7 @@ function hideWindowLinux(pid) {
  * | 移到 -32000 | `set position … to {-32000,-32000}` | **偶发 `F001`**（窗口离屏时 SDK 取证帧偶尔拿到空 canvas） |
  * | 1×1 缩到角 | `set size … to {2,2}` | 偶发 F001（同上，渲染尺寸过小触发 SDK 重试） |
  * | `--headless=new` | （启动参数） | 一律 `F001`，**不可用** |
+ * | `chrome-headless-shell.exe` | （候选） | 一律 `F001`（issue IKQ4JN 实测），**不可加进候选链** |
  *
  * 结论：macOS 上**最小化是唯一同时满足「不挡屏幕」与「mint 稳定」**的做法。
  * 最小化后窗口缩到屏幕右下角（Dock 区），肉眼几乎不可见，且不破坏 captcha。
@@ -845,9 +1115,36 @@ export class ChromiumSession {
              * 「已尝试 scoop chromium / Chrome / Chromium / Edge；用 ZCODE_CHROME_PATH
              * 显式指定 chrome.exe 路径」—— 在 macOS 上 scoop 不存在、`chrome.exe`
              * 也不是那个文件名，Mac 用户照着做只会更懵。口径见 {@link browserNotFoundMessage}。
+             *
+             * ⚠⚠ **必须带上 `detail`**（IKQ4JN 附带建议 1/3）：只报类别名时，
+             * 用户看不出「我的 scoop 根没在候选里」，也分不清「变量没生效」与
+             * 「路径写错」。`browserCandidates()` 是纯计算（不碰网络），再算一次成本可忽略。
+             *
+             * ⚠️⚠️ **必须抛 {@link BrowserDeploymentError}**（IKQ4JN 根因②）：
+             * 这是**部署错误**（本机没装浏览器），不是「产出能力失败」。
+             * 抛普通 `Error` 会让上层把它计入 captcha 设备信誉退避
+             * ⇒ 第 3 次点击起用户只看到「设备信誉不足」的误导文案。
              */
-            throw new Error(`${label}: 找不到可用的浏览器${this.options.notFoundHint ?? ''}。` +
-                browserNotFoundMessage(process.platform, envName));
+            throw new BrowserDeploymentError(`${label}: 找不到可用的浏览器${this.options.notFoundHint ?? ''}。` +
+                browserNotFoundMessage(process.platform, envName, {
+                    /**
+                     * ⚠️⚠️ **必须只列「真的会被尝试」的那些**（对抗审计 P1 修法）。
+                     *
+                     * `findBrowserExecutable()` 会**跳过**非绝对路径与空串（见那里
+                     * 的 `isAbsolute` 过滤，那是 `browserCandidates` 头部「坑 1」的
+                     * 防线：空环境变量会拼出 `Google\Chrome\Application\chrome.exe`
+                     * 这种相对路径）。而 `browserCandidates()` **原样返回**它们。
+                     *
+                     * 实测（环境变量全空的机器）：12 条候选里 **11 条是相对路径、
+                     * 一条都没被真的尝试过**，但文案会宣称「已尝试 12 条」并把那 11 条
+                     * 相对路径列出来 ⇒ 用户以为扫过那些位置，**正好废掉本修复
+                     * 「一眼看出 scoop 根没在里面」的作用**。
+                     *
+                     * ⇒ 文案与判据用**同一份过滤**，让「已尝试」这四个字是真的。
+                     */
+                    tried: browserCandidates().filter((p) => p.length > 0 && isAbsolute(p)),
+                    overrideValue: process.env[envName],
+                }), 'browser-not-found');
         }
         /**
          * ★ **Edge 兜底必须出声**（Gitee issue IKJLB1 的期望行为 2）。
@@ -906,6 +1203,14 @@ export class ChromiumSession {
              * ⚠ **不用 `--headless=new`** —— 实测 headless 一律 `F001`，必须 headful。
              * 为了不打扰用户，把窗口移到屏幕外。
              *
+             * ⚠⚠ **`chrome-headless-shell.exe` 属同一类，绝不能加进候选链**
+             * （Gitee issue IKQ4JN 的实测坑 2）：它**能启动、CDP 端口也正常**，
+             * 但实跑 `verifyCode: "F001"`（已复现）。它的失败形态与此处的
+             * `--headless=new` 逐格相同（都是「没有真实渲染帧」），
+             * 所以「候选链里加一条多覆盖一个位置」这个直觉在这里是**错**的 ——
+             * 只会得到一个比现在更难查的失败（端口通、mint 恒 F001）。
+             * 目前候选链**没有**它，别加。
+             *
              * ⚠ 移屏**不足以**让它不进任务栏（见 {@link hideWindowFromTaskbar}），
              * 故下面还有一步窗口样式/协议处理。
              */
@@ -959,8 +1264,8 @@ export class ChromiumSession {
              * 直接抛会变成「循环外的 promise rejection」，而 `start()` 仍会等满
              * `readyTimeoutMs` 才返回。存下来让循环**下一轮立刻**失败（见下）。
              */
-            this.spawnFailure = new Error(`${label}: 浏览器无法启动（${executable}）：${error.message}` +
-                `。可安装 Chrome/Chromium，或用 ${envName} 指定其它 chromium 内核浏览器。`);
+            this.spawnFailure = new BrowserDeploymentError(`${label}: 浏览器无法启动（${executable}）：${error.message}` +
+                `。可安装 Chrome/Chromium，或用 ${envName} 指定其它 chromium 内核浏览器。`, 'browser-spawn-failed');
         });
         child.once('exit', (code, signal) => {
             /**
@@ -975,8 +1280,26 @@ export class ChromiumSession {
             const how = signal !== null && signal !== undefined
                 ? `signal=${signal}`
                 : `code=${String(code)}`;
-            this.spawnFailure ??= new Error(`${label}: 浏览器进程异常退出（${executable}，${how}）` +
-                `。请重试，或用 ${envName} 指定其它 chromium 内核浏览器。`);
+            /**
+             * ## ⚠️⚠️ `code=0` 也算「起不来」（Gitee issue IKQ4JN 的实测坑）
+             *
+             * 有人用 **Chrome++ 之类的封装 exe**（如 `D:\…\Chrome\App\Chrome.exe`）：
+             * 外层 exe 会**在 9ms 内以 exit code 0 正常退出**，然后拉起一个独立进程。
+             *
+             * 实测表象极具误导性：CDP `/json/version` **517ms 就绪、端口完全正常**，
+             * 而这里判 `code=0`。若按「退出码 0 = 正常」放行，就会继续用一个
+             * **已经死了的** `this.child`（`killProcessTree` 打空、真实例泄漏）；
+             * 若按「异常退出」处理，则**浏览器明明跑着却被判死**。
+             *
+             * ⇒ 当前选择后者（判失败）并**明确告知**用户换一个真浏览器：
+             *   泄漏整棵进程树比「误判一个非标准封装」严重得多。这条也解释了
+             *   为什么它属于**部署错误**（换浏览器就能好，重试没用）。
+             */
+            this.spawnFailure ??= new BrowserDeploymentError(`${label}: 浏览器进程异常退出（${executable}，${how}）` +
+                `。请重试，或用 ${envName} 指定其它 chromium 内核浏览器。` +
+                (code === 0
+                    ? '（退出码 0 = 该 exe 启动了别的进程后自行退出，属不支持的封装形态，如 Chrome++）'
+                    : ''), 'browser-spawn-failed');
         });
         const timeoutMs = this.options.readyTimeoutMs ?? 30_000;
         const deadline = Date.now() + timeoutMs;
@@ -1016,7 +1339,8 @@ export class ChromiumSession {
              * 「浏览器起不来」比「端口没就绪」更贴近根因，用户才知道该换浏览器。
              */
             throw this.spawnFailure
-                ?? new Error(`${label}: 浏览器调试端口未就绪（${timeoutMs}ms 超时）`);
+                ?? new BrowserDeploymentError(`${label}: 浏览器调试端口未就绪（${timeoutMs}ms 超时）` +
+                    `。可换一个 chromium 内核浏览器，或用 ${envName} 指定。`, 'browser-spawn-failed');
         }
         /**
          * ★ **确认应答的确实是我们启动的那个浏览器**（防「连到旧实例」）。

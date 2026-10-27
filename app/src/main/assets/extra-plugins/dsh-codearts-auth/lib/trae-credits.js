@@ -235,6 +235,14 @@ export async function claimTraeDailyCheckin(credential, product, fetcher = fetch
         // 与积分余额中「签到奖励」包的 `credits_limit:150` 完全吻合）。
         // 故领取成功后补查一次状态 —— 多一次往返，换取如实报告所得。
         const status = await fetchTraeCheckinStatus(credential, product, fetcher);
+        // ⚠️⚠️ **抽奖刻意不挂在这里**（2026-10-20 用户报障后回退，实测证据）：
+        //    `credits.claimAll` 对 `precheckStatus: true` 的家会**先查状态**，
+        //    今天已签到就直接回 `already-claimed`、**根本不调本函数**
+        //    （`jet-hub-rpc.ts:1021-1025`）。而「已签到」恰恰是最该抽奖的时机
+        //    （签到后才解锁抽奖）⇒ 挂在成功分支等于**几乎永不触发**
+        //    （用户实测：4 个账号全显示「今天已签到」，看不到任何抽奖信息）。
+        //    ⇒ 抽奖移到 `provider-credits.ts` 的 trae 条目（`claim` 外层包装），
+        //      那条路对 `claimed` 与 `already-claimed` 都会跑。
         return {
             kind: 'claimed',
             credit: status?.dailyCredit ?? 0,

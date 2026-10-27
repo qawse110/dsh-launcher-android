@@ -1,0 +1,98 @@
+{
+  "summary": {
+    "tasks": 3,
+    "wins": 2,
+    "losses": 1,
+    "ties": 0,
+    "baseline": {
+      "exec": 3,
+      "spec": 4,
+      "risk": 1.67
+    },
+    "injected": {
+      "exec": 3.67,
+      "spec": 4.33,
+      "risk": 4
+    }
+  },
+  "rows": [
+    {
+      "id": "short",
+      "request": "做一个跑车",
+      "packetChars": 881,
+      "bSide": "x",
+      "baselineChars": 2379,
+      "injectedChars": 810,
+      "judge": {
+        "x": {
+          "exec": 3,
+          "spec": 4,
+          "risk": 3
+        },
+        "y": {
+          "exec": 4,
+          "spec": 4,
+          "risk": 2
+        },
+        "winner": "Y",
+        "why": "Y给出了可直接实现且可运行的玩法与关键代码，虽然缺少W/H与ctx初始化并忽略帧率相关风险；X只有主观文字造型描述，缺乏可交付的实现路径，但尺寸与验收细节更完整。"
+      },
+      "winner": "Y",
+      "winB": -1,
+      "aTokens": 1681,
+      "bTokens": 1115
+    },
+    {
+      "id": "creative",
+      "request": "以你自己为本体，做一个极具夸张艺术色彩的动画，主题自选，意境要浪漫而宏大",
+      "packetChars": 1125,
+      "bSide": "x",
+      "baselineChars": 13769,
+      "injectedChars": 3351,
+      "judge": {
+        "x": {
+          "exec": 5,
+          "spec": 5,
+          "risk": 5
+        },
+        "y": {
+          "exec": 2,
+          "spec": 4,
+          "risk": 1
+        },
+        "winner": "X",
+        "why": "X 给出完整可开工的分镜、色彩与验证流程，Y 代码截断且无风险说明。"
+      },
+      "winner": "X",
+      "winB": 1,
+      "aTokens": null,
+      "bTokens": null
+    },
+    {
+      "id": "engineering",
+      "request": "给这个单页加一个可拖拽的两段式输入，第一段上弦第二段甩出，要有力度反馈",
+      "packetChars": 970,
+      "bSide": "y",
+      "baselineChars": 2704,
+      "injectedChars": 2037,
+      "judge": {
+        "x": {
+          "exec": 3,
+          "spec": 4,
+          "risk": 2
+        },
+        "y": {
+          "exec": 3,
+          "spec": 4,
+          "risk": 4
+        },
+        "winner": "Y",
+        "why": "Y 明确覆盖取消、失焦、多点触控、硬停、reduced-motion 和可验收标准，风险控制强；X 的核心手势和数值更连贯，但缺边界处理与验收，且 beep、ball、渲染循环仍未实现。"
+      },
+      "winner": "Y",
+      "winB": 1,
+      "aTokens": 6729,
+      "bTokens": 4851
+    }
+  ]
+}

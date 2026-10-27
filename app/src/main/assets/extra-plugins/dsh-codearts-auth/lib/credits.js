@@ -49,6 +49,69 @@ const CODE_ALREADY_CLAIMED_ALT = 1001;
 const CODE_NO_QUALIFICATION = 1002;
 const CODE_ACTIVITY_ENDED = 1003;
 /**
+ * 这个包是不是**独立池**（不参与主池合计、也不能当通用积分消耗）。
+
+ * ## 为什么需要它（2026-10-21 合并审计发现）
+
+ * AStudio（讯飞 AstronStudio）的服务端给**两个互不相通**的池：主池
+ * （会员 / 购买 / 赠送）与「星火池」。上游自己写明了星火池「不参与主池合计」，
+
+ * `src/astudio-credits.ts` 的 `buildAstudioBalance` 据此把它起名为
+ * `星火积分（独立池，不参与主池合计）`。
+
+ * ## ⚠️⚠️ 为什么判据必须在**宿主侧**（本文件）而不是各处分写
+
+ * PR !134 只在**客户端**（`plugin-src/client/credit-expiry.js`）把独立池从
+
+ * 三档里摘出，后端选号侧（`src/buddy-balance-rank.ts` 的
+
+ * `splitBuddyCreditsByExpiry`）**完全不看 `pkg.name`** ⇒ **两侧口径分叉**：
+
+ * 同一份数据，前端说「永久 0」，后端说「永久 25000」。
+
+ * ⇒ 用户可见症状（**阻断级**）：AStudio 账号只剩星火池时，
+
+ * 面板显示「另有 25000 专属（不计入）」而三档一行不渲染（看起来「没积分」），
+
+ * 但后端把 25000 算成**临期** ⇒ `buddyBalanceTier` 判 `expiring` ⇒
+
+ * **锁定永久积分时该账号仍被判「可用」** ⇒ 选号把请求发给一个只有专属池的
+
+ * 账号 ⇒ 上游按主池计费 ⇒ 请求失败。
+
+ * ## ⚠️ 为什么用「池名含『独立池』」而不是 provider 白名单
+
+ * 池名是**运行时字符串**，而本文件（宿主侧）与客户端（`plugin-src/client/`）
+
+ * **不共享模块图**（见 AGENTS.md）⇒ 两处各存一份判据必然漂移。
+
+ * ⇒ 判据收敛到**本文件一份**，客户端那份由**单测锁死**（见
+
+ * `tests/unit/credit-expiry.spec.ts` 的「独立池判据必须两侧同源」段）。
+
+ * ⚠️ 这条判据依赖**池名** ⇒ 上游/本仓改池名会让它静默失效 ⇒ 那条同步锁
+
+ * 就是为此存在（改池名会让它当场变红）。
+
+ * @param pkg - 资源包（`name` 缺失/非字符串一律当「不是独立池」）。
+
+ * @returns 是独立池则为 `true`。
+
+ */
+export function isExclusiveCreditPool(pkg) {
+    const name = pkg !== null && pkg !== undefined && typeof pkg.name === 'string' ? pkg.name : '';
+    return name.includes(EXCLUSIVE_POOL_NAME_MARK);
+}
+/**
+ * 独立池在**池名**里的标记（宿主侧唯一持有点）。
+
+ * ⚠️ 客户端那份在 `plugin-src/client/credit-expiry.js`（两侧不共享模块图），
+
+ * 由单测锁死一致 —— 改这里必须同步改那边，否则守卫会红。
+
+ */
+export const EXCLUSIVE_POOL_NAME_MARK = '独立池';
+/**
  * 构造签到/余额请求头。不含 X-Device-Token（实测非必需）。
  *
  * `X-Domain` **以产品配置为准**，而不是优先用凭据里的 `credential.domain`：

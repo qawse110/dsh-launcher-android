@@ -98,20 +98,16 @@ function normalizeRemoteModel(entry) {
     const readPositiveInt = (value) => {
         return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : 0;
     };
-    const tags = Array.isArray(entry.tags)
-        ? entry.tags.filter((t) => typeof t === 'string').map((t) => t.toLowerCase())
-        : [];
     return {
         id,
         name: raccoonDisplayName(meta),
         contextWindow: readPositiveInt(params.context_window ?? entry.context_window),
         maxTokens: readPositiveInt(params.max_tokens),
-        // ⚠️ **不能只看 tags**：`vision` 是客户端「Raccoon-Auto 选模」的偏好标签，
-        // 不是服务端能力契约（远端根本没有模态字段，已穷举证实）。`tags` 不含
-        // `vision` 的 `sn-deepseek-v4-1-flash` 实测能看图（5/5 读对随机数字），
-        // 只认 tags 会让它被 DSH 投影成文本占位符 —— 图片根本发不出去。
-        // 证据与取舍见 `raccoon-product.ts` 的 RACCOON_IMAGE_CAPABILITY_OVERRIDES。
-        supportsImage: raccoonSupportsImage(id, tags),
+        // ⚠️ **不看 tags**：`vision` 是客户端「Raccoon-Auto 选模」的偏好标签，
+        // 不是服务端能力契约（远端根本没有模态字段，已穷举证实）。判据是
+        // 「**默认支持**，只禁 RACCOON_TEXT_ONLY_MODELS 里实测确认的纯文本模型」，
+        // 理由与实测证据见 `raccoon-product.ts` 的注释。
+        supportsImage: raccoonSupportsImage(id),
     };
 }
 /**

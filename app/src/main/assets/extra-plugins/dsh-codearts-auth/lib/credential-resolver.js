@@ -118,6 +118,27 @@
  */
 import { pickBuddyAccount } from './buddy-balance-selector.js';
 /**
+ * 显式声明「**本家没有免费模型概念**」的 `isFreeModel` 实现。
+ *
+ * ## 为什么需要这个常量（而不是让字段可选）
+ *
+ * `isFreeModel` 曾经是**可选**字段。于是新增一家 `balance: { kind: 'buddy' }`
+ * 装配时，漏传它 **既没有编译报错、也没有运行时报错** —— 只是静默地让该家的
+ * 免费模型走付费路径，被「锁定永久积分」拦住，报出「额度都属于永久」这种与
+ * 事实相反的文案，并把用户推向「解锁永久积分」（不可逆烧钱）。
+ *
+ * 这正是 Qoder 的实际事故：`src/qoder-adapter.ts` 的兜底表早在 `isFree: true`
+ * 上标好了 4 个免费模型，`toCatalogEntry` 也把 `isFree` 透出给了 UI，唯独
+ * 装配层漏了这三个字。同类缺陷此前在 buddy / workbuddy / trae 已经复发过一轮。
+ *
+ * ⇒ 把它改成**必填**后，新增渠道时漏写是**编译错误**。确实没有免费模型的渠道
+ * 用本常量显式表态，语义比裸写 `() => false` 清楚得多（后者读起来像「忘了实现」）。
+ *
+ * ⚠️ 只有**核实过**该家确实不存在模型级免费概念时才可以用它。判据是「产品/
+ * 兜底表里没有任何 `isFree: true`，且上游目录不返回 `is_free`」，不是「懒得查」。
+ */
+export const NO_FREE_MODEL = () => false;
+/**
  * 按 `enabled` + 模型限流筛出候选账号。
  *
  * ⚠️ **判据必须与 `AccountPool.getAvailableAccount` 逐字一致**（含「空 modelId
@@ -163,7 +184,9 @@ export function createCredentialResolver(deps, config) {
             // ⚠️ `isFreeModel` **先于**候选构造求值：与旧闭包「在 options 字面量里
             //    await」的时序一致（它可能触发远端目录拉取，放到候选之后会把
             //    「先拉目录、再筛候选」这个顺序反过来）。
-            const free = plan.isFreeModel === undefined ? false : await plan.isFreeModel(modelId);
+            // ⚠️ 字段现为**必填**（`NO_FREE_MODEL` 是「本家无免费模型」的显式表态），
+            //    故不再需要 `=== undefined` 兜底 —— 那种兜底正是 Qoder 漏接三周的遮掩。
+            const free = await plan.isFreeModel(modelId);
             const candidates = candidatesOf(deps.pool, providerId, modelId);
             // ① 免费模型（消耗 0 积分）不受「锁定永久积分」约束：锁定要保护的是
             //    「别把永久积分烧掉」，而免费模型既不扣临时也不扣永久积分，却被那道门
@@ -203,7 +226,36 @@ export function createCredentialResolver(deps, config) {
             if (picked.kind === 'locked') {
                 // ⚠️ **锁定时绝不可落到下面的池兜底** —— 那会绕过锁定、照样消耗永久
                 //    积分，使锁定形同虚设（用户明确要求报错）。文案由调用方逐字提供。
-                throw plan.lockedError(picked.reason ?? { kind: 'exhausted' });
+                //
+                // ⚠️ 但报错**之前**必须先证明失败原因是不是**限流**（真实报障
+                //    2026-10-13，CodeBuddy：`明明有积分却显示不可用`）。候选为空时
+                //    余额分档**一次都没跑过**，那句「积分都已用尽」是凭空断言；而
+                //    「全部启用账号被目标模型限流」正是候选为空的常见成因 ——
+                //    `candidatesOf` 会按 `modelRateLimits` 把它们全滤掉，解禁时刻
+                //    明明就在池里，却被这条 throw 短路掉了。
+                //
+                //    ⚠️ 判据用 `candidates.length === 0` 而**不是** `picked.reason`
+                //    的 kind：候选非空时余额分档已经跑过，限流标记在筛候选那一步
+                //    就生效了，此时再去问一次是多余的网络无关判断；且候选非空 ⇒
+                //    至少一个启用账号未被限流 ⇒ `throwIfAllRateLimited` 必然静默返回。
+                //
+                //    ⚠️ 这与本文件 ⑤ 的修法同型（Gitee IKJOZ9）：那里也是「先证明
+                //    是不是限流，再退兜底」。本处只是把它补到锁定分支上。
+                if (candidates.length === 0)
+                    config.throwIfAllRateLimited?.(config.product, modelId);
+                // ⚠️ **不再写 `?? { kind: 'exhausted' }` 兜底**（2026-10-14 审计实测打穿的
+                //    漏网路径）。`pickBuddyAccount` 的返回类型已收紧为 `reason` **必填**，
+                //    而它缺席时**只有一个**成因 —— 候选非空、每次 `select()` 都 `ok:true`，
+                //    但那些号的凭据全解析不出来（详见 `credential-only` 的说明）。此时
+                //    `ok:true` 已证明该号落在可用档（有钱），报「积分都已用尽」是
+                //    **自相矛盾**，且会把用户推向「解锁永久积分」（不可撤回地烧钱）。
+                //
+                //    ⚠️ **两种兜底值都不能写**：写 `exhausted` 会让「有人再写一份不填
+                //    `reason` 的编排」静默退回同一个缺陷；写 `credential-only` 则是
+                //    **不可达的死代码** —— 实测变异验证：把它改回 `exhausted` 时全套
+                //    用例仍绿（27 passed），即该行从未被执行。⇒ 让**类型系统**保证非空
+                //    （`tsconfig` 的 `strict` 已开，`strictNullChecks` 生效）。
+                throw plan.lockedError(picked.reason);
             }
         }
         else if (plan?.kind === 'loomy') {

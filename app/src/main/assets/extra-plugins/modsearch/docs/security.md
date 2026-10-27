@@ -31,8 +31,8 @@ English | [简体中文](security.zh-CN.md)
   output's `attempts` and `warnings`, or the cooldown state file.
 - There is no keychain or credential-manager integration, and no encryption at
   rest: the protection is file permissions plus the output boundaries above.
-  Environment variables (`TAVILY_API_KEY`, `EXA_API_KEY`, `FIRECRAWL_API_KEY`)
-  work as an alternative to the file and are never written to disk.
+  Environment variables (`TAVILY_API_KEY`, `EXA_API_KEY`, `FIRECRAWL_API_KEY`,
+  `KEENABLE_API_KEY`) work as an alternative to the file and are never written to disk.
 
 ## SSRF guards on the local fetcher
 

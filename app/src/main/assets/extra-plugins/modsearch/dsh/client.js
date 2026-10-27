@@ -21,7 +21,18 @@ window.__ModuleLoader__.load({
 
     // The engines the card offers, in the order the docs introduce them. The
     // host half carries the same list; both sides name what they show.
-    var ENGINES = ['antigravity-cli', 'tavily', 'exa', 'firecrawl', 'grok-cli', 'local'];
+    var ENGINES = [
+      'antigravity-cli',
+      'tavily',
+      'exa',
+      'firecrawl',
+      'keenable',
+      'grok-cli',
+      'local',
+    ];
+
+    // Engines that search with no key and no signup.
+    var KEYLESS_ENGINES = ['firecrawl', 'keenable'];
 
     // The chain is a row of search engines, so the page fetcher is not in it.
     // `local` reads a URL it is handed and searches for nothing, and a tickbox
@@ -770,7 +781,7 @@ window.__ModuleLoader__.load({
                       h(
                         'option',
                         { key: name, value: name, style: optionPaint },
-                        name === 'firecrawl' ? `${name}${t.keylessSuffix}` : name,
+                        KEYLESS_ENGINES.indexOf(name) >= 0 ? `${name}${t.keylessSuffix}` : name,
                       ),
                     ),
                   ),
@@ -783,10 +794,10 @@ window.__ModuleLoader__.load({
                   ? secretField(t.apiKey, 'apiKey', current.hasKey ? t.stored : t.unset)
                   : hint(draft.engine === 'local' ? t.localNote : t.cliNote, 'keyless'),
               canKey ? hint(t.apiKeyHint, 'api-key-rotation') : null,
-              // The default engine asks for no signup at all. Silence here
-              // reads as a key being required, which is the one thing this
-              // engine does not need.
-              draft.engine === 'firecrawl' && !current.hasKey
+              // The keyless engines ask for no signup at all. Silence here
+              // reads as a key being required, which is the one thing these
+              // engines do not need.
+              KEYLESS_ENGINES.indexOf(draft.engine) >= 0 && !current.hasKey
                 ? hint(t.keylessTier, 'keyless-tier')
                 : null,
               canKey ? textField(t.baseUrl, 'baseURL', t.endpointFallback) : null,

@@ -71,6 +71,7 @@
  * `settings-compat.ts` 中（当前无调用方）。
  */
 import { withDeadModelPruning } from './dead-model-store.js';
+import { withAnalyzeImageScoping } from './codearts-vision.js';
 /** dsh-llm 对「configurable provider 已存在」抛的 code。**当前仅作防御**保留。 */
 const DUPLICATE_DIRECTORY = 'DUPLICATE_DIRECTORY';
 /**
@@ -360,6 +361,21 @@ function isContentChunk(chunk) {
  *
  * 回归用例：`tests/unit/token-ledger-wiring.spec.ts` 的「两层包装的嵌套顺序」段
  *（按 dsh-llm 的 `prepareCall → call.stream` 真实路径驱动，含闭包式适配器用例）。
+ *
+ * ## 顺带做「analyzeImage 的路由作用域」摘除包装
+ *
+ * 本插件的 `analyzeImage` 工具**只服务 codearts 的纯文本模型**（图片经
+ * `kimi-k2.6-vl` 两段式中转，见 `codearts-vision.ts` 模块头与真实报障取证）。
+ * 但工具注册是**进程全局**的，而本插件注册了 20 个渠道 ⇒ 该工具会进入
+ * **每一家**发给上游的工具表。2026-10-23 真实报障：buddy/workbuddy 因此每轮
+ * `400 invalid function call parameters`（腾讯两站严格校验工具定义）。
+ *
+ * 这里在**每个**适配器上逐请求摘掉该工具（判据与工具层共用
+ * `codearts-vision.ts` 的 `shouldOfferAnalyzeImage`）。为何不用 `dsh-tools` 的
+ * `restrict()`：工具表在 `systemPrompt.assemble()` 那一步就固化，而「用户刚选的
+ * 新模型」只在 session-controller 的投影里、组装时读不到 ⇒「切模型的第一步仍会
+ * 400」。适配器层的 `options.provider` 是**本次请求的真实路由**，零时序、零竞态
+ *（时序分析见 `codearts-vision.ts` 模块头）。
  */
 export function registerAdapterIdempotent(llm, providers, adapter, warn, pruning) {
     // ⚠️ 顺序语义（见函数 doc）：**记账在内、剔除在外**。
@@ -367,6 +383,11 @@ export function registerAdapterIdempotent(llm, providers, adapter, warn, pruning
     //    于是 this.stream 命中记账陷阱；反过来则 this 落到裸适配器、记账被绕过。
     let target = wrapAdapterWithTokenLedger(providers, adapter);
     if (typeof adapter === 'object' && adapter !== null) {
+        // ⚠️ **最外层**：作用域摘除要在记账与失效剔除**之外** —— 它改的是 `options`
+        //    （工具表），而内两层改的是 `this`/返回值；放最外层时 options 先被摘干净，
+        //    内层拿到的就是已摘好的工具表。⚠️ 顺序反过来也能工作（内层只是透传），
+        //    但那样内层的记账/剔除会先看到未摘的表，日志里更难看出真实上送了哪些工具。
+        target = withAnalyzeImageScoping(providers, target);
         try {
             // ⚠️ `pruning.enabled === false` 时**完全不参与**失效模型机制
             //（不记录、**也不过滤**）—— 聚合 provider 必须这样。理由见

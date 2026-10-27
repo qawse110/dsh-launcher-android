@@ -46,6 +46,12 @@ window.__ModuleLoader__.load({
 			disableFrameRelayHint: "No picture is relayed at all: no ego-cast worker, no CDP/WGC screencast capture, no ffmpeg pull, and the watch panel opens no stream. ego_* tools keep working normally.",
 			disableFrameRelayOff: "Off (live view enabled)",
 			disableFrameRelayOn: "On (no picture pushed to this page)",
+			residentExecutor: "Resident executor",
+			residentExecutorHint: "Reuse one long-lived `ego-browser --serve` process across ego_* calls: the first call pays startup, later calls skip it (~16ms). A dead resident falls back to a fresh spawn automatically.",
+			residentExecutorOff: "Off (spawn per call)",
+			residentExecutorOn: "On (resident process)",
+			residentIdleMin: "Resident idle stop (minutes)",
+			residentIdleMinHint: "Stop the resident process after N minutes without an ego_* call (0 = keep it until the plugin unmounts). The browser itself is not affected.",
 			relayDisabledTitle: "Live frame relay is disabled",
 			relayDisabledBody: "Turn off \"Disable live frame relay\" in Settings → Plugins → ego-browser to see the live view here.",
 			minUnit: "min",
@@ -123,6 +129,12 @@ window.__ModuleLoader__.load({
 			disableFrameRelayHint: "完全不回传画面：不启动 ego-cast worker，不做 CDP/WGC 屏幕采集与 ffmpeg 拉流，观察窗不再建立任何拉流连接。ego_* 工具本身照常可用。",
 			disableFrameRelayOff: "关闭（保留实时画面）",
 			disableFrameRelayOn: "开启（不回传任何画面）",
+			residentExecutor: "常驻执行进程",
+			residentExecutorHint: "复用同一个 ego-browser --serve 进程执行 ego_* 调用：首次调用支付启动开销，之后每次约 16ms；常驻进程失效时自动回退到一次性 spawn。",
+			residentExecutorOff: "关闭（每次调用独立 spawn）",
+			residentExecutorOn: "开启（常驻进程）",
+			residentIdleMin: "常驻空闲停止（分钟）",
+			residentIdleMinHint: "N 分钟没有 ego_* 调用后停止常驻进程（0 = 一直保留到插件卸载）。不影响浏览器本体。",
 			relayDisabledTitle: "画面回传已禁用",
 			relayDisabledBody: "在「设置 → 插件 → ego-browser」中关闭「禁用画面回传」后，这里才会显示实时画面。",
 			minUnit: "分钟",
@@ -206,6 +218,34 @@ window.__ModuleLoader__.load({
 			openExternal: "Open real page",
 			raiseWindow: "Pop out window",
 			raiseWindowHint: "Raise the agent browser as a real window (a headless instance is replaced by a visible one on the same profile)",
+			sizeSyncOff: "🔒 Size lock",
+			sizeSyncOn: "🔓 Size sync",
+			sizeSyncHint: "Unlocked: resizing this panel resizes the REAL agent browser window (CDP window bounds). Click again to lock.",
+			sizePresets: "Size presets",
+			sizePresetsHint: "Set the agent browser window to a fixed aspect ratio",
+			resizeHint: "Drag to resize the agent browser window",
+			sizeApiOutdated: "Size API not loaded — restart DSH to pick up the new host build",
+			executorResident: "resident",
+			executorStarting: "resident · starting",
+			executorOneShot: "one-shot",
+			executorParked: "resident parked",
+			chromeLoginConnect: "Connect Chrome login",
+			chromeLoginReuse: "Reuse Chrome login",
+			chromeLoginWaiting: "Waiting for Chrome…",
+			chromeLoginHint: "Import cookies from your daily Chrome (extension bridge)",
+			chromeLoginNoPage: "Open the target site first",
+			chromeLoginDone: "Imported {n} cookies · {domain}",
+			chromeLoginFailed: "Import failed",
+			chromeLoginTimeout: "Chrome extension did not respond",
+			chromeLoginPairTitle: "Connect Chrome login state",
+			chromeLoginPairStep1: "1. chrome://extensions → Developer mode → Load unpacked",
+			chromeLoginPairStep2: "2. Open the extension popup and enter this pairing code:",
+			chromeLoginPairStep3: "3. Pair and keep Chrome open; afterwards one click imports the current site’s cookies.",
+			chromeLoginCopyPath: "Copy extension path",
+			chromeLoginPathHint: "Plugin folder / extension",
+			chromeLoginNewCode: "New code",
+			chromeLoginPaired: "Chrome paired — close this panel and click the button again.",
+			chromeLoginClose: "Close",
 			noUrl: "No URL to open",
 			closeTab: "Close tab",
 			newTab: "(new tab)",
@@ -254,6 +294,34 @@ window.__ModuleLoader__.load({
 				openExternal: "⧉ 打开真实页",
 				raiseWindow: "弹出窗口",
 				raiseWindowHint: "把 agent 浏览器弹出为真实窗口（无头实例会被同 Profile 的有头实例替换，标签页保留）",
+				sizeSyncOff: "🔒 锁定尺寸",
+				sizeSyncOn: "🔓 尺寸同步",
+				sizeSyncHint: "解锁后拖动面板会直接改变 agent 浏览器真实窗口大小（CDP 窗口 bounds）；再点一下锁定。",
+				sizePresets: "尺寸预设",
+				sizePresetsHint: "按固定比例设置 agent 浏览器窗口",
+				resizeHint: "拖动调整 agent 浏览器窗口大小",
+				sizeApiOutdated: "尺寸接口未就绪：请重启 DSH 以加载最新 host 构建",
+				executorResident: "常驻",
+				executorStarting: "常驻·启动中",
+				executorOneShot: "一次性",
+				executorParked: "常驻已停用",
+				chromeLoginConnect: "连接 Chrome 登录态",
+				chromeLoginReuse: "复用 Chrome 登录态",
+				chromeLoginWaiting: "等待 Chrome…",
+				chromeLoginHint: "从日常 Chrome 导入 cookie（扩展桥接）",
+				chromeLoginNoPage: "请先打开目标网站",
+				chromeLoginDone: "已导入 {n} 条 · {domain}",
+				chromeLoginFailed: "导入失败",
+				chromeLoginTimeout: "Chrome 扩展未响应",
+				chromeLoginPairTitle: "连接 Chrome 登录态",
+				chromeLoginPairStep1: "1. 打开 chrome://extensions → 开发者模式 → Load unpacked",
+				chromeLoginPairStep2: "2. 打开扩展弹窗，输入下面这组配对码：",
+				chromeLoginPairStep3: "3. 配对后保持 Chrome 运行；之后点按钮即可导入当前网站 cookie。",
+				chromeLoginCopyPath: "复制扩展路径",
+				chromeLoginPathHint: "插件目录 / extension",
+				chromeLoginNewCode: "重新生成",
+				chromeLoginPaired: "Chrome 已配对——关闭此面板再点按钮即可。",
+				chromeLoginClose: "关闭",
 				noUrl: "无可打开的地址",
 				closeTab: "关闭标签",
 				newTab: "(新标签页)",
@@ -316,6 +384,145 @@ window.__ModuleLoader__.load({
 			frameRelaySet(true);
 			return true;
 		}
+		var SIZE_SYNC_KEY = "dsh-ego:size-sync";
+		function sizeSyncStored() {
+			try {
+				return window.localStorage.getItem(SIZE_SYNC_KEY) === "1";
+			} catch (e) {
+				return false;
+			}
+		}
+		function sizeSyncStore(enabled) {
+			try {
+				window.localStorage.setItem(SIZE_SYNC_KEY, enabled ? "1" : "0");
+			} catch (e) {}
+		}
+		function createWindowSizeSync() {
+			var enabled = false;
+			var element = null;
+			var observer = null;
+			var timer = null;
+			var inFlight = false;
+			var baseWidth = 0;
+			var pointerDown = false;
+			var dragUntil = 0;
+			var lastAt = 0;
+			function onPointerDown() {
+				pointerDown = true;
+			}
+			function onPointerUp() {
+				if (!pointerDown) return;
+				pointerDown = false;
+				dragUntil = Date.now() + 350;
+				if (enabled) schedule();
+			}
+			function panelWidth() {
+				return Math.round(element && element.clientWidth || 0);
+			}
+			function send() {
+				timer = null;
+				if (!enabled || !element) return;
+				var w = panelWidth();
+				if (w < 120) return;
+				var now = Date.now();
+				if (!pointerDown && now > dragUntil) {
+					baseWidth = w;
+					return;
+				}
+				var delta = w - baseWidth;
+				if (Math.abs(delta) < 12) return;
+				if (now - lastAt < 200) {
+					schedule();
+					return;
+				}
+				if (inFlight) {
+					schedule();
+					return;
+				}
+				inFlight = true;
+				lastAt = now;
+				var sentBase = w;
+				fetch("/api/ego/window-size", {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({ delta })
+				}).then(function(r) {
+					return r.json().catch(function() {
+						return null;
+					});
+				}).then(function(parsed) {
+					if (parsed && parsed.ok === true) baseWidth = sentBase;
+				}).catch(function() {
+					return null;
+				}).finally(function() {
+					inFlight = false;
+				});
+			}
+			function schedule() {
+				if (timer !== null) return;
+				timer = setTimeout(send, 180);
+			}
+			function attach(el) {
+				element = el || null;
+				if (!enabled) return;
+				if (observer !== null) {
+					observer.disconnect();
+					observer = null;
+				}
+				if (element && typeof ResizeObserver !== "undefined") try {
+					observer = new ResizeObserver(function() {
+						if (enabled) schedule();
+					});
+					observer.observe(element);
+				} catch (e) {
+					observer = null;
+				}
+				if (baseWidth === 0) baseWidth = panelWidth();
+			}
+			function setEnabled(next) {
+				enabled = next === true;
+				sizeSyncStore(enabled);
+				if (!enabled) {
+					if (timer !== null) {
+						clearTimeout(timer);
+						timer = null;
+					}
+					if (observer !== null) {
+						observer.disconnect();
+						observer = null;
+					}
+					document.removeEventListener("pointerdown", onPointerDown, true);
+					document.removeEventListener("pointerup", onPointerUp, true);
+					return;
+				}
+				baseWidth = panelWidth();
+				lastAt = 0;
+				document.addEventListener("pointerdown", onPointerDown, true);
+				document.addEventListener("pointerup", onPointerUp, true);
+				if (element) attach(element);
+			}
+			function dispose() {
+				if (timer !== null) {
+					clearTimeout(timer);
+					timer = null;
+				}
+				if (observer !== null) {
+					observer.disconnect();
+					observer = null;
+				}
+				document.removeEventListener("pointerdown", onPointerDown, true);
+				document.removeEventListener("pointerup", onPointerUp, true);
+				element = null;
+			}
+			return {
+				isEnabled: function() {
+					return enabled;
+				},
+				setEnabled,
+				attach,
+				dispose
+			};
+		}
 		function initialSettingsState() {
 			return {
 				status: "idle",
@@ -324,13 +531,15 @@ window.__ModuleLoader__.load({
 				draft: {
 					isolateSpaces: false,
 					disableFrameRelay: false,
+					residentExecutor: false,
+					residentIdleMin: "30",
 					idleTimeoutMin: "0",
 					chromePath: "",
 					captureBackend: "auto",
 					streamProfile: "balanced",
 					cdpFps: "20",
 					cdpQuality: "55",
-					cdpMaxWidth: "960",
+					cdpMaxWidth: "1280",
 					cdpBackstopIntervalMs: "3000",
 					ffmpegFps: "20",
 					ffmpegMaxWidth: "1280",
@@ -402,12 +611,14 @@ window.__ModuleLoader__.load({
 						isolateSpaces: config.isolateSpaces === true || config.isolateSpaces === "true" || config.isolateSpaces === 1 || config.isolateSpaces === "1",
 						idleTimeoutMin: String(config.idleTimeoutMin ?? 0),
 						disableFrameRelay: config.disableFrameRelay === true || config.disableFrameRelay === "true" || config.disableFrameRelay === 1 || config.disableFrameRelay === "1",
+						residentExecutor: config.residentExecutor === true || config.residentExecutor === "true" || config.residentExecutor === 1 || config.residentExecutor === "1",
+						residentIdleMin: String(config.residentIdleMin ?? 30),
 						chromePath: config.chromePath || "",
 						captureBackend: config.captureBackend === "ffmpeg" && !ffmpegStatus.canSelectFfmpeg ? "cdp" : config.captureBackend || "auto",
 						streamProfile: config.streamProfile || "balanced",
 						cdpFps: String(config.cdpFps ?? 20),
 						cdpQuality: String(config.cdpQuality ?? 55),
-						cdpMaxWidth: String(config.cdpMaxWidth ?? 960),
+						cdpMaxWidth: String(config.cdpMaxWidth ?? 1280),
 						cdpBackstopIntervalMs: String(config.cdpBackstopIntervalMs ?? 3e3),
 						ffmpegFps: String(config.ffmpegFps ?? 20),
 						ffmpegMaxWidth: String(config.ffmpegMaxWidth ?? 1280),
@@ -515,6 +726,11 @@ window.__ModuleLoader__.load({
 					max: 1440,
 					def: 0
 				},
+				residentIdleMin: {
+					min: 0,
+					max: 1440,
+					def: 30
+				},
 				cdpFps: {
 					min: 5,
 					max: 30,
@@ -528,7 +744,7 @@ window.__ModuleLoader__.load({
 				cdpMaxWidth: {
 					min: 320,
 					max: 1920,
-					def: 960
+					def: 1280
 				},
 				cdpBackstopIntervalMs: {
 					min: 1e3,
@@ -599,12 +815,14 @@ window.__ModuleLoader__.load({
 						isolateSpaces: config.isolateSpaces === true || config.isolateSpaces === "true" || config.isolateSpaces === 1 || config.isolateSpaces === "1",
 						idleTimeoutMin: String(config.idleTimeoutMin ?? 0),
 						disableFrameRelay: config.disableFrameRelay === true || config.disableFrameRelay === "true" || config.disableFrameRelay === 1 || config.disableFrameRelay === "1",
+						residentExecutor: config.residentExecutor === true || config.residentExecutor === "true" || config.residentExecutor === 1 || config.residentExecutor === "1",
+						residentIdleMin: String(config.residentIdleMin ?? 30),
 						chromePath: config.chromePath || "",
 						captureBackend: config.captureBackend === "ffmpeg" && ffmpegStatus && !ffmpegStatus.canSelectFfmpeg ? "cdp" : config.captureBackend || "auto",
 						streamProfile: config.streamProfile || "balanced",
 						cdpFps: String(config.cdpFps ?? 20),
 						cdpQuality: String(config.cdpQuality ?? 55),
-						cdpMaxWidth: String(config.cdpMaxWidth ?? 960),
+						cdpMaxWidth: String(config.cdpMaxWidth ?? 1280),
 						cdpBackstopIntervalMs: String(config.cdpBackstopIntervalMs ?? 3e3),
 						ffmpegFps: String(config.ffmpegFps ?? 20),
 						ffmpegMaxWidth: String(config.ffmpegMaxWidth ?? 1280),
@@ -910,6 +1128,37 @@ window.__ModuleLoader__.load({
 					disabled: busy,
 					onEdit: function(v) {
 						controller.edit("disableFrameRelay", v === "true");
+					}
+				}), h(SettingsField, {
+					id: "plugin-config-ego-browser-residentexecutor",
+					label: t("residentExecutor"),
+					hint: t("residentExecutorHint"),
+					value: state.draft.residentExecutor ? "true" : "false",
+					options: [{
+						value: "false",
+						label: t("residentExecutorOff")
+					}, {
+						value: "true",
+						label: t("residentExecutorOn")
+					}],
+					disabled: busy,
+					onEdit: function(v) {
+						controller.edit("residentExecutor", v === "true");
+					}
+				}), h(SettingsField, {
+					id: "plugin-config-ego-browser-residentidle",
+					label: t("residentIdleMin"),
+					hint: t("residentIdleMinHint"),
+					value: state.draft.residentIdleMin,
+					numeric: true,
+					narrow: true,
+					unit: t("minUnit"),
+					min: 0,
+					max: 1440,
+					step: 1,
+					disabled: busy,
+					onEdit: function(v) {
+						controller.edit("residentIdleMin", v);
 					}
 				}), h(SettingsField, {
 					id: "plugin-config-ego-browser-idletimeout",
@@ -1698,224 +1947,16 @@ window.__ModuleLoader__.load({
 				} catch (e) {}
 			};
 		}
-		const OPEN_KEY = "dsh.ego.watch.open";
 		const ACTIVE_WINDOW_MS = 3e3;
-		const PANEL_CSS = `
-/* ---- deep Apple / macOS dark-glass chrome ---- */
-:root { --ego-ios-gap: 6px; }
-
-#dsh-ego-fab {
-  position: fixed; left: 0; top: 0; z-index: 9999;
-  width: 48px; height: 48px; border-radius: 50%;
-  border: 1px solid rgba(255,255,255,.14);
-  background: rgba(30,30,32,.72);
-  -webkit-backdrop-filter: blur(22px) saturate(180%);
-  backdrop-filter: blur(22px) saturate(180%);
-  color: #f5f5f7; cursor: grab;
-  touch-action: none; user-select: none; -webkit-user-select: none;
-  box-shadow: 0 10px 30px rgba(0,0,0,.45);
-  display: flex; align-items: center; justify-content: center;
-}
-#dsh-ego-fab.dsh-ego-dragging { cursor: grabbing; opacity:.85; }
-#dsh-ego-fab:hover { transform: scale(1.09); }
-#dsh-ego-fab[hidden] { display: none; }
-#dsh-ego-fab .dsh-ego-dot {
-  position: absolute; top: 1px; right: 1px; width: 11px; height: 11px;
-  border-radius: 50%; background: #86868b;
-  border: 2px solid rgba(30,30,32,.9);
-}
-#dsh-ego-fab svg { width: 22px; height: 22px; }
-/* FAB status dot: steady green while the agent is driving the browser
-   (busy), breathing green when idle (browser open, no recent action). */
-#dsh-ego-fab.dsh-ego-live:not(.dsh-ego-busy) .dsh-ego-dot {
-  background: #30d158; box-shadow: 0 0 8px #30d158aa;
-  animation: dsh-ego-breathe 2.4s ease-in-out infinite;
-}
-#dsh-ego-fab.dsh-ego-busy .dsh-ego-dot {
-  background: #30d158; box-shadow: 0 0 9px #30d158cc; animation: none;
-}
-@keyframes dsh-ego-breathe {
-  0%, 100% { box-shadow: 0 0 2px #30d15822; opacity: .5; }
-  50%      { box-shadow: 0 0 11px #30d158ee; opacity: 1; }
-}
-
-#dsh-ego-panel {
-  position: fixed; left: 0; top: 0; z-index: 9998;
-  width: 408px; max-height: 78vh;
-  display: flex; flex-direction: column; overflow: hidden;
-  border: 1px solid rgba(255,255,255,.12);
-  border-radius: 16px;
-  background: rgba(28,28,30,.74);
-  -webkit-backdrop-filter: blur(26px) saturate(180%);
-  backdrop-filter: blur(26px) saturate(180%);
-  color: #f5f5f7;
-  box-shadow: 0 14px 44px rgba(0,0,0,.55), inset 0 1px 0 rgba(255,255,255,.08);
-  /* Pop-out animation: the panel springs up-left out of the ball's spot.
-     transform-origin sits near its bottom-right (closest to the FAB). */
-  opacity: 0; pointer-events: none;
-  transform-origin: 82% 100%;
-  transform: translateY(12px) scale(.88);
-  transition: opacity .26s cubic-bezier(.16,.8,.3,1.05),
-              transform .26s cubic-bezier(.16,.8,.3,1.15),
-              visibility .26s;
-  will-change: transform, opacity;
-}
-#dsh-ego-panel.dsh-ego-panel-open { opacity: 1; pointer-events: auto; transform: none; }
-#dsh-ego-panel[hidden] { display: none; }
-#dsh-ego-panel.open-drawer { width: 640px; }
-
-/* FAB press / open feedback */
-#dsh-ego-fab:active { transform: scale(.95); }
-#dsh-ego-fab.dsh-ego-on { transform: scale(1.12); box-shadow: 0 0 0 6px rgba(10,132,255,.22), 0 10px 30px rgba(0,0,0,.5); }
-#dsh-ego-fab.dsh-ego-on:hover { transform: scale(1.18); }
-
-/* Drag handles for the panel: its header doubles as a title-bar grip. */
-#dsh-ego-head { cursor: grab; }
-#dsh-ego-head.dsh-ego-grabbing { cursor: grabbing; }
-#dsh-ego-head .dsh-ego-grip {
-  flex: none; width: 22px; height: 22px; border-radius: 6px;
-  display: inline-flex; align-items: center; justify-content: center;
-  color:#86868b; opacity:.8;
-}
-#dsh-ego-head .dsh-ego-grip svg { width: 13px; height: 13px; }
-
-#dsh-ego-head { display:flex; align-items:center; gap:4px; padding:10px 14px;
-  border-bottom:1px solid rgba(255,255,255,.08); }
-#dsh-ego-title { flex:1; font-size:13px; font-weight:600; letter-spacing:.2px;
-  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; display:flex; align-items:center; gap:6px; }
-#dsh-ego-title svg { width:16px; height:16px; color:#0a84ff; flex-shrink:0; }
-#dsh-ego-iconbtn {
-  background: transparent; border:none; color: #aeaeb2; cursor: pointer;
-  width: 28px; height: 28px; border-radius: 8px; padding: 0;
-  display:flex; align-items:center; justify-content:center;
-  transition: background .15s ease, color .15s ease;
-}
-#dsh-ego-iconbtn svg { width: 15px; height: 15px; }
-#dsh-ego-iconbtn:hover { background: rgba(255,255,255,.12); color: #f5f5f7; }
-#dsh-ego-iconbtn.off { opacity:.5; }
-#dsh-ego-iconbtn.spinning svg { animation: dsh-ego-spin .7s linear infinite; }
-@keyframes dsh-ego-spin { to { transform: rotate(360deg); } }
-
-#dsh-ego-body { flex:1; overflow-y:auto; padding:12px 14px; min-height:60px; }
-.dsh-ego-empty { padding:20px 12px; text-align:center; color:#86868b; font-size:12.5px; line-height:1.7; }
-.dsh-ego-off { padding:6px 14px 10px; text-align:center; font-size:11px; color:#6e6e73; }
-.dsh-ego-off svg { width:11px; height:11px; vertical-align:-1px; color:#6e6e73; }
-
-/* ---- login guide strip (top of the panel body) ---- */
-#dsh-ego-login { display:none; align-items:center; gap:8px; margin:0 14px 9px; padding:7px 10px;
-  border-radius:9px; border:1px solid rgba(255,214,10,.28); background: rgba(255,214,10,.09); }
-#dsh-ego-login.show { display:flex; }
-#dsh-ego-login .dsh-ego-login-txt { flex:1; min-width:0; font-size:11px; line-height:1.45; color:#f5f5f7; }
-#dsh-ego-login .dsh-ego-login-txt b { color:#ffd60a; }
-#dsh-ego-login .dsh-ego-login-btn { flex:none; background:#0a84ff; color:#fff; border:none; border-radius:8px;
-  font-size:11px; padding:4px 10px; cursor:pointer; white-space:nowrap; transition: background .15s ease; }
-#dsh-ego-login .dsh-ego-login-btn:hover { background:#338cff; }
-#dsh-ego-login .dsh-ego-login-btn.saving { opacity:.55; pointer-events:none; }
-#dsh-ego-login .dsh-ego-login-note { flex:none; font-size:10.5px; color:#6e6e73; white-space:nowrap; }
-/* dismiss (×) on guide strips so the user can close them and reclaim the space */
-.dsh-ego-dismiss { flex:none; width:18px; height:18px; line-height:1; border-radius:50%; border:none;
-  background: rgba(255,255,255,.12); color:inherit; font-size:13px; cursor:pointer; opacity:.75;
-  display:inline-flex; align-items:center; justify-content:center; padding:0; transition: background .15s,opacity .15s; }
-.dsh-ego-dismiss:hover { background: rgba(255,69,58,.35); opacity:1; }
-#dsh-ego-login .dsh-ego-dismiss { color:#ffd60a; }
-#dsh-ego-captcha .dsh-ego-dismiss { color:#ffd8d5; }
-
-/* ---- human-verification (CAPTCHA) reminder strip ---- */
-#dsh-ego-captcha { display:none; align-items:center; gap:8px; margin:0 14px 9px; padding:8px 11px;
-  border-radius:9px; border:1px solid rgba(255,69,58,.4); background: rgba(255,69,58,.13); color:#ffe1de; }
-#dsh-ego-captcha.show { display:flex; }
-#dsh-ego-captcha .dsh-ego-captcha-txt { flex:1; min-width:0; font-size:11.5px; line-height:1.5; }
-#dsh-ego-captcha .dsh-ego-captcha-txt b { color:#ff6961; }
-#dsh-ego-captcha .dsh-ego-captcha-kind { flex:none; font-size:10px; padding:2px 8px; border-radius:999px;
-  background: rgba(255,255,255,.12); color:#ffd8d5; text-transform:uppercase; letter-spacing:.4px; }
-
-/* ---- tab bar: frosted pills ---- */
-#dsh-ego-tabs { display:flex; gap:6px; padding:9px 12px;
-  border-bottom:1px solid rgba(255,255,255,.08); overflow-x:auto; flex-shrink:0; scrollbar-width:thin; }
-#dsh-ego-tabs:empty { display:none; }
-.dsh-ego-tab {
-  display:inline-flex; align-items:center; gap:6px; max-width:176px; white-space:nowrap;
-  padding:5px 12px; border-radius: 999px; cursor:pointer; font-size:11.5px; flex-shrink:0;
-  border:1px solid rgba(255,255,255,.1);
-  background: rgba(72,72,74,.45); color:#aeaeb2;
-  transition: background .15s ease, color .15s ease, border-color .15s ease;
-}
-.dsh-ego-tab > .dsh-ego-tabtxt { overflow:hidden; text-overflow:ellipsis; }
-.dsh-ego-tab:hover { color:#f5f5f7; background: rgba(72,72,74,.65); }
-.dsh-ego-tab.active {
-  background: #0a84ff; color:#fff; border-color: transparent;
-  box-shadow: 0 2px 10px rgba(10,132,255,.35);
-}
-.dsh-ego-tab .dsh-ego-tabdot { width:7px; height:7px; border-radius:50%; background:#86868b; flex-shrink:0; }
-.dsh-ego-tab.active .dsh-ego-tabdot { background:#fff; }
-.dsh-ego-tab .dsh-ego-tabclose { flex-shrink:0; width:14px; height:14px; line-height:13px; text-align:center;
-  border-radius:50%; font-size:12px; color:#86868b; margin-left:2px; }
-.dsh-ego-tab .dsh-ego-tabclose:hover { background:rgba(255,255,255,.2); color:#ff453a; }
-.dsh-ego-tab.active .dsh-ego-tabclose { color:rgba(255,255,255,.85); }
-.dsh-ego-tab.active .dsh-ego-tabclose:hover { color:#ff453a; background:rgba(255,255,255,.25); }
-
-/* ---- main live view ---- */
-.dsh-ego-liveview { display:flex; flex-direction:column; gap:9px; min-height:60px;
-  overflow:hidden; /* clips the zoomed image so it doesn't bleed outside */ }
-.dsh-ego-livebadge { font-size:11px; color:#86868b; letter-spacing:.3px;
-  display:flex; align-items:center; gap:6px; }
-.dsh-ego-state-dot { display:inline-block; width:8px; height:8px; border-radius:50%;
-  background:#30d158; box-shadow:0 0 6px #30d15888; flex-shrink:0;
-  animation: dsh-ego-breathe 2.4s ease-in-out infinite; }
-.dsh-ego-state-dot.busy { background:#30d158; box-shadow:0 0 7px #30d158bb; animation:none; }
-.dsh-ego-state-dot.pin { background:#0a84ff; box-shadow:0 0 6px #0a84ff88; animation:none; }
-.dsh-ego-back {
-  background: rgba(255,255,255,.12); color:#f5f5f7;
-  border:1px solid rgba(255,255,255,.12); border-radius:7px;
-  cursor:pointer; font-size:11px; padding:3px 9px;
-  display:inline-flex; align-items:center; gap:4px;
-  transition: background .15s ease;
-}
-.dsh-ego-back:hover { background: rgba(255,255,255,.2); }
-.dsh-ego-liveimg {
-  width:100%; border-radius:11px; display:block;
-  max-height:50vh; object-fit:contain;
-  border:1px solid rgba(255,255,255,.14);
-  background:#000; /* letterbox behind landscape jpeg */
-  box-shadow: 0 4px 16px rgba(0,0,0,.35);
-  user-select:none; -webkit-user-select:none; touch-action:none;
-  will-change:transform; cursor:grab;
-}
-.dsh-ego-zoomhint { font-size:10.5px; color:#6e6e73; letter-spacing:.2px; margin-top:-3px; }
-.dsh-ego-livetitle { font-size:13px; font-weight:600; }
-.dsh-ego-liveurl { font-size:11.5px; color:#86868b; word-break:break-all; }
-.dsh-ego-liveurl.dsh-ego-hint { color:#75c2ff; font-style:italic; font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; text-shadow:0 0 6px rgba(117,194,255,.4); }
-.dsh-ego-hint { animation: dsh-ego-hint-in .2s ease; }
-@keyframes dsh-ego-hint-in { from { opacity:.3 } to { opacity:1 } }
-
-/* ---- history drawer ---- */
-#dsh-ego-history { display:none; flex-direction:column; width:224px; flex-shrink:0;
-  border-left:1px solid rgba(255,255,255,.08); background: rgba(0,0,0,.18); }
-#dsh-ego-history.open { display:flex; }
-#dsh-ego-historyhead { padding:9px 12px; font-size:12px; font-weight:600; color:#86868b;
-  display:flex; align-items:center; gap:6px;
-  border-bottom:1px solid rgba(255,255,255,.06); }
-#dsh-ego-historyhead svg { width:12px; height:12px; }
-#dsh-ego-historylist { overflow-y:auto; padding:7px; }
-.dsh-ego-hitem { display:flex; gap:8px; align-items:center; padding:6px; border-radius:9px; cursor:pointer;
-  transition: background .15s ease; }
-.dsh-ego-hitem:hover { background: rgba(255,255,255,.1); }
-.dsh-ego-hthumb { width:58px; height:42px; border-radius:6px; object-fit:cover; background:#000;
-  flex-shrink:0; border:1px solid rgba(255,255,255,.14); }
-.dsh-ego-hinfo { min-width:0; }
-.dsh-ego-hurl { font-size:10.5px; color:#86868b; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.dsh-ego-htitle { font-size:10.5px; font-weight:500; color:#f5f5f7; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.dsh-ego-hactive { color:#30d158; font-size:10.5px; }
-.dsh-ego-hnone { padding:16px 8px; text-align:center; font-size:11px; color:#6e6e73; }
-
-#dsh-ego-cols { display:flex; flex:1; min-height:0; }
-.dsh-ego-maincol { flex:1; min-width:0; display:flex; flex-direction:column; }
-`;
-		const ICON_GLOBE = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 3c2.5 2.4 3.8 5.4 3.8 9S14.5 18.6 12 21"/><path d="M12 3C9.5 5.4 8.2 8.4 8.2 12s1.3 6.6 3.8 9"/><path d="M3 12h18"/></svg>`;
+		const ICON_AGENT_BROWSER = `<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><rect x="1.2" y="2.4" width="13.6" height="11.2" rx="2.4" stroke="currentColor" stroke-width="1.2"/><path d="M1.4 5.9h13.2" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/><circle cx="3.7" cy="4.15" r="0.6" fill="currentColor"/><circle cx="5.5" cy="4.15" r="0.6" fill="currentColor"/><path d="M8.2 7.0L12.6 10.6L10.6 10.9L11.7 13.2L10.6 13.8L9.5 11.5L8.0 13.1Z" fill="currentColor"/></svg>`;
 		const ICON_REFRESH = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-2.5-5.8"/><path d="M20 4.5V9h-4.5"/></svg>`;
 		const ICON_CLOCK = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7.5V12l3 2"/></svg>`;
-		const ICON_CLOSE = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>`;
-		const ICON_GRIP = `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><circle cx="8" cy="6" r="1.8"/><circle cx="16" cy="6" r="1.8"/><circle cx="8" cy="12" r="1.8"/><circle cx="16" cy="12" r="1.8"/><circle cx="8" cy="18" r="1.8"/><circle cx="16" cy="18" r="1.8"/></svg>`;
+		const ICON_OPEN_EXTERNAL = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6"/><path d="M20 4l-9 9"/><path d="M18 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4"/></svg>`;
+		const ICON_POPOUT = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="14" height="12" rx="2.2"/><path d="M9 21h12V9"/><path d="M9 15l6-6"/></svg>`;
+		const ICON_LOCK = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="10" width="14" height="10" rx="2.2"/><path d="M8 10V8a4 4 0 0 1 8 0v2"/></svg>`;
+		const ICON_UNLOCK = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="10" width="14" height="10" rx="2.2"/><path d="M8 10V8a4 4 0 0 1 7.6-1.8"/></svg>`;
+		const ICON_ASPECT = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2.2"/><path d="M3 10h18"/><path d="M8 5v5"/></svg>`;
+		const ICON_KEY = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="3.2"/><path d="M10.3 12.7L20 3"/><path d="M17 6l2 2"/><path d="M14.5 8.5l2 2"/></svg>`;
 		function apply(ctx) {
 			ctx.effect(() => ctx.locale.register(SETTINGS_NS, {
 				zh,
@@ -1976,1108 +2017,50 @@ window.__ModuleLoader__.load({
 					}
 				}, EgoBrowserCard);
 			});
-			var betterSidebarService;
-			try {
-				betterSidebarService = typeof ctx.get === "function" ? ctx.get("betterSidebar") : void 0;
-			} catch (e) {
-				betterSidebarService = void 0;
-			}
-			if (betterSidebarService !== void 0) ctx.effect(() => mountSidebarTab(ctx, betterSidebarService), "ego-browser sidebar tab");
-			else {
-				var disposeFloating = null;
-				ctx.effect(() => {
-					disposeFloating = mountFloatingWatch(ctx);
-					return function() {
-						if (disposeFloating) {
-							var d = disposeFloating;
-							disposeFloating = null;
-							d();
-						}
-					};
-				}, "ego-browser watch panel");
-				if (typeof ctx.inject === "function") ctx.inject(["betterSidebar"], function(sidebarCtx) {
-					var svc;
-					try {
-						svc = typeof sidebarCtx.get === "function" ? sidebarCtx.get("betterSidebar") : sidebarCtx.betterSidebar;
-					} catch (e) {
-						svc = void 0;
-					}
-					if (!svc) return;
-					if (disposeFloating) {
-						var d2 = disposeFloating;
-						disposeFloating = null;
-						d2();
-					}
-					sidebarCtx.effect(function() {
-						return mountSidebarTab(sidebarCtx, svc);
-					}, "ego-browser sidebar tab");
-				});
-			}
-		}
-		function mountFloatingWatch(ctx) {
-			if (document.getElementById("dsh-ego-fab") !== null) return () => {};
-			const style = document.createElement("style");
-			style.textContent = PANEL_CSS;
-			document.head.appendChild(style);
-			const panel = document.createElement("div");
-			panel.id = "dsh-ego-panel";
-			panel.hidden = true;
-			panel.innerHTML = `
-					<div id="dsh-ego-head">
-						<span class="dsh-ego-grip" title="${wt("dragHint")}">${ICON_GRIP}</span>
-						<span id="dsh-ego-title">${ICON_GLOBE}<span style="margin-left:6px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${wt("title")}</span></span>
-						<button id="dsh-ego-refresh" class="dsh-ego-iconbtn" title="${wt("refresh")}">${ICON_REFRESH}</button>
-						<button id="dsh-ego-historybtn" class="dsh-ego-iconbtn off" title="${wt("historyShow")}">${ICON_CLOCK}</button>
-						<button id="dsh-ego-close" class="dsh-ego-iconbtn" title="${wt("settingsHide")}">${ICON_CLOSE}</button>
-					</div>
-					<div id="dsh-ego-tabs"></div>
-					<div id="dsh-ego-login">
-						<span class="dsh-ego-login-txt">${wt("loginTitle")}</span>
-						<button id="dsh-ego-login-btn" class="dsh-ego-login-btn" type="button">${wt("loginBtn")}</button>
-						<span class="dsh-ego-login-note" id="dsh-ego-login-note"></span>
-						<button class="dsh-ego-dismiss" type="button" title="${wt("loginDismiss")}" data-dismiss="login">×</button>
-					</div>
-					<div id="dsh-ego-captcha">
-						<span class="dsh-ego-captcha-txt"><b>${wt("captchaTitle")}</b> — ${wt("captchaHint")}</span>
-						<span class="dsh-ego-captcha-kind" id="dsh-ego-captcha-kind"></span>
-						<button class="dsh-ego-dismiss" type="button" title="${wt("captchaDismiss")}" data-dismiss="captcha">×</button>
-					</div>
-					<div id="dsh-ego-cols">
-						<div class="dsh-ego-maincol">
-							<div id="dsh-ego-body"></div>
-						</div>
-						<aside id="dsh-ego-history">
-							<div id="dsh-ego-historyhead">${ICON_CLOCK} ${wt("history")}</div>
-							<div id="dsh-ego-historylist"></div>
-						</aside>
-					</div>
-					<div class="dsh-ego-off">${wt("liveView")} · ${wt("realtime")} · ${ICON_CLOCK} ${wt("historyShow")}</div>
-				`;
-			const fab = document.createElement("button");
-			fab.id = "dsh-ego-fab";
-			fab.type = "button";
-			fab.title = wt("fabTitle");
-			fab.textContent = "";
-			fab.innerHTML = `${ICON_GLOBE}<span class="dsh-ego-dot"></span>`;
-			const body = panel.querySelector("#dsh-ego-body");
-			const titleEl = panel.querySelector("#dsh-ego-title");
-			const refreshBtn = panel.querySelector("#dsh-ego-refresh");
-			const closeBtn = panel.querySelector("#dsh-ego-close");
-			const historyBtn = panel.querySelector("#dsh-ego-historybtn");
-			const historyEl = panel.querySelector("#dsh-ego-history");
-			const historyList = panel.querySelector("#dsh-ego-historylist");
-			const tabsEl = panel.querySelector("#dsh-ego-tabs");
-			const loginEl = panel.querySelector("#dsh-ego-login");
-			const loginBtn = panel.querySelector("#dsh-ego-login-btn");
-			const loginNote = panel.querySelector("#dsh-ego-login-note");
-			const captchaEl = panel.querySelector("#dsh-ego-captcha");
-			const captchaKindEl = panel.querySelector("#dsh-ego-captcha-kind");
-			const FLUSH_ROUTE = "/api/ego/flush";
-			const dismissedGuides = {
-				login: false,
-				captcha: false
-			};
-			const bindGuideDismiss = (which, el) => {
-				const btn = el && el.querySelector("[data-dismiss=\"" + which + "\"]");
-				if (!btn) return;
-				btn.addEventListener("click", () => {
-					dismissedGuides[which] = true;
-					el.classList.remove("show");
-				});
-			};
-			bindGuideDismiss("login", loginEl);
-			bindGuideDismiss("captcha", captchaEl);
-			const setTitle = (text) => {
-				const label = titleEl.querySelector("span:last-child");
-				if (label) label.textContent = text;
-			};
-			const renderRelayDisabled = () => {
-				if (disposed) return;
-				setTitle(wt("title"));
-				body.innerHTML = "<div class=\"dsh-ego-empty\">" + escapeHtml(wt("relayDisabledTitle")) + "<br><span style=\"font-size:11px;\">" + escapeHtml(wt("relayDisabledBody")) + "</span></div>";
-				liveCount = 0;
-				fab.classList.remove("dsh-ego-live", "dsh-ego-busy");
-			};
-			const teardownRelay = () => {
+			var getOptionalService = function(name) {
 				try {
-					if (sse) sse.close();
-				} catch (e) {}
-				sse = null;
-				doConnected = false;
-				stopVideo();
-				stopWatch(false);
-				captureBackend = "cdp";
-				streamGeneration = 0;
-				streamState = "idle";
-				streamMessage = "";
-				pageMeta.clear();
-				frameCache.clear();
-				lastList = [];
-			};
-			let disposed = false;
-			let liveCount = 0;
-			let historyOpen = false;
-			let lastList = [];
-			const setHistory = (open) => {
-				historyOpen = open;
-				historyEl.classList.toggle("open", open);
-				panel.classList.toggle("open-drawer", open);
-				historyBtn.classList.toggle("off", !open);
-				historyBtn.title = open ? wt("historyHide") : wt("historyShow");
-				if (open) renderHistory(lastList);
-			};
-			const renderHistory = (spaces) => {
-				historyList.innerHTML = "";
-				const list = Array.isArray(spaces) ? [...spaces].sort((a, b) => (a.lastActive ?? 0) - (b.lastActive ?? 0)) : [];
-				if (list.length === 0) {
-					historyList.innerHTML = `<div class="dsh-ego-hnone">${wt("noHistory")}</div>`;
+					return typeof ctx.get === "function" ? ctx.get(name) : void 0;
+				} catch (e) {
 					return;
 				}
-				for (const s of list) {
-					const item = document.createElement("div");
-					item.className = "dsh-ego-hitem";
-					const thumbSrc = frameCache.get(s.targetId);
-					const thumb = thumbSrc ? `<img class="dsh-ego-hthumb" src="${thumbSrc}" alt="">` : `<div class="dsh-ego-hthumb"></div>`;
-					const active = s.targetId === currentActiveId;
-					item.innerHTML = `${thumb}
-							<div class="dsh-ego-hinfo">
-								<div class="dsh-ego-htitle">${escapeHtml(s.title || s.url || wt("newTab"))}</div>
-								<div class="dsh-ego-hurl">${escapeHtml(s.url || "(about:blank)")}</div>
-								${active ? "<div class=\"dsh-ego-hactive\">● " + wt("current") + "</div>" : ""}
-							</div>`;
-					item.addEventListener("click", () => openPreview(s));
-					historyList.appendChild(item);
-				}
 			};
-			let pinned = null;
-			let currentActiveId = null;
-			let agentActiveId = null;
-			let selectedTabId = null;
-			let zoomState = {
-				scale: 1,
-				tx: 0,
-				ty: 0
-			};
-			const frameCache = /* @__PURE__ */ new Map();
-			let liveImg = null;
-			let liveImgTargetId = null;
-			let pendingLiveFrame = null;
-			let liveFlushRaf = null;
-			const pageMeta = /* @__PURE__ */ new Map();
-			const watchClientId = "floating-" + Math.random().toString(36).slice(2);
-			let watchStarted = false, watchTargetId = null, watchRenewTimer = null, watchStopTimer = null, watchRequest = null;
-			let captureBackend = "cdp", streamGeneration = 0, streamState = "idle", streamMessage = "", streamMime = "video/mp4; codecs=\"avc1.42E01E\"", videoCleanup = null;
-			const effectiveVisible = () => !panel.hidden;
-			const stopVideo = () => {
-				if (videoCleanup) try {
-					videoCleanup();
-				} catch {}
-				videoCleanup = null;
-			};
-			const applyCaptureStatus = (status) => {
-				if (!status || typeof status !== "object") return;
-				if (Number.isFinite(status.generation) && status.generation < streamGeneration) return;
-				if (status.generation === streamGeneration && streamState === "streaming" && status.state === "starting") return;
-				const nextBackend = status.backend || captureBackend;
-				const nextGeneration = status.generation ?? streamGeneration;
-				const nextState = status.state || streamState;
-				const nextMime = status.mime || streamMime;
-				const changed = captureBackend !== nextBackend || streamGeneration !== nextGeneration || streamState !== nextState || streamMime !== nextMime;
-				captureBackend = nextBackend;
-				streamGeneration = nextGeneration;
-				streamState = nextState;
-				status.message || status.code;
-				streamMime = nextMime;
-				if (changed) {
-					stopVideo();
-					const current = lastList.find((s) => s.targetId === (selectedTabId || currentActiveId));
-					if (current) renderLiveMain(current, selectedTabId !== null);
-				}
-			};
-			const requestWatch = (route, body) => {
-				if (watchRequest) return null;
-				watchRequest = postJson(route, body).finally(() => {
-					watchRequest = null;
-				});
-				return watchRequest;
-			};
-			const syncWatch = (targetId) => {
-				if (disposed || !effectiveVisible() || !targetId) return;
-				if (watchStopTimer) {
-					window.clearTimeout(watchStopTimer);
-					watchStopTimer = null;
-				}
-				if (watchStarted && watchTargetId === targetId) return;
-				const request = requestWatch(watchStarted ? WATCH_SWITCH_ROUTE : WATCH_START_ROUTE, {
-					clientId: watchClientId,
-					targetId
-				});
-				if (!request) {
-					watchRequest.finally(() => syncWatch(targetId));
-					return;
-				}
-				request.then((status) => {
-					watchStarted = status && status.ok !== false;
-					watchTargetId = status?.targetId || targetId;
-					if (watchTargetId !== targetId) {
-						selectedTabId = null;
-						currentActiveId = watchTargetId;
-					}
-					applyCaptureStatus(status);
-					if (!effectiveVisible()) stopWatch(true);
-				}).catch(() => {});
-				if (!watchRenewTimer) watchRenewTimer = window.setInterval(() => {
-					if (effectiveVisible() && watchTargetId) {
-						const renewal = requestWatch(WATCH_START_ROUTE, {
-							clientId: watchClientId,
-							targetId: watchTargetId
-						});
-						if (renewal) renewal.then(applyCaptureStatus).catch(() => {});
-					}
-				}, 5e3);
-			};
-			const stopWatch = (immediate) => {
-				if (watchRenewTimer) {
-					window.clearInterval(watchRenewTimer);
-					watchRenewTimer = null;
-				}
-				const stop = () => {
-					watchStopTimer = null;
-					watchStarted = false;
-					watchTargetId = null;
-					postJson(WATCH_STOP_ROUTE, { clientId: watchClientId }).catch(() => {});
-				};
-				if (immediate) stop();
-				else {
-					if (watchStopTimer) window.clearTimeout(watchStopTimer);
-					watchStopTimer = window.setTimeout(stop, 1500);
-				}
-			};
-			const INPUT_ROUTE = "/api/ego/input";
-			let inputBusy = false;
-			/**
-			* Send a pointer/wheel intention to the agent browser. Coordinates
-			* are already in browser CSS pixels; the worker turns them into CDP
-			* Input.dispatchMouseEvent on the page the panel is showing.
-			* `type`: mouseMoved | mousePressed | mouseReleased | mouseWheel.
-			*/
-			const sendInput = (targetId, type, params) => {
-				if (!!!targetId || type !== "mouseReleased" && type !== "keyUp" && !effectiveVisible()) return;
-				if (inputBusy && type === "mouseMoved") return;
-				if (type === "mouseMoved") {
-					inputBusy = true;
-					window.setTimeout(() => {
-						inputBusy = false;
-					}, 24);
-				}
-				fetch(INPUT_ROUTE, {
-					method: "POST",
-					headers: { "content-type": "application/json" },
-					body: JSON.stringify({
-						targetId,
-						type,
-						...params
-					})
-				}).then((res) => {
-					if (res.status === 409) {
-						liveImgTargetId = null;
-						refresh();
-					}
-				}).catch(() => {});
-			};
-			const keyboardProxy = createKeyboardProxy((targetId, type, params) => sendInput(targetId, type, params));
-			/**
-			* Map an event's client coords to the agent page's CSS pixels.
-			*
-			* The shown <img> is the screencast frame laid out with
-			* object-fit:contain, so the page fills a centered letterboxed box
-			* inside the element. We find that box from the image's natural
-			* (frame) size vs its rendered box, then scale into the page's CSS
-			* viewport (vw/vh), which the worker attaches to each frame.
-			*/
-			const browserXY = (e) => {
-				if (liveImgTargetId == null) return null;
-				const m = pageMeta.get(liveImgTargetId);
-				const vw = m?.vw, vh = m?.vh;
-				if (!Number.isFinite(vw) || !Number.isFinite(vh)) return null;
-				const img = liveImg;
-				if (!img) return null;
-				const rect = img.getBoundingClientRect();
-				const natW = img.naturalWidth || img.videoWidth || rect.width;
-				const natH = img.naturalHeight || img.videoHeight || rect.height;
-				if (!natW || !natH) return null;
-				const scale = Math.min(rect.width / natW, rect.height / natH);
-				const contentW = natW * scale;
-				const contentH = natH * scale;
-				const ox = (rect.width - contentW) / 2;
-				const oy = (rect.height - contentH) / 2;
-				const rx = e.clientX - rect.left - ox;
-				const ry = e.clientY - rect.top - oy;
-				return {
-					x: rx / contentW * vw,
-					y: ry / contentH * vh
-				};
-			};
-			const makeZoomImage = (urlEl, tagName = "img") => {
-				const img = document.createElement(tagName);
-				img.className = "dsh-ego-liveimg";
-				if (tagName === "img") img.draggable = false;
-				else {
-					img.muted = true;
-					img.autoplay = true;
-					img.playsInline = true;
-				}
-				img.title = "滚轮缩放 · 按住拖动平移 · 缩小到最小或双击复位";
-				const realText = urlEl ? urlEl.textContent : "";
-				let hintTimer = null;
-				const clearHint = () => {
-					if (hintTimer) {
-						window.clearTimeout(hintTimer);
-						hintTimer = null;
-					}
-				};
-				const showHint = (txt) => {
-					if (!urlEl) return;
-					urlEl.textContent = txt;
-					urlEl.classList.add("dsh-ego-hint");
-					clearHint();
-					hintTimer = window.setTimeout(() => {
-						urlEl.textContent = realText;
-						urlEl.classList.remove("dsh-ego-hint");
-						hintTimer = null;
-					}, 2e3);
-				};
-				const apply = () => {
-					img.style.transformOrigin = "0 0";
-					img.style.transform = `translate(${zoomState.tx}px, ${zoomState.ty}px) scale(${zoomState.scale})`;
-				};
-				let viewPanning = false;
-				let browserDrag = false;
-				let sx = 0, sy = 0, stx = 0, sty = 0;
-				let lastDragPos = null;
-				let dragTargetId = null;
-				let downButtons = 0;
-				const resetView = () => {
-					zoomState = {
-						scale: 1,
-						tx: 0,
-						ty: 0
-					};
-					apply();
-					showHint(wt("hintReset"));
-				};
-				img.title = wt("hintReset");
-				img.addEventListener("wheel", (e) => {
-					e.preventDefault();
-					e.stopPropagation();
-					if (e.ctrlKey || e.metaKey) {
-						const rect = img.getBoundingClientRect();
-						const mx = e.clientX - rect.left, my = e.clientY - rect.top;
-						const next = Math.min(8, Math.max(1, zoomState.scale * (e.deltaY < 0 ? 1.15 : 1 / 1.15)));
-						if (next <= 1) {
-							resetView();
-							return;
-						}
-						zoomState.tx = mx - (mx - zoomState.tx) * (next / zoomState.scale);
-						zoomState.ty = my - (my - zoomState.ty) * (next / zoomState.scale);
-						zoomState.scale = next;
-						apply();
-						showHint(wt("hintPan"));
-						return;
-					}
-					const p = browserXY(e);
-					if (p && liveImgTargetId) sendInput(liveImgTargetId, "mouseWheel", {
-						x: p.x,
-						y: p.y,
-						deltaX: e.deltaX || 0,
-						deltaY: e.deltaY || (e.deltaMode === 1 ? 40 : e.deltaY || 100)
-					});
-				}, { passive: false });
-				img.addEventListener("pointerdown", (e) => {
-					if (e.button !== 0) return;
-					img.setPointerCapture(e.pointerId);
-					sx = e.clientX;
-					sy = e.clientY;
-					stx = zoomState.tx;
-					sty = zoomState.ty;
-					if (e.ctrlKey || e.metaKey) {
-						viewPanning = true;
-						img.style.cursor = "grabbing";
-						showHint(wt("hintScroll"));
-						return;
-					}
-					browserDrag = true;
-					dragTargetId = liveImgTargetId;
-					keyboardProxy.focusAt(e, dragTargetId);
-					lastDragPos = null;
-					downButtons = 1;
-					const p = browserXY(e);
-					if (p) {
-						lastDragPos = p;
-						sendInput(dragTargetId, "mousePressed", {
-							x: p.x,
-							y: p.y,
-							button: "left",
-							buttons: 1,
-							clickCount: 1
-						});
-					}
-				});
-				img.addEventListener("pointermove", (e) => {
-					if (viewPanning) {
-						zoomState.tx = stx + (e.clientX - sx);
-						zoomState.ty = sty + (e.clientY - sy);
-						apply();
-						return;
-					}
-					if (!browserDrag) {
-						const p = browserXY(e);
-						if (p) sendInput(liveImgTargetId, "mouseMoved", {
-							x: p.x,
-							y: p.y,
-							buttons: 0
-						});
-						return;
-					}
-					const p = browserXY(e);
-					if (p) {
-						sendInput(dragTargetId, "mouseMoved", {
-							x: p.x,
-							y: p.y,
-							buttons: downButtons
-						});
-						lastDragPos = p;
-					}
-				});
-				const stopDrag = (e) => {
-					if (viewPanning) {
-						viewPanning = false;
-						img.style.cursor = e.ctrlKey ? "grab" : "grab";
-					}
-					if (browserDrag) {
-						browserDrag = false;
-						if (lastDragPos && dragTargetId) sendInput(dragTargetId, "mouseReleased", {
-							x: lastDragPos.x,
-							y: lastDragPos.y,
-							button: "left",
-							buttons: 0,
-							clickCount: 1
-						});
-						dragTargetId = null;
-					}
-					img.style.cursor = "grab";
-				};
-				img.addEventListener("pointerup", stopDrag);
-				img.addEventListener("pointercancel", stopDrag);
-				img.addEventListener("pointerleave", (e) => {
-					if (browserDrag || viewPanning) stopDrag(e);
-				});
-				img.addEventListener("dblclick", (e) => {
-					e.preventDefault();
-					resetView();
-				});
-				img.style.cursor = "grab";
-				apply();
-				return img;
-			};
-			const renderTabs = (spaces) => {
-				tabsEl.innerHTML = "";
-				const list = Array.isArray(spaces) ? spaces : [];
-				if (list.length === 0) {
-					if (selectedTabId) selectedTabId = null;
-					return;
-				}
-				for (const s of list) {
-					const tab = document.createElement("div");
-					tab.className = "dsh-ego-tab";
-					tab.title = s.url || "";
-					tab.__tid = s.targetId;
-					const dot = document.createElement("span");
-					dot.className = "dsh-ego-tabdot";
-					const txt = document.createElement("span");
-					txt.className = "dsh-ego-tabtxt";
-					txt.textContent = s.title || s.url || wt("newTab");
-					tab.appendChild(dot);
-					tab.appendChild(txt);
-					const closeBtn = document.createElement("span");
-					closeBtn.className = "dsh-ego-tabclose";
-					closeBtn.title = wt("closeTab");
-					closeBtn.textContent = "×";
-					closeBtn.addEventListener("click", (e) => {
-						e.stopPropagation();
-						(async () => {
-							try {
-								await fetch(EGO_CLOSE_ROUTE, {
-									method: "POST",
-									headers: { "content-type": "application/json" },
-									body: JSON.stringify({ targetId: s.targetId })
-								});
-							} catch {}
-							if (selectedTabId === s.targetId) {
-								selectedTabId = null;
-								pinned = null;
-							}
-						})().then(() => refresh());
-					});
-					tab.appendChild(closeBtn);
-					if (s.targetId === selectedTabId || selectedTabId === null && s.targetId === currentActiveId) tab.classList.add("active");
-					tab.addEventListener("click", () => {
-						if (selectedTabId === s.targetId) {
-							selectedTabId = null;
-							pinned = null;
-							renderSpaces(lastList);
-							return;
-						}
-						selectedTabId = s.targetId;
-						pinned = null;
-						renderLiveMain(s, true);
-						syncWatch(s.targetId);
-						[...tabsEl.querySelectorAll(".dsh-ego-tab")].forEach((t) => t.classList.toggle("active", t.__tid === s.targetId));
-					});
-					tabsEl.appendChild(tab);
-				}
-			};
-			const renderSingleView = (s) => {
-				body.innerHTML = "";
-				const view = document.createElement("div");
-				view.className = "dsh-ego-liveview";
-				const badge = document.createElement("div");
-				badge.className = "dsh-ego-livebadge";
-				badge.innerHTML = pinned ? `<span class="dsh-ego-state-dot pin"></span> ${wt("pinned")}` : `<span class="dsh-ego-state-dot${fab.classList.contains("dsh-ego-busy") ? " busy" : ""}"></span> ${wt("realtime")}`;
-				view.appendChild(badge);
-				if (pinned) {
-					const back = document.createElement("button");
-					back.className = "dsh-ego-back";
-					back.type = "button";
-					back.textContent = wt("backToLive");
-					back.addEventListener("click", () => {
-						pinned = null;
-						renderSpaces(lastList);
-					});
-					badge.appendChild(back);
-				}
-				const t = document.createElement("div");
-				t.className = "dsh-ego-livetitle";
-				t.textContent = s.title || s.url || wt("newTab");
-				const u = document.createElement("div");
-				u.className = "dsh-ego-liveurl";
-				u.textContent = s.url || "";
-				const cached = frameCache.get(s.targetId);
-				if (captureBackend === "ffmpeg" || cached) {
-					const img = makeZoomImage(u, captureBackend === "ffmpeg" ? "video" : "img");
-					if (captureBackend === "ffmpeg" && streamState === "streaming") {
-						stopVideo();
-						videoCleanup = createMsePlayer(img, streamGeneration, streamMime, (message) => {});
-					} else img.src = cached;
-					img.alt = "live";
-					attachLiveImg(s.targetId, img);
-					view.appendChild(img);
-				} else {
-					const n = document.createElement("div");
-					n.className = "dsh-ego-liveurl";
-					n.textContent = wt("noScreenshot");
-					view.appendChild(n);
-				}
-				view.appendChild(t);
-				view.appendChild(u);
-				body.appendChild(view);
-			};
-			const openPreview = (s) => {
-				if (disposed) return;
-				pinned = s;
-				renderSingleView(s);
-			};
-			const renderSpaces = (spaces) => {
-				if (disposed) return;
-				lastList = Array.isArray(spaces) ? spaces : [];
-				for (const s of lastList) {
-					const prev = pageMeta.get(s.targetId) || { targetId: s.targetId };
-					pageMeta.set(s.targetId, {
-						url: s.url,
-						title: s.title,
-						targetId: s.targetId,
-						...Number.isFinite(s.viewportW) ? { vw: s.viewportW } : prev.vw !== void 0 ? { vw: prev.vw } : {},
-						...Number.isFinite(s.viewportH) ? { vh: s.viewportH } : prev.vh !== void 0 ? { vh: prev.vh } : {}
-					});
-				}
-				const liveIds = new Set(lastList.map((s) => s.targetId));
-				for (const id of [...pageMeta.keys()]) if (!liveIds.has(id)) pageMeta.delete(id);
-				for (const id of [...frameCache.keys()]) if (!liveIds.has(id)) frameCache.delete(id);
-				const sorted = [...lastList].sort((a, b) => (b.lastActive ?? 0) - (a.lastActive ?? 0));
-				const activeMarked = lastList.find((s) => s.active === true) || sorted[0] || null;
-				if (activeMarked) {
-					agentActiveId = activeMarked.targetId;
-					currentActiveId = activeMarked.targetId;
-				}
-				maybeShowLoginGuide();
-				maybeShowCaptchaGuide();
-				renderTabs(lastList);
-				if (historyOpen) renderHistory(lastList);
-				if (pinned) return;
-				if (lastList.length === 0) {
-					if (frameRelayDisabled) {
-						renderRelayDisabled();
-						return;
-					}
-					setTitle("Agent 浏览器");
-					body.innerHTML = `<div class="dsh-ego-empty">${wt("noActivePages")}<br><span style="font-size:11px;">${wt("noActiveHint")}</span></div>`;
-					fab.classList.remove("dsh-ego-live", "dsh-ego-busy");
-					return;
-				}
-				lastList.length;
-				fab.classList.add("dsh-ego-live");
-				const busy = lastList.some((s) => Date.now() - (s.lastActive || 0) <= ACTIVE_WINDOW_MS);
-				if (busy !== lastSawActive) {
-					fab.classList.toggle("dsh-ego-busy", busy);
-					lastSawActive = busy;
-				} else fab.classList.remove("dsh-ego-busy");
-				const sel = selectedTabId !== null ? lastList.find((x) => x.targetId === selectedTabId) : null;
-				const current = sel || activeMarked;
-				currentActiveId = current.targetId;
-				syncWatch(current.targetId);
-				setTitle(sel ? wt("title") : wt("titleLive"));
-				renderLiveMain(current, sel);
-			};
-			const attachLiveImg = (targetId, img) => {
-				liveImg = img;
-				liveImgTargetId = targetId;
-				const cached = frameCache.get(targetId);
-				if (cached) img.src = cached;
-			};
-			const renderLiveMain = (current, isPinned) => {
-				body.innerHTML = "";
-				const view = document.createElement("div");
-				view.className = "dsh-ego-liveview";
-				const badge = document.createElement("div");
-				badge.className = "dsh-ego-livebadge";
-				badge.innerHTML = isPinned ? `<span class="dsh-ego-state-dot pin"></span> ${wt("pinned")}` : `<span class="dsh-ego-state-dot${fab.classList.contains("dsh-ego-busy") ? " busy" : ""}"></span> ${wt("realtime")}`;
-				view.appendChild(badge);
-				const t = document.createElement("div");
-				t.className = "dsh-ego-livetitle";
-				t.textContent = current.title || current.url || wt("newTab");
-				const u = document.createElement("div");
-				u.className = "dsh-ego-liveurl";
-				u.textContent = current.url || "";
-				const openHere = document.createElement("button");
-				openHere.type = "button";
-				openHere.className = "dsh-ego-back";
-				openHere.title = wt("openExternal");
-				openHere.textContent = wt("openExternal");
-				openHere.addEventListener("click", () => {
-					const url = current.url;
-					if (url && !url.startsWith("about:") && !url.startsWith("chrome://")) window.open(url, "_blank", "noopener");
-					else openHere.textContent = wt("noUrl");
-				});
-				badge.appendChild(openHere);
-				const raiseBtn = document.createElement("button");
-				raiseBtn.type = "button";
-				raiseBtn.className = "dsh-ego-back";
-				raiseBtn.title = wt("raiseWindowHint");
-				raiseBtn.textContent = wt("raiseWindow");
-				raiseBtn.addEventListener("click", () => {
-					fetch("/api/ego/raise", {
-						method: "POST",
-						headers: { "content-type": "application/json" },
-						body: "{}"
-					}).then((r) => r.json().catch(() => null)).catch(() => null);
-				});
-				badge.appendChild(raiseBtn);
-				const cached = frameCache.get(current.targetId);
-				if (captureBackend === "ffmpeg" || cached) {
-					const img = makeZoomImage(u, captureBackend === "ffmpeg" ? "video" : "img");
-					if (captureBackend === "ffmpeg" && streamState === "streaming") {
-						stopVideo();
-						videoCleanup = createMsePlayer(img, streamGeneration, streamMime, (message) => {});
-					} else img.src = cached;
-					img.alt = "live";
-					attachLiveImg(current.targetId, img);
-					view.appendChild(img);
-				} else {
-					const n = document.createElement("div");
-					n.className = "dsh-ego-liveurl";
-					n.textContent = wt("noScreenshot");
-					view.appendChild(n);
-				}
-				view.appendChild(t);
-				view.appendChild(u);
-				body.appendChild(view);
-			};
-			let lastSawActive = false;
-			const refresh = () => {
-				if (frameRelayDisabled) {
-					renderRelayDisabled();
-					return;
-				}
-				(async () => {
+			var betterSidebarService = getOptionalService("betterSidebar");
+			var disposeActive = null;
+			var activatePanel = function(effectCtx, kind, factory) {
+				if (disposeActive) {
+					var old = disposeActive;
+					disposeActive = null;
 					try {
-						const res = await fetch(SPACES_ROUTE, { cache: "no-store" });
-						if (disposed || !res.ok) {
-							renderEmpty();
-							return;
-						}
-						const data = await res.json();
-						if (!data || data.ok !== true) {
-							renderEmpty();
-							return;
-						}
-						applyCaptureStatus(data.capture);
-						renderSpaces(data.spaces);
-					} catch {
-						renderEmpty();
-					}
-				})();
-			};
-			const renderEmpty = () => {
-				if (body.children.length === 0) renderSpaces([]);
-			};
-			let sse = null;
-			let lastFrameAt = 0;
-			const FRAME_FOLLOW_MIN_MS = 350;
-			let followTimer = null;
-			const applyFrame = (targetId, dataUrl, vw, vh) => {
-				if (disposed) return;
-				frameCache.set(targetId, dataUrl);
-				const MAX_CACHED_FRAMES = 12;
-				if (frameCache.size > MAX_CACHED_FRAMES) for (const [id] of frameCache) {
-					if (id === targetId || id === liveImgTargetId) continue;
-					frameCache.delete(id);
-					if (frameCache.size <= MAX_CACHED_FRAMES) break;
+						old();
+					} catch (e) {}
 				}
-				if (Number.isFinite(vw) && Number.isFinite(vh)) {
-					const cur = pageMeta.get(targetId) || { targetId };
-					pageMeta.set(targetId, {
-						...cur,
-						vw,
-						vh
-					});
-				}
-				if (liveImg && liveImgTargetId === targetId) {
-					pendingLiveFrame = dataUrl;
-					if (!liveFlushRaf && !disposed) liveFlushRaf = window.requestAnimationFrame(() => {
-						liveFlushRaf = null;
-						if (disposed || !liveImg || pendingLiveFrame == null) return;
-						try {
-							liveImg.src = pendingLiveFrame;
-						} catch {}
-						pendingLiveFrame = null;
-					});
-					return;
-				}
-				if (!pinned && selectedTabId === null && targetId === agentActiveId) {
-					const now = Date.now();
-					if (now - lastFrameAt >= FRAME_FOLLOW_MIN_MS) {
-						lastFrameAt = now;
-						if (followTimer) window.clearTimeout(followTimer);
-						followTimer = window.setTimeout(() => {
-							if (disposed || pinned || selectedTabId !== null) return;
-							if (liveImg && liveImgTargetId === targetId) return;
-							const meta = pageMeta.get(targetId);
-							if (!meta) return;
-							currentActiveId = targetId;
-							renderLiveMain({
-								...meta,
-								targetId
-							}, false);
-						}, 0);
-					}
-				}
+				disposeActive = effectCtx.effect(function() {
+					return factory();
+				}, "ego-browser watch panel (" + kind + ")");
 			};
-			let reconnectFallbackTimer = null;
-			const openStream = () => {
-				if (disposed || frameRelayDisabled) {
-					if (frameRelayDisabled) renderRelayDisabled();
-					return;
-				}
-				fetch(WATCH_STATUS_ROUTE, { cache: "no-store" }).then((res) => res.ok ? res.json() : null).then((status) => {
-					if (disposed) return;
-					if (frameRelayOff(status)) {
-						teardownRelay();
-						renderRelayDisabled();
-						return;
-					}
-					applyCaptureStatus(status);
-					connectStream();
-				}).catch(() => {
-					if (!disposed && !frameRelayDisabled) connectStream();
-				});
-			};
-			const connectStream = () => {
-				if (disposed || frameRelayDisabled || sse) return;
-				doConnected = false;
-				sse = new EventSource("/api/ego/stream");
-				sse.onopen = () => {
-					doConnected = true;
-				};
-				sse.addEventListener("frame", (ev) => {
-					try {
-						const m = JSON.parse(ev.data);
-						if (!m || !m.targetId || !m.data) return;
-						if (Number.isFinite(m.vw) && Number.isFinite(m.vh)) {
-							const cur = pageMeta.get(m.targetId) || { targetId: m.targetId };
-							pageMeta.set(m.targetId, {
-								...cur,
-								vw: m.vw,
-								vh: m.vh
-							});
-						}
-						applyFrame(m.targetId, `data:image/jpeg;base64,${m.data}`, m.vw, m.vh);
-					} catch {}
-				});
-				sse.addEventListener("spaces", (ev) => {
-					if (disposed) return;
-					try {
-						const list = JSON.parse(ev.data);
-						if (Array.isArray(list)) renderSpaces(list);
-					} catch {}
-				});
-				sse.addEventListener("capture-status", (ev) => {
-					try {
-						applyCaptureStatus(JSON.parse(ev.data));
-					} catch {}
-				});
-				sse.onerror = () => {
-					doConnected = false;
-					if (reconnectFallbackTimer) return;
-					reconnectFallbackTimer = window.setTimeout(() => {
-						reconnectFallbackTimer = null;
-						if (disposed) return;
-						refresh();
-					}, 1500);
-				};
-			};
-			let doConnected = false;
-			const DRAG_KEY = "dsh.ego.watch.pos";
-			const DRAG_PANEL_KEY = "dsh.ego.watch.panelPos";
-			const FAB_W = 48, FAB_H = 48;
-			const PANEL_W = 408, PANEL_GAP = 8;
-			const loadPos = (key) => {
+			if (betterSidebarService !== void 0) activatePanel(ctx, "betterSidebar", function() {
+				return mountSidebarTab(ctx, betterSidebarService);
+			});
+			else if (typeof ctx.inject === "function") ctx.inject(["betterSidebar"], function(sidebarCtx) {
+				var svc;
 				try {
-					const s = JSON.parse(localStorage.getItem(key) || "null");
-					if (s && Number.isFinite(s.x) && Number.isFinite(s.y)) return s;
-				} catch {}
-				return null;
-			};
-			let pos = loadPos(DRAG_KEY) || {
-				x: window.innerWidth - 18 - FAB_W,
-				y: window.innerHeight - 104 - FAB_H
-			};
-			let panelPos = loadPos(DRAG_PANEL_KEY);
-			const clampFab = () => {
-				const vw = window.innerWidth, vh = window.innerHeight;
-				pos.x = Math.max(4, Math.min(vw - FAB_W - 4, pos.x));
-				pos.y = Math.max(4, Math.min(vh - FAB_H - 4, pos.y));
-			};
-			const placeFab = () => {
-				clampFab();
-				fab.style.left = pos.x + "px";
-				fab.style.top = pos.y + "px";
-			};
-			const placePanel = () => {
-				panel.style.left = panelPos.x + "px";
-				panel.style.top = panelPos.y + "px";
-			};
-			/** Position the panel against the ball: just above it (below when near
-			*  the top edge), clamped inside the viewport. */
-			const snapPanelToFab = () => {
-				const vw = window.innerWidth, vh = window.innerHeight;
-				const pw = panel.classList.contains("open-drawer") ? 640 : PANEL_W;
-				const ph = panel.offsetHeight > 0 ? panel.offsetHeight : Math.min(Math.round(vh * .7), 520);
-				let px = pos.x + FAB_W - pw;
-				let py = pos.y - ph - PANEL_GAP;
-				if (py < 8) py = pos.y + FAB_H + PANEL_GAP;
-				px = Math.max(8, Math.min(vw - pw - 8, px));
-				py = Math.max(8, Math.min(vh - ph - 8, py));
-				panelPos = {
-					x: Math.round(px),
-					y: Math.round(py)
-				};
-				placePanel();
-			};
-			placeFab();
-			if (panelPos) placePanel();
-			let suppressFabClick = false;
-			/**
-			* Make `el` drag the FAB or the panel (`which` = 'fab' | 'panel').
-			* Movement under ~5px is treated as a click, so the FAB still toggles.
-			* Interactive children (buttons/icons) never start a drag.
-			*/
-			const makeDraggable = (el, which) => {
-				const state = () => which === "fab" ? pos : panelPos;
-				let sx = 0, sy = 0, bx = 0, by = 0, active = false, dragged = false;
-				const down = (e) => {
-					if (e.button !== 0) return;
-					if (e.target && e.target.closest) {
-						const hit = e.target.closest("button, a, input, [role=\"button\"]");
-						if (hit && hit !== el) return;
-					}
-					active = true;
-					dragged = false;
-					sx = e.clientX;
-					sy = e.clientY;
-					const s = state();
-					bx = s.x;
-					by = s.y;
-					try {
-						el.setPointerCapture(e.pointerId);
-					} catch {}
-					el.classList.add("dsh-ego-dragging");
-					e.preventDefault();
-				};
-				const move = (e) => {
-					if (!active) return;
-					const dx = e.clientX - sx, dy = e.clientY - sy;
-					if (!dragged && Math.abs(dx) + Math.abs(dy) > 5) dragged = true;
-					if (dragged) {
-						const s = state();
-						s.x = bx + dx;
-						s.y = by + dy;
-						which === "fab" ? placeFab() : placePanel();
-					}
-				};
-				const up = (e) => {
-					if (!active) return;
-					active = false;
-					el.classList.remove("dsh-ego-dragging");
-					try {
-						el.releasePointerCapture(e.pointerId);
-					} catch {}
-					if (dragged) {
-						if (which === "fab") suppressFabClick = true;
-						try {
-							localStorage.setItem(which === "fab" ? DRAG_KEY : DRAG_PANEL_KEY, JSON.stringify(state()));
-						} catch {}
-					}
-				};
-				el.addEventListener("pointerdown", down);
-				el.addEventListener("pointermove", move);
-				el.addEventListener("pointerup", up);
-				el.addEventListener("pointercancel", up);
-			};
-			makeDraggable(fab, "fab");
-			makeDraggable(panel.querySelector("#dsh-ego-head"), "panel");
-			const setOpen = (open) => {
-				if (open) {
-					panel.hidden = false;
-					panel.classList.remove("dsh-ego-panel-hide");
-					snapPanelToFab();
-					panel.offsetHeight;
-					panel.classList.add("dsh-ego-panel-open");
-					fab.classList.add("on");
-					refresh();
-					openStream();
-					if (currentActiveId) syncWatch(selectedTabId || currentActiveId);
-				} else {
-					panel.classList.remove("dsh-ego-panel-open");
-					clearTimeout(panel._dshHideT);
-					panel._dshHideT = setTimeout(() => {
-						panel.classList.add("dsh-ego-panel-hide");
-						panel.hidden = true;
-						fab.classList.remove("on");
-					}, 280);
-					try {
-						if (sse) sse.close();
-					} catch {}
-					sse = null;
-					stopWatch(false);
-					stopVideo();
+					svc = typeof sidebarCtx.get === "function" ? sidebarCtx.get("betterSidebar") : sidebarCtx.betterSidebar;
+				} catch (e) {
+					svc = void 0;
 				}
-				try {
-					localStorage.setItem(OPEN_KEY, open ? "1" : "0");
-				} catch {}
-			};
-			fab.addEventListener("click", () => {
-				if (suppressFabClick) {
-					suppressFabClick = false;
-					return;
-				}
-				setOpen(panel.hidden);
+				if (!svc) return;
+				activatePanel(sidebarCtx, "betterSidebar", function() {
+					return mountSidebarTab(sidebarCtx, svc);
+				});
 			});
-			closeBtn.addEventListener("click", () => setOpen(false));
-			refreshBtn.addEventListener("click", () => {
-				refreshBtn.classList.add("spinning");
-				window.setTimeout(() => refreshBtn.classList.remove("spinning"), 800);
-				refresh();
+			if (typeof ctx.inject === "function") ctx.inject(["sidebarRight", "sidebarRightTabs"], function(nativeCtx) {
+				var sidebar = typeof nativeCtx.get === "function" ? nativeCtx.get("sidebarRight") : void 0;
+				var tabs = typeof nativeCtx.get === "function" ? nativeCtx.get("sidebarRightTabs") : void 0;
+				if (!sidebar || !tabs) return;
+				activatePanel(nativeCtx, "native", function() {
+					return mountNativeSidebarTab(nativeCtx, sidebar, tabs);
+				});
 			});
-			historyBtn.addEventListener("click", () => setHistory(!historyOpen));
-			const maybeShowLoginGuide = () => {
-				if (disposed || dismissedGuides.login) return;
-				const show = lastList.some((s) => s.url && !s.url.startsWith("about:")) && !captchaEl.classList.contains("show");
-				loginEl.classList.toggle("show", show);
-				loginNote.textContent = "";
-			};
-			const maybeShowCaptchaGuide = () => {
-				if (disposed || dismissedGuides.captcha) return;
-				const hit = lastList.find((s) => s.humanCheck && s.humanCheck.detected);
-				const show = !!hit;
-				captchaEl.classList.toggle("show", show);
-				if (show && captchaKindEl) captchaKindEl.textContent = hit.humanCheck.kind || "captcha";
-			};
-			loginBtn.addEventListener("click", () => {
-				(async () => {
-					loginBtn.classList.add("saving");
-					loginBtn.textContent = wt("loginSaving");
-					try {
-						const j = await (await fetch(FLUSH_ROUTE, {
-							method: "POST",
-							headers: { "content-type": "application/json" },
-							body: "{}"
-						})).json();
-						if (j && j.ok) loginNote.textContent = wt("loginSaved", { n: j.total ?? "" });
-						else loginNote.textContent = j?.error ? wt("loginNotConnected") : wt("loginFailed");
-					} catch {
-						loginNote.textContent = wt("loginFailed");
-					} finally {
-						loginBtn.classList.remove("saving");
-						loginBtn.textContent = wt("loginBtn");
-					}
-				})();
-			});
-			document.body.appendChild(fab);
-			document.body.appendChild(panel);
-			try {
-				localStorage.removeItem(OPEN_KEY);
-			} catch {}
-			panel.hidden = true;
-			fab.classList.remove("on");
-			refresh();
-			const onVisibility = () => {
-				if (document.visibilityState !== "hidden" && !panel.hidden) {
-					if (!sse) openStream();
-					syncWatch(selectedTabId || currentActiveId);
-				}
-			};
-			document.addEventListener("visibilitychange", onVisibility);
-			const offRelayWatch = frameRelaySubscribe((disabled) => {
-				if (disposed) return;
-				if (disabled) {
-					teardownRelay();
-					renderRelayDisabled();
-					return;
-				}
-				openStream();
-				refresh();
-			});
-			return () => {
-				disposed = true;
-				offRelayWatch();
-				if (liveFlushRaf != null) try {
-					window.cancelAnimationFrame(liveFlushRaf);
-				} catch {}
-				if (followTimer) window.clearTimeout(followTimer);
-				if (reconnectFallbackTimer) window.clearTimeout(reconnectFallbackTimer);
-				document.removeEventListener("visibilitychange", onVisibility);
-				if (watchRenewTimer) window.clearInterval(watchRenewTimer);
-				if (watchStopTimer) window.clearTimeout(watchStopTimer);
-				stopWatch(true);
-				stopVideo();
-				keyboardProxy.dispose();
-				try {
-					if (sse) sse.close();
-				} catch {}
-				fab.remove();
-				panel.remove();
-				style.remove();
-			};
 		}
 		var INPUT_ROUTE = "/api/ego/input";
 		var FLUSH_ROUTE = "/api/ego/flush";
@@ -3086,29 +2069,55 @@ window.__ModuleLoader__.load({
 .dsh-ego-side-root {
   display: flex; flex-direction: column; height: 100%; min-height: 0;
   overflow: hidden; color: inherit; background: transparent;
+  position: relative;
+  /* Chrome-inspired palette (light); dark values flip below. */
+  --ego-surface: #ffffff;
+  --ego-toolbar: #f1f3f4;
+  --ego-text: #202124;
+  --ego-text-2: #5f6368;
+  --ego-accent: #1a73e8;
+  --ego-on-accent: #ffffff;
+  --ego-hover: rgba(60, 64, 67, .08);
+  --ego-border: rgba(60, 64, 67, .16);
+  --ego-tab-active: #ffffff;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  .dsh-ego-side-root {
+    --ego-surface: #202124;
+    --ego-toolbar: #292a2d;
+    --ego-text: #e8eaed;
+    --ego-text-2: #9aa0a6;
+    --ego-accent: #8ab4f8;
+    --ego-on-accent: #202124;
+    --ego-hover: rgba(232, 234, 237, .08);
+    --ego-border: rgba(232, 234, 237, .16);
+    --ego-tab-active: #35363a;
+  }
 }
 .dsh-ego-side-root * { box-sizing: border-box; }
 
 .dsh-ego-side-head {
-  display: flex; align-items: center; gap: 4px; padding: 8px 10px;
-  border-bottom: 1px solid rgba(128,128,128,.18); flex-shrink: 0;
+  display: flex; align-items: center; gap: 4px; padding: 7px 10px;
+  border-bottom: 1px solid var(--ego-border); flex-shrink: 0;
+  background: var(--ego-toolbar); color: var(--ego-text);
 }
 .dsh-ego-side-title {
-  flex: 1; font-size: 12.5px; font-weight: 600; letter-spacing: .2px;
+  flex: 1; font-size: 13px; font-weight: 500; letter-spacing: .1px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  display: flex; align-items: center; gap: 5px; opacity: .85;
+  display: flex; align-items: center; gap: 6px;
+  color: var(--ego-text);
 }
-.dsh-ego-side-title svg { width: 14px; height: 14px; flex-shrink: 0; }
+.dsh-ego-side-title svg { width: 15px; height: 15px; flex-shrink: 0; color: var(--ego-text-2); }
 .dsh-ego-side-iconbtn {
   background: transparent; border: none; cursor: pointer;
-  width: 26px; height: 26px; border-radius: 7px; padding: 0;
+  width: 28px; height: 28px; border-radius: 50%; padding: 0;
   display: flex; align-items: center; justify-content: center;
-  color: inherit; opacity: .6;
-  transition: background .15s ease, opacity .15s ease;
+  color: var(--ego-text-2);
+  transition: background .15s ease, color .15s ease;
 }
-.dsh-ego-side-iconbtn:hover { background: rgba(128,128,128,.18); opacity: 1; }
-.dsh-ego-side-iconbtn.off { opacity: .4; }
+.dsh-ego-side-iconbtn:hover { background: var(--ego-hover); color: var(--ego-text); }
+.dsh-ego-side-iconbtn.off { opacity: .45; }
 .dsh-ego-side-iconbtn.spinning svg { animation: dsh-ego-side-spin .7s linear infinite; }
 @keyframes dsh-ego-side-spin { to { transform: rotate(360deg); } }
 
@@ -3142,41 +2151,126 @@ window.__ModuleLoader__.load({
 
 /* ---- tab strip: frosted pills ---- */
 .dsh-ego-side-tabs {
-  display: flex; gap: 5px; padding: 7px 10px; flex-shrink: 0;
-  border-bottom: 1px solid rgba(128,128,128,.12);
+  display: flex; gap: 3px; padding: 5px 10px 0; flex-shrink: 0;
+  background: var(--ego-toolbar);
   overflow-x: auto; scrollbar-width: thin;
 }
 .dsh-ego-side-tabs:empty { display: none; }
 .dsh-ego-side-tab {
-  display: inline-flex; align-items: center; gap: 5px; max-width: 160px;
-  white-space: nowrap; padding: 4px 10px; border-radius: 999px; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 6px; max-width: 160px;
+  white-space: nowrap; padding: 6px 10px; border-radius: 7px 7px 0 0; cursor: pointer;
   font-size: 11px; flex-shrink: 0;
-  border: 1px solid rgba(128,128,128,.2); background: rgba(128,128,128,.12);
-  opacity: .7; transition: background .15s, opacity .15s, border-color .15s;
+  border: 1px solid transparent; background: transparent;
+  color: var(--ego-text-2);
+  transition: background .15s, color .15s, border-color .15s;
 }
 .dsh-ego-side-tab > .dsh-ego-side-tabtxt { overflow: hidden; text-overflow: ellipsis; }
-.dsh-ego-side-tab:hover { opacity: 1; background: rgba(128,128,128,.2); }
+.dsh-ego-side-tab:hover { background: var(--ego-hover); color: var(--ego-text); }
 .dsh-ego-side-tab.active {
-  background: #0a84ff; color: #fff; border-color: transparent; opacity: 1;
-  box-shadow: 0 2px 8px rgba(10,132,255,.3);
+  background: var(--ego-tab-active); color: var(--ego-text);
+  border-color: var(--ego-border); box-shadow: 0 1px 2px rgba(0,0,0,.10);
 }
-.dsh-ego-side-tabdot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; opacity: .5; flex-shrink: 0; }
-.dsh-ego-side-tab.active .dsh-ego-side-tabdot { background: #fff; opacity: 1; }
+.dsh-ego-side-tabdot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; opacity: .45; flex-shrink: 0; }
+.dsh-ego-side-tab.active .dsh-ego-side-tabdot { background: var(--ego-accent); opacity: 1; }
 .dsh-ego-side-tabclose {
-  flex-shrink: 0; width: 13px; height: 13px; line-height: 12px; text-align: center;
+  flex-shrink: 0; width: 14px; height: 14px; line-height: 13px; text-align: center;
   border-radius: 50%; font-size: 11px; opacity: .5; margin-left: 1px;
 }
-.dsh-ego-side-tabclose:hover { background: rgba(255,255,255,.2); color: #ff453a; opacity: 1; }
+.dsh-ego-side-tabclose:hover { background: var(--ego-hover); color: #c5221f; opacity: 1; }
 
 /* ---- main body ---- */
 .dsh-ego-side-body { flex: 1; min-height: 0; overflow-y: auto; padding: 10px; }
 .dsh-ego-side-empty { padding: 20px 12px; text-align: center; font-size: 12px; opacity: .5; line-height: 1.7; }
 
-.dsh-ego-side-liveview { display: flex; flex-direction: column; gap: 7px; min-height: 60px; overflow: hidden; }
+.dsh-ego-side-liveview { display: flex; flex-direction: column; gap: 7px; min-height: 60px; overflow: hidden; position: relative; }
+/* macOS-style toolbar: independent status chip + segmented action groups.
+   No parent opacity — buttons stay crisp; only secondary text is dimmed. */
 .dsh-ego-side-livebadge {
-  font-size: 10.5px; opacity: .6; letter-spacing: .2px;
-  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  font-size: 10.5px; letter-spacing: .2px;
+  display: flex; flex-direction: column; align-items: stretch; gap: 6px;
+  position: relative; z-index: 40;
 }
+.dsh-ego-side-statusline { display: flex; align-items: center; gap: 6px; min-width: 0; flex-wrap: wrap; }
+.dsh-ego-side-actionline { display: flex; align-items: center; gap: 6px; min-width: 0; flex-wrap: wrap; position: relative; }
+.dsh-ego-side-statuschip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 0 2px; color: var(--ego-text-2);
+}
+.dsh-ego-side-execchip {
+  font-size: 9.5px; color: var(--ego-text-2); padding: 0 2px; white-space: nowrap;
+}
+.dsh-ego-side-btngroup {
+  display: inline-flex; align-items: center; gap: 2px;
+  border-radius: 4px; background: transparent;
+}
+.dsh-ego-side-btngroup .dsh-ego-side-back { border: 0; background: transparent; border-radius: 4px; }
+.dsh-ego-side-btngroup .dsh-ego-side-back:hover { background: var(--ego-hover); }
+.dsh-ego-side-btngroup .dsh-ego-side-back-on {
+  background: rgba(26,115,232,.10); color: var(--ego-accent);
+}
+.dsh-ego-side-btnico { display: inline-flex; width: 14px; height: 14px; align-items: center; justify-content: center; opacity: .85; }
+.dsh-ego-side-btnico svg { display: block; }
+.dsh-ego-side-badgeline {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; position: relative;
+  flex: 1;
+}
+.dsh-ego-side-badgestatus { white-space: nowrap; opacity: .82; }
+.dsh-ego-side-pageinfo {
+  flex-basis: 100%; display: flex; align-items: baseline; gap: 8px;
+  min-width: 0; font-size: 10.5px; color: var(--ego-text-2);
+  background: var(--ego-surface);
+}
+.dsh-ego-side-pageinfo-tabs { flex-basis: auto; flex-shrink: 0; padding: 7px 10px 5px; }
+.dsh-ego-side-pagemessage {
+  flex-shrink: 0; padding: 2px 10px 0; font-size: 10px; color: var(--ego-text-2); opacity: .85;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.dsh-ego-side-pageinfo .dsh-ego-side-livetitle {
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 62%; flex: none;
+  color: var(--ego-text); font-size: 12.5px; font-weight: 500;
+}
+.dsh-ego-side-pageinfo .dsh-ego-side-liveurl {
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0;
+  color: var(--ego-text-2); font-size: 11px;
+}
+.dsh-ego-side-presets {
+  position: absolute; top: 24px; right: 0; z-index: 30;
+  min-width: 92px; padding: 4px; display: flex; flex-direction: column; gap: 2px;
+  background: var(--dsw-alias-bg-layer-1, #fff);
+  border: 1px solid rgba(128,128,128,.3); border-radius: 8px;
+  box-shadow: 0 6px 24px rgba(0,0,0,.18);
+}
+.dsh-ego-side-preset-item {
+  border: 0; background: transparent; color: inherit; text-align: left;
+  font-size: 11px; padding: 4px 10px; border-radius: 6px; cursor: pointer;
+}
+.dsh-ego-side-preset-item:hover { background: rgba(128,128,128,.2); }
+.dsh-ego-side-stage { position: relative; display: block; min-height: 0; }
+.dsh-ego-side-resize { position: absolute; z-index: 10; background: transparent; }
+.dsh-ego-side-resize-right { top: 0; bottom: 0; right: 0; width: 12px; cursor: col-resize; }
+.dsh-ego-side-resize-bottom { left: 0; right: 0; bottom: 0; height: 12px; cursor: row-resize; }
+.dsh-ego-side-resize-corner {
+  right: 0; bottom: 0; width: 20px; height: 20px; cursor: nwse-resize;
+  border-bottom-right-radius: 9px;
+}
+/* No permanent colour band: a whisper of affordance on hover, and a slightly
+   warmer hint while size-sync is unlocked. The handles themselves stay
+   transparent so the frame edge looks clean. */
+.dsh-ego-side-stage:hover .dsh-ego-side-resize-right {
+  background: linear-gradient(to left, rgba(128,128,128,.26), rgba(128,128,128,0));
+}
+.dsh-ego-side-stage:hover .dsh-ego-side-resize-bottom {
+  background: linear-gradient(to top, rgba(128,128,128,.26), rgba(128,128,128,0));
+}
+.dsh-ego-side-stage:hover .dsh-ego-side-resize-corner { background: rgba(128,128,128,.28); }
+.dsh-ego-size-unlocked .dsh-ego-side-resize-right {
+  background: linear-gradient(to left, rgba(217,119,87,.10), rgba(217,119,87,0));
+}
+.dsh-ego-size-unlocked .dsh-ego-side-resize-bottom {
+  background: linear-gradient(to top, rgba(217,119,87,.10), rgba(217,119,87,0));
+}
+.dsh-ego-size-unlocked .dsh-ego-side-resize-corner { background: rgba(217,119,87,.10); }
+.dsh-ego-side-resize:hover { background: rgba(217,119,87,.45) !important; }
 .dsh-ego-side-state-dot {
   display: inline-block; width: 7px; height: 7px; border-radius: 50%;
   background: #30d158; box-shadow: 0 0 5px #30d15888; flex-shrink: 0;
@@ -3189,12 +2283,59 @@ window.__ModuleLoader__.load({
   50%      { box-shadow: 0 0 10px #30d158ee; opacity: 1; }
 }
 .dsh-ego-side-back {
-  background: rgba(128,128,128,.18); border: 1px solid rgba(128,128,128,.2);
-  border-radius: 6px; cursor: pointer; font-size: 10.5px; padding: 2px 8px;
-  display: inline-flex; align-items: center; gap: 3px;
-  transition: background .15s ease; color: inherit;
+  height: 26px; padding: 0 8px;
+  background: transparent; border: 1px solid transparent;
+  border-radius: 4px; cursor: pointer; font-size: 11px; font-weight: 500;
+  display: inline-flex; align-items: center; gap: 5px;
+  transition: background .14s ease, color .14s ease, transform .08s ease;
+  color: var(--ego-text-2); white-space: nowrap;
 }
-.dsh-ego-side-back:hover { background: rgba(128,128,128,.3); }
+.dsh-ego-side-back:hover { background: var(--ego-hover); color: var(--ego-text); }
+.dsh-ego-side-back:active { transform: scale(.98); }
+.dsh-ego-side-back:focus-visible { outline: 2px solid var(--ego-accent); outline-offset: 1px; }
+.dsh-ego-side-back-on { color: var(--ego-accent); background: rgba(26,115,232,.10); }
+/* Primary action: Chrome-blue filled button (primary sign-in affordance). */
+.dsh-ego-side-loginbtn {
+  background: var(--ego-accent); color: var(--ego-on-accent);
+  border-color: transparent; border-radius: 4px; font-weight: 500;
+}
+.dsh-ego-side-loginbtn:hover { background: var(--ego-accent); color: var(--ego-on-accent); filter: brightness(.96); }
+.dsh-ego-side-loginbtn-ready {
+  background: transparent; color: var(--ego-accent);
+  border-color: var(--ego-border);
+}
+.dsh-ego-side-loginbtn-ready:hover { background: var(--ego-hover); color: var(--ego-accent); filter: none; }
+.dsh-ego-side-loginbtn-head { height: 26px; margin-left: 2px; }
+.dsh-ego-side-loginbtn-busy { opacity: .65; pointer-events: none; }
+/* Pairing popover: Chrome-style white card, anchored under the header. */
+.dsh-ego-side-pairbox {
+  position: absolute; top: 104px; right: 10px; z-index: 95;
+  width: min(320px, calc(100% - 20px));
+  padding: 14px;
+  border: 1px solid var(--ego-border); border-radius: 8px;
+  background: var(--ego-surface); color: var(--ego-text);
+  box-shadow: 0 4px 16px rgba(0,0,0,.20);
+  display: flex; flex-direction: column; gap: 6px;
+  font-size: 11px; line-height: 1.55;
+}
+.dsh-ego-side-pairhead { display: flex; align-items: center; gap: 8px; font-weight: 500; font-size: 13px; color: var(--ego-text); }
+.dsh-ego-side-pairhead > span:first-child { flex: 1; }
+.dsh-ego-side-pairclose {
+  border: 0; background: transparent; color: var(--ego-text-2); opacity: .7;
+  font-size: 16px; line-height: 1; cursor: pointer; padding: 0 2px;
+}
+.dsh-ego-side-pairclose:hover { opacity: 1; background: var(--ego-hover); border-radius: 50%; }
+.dsh-ego-side-pairstep { opacity: .8; }
+.dsh-ego-side-paircode {
+  font-size: 24px; font-weight: 700; letter-spacing: 6px;
+  color: var(--ego-accent); text-align: center; padding: 2px 0 4px;
+  font-variant-numeric: tabular-nums;
+}
+.dsh-ego-side-pairpath {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 10px;
+  opacity: .65; word-break: break-all;
+  background: var(--ego-hover); color: var(--ego-text-2); border-radius: 4px; padding: 4px 6px;
+}
 .dsh-ego-side-liveimg {
   width: 100%; border-radius: 9px; display: block;
   max-height: 50vh; object-fit: contain;
@@ -3202,6 +2343,16 @@ window.__ModuleLoader__.load({
   user-select: none; -webkit-user-select: none; touch-action: none;
   will-change: transform; cursor: grab;
 }
+/* #81: the semantic <img> keeps layout + pointer/zoom; the two overlay layers
+   carry the visible pixels and only swap once the next frame has decoded. */
+.dsh-ego-side-livebox { position: relative; width: 100%; min-height: 0; }
+.dsh-ego-side-liveimg-semantic { opacity: 0; }
+.dsh-ego-side-livebuf {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  display: block; object-fit: contain; opacity: 0;
+  pointer-events: none; will-change: opacity;
+}
+.dsh-ego-side-livebuf.dsh-ego-side-livebuf-on { opacity: 1; }
 .dsh-ego-side-livetitle { font-size: 12px; font-weight: 600; }
 .dsh-ego-side-liveurl { font-size: 10.5px; opacity: .55; word-break: break-all; }
 .dsh-ego-side-liveurl.dsh-ego-side-hint { color: #75c2ff; font-style: italic; font-weight: 500; opacity: 1; }
@@ -3255,6 +2406,9 @@ window.__ModuleLoader__.load({
 			this.disposed = false;
 			this.visible = false;
 			this.clientId = "sidebar-" + Math.random().toString(36).slice(2);
+			this.maxWidthHint = 800;
+			this.watchMaxWidth = 0;
+			this._maxWidthTimer = null;
 			this.watchStarted = false;
 			this.watchTargetId = null;
 			this.watchRenewTimer = null;
@@ -3278,6 +2432,12 @@ window.__ModuleLoader__.load({
 			this.liveFlushRaf = null;
 			this.liveImg = null;
 			this.liveImgTargetId = null;
+			this.liveBuffers = null;
+			this.liveBufferIndex = 0;
+			this.liveBufferLoading = false;
+			this.liveBufferPending = null;
+			this.liveFrameUrl = null;
+			this.liveFrameTargetId = null;
 			this.wiringStale = false;
 			this._lastUnwiredAt = 0;
 			this._wiredRecomputeQueued = false;
@@ -3432,6 +2592,8 @@ window.__ModuleLoader__.load({
 			if (this.followTimer) window.clearTimeout(this.followTimer);
 			if (this.reconnectFallbackTimer) window.clearTimeout(this.reconnectFallbackTimer);
 			if (this._zoomHintTimer) window.clearTimeout(this._zoomHintTimer);
+			if (this._maxWidthTimer) window.clearTimeout(this._maxWidthTimer);
+			this._maxWidthTimer = null;
 			document.removeEventListener("visibilitychange", this.onDocumentVisibility);
 			if (this.watchRenewTimer) window.clearInterval(this.watchRenewTimer);
 			if (this.watchStopTimer) window.clearTimeout(this.watchStopTimer);
@@ -3459,6 +2621,21 @@ window.__ModuleLoader__.load({
 				this._stopWatch(false);
 				this._destroyVideo();
 			}
+		};
+		LivePreviewController.prototype.scheduleMaxWidthRefresh = function() {
+			var self = this;
+			if (this.disposed || this._maxWidthTimer) return;
+			this._maxWidthTimer = window.setTimeout(function() {
+				self._maxWidthTimer = null;
+				if (self.disposed || !self.visible || !self.watchStarted || self.watchTargetId == null) return;
+				var applied = self.watchMaxWidth || 0;
+				var next = self.maxWidthHint || 0;
+				if (!(applied > 0) || !(next > 0)) return;
+				if (Math.abs(next - applied) < applied * .2) return;
+				var target = self.watchTargetId;
+				self.watchStarted = false;
+				self._syncWatch(target);
+			}, 700);
 		};
 		LivePreviewController.prototype._requestWatch = function(route, body) {
 			if (this.watchRequest) return null;
@@ -3495,7 +2672,8 @@ window.__ModuleLoader__.load({
 			if (this.watchStarted && this.watchTargetId === targetId) return;
 			var body = {
 				clientId: this.clientId,
-				targetId
+				targetId,
+				maxWidth: this.maxWidthHint
 			};
 			var request = this._requestWatch(route, body);
 			if (!request) {
@@ -3507,6 +2685,7 @@ window.__ModuleLoader__.load({
 			request.then(function(status) {
 				self.watchStarted = status && status.ok !== false;
 				self.watchTargetId = status && status.targetId || targetId;
+				self.watchMaxWidth = self.maxWidthHint;
 				if (self.watchTargetId !== targetId) {
 					self.selectedTabId = null;
 					self.currentActiveId = self.watchTargetId;
@@ -3518,7 +2697,8 @@ window.__ModuleLoader__.load({
 				if (self.visible && self.watchTargetId) {
 					var renewal = self._requestWatch(WATCH_START_ROUTE, {
 						clientId: self.clientId,
-						targetId: self.watchTargetId
+						targetId: self.watchTargetId,
+						maxWidth: self.maxWidthHint
 					});
 					if (renewal) renewal.then(function(status) {
 						self._applyCaptureStatus(status);
@@ -3572,7 +2752,86 @@ window.__ModuleLoader__.load({
 				if (cached) try {
 					img.src = cached;
 				} catch (e) {}
+				this._seedLiveBuffers(cached || null);
 			}
+		};
+		LivePreviewController.prototype.setLiveBuffers = function(buffers) {
+			this.liveBuffers = buffers && buffers.length === 2 ? buffers : null;
+			this.liveBufferIndex = 0;
+			this.liveBufferLoading = false;
+			this.liveBufferPending = null;
+			if (!this.liveBuffers) return;
+			this._seedLiveBuffers(this.frameCache.get(this.liveImgTargetId) || null);
+		};
+		LivePreviewController.prototype._seedLiveBuffers = function(seed) {
+			var buffers = this.liveBuffers;
+			if (!buffers) return;
+			for (var i = 0; i < 2; i++) {
+				var el = buffers[i];
+				if (!el) continue;
+				try {
+					el.style.opacity = i === 0 ? "1" : "0";
+				} catch (e) {}
+				if (seed) try {
+					el.src = seed;
+				} catch (e) {}
+				else try {
+					el.removeAttribute("src");
+				} catch (e) {}
+			}
+			this.liveFrameUrl = seed || null;
+			this.liveBufferIndex = 0;
+		};
+		LivePreviewController.prototype._presentLiveFrame = function(dataUrl) {
+			if (!dataUrl) return;
+			this.liveFrameUrl = dataUrl;
+			this.liveFrameTargetId = this.liveImgTargetId;
+			if (!this.liveBuffers) {
+				if (this.liveImg) try {
+					this.liveImg.src = dataUrl;
+				} catch (e) {}
+				return;
+			}
+			if (this.liveBufferLoading) {
+				this.liveBufferPending = dataUrl;
+				return;
+			}
+			var nextIndex = 1 - this.liveBufferIndex;
+			var next = this.liveBuffers[nextIndex];
+			var current = this.liveBuffers[this.liveBufferIndex];
+			if (!next) return;
+			var self = this;
+			var settled = false;
+			var settle = function() {
+				if (settled) return;
+				settled = true;
+				if (!self.liveBuffers || self.liveBuffers[nextIndex] !== next) {
+					self.liveBufferLoading = false;
+					return;
+				}
+				self.liveBufferLoading = false;
+				try {
+					next.style.opacity = "1";
+					if (current) current.style.opacity = "0";
+				} catch (e) {}
+				self.liveBufferIndex = nextIndex;
+				if (self.liveBufferPending) {
+					var pending = self.liveBufferPending;
+					self.liveBufferPending = null;
+					self._presentLiveFrame(pending);
+				}
+			};
+			this.liveBufferLoading = true;
+			try {
+				next.onload = settle;
+				next.onerror = settle;
+				next.src = dataUrl;
+			} catch (e) {
+				settle();
+			}
+			try {
+				if (next.decode) next.decode().then(settle, settle);
+			} catch (e) {}
 		};
 		LivePreviewController.prototype.refresh = function() {
 			var self = this;
@@ -3739,10 +2998,9 @@ window.__ModuleLoader__.load({
 				if (!this.liveFlushRaf && !this.disposed) this.liveFlushRaf = window.requestAnimationFrame(function() {
 					self2.liveFlushRaf = null;
 					if (self2.disposed || !self2.liveImg || self2.pendingLiveFrame == null) return;
-					try {
-						self2.liveImg.src = self2.pendingLiveFrame;
-					} catch (e) {}
+					var frameUrl = self2.pendingLiveFrame;
 					self2.pendingLiveFrame = null;
+					self2._presentLiveFrame(frameUrl);
 				});
 				return;
 			}
@@ -3779,6 +3037,15 @@ window.__ModuleLoader__.load({
 					self.refresh();
 				}
 			}).catch(function() {});
+		};
+		LivePreviewController.prototype.noteViewport = function(targetId, width, height) {
+			if (!targetId || !Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return;
+			var prev = this.pageMeta.get(targetId) || { targetId };
+			this.pageMeta.set(targetId, Object.assign({}, prev, {
+				vw: Math.round(width),
+				vh: Math.round(height)
+			}));
+			this._recompute();
 		};
 		LivePreviewController.prototype.browserXY = function(e) {
 			if (this.liveImgTargetId == null || !this.liveImg) return null;
@@ -4017,6 +3284,8 @@ window.__ModuleLoader__.load({
 		};
 		function EgoBrowserTab(props) {
 			var visible = props.visible;
+			var visibleRef = React.useRef(visible);
+			visibleRef.current = visible;
 			var ctx = props.ctx;
 			var controllerRef = React.useRef(null);
 			if (controllerRef.current === null) controllerRef.current = new LivePreviewController(ctx);
@@ -4028,12 +3297,314 @@ window.__ModuleLoader__.load({
 			});
 			var imgRef = React.useRef(null);
 			var videoRef = React.useRef(null);
+			var rootRef = React.useRef(null);
+			var sizeSyncRef = React.useRef(null);
+			if (sizeSyncRef.current === null) {
+				sizeSyncRef.current = createWindowSizeSync();
+				sizeSyncRef.current.setEnabled(sizeSyncStored());
+			}
+			var sizeSync = sizeSyncRef.current;
+			var sizeSyncState = React.useState(sizeSync.isEnabled());
+			var sizeSyncOn = sizeSyncState[0];
+			var setSizeSyncOn = sizeSyncState[1];
+			var residentState = React.useState(null);
+			var residentInfo = residentState[0];
+			var setResidentInfo = residentState[1];
+			React.useEffect(function() {
+				var disposed = false;
+				var load = function() {
+					fetch("/api/ego/executor", { cache: "no-store" }).then(function(r) {
+						return r.ok ? r.json() : null;
+					}).then(function(json) {
+						if (!disposed && json && json.ok) setResidentInfo(json);
+					}).catch(function() {});
+				};
+				load();
+				var timer = window.setInterval(load, 15e3);
+				return function() {
+					disposed = true;
+					window.clearInterval(timer);
+				};
+			}, []);
+			var chromeLoginState = React.useState({
+				phase: "loading",
+				paired: false,
+				busy: false,
+				message: "",
+				code: "",
+				expiresAt: 0,
+				port: 53820,
+				extensionPath: "",
+				tokenPath: ""
+			});
+			var chromeLogin = chromeLoginState[0];
+			var setChromeLogin = chromeLoginState[1];
+			var pairOpenState = React.useState(false);
+			var pairOpen = pairOpenState[0];
+			var setPairOpen = pairOpenState[1];
+			React.useEffect(function() {
+				var disposed = false;
+				var load = function() {
+					fetch("/api/ego/login-extension/health", { cache: "no-store" }).then(function(r) {
+						return r.ok ? r.json() : null;
+					}).then(function(json) {
+						if (disposed || !json) return;
+						setChromeLogin(function(prev) {
+							return {
+								...prev,
+								phase: json.ok ? "ready" : "error",
+								paired: !!json.paired,
+								port: json.port || prev.port,
+								extensionPath: json.extensionPath || prev.extensionPath,
+								tokenPath: json.tokenPath || prev.tokenPath
+							};
+						});
+					}).catch(function() {});
+				};
+				load();
+				var timer = window.setInterval(load, 8e3);
+				return function() {
+					disposed = true;
+					window.clearInterval(timer);
+				};
+			}, []);
+			var loginDomainFromUrl = function(url) {
+				try {
+					var host = new URL(url).hostname;
+					if (!host || host === "localhost") return host || "";
+					var parts = host.split(".");
+					return parts.length > 2 ? parts.slice(-2).join(".") : host;
+				} catch (e) {
+					return "";
+				}
+			};
+			var startChromeLogin = function() {
+				if (chromeLogin.busy) return;
+				if (!chromeLogin.paired) {
+					fetch("/api/ego/login-extension/pair-code", {
+						method: "POST",
+						headers: { "content-type": "application/json" },
+						body: "{}"
+					}).then(function(r) {
+						return r.json();
+					}).then(function(json) {
+						if (json && json.ok) {
+							setPairOpen(true);
+							setChromeLogin(function(prev) {
+								return {
+									...prev,
+									code: json.code || "",
+									expiresAt: json.expiresAt || 0,
+									port: json.port || prev.port,
+									message: ""
+								};
+							});
+						} else setChromeLogin(function(prev) {
+							return {
+								...prev,
+								message: json && json.error || "无法启动 Chrome 登录桥接"
+							};
+						});
+					}).catch(function(err) {
+						setChromeLogin(function(prev) {
+							return {
+								...prev,
+								message: String(err && err.message || err)
+							};
+						});
+					});
+					return;
+				}
+				var domain = loginDomainFromUrl(state.currentSpace && state.currentSpace.url);
+				if (!domain) {
+					setChromeLogin(function(prev) {
+						return {
+							...prev,
+							message: wt("chromeLoginNoPage")
+						};
+					});
+					return;
+				}
+				setChromeLogin(function(prev) {
+					return {
+						...prev,
+						busy: true,
+						message: wt("chromeLoginWaiting")
+					};
+				});
+				fetch("/api/ego/login-extension/import", {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({ domains: [domain] })
+				}).then(function(r) {
+					return r.json();
+				}).then(function(json) {
+					if (!json || json.ok !== true || !json.jobId) throw new Error(json && json.error || "无法启动导入");
+					var jobId = json.jobId;
+					var started = Date.now();
+					var tick = function() {
+						fetch("/api/ego/login-extension/status?id=" + encodeURIComponent(jobId), { cache: "no-store" }).then(function(r) {
+							return r.json();
+						}).then(function(status) {
+							if (status && status.state === "done" && status.report) {
+								var report = status.report;
+								setChromeLogin(function(prev) {
+									return {
+										...prev,
+										busy: false,
+										message: report.ok ? wt("chromeLoginDone").replace("{n}", String(report.written || 0)).replace("{domain}", domain) : report.error || wt("chromeLoginFailed")
+									};
+								});
+							} else if (Date.now() - started > 125e3) setChromeLogin(function(prev) {
+								return {
+									...prev,
+									busy: false,
+									message: wt("chromeLoginTimeout")
+								};
+							});
+							else window.setTimeout(tick, 800);
+						}).catch(function() {
+							window.setTimeout(tick, 1200);
+						});
+					};
+					window.setTimeout(tick, 500);
+				}).catch(function(err) {
+					setChromeLogin(function(prev) {
+						return {
+							...prev,
+							busy: false,
+							message: String(err && err.message || err)
+						};
+					});
+				});
+			};
+			var presetState = React.useState(false);
+			var presetOpen = presetState[0];
+			var setPresetOpen = presetState[1];
+			var noticeState = React.useState("");
+			var sizeNotice = noticeState[0];
+			var setSizeNotice = noticeState[1];
+			var presetRef = React.useRef(null);
+			var PRESETS = [
+				{
+					label: "16:9",
+					ratio: 16 / 9
+				},
+				{
+					label: "4:3",
+					ratio: 4 / 3
+				},
+				{
+					label: "21:9",
+					ratio: 21 / 9
+				},
+				{
+					label: "1:1",
+					ratio: 1
+				},
+				{
+					label: "9:16",
+					ratio: 9 / 16
+				}
+			];
+			var noteSizeResult = function(status, parsed) {
+				if (status === 400 || status === 404) setSizeNotice(wt("sizeApiOutdated"));
+				else if (parsed && parsed.ok === true) setSizeNotice("");
+			};
+			var applyPreset = function(ratio) {
+				setPresetOpen(false);
+				fetch("/api/ego/window-size", {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({ aspect: ratio })
+				}).then(function(r) {
+					return r.json().catch(function() {
+						return null;
+					}).then(function(parsed) {
+						noteSizeResult(r.status, parsed);
+						if (parsed && parsed.ok === true && parsed.viewport && controller.liveImgTargetId) controller.noteViewport(controller.liveImgTargetId, parsed.viewport.width, parsed.viewport.height);
+						return parsed;
+					});
+				}).catch(function() {
+					return null;
+				});
+			};
+			React.useEffect(function() {
+				if (!presetOpen) return;
+				var onDoc = function(event) {
+					var menu = presetRef.current;
+					if (menu && event.target instanceof Node && menu.contains(event.target)) return;
+					setPresetOpen(false);
+				};
+				document.addEventListener("pointerdown", onDoc, true);
+				return function() {
+					document.removeEventListener("pointerdown", onDoc, true);
+				};
+			}, [presetOpen]);
+			var beginResize = function(axis) {
+				return function(event) {
+					event.preventDefault();
+					event.stopPropagation();
+					var startX = event.clientX;
+					var startY = event.clientY;
+					var sentX = 0;
+					var sentY = 0;
+					var lastAt = 0;
+					var inFlight = false;
+					var sendStep = function(stepX, stepY) {
+						var payload = {};
+						if (Math.abs(stepX) >= 1) payload.delta = Math.round(stepX);
+						if (Math.abs(stepY) >= 1) payload.dy = Math.round(stepY);
+						if (payload.delta === void 0 && payload.dy === void 0) return;
+						fetch("/api/ego/window-size", {
+							method: "POST",
+							headers: { "content-type": "application/json" },
+							body: JSON.stringify(payload)
+						}).then(function(r) {
+							return r.json().catch(function() {
+								return null;
+							}).then(function(parsed) {
+								noteSizeResult(r.status, parsed);
+								if (parsed && parsed.ok === true && parsed.viewport && controller.liveImgTargetId) controller.noteViewport(controller.liveImgTargetId, parsed.viewport.width, parsed.viewport.height);
+								return parsed;
+							});
+						}).catch(function() {
+							return null;
+						}).finally(function() {
+							inFlight = false;
+						});
+					};
+					var onMove = function(ev) {
+						var dxTotal = axis === "y" ? 0 : ev.clientX - startX;
+						var dyTotal = axis === "x" ? 0 : ev.clientY - startY;
+						var stepX = dxTotal - sentX;
+						var stepY = dyTotal - sentY;
+						if (Math.abs(stepX) < 3 && Math.abs(stepY) < 3) return;
+						var now = Date.now();
+						if (inFlight || now - lastAt < 120) return;
+						inFlight = true;
+						lastAt = now;
+						sentX = dxTotal;
+						sentY = dyTotal;
+						sendStep(stepX, stepY);
+					};
+					var onUp = function() {
+						document.removeEventListener("pointermove", onMove);
+						document.removeEventListener("pointerup", onUp);
+						document.removeEventListener("pointercancel", onUp);
+					};
+					document.addEventListener("pointermove", onMove);
+					document.addEventListener("pointerup", onUp);
+					document.addEventListener("pointercancel", onUp);
+				};
+			};
 			var bindLiveImg = function(el) {
 				imgRef.current = el;
 				if (el && state.currentTargetId != null && (controller.liveImg !== el || controller.liveImgTargetId !== state.currentTargetId)) {
 					controller.setLiveImg(el, state.currentTargetId);
 					controller.noteWired();
 				}
+				if (sizeSyncOn) sizeSync.attach(el);
 			};
 			var bindLiveVideo = function(el) {
 				videoRef.current = el;
@@ -4041,7 +3612,22 @@ window.__ModuleLoader__.load({
 					controller.setLiveVideo(el, state.currentTargetId);
 					controller.noteWired();
 				}
+				if (el) controller.setLiveBuffers(null);
+				if (sizeSyncOn) sizeSync.attach(el);
 			};
+			var liveBuffersRef = React.useRef([null, null]);
+			var syncLiveBuffersRef = React.useRef(function() {
+				var list = liveBuffersRef.current;
+				controller.setLiveBuffers(list[0] && list[1] ? [list[0], list[1]] : null);
+			});
+			var bindLiveBufA = React.useRef(function(el) {
+				liveBuffersRef.current[0] = el;
+				syncLiveBuffersRef.current();
+			});
+			var bindLiveBufB = React.useRef(function(el) {
+				liveBuffersRef.current[1] = el;
+				syncLiveBuffersRef.current();
+			});
 			React.useEffect(function() {
 				controller.start();
 				return function() {
@@ -4049,8 +3635,57 @@ window.__ModuleLoader__.load({
 				};
 			}, [controller]);
 			React.useEffect(function() {
-				controller.setVisible(visible);
+				var root = rootRef.current;
+				if (!root || !controller) return;
+				var dpr = typeof window !== "undefined" && window.devicePixelRatio || 1;
+				var update = function() {
+					var width = root.clientWidth;
+					if (!(width > 0)) return;
+					var next = Math.max(480, Math.min(1280, Math.round(width * dpr * 1.15)));
+					if (next === controller.maxWidthHint) return;
+					controller.maxWidthHint = next;
+					controller.scheduleMaxWidthRefresh();
+				};
+				update();
+				var observer = null;
+				if (typeof ResizeObserver !== "undefined") try {
+					observer = new ResizeObserver(update);
+					observer.observe(root);
+				} catch (e) {
+					observer = null;
+				}
+				return function() {
+					if (observer) try {
+						observer.disconnect();
+					} catch (e) {}
+				};
 			}, [visible, controller]);
+			React.useEffect(function() {
+				controller.setVisible(visible && !document.hidden);
+			}, [visible, controller]);
+			React.useEffect(function() {
+				var onVisibility = function() {
+					controller.setVisible(!!visibleRef.current && !document.hidden);
+				};
+				document.addEventListener("visibilitychange", onVisibility);
+				return function() {
+					document.removeEventListener("visibilitychange", onVisibility);
+				};
+			}, [controller]);
+			React.useEffect(function() {
+				if (!visible) sizeSync.attach(null);
+				else sizeSync.attach(imgRef.current || videoRef.current);
+			}, [
+				visible,
+				sizeSync,
+				state.currentTargetId,
+				state.streamGeneration
+			]);
+			React.useEffect(function() {
+				return function() {
+					sizeSync.dispose();
+				};
+			}, [sizeSync]);
 			React.useEffect(function() {
 				if (imgRef.current && state.currentTargetId != null) controller.setLiveImg(imgRef.current, state.currentTargetId);
 				if (videoRef.current && state.currentTargetId != null) controller.setLiveVideo(videoRef.current, state.currentTargetId);
@@ -4078,7 +3713,21 @@ window.__ModuleLoader__.load({
 				state.streamGeneration
 			]);
 			var h = React.createElement;
-			var header = h("div", { className: "dsh-ego-side-head" }, h("span", { className: "dsh-ego-side-title" }, h("span", { dangerouslySetInnerHTML: { __html: ICON_GLOBE } }), h("span", { style: { marginLeft: "5px" } }, state.busy ? wt("titleLive") : wt("title"))), h("button", {
+			var icon = function(svg) {
+				return h("span", {
+					className: "dsh-ego-side-btnico",
+					dangerouslySetInnerHTML: { __html: svg }
+				});
+			};
+			var streamText = (state.backend === "ffmpeg" ? "FFmpeg · H.264" : "CDP") + " · " + (state.streamState === "failed" ? state.streamMessage || wt("failed") : state.streamState) + (state.currentTargetId ? state.wiringStale ? " · " + wt("stale") : " · " + wt("captured") : "");
+			var executorText = residentInfo ? residentInfo.mode === "resident" ? wt("executorResident") + (residentInfo.ageMs ? " " + Math.round(residentInfo.ageMs / 6e4) + "m" : "") : residentInfo.parked ? wt("executorParked") : residentInfo.mode === "starting" ? wt("executorStarting") : wt("executorOneShot") : "";
+			var header = h("div", { className: "dsh-ego-side-head" }, h("span", { className: "dsh-ego-side-title" }, h("span", { dangerouslySetInnerHTML: { __html: ICON_AGENT_BROWSER } }), h("span", { style: { marginLeft: "5px" } }, state.busy ? wt("titleLive") : wt("title"))), h("button", {
+				className: "dsh-ego-side-back dsh-ego-side-loginbtn dsh-ego-side-loginbtn-head" + (chromeLogin.paired ? " dsh-ego-side-loginbtn-ready" : "") + (chromeLogin.busy ? " dsh-ego-side-loginbtn-busy" : ""),
+				type: "button",
+				title: chromeLogin.message || wt("chromeLoginHint"),
+				disabled: chromeLogin.busy,
+				onClick: startChromeLogin
+			}, icon(chromeLogin.paired ? ICON_LOCK : ICON_KEY), chromeLogin.busy ? wt("chromeLoginWaiting") : chromeLogin.paired ? wt("chromeLoginReuse") : wt("chromeLoginConnect")), h("button", {
 				className: "dsh-ego-side-iconbtn" + (state.busy ? " spinning" : ""),
 				title: wt("refresh"),
 				onClick: function() {
@@ -4091,11 +3740,38 @@ window.__ModuleLoader__.load({
 					controller.toggleHistory();
 				}
 			}, h("span", { dangerouslySetInnerHTML: { __html: ICON_CLOCK } })));
+			var pairbox = pairOpen ? h("div", { className: "dsh-ego-side-pairbox" }, h("div", { className: "dsh-ego-side-pairhead" }, h("span", null, wt("chromeLoginPairTitle")), h("button", {
+				className: "dsh-ego-side-pairclose",
+				type: "button",
+				title: wt("chromeLoginClose"),
+				onClick: function() {
+					setPairOpen(false);
+				}
+			}, "×")), h("div", { className: "dsh-ego-side-pairstep" }, wt("chromeLoginPairStep1")), h("div", { className: "dsh-ego-side-pairstep" }, wt("chromeLoginPairStep2")), h("div", { className: "dsh-ego-side-paircode" }, chromeLogin.code || "······"), h("div", { className: "dsh-ego-side-pairstep" }, wt("chromeLoginPairStep3")), h("div", { className: "dsh-ego-side-pairpath" }, chromeLogin.extensionPath || wt("chromeLoginPathHint")), h("div", { style: {
+				display: "flex",
+				gap: "6px",
+				flexWrap: "wrap"
+			} }, h("button", {
+				className: "dsh-ego-side-back",
+				type: "button",
+				onClick: function() {
+					try {
+						navigator.clipboard.writeText(chromeLogin.extensionPath || "");
+					} catch (e) {}
+				}
+			}, wt("chromeLoginCopyPath")), !chromeLogin.paired ? h("button", {
+				className: "dsh-ego-side-back",
+				type: "button",
+				onClick: startChromeLogin
+			}, wt("chromeLoginNewCode")) : null), chromeLogin.paired ? h("div", {
+				className: "dsh-ego-side-pairstep",
+				style: { color: "#7fbf8a" }
+			}, wt("chromeLoginPaired")) : null) : null;
 			if (state.historyOpen) {
 				var sorted = state.spaces.slice().sort(function(a, b) {
 					return (a.lastActive || 0) - (b.lastActive || 0);
 				});
-				return h("div", { className: "dsh-ego-side-root" }, header, h("div", { className: "dsh-ego-side-history" }, h("div", { className: "dsh-ego-side-historyhead" }, h("span", { dangerouslySetInnerHTML: { __html: ICON_CLOCK } }), " " + wt("history")), h("div", { className: "dsh-ego-side-historylist" }, sorted.length === 0 ? h("div", { className: "dsh-ego-side-hnone" }, wt("noHistory")) : sorted.map(function(s) {
+				return h("div", { className: "dsh-ego-side-root" }, header, pairbox, h("div", { className: "dsh-ego-side-history" }, h("div", { className: "dsh-ego-side-historyhead" }, h("span", { dangerouslySetInnerHTML: { __html: ICON_CLOCK } }), " " + wt("history")), h("div", { className: "dsh-ego-side-historylist" }, sorted.length === 0 ? h("div", { className: "dsh-ego-side-hnone" }, wt("noHistory")) : sorted.map(function(s) {
 					return h("div", {
 						key: s.targetId,
 						className: "dsh-ego-side-hitem" + (s.targetId === state.currentTargetId ? " active" : ""),
@@ -4111,10 +3787,6 @@ window.__ModuleLoader__.load({
 				}))));
 			}
 			var guides = [];
-			if (state.showLoginGuide) guides.push(h(EgoLoginGuide, {
-				key: "login",
-				controller
-			}));
 			if (state.captchaKind) guides.push(h(EgoCaptchaGuide, {
 				key: "captcha",
 				kind: state.captchaKind,
@@ -4164,13 +3836,14 @@ window.__ModuleLoader__.load({
 					onDoubleClick: function(e) {
 						controller.handleDoubleClick(e);
 					}
-				}) : currentSpace.thumbnail ? h("img", {
+				}) : currentSpace.thumbnail ? h("div", { className: "dsh-ego-side-livebox" }, h("img", {
 					ref: bindLiveImg,
 					key: "liveimg",
-					className: "dsh-ego-side-liveimg",
+					className: "dsh-ego-side-liveimg dsh-ego-side-liveimg-semantic",
 					src: currentSpace.thumbnail,
 					alt: "live",
 					draggable: false,
+					decoding: "async",
 					onPointerDown: function(e) {
 						controller.handlePointerDown(e);
 					},
@@ -4186,14 +3859,28 @@ window.__ModuleLoader__.load({
 					onDoubleClick: function(e) {
 						controller.handleDoubleClick(e);
 					}
-				}) : h("div", { className: "dsh-ego-side-liveurl" }, state.streamMessage || wt("noScreenshot"));
-				body = h("div", { className: "dsh-ego-side-body" }, h("div", { className: "dsh-ego-side-liveview" }, h("div", { className: "dsh-ego-side-livebadge" }, h("span", { className: "dsh-ego-side-state-dot" + (state.pinned ? " pin" : state.busy ? " busy" : "") }), h("span", { style: { flex: 1 } }, (state.backend === "ffmpeg" ? "FFmpeg · H.264" : "CDP") + " · " + (state.streamState === "failed" ? state.streamMessage || wt("failed") : state.streamState) + (state.currentTargetId ? state.wiringStale ? " · " + wt("stale") : " · " + wt("captured") : "")), state.pinned ? h("button", {
+				}), h("img", {
+					ref: bindLiveBufA.current,
+					key: "livebuf-a",
+					className: "dsh-ego-side-liveimg dsh-ego-side-livebuf",
+					alt: "",
+					draggable: false,
+					decoding: "async"
+				}), h("img", {
+					ref: bindLiveBufB.current,
+					key: "livebuf-b",
+					className: "dsh-ego-side-liveimg dsh-ego-side-livebuf",
+					alt: "",
+					draggable: false,
+					decoding: "async"
+				})) : h("div", { className: "dsh-ego-side-liveurl" }, state.streamMessage || wt("noScreenshot"));
+				body = h("div", { className: "dsh-ego-side-body" }, h("div", { className: "dsh-ego-side-liveview" }, h("div", { className: "dsh-ego-side-livebadge" }, h("div", { className: "dsh-ego-side-statusline" }, h("span", { className: "dsh-ego-side-statuschip" }, h("span", { className: "dsh-ego-side-state-dot" + (state.pinned ? " pin" : state.busy ? " busy" : "") }), h("span", { className: "dsh-ego-side-badgestatus" }, streamText)), executorText ? h("span", { className: "dsh-ego-side-execchip" }, executorText) : null, state.pinned ? h("button", {
 					className: "dsh-ego-side-back",
 					type: "button",
 					onClick: function() {
 						controller.unpin();
 					}
-				}, wt("backToLive")) : null, h("button", {
+				}, wt("backToLive")) : null, h("span", { style: { flex: 1 } })), h("div", { className: "dsh-ego-side-actionline" }, h("div", { className: "dsh-ego-side-btngroup" }, h("button", {
 					className: "dsh-ego-side-back",
 					type: "button",
 					title: wt("openExternal"),
@@ -4201,7 +3888,7 @@ window.__ModuleLoader__.load({
 						var url = currentSpace.url;
 						if (url && !url.startsWith("about:") && !url.startsWith("chrome://")) window.open(url, "_blank", "noopener");
 					}
-				}, wt("openExternal")), h("button", {
+				}, icon(ICON_OPEN_EXTERNAL), wt("openExternal")), h("button", {
 					className: "dsh-ego-side-back",
 					type: "button",
 					title: wt("raiseWindowHint"),
@@ -4218,41 +3905,56 @@ window.__ModuleLoader__.load({
 							return null;
 						});
 					}
-				}, wt("raiseWindow"))), liveImg, h("div", { className: "dsh-ego-side-livetitle" }, currentSpace.title || currentSpace.url || wt("newTab")), h("div", { className: "dsh-ego-side-liveurl" + (state.zoomHint ? " dsh-ego-side-hint" : "") }, state.zoomHint || currentSpace.url || "")));
+				}, icon(ICON_POPOUT), wt("raiseWindow"))), h("div", { className: "dsh-ego-side-btngroup" }, h("button", {
+					className: "dsh-ego-side-back" + (sizeSyncOn ? " dsh-ego-side-back-on" : ""),
+					type: "button",
+					title: wt("sizeSyncHint"),
+					onClick: function() {
+						var next = !sizeSyncOn;
+						setSizeSyncOn(next);
+						sizeSync.setEnabled(next);
+						if (next) sizeSync.attach(imgRef.current || videoRef.current);
+					}
+				}, icon(sizeSyncOn ? ICON_LOCK : ICON_UNLOCK), sizeSyncOn ? wt("sizeSyncOn") : wt("sizeSyncOff")), h("button", {
+					className: "dsh-ego-side-back" + (presetOpen ? " dsh-ego-side-back-on" : ""),
+					type: "button",
+					title: wt("sizePresetsHint"),
+					onClick: function() {
+						setPresetOpen(!presetOpen);
+					}
+				}, icon(ICON_ASPECT), wt("sizePresets"))), presetOpen ? h("div", {
+					className: "dsh-ego-side-presets",
+					ref: presetRef
+				}, PRESETS.map(function(preset) {
+					return h("button", {
+						key: preset.label,
+						type: "button",
+						className: "dsh-ego-side-preset-item",
+						onClick: function() {
+							applyPreset(preset.ratio);
+						}
+					}, preset.label);
+				})) : null)), h("div", { className: "dsh-ego-side-stage" + (sizeSyncOn ? " dsh-ego-size-unlocked" : "") }, liveImg, h("div", {
+					className: "dsh-ego-side-resize dsh-ego-side-resize-right",
+					title: wt("resizeHint"),
+					onPointerDown: beginResize("x")
+				}), h("div", {
+					className: "dsh-ego-side-resize dsh-ego-side-resize-bottom",
+					title: wt("resizeHint"),
+					onPointerDown: beginResize("y")
+				}), h("div", {
+					className: "dsh-ego-side-resize dsh-ego-side-resize-corner",
+					title: wt("resizeHint"),
+					onPointerDown: beginResize("xy")
+				}))));
 			}
-			return h("div", { className: "dsh-ego-side-root" }, header, guides, tabsEl, body);
-		}
-		function EgoLoginGuide(props) {
-			var controller = props.controller;
-			var h = React.createElement;
-			var noteState = React.useState("");
-			var note = noteState[0], setNote = noteState[1];
-			var savingState = React.useState(false);
-			var saving = savingState[0], setSaving = savingState[1];
-			return h("div", { className: "dsh-ego-side-login" }, h("span", { className: "dsh-ego-side-login-txt" }, wt("loginTitle")), h("button", {
-				className: "dsh-ego-side-login-btn" + (saving ? " saving" : ""),
-				type: "button",
-				disabled: saving,
-				onClick: function() {
-					setSaving(true);
-					setNote("");
-					controller.flushLogin().then(function(j) {
-						if (j && j.ok) setNote(wt("loginSaved", { n: j.total || "" }));
-						else setNote(j && j.error ? wt("loginNotConnected") : wt("loginFailed"));
-					}).catch(function() {
-						setNote(wt("loginFailed"));
-					}).finally(function() {
-						setSaving(false);
-					});
-				}
-			}, saving ? wt("loginSaving") : wt("loginBtn")), note ? h("span", { className: "dsh-ego-side-login-note" }, note) : null, h("button", {
-				className: "dsh-ego-side-iconbtn",
-				type: "button",
-				title: wt("loginDismiss"),
-				onClick: function() {
-					controller.dismissGuide("login");
-				}
-			}, "×"));
+			return h("div", {
+				className: "dsh-ego-side-root",
+				ref: rootRef
+			}, header, guides, tabsEl, currentSpace ? h("div", { className: "dsh-ego-side-pageinfo dsh-ego-side-pageinfo-tabs" }, h("span", {
+				className: "dsh-ego-side-livetitle",
+				title: currentSpace.title || currentSpace.url || ""
+			}, currentSpace.title || currentSpace.url || wt("newTab")), h("span", { className: "dsh-ego-side-liveurl" + (state.zoomHint || sizeNotice ? " dsh-ego-side-hint" : "") }, sizeNotice || state.zoomHint || currentSpace.url || "")) : null, chromeLogin.message && !pairOpen ? h("div", { className: "dsh-ego-side-pagemessage" }, chromeLogin.message) : null, body, pairbox);
 		}
 		function EgoCaptchaGuide(props) {
 			var controller = props.controller;
@@ -4267,31 +3969,9 @@ window.__ModuleLoader__.load({
 				}
 			}, "×"));
 		}
-		function mountSidebarTab(ctx, betterSidebar) {
-			if (!betterSidebar) return function() {};
-			var styleEl = document.createElement("style");
-			styleEl.textContent = TAB_CSS;
-			document.head.appendChild(styleEl);
-			var disposeTab = betterSidebar.registerTab({
-				id: "ego-browser:watch",
-				title: function() {
-					return wt("title");
-				},
-				order: 70,
-				single: true,
-				component: EgoBrowserTab
-			});
+		function startWatchProbe(openWatchTab) {
 			var probeDisposed = false;
 			var baseline = null;
-			var autoOpened = {};
-			var openWatchTab = function(sessionId) {
-				var key = sessionId || "";
-				if (autoOpened[key] === true) return;
-				autoOpened[key] = true;
-				try {
-					betterSidebar.openTab({ type: "ego-browser:watch" }, sessionId ? { sessionId } : void 0);
-				} catch (e) {}
-			};
 			(async function() {
 				if (probeDisposed) return;
 				try {
@@ -4347,18 +4027,144 @@ window.__ModuleLoader__.load({
 					offProbeRelay();
 				} catch (e) {}
 				closeProbeSse();
+			};
+		}
+		function mountSidebarTab(ctx, betterSidebar) {
+			if (!betterSidebar) return function() {};
+			var styleEl = document.createElement("style");
+			styleEl.textContent = TAB_CSS;
+			document.head.appendChild(styleEl);
+			var disposeTab = betterSidebar.registerTab({
+				id: "ego-browser:watch",
+				title: function() {
+					return wt("title");
+				},
+				order: 70,
+				single: true,
+				component: EgoBrowserTab
+			});
+			var autoOpened = {};
+			var openWatchTab = function(sessionId) {
+				var key = sessionId || "";
+				if (autoOpened[key] === true) return;
+				autoOpened[key] = true;
+				try {
+					betterSidebar.openTab({ type: "ego-browser:watch" }, sessionId ? { sessionId } : void 0);
+				} catch (e) {}
+			};
+			var closeProbe = startWatchProbe(openWatchTab);
+			return function() {
+				closeProbe();
 				disposeTab();
 				styleEl.remove();
 			};
 		}
-		function escapeHtml(s) {
-			return String(s).replace(/[&<>"']/g, (c) => ({
-				"&": "&amp;",
-				"<": "&lt;",
-				">": "&gt;",
-				"\"": "&quot;",
-				"'": "&#39;"
-			})[c]);
+		var NATIVE_WATCH_ID = "dsh-ego-browser:watch";
+		var NATIVE_WATCH_KIND = "ego-browser:watch";
+		function EgoNativeWatchBody(props) {
+			var info = props.useTabInfo();
+			var visible = !!(info && info.tab && info.tab.visible);
+			return React.createElement(EgoBrowserTab, {
+				visible,
+				ctx: props.ctx
+			});
+		}
+		function EgoWatchIcon(props) {
+			var size = props && typeof props.size === "number" ? props.size : 16;
+			var h = React.createElement;
+			return h("svg", {
+				width: size,
+				height: size,
+				viewBox: "0 0 16 16",
+				fill: "none",
+				xmlns: "http://www.w3.org/2000/svg",
+				className: props && props.className,
+				"aria-hidden": "true"
+			}, h("rect", {
+				x: 1.2,
+				y: 2.4,
+				width: 13.6,
+				height: 11.2,
+				rx: 2.4,
+				stroke: "currentColor",
+				strokeWidth: 1.2
+			}), h("path", {
+				d: "M1.4 5.9h13.2",
+				stroke: "currentColor",
+				strokeWidth: 1.2,
+				strokeLinecap: "round"
+			}), h("circle", {
+				cx: 3.7,
+				cy: 4.15,
+				r: .6,
+				fill: "currentColor"
+			}), h("circle", {
+				cx: 5.5,
+				cy: 4.15,
+				r: .6,
+				fill: "currentColor"
+			}), h("path", {
+				d: "M8.2 7.0L12.6 10.6L10.6 10.9L11.7 13.2L10.6 13.8L9.5 11.5L8.0 13.1Z",
+				fill: "currentColor"
+			}));
+		}
+		function mountNativeSidebarTab(ctx, sidebar, tabs) {
+			if (!sidebar || !tabs) return function() {};
+			var styleEl = document.createElement("style");
+			styleEl.textContent = TAB_CSS;
+			document.head.appendChild(styleEl);
+			var disposeType = tabs.register({
+				id: NATIVE_WATCH_ID,
+				kind: NATIVE_WATCH_KIND,
+				keepMounted: true,
+				priority: "extension",
+				title: function() {
+					return wt("title");
+				},
+				guide: [{
+					id: "ego-watch",
+					order: 90,
+					title: function() {
+						return wt("title");
+					},
+					icon: EgoWatchIcon
+				}]
+			});
+			var disposeBody = ctx.slots.register({
+				name: "sidebar.right.pane.tab",
+				key: NATIVE_WATCH_ID,
+				inject: function() {
+					return { ctx };
+				}
+			}, EgoNativeWatchBody);
+			var autoOpened = {};
+			var openWatchTab = function(sessionId) {
+				var key = sessionId || "";
+				if (autoOpened[key] === true) return;
+				var showing;
+				try {
+					var m = sidebar.mounted;
+					showing = m && typeof m.getSnapshot === "function" ? m.getSnapshot() : void 0;
+				} catch (e) {
+					showing = void 0;
+				}
+				if (sessionId && showing !== void 0 && showing !== sessionId) return;
+				try {
+					sidebar.openTab(NATIVE_WATCH_KIND);
+					autoOpened[key] = true;
+				} catch (e) {}
+			};
+			var closeProbe = startWatchProbe(openWatchTab);
+			return function() {
+				closeProbe();
+				try {
+					disposeBody();
+				} catch (e) {}
+				try {
+					disposeType();
+				} catch (e) {}
+				styleEl.remove();
+			};
 		}
 		const name = "ego-browser";
 		//#endregion

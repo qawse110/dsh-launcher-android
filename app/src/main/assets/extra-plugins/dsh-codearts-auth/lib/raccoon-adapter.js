@@ -19,7 +19,7 @@
  *    缺了它会退化为裸 id（AGENTS.md 记录的真实缺陷）。
  */
 import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
-import { createModelCatalog } from './model-catalog.js';
+import { createModelCatalog, isCatalogFresh, isCatalogFreshFor } from './model-catalog.js';
 import { RemoteCatalogGate } from './remote-catalog-gate.js';
 import { broadcastCatalogChanged } from './catalog-broadcast.js';
 import { isRaccoonExpired } from './raccoon.js';
@@ -73,6 +73,44 @@ export function raccoonThinkingExtraBody(effort) {
     return { thinking: { type } };
 }
 /**
+ * 从「已声明的档位」里挑出**默认档**（Issue IKLIDV 的方向取反修复）。
+ *
+ * ## 为什么单独抽成入参化的纯函数
+ *
+ * 原实现的兜底分支是 `RACCOON_REASONING_EFFORTS[0] ?? RACCOON_EFFORT_ON`
+ * —— 把「数组第一项」当成了「默认档」。那个等价关系**只在旧顺序下偶然成立**
+ *（`['on','off']` 的首项恰是 `on`）。顺序按强度序规整成 `['off','on']` 后，
+ * 该分支会静默回退成 **`off`（关闭思考）**：与「实测服务端默认即开启」相反，
+ * 且是无人察觉的行为变更。
+ *
+ * ⚠️ **该分支在生产里不可达**（`RACCOON_DEFAULT_EFFORT` 恒在列表内）
+ * ⇒ 任何「喂真实常量」的断言都**恒真**，抓不到它。
+ * 故这里把 `declared` / `preferred` 都做成**入参**，让用例能构造
+ * 「首选档不在列表里」这一格，从而真正锁住兜底方向。
+ *
+ * ⚠️ 兜底值是**语义上正确的「开启」**，与顺序彻底解耦：
+ * 有序数组的下标表达位置，不表达语义。
+ *
+ * ⚠️⚠️ **取舍（已实测，审计登记）**：兜底值 `RACCOON_EFFORT_ON` 可能**不在
+ * `declared` 里**（若将来有人把该常量删掉）。那一刻新旧两种写法的失败形态不同：
+ * - 旧式 `declared[0]`：返回值**恒在列表内**，但会静默给出 `off`（**错档**）；
+ * - 本式：返回列表外的 `on` ⇒ `dsh-llm` 的 `normalizeModelInfo` 抛
+ *   **`INVALID_MODEL_REASONING`**（**响亮报错**，实测确认）。
+ *
+ * 本函数**刻意选后者**：这是「静默给错档」与「响亮的配置错误」之间的取舍，
+ * 而后者更容易被发现。⚠️ 又因该分支**生产不可达**（`RACCOON_DEFAULT_EFFORT`
+ * 恒在列表内），这个取舍当前无任何现实影响 —— 记在这里是为了避免下一个人
+ * 看到「返回值可能不在列表内」时误以为是漏了防御而改回去。
+ *
+ * @param declared - 该模型声明的档位 id。
+ * @param preferred - 期望的默认档。
+ * @returns `preferred`（若它确实被声明），否则为 `RACCOON_EFFORT_ON`（**可能不在
+ *   `declared` 内** —— 见上方取舍）。
+ */
+export function raccoonDefaultEffort(declared, preferred) {
+    return declared.includes(preferred) ? preferred : RACCOON_EFFORT_ON;
+}
+/**
  * 该模型在 UI 上可选的思考档位。
  *
  * ⚠️ **所有模型都返回同样两档** —— 实测 `extra_body.thinking` 是 **provider 级
@@ -86,10 +124,7 @@ export function raccoonReasoningInfo() {
         id: ReasoningEffortId(id),
         name: RACCOON_EFFORT_NAMES[id] ?? id,
     }));
-    // ⚠️ 默认档必须确实在列表里（防御：常量被改乱时不至于抛错）
-    const defaultEffort = RACCOON_REASONING_EFFORTS.includes(RACCOON_DEFAULT_EFFORT)
-        ? ReasoningEffortId(RACCOON_DEFAULT_EFFORT)
-        : ReasoningEffortId(RACCOON_REASONING_EFFORTS[0] ?? RACCOON_EFFORT_ON);
+    const defaultEffort = ReasoningEffortId(raccoonDefaultEffort(RACCOON_REASONING_EFFORTS, RACCOON_DEFAULT_EFFORT));
     return { efforts, defaultEffort };
 }
 /**
@@ -242,6 +277,14 @@ export class RaccoonAdapter extends LlmAdapter {
     fallbackIndex;
     /** 远端模型缓存；未拉取时为 undefined。 */
     remoteModels;
+    /**
+     * ⚠️ 上次**成功**读到远端目录的时刻（0 = 从未成功过）。
+     *
+     * ⚠️ 与 `remoteModels` **并存**、不是替代：`remoteModels` 存「有哪些模型」，
+     *    本字段存「何时读到的」。两者缺一都会坏：只有 `remoteModels` 则目录永不更新
+     *    （现状）；只有 `catalogAt` 则无内容可展示。
+     */
+    catalogAt = 0;
     /** 目录加载闸门：并发去重 + 失败/空结果冷却（见 `remote-catalog-gate.ts`）。 */
     catalogGate;
     /**
@@ -265,6 +308,17 @@ export class RaccoonAdapter extends LlmAdapter {
             // ⚠️ 未知 id 保守报 ['text']（宁可少报能力，也不报服务端可能不认的模态）。
             unknownModelInputModalities: () => ['text'],
             syncCatalog: () => this.syncCatalogEntries(),
+            /**
+             * ★ **强制重拉**（供后台 20 分钟刷新器与「用户改设置」）。
+             *
+             * ⚠️ 与 `loadCatalog` 的差别：后者内部有 `isCatalogFresh` 判据 ⇒ 新鲜时**不拉**。
+             * 本回调要的是「无视新鲜度，强制拉一次」，故先清时刻再调同一个方法 ——
+             * **不另写一份拉取逻辑**（那会让两条路的上游行为分叉）。
+             */
+            refresh: async () => {
+                this.catalogAt = 0;
+                await this.loadModels();
+            },
         });
     }
     /**
@@ -287,6 +341,20 @@ export class RaccoonAdapter extends LlmAdapter {
      * ⚠️ **2026-10-08 Task 7a**：骨架（含上面这条理由）已上移到共享实现
      * `src/model-catalog.ts`，此处只剩委托。
      */
+    /**
+     * ★ **后台目录刷新器入口**（`src/index.ts` 的 `refreshOf` 调 `adapter.refresh?.()`）。
+     *
+     * ⚠️⚠️ 必须由适配器**显式转发** `catalog.refresh`：`ModelCatalog`（`model-catalog.ts`）
+     *    上的这个成员**不会**自动变成适配器的成员 —— `pruned()` 的 Proxy 只透传
+     *    **适配器自己的**成员（`dead-model-store.ts:748-749`）。
+     *    漏转发 ⇒ 刷新器「已武装」却对这家**空转**，且**零日志**（`refreshOf` 返回
+     *    `undefined` 时静默跳过 —— `index.ts` 的装配注释写着这件事）。
+     *    ⚠️ 与 `options.refresh`（HTTP 401 后的**凭据**重取）**不是同一件事**，
+     *    两者同名纯属巧合，**不得合并**。
+     */
+    async refresh() {
+        await this.catalog.refresh?.();
+    }
     listAllModels() {
         return this.catalog.listAllModels();
     }
@@ -332,8 +400,23 @@ export class RaccoonAdapter extends LlmAdapter {
      * 并用 {@link RemoteCatalogGate} 的冷却挡住「每模型重试一次」的放大。
      */
     async loadModels() {
-        if (this.remoteModels !== undefined)
+        // ⚠️⚠️ **两处判据都要改**（方法入口 + gate 后复查）。只改入口的话，
+        //    第二次复查会把「刚拉到的」当成陈旧而再拉一次（放大成每轮两次上游请求）。
+        //
+        // ⚠️ 判据来源：`isCatalogFresh`（`model-catalog.ts` 的**唯一**实现）；聚合
+        //    那条缓存短路（`aggregate-adapter.ts` 的 `refreshCatalog`）也走它。
+        //    ⚠️ **不是「逐字相同」**：那边另有两处本家没有的前提（`force` 与
+        //    `options.catalogTtlMs` 覆盖的 60s TTL），本家用的是 20 分钟默认周期。
+        //
+        // ⚠️ 第 ① 处（方法入口）用 `isCatalogFreshFor`：用户在 Jet Hub 改开关后要
+        //    **立即**重拉（规格 §6 的正确性要求，见 `invalidateCatalogCache`）。
+        //    ⚠️ 第 ② 处（gate 之后复查）**刻意仍用 `isCatalogFresh`**：那里问的是
+        //    「手上这份旧读数还能不能用」—— 若也判失效，一次失败的拉取会把**完整旧
+        //    目录**判成不可用 ⇒ 回落兜底表（子集）⇒ 用户看到「模型反而变少」。
+        if (this.remoteModels !== undefined
+            && isCatalogFreshFor(this.product.id, this.catalogAt, this.options.now?.() ?? Date.now())) {
             return this.remoteModels;
+        }
         const fetchRemote = this.options.fetchRemoteModels;
         if (fetchRemote !== undefined) {
             await this.catalogGate.run(async () => {
@@ -341,10 +424,15 @@ export class RaccoonAdapter extends LlmAdapter {
                 if (fetched.length === 0)
                     return false;
                 this.remoteModels = fetched;
+                // ⚠️ **只在成功时**记时刻：失败不写，否则一次抖动会把上界刷新掉、
+                //    下轮还要等满 20 分钟才发现上游没恢复。
+                this.catalogAt = this.options.now?.() ?? Date.now();
                 return true;
             });
-            if (this.remoteModels !== undefined)
+            if (this.remoteModels !== undefined
+                && isCatalogFresh(this.catalogAt, this.options.now?.() ?? Date.now())) {
                 return this.remoteModels;
+            }
         }
         return this.product.fallbackModels.map(fallbackToRemote);
     }

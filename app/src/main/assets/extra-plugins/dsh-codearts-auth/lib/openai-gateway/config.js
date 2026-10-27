@@ -1,6 +1,17 @@
 export const DEFAULT_GATEWAY_HOST = '127.0.0.1';
 export const DEFAULT_GATEWAY_PORT = 8326;
 /**
+ * 「允许局域网访问」设置页开关（2026-10-20）打开时的监听地址：绑全部网卡。
+ *
+ * ⚠️⚠️ 与 {@link isWildcardHost} 的关系必须说清：那个 fail-closed 闸门拦的是
+ * **env 字符串解析链上的意外通配**（不可见字符、`U+3002` 表意句号、全角数字等
+ * 三轮审计实测的绕过形态）——它防的是「用户写了个看起来无害的串，内核却绑了
+ * 全网卡」。而这里的 `'0.0.0.0'` 是**程序内字面量**：没有解析环节、没有绕过面，
+ * 是用户在设置页里**显式**做出的选择（开关默认关闭，打开时 UI 会同步给出
+ * 暴露面警告）。两者正交，谁也不取代谁。
+ */
+export const WILDCARD_GATEWAY_HOST = '0.0.0.0';
+/**
  * 网关开关。只有**显式**的假值才停用，未设置时默认启用（保持既有行为）。
  *
  * ⚠️ 不能写成 `parseInt(raw) || 1` 这类形式：`'0'` 是**合法**的停用值，
@@ -48,6 +59,20 @@ const INVISIBLE = /[\p{Cf}\p{Cc}\p{Cs}\p{Mn}\p{Me}\p{Zs}\p{Zl}\p{Zp}]/gu;
  * {@link stripHostBrackets}，它**保留 zone id** —— 见那里的注释。
  */
 function normalizeHostForCompare(host) {
+    // ⚠️⚠️ **非字符串必须当空串**（2026-10-22 对抗审计 m-1）：
+    //   本函数是 `isWildcardHost` / `isLoopbackHost` 的**唯一归一化入口**，
+    //   而客户端（`openai-gateway-panel.js`）会拿 `status.address?.host` 直接调它。
+    //   实测：`running:true` + `address:null` 是**合法组合**（宿主侧 `running`与
+    //   `address` 是两次独立 `degrade`）⇒ `undefined.normalize()` 抛
+    //   `TypeError: Cannot read properties of undefined (reading 'normalize')`
+    //   ⇒ **整个网关状态面板直接崩**（用户只看到一片空白）。
+    //
+    // ⚠️ 归为**空串**是异常方向正确的：
+    //   - 对 `isWildcardHost`：空串 ⇒ `true`（当成通配、**拒绝**）—— fail-closed；
+    //   - 对 `isLoopbackHost`：空串 ⇒ `true`（当成回环）—— 与它“空 host 不告警”的既有语义一致。
+    //   两者都比「报 TypeError」好。
+    if (typeof host !== 'string')
+        return '';
     let value = host.normalize('NFKC').replace(INVISIBLE, '');
     // 剥方括号与端口。⚠️ `\d*`（不是 `\d+`）：`[::]:` 的空端口也要剥掉。
     const bracketed = /^\[([^\]]*)\](?::\d*)?$/.exec(value);
@@ -382,16 +407,36 @@ function resolveHost(env) {
     }
     return host;
 }
+/**
+ * env 是否**显式**给了监听 host。
+ *
+ * 「允许局域网访问」设置页开关据此判断自己会不会被覆盖：env 是运维口径，
+ * 优先级高于 UI 开关（与 `DSH_OPENAI_GATEWAY_ENABLED` 优先于设置页开关同一
+ * 取向，见 `runtime.ts` 的注释）。开关打开但 env 给了 host 时，UI 必须明说
+ * 「这个开关此刻不生效」，否则又是一个「打开了却没反应」。
+ */
+export function isGatewayHostFromEnv(env = process.env) {
+    const raw = env.DSH_OPENAI_GATEWAY_HOST;
+    return raw !== undefined && raw.trim() !== '';
+}
 /** 解析本机网关配置，地址/端口错误时显式失败，避免静默换端口或静默监听全网卡。 */
-export function resolveGatewayConfig(env = process.env) {
+export function resolveGatewayConfig(env = process.env, options = {}) {
     const host = resolveHost(env);
     const rawPort = env.DSH_OPENAI_GATEWAY_PORT;
-    if (rawPort === undefined || rawPort.trim() === '') {
-        return { host, port: DEFAULT_GATEWAY_PORT };
-    }
-    const port = Number.parseInt(rawPort, 10);
-    if (!Number.isInteger(port) || port < 1 || port > 65535 || String(port) !== rawPort.trim()) {
-        throw new Error('DSH_OPENAI_GATEWAY_PORT 必须是 1 到 65535 之间的整数');
+    const port = (() => {
+        if (rawPort === undefined || rawPort.trim() === '')
+            return DEFAULT_GATEWAY_PORT;
+        const parsed = Number.parseInt(rawPort, 10);
+        if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535 || String(parsed) !== rawPort.trim()) {
+            throw new Error('DSH_OPENAI_GATEWAY_PORT 必须是 1 到 65535 之间的整数');
+        }
+        return parsed;
+    })();
+    // 「允许局域网访问」开关：仅当 env 没有显式给 host 时生效（env 优先）。
+    // ⚠️ 刻意放在 resolveHost 之后：env 里的通配值仍会被闸门拒绝——开关只能
+    // **显式**选择通配，不能让任何字符串解析链「顺便」通配。
+    if (options.allowLan === true && !isGatewayHostFromEnv(env)) {
+        return { host: WILDCARD_GATEWAY_HOST, port };
     }
     return { host, port };
 }

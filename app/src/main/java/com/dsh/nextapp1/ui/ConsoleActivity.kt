@@ -410,14 +410,17 @@ class ConsoleActivity : AppCompatActivity() {
      *
      * ⚠ **必须把发现的版本写到 dsh_install_tag**（原实现漏了这一步，是真机可复现的缺陷）：
      * DshFlow 决定装哪个版本时读的是 prefs 里的 dsh_install_tag，缺省回落到**钉死版本**
-     * （assets/dsh-pin.json）。所以只调 checkRemote 而不写 tag 的话，流程会拿钉死版本去
+     * （assets/dsh-pin.json）。所以只调检查函数而不写 tag 的话，流程会拿钉死版本去
      * npm 装 —— 检查到的那个新版本**根本不会被安装**，用户看到「发现新版本」却装了个旧版，
      * 点了个寂寞。「更新 next」按钮（见 startUpdateCheckNext）一直是正确写法，本函数对齐它。
+     *
+     * 检查改用 [DshUpdater.checkRemoteForChannel]：本仓跟随 next 线（钉死版本号本身是预发布），
+     * 只查 latest 会永远回「已是新版」——真机表现为「检查不到最新更新」，而 next 线已有 0.2.1-rc.4。
      */
     private fun startUpdateCheck(force: Boolean, onLog: ((String) -> Unit)? = null) {
         val log: (String) -> Unit = onLog ?: { appendLine(it) }
         thread {
-            val version = DshUpdater.checkRemote(this, force, log)
+            val version = DshUpdater.checkRemoteForChannel(this, force, log)
             if (version != null) {
                 log("发现 dsh v$version，重启流程执行 npm 官方更新…")
                 // 传下去的是**精确版本号**而非 "latest"：检查与安装之间若 registry 又发了新版，

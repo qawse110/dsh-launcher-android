@@ -28,16 +28,29 @@
  * 静默丢弃会让用户以为图片被模型看到了。
  */
 import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
-import { createModelCatalog } from './model-catalog.js';
+import { createModelCatalog, isCatalogFresh, isCatalogFreshFor } from './model-catalog.js';
 import { RemoteCatalogGate } from './remote-catalog-gate.js';
 import { broadcastCatalogChanged } from './catalog-broadcast.js';
 import { httpErrorCode, collectImages } from './openai-compat.js';
 import { MINIMAX, MINIMAX_INFER_PATH } from './minimax-product.js';
-import { minimaxInferHeaders } from './minimax.js';
+import { describeMinimaxGeoRoute, minimaxInferHeadersFor } from './minimax.js';
 import { planSessionTitleThinking } from './session-title.js';
 import { registerAdapterIdempotent, } from './llm-register-compat.js';
 import { buildMinimaxMessagesPayload, consumeMinimaxSse, } from './minimax-messages.js';
-import { isMinimaxExpired, minimaxFallbackEntries, } from './minimax.js';
+import { isMinimaxExpiringWithin, minimaxFallbackEntries, minimaxFetch, } from './minimax.js';
+/**
+ * 请求前预判的**最小剩余有效期**（2026-10-24 本地试验版）。
+ *
+ * 旧判据是 `isMinimaxExpired`（已过期才续）—— 401 都发出去一轮了才补。
+ * 改成「剩余不足 60s 就先续」，与官方 `oauth-core` 的
+ * `getAccessToken({minValidityMs})` 同语义：让 token 在**临死前**换新，
+ * 而不是让用户的请求撞在正在死掉的 token 上。60s 取官方 30s 的两倍宽：
+ * 一次续期 grant 实测 ~300ms，60s 足够覆盖慢网络下的整轮续期。
+ *
+ * ⚠️ 巡检（60s tick、5min margin）正常在跑时，这里的命中应**接近于零**；
+ * 命中变多说明巡检没跟上（宿主刚唤醒 / 巡检被阻塞），它兜的是那个底。
+ */
+const MINIMAX_ONDEMAND_MIN_VALIDITY_MS = 60_000;
 /**
  * 前缀识别「必须 adaptive thinking」的模型。
  *
@@ -67,20 +80,11 @@ const MINIMAX_ADAPTIVE_ONLY_PREFIX = 'MiniMax-M3.1';
  * —— 而它**实际可以开关思考**（真机实测）。那是**功能缺失**：
  * 用户在 UI 上无法为 M3 关闭思考。
  *
- * 修法（照 Qoder `qoderEffortsFor` 的既有口径）：
- * - `efforts` 取远端 `effort_options`（只有 M3.1 有）；
- * - `thinkingMode === 'switchable'` 时**追加 `none`**（= 「关闭思考」档）
- *   —— DSH 的 `LlmModelReasoningInfo` **没有** `supportsDisable` 字段，
- *   「可关闭」就是靠 `efforts` 里出现 `none` 表达的；
- * - 两者皆无 ⇒ `undefined`（不声明）。
- *
- * ⚠️ `forced_on` 的模型**绝不**追加 `none`：M3.1 会硬 400，
- * M2.7 会被静默忽略（那会让用户以为关掉了、实际没关 —— 比不给选项更糟）。
- *
  * 修法（照客户端 `thinking.js` 的**权威词汇**）：
  * - `efforts` 取远端 `effort_options`（只有 M3.1 有）；
  * - `thinkingMode === 'switchable'` 时给出**开/关两态**：
- *   `on`（→ `thinking:{type:'adaptive'}`）与 `none`（→ `{type:'disabled'}`）。
+ *   `on`（→ `thinking:{type:'adaptive'}`）与 `none`（→ `{type:'disabled'}`）；
+ *   ⚠️ **数组顺序是 `none` 在前、`on` 在后**（强度序，见下）。
  *   ⚠️ 客户端用的就是 `on` / `off` 这两个词
  *   （`isMiniMaxM3ThinkingMode`：`value === 'on' || value === 'off'`），
  *   `off` 在 DSH 侧的惯用名是 `none`（Qoder 的「关闭思考」也用 `none`）；
@@ -90,6 +94,11 @@ const MINIMAX_ADAPTIVE_ONLY_PREFIX = 'MiniMax-M3.1';
  * 实测 M3 **不发 `thinking` 时默认「不思考」**（两轮各 0 字符），
  * 而 `adaptive` 有 **2785 / 2797** 字符。若只声明 `none`，用户**只能关、无法开**
  * —— 那比不给选项更糟（把模型的强项藏起来了）。
+ *
+ * ⚠️⚠️ **这两个档位的追加顺序是 `none` → `on`（强度序），不是 `on` → `none`**
+ *（Issue IKLIDV）：DSH 把 `reasoning.efforts` 当**展示顺序**、客户端**直接 `map`
+ * 不排序** ⇒ 原写法会让「开启」落在横向档位轴的最左（左强右弱）。
+ * 详见函数体内 `switchable` 分支的注释。
  *
  * ⚠️ `forced_on` 的模型**绝不**追加任何开关：M3.1 会硬 400，
  * M2.7 会被静默忽略（那会让用户以为关掉了、实际没关）。
@@ -106,14 +115,30 @@ export function minimaxReasoningInfo(entry) {
         return undefined;
     const ids = [...(options ?? [])];
     if (switchable) {
-        // ⚠️ 顺序：**先 `on` 后 `none`** —— DSH 按数组顺序渲染，
-        // 「开启」应排在「关闭」之前（默认档也由 `defaultEffort` 表达，
-        // 但 M3 远端没给 `default_effort`，故把 `on` 放前面更符合直觉）。
+        // ⚠️ 顺序：**先 `none` 后 `on`**（= 强度序，弱 → 强），Issue IKLIDV。
+        //
+        // ⚠️⚠️ 原实现是**先 `on` 后 `none`**，理由是「DSH 按数组顺序渲染，把默认档
+        // 放前面更符合直觉」。那个动机只在**纵向列表**里成立：DSH 实际把该数组当
+        // **展示顺序**（`dsh-llm/lib/types/types.d.ts`：`adapter-preferred display
+        // order`），客户端**直接 `map` 不排序**（`dsh-client-ui-model-selection`）。
+        // 一旦按数组顺序铺成**横向档位轴**，`['on','none']` 就变成「左强右弱」——
+        // 「开启」贴最左、「关闭」贴最右。强度序的权威是本仓库
+        // `REASONING_EFFORT_RANK`（`none: 0` / `on: 5`）⇒ `none` 必须在前。
+        // 同一形态在 codearts（`llm-adapter.ts`）与 raccoon（`raccoon-product.ts`）
+        // 各有一处，三处已一并按同一条规则规整。
+        //
+        // ⚠️ 默认档**不靠位置**表达：M3 远端没给 `default_effort`，故它**没有**
+        // `defaultEffort`（保持服务端默认 = 实测不思考，见下）。移动位置不改变这一点。
+        //
+        // ⚠️ 远端 `effort_options` 那段**保持原序**（如实镜像上游，不重排）——
+        // 只有这一对我们自己追加的两档按强度序排。故当远端档位存在时，
+        // 整条数组**不一定全局单调**（如 M3.1 的 `default` 本就未登记强度）；
+        // 而 M3 这种「只有我们追加的两档」的情形是全局升序的。
         // 幂等：远端若哪天自己下了这几个名字，不重复追加。
-        if (!ids.includes('on'))
-            ids.push('on');
         if (!ids.includes('none'))
             ids.push('none');
+        if (!ids.includes('on'))
+            ids.push('on');
     }
     const efforts = ids.map((id) => {
         if (id === 'none')
@@ -308,6 +333,14 @@ export class MinimaxAdapter extends LlmAdapter {
     options;
     product;
     remoteModels;
+    /**
+     * ⚠️ 上次**成功**读到远端目录的时刻（0 = 从未成功过）。
+     *
+     * ⚠️ 与 `remoteModels` **并存**、不是替代：`remoteModels` 存「有哪些模型」，
+     *    本字段存「何时读到的」。两者缺一都会坏：只有 `remoteModels` 则目录永不更新
+     *    （现状）；只有 `catalogAt` 则无内容可展示。
+     */
+    catalogAt = 0;
     /** 目录加载闸门：并发去重 + 失败/空结果冷却（见 `remote-catalog-gate.ts`）。 */
     catalogGate;
     /**
@@ -329,11 +362,42 @@ export class MinimaxAdapter extends LlmAdapter {
             // ⚠️ 未知 id 保守报 ['text']（宁可少报能力，也不报服务端可能不认的模态）。
             unknownModelInputModalities: () => ['text'],
             syncCatalog: () => this.syncCatalogEntries(),
+            /**
+             * ★ **强制重拉**（供后台 20 分钟刷新器与「用户改设置」）。
+             *
+             * ⚠️ 与 `loadCatalog` 的差别：后者内部有 `isCatalogFresh` 判据 ⇒ 新鲜时**不拉**。
+             * 本回调要的是「无视新鲜度，强制拉一次」，故先清时刻再调同一个方法 ——
+             * **不另写一份拉取逻辑**（那会让两条路的上游行为分叉）。
+             */
+            refresh: async () => {
+                this.catalogAt = 0;
+                await this.loadModels();
+            },
         });
     }
     providerInfo(provider) {
         const id = typeof provider === 'string' && provider.length > 0 ? provider : this.product.id;
         return { id, name: this.product.displayName };
+    }
+    /**
+     * 取**某个账号**该走的 fetcher（MiniMax 国际站代理支持）。
+     *
+     * ⚠️⚠️ **必须按账号现取，不能在构造 / 循环外固化**：本适配器在一轮请求内会
+     * **换号**（限流 / 额度时 `getAvailableAccount` 换人），出口必须跟着换 ——
+     * 固化一份会让换号后**仍走旧账号的出口**（症状「换了号还是被分流」，零报错）。
+     *
+     * ⚠️ 优先级：`fetchImpl`（单测替身）> `fetchFor(accountId)` > 全局 `fetch`。
+     * 未注入 `fetchFor`（中国站 / 旧接线）⇒ 恒走既有路径，**行为逐字节不变**。
+     *
+     * ⚠️ 空账号 id（`''`）= 直连：`fetchFor` 的解析器按「空 id = 没配代理」处理
+     * （见 `minimax-proxy.ts`）—— 拿不到账号时不该去查一个空 id。
+     */
+    fetcherFor(accountId) {
+        if (this.options.fetchImpl !== undefined)
+            return this.options.fetchImpl;
+        if (this.options.fetchFor !== undefined)
+            return this.options.fetchFor(accountId);
+        return fetch;
     }
     /**
      * 取远端模型目录；**失败时不把兜底表写进缓存**。
@@ -345,8 +409,23 @@ export class MinimaxAdapter extends LlmAdapter {
      * 并用 {@link RemoteCatalogGate} 的冷却挡住「每模型重试一次」的放大。
      */
     async loadModels() {
-        if (this.remoteModels !== undefined)
+        // ⚠️⚠️ **两处判据都要改**（方法入口 + gate 后复查）。只改入口的话，
+        //    第二次复查会把「刚拉到的」当成陈旧而再拉一次（放大成每轮两次上游请求）。
+        //
+        // ⚠️ 判据来源：`isCatalogFresh`（`model-catalog.ts` 的**唯一**实现）；聚合
+        //    那条缓存短路（`aggregate-adapter.ts` 的 `refreshCatalog`）也走它。
+        //    ⚠️ **不是「逐字相同」**：那边另有两处本家没有的前提（`force` 与
+        //    `options.catalogTtlMs` 覆盖的 60s TTL），本家用的是 20 分钟默认周期。
+        //
+        // ⚠️ 第 ① 处（方法入口）用 `isCatalogFreshFor`：用户在 Jet Hub 改开关后要
+        //    **立即**重拉（规格 §6 的正确性要求，见 `invalidateCatalogCache`）。
+        //    ⚠️ 第 ② 处（gate 之后复查）**刻意仍用 `isCatalogFresh`**：那里问的是
+        //    「手上这份旧读数还能不能用」—— 若也判失效，一次失败的拉取会把**完整旧
+        //    目录**判成不可用 ⇒ 回落兜底表（子集）⇒ 用户看到「模型反而变少」。
+        if (this.remoteModels !== undefined
+            && isCatalogFreshFor(this.product.id, this.catalogAt, this.options.now?.() ?? Date.now())) {
             return this.remoteModels;
+        }
         const fetchRemote = this.options.fetchRemoteModels;
         if (fetchRemote !== undefined) {
             await this.catalogGate.run(async () => {
@@ -354,10 +433,15 @@ export class MinimaxAdapter extends LlmAdapter {
                 if (fetched.length === 0)
                     return false;
                 this.remoteModels = fetched;
+                // ⚠️ **只在成功时**记时刻：失败不写，否则一次抖动会把上界刷新掉、
+                //    下轮还要等满 20 分钟才发现上游没恢复。
+                this.catalogAt = this.options.now?.() ?? Date.now();
                 return true;
             });
-            if (this.remoteModels !== undefined)
+            if (this.remoteModels !== undefined
+                && isCatalogFresh(this.catalogAt, this.options.now?.() ?? Date.now())) {
                 return this.remoteModels;
+            }
         }
         return minimaxFallbackEntries(this.product);
     }
@@ -390,6 +474,20 @@ export class MinimaxAdapter extends LlmAdapter {
      * 上面这段缺陷史也随之上移；此处只剩委托。
      * ⇒ 骨架里**同样**不能把它改成 `async`（同一个 `all is not iterable` 后果）。
      */
+    /**
+     * ★ **后台目录刷新器入口**（`src/index.ts` 的 `refreshOf` 调 `adapter.refresh?.()`）。
+     *
+     * ⚠️⚠️ 必须由适配器**显式转发** `catalog.refresh`：`ModelCatalog`（`model-catalog.ts`）
+     *    上的这个成员**不会**自动变成适配器的成员 —— `pruned()` 的 Proxy 只透传
+     *    **适配器自己的**成员（`dead-model-store.ts:748-749`）。
+     *    漏转发 ⇒ 刷新器「已武装」却对这家**空转**，且**零日志**（`refreshOf` 返回
+     *    `undefined` 时静默跳过 —— `index.ts` 的装配注释写着这件事）。
+     *    ⚠️ 与 `options.refresh`（HTTP 401 后的**凭据**重取）**不是同一件事**，
+     *    两者同名纯属巧合，**不得合并**。
+     */
+    async refresh() {
+        await this.catalog.refresh?.();
+    }
     listAllModels() {
         return this.catalog.listAllModels();
     }
@@ -439,23 +537,68 @@ export class MinimaxAdapter extends LlmAdapter {
      * ⚠️ **错误必须抛错**，不静默返回空流（Qoder 早期同型缺陷）。
      */
     async *stream(options) {
+        /**
+         * 本次请求是否**在跟随之前**观测到「国际站被地理路由」（issue IKMEVG）。
+         *
+         * ⚠️ 必须在这里声明、由 `send()` 的 `onGeoRoute` 置位：一旦跟到中国站，
+         * 国际站 token 得到的 `401 invalid access token` 与「凭据真失效」**逐字同形**
+         * （本机实测），事后无法区分。故判定的时机只能卡在 307 那一跳。
+         */
+        let geoRouted = false;
         let credential = await this.options.resolveCredential(options.model);
-        if (credential === undefined || isMinimaxExpired(credential)) {
-            await this.options.refresh();
-            credential = await this.options.resolveCredential(options.model);
+        if (credential === undefined || isMinimaxExpiringWithin(credential, MINIMAX_ONDEMAND_MIN_VALIDITY_MS)) {
+            /**
+             * ⚠️⚠️ **续期失败不得让请求直接死掉**（2026-10-27 审计修）。
+             *
+             * ## 修前的缺陷
+             *
+             * 这里是裸 `await this.options.refresh()`。而 `isMinimaxExpiringWithin`
+             * 是 **fail-open** 的（读不到 `expires_at` ⇒ 返回 `true` = 该续）
+             * ⇒ 对于「凭据缺 / 非法 `expires_at`」的账号，**每个请求**都会走到这里；
+             * 一旦续期抛错，请求**一次上游都不发**就失败了。
+             *
+             * 实测（构造一条无 `expires_at` 的凭据 + refresh 抛 `invalid_grant`）：
+             * `fetch` 调用 **0 次**、请求直接失败 —— 而旧判据（`isMinimaxExpired`）
+             * 会正常放行，让请求用掉最后那段时间。
+             *
+             * ## 修法：降级为「用现有凭据继续发」
+             *
+             * 手上有 `credential` 且 `access_token` 非空 ⇒ 先发出去，让**上游**来否决
+             * （它才是权威）。401 之后下面还有一条专门的「401 先续期再重发」路径兜底，
+             * 那一步的 `refresh()` 失败会正确地报 `AUTH`。
+             *
+             * ⚠️ 这一格**不会**掩盖真终态：续期失败的原因会进 `warn`（含 error message），
+             *   且 401 兜底那条路径仍按原语义分类。它只把「预判失败」与「请求失败」
+             *   解耦 —— 预判是**优化**，不该是**门禁**。
+             */
+            try {
+                await this.options.refresh();
+                credential = await this.options.resolveCredential(options.model);
+            }
+            catch (error) {
+                if (credential === undefined || credential.access_token === '') {
+                    // 手上根本没有可用凭据 ⇒ 只能报错（与原行为一致）
+                    throw error;
+                }
+                this.options.warn?.(`[minimax] 请求前预判续期失败，改用现有凭据继续发送（由上游判定是否有效）：`
+                    + `${error instanceof Error ? error.message : String(error)}`);
+            }
         }
         if (credential === undefined || credential.access_token === '') {
             throw new LlmError('minimax: no usable credential; log in first', 'MISSING_CREDENTIAL');
         }
         /**
-         * 本次请求实际使用的账号 id（请求级轮换的记账键）。语义与 loomy / raccoon 同款：
-         * 按 access_token 反查池内条目；单凭据回退时保持空串（无池即无「下一个号」，
-         * 轮换自然失效，不误标）。
+         * 本次请求实际使用的账号 id（请求级轮换的记账键 **且是取出口的键**）。
+         * 语义与 loomy / raccoon 同款：按 access_token 反查池内条目；单凭据回退时
+         * 保持空串（无池即无「下一个号」，轮换自然失效，不误标）。
          *
          * ⚠️ 反查的第二参是**凭据内容**而不是 ref 名（传 ref 名会恒匹配失败且**静默**）。
+         *
+         * ⚠️ `accountIdOverride` **优先于**反查：探测路径拿不到池，只能靠调用方
+         * 显式说明「我代表这个账号」（见该字段的注释）。
          */
-        let activeAccountId = '';
-        if (this.options.accountPool) {
+        let activeAccountId = this.options.accountIdOverride ?? '';
+        if (activeAccountId === '' && this.options.accountPool) {
             try {
                 activeAccountId = await this.options.accountPool.findAccountIdByCredential(this.product.id, credential.access_token) ?? '';
             }
@@ -544,10 +687,32 @@ export class MinimaxAdapter extends LlmAdapter {
             ...images === undefined ? {} : { images },
         });
         /**
-         * 发送一次推理请求。
+         * 发送一次推理请求（**含传输级重试**）。
          *
          * ⚠️ 头取**闭包里的当前** `credential`（换号后只需改这个变量）—— 与
          * raccoon 的 `send()` 同款，避免把 token 当参数传来传去而漏传一处。
+         *
+         * ## ⚠️⚠️ 为什么必须有传输级重试（2026-10-15 真实缺陷）
+         *
+         * 用户报障：「模型连接测试失败，显示 `fetch failed`」。
+         *
+         * 本机取证（同一凭据、同一端点、连打 10 次）：
+         * ```
+         * 签到 (signin/status): 成功 5/10 —— 失败全是
+         *   fetch failed ← self-signed certificate in certificate chain [SELF_SIGNED_CERT_IN_CHAIN]
+         * 目录 (models)       : 成功 10/10
+         * ```
+         * ⇒ 约 **50%** 概率被**环境里的 HTTPS 检查代理**（企业/杀软/Clash 的 MITM 证书）
+         * 打断。这是**环境问题**，但症状落在插件上：一次偶发中断 = 整轮请求失败，
+         * 用户看到 `fetch failed`，而重试一次几乎必然成功。
+         *
+         * ⚠️ **只重试传输错误，绝不重试 HTTP 状态错误**：4xx/5xx 是**服务端的明确答复**
+         *（401 要续期、402 要充值、429 要冷却），重发只会原样再失败，还会掩盖真实原因、
+         * 浪费时间。判据与退避都在 `minimaxFetchWithRetry`（`src/minimax.ts`）里，
+         * **与目录路径共用同一份实现** —— 本文件不再另写一份（同义判据分两处必然漂移）。
+         *
+         * ⚠️ **abort 绝不重试**：用户点了停止还继续发 3 次是**不可接受**的行为
+         *（本仓库 `llm-adapter.ts` 记过同型缺陷）。
          */
         const send = async () => {
             // ⚠️ 每次现读闭包变量：`credential` 是 `let`（换号会替换它），TS 不会把
@@ -556,11 +721,53 @@ export class MinimaxAdapter extends LlmAdapter {
             if (current === undefined) {
                 throw new LlmError('minimax: no usable credential; log in first', 'MISSING_CREDENTIAL');
             }
-            return fetch(`${this.product.apiHost}${MINIMAX_INFER_PATH}`, {
+            /**
+             * ⚠️⚠️ 必须走 `minimaxFetch`（重试 + **保凭据跟随重定向**），不能裸 `fetch`。
+             *
+             * 真实缺陷（2026-10-17，issue IKMEVG）：`agent.minimax.io` 对所有路径恒返
+             * `307 → agent.minimaxi.com`，而 fetch **跨 origin 跟随会剥掉
+             * `Authorization`** ⇒ 第二跳无凭据 ⇒ `401 {"message":"token is required"}`。
+             * 用户看到的是「模型连接测试失败」，真因却是重定向丢头。
+             *
+             * ⚠️ 头必须由 `buildInit` **每跳重新构造**（这里每次现读 `current`，
+             * 换号后连第一跳也会带上新 token）。
+             *
+             * ⚠️ 国际站另需附用户设置的 `X-Forwarded-For`（绕开 Akamai 按出口 IP
+             * 的地理分流）。**每次现读**池里的设置，不缓存 —— 用户随时可能在面板里改。
+             *
+             * ⚠️ **必须用 `typeof` 判一下**：`accountPool` 是结构化类型（`AccountPool`），
+             * 而单测/旧接线可能传**只实现了一部分方法**的替身 —— 直接
+             * `this.options.accountPool?.minimaxXff()` 会在那种替身上抛 `TypeError`
+             * （`?.` 只挡 `null`/`undefined`，挡不住「对象上没有这个方法」）。
+             * 实测后果：`minimax-adapter.spec.ts` 的轮换组 16 条用例全红。
+             *
+             * ⚠️ **探测路径（无池）必须仍能拿到 XFF**：探测适配器刻意不传
+             * `accountPool`（既定语义：不写任何标记），那 XFF 就读不到 ⇒ 大陆出口
+             * 的「测试」恒 307→401，与「凭据失效」同形（2026-10-24 活体实测：
+             * 用户已设 XFF，`account.test` 仍报 invalid access token）。
+             * 故提供 `xffOverride`：探测槽显式传入池里的当前值 —— 它是**只读**的
+             * 展示性设置，探测带它不违反「不写状态」的语义。
+             */
+            const pool = this.options.accountPool;
+            const xff = this.options.xffOverride
+                ?? (typeof pool?.minimaxXff === 'function' ? pool.minimaxXff() : undefined);
+            return minimaxFetch(`${this.product.apiHost}${MINIMAX_INFER_PATH}`, () => ({
                 method: 'POST',
-                headers: minimaxInferHeaders(current),
+                headers: minimaxInferHeadersFor(current, xff, this.product.id),
                 body: JSON.stringify(payload),
                 signal: options.signal,
+            }), {
+                /**
+                 * ⚠️ **推理主路径必须走该账号的出口**（国际站代理）。
+                 *
+                 * `send()` 会被**多次**调用（401 续期后重发、轮换换号后重发），故这里
+                 * 必须**每次按当时的 `activeAccountId` 现取** fetcher —— 在闭包外固化
+                 * 一份会让换号后**仍走旧账号的出口**（症状「换了号还是被分流」，零报错）。
+                 */
+                fetcher: this.fetcherFor(activeAccountId),
+                signal: options.signal,
+                // 记下「地理路由」：跟随后 401 与「凭据失效」同形，只能在此刻判。
+                onGeoRoute: () => { geoRouted = true; },
             });
         };
         /**
@@ -600,7 +807,22 @@ export class MinimaxAdapter extends LlmAdapter {
                 // 交给同一条分类判据；原文进错误文案，用户至少能看到服务端说了什么。
                 const text = await response.text().catch(() => '');
                 return {
-                    error: new LlmError(`minimax: 推理端点返回了非 SSE 响应（HTTP 200）${text === '' ? '' : ` — ${text.slice(0, 500)}`}`, 'SERVER'),
+                    error: new LlmError(`minimax: 推理端点返回了非 SSE 响应（HTTP 200）${text === '' ? '' : ` — ${text.slice(0, 500)}`}`, 
+                    /**
+                     * ⚠️⚠️ **不能用 `SERVER`**（2026-10-17 审计发现的真缺陷，本行是既有代码）。
+                     *
+                     * 本对象会被 `attempt()` 原样当作 `streamError`，**不经过**
+                     * `httpErrorCode()` 重新归类（实测最终 `error.code === 'SERVER'`）。
+                     * 而 DSH 的 `DEFAULT_RETRYABLE_CODES` 含 `'SERVER'`、
+                     * `DEFAULT_MAX_RETRIES = 5` ⇒ 这条**确定性失败**（网关就是没给 SSE，
+                     * 同一请求重发大概率还是同样结果）会被 `dsh-llm-retry` 自动重试 5 次，
+                     * 每次都重跑整条换号循环。
+                     *
+                     * 用 `INVALID_REQUEST` 的理由与地理路由处同源：它**不在**默认可重试集合、
+                     * 也**不会**被 harness 替换文案（只用 `QUOTA` / `AUTH` 替换）。
+                     * 语义也对位 ——「这次响应格式不可用」是请求层面的确定性拒绝。
+                     */
+                    'INVALID_REQUEST'),
                     text,
                 };
             }
@@ -630,11 +852,38 @@ export class MinimaxAdapter extends LlmAdapter {
          *
          * 必要性：本家凭据可能被服务端提前撤销而本地 `expiresAt` 仍在未来 —— 只靠
          * 上面的过期预判不会续期，401 会白打一轮。
+         *
+         * ⚠️⚠️ **续期失败必须分类处理**（2026-10-27 第二轮审计打穿）：
+         * `minimax-auth` 的续期会抛 `MinimaxRefreshTokenExpiredError`（RT 确实已死）。
+         * 那种情形下正确的出口是**把「请重新登录」这条指路文案传出去**，而不是吞成
+         * `AUTH` —— `AUTH` 会被客户端替换成固定文案「API 密钥无效」并丢掉原文
+         *（本仓库的既有纪律：`IKLBSH`，凡「文案本身就是出路」的错误必须避开 `AUTH`）。
+         *
+         * ⚠️ 同时留一条 warn，让「续期失败」与「续了但没用」可分。
          */
         if (response.status === 401 || response.status === 403) {
-            await this.options.refresh();
-            const refreshed = await this.options.resolveCredential(options.model);
+            let refreshError;
+            try {
+                await this.options.refresh();
+            }
+            catch (error) {
+                refreshError = error;
+                this.options.warn?.(`[minimax] 401 后按需续期失败：${error instanceof Error ? error.message : String(error)}`);
+            }
+            const refreshed = refreshError === undefined
+                ? await this.options.resolveCredential(options.model)
+                : undefined;
             if (refreshed === undefined || refreshed.access_token.length === 0) {
+                /**
+                 * ⚠️ 终态（RT 已死）⇒ 抛出**带指路文案**的错误，**不用 `AUTH`**。
+                 * 其余情形（续期成功了但拿不到凭据 / 网络类失败）仍按原 `AUTH` 口径 ——
+                 * 那是「凭据暂时取不到」，与「需要重新登录」是两件事。
+                 */
+                const terminal = refreshError !== undefined
+                    && refreshError.name === 'MinimaxRefreshTokenExpiredError';
+                if (terminal) {
+                    throw new LlmError(`minimax: refresh_token 已失效，请重新登录（${refreshError instanceof Error ? refreshError.message : String(refreshError)}）`, 'INVALID_REQUEST', { status: response.status });
+                }
                 throw new LlmError('minimax: credential expired and refresh failed', 'AUTH', { status: response.status });
             }
             credential = refreshed;
@@ -715,6 +964,51 @@ export class MinimaxAdapter extends LlmAdapter {
         const throwCurrent = () => {
             if (streamError !== undefined)
                 throw streamError;
+            /**
+             * ⚠️⚠️ **地理路由要解释背景，但不能吞掉真实错误**（issue IKMEVG，自查修正）。
+             *
+             * 判据是 `geoRouted`（跟随**之前**看到的 307→minimaxi.com），不是状态码：
+             * 跟到中国站后国际站 token 得到的 `401` 与「凭据真失效」逐字同形，
+             * 拿它判会把「换个网络就能用」误报成「请重新登录」。
+             *
+             * ⚠️⚠️ **但 `geoRouted` 只说明「经历过 307」，不说明失败原因就是它**
+             * （真实反例：`307 → 402 insufficient_balance_error`）。初版在此
+             * **无条件**把错误码改成 `SERVER`，于是 402 的 `QUOTA_EXCEEDED` 被覆盖
+             * ⇒ 用户看到「去填 IP / 走代理」，而**「去充值」这个唯一有效动作消失**。
+             *
+             * ⇒ 现在的口径：**错误码优先保留真实语义**（402 仍是 `QUOTA_EXCEEDED`），
+             * 地理路由只作为**文案附加说明**。
+             *
+             * ⚠️⚠️ **地理路由用 `INVALID_CREDENTIAL` 而不是 `SERVER`**（自查发现的真缺陷）：
+             *
+             * DSH 的 `dsh-llm/lib/types/retry-policy.js` 里
+             * `DEFAULT_RETRYABLE_CODES = [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT]`，
+             * `DEFAULT_MAX_RETRIES = 5` ⇒ 用 `SERVER` 会被 `dsh-llm-retry` **自动重试 5 次**。
+             * 而地理路由是**确定性失败**（出口 IP 不会因重试而变）⇒ 每次重试都会重新选号、
+             * 重新 307、重新跟到中国站、重新 401，用户白等约 15s 退避、日志凭空多一串失败。
+             *
+             * `INVALID_CREDENTIAL` 的官方注释恰好是同一理由
+             *（"Deliberately outside the default retryable set — a malformed credential
+             * fails identically on every attempt"），且它不会被文案替换
+             *（DSH 只在 `QUOTA` / `AUTH` 上替换 message）。
+             * ⇒ 语义对位：**确定性、不可重试、文案必须保留**。
+             */
+            if (geoRouted) {
+                const geoDetail = errorText === '' ? undefined : errorText.slice(0, 200);
+                // 402 = 余额不足，语义比「地理路由」更具体，必须保住 QUOTA_EXCEEDED。
+                if (status === 402) {
+                    throw new LlmError(`minimax: ${describeMinimaxGeoRoute(geoDetail)}`, 'QUOTA_EXCEEDED', { status });
+                }
+                const code = httpErrorCode(status);
+                /**
+                 * 只有「真实状态没有更具体语义」的档位才让地理路由接管错误码。
+                 * ⚠️ 接管时一律用 `INVALID_CREDENTIAL`（不可重试，见上）；
+                 * 若直接沿用 `AUTH` 会被 harness 的文案替换吞掉 message
+                 *（本仓库 IKLBSH 记过的复发形态），沿用 `SERVER` 则会触发 5 次自动重试。
+                 */
+                const geoOwnsCode = code === 'SERVER' || code === 'AUTH';
+                throw new LlmError(`minimax: ${describeMinimaxGeoRoute(geoDetail)}`, geoOwnsCode ? 'INVALID_CREDENTIAL' : code, status === 0 ? {} : { status });
+            }
             // ⚠️ 402 是**余额不足**，必须原样透出 —— 它是最常见的真实失败，
             // 归成 SERVER/AUTH 会让用户看不到「去充值」这个唯一有效动作。
             const code = status === 402 ? 'QUOTA_EXCEEDED' : httpErrorCode(status);
@@ -806,6 +1100,10 @@ export function registerMinimaxLlm(ctx, options) {
         // ⚠️ 注入**唯一**的广播实现（`src/catalog-broadcast.ts`），不要在这里
         // 另写一份 emit —— 两份实现必然漂移（issue IKJVTF 的缺陷① 就是「十处全漏」）。
         onCatalogLoaded: () => broadcastCatalogChanged(ctx),
+        // ⚠️ 告警必须真的能被看见（2026-10-27 审计）：`warn` 承载
+        // 「预判续期失败 → 降级发送」这条**静默风险**，缺省退回 `console.warn`
+        // 而不是吞掉（与 autoclaw / astudio 同约定）。
+        warn: options.warn ?? ((message) => { ctx.logger.warn(message); }),
     });
     registerAdapterIdempotent(ctx.llm, [product.id], adapter);
     return adapter;

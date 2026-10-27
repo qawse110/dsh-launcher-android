@@ -1,4 +1,6 @@
-# dsh-arbiter-wf（**0.8.3-stable**）
+# 许愿特化器 · Wish Specializer（包名 dsh-wish-specializer，**0.9.0-stable**；最新发布 0.9.0-stable）
+
+当前选项包括档位、权限、英文模式、模型与思考档位、上下文、只读工具、顾问及双击回车。现行运行与提交规则见 [优化生产管线](../docs/OPTIMIZATION-PIPELINE.md)。下列旧版记录和跑分按当时版本解读；历史基调试验与时延测量不代表当前功能或性能，原始证据不改写。
 
 ## 0.8.0-preview：独立裁判层（改名首版）
 
@@ -8,9 +10,9 @@
 - 首次交付前：先自验并取得原始工具结果，再调用 `mode: review_result`；可提供最多四个项目内成果相对路径 `artifacts`。不提交自己的通过结论。
 - 自动读取最近一条真人消息以来的证据；成果复核不提供主模型正文或先前顾问结果。不实现跨轮记忆。
 - 验收状态分满足、不满足、未验证；顾问不是用户授权，也不能代替用户的视觉体验测试。
-- 取消/截止信号传至模型并等待收尾（依赖 provider 遵守取消）；一次最长目标 5 分钟，不自动重试。
-- 限时默认 300 秒，可用环境变量 `DSH_PO06_ADVISOR_TIMEOUT_MS` 调整（毫秒，钳制在 60 秒~15 分钟）；重启 DSH 生效。
-- 到点不会空手而归：已有完整报告就保留并标为部分产出；只跑到一半也会交回思考尾部与查证记录，供调用方判断下一步。
+- 取消信号传至模型并等待收尾（依赖 provider 遵守取消）；默认不设顾问总时间上限，不自动重试。
+- 只有显式设置 `DSH_PO06_ADVISOR_TIMEOUT_MS` 才启用调用方截止；只读查证仍有轮次上限，模型流/输出终止仍由 provider 决定。
+- 若调用方显式设置截止，到点不会空手而归：已有完整报告就保留并标为部分产出；只跑到一半也会交回思考尾部与查证记录，供调用方判断下一步。
 - 专项输入：`scope` 是**检查维度、不是行业**（geometry形体与装配 / appearance画面观感 / code代码正确性 / interaction交互逻辑 / performance性能证据 / delivery交付覆盖 / custom其它专项），`focus` 为具体对象与检查点。省略scope保持general兼容；专项不能泛化成整体通过。按任务实际需要选维度，一次只选一个，不适用就不选。
 - 通用性约束：提示词与参数说明不含任何行业的专用词汇，由 `advisor-generality.test.mjs` 机械拦截——专项是“怎么查”，不是“查什么行业”。任何领域的成果都用同一套维度，`custom` 兜住维度外的情形。
 - 几何/外观只发图片、不注入开发历史或源码、不开放源码工具；误传文件在卡片标“本次范围排除”。代码/交互/性能仅发相关源码与原始日志，图片排除；可用`evidenceRefs`选择本次工具证据编号。用户原话和权限边界始终保留。
@@ -46,8 +48,8 @@
 
 > 💬 中文用户交流：**QQ 群 1121399051**（最新消息、安装帮助、版本公告）。
 
-`@dsh-external/dsh-arbiter-wf` · **0.8.3-stable** · GitHub Release（**未发 npm**：`private: true`，只发附件）
-→ 下载：<https://github.com/WestFox-AwA/dsh-prompt-optimizer/releases/tag/v0.8.3-stable>（附件含 `tgz` 与 `SHA256SUMS`）
+`@dsh-external/dsh-wish-specializer` · **0.9.0-stable** · GitHub Release（**未发 npm**：`private: true`，只发附件）
+→ 下载：<https://github.com/WestFox-AwA/dsh-wish-specializer/releases/tag/v0.9.0-stable>（附件含 `tgz` 与 `SHA256SUMS`）
 
 > **0.7.8（历史版本）的一句话**：**档位终于真的分开了**——补充程度（700 / 1200 / 2000 字）与自主预算
 > （1 / 2 / 3 个问题）两个维度逐级递进；此前 `minimal` 从未被任何档位使用、且 standard 与 heavy 的
@@ -77,10 +79,10 @@
 > `toolCallId`/`uri` 只有宿主才有 ⇒ 整份补丁 `BAD_SCHEMA`、合法条目陪葬；现在只补宿主确实知道的事实，
 > 其余逐条丢弃并记账）；③ `provenance:'machine'` **从未生效**的顺序缺陷（从读入材料推出来的条目曾看起来像"你说过的"）。
 
-> **人工验收就一遍**：见 `po06/HUMAN-TEST.md`（12 步 + 4 个反馈点）。前提：**档位不能是「关闭」**——关闭档按设计不拦截。
+> **人工验收就一遍**：见 `docs/legacy/po06-HUMAN-TEST.md`（12 步 + 4 个反馈点）。前提：**档位不能是「关闭」**——关闭档按设计不拦截。
 
 > ⚠️ **版本号叫 stable 指的是"这一版对外定为正式版"，不是"能力已通过专业跑分"。**
-> - **内部自洽有证据**：**1,003 项测试 + 234 个变异守卫**全绿，含打包自足性与文档漂移门禁。
+> - **内部自洽有证据**：**全部套件 + 变异守卫**全绿，含打包自足性与文档漂移门禁。
 > - 📊 **作者实测观察（不是专业跑分）**：测试主要在 **DeepSeek-V4.1-Flash + PTC + PowerShell** 环境下进行。
 >   **目前没有做过专业的跑分测试**；但在常见的各类 one-shot 任务与长任务迭代中，
 >   **实际效果明显强于同环境、同提示词下的 DeepSeek-V4.1-Flash**；另据**少量项目**的统计，
@@ -103,11 +105,11 @@
 | **上下文**：回合 0~10 / 全文（**全文时滑块只有 关/开**） | 解释层**真的去读会话上下文**（真机实测：`histChars=7066`、读了 4 个回合）。0/关 = 不读 |
 | **读项目文件**：开 / 关 | 打开后解释层可用 **`read`/`glob`/`grep`** 查证项目实际内容（限定会话工作目录内、只读、轮次与时限封顶、越界拒绝）。**默认关**（0.5 默认开——工具轮次要花时间与 token，不悄悄放大成本） |
 | **模型** | 下拉来自**宿主模型目录**；默认"跟随会话模型"，选了就以所选路由解释 |
-| **`?` 帮助** | 弹层正文来自包里的 `HELP-0.6.md`（宿主 `GET /po06/api/help` 取，**客户端不内置副本**）；写的是 0.6 的真实行为，读不到就如实说"读不到"并给出文件路径 |
+| **`?` 帮助** | 弹层正文来自包里的 [中文帮助](HELP-0.6.md) / [英文帮助](HELP-0.6.en.md)（宿主 `GET /po06/api/help` 取，**客户端不内置副本**）；写的是 0.6 的真实行为，读不到就如实说"读不到"并给出文件路径 |
 | **提示词**（详情面板内） | 能看当前生效正文、能改、**能撤销上一次修改**，也能恢复内置 |
 
 **「详情」面板只留「控制」与「解释层提示词」**（用户 2026-09-21 要求撤掉了「它在替我做什么」「最近几轮」两块；
-逐轮台账仍在**设置页 → 插件 → 提示词优化器**里看：预算内/超预算、上下文读了多少字/几回合、
+逐轮台账仍在**设置页 → 插件 → 许愿特化器**里看：预算内/超预算、上下文读了多少字/几回合、
 有没有派工具（没派会写原因，例如"读文件开关是关的"）、有没有从工具路径回落；**缺值显示"未记录"**，不拿 0 冒充"没发生"）。
 **"无出处条目"的警告没有消失**——它挪进了拦截审查面板（机器自己编的、没有你原话支撑的要求必须看得见）。
 
@@ -127,33 +129,42 @@
 **① 从 Release 下载安装包**（两个附件：`tgz` + 校验和）：
 
 ```powershell
-# 直链（版本号换成你要的；0.8.3-stable 是最新版）
-$v = '0.8.3-stable'
+# 直链（版本号换成你要的；0.9.0-stable 是最新版）
+$v = '0.9.0-stable'
 $dir = "$env:USERPROFILE\Downloads"
-Invoke-WebRequest "https://github.com/WestFox-AwA/dsh-prompt-optimizer/releases/download/v$v/dsh-external-dsh-po06-$v.tgz" -OutFile "$dir\dsh-external-dsh-po06-$v.tgz"
-Invoke-WebRequest "https://github.com/WestFox-AwA/dsh-prompt-optimizer/releases/download/v$v/SHA256SUMS-$v.txt" -OutFile "$dir\SHA256SUMS-$v.txt"
+Invoke-WebRequest "https://github.com/WestFox-AwA/dsh-wish-specializer/releases/download/v$v/dsh-external-dsh-wish-specializer-$v.tgz" -OutFile "$dir\dsh-external-dsh-wish-specializer-$v.tgz"
+Invoke-WebRequest "https://github.com/WestFox-AwA/dsh-wish-specializer/releases/download/v$v/SHA256SUMS-$v.txt" -OutFile "$dir\SHA256SUMS-$v.txt"
 # 校验（下载坏了会在安装后才以"行为怪怪的"暴露，先比一下最省事）
-Get-FileHash "$dir\dsh-external-dsh-po06-$v.tgz" -Algorithm SHA256 | Select-Object -ExpandProperty Hash
+Get-FileHash "$dir\dsh-external-dsh-wish-specializer-$v.tgz" -Algorithm SHA256 | Select-Object -ExpandProperty Hash
 Get-Content "$dir\SHA256SUMS-$v.txt"
 ```
-> 也可以在浏览器里打开 <https://github.com/WestFox-AwA/dsh-prompt-optimizer/releases> 挑对应版本手动下这两个文件。
-> ⚠ **本版是预发布（`-beta.1`）**：GitHub 的 `releases/latest` **不会**指向预发布，
-> 所以请用上面带 `v$v` 的直链下载（`latest` 那条路仍是上一个正式版 `v0.6.10`）。
+> 也可以在浏览器里打开 <https://github.com/WestFox-AwA/dsh-wish-specializer/releases> 挑对应版本手动下这两个文件。
+
+> ### 装不上时的排查顺序（issue #29）
+>
+> | 你看到的 | 真正的原因 | 怎么办 |
+> |---|---|---|
+> | 插件市场报 `no matching package found`，随后回落到 git 安装 | 本包**按设计不发 npm**（`private: true`），registry 上永远搜不到 | 用上面的 Release 附件装，别让安装器去搜 npm |
+> | git 安装报 `schannel: … SEC_E_INVALID_TOKEN` | 本机 git 的 TLS/代理问题（命令连 GitHub 都没连上），与插件无关 | 改用 Release 附件；或 `git config --global http.sslBackend openssl` 后重试 |
+> | 安装器提示 `allowBuilds` / 构建脚本被拦 | 本包**没有任何构建步骤**，这条提示是通用的 | 不用改 `allowBuilds`；按上一条排查 TLS |
+> | 装上了但没有拦截（`gate: rollout-off`） | 档位还停在关闭 | 把档位拨到**标准**或**重度** |
+> 本版是**正式版**（无 `-beta` 后缀），`releases/latest` 会指向它；
+> 想装旧版就把 `$v` 换成对应 tag。版本号只有一个真源：`po06/package.json`。
 
 **② 新建一个干净 profile 并装进去**：
 
 ```powershell
 # 用发行版自带的 web 模板新建 profile（不含 0.5.x）
-dsh --profile po06beta --from-default-profile web --dump-config
+dsh --profile po061 --from-default-profile web --dump-config
 # 装本包（tgz 路径换成你下载到的位置）
-dsh plugin --profile po061 add "$env:USERPROFILE\Downloads\dsh-external-dsh-arbiter-wf-0.8.3-stable.tgz"
+dsh plugin --profile po061 add "$env:USERPROFILE\Downloads\dsh-external-dsh-wish-specializer-0.9.0-stable.tgz"
 ```
 
-**③（可选，但强烈建议）一条命令自检**"装好了、装的是这一份、会被装配"（**不调模型、不花钱**）：
+**③（可选，但强烈建议）一条命令自检**：装好了、装的是这一份、会被装配"（**不调模型、不花钱**）：
 
 ```powershell
 # 需要仓库里的脚本；没克隆仓库就跳过这步，直接进 ④
-node <repo>\po06\scripts\check-install.mjs --profile po061 --expect-version 0.8.3-stable
+node <repo>\po06\scripts\check-install.mjs --profile po061 --expect-version 0.9.0-stable
 ```
 
 它会逐条回答：
@@ -174,8 +185,8 @@ Set-Content -Path "$env:USERPROFILE\.dsh\po06.json" -Encoding utf8 -Value '{"set
 
 也可以装完之后**在面板上拨档位**（档位 关闭/轻度/标准/重度 就是启用开关；`关闭` = 不拦截）。
 
-**⑤ 用那个 profile 开工**：`dsh --profile po06beta`（它会启动该 profile 的应用并打印带 token 的地址）。
-⚠ **`--profile` 必须写在子命令之前**：`dsh --profile po06beta …` 可以，`dsh web --profile po06beta` **不行**
+**⑤ 用那个 profile 开工**：`dsh --profile po061`（它会启动该 profile 的应用并打印带 token 的地址）。
+⚠ **`--profile` 必须写在子命令之前**：`dsh --profile po061 …` 可以，`dsh web --profile po061` **不行**
 （`web` 子命令明确拒绝父级的 `--profile`，实测报 `web takes none of parent --profile`）。
 默认端口被占用时加 `--port 3081`。
 **效果什么时候生效（P11 改变的地方）**：网页输入框里按发送/回车会被**前置拦截**——
@@ -184,7 +195,7 @@ Set-Content -Path "$env:USERPROFILE\.dsh\po06.json" -Encoding utf8 -Value '{"set
 「审查」权限下，解释完成后先给你看正文并可**直接编辑**（点「确认提交」才发）。
 **档位＝「关闭」时不拦截、不等待、不注入**（走原生路径，0 等待）。
 仍然存在的旧路径：**非网页入口**（终端等）发的消息不会被拦，那种情况下包落在同一轮的第 2 步起。
-⚠ 拦截链的**整链真机验收尚未完成**（按用户要求改由人工一遍跑完，见 `po06/HUMAN-TEST.md`）。
+⚠ 拦截链的**整链真机验收尚未完成**（按用户要求改由人工一遍跑完，见 `docs/legacy/po06-HUMAN-TEST.md`）。
 
 **④ 关掉 / 卸掉（随时、一步）**：
 
@@ -192,7 +203,7 @@ Set-Content -Path "$env:USERPROFILE\.dsh\po06.json" -Encoding utf8 -Value '{"set
 # 关：把 enabled 改 false（或直接删掉这个文件——读不到就是不启用）
 Set-Content -Path "$env:USERPROFILE\.dsh\po06.json" -Encoding utf8 -Value '{"settingsVersion":1,"enabled":false,"rollout":{"mode":"off"}}'
 # 卸：从 profile 移除并把 profile 整个删掉
-dsh plugin --profile po06beta remove @dsh-external/dsh-po06
+dsh plugin --profile po061 remove @dsh-external/dsh-po06
 Remove-Item -Recurse -Force "$env:USERPROFILE\.dsh\profiles\po06beta"
 ```
 
@@ -324,6 +335,31 @@ node <repo>\po06\scripts\preflight-e001.mjs --stage S4 [--budget <n>]
 > ② 期望片段指到了**被断言的消息**而不是**会红的那条用例名**。
 > **变异守卫的价值不在于"抓到了"，而在于它也会抓我。**
 
+## 实测效果（跑分，0.9.0-beta-1）
+
+> 以下为当时版本的测量，未重跑，也不证明移除基调后的效果或时延。现行脚本在 [bench-dims.mjs](scripts/bench-dims.mjs)，原报告保留在 [评测总账](eval/BENCH-TOTAL-0.9.0-beta-1.md)。
+
+**方法**：每个用例 4–5 次真实调用——优化 1 次、工作模型「不加注入 / 加注入」各 1 次、评审 2 次（X/Y 顺序互换）。
+两次评审一致才算胜负，相反记为「不可判定」。评审不知道哪份带注入。
+
+| 你的输入 | 注入 vs 不加注入 | 判读 |
+| --- | --- | --- |
+| 只有愿望（“做个 X，要 Y”） | **4 胜 / 2 负 / 2 不可判定**（8 条） | 需要方向感的任务有增益；**要“立刻能跑”的产物不占优** |
+| 贴代码问 bug、要决策 | **2 胜 / 0 负** | 最稳的一档，且多命中真正的根因 |
+| 复杂项目 + 失败报告 | **2 胜 / 1 负**（3 条） | 失败归因与下一步更具体 |
+| 已写好精确规格/步骤 | **0 胜 / 2 负** | 规格没被改坏，但**多一层建议会稀释执行**——这种情况请直接跳过优化 |
+
+**成本**：每轮固定增加约 **2.8k token + 12 秒**（优化器 2318 token/12s + 注入包约 517 token）。
+
+### 关于这些数字的诚实说明
+
+受作者时间与成本所限，跑的是**小批量**测试（每档 2–8 条），不是大规模基准，也给不出置信区间；
+评审用的是同一家的模型，天然有同偏好。这些结果与作者本人及大量用户**日常使用中的实际感受基本吻合**，
+但那只能算佐证，不能算论文级结论。
+
+所以这里只敢说：**大概率能帮到你**，帮多少取决于你的输入有多“许愿”。
+我们不是权威机构，也不会为了推广去夸大战绩——不能用的场景（精准规格）我们在上面直接写了“0 胜 2 负”。
+但可以确信的是：这是一个**有用的好插件**，它的增益有据可查，它的短板也写在明面上。
 ## **未验证**（不要让这些看起来像"也有"）
 
 | 缺口 | 说明 |
@@ -373,8 +409,8 @@ node <repo>\po06\scripts\preflight-e001.mjs --stage S4 [--budget <n>]
 
 ```
 po06/
-  lib/         54 个模块（domain / 编译 / 解释 / 澄清 / 长任务 / 验证 / 反馈 / 迁移 / 灰度 / 装配闸门 / 评估计划 / 冒烟 / 宿主资源定位 / 只读工具 / 会话上下文 / 清痕 / **档位策略与领域维度** / **虚拟 POSIX 层**）
-  test/        93 套测试 + 变异检验（234 个变异）
+  lib/         按域分层的模块（domain / 编译 / 解释 / 澄清 / 长任务 / 验证 / 反馈 / 迁移 / 灰度 / 装配闸门 / 评估计划 / 冒烟 / 宿主资源定位 / 只读工具 / 会话上下文 / 清痕 / **档位策略与领域维度** / **虚拟 POSIX 层**）
+  test/        每个套件一个文件 + 变异检验
   eval/        HOLDOUT-v2.md（已封存，v1 的 18 题逐字节未改 + 追加 H-19/H-20）、HOLDOUT-v1.md（保留以备复核）、
                release-check.json、plan-E001.json、smoke-H-12.json
   scripts/     check-release.mjs（发版前自检）、plan-e001.mjs（留出评估计划与预算闸门）、

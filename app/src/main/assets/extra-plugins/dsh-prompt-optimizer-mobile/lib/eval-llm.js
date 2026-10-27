@@ -1,3 +1,4 @@
+import { drainWithTools } from './read-tools.js'
 // P7 · 模型调用的**薄适配层**（宿主侧）。
 //
 // 为什么单独一层：调用形状（provider/model/温度/消息构造/流式收集）与
@@ -14,24 +15,7 @@ import { requireLlmLib } from './llm-lib.js'
  * sink 只做展示，**不许影响收集**：抛错一律吞掉（界面坏了不能把模型调用带下水）。
  */
 export async function drain(stream, t0, sink) {
-  const out = { text: '', reasoning: '', usage: null, finish: null, ms: 0, chunkTypes: {} }
-  const emit = (dt, dr) => {
-    if (typeof sink !== 'function') return
-    try { sink({ text: dt, reasoning: dr, textChars: out.text.length, reasoningChars: out.reasoning.length }) } catch { /* 展示层的问题不拖累收集 */ }
-  }
-  for await (const chunk of stream) {
-    const t = chunk && chunk.type
-    if (t) out.chunkTypes[t] = (out.chunkTypes[t] || 0) + 1
-    if (t === 'text-delta') { out.text += String(chunk.text || chunk.delta || ''); emit(String(chunk.text || chunk.delta || ''), '') }
-    else if (t === 'reasoning-delta') { out.reasoning += String(chunk.text || chunk.delta || ''); emit('', String(chunk.text || chunk.delta || '')) }
-    else if (t === 'usage') out.usage = chunk.usage || null
-    else if (t === 'finish') out.finish = chunk.finish || chunk.reason || null
-    // ⚠ 兜底：有的适配器把 usage 挂在**别的** chunk 上（或 finish 里），只认 `type==='usage'` 会漏掉
-    // ⇒ 界面永远显示 `Σ — tok`（用户实测"token 还不会统计"）。凡是带着 usage 的 chunk 都收。
-    if (!out.usage && chunk && chunk.usage && typeof chunk.usage === 'object') out.usage = chunk.usage
-  }
-  out.ms = Date.now() - t0
-  return out
+  return drainWithTools(stream, t0, sink)
 }
 
 /**

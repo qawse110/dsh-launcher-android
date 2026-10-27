@@ -36,7 +36,7 @@ The dump should contain both `searchProvider: modsearch` and a plugin row named 
 Install into the profile you actually start. `web` is the normal browser UI profile:
 
 ```sh
-npx -y @deepseek-ai/dsh plugin --profile web add @liustack/modsearch@5.10.6
+npx -y @deepseek-ai/dsh plugin --profile web add @liustack/modsearch@5.10.10
 ```
 
 Restart dsh after installation, then confirm the resolved package:
@@ -47,11 +47,13 @@ npx -y @deepseek-ai/dsh plugin --profile web list --depth 0
 
 The exact version is intentional. pnpm 11 can hold back very recent releases through `minimumReleaseAge`, which can make `@latest` resolve to an older package. The release process keeps the version in this command synchronized with `package.json`.
 
+The desktop app's `desktop` profile is installed only from its own window: the dsh CLI rejects it with `profile "desktop" is managed exclusively by the Electron application`. In the **Add plugin** dialog, enter the package name `@liustack/modsearch`, not the GitHub repository URL. Only the npm package ships the built CLI. A GitHub install brings source only, and pnpm blocks the build step that would fill in the gap.
+
 ## What the bundle changes
 
 The bundle contributes two patch operations:
 
-1. It sets the dsh web seam's `searchProvider` to `modsearch`.
+1. It sets the dsh web seam's `searchProvider` to `modsearch` and keeps the shipped `fetchProvider: http`, since the row replaces the host's whole web config.
 2. It mounts the package root as the `modsearch` plugin.
 
 The plugin then exposes:
@@ -69,7 +71,7 @@ The dsh plugin does not keep a second engine config. It inherits the same enviro
 Start with the offline health check:
 
 ```sh
-npx -y @liustack/modsearch@5.10.6 doctor
+npx -y @liustack/modsearch@5.10.10 doctor
 ```
 
 Common settings:
@@ -79,11 +81,12 @@ modsearch config set engine antigravity-cli
 modsearch config set tavily.apiKey <key>
 modsearch config set exa.apiKey <key>
 modsearch config set firecrawl.apiKey <key>
+modsearch config set keenable.apiKey <key>
 modsearch config set firecrawl.keylessFetch false
 modsearch config set cooldown off
 ```
 
-No setting is required to start: search and page fetch run on Firecrawl's keyless free quota (1,000 free credits/month, no signup). Keyless public-page fetch is on by default; it sends the requested URL to Firecrawl's cloud crawler, and the result warning names that route. `firecrawl.keylessFetch false` keeps automatic fetch local-only. Private and reserved targets are never sent to Firecrawl and fall through to the local fetcher.
+No setting is required to start: search and page fetch run on Firecrawl's keyless free quota (1,000 free credits/month, no signup), and search falls back to Keenable's keyless pool (1,000 requests/hour per IP, no signup). Keyless public-page fetch is on by default. It sends the requested URL to Firecrawl's cloud crawler, and the result warning names that route. `firecrawl.keylessFetch false` keeps automatic fetch local-only. Private and reserved targets are never sent to Firecrawl and fall through to the local fetcher.
 
 See the [full engine configuration reference](../skills/modsearch/references/configure.md) and [security model](security.md).
 
@@ -93,13 +96,13 @@ The dsh web UI has no terminal, so the plugin brings its own settings card. On d
 
 The card holds three things:
 
-- The preferred engine: automatic, or one of `antigravity-cli`, `tavily`, `exa`, `firecrawl`, `grok-cli`. The `firecrawl` option is labelled as the keyless free tier. `local` fetches single pages and searches nothing, so it is not offered, unless the config file already names it as `engine`, in which case it stays listed rather than let the card disagree with the file.
-- The selected engine's own settings: API key and base URL for the HTTP engines (`tavily`, `exa`, `firecrawl`), and the model for `antigravity-cli`. Engines that sign in through their own command-line tool, and the built-in fetcher, show a line saying they need neither. Selecting `firecrawl` with no key stored adds a line saying it runs on the keyless free tier by default.
+- The preferred engine: automatic, or one of `antigravity-cli`, `tavily`, `exa`, `firecrawl`, `keenable`, `grok-cli`. The `firecrawl` and `keenable` options are labelled as the keyless free tier. `local` fetches single pages and searches nothing, so it is not offered, unless the config file already names it as `engine`, in which case it stays listed rather than let the card disagree with the file.
+- The selected engine's own settings: API key and base URL for the HTTP engines (`tavily`, `exa`, `firecrawl`, `keenable`), and the model for `antigravity-cli`. Engines that sign in through their own command-line tool, and the built-in fetcher, show a line saying they need neither. Selecting `firecrawl` or `keenable` with no key stored adds a line saying it runs on the keyless free tier by default.
 - The automatic engine chain: one checkbox per search engine `modsearch doctor` found ready on this machine. Checked means automatic routing may use it. Engines this machine cannot run are left out, since they are not a decision to make, and so is `local`, which fetches pages rather than searching. `grok-cli` carries an "X search only" note, since it serves the social role alone. When doctor's answer never arrives, every search engine is listed with a line saying the status is unknown. A successful save re-reads doctor, so an engine the save just made ready gets its checkbox straight away.
 
 Every engine is checked by default. Unchecking one writes only `enabled: false`. Checking it again deletes that override instead of storing a redundant `true`. Unchecking the current preference returns the preference to automatic. The card only edits engines it lists: the `enabled` of an engine with no checkbox (one this machine cannot run, and `local`) is copied through untouched, and `modsearch config set <engine>.enabled` is the only way to change it. When no engine is ready here, the row of checkboxes is replaced by a line reading "No engine is ready on this machine yet."
 
-Official Tavily, Exa, and Firecrawl endpoints live in the provider code. The base URL field is an override only. Leaving it blank or clearing it uses the built-in official address and writes no default URL into the config file.
+Official Tavily, Exa, Firecrawl, and Keenable endpoints live in the provider code. The base URL field is an override only. Leaving it blank or clearing it uses the built-in official address and writes no default URL into the config file.
 
 Everything else stays CLI only, including `bin`, `allowPrivateNetwork`, `cooldown` and `keylessFetch`. A card save copies them through untouched, and cannot create them.
 
@@ -144,6 +147,7 @@ Disabling only `x_search` or `read_page` is safe. If `searchProvider` is disable
 - id: web
   config:
     searchProvider: deepseek-official
+    fetchProvider: http
 
 - id: modsearch
   config:
@@ -173,7 +177,7 @@ The first call should use dsh's native `web_search` card. The other two should a
 Refresh the recorded request with the exact current version:
 
 ```sh
-npx -y @deepseek-ai/dsh plugin --profile <name> add @liustack/modsearch@5.10.6
+npx -y @deepseek-ai/dsh plugin --profile <name> add @liustack/modsearch@5.10.10
 ```
 
 Remove it with:
@@ -187,6 +191,7 @@ If a user patch still names `searchProvider: modsearch`, change or remove that o
 ## Troubleshooting
 
 - `declares no dsh.bundle`: an older ModSearch release landed. Reinstall the exact version shown above.
+- `modsearch's CLI build is missing`, or `Cannot find module .../dist/main.js` on 5.10.6 and older: the plugin was installed from the GitHub repository, which ships no build. Remove it and add it again by package name, `@liustack/modsearch`.
 - `web seam has no registerSearchProvider`: dsh moved a developer-preview interface. `x_search` and `read_page` still register, while web search is skipped with a visible log message. Check the latest dsh release before changing the plugin.
 - `modsearch failed (exit ...)`: run `modsearch doctor`. The error includes the engine attempts made by the CLI.
 - The package appears in `plugin list` but not `--dump-config`: verify it appears in `dsh.profile.bundles` inside `~/.dsh/profiles/<name>/package.json`.

@@ -3837,6 +3837,13 @@ var CdpCaptureBackend = class {
 	pendingFrame;
 	sendTimer;
 	backstopTimer;
+	/**
+	* Screencast metadata only carries a fresh viewport size when Chrome decides
+	* to include it; after a programmatic window resize the frames kept reporting
+	* the old width/height, so panel clicks were mapped into a stale coordinate
+	* space. Refresh the real viewport on a slow cadence while streaming.
+	*/
+	viewportTimer;
 	lastSentAt;
 	metrics;
 	offFrame;
@@ -3854,6 +3861,7 @@ var CdpCaptureBackend = class {
 		this.pendingFrame = null;
 		this.sendTimer = null;
 		this.backstopTimer = null;
+		this.viewportTimer = null;
 		this.lastSentAt = 0;
 		this.metrics = {
 			sourceFrames: 0,
@@ -3873,15 +3881,17 @@ var CdpCaptureBackend = class {
 			})).catch(() => {});
 		});
 	}
-	async start({ targetId }) {
+	async start({ targetId, maxWidth }) {
 		await this.stop("restart");
 		const session = await this.sessions.ensure(targetId);
 		const config = this.getConfig();
+		const effectiveMaxWidth = Math.max(320, Math.min(config.cdpMaxWidth, maxWidth && maxWidth > 0 ? Math.round(maxWidth) : config.cdpMaxWidth));
 		this.current = {
 			targetId,
 			sessionId: session.sessionId,
 			lastFrameAt: 0,
-			startedAt: this.now()
+			startedAt: this.now(),
+			maxWidth: effectiveMaxWidth
 		};
 		this.onStatus({
 			backend: "cdp",
@@ -3892,8 +3902,8 @@ var CdpCaptureBackend = class {
 			await this.cdp.call("Page.startScreencast", {
 				format: "jpeg",
 				quality: config.cdpQuality,
-				maxWidth: config.cdpMaxWidth,
-				everyNthFrame: 1
+				maxWidth: effectiveMaxWidth,
+				everyNthFrame: Math.max(1, Math.min(8, Math.round(60 / Math.max(1, config.cdpFps))))
 			}, session.sessionId);
 			this.onStatus({
 				backend: "cdp",
@@ -3902,6 +3912,7 @@ var CdpCaptureBackend = class {
 				metrics: this.metrics
 			});
 			this.#scheduleBackstop();
+			this.#scheduleViewportSync();
 		} catch (error) {
 			this.current = null;
 			this.onStatus({
@@ -3914,22 +3925,30 @@ var CdpCaptureBackend = class {
 			throw error;
 		}
 	}
-	async switchTarget({ targetId }) {
+	async switchTarget({ targetId, maxWidth }) {
 		this.onStatus({
 			backend: "cdp",
 			state: "switching",
 			targetId
 		});
-		await this.start({ targetId });
+		await this.start({
+			targetId,
+			maxWidth
+		});
 	}
 	async updateConfig() {
-		if (this.current) await this.start({ targetId: this.current.targetId });
+		if (this.current) await this.start({
+			targetId: this.current.targetId,
+			maxWidth: this.current.maxWidth
+		});
 	}
 	async stop(reason = "stopped") {
 		this.clearTimer(this.sendTimer);
 		this.clearTimer(this.backstopTimer);
+		this.clearTimer(this.viewportTimer);
 		this.sendTimer = null;
 		this.backstopTimer = null;
+		this.viewportTimer = null;
 		this.pendingFrame = null;
 		const current = this.current;
 		this.current = null;
@@ -3953,6 +3972,8 @@ var CdpCaptureBackend = class {
 		};
 	}
 	dispose() {
+		if (this.viewportTimer) this.clearTimer(this.viewportTimer);
+		this.viewportTimer = null;
 		this.offFrame?.();
 		this.offFrame = null;
 		this.offDestroyed?.();
@@ -4004,6 +4025,24 @@ var CdpCaptureBackend = class {
 		this.metrics.sentFrames += 1;
 		this.onJpegFrame(frame);
 	}
+	/**
+	* Keep the session's viewport size in sync with the real page. Chrome does
+	* not reliably attach fresh viewport metadata to every screencast frame, and
+	* the window-size route resizes the window directly; without this poll the
+	* frames kept advertising the pre-resize viewport and panel input was mapped
+	* to the wrong coordinates.
+	*/
+	#scheduleViewportSync() {
+		if (this.viewportTimer) this.clearTimer(this.viewportTimer);
+		this.viewportTimer = this.setTimer(async () => {
+			const current = this.current;
+			if (!current) return;
+			try {
+				await this.sessions.updateViewport(current.targetId);
+			} catch {}
+			if (this.current === current) this.#scheduleViewportSync();
+		}, 1e3);
+	}
 	#scheduleBackstop() {
 		this.clearTimer(this.backstopTimer);
 		const interval = this.getConfig().cdpBackstopIntervalMs;
@@ -4012,7 +4051,8 @@ var CdpCaptureBackend = class {
 			if (!current) return;
 			if (this.now() - current.lastFrameAt >= interval) try {
 				const session = await this.sessions.updateViewport(current.targetId);
-				const scale = session.viewportW > this.getConfig().cdpMaxWidth ? this.getConfig().cdpMaxWidth / session.viewportW : 1;
+				const maxWidth = this.current?.maxWidth ?? this.getConfig().cdpMaxWidth;
+				const scale = session.viewportW > maxWidth ? maxWidth / session.viewportW : 1;
 				const result = await this.cdp.call("Page.captureScreenshot", {
 					format: "jpeg",
 					quality: this.getConfig().cdpQuality,
@@ -4091,7 +4131,7 @@ var CaptureManager = class {
 		const value = requested || this.getConfig().captureBackend;
 		return value === "auto" ? "cdp" : value;
 	}
-	async startWatch({ clientId, backend, targetId }) {
+	async startWatch({ clientId, backend, targetId, maxWidth }) {
 		if (!clientId || !targetId) throw new Error("clientId and targetId are required");
 		this.clearTimer(this.stopTimer);
 		this.stopTimer = null;
@@ -4101,7 +4141,8 @@ var CaptureManager = class {
 			clientId,
 			backend: requestedBackend,
 			targetId,
-			expiresAt: this.now() + this.leaseTtlMs
+			expiresAt: this.now() + this.leaseTtlMs,
+			...maxWidth && maxWidth > 0 ? { maxWidth } : {}
 		});
 		if (existing && existing.backend === requestedBackend && existing.targetId === targetId) {
 			const resolved = this.#resolvedBackend(requestedBackend);
@@ -4109,17 +4150,18 @@ var CaptureManager = class {
 			if (this.backend && this.backendName === resolved) return this.status();
 		}
 		return this.#enqueue(async () => {
-			await this.#activate(this.#resolvedBackend(backend), targetId);
+			await this.#activate(this.#resolvedBackend(backend), targetId, false, maxWidth);
 			return this.status();
 		});
 	}
-	async switchWatch({ clientId, targetId }) {
+	async switchWatch({ clientId, targetId, maxWidth }) {
 		const lease = this.leases.get(clientId);
 		if (!lease) throw new Error("watch lease not found");
 		lease.targetId = targetId;
 		lease.expiresAt = this.now() + this.leaseTtlMs;
+		if (maxWidth && maxWidth > 0) lease.maxWidth = maxWidth;
 		return this.#enqueue(async () => {
-			await this.#activate(this.#resolvedBackend(lease.backend), targetId);
+			await this.#activate(this.#resolvedBackend(lease.backend), targetId, false, maxWidth ?? lease.maxWidth);
 			return this.status();
 		});
 	}
@@ -4164,7 +4206,7 @@ var CaptureManager = class {
 		const lease = [...this.leases.values()].sort((a, b) => b.expiresAt - a.expiresAt)[0];
 		if (lease) return this.#enqueue(() => this.#activate(this.#resolvedBackend(lease.backend), lease.targetId));
 	}
-	async #activate(backendName, targetId, force = false) {
+	async #activate(backendName, targetId, force = false, maxWidth) {
 		if (!force && this.backend && this.backendName === backendName && this.targetId === targetId) return;
 		await this.#stopBackend("backend-change");
 		const factory = this.backendFactories[backendName];
@@ -4178,7 +4220,7 @@ var CaptureManager = class {
 				message
 			});
 			if (backendName === "ffmpeg" && this.backendFactories.cdp) {
-				await this.#activate("cdp", targetId, true);
+				await this.#activate("cdp", targetId, true, maxWidth);
 				if (this.backend && this.backendName === "cdp") this.#setStatus({
 					backend: "cdp",
 					code: "ffmpeg-fallback-cdp",
@@ -4215,7 +4257,8 @@ var CaptureManager = class {
 			this.backend = candidate;
 			await candidate.start({
 				targetId,
-				generation
+				generation,
+				...maxWidth && maxWidth > 0 ? { maxWidth } : {}
 			});
 		} catch (error) {
 			const e = error;
@@ -4234,7 +4277,7 @@ var CaptureManager = class {
 				message: e.message
 			});
 			if (backendName === "ffmpeg" && this.backendFactories.cdp) {
-				await this.#activate("cdp", targetId, true);
+				await this.#activate("cdp", targetId, true, maxWidth);
 				if (this.backend && this.backendName === "cdp") this.#setStatus({
 					backend: "cdp",
 					code: "ffmpeg-fallback-cdp",
@@ -4294,6 +4337,31 @@ var CaptureManager = class {
 		await this.stop("disposed");
 	}
 };
+//#endregion
+//#region src/worker/snapshot.ts
+/** A single viewport PNG on the existing control session; never starts a watch. */
+async function captureSnapshot(sessions, targetId, maxWidth) {
+	const viewport = (await sessions.call(targetId, "Runtime.evaluate", {
+		expression: "({ x: window.scrollX, y: window.scrollY, width: window.innerWidth, height: window.innerHeight, dpr: window.devicePixelRatio })",
+		returnByValue: true
+	})).result?.value;
+	if (!viewport || !Number.isFinite(viewport.width) || !Number.isFinite(viewport.height) || viewport.width <= 0 || viewport.height <= 0) throw new Error("viewport unavailable");
+	const dpr = Number.isFinite(viewport.dpr) && viewport.dpr > 0 ? viewport.dpr : 1;
+	const scale = Math.min(1, maxWidth / viewport.width) / dpr;
+	const image = await sessions.call(targetId, "Page.captureScreenshot", {
+		format: "png",
+		captureBeyondViewport: false,
+		clip: {
+			x: viewport.x || 0,
+			y: viewport.y || 0,
+			width: viewport.width,
+			height: viewport.height,
+			scale
+		}
+	});
+	if (!image.data) throw new Error("snapshot unavailable");
+	return Buffer.from(image.data, "base64");
+}
 //#endregion
 //#region src/worker/mp4-fragments.ts
 const MAX_BOX_BYTES = 67108864;
@@ -5024,6 +5092,49 @@ var FfmpegCaptureBackend = class {
 		this.offDestroyed = null;
 	}
 };
+/** A sanity ceiling; the OS clamps to the display anyway. */
+const MAX_VIEWPORT_WIDTH = 3840;
+const MAX_VIEWPORT_HEIGHT = 2160;
+/** Keep a requested viewport inside a sane range (a sliver is unusable). */
+function clampViewportSize(width, height) {
+	return {
+		width: Math.min(MAX_VIEWPORT_WIDTH, Math.max(320, Math.round(width))),
+		height: Math.min(MAX_VIEWPORT_HEIGHT, Math.max(200, Math.round(height)))
+	};
+}
+/**
+* Apply a drag delta to the current viewport width.
+*
+* The panel's size-sync toggle maps the user's drag on the sidebar edge to a
+* window-width change, not to an absolute width: the panel is much narrower
+* than the browser window, so absolute mapping would shrink the window to the
+* sidebar on the very first frame.
+*/
+function widthWithDelta(currentWidth, delta) {
+	const next = Math.round(currentWidth + delta);
+	return Math.min(MAX_VIEWPORT_WIDTH, Math.max(320, next));
+}
+/**
+* Compute CDP `Browser.setWindowBounds` bounds for a desired page viewport.
+*
+* `left`/`top` are preserved when known so the window does not jump to another
+* corner while the user drags a panel edge. `windowState: 'normal'` is always
+* included: a maximized window ignores width/height until it is restored.
+*/
+function computeWindowBounds(viewport, chromeFrame = {
+	width: 0,
+	height: 0
+}, current = {}) {
+	const width = Math.max(320, Math.round(viewport.width + Math.max(0, chromeFrame.width)));
+	const height = Math.max(200, Math.round(viewport.height + Math.max(0, chromeFrame.height)));
+	return {
+		...typeof current.left === "number" && Number.isFinite(current.left) ? { left: Math.round(current.left) } : {},
+		...typeof current.top === "number" && Number.isFinite(current.top) ? { top: Math.round(current.top) } : {},
+		width,
+		height,
+		windowState: "normal"
+	};
+}
 //#endregion
 //#region src/worker/ego-cast-worker.ts
 const SENTINEL = "@@DSH_RESULT@@";
@@ -5039,7 +5150,7 @@ let castConfig = {
 	ffmpegFallbackReason: "",
 	cdpFps: 20,
 	cdpQuality: 55,
-	cdpMaxWidth: 960,
+	cdpMaxWidth: 1280,
 	cdpBackstopIntervalMs: 3e3,
 	ffmpegFps: 20,
 	ffmpegMaxWidth: 1280,
@@ -5434,6 +5545,56 @@ function stopSiblingWorkers() {
 		}
 	} catch {}
 }
+/**
+* Chrome's own frame around the page, used to turn a desired PAGE viewport into
+* a WINDOW size. Measured from the page because the frame height differs by
+* platform/version; falls back to a conservative constant when the page cannot
+* be evaluated (closed tab, navigation in flight).
+*/
+async function measureChromeFrame(browser, targetId) {
+	try {
+		const value = (await browser.sessions.call(targetId, "Runtime.evaluate", {
+			expression: "({ ow: window.outerWidth, iw: window.innerWidth, oh: window.outerHeight, ih: window.innerHeight })",
+			returnByValue: true
+		}))?.result?.value;
+		if (value && Number.isFinite(value.ow) && Number.isFinite(value.iw) && Number.isFinite(value.oh) && Number.isFinite(value.ih)) return {
+			width: Math.max(0, Math.round(value.ow - value.iw)),
+			height: Math.max(0, Math.round(value.oh - value.ih))
+		};
+	} catch {}
+	return {
+		width: 0,
+		height: IS_WIN ? 132 : 88
+	};
+}
+/**
+* The page's real viewport size. The panel reports only a width (its element
+* box cannot be trusted for height: CSS caps it and the thumbnail branch
+* distorts it), so the height follows the aspect the page is actually laid out
+* at right now.
+*/
+async function measureViewport(browser, targetId) {
+	try {
+		const value = (await browser.sessions.call(targetId, "Runtime.evaluate", {
+			expression: "({ w: window.innerWidth, h: window.innerHeight })",
+			returnByValue: true
+		}))?.result?.value;
+		if (value && Number.isFinite(value.w) && Number.isFinite(value.h) && value.w > 0 && value.h > 0) return {
+			width: Math.round(value.w),
+			height: Math.round(value.h)
+		};
+	} catch {}
+	return null;
+}
+/**
+* The panel's resize handles fire several requests per second while dragging.
+* Measuring the window, Chrome's frame and the page viewport on every one of
+* them meant ~5 CDP round-trips per step and made the drag stutter. Cache the
+* expensive parts; the cached viewport is maintained by our own resizes and
+* re-read from the session every couple of seconds.
+*/
+const windowSizeCache = /* @__PURE__ */ new Map();
+const windowSizeViewportRefresh = /* @__PURE__ */ new Map();
 async function main() {
 	stopSiblingWorkers();
 	rmSync(CAST_STATE_FILE, { force: true });
@@ -5450,6 +5611,142 @@ async function main() {
 				spaces: active ? await snapshotSpaces() : [],
 				capture: manager.status()
 			});
+			if (req.method === "GET" && url.pathname === "/api/snapshot") {
+				const browser = active;
+				if (!browser) return sendJson(res, 409, {
+					ok: false,
+					error: "no live browser"
+				});
+				const maxWidth = Number(url.searchParams.get("maxWidth") ?? 320);
+				if (!Number.isInteger(maxWidth) || maxWidth < 1 || maxWidth > 1920) return sendJson(res, 400, {
+					ok: false,
+					error: "maxWidth must be an integer from 1 to 1920"
+				});
+				const targets = await listTargets();
+				const targetId = url.searchParams.get("targetId") || await activeTargetId() || targets[0]?.targetId;
+				if (!targetId || !targets.some((target) => target.targetId === targetId)) return sendJson(res, 409, {
+					ok: false,
+					error: "target is no longer available"
+				});
+				const png = await captureSnapshot(browser.sessions, targetId, maxWidth);
+				res.writeHead(200, {
+					"content-type": "image/png",
+					"content-length": png.length,
+					"cache-control": "no-store"
+				});
+				return res.end(png);
+			}
+			if (req.method === "POST" && url.pathname === "/api/window-size") {
+				const body = await readJson(req);
+				const requestedWidth = Number(body.width);
+				const requestedDelta = Number(body.delta);
+				const requestedHeight = Number(body.height);
+				const requestedDy = Number(body.dy);
+				const requestedAspect = Number(body.aspect);
+				const hasWidth = Number.isFinite(requestedWidth) && requestedWidth >= 200;
+				const hasDelta = Number.isFinite(requestedDelta) && requestedDelta !== 0;
+				const hasHeight = Number.isFinite(requestedHeight) && requestedHeight >= 120;
+				const hasDy = Number.isFinite(requestedDy) && requestedDy !== 0;
+				const hasAspect = Number.isFinite(requestedAspect) && requestedAspect > 0 && requestedAspect < 10;
+				if (!hasWidth && !hasDelta && !hasHeight && !hasDy && !hasAspect) return sendJson(res, 400, {
+					ok: false,
+					error: "width, delta, height, dy or aspect is required"
+				});
+				if (!active) return sendJson(res, 409, {
+					ok: false,
+					code: "browser-disconnected",
+					error: "no live browser"
+				});
+				const browser = active;
+				const targetId = typeof body.targetId === "string" && body.targetId ? body.targetId : await activeTargetId();
+				if (!targetId) return sendJson(res, 409, {
+					ok: false,
+					error: "no active target"
+				});
+				try {
+					const now = Date.now();
+					let cache = windowSizeCache.get(targetId);
+					if (!cache || now - cache.measuredAt > 1e4) {
+						const { windowId } = await browser.cdp.call("Browser.getWindowForTarget", { targetId });
+						if (typeof windowId !== "number") return sendJson(res, 409, {
+							ok: false,
+							code: "headless",
+							error: "the browser has no window (headless); use the pop-out button first"
+						});
+						const current = await browser.cdp.call("Browser.getWindowBounds", { windowId });
+						const chromeFrame = await measureChromeFrame(browser, targetId);
+						const measured = await measureViewport(browser, targetId);
+						const bounds = current?.bounds ?? {};
+						cache = {
+							windowId,
+							chromeFrame,
+							viewport: measured ?? {
+								width: Math.max(0, (bounds.width ?? 0) - chromeFrame.width),
+								height: Math.max(0, (bounds.height ?? 0) - chromeFrame.height)
+							},
+							left: typeof bounds.left === "number" ? bounds.left : 0,
+							top: typeof bounds.top === "number" ? bounds.top : 0,
+							measuredAt: now,
+							viewportAt: now
+						};
+						windowSizeCache.set(targetId, cache);
+					} else if (now - cache.viewportAt > 2e3) {
+						const session = await browser.sessions.updateViewport(targetId).catch(() => null);
+						if (session && Number.isFinite(session.viewportW) && Number.isFinite(session.viewportH)) cache.viewport = {
+							width: session.viewportW,
+							height: session.viewportH
+						};
+						cache.viewportAt = now;
+					}
+					const currentWidth = cache.viewport.width;
+					const currentHeight = cache.viewport.height;
+					if ((currentWidth <= 0 || currentHeight <= 0) && !(hasWidth && hasHeight)) return sendJson(res, 409, {
+						ok: false,
+						error: "could not determine the current viewport size"
+					});
+					const width = hasWidth ? Math.round(requestedWidth) : hasDelta ? widthWithDelta(currentWidth, requestedDelta) : currentWidth;
+					let height;
+					if (hasHeight) height = Math.round(requestedHeight);
+					else if (hasAspect) height = Math.round(width / requestedAspect);
+					else if (hasDy) height = Math.round(currentHeight + requestedDy);
+					else height = Math.round(width * currentHeight / currentWidth);
+					const clamped = clampViewportSize(width, height);
+					const bounds = computeWindowBounds(clamped, cache.chromeFrame, {
+						left: cache.left,
+						top: cache.top
+					});
+					await browser.cdp.call("Browser.setWindowBounds", {
+						windowId: cache.windowId,
+						bounds
+					});
+					cache.viewport = clamped;
+					cache.left = typeof bounds.left === "number" ? bounds.left : cache.left;
+					cache.top = typeof bounds.top === "number" ? bounds.top : cache.top;
+					cache.measuredAt = now;
+					cache.viewportAt = now;
+					if (!windowSizeViewportRefresh.has(targetId)) {
+						const timer = setTimeout(() => {
+							windowSizeViewportRefresh.delete(targetId);
+							browser.sessions.updateViewport(targetId).catch(() => {});
+						}, 160);
+						timer.unref?.();
+						windowSizeViewportRefresh.set(targetId, timer);
+					}
+					return sendJson(res, 200, {
+						ok: true,
+						windowId: cache.windowId,
+						bounds,
+						viewport: clamped
+					});
+				} catch (error) {
+					windowSizeCache.delete(targetId);
+					return sendJson(res, 503, {
+						ok: false,
+						code: "window-resize-failed",
+						error: error.message || String(error)
+					});
+				}
+			}
 			if (req.method === "GET" && url.pathname === "/api/watch/status") return sendJson(res, 200, {
 				ok: true,
 				...manager.status()

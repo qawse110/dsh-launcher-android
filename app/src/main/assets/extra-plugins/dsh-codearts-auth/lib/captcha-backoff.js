@@ -43,6 +43,54 @@
  * 这一点由「池的 mint 回调走同一个 `mintCaptcha`」保证，不需要池自己判断。
  */
 /**
+ * **冷却闸门错误**：因处于退避冷却期而**直接拒绝**，本次根本没有发起 mint。
+ *
+ * ## ⚠️⚠️ 为什么必须单独可判别（对抗审计实测的 P0，IKQ4JN 附带修）
+ *
+ * 冷却闸门抛普通 `Error` 时，它会**流回调用侧那个「记一次失败」的 catch**
+ * （闸门在 `ZcodeCaptchaBrowser` 内部，而 catch 包住整个 `mintWithOutcome`）
+ * ⇒ 每点一次就 `noteFailure()` 一次 ⇒ `streak` 单调增长、冷却**指数放大**。
+ *
+ * 实测（`threshold=3, base=60s, max=30min`）：
+ *
+ * ```
+ * 真失败 3 次 ⇒ 冷却 60s, streak=3
+ * 冷却期内再点 5 次 ⇒ streak 4→8，冷却 60s → 120 → 240 → 480 → 960 → 1800s
+ * ```
+ *
+ * ⇒ **用户多点几次操作，就把 1 分钟冷静期推成 30 分钟**，而他什么也没做错
+ * （那 5 次请求一次都没发出去，**没有伤到任何设备信誉**）。
+ *
+ * ## 判据
+ *
+ * 闸门拒绝 = 「本次没有 mint」⇒ **不得**计入 streak（与部署错误同一条理由：
+ * 没有发出请求就没有信誉可伤）。这与「冷却期内继续尝试」无关 ——
+ * 闸门本来就该拒绝，只是不该**因为被拒绝**而加重处罚。
+ *
+ * ⚠️ 它**不是**部署错误：冷却可能是真信誉问题导致的，文案仍应保持
+ * 「稍后再试 + 若从未成功过则去装浏览器」的双出口（见调用点）。
+ */
+export class CaptchaCooldownError extends Error {
+    remainMs;
+    constructor(message, remainMs) {
+        super(message);
+        this.remainMs = remainMs;
+        this.name = 'CaptchaCooldownError';
+    }
+}
+/**
+ * 该错误是否只是「冷却期拒绝」（⇒ **不**再计入退避，否则冷却会自我放大）。
+ *
+ * ⚠️ 与 `isBrowserDeploymentError`（`chromium-session.ts`）一样用 `name` + 字段双判
+ * （对模块副本免疫）。
+ */
+export function isCaptchaCooldownError(error) {
+    if (typeof error !== 'object' || error === null)
+        return false;
+    const record = error;
+    return record.name === 'CaptchaCooldownError' && typeof record.remainMs === 'number';
+}
+/**
  * captcha 产出失败计数器与冷却闸门。
  *
  * 有状态：每个 provider 实例持有一个即可（captcha 的产出能力是**设备级**的，

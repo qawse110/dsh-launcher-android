@@ -21,8 +21,13 @@
 //
 // 纯函数 + 一个有界累加器：不读文件、不读时间、不调 LLM。
 
-/** 每会话保留的回合数上限。**内存有界**是硬要求：会话可能开一整天。 */
-export const CTX_MAX_TURNS = 12
+/**
+ * 每会话**保留**的回合数上限（不是注入上限；注入多少由 historyMode/turns 决定）。
+ * 2026-10-22 用户口径：`full` 要“尽可能接近工作模型的上下文”，所以保留量放到 50 回合；
+ * `turns` 模式仍然只注入最近 N 个（默认几个，见 settings）。
+ * 内存有界仍是硬要求：只留回合对象，不改写历史。
+ */
+export const CTX_MAX_TURNS = 50
 /** 单段文本的落库上限（用户原话与助手回复各自）。截断事实会写进注入文本。 */
 // ⚠ 2026-09-26 由 4000 提到 6000，并把总预算同步翻到 24000（用户实测几万字提示词）。
 // 这个上限**只作用于「存进会话历史、供后续轮次当上下文」的那份文本**；
@@ -121,9 +126,16 @@ export function createSessionHistory() {
         const s = slot(sid)
         if (!s) return
         if (event.type === 'user/message') {
+          // 2026-10-22 真机（诊断实录）：宿主把**插件自己注入的上下文**也作为 user/message 投递，
+          // 其中 source.kind === 'runtime-context'。原样收下 = 让优化器把自己的输出当用户原话读回来。
+          // 这里在**入口**拒收它，而不是事后靠正则剥文本。
+          const srcKind = event.data && event.data.source && event.data.source.kind
+          if (srcKind === 'runtime-context') return
           // 先落上一回合的助手正文，再开新回合（顺序反了会把回复算到新回合头上）
           flush(s)
-          const text = extractEventText(event)
+          // 只收**用户真的说的话**：注入块在这里剥掉（见 stripInjectedText）
+          const raw = extractEventText(event)
+          const text = stripInjectedText(raw)
           if (!text) return
           openTurn(s, clip(text, CTX_MAX_TEXT_CHARS).text)
           return
@@ -196,6 +208,27 @@ export function createSessionHistory() {
  * 本函数覆盖三种形状（string / data.content 数组 / data.message.content 数组）。
  * 纯函数，不抛。
  */
+/**
+ * 剥掉**机器注入**的块，只留用户真正说的话。
+ *
+ * 为什么必须剥：宿主会把插件/系统注入的上下文（本插件自己的三段落、系统提醒等）
+ * 一起放进会话事件的正文里。原样收进历史，就等于让优化器**把自己的上一轮输出当成用户的话**读回来——
+ * 真机表现就是：用户只说“测试/已重启”，它却接着聊上一轮的内部话题。
+ *
+ * 只按**已知标记**剥，不做语义猜测：剥完为空就当这一轮没有用户原话（不伪造内容）。
+ */
+const INJECTED_BLOCKS = [
+  // 注入块**总是贴在用户消息尾部**：从第一个标记开始一刀切到结尾，
+  // 而不是只删到下一个“【”——否则第二个、第三个块会残留（真机验证过）。
+  /(?:【给工作模型[^】]*】|【提示词辅助|【插件辅助上下文)[\s\S]*$/g,
+  /<system-reminder>[\s\S]*?<\/system-reminder>/g,
+]
+export function stripInjectedText(text) {
+  let out = String(text == null ? '' : text)
+  for (const re of INJECTED_BLOCKS) out = out.replace(re, '')
+  return out.replace(/\n{3,}/g, '\n\n').trim()
+}
+
 export function extractEventText(event) {
   try {
     const d = event && event.data
