@@ -25,15 +25,23 @@ class DshUpdaterTest {
 
     private val ctx: Context = ApplicationProvider.getApplicationContext()
 
-    /** 伪造已安装的 @deepseek-ai/dsh 版本。 */
+    /** 伪造已安装的 @deepseek-ai/dsh 版本（含真装一定有的 lib/bin.js，那是 isInstalled 的判据）。 */
     private fun fakeInstall(version: String?) {
-        val pkg = File(ctx.filesDir, "dsh-prefix/node_modules/@deepseek-ai/dsh/package.json")
+        val dir = File(ctx.filesDir, "dsh-prefix/node_modules/@deepseek-ai/dsh")
         if (version == null) {
-            pkg.delete()
+            // 卸载：连 lib/bin.js 一起删。只删 package.json 会留下「版本没了但 CLI 还在」的
+            // 半装状态，让 isInstalled 仍为 true，与「未安装」的语义不符。
+            dir.deleteRecursively()
             return
         }
-        pkg.parentFile!!.mkdirs()
-        pkg.writeText("""{"name":"@deepseek-ai/dsh","version":"$version"}""")
+        dir.mkdirs()
+        File(dir, "package.json").writeText("""{"name":"@deepseek-ai/dsh","version":"$version"}""")
+        // 真装必然生成 lib/bin.js；「已装版本与目标不一致时应当判定需要升级」一例要断言
+        // 「bin.js 存在 ⇒ 旧逻辑只看它在不在，会误判无需升级」，故这里必须把它造出来
+        // （该断言自 2026-10-18 ca9e1f9 起一直红，CI 单测门禁因此长期失败）。
+        val cli = File(dir, "lib/bin.js")
+        cli.parentFile!!.mkdirs()
+        cli.writeText("// fake dsh cli\n")
     }
 
     private fun console() =
