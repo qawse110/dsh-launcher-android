@@ -102,6 +102,15 @@
       "upstream": "https://github.com/Fisfzy/dsh-ego-browser"
     },
     {
+      "dir": "dsh-skills-manager",
+      "name": "@michengai/dsh-skills-manager",
+      "id": "skills-manager",
+      "title": "Skills 管理器",
+      "desc": "统一加载并安全管理本机 Agent Skills：全局（DSH_HOME/skills）与项目级 skill 的列表/详情/新建/导入(zip 或目录)/删除/启停，接 skills.sh、ClawHub 等在线目录，另带仓库管理与在线更新。**上游原版、零本地改动**：取自 npm @michengai/dsh-skills-manager@1.2.20 整包产物（上游仓库 MichengAI/dsh-skills-manager，Apache-2.0），49 个文件 / 1,542,265 字节逐字节原样（含 assets/，仅 README 配图引用，未裁任何运行时文件）。⚠ 原需求写的 @michengai/dsh-skill-manager（单数）在 npm 与 npmmirror 均 404，真实包名是复数 skills 的这一个，已按真实包名内置。兼容性：engines.dsh = >=0.2.0-rc.1 <0.3.0-0 独占判定（按清单 compatContract，该字段存在即完全忽略其 11 条 peerDependencies）；用宿主同一份 evaluatePluginCompatibility 实测：0.2.1-rc.2 / 0.2.1-rc.4 / 0.2.0-rc.2 返回 undefined（无问题），0.3.0 与 0.1.9-rc.1 如期返回 requirements.engines.dsh ⇒ 上界真实生效而非空声明。服务端：lib/index.js 的 inject=[webServer, skills, tools, sessions]，注册前缀路由 /api/dsh-skills-manager、向 ctx.skills 注册全局与按 agent 的 external skill provider，并注册 create_skill 工具（工具级 ask 策略把它指向 DSH_HOME/skills）。前端：lib/client.js 为预打包 __ModuleLoader__ 模块，仅 require react / react-dom/client / @deepseek-ai/dsh-client-ui-primitives（三者均在宿主前端 seed 表内），注册到 main、sidebar.panellist、settings.section（id=skills-manager，order 25）、plugins.bundle.config 四个槽位 ⇒ 面板外挂既有侧栏与设置页，不与 ACP 的 compress 工具、也不与 prompt-opt 的 preset-wish 抢同一块 UI。运行时依赖仅 fflate 0.8.3（zip 导入的 unzipSync），已由依赖桥接解析到 files/plugins/node_modules/fflate@0.8.3，无需 pnpm 重新解析；其余只用 node: 内置模块。bundle 层只插一条 skills-manager（无 preset、无 host patch 行），不动宿主 compaction 行与其它内置插件。",
+      "version": "1.2.20",
+      "upstream": "https://github.com/MichengAI/dsh-skills-manager"
+    },
+    {
       "dir": "billion-context",
       "name": "billion-context",
       "id": "bili-native",

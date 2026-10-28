@@ -707,11 +707,59 @@ dist/index.js (4.62MB，代理主程序)   dist/agent/dsh-native.js (2.22MB，�
 
 **设备装配（本轮已跑，真机）**
 
-- 备份：§/storage/emulated/0/code/.dshchk-20261028/device-before-restructure-20261028-140143.tar.gz§（14,928,019 B，含 extra-plugins / plugins / 清单 / status / marker / profile patch+package.json）。
-- 同步：§files/extra-plugins§ 整体换为仓库 12 个目录，§files/install§ 与 §files/plugin-manifest.json§ 一并同步（§diff -rq§ install 目录 IDENTICAL，清单 sha256 §071ee685…26dc§ 仓库 = 设备）。
-- 装配日志关键行：§retired builtin pruned: dsh-prompt-optimizer-mobile§ / §retired builtin pruned: dsh-codearts-auth§（旧目录与 profile link 依赖、bundles 条目被机械剪枝）→ §extra plugin dsh-wish-specializer synced: absent -> 0.9.0-stable§ → §dsh plugin add§ 成功 → §extra plugin dsh-providers-hub synced: absent -> 2.8.261028§ → §dsh plugin add§ 成功 → §builtin plugins assembled: 12 ok, 0 failed / 12 total§ → §builtin patch entries cleaned§ → §compat audit: 12 compatible, 0 incompatible / 12 total (dsh 0.2.1-rc.2)§ → §plugin dep bridge: 232 kept, 6 linked, 22 stale removed, 0 warn§ → §profile dep bridge: 2 linked, 541 already present, 0 warn§。
-- 结果核对：§files/plugins§ 下 12 个目录，版本 §dsh-wish-specializer 0.9.0-stable§ / §dsh-providers-hub 2.8.261028§ / §dsh-mobile-replay 0.1.0§；旧两目录已不存在；profile §dependencies§ 与 §dsh.profile.bundles§ 均指向新包名（§@dsh-external/dsh-wish-specializer§ / §dsh-providers-hub§ / §dsh-mobile-replay§）；§plugin-status.json§ 12 项全部 §compatible=true§。
-- **逐字节对照**：仓库 A 对设备上游包（排除 §runtime/§）90 个文件 sha256 全等；仓库 B 对设备上游包（排除 §*.map§ / §*.d.ts§）251 个文件 sha256 全等 ⇒ 「零本地改动」不是自述而是可复算的事实。
-- 一处**预期差异**（记录在案、非缺陷）：§files/plugins/dsh-provider-headers/lib/client.js§ 带有 §stub/patchers/plugin-compat.mjs:151§ 的 §dsh-launcher-client-compat-v1§ 标记与 require 包名改写——那是**启动期 stub 补丁**写进去的（该插件用 §@deepseek-ai/dsh-client-store§ 替换已不存在的 §dsh-client-runtime/client§），发生在装配之后的每次启动，与 assembler 无关；仓库源码保持未打补丁的原样。12 个目录中只有它带该标记。
-- **验证后清理**：临时 profile §files/.dsh/profiles/replaytest§ 已删除。
-**边界**：本轮**未重启 dsh**，真机渲染与交互未验证；M 的样式在 A/B 两个面板上的实际视觉效果只能由实机确认。旧 fork 时代的记录（``十、``十二）按 append-only 惯例保留原文。
+- 备份：`/storage/emulated/0/code/.dshchk-20261028/device-before-restructure-20261028-140143.tar.gz`（14,928,019 B，含 extra-plugins / plugins / 清单 / status / marker / profile patch+package.json）。
+- 同步：`files/extra-plugins` 整体换为仓库 12 个目录，`files/install` 与 `files/plugin-manifest.json` 一并同步（`diff -rq` install 目录 IDENTICAL，清单 sha256 `071ee685…26dc` 仓库 = 设备）。
+- 装配日志关键行：`retired builtin pruned: dsh-prompt-optimizer-mobile` / `retired builtin pruned: dsh-codearts-auth`（旧目录与 profile link 依赖、bundles 条目被机械剪枝）→ `extra plugin dsh-wish-specializer synced: absent -> 0.9.0-stable` → `dsh plugin add` 成功 → `extra plugin dsh-providers-hub synced: absent -> 2.8.261028` → `dsh plugin add` 成功 → `builtin plugins assembled: 12 ok, 0 failed / 12 total` → `builtin patch entries cleaned` → `compat audit: 12 compatible, 0 incompatible / 12 total (dsh 0.2.1-rc.2)` → `plugin dep bridge: 232 kept, 6 linked, 22 stale removed, 0 warn` → `profile dep bridge: 2 linked, 541 already present, 0 warn`。
+- 结果核对：`files/plugins` 下 12 个目录，版本 `dsh-wish-specializer 0.9.0-stable` / `dsh-providers-hub 2.8.261028` / `dsh-mobile-replay 0.1.0`；旧两目录已不存在；profile `dependencies` 与 `dsh.profile.bundles` 均指向新包名（`@dsh-external/dsh-wish-specializer` / `dsh-providers-hub` / `dsh-mobile-replay`）；`plugin-status.json` 12 项全部 `compatible=true`。
+- **逐字节对照**：仓库 A 对设备上游包（排除 `runtime/`）90 个文件 sha256 全等；仓库 B 对设备上游包（排除 `*.map` / `*.d.ts`）251 个文件 sha256 全等 ⇒ 「零本地改动」不是自述而是可复算的事实。
+- 一处**预期差异**（记录在案、非缺陷）：`files/plugins/dsh-provider-headers/lib/client.js` 带有 `stub/patchers/plugin-compat.mjs:151` 的 `dsh-launcher-client-compat-v1` 标记与 require 包名改写——那是**启动期 stub 补丁**写进去的（该插件用 `@deepseek-ai/dsh-client-store` 替换已不存在的 `dsh-client-runtime/client`），发生在装配之后的每次启动，与 assembler 无关；仓库源码保持未打补丁的原样。12 个目录中只有它带该标记。
+- **验证后清理**：临时 profile `files/.dsh/profiles/replaytest` 已删除。
+**边界**：本轮**未重启 dsh**，真机渲染与交互未验证；M 的样式在 A/B 两个面板上的实际视觉效果只能由实机确认。旧 fork 时代的记录（「十」「十二」）按 append-only 惯例保留原文。
+
+### 十四、内置插件新增 `@michengai/dsh-skills-manager` 1.2.20（2026-10-28T08:5xZ／北京 16:5x）
+
+**需求（用户原话 m02481）**：「内置插件增加`@michengai/dsh-skill-manager`」。**包名纠偏**：该写法在 npm 与 npmmirror 上均为 404；实际发行包是本节的**复数**形式 `dsh-skills-manager`（owner `@michengai`）。按实际存在的包落地，未新建别名或占位包。
+
+**一、上游身份（可复算）**
+
+- 版本：`1.2.20`，`dist-tags.latest = 1.2.20`（截至 2026-10-28 无更新版本）。
+- registry 记：`shasum e3c50f55df97aeed56a82b35ca8e24c93e55755a`、`integrity sha512-PBTD5unHoAEZw3L56jTwORLKpSBGIbuNtzRcZEHSr4pRLaq8A6spys2OTmM8ajD+oBQJLPe/A97OssP5pUYjbQ==`、`fileCount 49`、`unpackedSize 1542265`、发布时间 `2026-10-26T06:03:24.222Z`、带 provenance（`slsa.dev/provenance/v1`）。
+- 本地 tarball `pkg.tgz`（1,044,757 B）`sha1` 与 registry 的 `shasum` **逐位相同**，`sha256 62a2f7b1ed3c6a0ad9c70767ba7963c3d2002254177572f25be483099ebf6bdc` ⇒ 取回的就是上游那一份。
+- 仓库目录 `app/src/main/assets/extra-plugins/dsh-skills-manager`：49 文件 / 1,542,265 B，与 tarball 解包结果 `diff -rq` **零差异**（未做任何本地改写，与上一轮两次「去 fork 化」后的口径一致）。
+
+**二、装进来的到底做什么**
+
+- 服务端（`lib/index.js`，`inject: [webServer, skills, tools, sessions]`）：注册 `/api/dsh-skills-manager` 前缀路由（`ctx.webServer.register({kind:'prefix'})`，lib/index.js:362）、向 `ctx.skills` 注册 provider（全局 + 按 agent，lib/index.js:326-327）、注册工具 `create_skill`（lib/index.js:330）。
+- 客户端（`lib/client.js`，预打包的 `window.__ModuleLoader__.load` 模块）：只 require `react` / `react-dom/client` / `@deepseek-ai/dsh-client-ui-primitives`，注册 UI 槽位 `main`、`sidebar.panellist`、`settings.section`（id `skills-manager`，order 25）、`plugins.bundle.config`。三个 require 均在宿主的 frontend 种子表（`OZ()` 返回的 map）内 ⇒ 无需额外注入即可解析。
+- 自带 `assets/`（30 文件 / 911,980 B）仅被 README 引用，`lib/*.js` 里对 `assets` 的引用数为 **0** ⇒ 保留不影响运行（未裁剪，避免与上游 `files` 字段口径打架）。
+- 依赖：仅 `fflate@0.8.3` 一个运行时依赖，已由装配链的 dep bridge 链接到 `files/plugins/node_modules`。
+
+**三、兼容契约（用宿主真实函数判定，不靠读文档）**
+
+- 该包 **`engines.dsh` 独占判定**：`>=0.2.0-rc.1 <0.3.0-0`（有上界），另 `engines.node ^22.19.0 || >=24.0.0`，11 条 peer 全为 `@deepseek-ai/dsh-*` 与 react 系列（peerDependenciesMeta 未声明）。
+- 直接 import `@deepseek-ai/dsh-app-boot/lib/index.js` 的 `evaluatePluginCompatibility` 实测：`0.2.1-rc.2` / `0.2.1-rc.4` / `0.2.0-rc.2` → 返回 `undefined`（兼容）；`0.3.0` 与 `0.1.9-rc.1` → 返回 `{requirements:{'engines.dsh':'>=0.2.0-rc.1 <0.3.0-0'}}`（如实拦截）。**上界是真的**，将来 dsh 升到 0.3 该包会被自动禁用——已记在清单 desc 里。
+- 对照组：线上仍存的归档项 `billion-context-dsh@0.2.27` 在 `0.2.1-rc.4` 下被判不兼容（16 条钉死 peer），与本包形成对照，说明判定函数确实在工作而非恒真。
+
+**四、清单 / 文档**
+
+- `app/src/main/assets/plugin-manifest.json`：在 `dsh-ego-browser` 与 `billion-context` 之间新增一行（dir `dsh-skills-manager` / name `@michengai/dsh-skills-manager` / id `skills-manager` / title「Skills 管理器」/ version `1.2.20` / upstream `https://github.com/MichengAI/dsh-skills-manager`），desc 写清上面的包名纠偏、零本地改动、engines 独占契约与实测结果、服务端/客户端入口、fflate 桥接、bundle patch 单 insert。清单共 13 行、sha256 `ad048a70dab94cf6b517228bb161cde1aa557e75ebb021d6d827014323ed1337`（仓库 = 设备）。
+- `README.md`：内置表新增该行（`billion-context` 行之前），并把「当前为 **12 个**」改为「当前为 **13 个**」（README.md:102）。
+- 门禁 `node tools/check-plugin-manifest.mjs` → `✓ 插件清单一致性校验通过：builtin=13，optional=3`。
+
+**五、设备装配（真机已跑）**
+
+- 备份：`/storage/emulated/0/code/.dshchk-20261028/device-before-skillsmanager-20261028-165512.tar.gz`（14,795,831 B，含 extra-plugins / plugins / 清单 / status / marker / profile patch+package.json）。
+- 同步后跑真实装配：`extra plugin dsh-skills-manager synced: absent -> 1.2.20 (apk 300)` → `dsh plugin add dsh-skills-manager` 成功 → `builtin plugins assembled: 13 ok, 0 failed / 13 total` → `compat audit: 13 compatible, 0 incompatible / 13 total (dsh 0.2.1-rc.2)` → `plugin dep bridge: 172 kept, 66 linked, 3 stale removed, 0 warn` → `profile dep bridge: 0 linked, 543 already present, 0 warn`。pnpm 另打一行 peer 依赖 `[WARN]`（非致命，exit=0）。
+- 到位核对：`files/plugins/dsh-skills-manager` 49 文件、与仓库 `diff -rq` IDENTICAL；profile `dependencies` 增加 `link:…/plugins/dsh-skills-manager`、`dsh.profile.bundles` 增加 `@michengai/dsh-skills-manager`；`plugin-status.json` `checkedAt 2026-10-28T08:55:27.040Z`、13 项全部 `compatible=true`；`files/plugins/node_modules/fflate` → 0.8.3。
+- **不重启即可验证装载**：真机 `--profile web --dump-config` → exit 0、1621 行、`skipping` **0 条**，1413-1415 行出现 `# == @michengai/dsh-skills-manager` / `- id: skills-manager` / `name: '@michengai/dsh-skills-manager'`。注：`--import` 必须给 `fs-register.mjs` 的**绝对路径**，相对路径报 `ERR_MODULE_NOT_FOUND`。
+- 客户端契约核对（`@deepseek-ai/dsh-client-modules/lib/index.js:731-738`）：声明 `dsh.client` 且 platform 为 `web` 的包必须导出 `./client`，否则报 `client bundle not found`；本包 `exports['./client'] = ./lib/client.js`，从 profile 解析 `require.resolve('@michengai/dsh-skills-manager/client')` 命中真实文件 ⇒ 不触发该失败类。
+
+**六、边界（未验证）**
+
+- 本轮**未重启 dsh**，面板/侧栏/设置的**实际渲染与交互**未经验证（新插件要重启后才在 WebUI 出现）；上述只证明「装配 + 配置解析 + 模块可解析」这一层。
+- 未在真机点过 `create_skill` 工具与 `/api/dsh-skills-manager` 路由的运行时行为（需要重启并把请求打到新进程）。
+- 该包 `engines.dsh` 有上界 `<0.3.0-0`：dsh 升到 0.3 时会被判定不兼容并静默禁用，届时需上游放宽或本地另案处理。
+
+**七、顺手修正**：上一小节（「十三」）里有 7 行把 Markdown 反引号写成了占位符（U+00A7），本轮按原文字逐个还原为反引号——**只改符号、不改任何陈述**，`git diff` 里那 7 行的增删可逐字对照。
+
+**八、收尾（2026-10-28T09:0xZ）**：提交 `e7943ce` 已推 `origin/next`（52 文件：该包 49 个文件 + 清单 + README + 本日志；`refs/heads/next:refs/heads/next`，远端另有一个同名 tag 需规避）。Actions 两个 workflow 均 success：`CI` success、`Build APK` success（artifact `app-debug-apk` 88.1MB，id 12804496293）。

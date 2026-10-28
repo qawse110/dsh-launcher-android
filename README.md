@@ -94,11 +94,12 @@ Kotlin 展示面与 `install-dsh.mjs` 装配面都从它派生；一致性由 `n
 | `dsh-vision` | 自 `prebuilt.tgz` 恢复 | 给纯文本模型加上 `view_image` 工具：复用宿主 Provider 配置，或接自定义 OpenAI 兼容 VLM 端点 |
 | `@liustack/modsearch` | <https://github.com/liustack/modsearch> `v5.10.10`（npm 产物，整包同源） | 联网检索：把 `web_search`/`web_fetch` 的后端换成免密钥的 modsearch 引擎链（Firecrawl 免密钥、1,000 次/月），并新增 `x_search`、`read_page`。⚠ 运行时依赖 `commander`/`undici` 由**依赖桥接**供给（见下） |
 | `dsh-ego-browser` | <https://github.com/Fisfzy/dsh-ego-browser> `v0.9.4`（npm 产物，整包同源） | Agent 浏览器：30+ `ego_*` 工具 + 实时观察窗，底层内置 ego-lite 运行时。⚠ **运行期需一个可达的 Chrome/Chromium 二进制**（本机未装，见下） |
+| `@michengai/dsh-skills-manager` | npm `@michengai/dsh-skills-manager@1.2.20` **上游原版（零本地改动）**（源码仓库 <https://github.com/MichengAI/dsh-skills-manager>，Apache-2.0） | Skills 管理器：统一加载并安全管理本机 Agent Skills——全局（`DSH_HOME/skills`）与项目级 skill 的列表/详情/新建/导入（zip 或目录）/删除/启停，接 skills.sh、ClawHub 等在线目录，另有仓库管理与在线更新。49 文件 / 1,542,265 字节整包原样（含 `assets/`，只有 README 配图引用）。⚠ 需求里写的 `@michengai/dsh-skill-manager`（单数）在 npm 与 npmmirror 都 404，真实包名是复数 `skills` 的这一个。`engines.dsh = >=0.2.0-rc.1 <0.3.0-0` 独占兼容判定（有该字段即忽略其 11 条 peer）；运行时只依赖 `fflate`（已由依赖桥接解析到 0.8.3） |
 | `billion-context` | <https://github.com/ranxianglei/billion-context> `v0.1.208`（npm 产物，按上游 `files` 字段裁剪） | 上下文压缩 ACP：给模型 `compress`/`decompress`/`search_context`/`acp_status`/`acp_cache`/`read_original_image` 六个工具，由模型自己决定何时压缩、压缩什么（而非硬性截断），另附 `/acp`、`/acp-cache` 命令。⚠ 与旧内置的 `billion-context-dsh` 是**两个不同的包**：本包为进程外 MITM 代理架构，插件本体只注册工具，实际压缩由它 spawn 的 `dist/index.js` 代理进程完成。其自带的 `dsh.bundle.patch.yml` 会 disable 宿主的 `compaction-basic` 行，并**整体替换** `llm-deepseek` 的 `retryPolicy`、向四个 preset 注入 `biliBasicCompactionPolicy` |
 
 ### 内置集合的构成
 
-内置集合**由用户逐项决定**（原先「仅内置三个」的约束已撤回），当前为 **12 个**。
+内置集合**由用户逐项决定**（原先「仅内置三个」的约束已撤回），当前为 **13 个**。
 装完即可用；源码在 `assets/extra-plugins/`，唯一真源见
 [`plugin-manifest.json`](app/src/main/assets/plugin-manifest.json)。
 

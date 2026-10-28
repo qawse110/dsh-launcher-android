@@ -1,0 +1,363 @@
+# Changelog
+
+## 1.2.20 - 2026-10-26
+
+- Support registering custom skill sources: Allow adding skill folders for third-party agents outside the built-in list as read-only external sources, persisted to the `customSources` section in `roots.json` with full support for grouping, categories, and toggles (Issue #67, PR #68).
+- Scan product directories for skill candidates: Add automatic detection of sub-profile skill folders up to two levels down, reporting skill counts, conflicts, and registration states for one-click batch registration (PR #68).
+- Refine custom source form UX: Place the display name field before the folder path field; retain the settings modal and smoothly fallback to remaining sources when unregistering a custom source, keeping scan candidates up to date.
+- Modal action layout polish: Add visual separation and ample margin between form actions and the global footer buttons, preventing misclicks and visual grouping ambiguity.
+
+## 1.2.19 - 2026-10-25
+
+- Configurable external skill source folders: External read-only agent sources (Codex, Claude Code, Cursor, CC Switch, Google Antigravity, etc.) can now be pointed at custom folders directly from the UI, persisted to `~/.dsh/skills-manager/roots.json` taking precedence over environment variables with immediate effect (PR #66).
+- New header "Source folders…" management action with in-dialog source switching, enabling first-time configuration for sources that are empty or have missing default directories.
+- Fix custom folder dialog pre-fill: Retain the currently active directory instead of falling back to default, preventing accidental resets when saving without edits.
+- Atomic configuration persistence: Commit in-memory root path configuration only after successful disk writes, preventing memory contamination on filesystem errors.
+- Responsive custom badge layout: Move the "Custom" badge into the header label to ensure visibility even when paths are hidden in narrow container widths.
+
+## 1.2.18 - 2026-10-24
+
+- Upgrade host admission policy: Declare `engines.dsh: ">=0.2.0-rc.1 <0.3.0-0"` to support the entire DeepSeek Harness `0.2.x` line (including `0.2.0-rc.1` onwards, future alphas, RCs, and stable releases) without requiring routine plugin version bumps.
+- Decouple peerDependencies locks: Broaden all `@deepseek-ai/dsh-*` peer dependencies to the `0.2.x` generation range.
+- Upgrade build-time development dependencies: Synchronize all `@deepseek-ai/dsh-*` devDependencies to latest `0.2.1-rc.3`.
+
+## 1.2.16 - 2026-10-24
+
+- Dynamically migrate non-baseline external sources in `migrateManagerStateDocument()`, resolving state lockup and accidental fail-closed disablement when upgrading from older releases (Issue #63).
+
+## 1.2.15 - 2026-10-24
+
+- Recognize Google Antigravity global skills under `~/.gemini/config/skills` with `DSH_ANTIGRAVITY_HOME` override support (#61).
+
+## 1.2.14 - 2026-10-24
+
+- Support DeepSeek Harness `0.2.1-rc.3` while retaining all existing supported versions.
+
+## 1.2.13 - 2026-10-23
+
+- Hide the heading version chip when online updates are disabled alongside the update check action.
+- Disable the bundle config toggle with localized diagnostics when online updates are locked by host configuration (`updater: false` or `onlineUpdate: false`), preventing silent 403 bounces.
+- Clean up sidebar controller listeners and slots on plugin teardown, invalidating late initialization and rollback responses.
+
+## 1.2.12 - 2026-10-23
+
+- Support opt-out toggle for online updates with a native switch under bundle configuration (Issue #50).
+- Support host-level Cordis plugin configuration (`updater: false` or `onlineUpdate: false`) to disable the update endpoint and automatically hide the update action (#50).
+- Intercept update requests with HTTP 403 when online updates are disabled (#50).
+
+## 1.2.11 - 2026-10-21
+
+- Resolve API endpoints and plugin self-update URLs against the page base (`document.baseURI`) instead of raw site-root paths, fixing "non-JSON response (HTTP 404)" when DeepSeek Harness is deployed behind a prefix-stripping reverse proxy (Issue #56).
+- Handle base URLs lacking trailing slashes and gracefully fall back to literal paths in non-browser and test environments (#56).
+
+## 1.2.10 - 2026-10-21
+
+- Enlarge skill detail dialogs to 760px wide with a spacious, monospace body reader that can be resized vertically (Issue #54).
+- Add a one-click "Copy body" button with transient status feedback and full-title tooltips for truncated skill names (Issue #54).
+- Unify the wide layout and reading experience across local skills, repository skills, and catalog skills (ClawHub and skills.sh) (Issue #54).
+- Preserve Unicode and non-ASCII skill names, preventing Chinese and mixed skill names from being truncated into invalid short candidates (#53).
+- Enforce host naming policies with clear diagnostics while allowing historical non-conforming skills to be safely disabled and cleaned up (#53).
+- Align the sidebar panel width with the 960px host baseline and adopt native switch controls.
+
+## 1.2.9 - 2026-10-21
+
+- Align the enable/disable switch with lifecycle gatekeeper semantics: disabling globally blocks both model and slash invocations; enabling respects source frontmatter (`disable-model-invocation` and `user-invocable`) without forcing privileges (#43, #51).
+- Prevent repository and catalog installations from overriding `disable-model-invocation: true`, keeping user-only skills out of the model `skill-catalog` (#51).
+- Restore clean frontmatter policy inheritance when re-enabling a previously toggled skill (#43).
+
+## 1.2.8 - 2026-10-19
+
+- Let the settings page fill the host content column by removing the 820px cap.
+- Scroll the modal body when content exceeds the viewport while keeping footer actions visible across create, import, detail, and category dialogs.
+- Only decorate settings nav buttons that render the host `svg` as a direct child, so wrapped icons keep the host layout.
+
+## 1.2.7 - 2026-10-19
+
+- Keep the Skills settings nav icon visible under third-party skins by rendering it as an independent CSS mask instead of rewriting the host SVG (#49).
+- Align the scope tabs indicator with the 2px inset used by the Skills page.
+- Document the environment variables that override each supported agent directory.
+
+## 1.2.6 - 2026-10-18
+
+- Hide native skills when the native DSH source (`~/.dsh/skills`) is turned off in Settings → Skills by publishing a rank-399 overlay with `modelInvocable: false` (#48).
+
+## 1.2.5 - 2026-10-17
+
+- List top-level directory links in writable DSH skill folders (`~/.dsh/skills` and project `.dsh/skills`) as read-only entries. Details and enable/disable work; delete, overwrite, and import replacement are refused (#45).
+
+## 1.2.4 - 2026-10-17
+
+- Align confirmation dialog destructive action styling with host warning patterns, using red outlined buttons for deletion and uninstallation.
+
+## 1.2.3 - 2026-10-17
+
+- Support DeepSeek Harness `0.2.1-rc.2` while retaining all existing supported versions.
+
+## 1.2.2 - 2026-10-17
+
+- Support DeepSeek Harness `0.2.1-rc.1`; supported host versions are `0.2.0-rc.1`, `0.2.0-rc.2`, and `0.2.1-rc.1`.
+- Remove intermediate pre-release support for `0.2.1-alpha.1` through `0.2.1-alpha.5`.
+
+## 1.2.1 - 2026-10-17
+
+- After this plugin updates itself, installing or removing other plugins no longer fails the one-day supply-chain check just because this package was published recently.
+- Installed copies list the global copy first, then project copies. Location labels use a middle dot, and both the label and the path stay within their half of the row.
+- Source paths in Global and Project stay within half the row instead of a fixed 180px. The full path remains in the tooltip.
+- Confirmation text sits in the dialog description, and the buttons stay in the footer, so the text is no longer pushed down against the buttons.
+
+## 1.2.0 - 2026-10-17
+
+- Supported hosts are now DeepSeek Harness `0.2.0-rc.1`, `0.2.0-rc.2`, `0.2.1-alpha.1`, `0.2.1-alpha.2`, `0.2.1-alpha.3`, `0.2.1-alpha.4`, and `0.2.1-alpha.5`. Hosts before `0.2.0` are no longer supported. If you still use a `0.1.x` host, install plugin `1.1.23` instead of `@latest`.
+- Tabs, dialogs, inputs, and icon buttons use the host controls. The screen no longer depends on Ant Design.
+- Search-bar icon buttons use the same outlined buttons as the actions on a skill row.
+- Source paths in Global and Project stay on one line and are capped at 180px. The full path remains in the tooltip.
+- The project DSH source uses the same name as the global DSH source.
+
+## 1.1.23 - 2026-10-16
+
+- Dialog actions now share one layout: cancel is an outline button, ordinary confirm is solid, and destructive confirm is solid red.
+- Renaming a category asks you to confirm, and the button stays disabled until the name changes.
+- Source filter choices are text only. Filter controls keep even spacing, and the search field uses the remaining width. Dialog dropdowns use the host menu and fill their column.
+- The settings entry uses the same skill icon as Codex UI. It no longer changes another dialog row that merely says Skills, and disabling the plugin restores the original gear.
+- GitHub, feedback, and check for updates use the same host outline buttons.
+
+## 1.1.22 - 2026-10-16
+
+- Official DSH Design & Token Alignment: Align completely with official DSH design tokens and bridge Ant Design styles to host semantic CSS variables; adopt the official radius scale (R4/R8/R12/R16/R20/R28) and ensure seamless light/dark and frosted glass theme adaptation (#41).
+- Accessible Switch & Primitive Alignment: Refactor skill and category toggle switches to match host Switch primitive dimensions and interactions; replace forced red disabled states with host neutral dark tokens and brand active colors for WCAG contrast and full WAI-ARIA support; unify events on native onClick and align focus-ring tokens (#42).
+- Dropdown Polish: Elevate Select trigger style specificity to eliminate hover/open background flashes; align active focus state with host focus rings and apply prominent elevation tokens to popup menus.
+
+## 1.1.21 - 2026-10-15
+
+- Support DSH `0.2.1-alpha.3` while retaining all existing supported versions.
+- Allow ordinary user-level Shared Agent skills to be managed, trashed and restored without installation records, preserving discovery, loading and path safety while keeping other agent sources read-only.
+- Add real ClawHub / skills.sh search and individual skill installation, with ten-item download-ranking pages and an explicit load-more button.
+- Fix concurrent repository operations overwriting catalog state, lost workspace installation badges, and interference between same-name copies; preserve source identity through trash and restore.
+- Allow installation beyond 500 source records without discarding active copies or recoverable trash identities; retain the state file's byte-size limit.
+- Keep failed recovery from blocking listings and unrelated operations, preserve pending state with actionable warnings, and mark legacy identities with unknown locations rather than guessing directories.
+- Improve oversized-response diagnostics, stream cleanup, and cancellation on navigation or unmount; remove unused skill-array expansion.
+- Support explicit indentation indicators in YAML block scalars.
+- Source tracking above 16 MiB can still be reduced by removing Trash records or legacy identities, without deleting active installation copies. Further growth is rejected.
+- Permanent deletion removes Trash files only after source tracking is saved. A catalog skill with a known installation location no longer also shows an unknown-location badge.
+
+## 1.1.19 - 2026-10-14
+
+- Adjust settings navigation section order to ensure stable placement and avoid conflicts with other plugins.
+
+## 1.1.18 - 2026-10-13
+
+- Visual and brand enhancements: integrate official brand logos for ecosystem sources (DSH, WorkBuddy, CC Switch, Codex, Qoder, Cursor, Claude Code, etc.), remove redundant collapse arrows on source cards, and preserve full paths.
+- Category UX improvements: collapse category folders by default (expand automatically when searching), add modal for batch-assigning skills with descriptions and search, and support HTML5 drag-and-drop categorization within the same source.
+- Source toggle: wire DSH source toggle in persistence and policy layers to align with external sources.
+- List streamlining: automatically hide empty external read-only sources in the global view and dropdown selector.
+- Repository view: format branch label as default branch and style commit SHA with monospace badge and spacing.
+- Disabled external sources no longer hide same-name bundled skills from enabled plugins. Native-source blocking and explicit per-skill disables remain effective, including mixed disabled-source groups (#33, #34).
+
+## 1.1.17 - 2026-10-12
+
+- Support DSH `0.2.1-alpha.2` while retaining all existing supported versions.
+
+[简体中文](CHANGELOG.zh-CN.md)
+
+## 1.1.16 - 2026-10-12
+
+- You can add categories inside each skill source and place skills in them. Categories stay in the manager and do not move files. Each category can be turned on or off together.
+- The project tab selects a registered workspace from the dropdown at the top. It no longer lists every workspace collapsed by default, and it no longer treats a plain skills folder at the project root as a skill source.
+
+## 1.1.15 - 2026-10-11
+
+- Creating, importing, and installing from a repository can target a registered workspace. The copy goes to that project's `.dsh/skills`. The user directory stays the default, and the dialog warns that project files may be committed.
+- The project tab lists registered workspaces, collapsed by default. Expand one to view and manage its skills.
+- The same repository skill can be installed in more than one place. Update, roll back, and uninstall apply only to the copy you select.
+- A repository skill that only conflicts with a local copy shows Name conflict and cannot be installed over it.
+- If a workspace is no longer registered, or its project root has changed, managing, restoring, or removing that project skill stops. It does not write to another project.
+- Creating and importing can also write to Shared Agent. Codex, Claude, and other agent directories stay read-only.
+
+## 1.1.13 - 2026-10-07
+
+- Repository installs can go to DSH skills or Shared Agent. Codex, Claude and other agent directories stay read-only.
+- Tracked repository copies can be uninstalled to Trash, including local edits. Restore keeps the original destination.
+- Thanks to @funk80rus (#26).
+
+## 1.1.12 - 2026-10-07
+
+- Official Desktop can update this plugin in place. It no longer targets the web profile by mistake.
+- A new version is marked with a warning color. Version numbers keep their normal color.
+- After updating, fully quit and reopen DSH Desktop.
+
+## 1.1.10 - 2026-10-06
+
+- The installed-plugin list shows “Skills Manager” and a localized description instead of the package name. Titles and descriptions come from `meta.title` and `meta.description` in `locale/zh.json` and `locale/en.json`.
+- Installing from GitHub now includes the compiled runtime, so no manual build is required.
+
+## 1.1.9 - 2026-10-04
+
+- Fix a stale `/api/dsh-skills-manager` route after plugin unload or reactivation that could fail startup with `duplicate prefix route` and leave the Skills settings panel unavailable (#25). The route now uses an explicit Cordis effect so restarts and failed startup release it correctly.
+
+## 1.1.8 - 2026-09-30
+
+- Recognize WorkBuddy skills in `~/.workbuddy/skills` and `<project>/.workbuddy/skills`.
+- Recognize Qoder (`~/.qoder/skills`, `<project>/.qoder/skills`), Qoder CN CLI (`~/.qoder-cn/skills`), and Qoder CN IDE (`~/.lingma/skills`, `<project>/.lingma/skills`). Qoder CN CLI project skills use the shared Qoder project directory.
+
+## 1.1.7 - 2026-09-30
+
+- Installing a skill from a repository now records the same explicit enable policy as turning the switch on. The skill appears in the slash menu immediately, including when its description is not accepted by the host YAML parser.
+
+## 1.1.6 - 2026-09-30
+
+This release supports DeepSeek Harness `0.2.0-rc.2`. Previously supported versions remain available.
+
+## 1.1.5 - 2026-09-28
+
+This release supports DeepSeek Harness `0.2.0-rc.1`. Previously supported versions remain available.
+
+## 1.1.4 - 2026-09-25
+
+This release supports DeepSeek Harness `0.1.7-rc.2`. Previously supported versions remain available.
+
+## 1.1.3 - 2026-09-24
+
+This release publishes the `0.1.7-rc.1` support. `1.1.1` and `1.1.2` were tagged but not published.
+
+- Compatibility installs pin Cordis plugins to the host's Cordis line, so older rc hosts still boot during release verification.
+- The README compatibility sentence now matches the package version.
+
+## 1.1.2 - 2026-09-24
+
+This release publishes the `0.1.7-rc.1` support from 1.1.1. That tag was not published: newer Cordis plugins no longer match the Cordis `4.0.2` pin used by older rc hosts, so those hosts exited before the compatibility check could connect.
+
+- Compatibility installs now pin `cordis-plugin-group`, `cordis-plugin-hmr`, `cordis-plugin-include`, `cordis-plugin-loader`, and `cordis-plugin-timer` to the host's Cordis line.
+- Supported hosts remain `0.1.0-rc.8`, `0.1.1-rc.2`, `0.1.2-rc.1`, `0.1.5-rc.1`, `0.1.5-rc.2`, and `0.1.7-rc.1`.
+
+## 1.1.1 - 2026-09-24
+
+This release supports DeepSeek Harness `0.1.7-rc.1` and no longer accepts alpha host versions.
+
+- Supported hosts are `0.1.0-rc.8`, `0.1.1-rc.2`, `0.1.2-rc.1`, `0.1.5-rc.1`, `0.1.5-rc.2`, and `0.1.7-rc.1`.
+- `0.1.6-alpha.1`, `0.1.6-alpha.2`, and `0.1.7-alpha.1` are no longer in the compatibility range.
+
+## 1.1.0 - 2026-09-23
+
+This release rebuilds **Settings → Skills** and adds DeepSeek Harness `0.1.7-alpha.1`, while keeping the seven earlier supported versions.
+
+- The page follows the host light or dark theme, with the usual blue controls.
+- Refresh, create, and import use round buttons. GitHub, feedback, and check for updates stay small and keep their icons.
+- Source and status are compact dropdowns, with search on the same row at the right. Escape closes an open filter or More menu without closing Settings.
+- Skills are grouped by source and can be collapsed. Hover a name to read its description. Skill detail matches repository detail: name, description, file path, and a read-only body.
+- The enable switch sits at the right of each row. Enabled and disabled labels next to it are gone; shadowed and invalid skills still show a status.
+- Check for updates opens a normal dialog, not a centered one. Status sits next to the latest version, and the manual command wraps. Escape closes only that dialog.
+
+## 1.0.1 - 2026-09-21
+
+This maintenance release improves source development, packaging verification and screenshot privacy while retaining the existing plugin runtime interfaces.
+
+### Development and packaging
+
+- Migrate ten source modules to strict TypeScript, retaining the existing plugin architecture and JavaScript runtime entry points. Add domain, host and client contracts, plus positive and negative type tests; include type checking in the main test command.
+- Stop tracking `lib` in Git. Run type checks and build automatically before packing, and verify that a clean directory without `lib` produces a package with all runtime files and a loadable server entry point.
+- Cover the exact minimum Node.js version 22.19.0 alongside Node.js 24 in CI. Code changes continue to trigger the supported-host compatibility matrix.
+- Document supported installation via the npm registry or locally built `.tgz` packages; direct Git/GitHub dependency installation is not supported. Align the English and Chinese development instructions.
+
+### Fixes
+
+- Restore modal focus after an asynchronous form submission disables the focused button, so Escape after an error closes only the plugin dialog instead of the entire host settings page.
+
+### Documentation and privacy
+
+- Crop all nine screenshots to their feature panels, redact local paths, and remove real filenames and project directories from the background. Reduce total screenshot size by 81% with lossless compression.
+- Correct the English screenshot caption and align image display sizes with the cropped files.
+
+## 1.0.0 - 2026-09-21
+
+### 1.0 release scope
+
+This release upgrades directly from published 0.1.53 to 1.0.0. The planned 0.1.54 was not released separately; all its changes are included here. The plugin enters the 1.x series, while host support remains limited to the explicitly listed DSH versions.
+
+### New: skill repositories and installation
+
+- Add a Repositories tab alongside Global skills, Project skills and Trash, with public GitHub subscription management.
+- Accept owner/repo, HTTPS repository URLs and tree URLs; select a branch, tag or skill subdirectory, or use the default branch.
+- Browse collapsible repository groups; search names and descriptions, filter repositories and installation states, and read skill contents, paths and snapshot details.
+- Install individual skills into global DSH with their instructions, scripts and resources. Installation does not execute scripts or overwrite same-name skills.
+- Show Available, Installed, Name conflict, Invalid format and Update available states, with inline installation progress and success or failure feedback.
+- Distinguish local skills from repository installations, link to their GitHub source, and navigate directly to repository update management.
+- Removing a subscription preserves installed skills and source tracking.
+
+### New: skill updates and backup rollback
+
+- Combine refresh and update checks into Refresh & check updates. Refresh updates the scan cache and detects changes without replacing local copies.
+- Compare content hashes for every skill file, including instructions, scripts and resources; unrelated repository changes do not trigger an update.
+- Preview added, modified and deleted files before explicitly confirming backup and replacement.
+- Protect local edits by default; overwriting requires Back up local edits and replace. Changes after preview require a new preview.
+- Restore the previous version after previewing changes and backing up the current copy, preserving any local edits stored in the backup.
+- Use directory replacement and failure rollback, including recovery from tracking-write failures. Historical backups are retained without automatic cleanup.
+
+### Downloads and reliability
+
+- Download ZIP archives directly from codeload.github.com without consuming GitHub REST anonymous quotas. Unspecified branches use HEAD first; only 404 triggers main/master fallback. A 403 or timeout does not trigger blind branch retries.
+- Use SHA-256 content snapshots and verified caches for installation and updates. Missing or corrupt caches require refresh instead of silently installing different content.
+- Preserve the previous catalog and cache after scan or network failures, remove duplicate catalog reads and hash calculations, and keep downloads outside the local file mutation queue.
+- Recover interrupted installation tracking only after verifying the complete installed directory. Modified, missing or extra files and linked directories are not automatically adopted.
+- Provide specific archive-size and tracking-write errors; enforce limits on expanded size, entry count, paths and instruction size, and reject unsafe paths, duplicate paths and corrupt archives.
+- Cover cross-site and write-request protection and path traversal rejection; serialize repository mutations.
+
+### Interface and interactions
+
+- Align headings, tabs, tab-specific actions, filters and lists; use host Input/Menu components with archive-style input and dropdown presentation.
+- Use compact two-line skill rows with source links, invocation state and a More menu; reduce long-list clutter through filtering and collapsible groups.
+- Scope import results to their tab so Global import completion no longer appears in Repositories.
+- Fix background flicker when opening repository details: show a loading dialog immediately and read details without changing the whole page's busy state or reloading its list.
+- Add a spinner, current repository and item counts to both all-repository refresh and single-repository refresh in the management dialog. Stop on completion or failure, allow retries, and respect reduced-motion preferences.
+- Complete Chinese and English labels, errors, progress and results; remove unused strings and correct the project empty-state hint to include ordinary workspaces.
+- Use host semantic colors with fallbacks for older hosts; retain dropdown keyboard navigation, dismissal and focus restoration.
+
+### Documentation and validation
+
+- Update both READMEs with repository installation, source tracking, update and rollback guidance and limits; provide complete Chinese and English repository guides.
+- Refresh bilingual banners with DSH Skills Manager at the top and replace Global/Repositories screenshots. Use WebP with lossless screenshot compression at original resolution.
+- Keep public documentation focused on current product behavior, excluding internal handoffs, runtime evidence, machine paths and historical test screenshots.
+- Pin official host dependencies throughout the compatibility graph and verify installed versions, fixing mixed prerelease dependencies; retain seven-host and real-browser regression coverage.
+
+### Existing capabilities retained in 1.0
+
+These capabilities were already available in 0.x and remain supported; they are not all new in this release:
+
+- Global and current-session project discovery, search, details, diagnostics and per-skill or per-source toggles, for both ordinary workspaces and Git projects.
+- Project precedence, independent same-name copies and global fallback after disabling a copy. Toggles affect DSH invocation without modifying other agents' source files.
+- Sources including DSH, Shared Agent, CC Switch, Codex, Claude Code, Gemini, OpenCode, Cursor, Copilot, Windsurf, Trae, OpenClaw, Roo and CodeBuddy.
+- Skill creation and ZIP, folder or SKILL.md import into global DSH; Trash, restore and permanent deletion for DSH skills.
+- Plugin version checking and update controls, plus Chinese and English interfaces.
+
+### Upgrade and boundaries
+
+- After publication, update the plugin through Settings → Skills → Check for updates or rerun the README installation command, then restart DSH and refresh the page. Repository Refresh & check updates checks skill contents, not the plugin version.
+- No manual migration of existing skills is required. Users of local 0.1.54 test builds should back up skills and skills-manager state under DSH_HOME before upgrading.
+- Only public GitHub repositories, global DSH installation and manually confirmed updates are supported. Private credentials, automatic updates, bulk overwrites and project-level repository installation are not included.
+- Repository archives are limited to 32 MiB; subdirectory filtering does not reduce download size. Backups are not automatically deleted, and only the most recent backup has a quick rollback action. Forced termination or power loss may require manual recovery.
+- Supported DSH versions: 0.1.0-rc.8, 0.1.1-rc.2, 0.1.2-rc.1, 0.1.5-rc.1, 0.1.5-rc.2, 0.1.6-alpha.1 and 0.1.6-alpha.2. Node.js: ^22.19.0 or >=24.0.0.
+
+## 0.1.53 - 2026-09-18
+
+- Fix the empty Project tab on official DeepSeek Harness `0.1.6-alpha.2`. Session lists no longer expose a current-session field; the tab now follows the session shown in the main view, while older hosts keep the previous current-session binding.
+- Add support for DeepSeek Harness `0.1.6-alpha.2` while retaining the six previously supported versions.
+- Use a bilingual package.json description matching the GitHub repository.
+
+## 0.1.52 - 2026-09-16
+
+- Add support for DeepSeek Harness `0.1.6-alpha.1` while retaining support for the five previously supported versions; skill discovery, enable/disable policies, and management workflows remain unchanged.
+- Canonicalize isolated-host sandbox paths so Windows 8.3 temp directories still match project skill roots in CI.
+
+## 0.1.51 - 2026-09-16
+
+- Add support for DeepSeek Harness `0.1.6-alpha.1` while retaining support for the five previously supported versions; skill discovery, enable/disable policies, and management workflows remain unchanged.
+
+## 0.1.50 - 2026-09-12
+
+- Fix project skills being skipped in non-Git workspaces. When no `.git` ancestor exists, use the current session cwd as the project root so skills can be viewed and toggled without running `git init`.
+
+## 0.1.49 - 2026-09-12
+
+- Add Copilot support for global `~/.copilot/skills` and project `.github/skills`, and expand project sources for common agents. The project tab follows only the current session; direct project-management API calls must include its ID in `x-dsh-skills-session`.
+- Prioritize project copies over global copies and toggle each source independently. Another enabled copy can take over when one is disabled, with the active source identified in the UI; invocation is blocked only when all copies are disabled.
+- Give Global, Project, and Trash separate tabs, group skills into collapsible sources, hide long descriptions, and remove redundant information. Creation and import always save to global DSH; generic project `skills/` directories use a neutral source label.
+- Fix update buttons and dialogs not following language changes, and align Trash date formatting and import-warning separators with the UI language.
