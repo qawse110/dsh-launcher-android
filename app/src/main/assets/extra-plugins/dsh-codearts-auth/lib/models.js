@@ -22,28 +22,6 @@ const CODEARTS_MODELS_CACHE_FILENAME = 'codearts_models.json';
  * 签名前都要查它，独立文件可避免解析整份模型元数据。
  */
 const CODEARTS_BENEFIT_CACHE_FILENAME = 'codearts_benefit_models.json';
-/**
- * 远端不可用时的 benefit 模型兜底集合。
- *
- * **为什么需要它**：benefit 模型调用必须带 `maas_type: benefit`（参与
- * SDK-HMAC-SHA256 签名），否则后端返回
- * `InferHub.002002009.404 The model is not registered`。该集合的权威来源是
- * `opengw gateway/config` 的 `result.models`（见 {@link fetchCodeArtsRemoteModels}），
- * 但首次启动、未登录或远端拉取失败时拿不到，故保留一份兜底。
- *
- * 实证（2026-09-23，对齐 deveco-code-rust fb1b4a2）：
- * 1. IDE kernel 日志的 `inferhub-provider [header-debug] full headers` 显示
- *    `deepseek-v4.1-flash` 的实际出站请求带 `"maas_type":"benefit"`；
- * 2. 逐个对照两个端点的模型：`gateway/config` 的模型（glm-5.3-flash、
- *    deepseek-v4.1-flash 等）不带该头一律 404 not registered、带上即成功；
- *    而 `/v1/model/builtin` 的模型（GLM-5.2 等）带上反而 `unsupported model`。
- *
- * ⚠️ `deepseek-v4-flash` / `deepseek-v4-pro`（无日期后缀）**不在**此集合：
- * 它们是后端另外注册的非 benefit 模型，带上 maas_type 会报 unsupported model。
- * 尤其注意 gateway/config 返回的是它们的**带日期后缀**形态
- * （`deepseek-v4-flash-0731`），归一化后落到这两个 id —— 绝不能连带标成 benefit。
- */
-export const CODEARTS_BENEFIT_FALLBACK = ['glm-5.3-flash', 'deepseek-v4.1-flash'];
 /** 动态模型拉取超时（ms）。 */
 const FETCH_TIMEOUT_MS = 10_000;
 /** 定时刷新远端模型列表的间隔（2 小时）。 */
@@ -61,6 +39,30 @@ let benefitMemoryCache;
  * 远端 gateway/config 返回带日期后缀的 model_id（-0731 = 7月31日版本），
  * 但 chat 端点只认不带后缀的 id（InferHub.002002009.404 "model is not registered"）。
  * 仅匹配末尾 -NNNN（4 位数字），避免误去 glm-5.3-flash 等无后缀 id。
+ *
+ * ⚠️⚠️ **2026-10-27 修订：本函数不再是「暴露给用户的那个 id」的裁剪刀。**
+ *
+ * 实测（IDE 内核日志 `kernel-codeartsdoer-incognito-2026-10-27T220300`）：
+ * `/v1/model/builtin` **同时**下发两个**独立**条目 ——
+ *
+ * ```
+ * {"model_id":"deepseek-v4.1-flash",      "model_name":"DeepSeek-V4.1-Flash",      ...}
+ * {"model_id":"deepseek-v4.1-flash-1017", "model_name":"DeepSeek-V4.1-Flash-1017", ...}
+ * ```
+ *
+ * 两者 `model_type` 都是 `admin`、`context` 都是 `1048576`，是**上游并存的旧版与新版**。
+ * 修前 `parseModelInfo` 拿本函数的**产物**做 `seen` 去重键 ⇒ 带版本号的那条被静默吞掉
+ * ⇒ 用户报障「IDE 里已更新到 1017，我们的列表没更新」（虽然不是没拉到远端，
+ * 而是拉到后被自己去重吃掉）。
+ *
+ * ⇒ 现在 `parseModelInfo` 用**原始 `model_id`** 做去重键与对外 id，
+ * 本函数只保留两处**内部**用途：
+ * 1. gateway 分支判断「该 id 是否带日期后缀」（决定是否记为 benefit，见下方注释）；
+ * 2. `model_name` 缺失时给一个不含版本号的兜底 id。
+ *
+ * ⚠️ 若将来发现某个带后缀的 id 在 chat 端点**不可用**，处置方式是在
+ * `parseModelInfo` 里**显式跳过**那一条（并登记实测），**不要**退回「统一裁剪」——
+ * 那会把上游有意并存的版本再次合并掉。
  */
 export function normalizeModelId(id) {
     if (id.length > 5) {
@@ -77,14 +79,29 @@ nowMs) {
     const rawId = m['model_id'];
     if (typeof rawId !== 'string' || rawId.length === 0)
         return undefined;
-    const id = normalizeModelId(rawId);
+    /**
+     * ⚠️⚠️ **对外 id 用原始 `model_id`，不裁版本后缀**（2026-10-27 修）。
+     *
+     * 上游把「旧版」与「带日期的新版」当成**两个独立条目**同时下发
+     * （实测 `deepseek-v4.1-flash` 与 `deepseek-v4.1-flash-1017` 并存，
+     * 两者 `model_type` 都是 `admin`、`context` 都是 1048576）。
+     * 修前这里用 `normalizeModelId(rawId)` 的产物做 id 与去重键 ⇒ 带版本号的那条
+     * 被静默吞掉 ⇒ 用户看到「IDE 已更新 1017，插件列表没更新」。
+     *
+     * ⚠️ 因此 `seen` 的键也必须是 rawId —— 用归一后的 id 会把两条并成一条。
+     */
+    const id = rawId;
     // 过滤视觉（VL）多模态模型
     // id 含 -VL- 或以 -VL 结尾（如 Qwen3-VL-235B），上下文小、不支持工具调用，
     // 不适合当 agent 主模型，从列表隐藏；只通过 analyzeImage 等工具间接调用。
     if (id.includes('-VL-') || id.endsWith('-VL'))
         return undefined;
     const rawName = m['model_name'];
-    const name = typeof rawName === 'string' && rawName.length > 0 ? normalizeModelId(rawName) : id;
+    /**
+     * ⚠️ 展示名也**不裁版本后缀**：`DeepSeek-V4.1-Flash-1017` 里的 `1017` 正是
+     * 用户要看的版本信息（裁掉就与旧版同名、无法区分）。
+     */
+    const name = typeof rawName === 'string' && rawName.length > 0 ? rawName : id;
     if (seen.has(id))
         return undefined;
     seen.add(id);
@@ -344,9 +361,36 @@ nowMs = Date.now()) {
             }
         }
     }
-    // 持久化 benefit 集合：chat 请求签名时据此决定是否带 maas_type。
-    // 仅在确实从 gateway 拿到模型时写入，避免把空集合覆盖掉可用缓存。
-    if (benefitIds.length > 0) {
+    /**
+     * 持久化 benefit 集合：chat 请求签名时据此决定是否带 `maas_type`。
+     *
+     * ⚠️⚠️ **判据是「gateway 形状可识别」，不是「解析出非空列表」**（2026-10-27 审计 P1 修）。
+     *
+     * 修前是 `if (benefitIds.length > 0)` —— 注释理由是「避免把空集合覆盖掉可用缓存」。
+     * 那条理由**只对了一半**：`result.models: []` 是**合法**状态（上游把 benefit 模型
+     * 全部下架 / 该账号无 benefit 通道时就是这样，本文件上面 `outcome.gatewayOk`
+     * 的注释也这么写），而修前的写法让这个合法状态**无法落到磁盘** ⇒ 陈旧集合
+     * **只增不减**、跨重启存活。
+     *
+     * ## 后果（对抗审计实测）
+     *
+     * 磁盘上留着旧版本写下的 `["glm-5.3-flash"]`、而该账号其实已无 benefit 包：
+     * 每条请求「带头 → 4004.200 → 领取（**写**）→ 仍 4004 → 去头 → 成功」
+     * ⇒ 实测 3 条请求 = **3 次领取 + 6 次 chat**，永久持续（跨重启）。
+     * 这与本 PR 删掉静态表的理由（「静态表会过时」）是**同一个病**，只是搬到了磁盘。
+     *
+     * ⇒ 区分两件事：
+     * - **gateway 请求失败 / 形状认不出** ⇒ 不覆盖（保留旧值，宁可陈旧也不清空）；
+     * - **gateway 成功且形状可识别（含 `[]`）** ⇒ **覆盖**（`[]` 表示「确认无」）。
+     *
+     * ⚠️ 配套：`loadBenefitCache` 必须能把「文件里是 `[]`」与「文件不存在 / 解析失败」
+     * 区分开（前者返回 `[]`＝确认无，后者返回 `undefined`＝未确认），否则本节
+     * 写下的 `[]` 在下次启动时又会被当成「未确认」。
+     */
+    // ⚠️ 判据用**局部标志**而不是 `outcome?.gatewayOk`：`outcome` 是可选参数，
+    //    调用方（含单测、以及本文件里的直接调用）可能根本不传 ⇒ 用它会**静默失效**
+    //    （实测：不传 outcome 时陈旧值没被清掉，用例当场抓到）。
+    if (gatewayArr !== undefined || benefitIds.length > 0) {
         setBenefitMemoryCache(benefitIds);
         saveBenefitCache(benefitIds);
     }
@@ -362,6 +406,23 @@ function cacheDir() {
         return override;
     const home = process.env.USERPROFILE ?? process.env.HOME;
     if (!home)
+        return undefined;
+    /**
+     * ⚠️⚠️ **测试环境拒写真实用户目录**（2026-10-27 实测污染后补的防线）。
+     *
+     * 实测：跑完 `pnpm test` 后 `~/.cache/deveco/codearts_models.json` 与
+     * `codearts_benefit_models.json` 的 mtime 都变成当天；把两个文件**删掉**再跑
+     * `llm-adapter.spec.ts`，它们**被重新生成** ⇒ 有 spec 走了真读真写路径
+     * （`tests/setup-isolation.ts` 已注入 `DSH_CODEARTS_CACHE_DIR`，但仍有
+     * 一条腿绕过了它 —— 追查成本高，且这类污染的后果是**污染用户的下一轮真实运行**：
+     * 模型列表被测试造的空目录顶掉、benefit 集合被错值顶掉 ⇒ 每轮带错头）。
+     *
+     * ⇒ 判据：`NODE_ENV === 'test'` **且**最终解析到真实 `~/.cache/deveco`
+     *   ⇒ 返回 `undefined`（＝「没有缓存目录」）⇒ 读走「未确认」、写静默跳过。
+     *   ⚠️ 显式设了其他目录（单测自己的临时目录）不受影响；生产（NODE_ENV 不是
+     *   test）完全不受影响 —— 与 `refresh-journal` 的同类防线同型。
+     */
+    if (process.env.NODE_ENV === 'test')
         return undefined;
     return `${home}/.cache/deveco`;
 }
@@ -436,7 +497,7 @@ export function setMemoryCache(models) {
 }
 /**
  * 保存 benefit 模型 id 集合到缓存文件（原子写入 tmp+rename）。
- * 文件不存在或写入失败时静默忽略 —— 判定会回退到静态兜底集合。
+ * 文件不存在或写入失败时静默忽略 —— 判定只会退回「未确认」。
  *
  * 同步写入（与 {@link loadBenefitCache} 一致）：chat 请求签名前要读它，
  * 异步写入会让「刚拉取完就发消息」的窗口期内读到旧值/空值。
@@ -456,7 +517,21 @@ export function saveBenefitCache(ids) {
         // 写入失败静默忽略
     }
 }
-/** 加载缓存文件中的 benefit 模型 id 集合；文件不存在或解析失败时返回 undefined。 */
+/**
+ * 加载缓存文件中的 benefit 模型 id 集合。
+ *
+ * ## 三种状态必须可分（2026-10-27 审计 P1 修）
+ *
+ * | 磁盘状态 | 返回 | 含义 | ⇒ 是否带 `maas_type` |
+ * |---|---|---|---|
+ * | 文件不存在 / 解析失败 | `undefined` | **未确认** | 不带（靠自愈补头） |
+ * | 文件是 `[]` | `[]` | **确认无** benefit 模型 | 不带（且**不**再尝试领取） |
+ * | 文件是 `["glm-5.3-flash"]` | 数组 | 确认有这些 | 命中才带 |
+ *
+ * ⚠️⚠️ 修前把「空数组」与「读不到」**都**返回 `undefined` ⇒
+ * `saveBenefitCache([])` 写下的「确认无」在下次启动时又退化成「未确认」，
+ * 于是 `models.ts` 那侧修好的「空集合可落盘」被这里**抵消**（配套改动，缺一不可）。
+ */
 export function loadBenefitCache() {
     const path = benefitCachePath();
     if (!path)
@@ -466,8 +541,11 @@ export function loadBenefitCache() {
             return undefined;
         const text = readFileSync(path, 'utf-8');
         const ids = JSON.parse(text);
-        if (!Array.isArray(ids) || ids.length === 0)
+        // ⚠️ 合法空数组 = 「确认无」（区别于文件缺失/解析失败的「未确认」）。
+        if (!Array.isArray(ids))
             return undefined;
+        if (ids.length === 0)
+            return [];
         return ids.filter((id) => typeof id === 'string');
     }
     catch {
@@ -479,21 +557,31 @@ export function setBenefitMemoryCache(ids) {
     benefitMemoryCache = ids;
 }
 /**
- * 判断某模型是否为 benefit（免费额度）模型 —— 决定 chat 请求是否必须带
- * `maas_type: benefit`。
+ * 该模型的 benefit（免费额度）身份**由远端集合确认**。
  *
- * 优先级：内存缓存 → 磁盘缓存（远端拉取所得）→ 静态兜底集合。
- * 远端集合优先，使后端新增 benefit 模型时**无需改代码**即可自动识别。
+ * ## 为什么只有一个判据、没有静态兜底表
  *
- * ⚠️ 判定**不是**「名字里带 flash」这类猜测：`deepseek-v4-flash`（无后缀）
- * 与 `glm-5.3-flash` 名字形态相同，benefit 属性却相反。唯一权威来源是
- * gateway/config 的模型清单 + 兜底表。
+ * 早期用一张写死的兜底表（2026-09-23 对齐 deveco-code-rust）推断 benefit 身份，
+ * 但那张表**不会随后端演进更新**，两次都成了缺陷根源：
+ *
+ * - 表过时 ⇒ 首次请求恒带 `maas_type: benefit`，而后端已把 `deepseek-v4.1-flash`
+ *   改按常规 `0.18x` 模型下发 ⇒ 每次首条消息都报
+ *   `InferHub.4004.200 benefit not found`（2026-10-25 修，见 `e611a61`）。
+ * - 表与远端集合谁优先 ⇒ 同一语义两套判据；后端再改一次就又错一遍。
+ *
+ * 2026-10-26 本机复测（真实账号直连 `chat/completions`）：
+ * `deepseek-v4.1-flash` 不带该头**出流正常**、带上即 `4004.200`；
+ * `glm-5.3-flash` 不带该头 `002002009.404`、属**只按 benefit 通道注册**。
+ * 两者形态相反，恰好证明「按名字/按历史表猜」不可行。
+ *
+ * ⇒ 权威来源只剩 `opengw gateway/config` 的 `result.models`
+ * （见 {@link fetchCodeArtsRemoteModels}）；后端千变万化的情况由 `stream()` 的
+ * **双向自愈**兜住：404 未注册 ⇒ 补头重试一次，4004.200 ⇒ 先领福利、再去头重试
+ * 一次。因此**没有静态表也不会卡死新模型**，只是首次多一轮往返。
  */
-export function isCodeArtsBenefitModel(model) {
+export function isCodeArtsBenefitModelKnown(model) {
     if (benefitMemoryCache === undefined)
         benefitMemoryCache = loadBenefitCache();
-    if (benefitMemoryCache !== undefined && benefitMemoryCache.includes(model))
-        return true;
-    return CODEARTS_BENEFIT_FALLBACK.includes(model);
+    return benefitMemoryCache !== undefined && benefitMemoryCache.includes(model);
 }
 //# sourceMappingURL=models.js.map

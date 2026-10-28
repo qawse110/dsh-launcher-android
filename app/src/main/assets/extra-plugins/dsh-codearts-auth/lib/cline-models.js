@@ -36,7 +36,7 @@
  * 用户按免费预期使用却被计费。
  *
  * 这一「集合动态判定、不硬编码」的做法与 CodeArts 的 benefit 集合同源
- * （见 `src/models.ts` 的 `isCodeArtsBenefitModel` 与 AGENTS.md 的对应章节）。
+ * （见 `src/models.ts` 的 `isCodeArtsBenefitModelKnown` 与 AGENTS.md 的对应章节）。
  */
 import { clineHeaders } from './cline.js';
 import { CLINE_MODELS_PATH, CLINE_RECOMMENDED_MODELS_PATH, } from './cline-product.js';

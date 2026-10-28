@@ -6069,14 +6069,86 @@ function registerJetHubEndpoints(ctx, pool, auths, modelAdapters) {
                 // 对话框模型选择器读的仍是过滤后的 `listModels`，可见性行为完全不变。
                 const catalogSource = modelAdapters?.[req.provider];
                 const all = catalogSource?.listAllModels();
+                /**
+                 * ⚠️⚠️ **黑名单补回必须以上游目录为界**（真实缺陷，2026-10-27）。
+                 *
+                 * ## 缺陷形态
+                 *
+                 * 旧实现无条件把 `disabledMap` 里所有 `true` 的 id 补进设置页目录。
+                 * 于是**上游已下架**、但用户曾经关掉过的模型会**永久留在设置页**：
+                 * 灰显、能点「打开」，点开却必然 404（实测 `GLM-5` / `glm-5.3-flash`
+                 * 回 `InferHub.002002009.404 The model is not registered`）。
+                 *
+                 * 用户视角：这模型明明还在列表里、开关也能动，为什么一发就失败？
+                 * 而它既不是 `dead`（没有阳性请求失败记录）、也不在远端目录里 ——
+                 * 两条现有的「可解释」路径都覆盖不到它。
+                 *
+                 * ## ⚠️⚠️ 判据必须用 `listAllModels()`，**不能用 `models`**
+                 *
+                 * 这是本修法最容易搞反的一处：`llm.listModels()` 的结果**已被适配器按
+                 * 黑名单过滤**（见上方长注释）。若拿它当「在售集合」，那么**每一个被
+                 * 用户关掉的在售模型都不在其中** ⇒ 它们会被判成「已下架」⇒ 全部不再
+                 * 补回 ⇒ 用户关掉的模型从设置页集体消失、无法重新打开 ——
+                 * 那正是本端点**当初要修的那个缺陷**，等于把坑重新挖一遍。
+                 *
+                 * ⇒ 权威在售集合只能取 **`listAllModels()`**（不套黑名单的全量目录）。
+                 * 拿不到它（外部/旧适配器没有该方法）时，**放弃该判据**（照旧补回），
+                 * 宁可留着幽灵条目，也不让用户在售模型凭空消失。
+                 *
+                 * ## ⚠️⚠️ 但「拿得到 `listAllModels()`」**仍然不等于**「拿到了全量目录」
+                 * （2026-10-28 修，PR159 首版的缺口）
+                 *
+                 * 它在**冷缓存 / 远端降级**下返回的是各家**编译期兜底表**，而那是远端
+                 * 目录的**子集**（`model-catalog.ts` 的 `cached ?? config.syncCatalog()`；
+                 * Issue IKJW33 实测：`cline` 冷缓存只有 **3** 条、远端有 **460** 条）。
+                 *
+                 * 后果与本修复要治的病**同形但方向相反**：用户关掉的**在售**模型若恰好
+                 * 不在兜底表里（例如 codearts 近期新增、只存在于远端的 `glm-5.3` /
+                 * `kimi-k3`），会被判成「已下架」⇒ **从设置页彻底消失、再也打不开**。
+                 * 命中窗口很实在：远端拉取失败、离线启动、或刚重启还没拉到目录时。
+                 *
+                 * ⇒ 判据的前置条件必须是**适配器自报「这份目录确认来自远端完整读取」**
+                 * （{@link ModelCatalogSource.catalogConfirmedRemote}）。证明不了就放弃判据。
+                 * 这条正是本文件注释里那句原则的落地：「判据只能建立在**确认拿到全量目录**
+                 * 之上」—— 而「拿得到一份数组」不是「确认拿到全量」。
+                 *
+                 * | 形态 | 处置 |
+                 * |---|---|
+                 * | 自报确认远端 + `listAllModels()` 非空 | 补回时只补**仍在其中**的（本次要修的） |
+                 * | 自报**未**确认远端（false / 未实现） | **放弃判据**，照旧补回（保守；其余 14 家的默认行为） |
+                 * | `listAllModels()` 不可用（`undefined`） | 同样放弃判据 |
+                 * | 它返回空数组 | 同样放弃判据（空目录 = 无账号门控，不是「全部下架」） |
+                 *
+                 * ⚠️ 判据只能建立在「确认拿到全量目录」之上。拿「读不到」反推「已下架」
+                 * 正是本仓库 `dead-model-store.ts` 头注释明令禁止的「从残缺目录反推」。
+                 *
+                 * ⚠️ **不删用户数据**：这里只是**不显示**已下架条目，`disabledMap` 里的
+                 * 记录原样保留 —— 万一上游把模型重新上架，开关状态还在（用户不必重设）。
+                 */
+                // ⚠️ 探测本身抛错一律按「未确认」处理（保守方向：宁可多留一个幽灵条目）。
+                let confirmedRemote;
+                try {
+                    confirmedRemote = catalogSource?.catalogConfirmedRemote?.();
+                }
+                catch {
+                    confirmedRemote = undefined;
+                }
+                const onSale = confirmedRemote === true && all !== undefined && all.length > 0
+                    // ⚠️ 取**两个来源的并集**（与 `fullCatalogIds` 同口径）：`listModels` 是
+                    //    被黑名单过滤过的远端目录，`listAllModels` 是不套黑名单的那份 ——
+                    //    任一来源里有它，就不能说它已下架。
+                    ? new Set([...models.map((model) => model.id), ...all.map((model) => model.id)])
+                    : undefined;
+                const stillOnSale = (id) => onSale === undefined || onSale.has(id);
                 let catalog;
                 if (all !== undefined) {
                     catalog = [...all];
                     // 全量目录里若仍有黑名单命中却缺失者，一并补上（保底，正常不会发生）。
                     const known = new Set(catalog.map((model) => model.id));
                     for (const id of Object.keys(disabledMap)) {
-                        if (disabledMap[id] === true && !known.has(id))
+                        if (disabledMap[id] === true && !known.has(id) && stillOnSale(id)) {
                             catalog.push({ id, name: id });
+                        }
                     }
                 }
                 else {

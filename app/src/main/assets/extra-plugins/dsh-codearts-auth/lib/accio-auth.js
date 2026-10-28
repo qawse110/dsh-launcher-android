@@ -779,6 +779,7 @@ export class AccioAuth extends Service {
                     current: entry,
                     refresh: (c) => this.refreshCredentialUnderLock(entry.credentialRef, c),
                     save: (c) => this.ctx.credentials.set(ref, JSON.stringify(c)),
+                    makeTerminalError: (message) => new AccioRefreshTokenExpiredError(message),
                     warn: (message) => this.warn(message),
                     info: (message) => this.ctx.logger?.info?.(message),
                 });

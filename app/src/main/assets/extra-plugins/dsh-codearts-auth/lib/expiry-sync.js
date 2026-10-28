@@ -144,7 +144,69 @@ export async function refreshAccountWithReconcile(params) {
     if (refreshed === undefined) {
         throw new Error(`${tag} 续期响应缺少访问令牌，凭据未更新`);
     }
-    await save(refreshed);
+    /**
+     * ⚠️⚠️ **`save()` 失败 = 凭据已死，必须报终态**（真实缺陷，2026-10-27）。
+     *
+     * ## 为什么不能像以前那样让它当普通异常冒泡
+     *
+     * `refresh()` 成功意味着**服务端已经把旧的一次性 token 消耗掉并签发了新的**
+     * （codearts / officeace 的 refresh_token 都是一次性的）。此时若 `save()`
+     * 失败，新凭据只有一个内存引用、随调用栈一起消失 ⇒ **本地永久停留在那份
+     * 已被消耗的旧 token 上**。
+     *
+     * 旧实现让这个异常直接冒泡，调用方（`refreshAll` 的 catch）把它当**非终态**
+     * 处理：只记一条 warn、不标 `refreshable:false`、下一轮继续用同一份死 token
+     * 去兑换 ⇒ 服务端如实回 `STS5.1806 the refresh token has been used`
+     * ⇒ 每轮失败一次、日志被 `terminalWarned` 去重、面板照常显示「自动续期」。
+     *
+     * 实测（2026-10-27 两次独立事故）：
+     * - 时间线：16:58 续期成功落盘 → 17:58 那轮「兑换成功但 `.credentials.yaml`
+     *   **零写入**」 → 18:23 池值被标 false → 18:30 实测 STS5.1806；
+     * - 上一版「判终态前重读凭据」的防护**救不了它**：磁盘上的 `refresh_token`
+     *   与刚用过的那份**完全相同**（因为没写进去），条件不成立。
+     *
+     * ⇒ 必须抛**终态错误**，让调用方走「需重新登录」分支。
+     *
+     * ## ⚠️⚠️ 终态错误的**类型必须由调用方给**（PR159 首版缺陷，2026-10-28 修）
+     *
+     * 首版让本模块 `import { RefreshTokenExpiredError } from './oauth.js'`
+     * （codearts 的类），注释声称「各家 `refreshAll` 都按
+     * `instanceof RefreshTokenExpiredError` 判终态 ⇒ **九家同时受益**」。
+     * **这句不成立**：每家都有**自己的**同名类（buddy 用 `buddy-oauth.ts` 的、
+     * trae / qoder / cline / lobsterai 各自在 auth 文件里定义、gemini 是
+     * `GeminiRefreshTokenExpiredError`、minimax 是 `MinimaxRefreshTokenExpiredError`、
+     * accio 是 `AccioRefreshTokenExpiredError`），跨模块 `instanceof` **恒为 false**
+     * ⇒ 另外 8 家仍落「非终态」分支，账号照样静默死 —— 正是本修复要治的病。
+     *
+     * 另一种写法（本模块自定义一个中立类）同样不行：它不属于任何一家的判据。
+     * ⇒ 只能由调用方把自己的类**注入**进来（`makeTerminalError`）。
+     *
+     * ## 为什么该参数是**必填**而不是可选带默认值
+     *
+     * 可选 + 默认 = 「漏接线」是**静默**的（退回普通 Error ⇒ 又变回静默死号），
+     * 正是本缺陷的形态。必填 ⇒ 任何新增的调用点漏传都会在 `tsc --noEmit` 变红，
+     * 不依赖人记得。实测接线点：九家、共 10 处（gemini 有两处）。
+     *
+     * ⚠️ `save()` 抛的是**存储层**错误（权限/磁盘满/序列化），不是网络错误，
+     * 且此刻服务端票据已消耗 ⇒ 重试无意义，**不属可自愈类**。
+     */
+    try {
+        await save(refreshed);
+    }
+    catch (error) {
+        // ⚠️ 这条 warn 在**抛终态之前**单独记一次：调用方的终态分支会把它归成
+        //    「refresh_token 已失效」，而真正的原因是**落盘失败**——两者对该怎么
+        //    处置的答案相同（重新登录），但排查时要能一眼分清是谁的锅。
+        //    实测（2026-10-27）当时的日志只有「续期失败：<存储错误>」一条，
+        //    与「服务端拒绝」同形，导致定位多花了几十分钟。
+        params.warn?.(`${tag} 账号 ${accountId} 续期**已成功但落盘失败**（${provider}）：`
+            + `${error instanceof Error ? error.message : String(error)}`
+            + ` ⇒ refresh_token 已在服务端被消耗，本地凭据已失效，需重新登录`);
+        throw params.makeTerminalError(`${tag} 账号 ${accountId} 续期成功但**新凭据落盘失败**：`
+            + `${provider} 的 refresh_token 是一次性的，服务端那份已被消耗，`
+            + `本地仍停留在旧 token 上，继续重试只会得到「已被使用」⇒ 必须重新登录。`
+            + `落盘错误：${error instanceof Error ? error.message : String(error)}`);
+    }
     await syncAccountExpiry({
         pool,
         provider,

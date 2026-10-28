@@ -675,3 +675,12 @@ dist/index.js (4.62MB，代理主程序)   dist/agent/dsh-native.js (2.22MB，�
 - `0.2.1-rc.2 → 0.2.1-rc.4` 的实装由用户点按钮触发；缓存已在修复下刷新为可用状态，但**未替用户执行**。
 - **交付与安装口径（本轮实测）**：CI 的 `Build APK` 在 push 到 `next` 时产 **debug** 变体（`app-debug-apk` artifact，本仓 `versionCode 300` / `versionName 4.10.2-fix6`），其签名用的是 runner 上**临时生成的 debug keystore**——实测今天（`9d47825`，cert `5f06d87a…`）与 2026-10-20 那次（`3c3484f0`，cert `e36083fc…`）**证书不同**，故两个 debug 包之间不能覆盖安装；要能直接覆盖升级，得走 `Release APK` 工作流（`release.yml`：tag `v*` 触发，用仓库内 `signing/release.keystore` 正式签名）。下载的 artifact 已核：内含新资产（`assets/plugin-manifest.json` 四项版本正确、`assets/extra-plugins/*` 各 `package.json` 与仓库一致、`assets/install/plugins.mjs` sha256 与仓库相同即含不降级守卫、`assets/install/dsh.mjs` 含 `clearPnpmPackumentCache`），APK sha256 `42b05536…b486`。
 - **零改动即刻生效的验证**：本轮修复不需要等新 APK —— `files/install/*.mjs` 与 `files/extra-plugins` 已按仓库同步并跑过真实装配（11 ok / compat 11/11），设备上「检查更新」「更新 next」按钮现在走的就是修复后的代码。
+
+### 十二、codearts-auth 内容级更新到 gitee master（版本号不变，需重启生效）
+
+背景：本轮「移动端适配能否插件化」调研中发现，本机 `dsh-codearts-auth` 的 lib 与 gitee master 的最新代码相差 19 个 js（`models` +129/−41、`llm-adapter` +375/−23 新增 glm-5.3 / deepseek-v4.1-flash-1017 / kimi-k3 等、`codearts-credits`、`jet-hub-rpc`、`expiry-sync`、`oauth`、`openai-gateway/tencent-fingerprint` 等）。上游版本号未 bump（仍 `0.2.1-rc.2`），属"同版本不同内容"，因此清单/`plugin-status.json` 都看不出变化，`syncExtraPlugin` 的同版本路径（`order === 0`）也不会拦住覆盖 —— 需靠本节记录留痕。
+
+做法（未走 README 方式一）：方式一按 git 包名装出 `dsh-providers-hub`，会与启动器钉死的 `dir/name = dsh-codearts-auth` 并存并被下次启动重新 add。故在 `files/tmp/codearts-build` 用 pnpm 构建（`/storage` 是 FUSE，symlink 报 `ERR_PNPM_EACCES`），复刻 5 处本地身份（`package.json:2`、`cordis.patch.yml:1/:8`、`plugin-src/client/index.js:177`、`jet-hub-styles.js:1551/:1568`、`panel-entry.js:117`），再注入本仓独有的 173 行 `max-width: 560px` 块（上游 master 无此块）；注入后 `lib/client/jet-hub.js` 与安装前逐字节相同（`sha256 b50a8045…32a0`，14513 行）⇒ 客户端 UI 与本地 delta 完全保持。
+
+核验（Lead 独立复核）：设备目录 251 文件 / 8,942,511 B；`diff -rq` 设备 lib 对 `dsh-providers-hub@2.8.261028` 的 lib 只差 `client/jet-hub.js`（= 本地身份 + 173 行块），其余 244 个 js 与上游最新发布逐字节相同；245 个 js 全部 `node --check` 通过；profile `deps/bundles` 仍是 `dsh-codearts-auth`，`.extra-plugins-synced.json` 的 `0.2.1-rc.2@apk:300/ae03838c` 未变；仓库副本已同步为同一棵树（`app/src/main/assets/extra-plugins/dsh-codearts-auth`，diff 0）。
+回滚：`/storage/emulated/0/code/.dshchk-20261028/backup-20261028-123941/plugin-dsh-codearts-auth`（251 文件 9.0M）拷回 `files/plugins/` 即可。**未重启 dsh**，故当前进程仍跑旧代码。

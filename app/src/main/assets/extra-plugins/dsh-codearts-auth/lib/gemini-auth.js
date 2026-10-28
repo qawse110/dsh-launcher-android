@@ -213,6 +213,7 @@ export class GeminiAuth extends Service {
                 accessors: GEMINI_EXPIRY_ACCESSORS,
                 refresh: (c) => this.refreshCredential(c, id),
                 save: (c) => this.ctx.credentials.set(ref, JSON.stringify(c)),
+                makeTerminalError: (message) => new GeminiRefreshTokenExpiredError(message),
                 warn: (message) => this.ctx.logger?.warn?.(message),
                 info: (message) => this.ctx.logger?.info?.(message),
             });
@@ -272,6 +273,7 @@ export class GeminiAuth extends Service {
                         refreshSignal = s;
                     }),
                     save: (c) => this.ctx.credentials.set(ref, JSON.stringify(c)),
+                    makeTerminalError: (message) => new GeminiRefreshTokenExpiredError(message),
                     warn: (message) => this.ctx.logger?.warn?.(message),
                     info: (message) => this.ctx.logger?.info?.(message),
                 });

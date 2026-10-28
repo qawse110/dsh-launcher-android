@@ -398,6 +398,7 @@ export class CodeArtsAuth extends Service {
                     current: entry,
                     refresh: (c) => this.refreshCredentialUnderLock(entry.credentialRef, c),
                     save: (c) => this.ctx.credentials.set(ref, JSON.stringify(c)),
+                    makeTerminalError: (message) => new RefreshTokenExpiredError(message),
                     warn: (message) => this.ctx.logger?.warn?.(message),
                     info: (message) => this.ctx.logger?.info?.(message),
                 });

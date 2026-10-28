@@ -1682,7 +1682,7 @@ export async function officeaceExpiry(credential, ref) {
  * （`codearts-credits.ts` 的 `CodeArtsAccountInfo.credit` 注释明写「`undefined`
  * 表示这个账户没有积分口径」，与 `{ total: 0 }` 严格区分），而这类账号**能正常
  * 推理**；且 codearts 有 benefit（免费额度）模型走 `maas_type: benefit`
- * （`isCodeArtsBenefitModel` 动态判定）——**积分余额 0 ≠ codearts 不可用**。
+ * （`isCodeArtsBenefitModelKnown` 按远端集合判定）——**积分余额 0 ≠ codearts 不可用**。
  *
  * ⚠️ 与 `loomyExpiry` 的 `permanent > 0 ? NEVER : UNUSABLE` **不是**同一口径：
  * 那里的 `permanent` 是 loomy **自己的永久积分余额**（0 就是真的没有额度）；

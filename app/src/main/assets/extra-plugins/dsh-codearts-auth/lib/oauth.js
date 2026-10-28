@@ -144,7 +144,28 @@ export async function requestToken(body, keyPair, fetcher = fetch) {
         // 两相对比，这里选择后者。
         const errorCode = String(data?.error_code ?? '');
         if (data?.error === 'invalid_grant'
-            || errorCode.includes('ExpiredRefreshToken')) {
+            || errorCode.includes('ExpiredRefreshToken')
+            // ⚠️⚠️ `STS5.1806` 必须是**终态**（issue IKQY27 同批排查，2026-10-27）。
+            //
+            // 它是「一次性 token 已被消费」的专属错误码：
+            // `{"error_code":"STS5.1806","error_msg":"invalid refresh token: 'the
+            // refresh token has been used'"}`。华为 STS 的 refresh_token 一次性轮换，
+            // 一旦被兑换过就永久失效 —— 重试一万次也还是同一个报文。
+            //
+            // ## 为什么原先漏判会造成「静默 15 小时」
+            //
+            // 原先它落到下面那句 `throw new Error(message)`（非终态），于是：
+            // ① `refreshAll` 走非终态分支，`refreshable` **不会被写成 false**；
+            // ② 唯一的另一条终态判据是「本地 refresh_token 已过期」，而该账号的
+            //    `exp` 还剩 29 天 ⇒ 这条腿也不成立；
+            // ③ ⇒ 池内 `refreshable` 永远停在 `true`，面板照常显示「自动续期」，
+            //    而每 30 分钟的续期全部无声失败。
+            //
+            // 实测（2026-10-27 本机两个账号）：token 实际在兑换成功后被消费、新凭据
+            // 未落盘，`expiresAt` 冻在过期那一刻，直到用户主动查积分才暴露
+            // `HTTP 400 APIG.0602`。归终态后账号会**当场**显示「需重新登录」。
+            || errorCode.includes('STS5.1806')
+            || /refresh\s*token\s+has\s+been\s+used/i.test(message)) {
             throw new RefreshTokenExpiredError(message);
         }
         throw new Error(message);

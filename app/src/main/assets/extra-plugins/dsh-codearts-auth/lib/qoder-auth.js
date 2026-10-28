@@ -426,6 +426,7 @@ export class QoderAuth extends Service {
                     //    刷不动」，与代理完全无关的表象（最难查的一类）。
                     refresh: (c) => this.refreshCredential(c, entry.id),
                     save: (c) => this.ctx.credentials.set(ref, JSON.stringify(c)),
+                    makeTerminalError: (message) => new RefreshTokenExpiredError(message),
                     warn: (message) => this.ctx.logger?.warn?.(message),
                 });
             }
