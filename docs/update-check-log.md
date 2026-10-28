@@ -763,3 +763,38 @@ dist/index.js (4.62MB，代理主程序)   dist/agent/dsh-native.js (2.22MB，�
 **七、顺手修正**：上一小节（「十三」）里有 7 行把 Markdown 反引号写成了占位符（U+00A7），本轮按原文字逐个还原为反引号——**只改符号、不改任何陈述**，`git diff` 里那 7 行的增删可逐字对照。
 
 **八、收尾（2026-10-28T09:0xZ）**：提交 `e7943ce` 已推 `origin/next`（52 文件：该包 49 个文件 + 清单 + README + 本日志；`refs/heads/next:refs/heads/next`，远端另有一个同名 tag 需规避）。Actions 两个 workflow 均 success：`CI` success、`Build APK` success（artifact `app-debug-apk` 88.1MB，id 12804496293）。
+
+### 十五、skills-manager 运行时证据补齐（2026-10-28T10:02Z／北京 18:02）
+
+第十四节把证据停在装配层（文件在、manifest 认、装配 13/13），顾问据此批评「装了台只能看清铭牌、不能点火的机器」。本轮把「点火」补上：**不重启 dsh**，在真机运行进程里证明该插件的服务端与客户端两侧都活着。
+
+**一、拿到入口（不再靠猜 token）**
+- 3080 的访问 token 每次启动轮换、日志尾部取不到；但 Android 侧 `WebAuth.ensureSession` 早已把交换后的会话 cookie 落到 `shared_prefs/dsh_console.xml` 的 `dsh_web_auth_cookie`（源码 `app/src/main/java/com/dsh/nextapp1/core/WebAuth.kt`：`TOKEN_URL_RE` / `PREF_COOKIE`）。带它请求 `http://127.0.0.1:3080/` 得 200（裸请求 401）。
+
+**二、服务端半侧（HTTP 面）＝已点火**
+- `GET /api/dsh-skills-manager/state` → 200，`data.roots` 22 项，首项 `key=dsh`、`path=<files>/.dsh/skills`、`native=true`、`enabled=true`。
+- `GET /api/dsh-skills-manager/sidebar-entry` → 200 `{"ok":true,"data":{"enabled":true}}`。
+- 该服务进程 pid 12957 启动于 `2026-10-28T08:51:47Z`，**早于** 16:55 的本轮装配；装配后 profile 条目由 `^1.2.20` 变 `link:<files>/plugins/dsh-skills-manager`，路由随即 200 ⇒ **未重启即热加载生效**。
+- 反向排除：`logs/web.log` 的 `EADDRINUSE`/`startup failed` 属 16:52 的第二个实例（node:13804），与当前进程无关。
+
+**三、写路径真的能写，且已原样回滚**
+- 不带客户端标记的 `POST /api/dsh-skills-manager/category-create` → 403 `{"code":"error.proto.forbidden"}`（`lib/index.js:160` 要求请求头 `x-dsh-skills-manager: 1`）——这本身证明写闸门在生效。
+- 带标记 → 200 创建 `{"root":"dsh","category":{"id":"c9effb9c09829e88","name":"zz-dshchk-probe"}}`，`state` 立即可见；随后 `category-delete` 200 删除、复查不再出现。
+- 状态文件 `.dsh/skills-manager/state.json` 已用备份原样覆盖：`sha256 f345dab03e9a46289e19d4c9976e1a8cdb1e61b11c676748fa3c9a695dbdeb9d`（1503 B），`cmp` 与备份逐字节相同（中间一次写入使文件多出空 `categories.dsh` 键，已按备份回滚）。
+
+**四、客户端 UI 真的渲染出来了**
+- 自建 WebView CDP 中继（旧 41999 中继已死）：`EGO_LINUX_WEBVIEW_RELAY_PORT=41998 node <files>/webview-cdp-relay.mjs` → `Chrome/156.0.8078.47`（Android 16 / RMX3888 / wv）；顺带更正一条旧结论：该 WebView CDP **支持** `Target.createTarget` + `attachToTarget{flatten}`。
+- **settings.section**：设置 → 导航第 6 项「技能」（带 `data-dssm-nav-icon`）→ 渲出 `.dssm-section`：标题「技能 v1.2.20」、页签「全局技能／项目技能／发现技能／回收站」、统计「0 个技能／0 个已启用／0 个已停用／0 个诊断异常」、来源「DSH」「公共 Agent」。
+- **sidebar.panellist + main**：侧栏「技能」按钮 → `.dssm-main-panel` 实渲 361×350，按钮含「GitHub／问题反馈／检查更新／刷新／创建技能／导入技能／来源目录／新建分类／启停来源 DSH」。
+- 页面内 `[class*=dssm]` 节点 58 个、注入样式 `dssm-settings-nav-icon-style` / `dssm-sidebar-entry-style` 两条；渲染期网络里插件组合包 200、`/api/dsh-skills-manager/sidebar-entry` 200、`/api/michengai/dsh-skills-manager/update` 200，`Runtime.exceptionThrown` 与 `console.error` 均为 0。
+- 截图由真实抓取产生（`Page.captureScreenshot`）；因 `view_image` 报 dsh-vision 未配 API key，视觉结论一律以 DOM 文本与节点结构为准，截图仅作复核副本。
+- 截图原件已随仓入库（便于日后目视复核）：`docs/runtime-evidence/evid-settings-skills.png`（139,563 B）、`docs/runtime-evidence/evid-sidebar-skills.png`（148,216 B）。
+- 证据汇编（随仓）：`docs/runtime-evidence/EVIDENCE-runtime.md`，配套原始 JSON `evid-settings-skills.json` / `evid-sidebar-skills.json`（含 `state` 与面板文本摘录）。
+
+**五、仍未证（不遮掩）**
+- `create_skill` 工具的**实际执行**：本会话的审批策略是「审批提示已禁用，需审批的动作自动拒绝」，该工具带 `ask` 闸门（插件 `lib/index.js:358`），调用返回 `the user rejected tool "create_skill"`；未做任何绕过（例如直接调内部函数）。闸门存在本身已读证，但「点下去真建出一个技能」在本会话无法跑通。
+- `plugins.bundle.config` 槽位没有在本页看到独立卡片：该槽位由 `dsh-client-ui-plugin-manager/lib/client.js:2964` 按 `entryKey = pkg.name` 在**具体插件详情页**分发，本轮只停在插件列表层，未展开该卡片。
+- 页面级截图无法目视核对（`view_image` 无 key）；一切视觉结论均来自 DOM 文本与节点结构，已在上面写清来源。
+
+**六、顺带更正一条旧环境结论**
+- 旧记忆写「WebView CDP 无 `Target.createTarget`」，本轮实测**可以**（返回 targetId，attach 后 Page/Runtime/Network 域全部可用）。先前「不能」的结论应作废。
