@@ -1,0 +1,8 @@
+# dsh-providers-hub 配置包补丁：在空配置根上追加插件行。
+# 后续配置补丁可通过 id 引用此行。
+# ⚠️ 行 id `codearts-auth` 与包名无关，是别的 patch 引用本行的**稳定锚点** ——
+#    改名时只动 `name`（= 要加载的模块名，必须与 package.json 的包名一致），
+#    id 保持不变。
+- insert:
+    - id: codearts-auth
+      name: 'dsh-providers-hub'

@@ -1,0 +1,9 @@
+# dsh-mobile-replay：把 dsh-prompt-optimizer-mobile 与 dsh-codearts-auth 的本地
+# 移动端重放（A 的 ⑧⑨ 窄屏 CSS + 内联等价覆盖 + options-label 标记；B 的 173 行 560px
+# 窄屏块）外置成独立插件。两个上游包因此可以保持**未改动的原版**：
+#   A = @dsh-external/dsh-wish-specializer 0.9.0-stable（官方 Release tgz）
+#   B = dsh-providers-hub 2.8.261028（npm 原包）
+# 本插件服务端半端为空（无 host 行为），样式与 DOM 标记全在浏览器半端 lib/client.js。
+- insert:
+    - id: mobile-replay
+      name: 'dsh-mobile-replay'

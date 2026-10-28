@@ -17,22 +17,30 @@
       "upstream": "https://github.com/mexiaosqwq/dsh-web-mobile"
     },
     {
-      "dir": "dsh-prompt-optimizer-mobile",
-      "name": "dsh-prompt-optimizer-mobile",
-      "id": "prompt-optimizer",
+      "dir": "dsh-wish-specializer",
+      "name": "@dsh-external/dsh-wish-specializer",
+      "id": "dsh-wish-specializer",
       "title": "提示词优化",
-      "desc": "发送前用独立 AI 把输入改写成命令。基于上游 WestFox-AwA/dsh-wish-specializer（原 dsh-prompt-optimizer）v0.9.0-stable，**本部署默认启用**（仅显式 enabled:false 才关闭；上游原版默认不启用），并保留移动端窄屏 UI 适配与包名对齐（详见该目录 FORK.md）。本轮基线为上游 v0.9.0-stable（仓库已改名 dsh-wish-specializer），上游新增 advisor-*/inference-* 等 12 个模块已整体采用；本地保留 6 个文件的身份/窄屏 UI 改动。上游 0.9.0 已自带并按会话增强 issue #16 的设置写回修复（lib/settings.js 逐字节取上游，无本地补丁）",
+      "desc": "发送前用独立 AI 把输入改写成命令。**上游原版、零本地改动**：取自 WestFox-AwA/dsh-wish-specializer v0.9.0-stable 的官方 Release tgz（sha256 50e98da5…875b8f）。此前本仓是 fork（改名 dsh-prompt-optimizer-mobile + 包名对齐 + 窄屏 UI 内联进 lib/client.js）；这些移动端改动现已外置到同目录的 dsh-mobile-replay 插件，故本包可与上游逐字节同步，直接整包替换即可升级。两点裁剪/注意：① 未随包 runtime/（上游 Windows MSYS2 bash 运行时，45.8 MB / 164 文件）——lib/index.js 在非 win32 上把 want 置 false，Android 永不解析该目录，属于死重量；② 上游 bundle 层会额外插入 preset-wish（许愿模式 agent preset），其中 tool-wish-check 指向 @dsh-external/dsh-wish-specializer/check，而 0.9.0-stable 的 package.json exports 未导出该子路径 ⇒ 该 preset 一被启用就会解析失败（上游 main 已修，待发版）。本部署在 profile 的 cordis.patch.yml 里用 '- id: preset-wish / disabled: true' 关掉它（profile 层在 bundle 层之后应用），不影响优化按钮本身",
       "version": "0.9.0-stable",
       "upstream": "https://github.com/WestFox-AwA/dsh-wish-specializer"
     },
     {
-      "dir": "dsh-codearts-auth",
-      "name": "dsh-codearts-auth",
+      "dir": "dsh-providers-hub",
+      "name": "dsh-providers-hub",
       "id": "codearts-auth",
       "title": "CodeArts 多 Provider",
-      "desc": "CodeArts/Buddy/Qoder/Trae/Cline/loomy/raccoon/zcode/opencode/gemini 等 Provider 登录、积分与模型接入。源码追到上游 gitee master 4d5e6779（2026-10-27；fix(client) 面板入口偏好首读超时改为有界重试，冷启动不再永久降级「仅侧栏」；包内 version 仍 0.2.1-rc.2）。上游已于 2026-10-27 强推（force-push）重写历史：旧基线 86e3591 不再是 HEAD 祖先（两树相差 333 文件 /+88221/-13939），此前两处本地恢复——buddy/workbuddy 渠道（8 个 src/buddy*.ts）与第 4 条 DSH 身份首句内容级指纹——现已是上游原生存在，不再重放。本仓相对 4d5e6779 的本地差异仅剩 5 处包名对齐（package.json 与 cordis.patch.yml 的 name、client/jet-hub-styles.js 的 PLUGIN_ID、client/index.js 的配置槽 key、client/panel-entry.js 的 data-plugin），id 仍为 codearts-auth。上游已改名 dsh-providers-hub，本仓沿用 dsh-codearts-auth 以保持 profile/清单稳定。上游已有基础 720px 窄屏适配，本仓另重放 172 行扩展适配层（≤560px 上下堆叠/触控/横滑）",
-      "version": "0.2.1-rc.2",
+      "desc": "CodeArts/Buddy/Qoder/Trae/Cline/loomy/raccoon/zcode/opencode/gemini 等 Provider 登录、积分与模型接入。**上游原版、零本地改动**：取自 npm dsh-providers-hub@2.8.261028（上游已由 gitee 仓库 + 包名 dsh-codearts-auth 改名而来，patch 里的 insert id 仍是 codearts-auth，是给其它补丁做锚点的稳定标识，改名时不能动）。此前本仓是本地构建（包名对齐 5 处 + 172 行 ≤560px 窄屏扩展层）；窄屏扩展层现已外置到 dsh-mobile-replay，故本包可与 npm 上游逐字节同步。裁剪：未随包 *.map（3.50 MB）与 *.d.ts（3.16 MB），属调试/类型产物，运行时不需要",
+      "version": "2.8.261028",
       "upstream": "https://gitee.com/iJetLi/deepseek-harness-codearts"
+    },
+    {
+      "dir": "dsh-mobile-replay",
+      "name": "dsh-mobile-replay",
+      "id": "mobile-replay",
+      "title": "移动端重放",
+      "desc": "把原先熔在提示词优化与 CodeArts 两个 fork 里的移动端适配外置成独立插件，两个上游包因此可以保持原版、随上游整包升级。纯前端：服务端半端 lib/index.js 的 apply() 为空，样式与 DOM 标记全在 lib/client.js。内容 = A 的 ⑧⑨ 两段窄屏样式（拦截浮层宽度改 vw、控件栏纵向堆叠、触控目标抬高，并按 fork 的内联样式语义补 !important）+ B 的 173 行 ≤560px 块（25 个 .dim-jh-* 类）+ 给 A 的「优化选项」标题 span 补 data-po06=options-label 标记。选择器一律挂 [data-po06=…] 属性值而非包名，故与上游包名无关。⚠ 样式以 <style> 追加到 document 末尾，与上游自带样式表是普通层叠关系（两边都没有 Shadow DOM，等价）；上游若在某处用同等特异性规则覆盖，上游仍应获胜——两侧冲突处已按此原则选定 !important 的范围",
+      "version": "0.1.0"
     },
     {
       "dir": "dsh-status-bridge",

@@ -84,8 +84,9 @@ Kotlin 展示面与 `install-dsh.mjs` 装配面都从它派生；一致性由 `n
 | 插件 | 来源 | 作用 |
 |---|---|---|
 | `dsh-web-mobile` | <https://github.com/mexiaosqwq/dsh-web-mobile> `v3.2.1` | 竖屏/窄屏 Web 适配（抽屉导航、全宽会话、安全区、触控人体工学） |
-| `dsh-prompt-optimizer-mobile` | <https://github.com/WestFox-AwA/dsh-wish-specializer> `v0.9.0-stable` 基线（见 [FORK.md](app/src/main/assets/extra-plugins/dsh-prompt-optimizer-mobile/FORK.md)） | 提示词优化（发送前用独立 AI 改写成命令）。**本部署默认启用**：未配置即启用，仅显式 `enabled:false` 才关闭（上游原版默认不启用，本部署依需要翻转）；另保留移动端窄屏 UI 适配与包名对齐 |
-| `dsh-codearts-auth` | <https://gitee.com/iJetLi/deepseek-harness-codearts> master `4d5e6779` 本地构建（2026-10-27；上游已强推重写历史，旧基线 `86e3591` 不再是祖先：此前**定向恢复的 buddy / workbuddy 渠道与第 4 条内容级 DSH 身份首句指纹现为上游原生存在**，本地仅余 5 处包名对齐） | CodeArts / Buddy / Qoder / Trae / Cline / Loomy / Gemini 等多 Provider 登录与模型接入（另含 Accio、AStudio、Gemini 代理等新增适配器；buddy 指纹规则 4 条；上游已有基础 720px 窄屏适配，本仓另重放扩展适配层） |
+| `@dsh-external/dsh-wish-specializer` | <https://github.com/WestFox-AwA/dsh-wish-specializer> `v0.9.0-stable` **上游原版（零本地改动）** | 提示词优化（发送前用独立 AI 把输入改写成命令）。⚠ 与早先的 `dsh-prompt-optimizer-mobile` 相比是**结构性变更**：本地那套「默认启用翻转 + 窄屏 UI + 包名对齐」已**外置到 `dsh-mobile-replay`**，本包因此可与上游逐字节同步、整包替换即升级。两处需知：① 未随包上游 `runtime/`（Windows MSYS2 bash 运行时，45.8 MB / 164 文件，Android 上 `lib/index.js` 从不解析它）；② 上游 bundle 层会插入 `preset-wish`（Wish 预置 agent，其 `tool-wish-check` 指向未导出的 `./check` 子路径）——本部署在 profile 的 `cordis.patch.yml` 里 `- id: preset-wish / disabled: true` 关掉，**包本身一个字节没改** |
+| `dsh-providers-hub` | npm `dsh-providers-hub@2.8.261028` **上游原版（零本地改动）**（源码仓库 <https://gitee.com/iJetLi/deepseek-harness-codearts>，即原 `dsh-codearts-auth` 改名而来） | CodeArts / Buddy / Qoder / Trae / Cline / Loomy / Raccoon / zcode / OpenCode / Gemini 等多 Provider 登录与模型接入。⚠ 与早先的本地构建 `dsh-codearts-auth` 相比：**172 行 ≤560px 窄屏扩展层已外置到 `dsh-mobile-replay`**，本包改为与 npm 上游同源（裁剪 `*.map` / `*.d.ts` 两类非运行时产物）；patch 里的 insert `id` 仍是 `codearts-auth`，那是给其它补丁做锚点的稳定标识，不随包名改 |
+| `dsh-mobile-replay` | **本仓库自研** `v0.1.0` | 移动端适配层（纯前端）：把原先熔进两个 fork 的窄屏改动集中成独立插件——提示词优化面板的窄屏样式（拦截浮层宽度改 `vw`、控件栏纵向堆叠、触控目标抬高）+ CodeArts 面板的 173 行 `≤560px` 块（25 个 `.dim-jh-*` 类）+ 给「优化选项」标题补 `data-po06` 标记。选择器一律挂属性值而非包名，故两个上游包改名/升级都不影响它；⚠ 它是普通样式层叠（无 Shadow DOM），上游同等特异性规则仍应获胜 |
 | `dsh-status-bridge` | **本仓库自研** `v0.1.3` | dsh 运行状态桥接到悬浮窗/通知（本地 HTTP，默认 :3190）。**与启动器 Kotlin 侧强耦合**：不装配则悬浮窗状态显示/TTS 播报链路失效（心跳 note 记为 `bridge-absent`，与「装了但掉线」区分开）。`/status` **需要 token**（每次启动轮换、写入 `files/status-bridge.json`，Kotlin 通过 `BridgeContract` 同源读取；不再回 CORS 头）；`lastText` 支持**逐段实时增长**（经 LLM 层 `llm/stream` waterfall 钩子对主请求做 tee，只取 `text-delta`，`reasoning`/`tool-call` 不外放） |
 | `dsh-android-links` | **本仓库自研** `v0.1.1` | 在 dsh HOME 创建 `sdcard → /storage/emulated/0` 符号链接，让工作区目录浏览器直达 SD 卡 |
 | `dsh-net-proxy` | <https://github.com/mafeis/dsh-net-proxy> `v0.8.0` | 让 agent 自身的网络请求（web_search / web_fetch / 外部 API）走已配置的 HTTP(S) 代理 |
@@ -97,7 +98,7 @@ Kotlin 展示面与 `install-dsh.mjs` 装配面都从它派生；一致性由 `n
 
 ### 内置集合的构成
 
-内置集合**由用户逐项决定**（原先「仅内置三个」的约束已撤回），当前为 **11 个**。
+内置集合**由用户逐项决定**（原先「仅内置三个」的约束已撤回），当前为 **12 个**。
 装完即可用；源码在 `assets/extra-plugins/`，唯一真源见
 [`plugin-manifest.json`](app/src/main/assets/plugin-manifest.json)。
 
@@ -195,9 +196,28 @@ Kotlin 展示面与 `install-dsh.mjs` 装配面都从它派生；一致性由 `n
 > （仓库源码未受影响，仍是新版）。本次已按仓库重新同步并重跑装配，11 项全部为最新版。
 > 结论：**APK 重装会以 assets 覆盖 extra-plugins**；改完插件后若发生重装，需重新同步一次。
 
-### 插件版本同步记录（本轮 · 2026-10-27）
+### 插件结构变更：上游包去 fork 化 + 外置移动端适配层（2026-10-28）
 
-本轮对齐上游 4 个插件（dsh 本体 pin 保持 0.2.1-rc.2 不变），全部在仓库源码层完成并已重跑设备装配：
+目标：**两个上游包都不再需要 fork**，以后直接拿上游产物整包替换即可升级；本地那点移动端适配抽成独立插件。
+
+| 变更 | 旧 | 新 | 合入方式 |
+|---|---|---|---|
+| 提示词优化 | `dsh-prompt-optimizer-mobile`（fork：改名 + 包名对齐 + 窄屏 UI 内联在 `lib/client.js`） | **`@dsh-external/dsh-wish-specializer` `0.9.0-stable`** | 上游官方 Release tgz 解包即用，**零本地改动**；只剔除 `runtime/`（Windows MSYS2 bash 运行时，45.8 MB / 164 文件，Android 永不解析） |
+| 多 Provider 登录 | `dsh-codearts-auth`（本地构建：5 处包名对齐 + 172 行 ≤560px 扩展层内联） | **`dsh-providers-hub` `2.8.261028`** | npm 上游整包，**零本地改动**；只剔除 `*.map`（3.50 MB）与 `*.d.ts`（3.16 MB） |
+| 移动端适配 | （熔在上两个 fork 里） | **`dsh-mobile-replay` `0.1.0`（本仓库自研）** | 新写：A 的 ⑧⑨ 两段窄屏样式 + B 的 173 行 ≤560px 块（25 个 `.dim-jh-*` 类）+ 给「优化选项」标题补 `data-po06` 标记 |
+
+- **改名的连带影响**：`dsh-providers-hub` 的 `cordis.patch.yml` 里 insert `id` 仍是 `codearts-auth`（上游保留的稳定锚点，供其它补丁引用）；`@dsh-external/dsh-wish-specializer` 的 insert `id` 变为 `dsh-wish-specializer`。清单里三个新条目的 `upstream` 字段分别指向 GitHub（A）与 Gitee（B），M 无上游。
+- **`preset-wish` 的处置**：A 的 bundle 补丁层会额外插入一条 agent preset（`id: wish`），其工具清单含 `tool-wish-check → @dsh-external/dsh-wish-specializer/check`；而 0.9.0-stable 的 `exports` 未导出该子路径（`import` 实测 `ERR_PACKAGE_PATH_NOT_EXPORTED`，上游 main 已修、未发版）。本部署在 **profile 层** `cordis.patch.yml` 用 `- id: preset-wish / disabled: true` 关掉（bundle 层先应用、profile 层后应用 ⇒ 无需改上游一个字节）；`tool-wish-check` 不是顶层 entry，**不要**为它单写 patch 行（会报 `entry not found`）。已实测：不带 disable 行时 `--dump-config` 与 boot 仍能起来（dump 不解析子路径），disable 行是按设计选择的克制做法。
+- **`dsh-mobile-replay` 的耦合方式**：`lib/index.js` 的 `apply()` 为空，纯前端；所有选择器挂 `[data-po06=…]` 属性值或 `.dim-jh-*` 类名，**不依赖两个上游包的包名**，因此上游升级不牵动它。样式以 `<style>` 追加到 `document` 末尾，与上游样式表是普通层叠关系（双方都没有 Shadow DOM）；冲突处按「上游同等特异性仍应获胜」选定 `!important` 范围。
+- **机械核验**：清单门禁 `node tools/check-plugin-manifest.mjs` → `builtin=12，optional=3`；三个新目录共 90 + 251 + 7 文件（1,773,140 / 8,933,907 / 41,592 bytes），`node --check` 对三个插件全部 JS 0 失败；B 里残留的 `dsh-codearts-auth` 字样只有两处**备份文件格式常量**（`lib/client/jet-hub.js:5019` 的 `dsh-codearts-auth/backup.encrypted` 与 `:5229` 的 `BACKUP_FORMAT`），`PLUGIN_ID` 已为 `dsh-providers-hub`（`:1604`）；A 内 `dsh-prompt-optimizer-mobile` 命中 0 次；B 的 `lib/` 内已无 `max-width:560px`（该层只在 M 的 `lib/replay-b.css`）。
+- **profile dump 复核**（真机、dsh `0.2.1-rc.4`）：`node --expose-internals --import fs-register.mjs bin.js --profile web --dump-config` → exit 0、1621 行、**0 条 skipping**；`dsh-wish-specializer` 与 `preset-wish`（被 profile patch 改写为 disabled）、`dsh-providers-hub`（entryKey 仍 `codearts-auth`）、`mobile-replay` 均在位。
+- **本轮未验证**：真机重启后的实际渲染与交互（本轮**不重启 dsh**）；`dsh-mobile-replay` 的样式在 A/B 两个面板上的视觉效果只能由实机确认（源码与结构校验不能替代实机渲染）。
+
+### 插件版本同步记录（上一轮 · 2026-10-27；fork 时代，已被上节取代）
+
+> 该轮对齐上游 4 个插件时的**目录与包名如今已不存在**（`dsh-prompt-optimizer-mobile` / `dsh-codearts-auth` 已由上一节的三个插件取代）。本节按历史原样保留，用于追溯版本与构建证据；其中的路径不再是当前结构。
+
+该轮对齐上游 4 个插件（dsh 本体 pin 保持 0.2.1-rc.2 不变），全部在仓库源码层完成并已重跑设备装配：
 
 | 插件 | 旧 → 新 | 合入方式 |
 |---|---|---|
@@ -213,7 +233,7 @@ Kotlin 展示面与 `install-dsh.mjs` 装配面都从它派生；一致性由 `n
 - **billion-context 0.1.208**：新增 `dist/agent/dsh-compaction-gate.js`（上游 `exports` 的 `./dsh-compaction-gate`，缺它会让 `dsh-client-modules` 报 client bundle not found 并使 WebUI 起不来）；新增运行时依赖 `mysql2 ^3.15.3` 只被 mysql 存储后端动态 `import`，本机未随包（启用该后端时会明确报错）；`dsh.bundle.patch.yml` 2256→2814 bytes。
 - **兼容性复核**：用 dsh 自带的 `evaluatePluginCompatibility`（`@deepseek-ai/dsh-app-boot`）在 runtimeVersion `0.2.1-rc.2` 与 `0.2.1-rc.4` 各跑一遍：11 内置 + 2 可选**全部 compatible**，仅归档的 `billion-context-dsh@0.2.27` 被判 incompatible（16 条钉死 peer，符合预期）。
 - **本轮未验证项**：真机浏览器渲染/交互与 ego-browser 实机自动化只能由设备确认（本机无 Chrome/Chromium 二进制，`ego_*` 工具可加载可调用但会如实回报「未找到浏览器二进制」）；`extension/` 与 TUI 面在 Android 不适用；本轮**不重启 dsh**，插件热加载效果未验证。
-### 插件版本同步记录（上一轮 · 2026-10-21/22）
+### 插件版本同步记录（更早一轮 · 2026-10-21/22）
 
 该轮（2026-10-21）对齐上游 5 个插件；dsh 本体 pin 保持 `0.2.1-rc.2`（npm `latest`/`next` 均为该版本，无更新）。同日稍晚又把 `dsh-codearts-auth` 从 tag `0.2.1-rc.2` 改装为上游 master `651dac30` 本地构建（包内 version 仍为 `0.2.1-rc.2`，内容领先 tag）；**2026-10-22 又更新到上游 master `70d1d64`，并定向恢复该压合提交移除的 `buddy` / `workbuddy` 渠道**；**同日下半天再把上游从 `70d1d64` 追到 `86e3591`**（4 个 perf/fix 提交：单渠道折算加总预算、`collectCreditsStatus` 有限并发 3 及其审计打穿的 8 处修复），同时**恢复被压合提交删掉的 probe-system 守卫**（探测请求必须带首条 system）。差异与恢复做法见下表与 [构建溯源](docs/codearts-master-build-evidence.md)。
 

@@ -1,0 +1,61 @@
+{
+  "name": "@dsh-external/dsh-wish-specializer",
+  "version": "0.9.0-stable",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/WestFox-AwA/dsh-wish-specializer.git"
+  },
+  "homepage": "https://github.com/WestFox-AwA/dsh-wish-specializer#readme",
+  "bugs": {
+    "url": "https://github.com/WestFox-AwA/dsh-wish-specializer/issues"
+  },
+  "description": "许愿特化器（Wish Specializer）：把你的一句话愿望特化成工作 AI 能照着做的要求——方向性补充（审美 / 光影与材质 / 构图与层次 / 场景 / 交互 / 验收口径）、独立顾问复核、注入可见；不改写用户原话，不记验收通过。private 保持 true：只发 GitHub Release 附件，不发布到 npm。",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "license": "BSD-3-Clause",
+  "peerDependencies": {
+    "cordis": ">=4.0.0-rc <5"
+  },
+  "peerDependenciesMeta": {
+    "cordis": {
+      "optional": true
+    }
+  },
+  "files": [
+    "lib",
+    "runtime",
+    "cordis.patch.yml",
+    "README.md",
+    "HELP-0.6.md",
+    "HELP-0.6.en.md",
+    "eval/HOLDOUT-v2.md",
+    "eval/HOLDOUT-v1.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "external": [
+        "@deepseek-ai/dsh-client-ui-primitives"
+      ],
+      "immediately": true
+    }
+  }
+}

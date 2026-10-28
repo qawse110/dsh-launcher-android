@@ -684,3 +684,34 @@ dist/index.js (4.62MB，代理主程序)   dist/agent/dsh-native.js (2.22MB，�
 
 核验（Lead 独立复核）：设备目录 251 文件 / 8,942,511 B；`diff -rq` 设备 lib 对 `dsh-providers-hub@2.8.261028` 的 lib 只差 `client/jet-hub.js`（= 本地身份 + 173 行块），其余 244 个 js 与上游最新发布逐字节相同；245 个 js 全部 `node --check` 通过；profile `deps/bundles` 仍是 `dsh-codearts-auth`，`.extra-plugins-synced.json` 的 `0.2.1-rc.2@apk:300/ae03838c` 未变；仓库副本已同步为同一棵树（`app/src/main/assets/extra-plugins/dsh-codearts-auth`，diff 0）。
 回滚：`/storage/emulated/0/code/.dshchk-20261028/backup-20261028-123941/plugin-dsh-codearts-auth`（251 文件 9.0M）拷回 `files/plugins/` 即可。**未重启 dsh**，故当前进程仍跑旧代码。
+
+### 十三、结构变更：两个上游包去 fork 化 + 移动端适配外置为 `dsh-mobile-replay`（2026-10-28T06:0xZ／北京 14:0x）
+
+**动机**：上一轮的 `dsh-prompt-optimizer-mobile` / `dsh-codearts-auth` 都是 fork——本地在包名、注册 id、窄屏样式上动过手，于是每次追上游都要重放补丁（`git merge-file` 逐 hunk 判读）。目标改成：**上游包保持逐字节原样**，本地适配抽到独立插件里，以后直接整包替换即升级。
+
+**新结构（内置 12 个，原 11 个 + 3 新 − 2 旧）**
+
+| 位置 | 插件 | 版本 | 来源与裁剪 |
+|---|---|---|---|
+| A | `@dsh-external/dsh-wish-specializer`（原 `dsh-prompt-optimizer-mobile`） | `0.9.0-stable` | 上游官方 Release tgz，**零本地改动**；仅剔除 `runtime/`（Windows MSYS2 bash 运行时，45.8 MB / 164 文件）⇒ 90 文件 / 1,773,140 B |
+| B | `dsh-providers-hub`（原 `dsh-codearts-auth`，上游改名） | `2.8.261028` | npm 上游整包，**零本地改动**；仅剔除 `*.map`（3.50 MB）与 `*.d.ts`（3.16 MB）⇒ 251 文件 / 8,933,907 B |
+| M | `dsh-mobile-replay`（本仓库自研，新） | `0.1.0` | A 的 ⑧⑨ 两段窄屏样式 + B 的 173 行 ≤560px 块（25 个 `.dim-jh-*` 类）+ 给「优化选项」标题补 `data-po06` 标记 ⇒ 7 文件 / 41,592 B |
+
+**关键点**
+
+- **锚点 id 不随包名变**：B 的 `cordis.patch.yml` 里 insert `id: codearts-auth` 仍保留（供其它补丁引用的稳定锚点）；A 的 insert id 变为 `dsh-wish-specializer`。清单三条新记录分别带 `upstream` 指向 GitHub（A）/ Gitee（B），M 无上游。
+- **`preset-wish` 的处置**：A 的 bundle 补丁层会插入一条 agent preset（`id: wish`），其工具清单含 `tool-wish-check → @dsh-external/dsh-wish-specializer/check`，而 `0.9.0-stable` 的 `package.json` `exports` 未导出该子路径——`node --input-type=module -e "import(...)"` 实测 **`ERR_PACKAGE_PATH_NOT_EXPORTED`**（上游 main 已修、未发版）。处置：在 **profile 层** `cordis.patch.yml` 用 `- id: preset-wish / disabled: true` 关掉（bundle 层先应用、profile 层后应用 ⇒ 上游一个字节不用改）。`tool-wish-check` **不是顶层 entry**，不要为它单写 patch 行（会报 `entry not found`）。
+- **M 与上游的解耦**：`lib/index.js` 的 `apply()` 为空，纯前端；选择器挂 `[data-po06=…]` 属性值与 `.dim-jh-*` 类名、**不引用包名**，故 A/B 改名或升级都不牵动 M。样式以 `<style>` 追加到 `document` 末尾，与上游样式表是普通层叠（双方均无 Shadow DOM）；冲突处按「上游同等特异性仍应获胜」圈定 `!important` 范围。
+- **验证**：清单门禁 `node tools/check-plugin-manifest.mjs` → `builtin=12，optional=3`；三个新插件全部 JS `node --check` **0 失败**；B 内残留的 `dsh-codearts-auth` 字样只有两处**备份文件格式常量**（`lib/client/jet-hub.js:5019` 的 `dsh-codearts-auth/backup.encrypted`、`:5229` 的 `BACKUP_FORMAT`），`PLUGIN_ID` 已为 `dsh-providers-hub`（`:1604`）；A 内 `dsh-prompt-optimizer-mobile` **0 命中**；B 的 `lib/` 内已无 `max-width:560px`（该层只在 M 的 `lib/replay-b.css`）。
+- **profile dump 复核**（真机 dsh `0.2.1-rc.4`）：`--profile web --dump-config` → exit 0、1621 行、**0 条 skipping**；`dsh-wish-specializer` / `preset-wish`（被 profile patch 改写为 disabled）/ `dsh-providers-hub`（entryKey 仍 `codearts-auth`）/ `mobile-replay` 均在位。另在临时 profile（`.dsh/profiles/replaytest`，验证后已删除）做过对照：不写 disable 行时 dump 与 boot 也都能起来（dump 不解析子路径），disable 行是按设计选择的克制做法。
+
+**设备装配（本轮已跑，真机）**
+
+- 备份：§/storage/emulated/0/code/.dshchk-20261028/device-before-restructure-20261028-140143.tar.gz§（14,928,019 B，含 extra-plugins / plugins / 清单 / status / marker / profile patch+package.json）。
+- 同步：§files/extra-plugins§ 整体换为仓库 12 个目录，§files/install§ 与 §files/plugin-manifest.json§ 一并同步（§diff -rq§ install 目录 IDENTICAL，清单 sha256 §071ee685…26dc§ 仓库 = 设备）。
+- 装配日志关键行：§retired builtin pruned: dsh-prompt-optimizer-mobile§ / §retired builtin pruned: dsh-codearts-auth§（旧目录与 profile link 依赖、bundles 条目被机械剪枝）→ §extra plugin dsh-wish-specializer synced: absent -> 0.9.0-stable§ → §dsh plugin add§ 成功 → §extra plugin dsh-providers-hub synced: absent -> 2.8.261028§ → §dsh plugin add§ 成功 → §builtin plugins assembled: 12 ok, 0 failed / 12 total§ → §builtin patch entries cleaned§ → §compat audit: 12 compatible, 0 incompatible / 12 total (dsh 0.2.1-rc.2)§ → §plugin dep bridge: 232 kept, 6 linked, 22 stale removed, 0 warn§ → §profile dep bridge: 2 linked, 541 already present, 0 warn§。
+- 结果核对：§files/plugins§ 下 12 个目录，版本 §dsh-wish-specializer 0.9.0-stable§ / §dsh-providers-hub 2.8.261028§ / §dsh-mobile-replay 0.1.0§；旧两目录已不存在；profile §dependencies§ 与 §dsh.profile.bundles§ 均指向新包名（§@dsh-external/dsh-wish-specializer§ / §dsh-providers-hub§ / §dsh-mobile-replay§）；§plugin-status.json§ 12 项全部 §compatible=true§。
+- **逐字节对照**：仓库 A 对设备上游包（排除 §runtime/§）90 个文件 sha256 全等；仓库 B 对设备上游包（排除 §*.map§ / §*.d.ts§）251 个文件 sha256 全等 ⇒ 「零本地改动」不是自述而是可复算的事实。
+- 一处**预期差异**（记录在案、非缺陷）：§files/plugins/dsh-provider-headers/lib/client.js§ 带有 §stub/patchers/plugin-compat.mjs:151§ 的 §dsh-launcher-client-compat-v1§ 标记与 require 包名改写——那是**启动期 stub 补丁**写进去的（该插件用 §@deepseek-ai/dsh-client-store§ 替换已不存在的 §dsh-client-runtime/client§），发生在装配之后的每次启动，与 assembler 无关；仓库源码保持未打补丁的原样。12 个目录中只有它带该标记。
+- **验证后清理**：临时 profile §files/.dsh/profiles/replaytest§ 已删除。
+**边界**：本轮**未重启 dsh**，真机渲染与交互未验证；M 的样式在 A/B 两个面板上的实际视觉效果只能由实机确认。旧 fork 时代的记录（``十、``十二）按 append-only 惯例保留原文。

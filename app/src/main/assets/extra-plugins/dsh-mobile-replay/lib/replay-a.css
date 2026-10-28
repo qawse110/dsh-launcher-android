@@ -1,0 +1,55 @@
+/* ─────────────────────────────────────────────────────────────────────────
+ * A 段：dsh-prompt-optimizer-mobile（上游 @dsh-external/dsh-wish-specializer）
+ * 的移动端重放。来源 = 本地分支 lib/client.js 的 ⑧⑨ 两段注入样式（逐条照抄），
+ * 外加「内联样式等价覆盖」——fork 把若干值直接写进 S.* 内联样式对象，内联
+ * 优先级高于普通规则，故这里用 !important 复现同样结果。
+ *
+ * 结构前提（上游 0.9.0-stable 原样）：
+ *   [data-po06="bar"][data-po06-busy] > [data-po06="bar-row-1"] > button[data-po06="options-btn"]
+ *        > svg + span(标题「优化选项」) + span[data-po06="options-summary"] + span(▾)
+ *   [data-po06="intercept"] 是【拦截浮层】（width/minWidth 内联）
+ * 标题 span 上游没有标记，由 client.js 的 markLabels() 补 data-po06="options-label"。
+ * ───────────────────────────────────────────────────────────────────────── */
+/* ⑧ 拦截浮层：上游按桌面尺度内联写死宽高（宽 460 / minWidth 360），真机视口仅 361 CSS px
+ *    ⇒ 不覆盖就右侧被裁。宽高在内联上，必须 !important。 */
+@media (max-width:768px){[data-po06="intercept"]{width:calc(100vw - 20px) !important;min-width:0 !important;max-width:520px !important}}
+@media (max-width:560px){[data-po06="intercept"]{width:calc(100vw - 16px) !important;min-width:0 !important;max-height:min(78vh,640px) !important}}
+@media (max-width:420px){[data-po06="intercept"]{width:calc(100vw - 12px) !important;border-radius:10px}}
+/* 触控目标：浮层按钮原 28px 高，窄屏抬到 38px */
+@media (max-width:560px){[data-po06] button{min-height:38px}}
+
+/* ⑨ 控件栏窄屏修复：宿主 conversation.input.left 是横向挤占的 flex 行，CJK 可在任意
+ *   字符间断行 ⇒ 「优化选项」曾被逐字竖排并与相邻控件重叠。 */
+/* ① 控件栏整体不许横向溢出，按钮一律不被压缩（显式 box-sizing 与 client.js 的内联等价覆盖配套） */
+[data-po06="bar"]{max-width:100%;box-sizing:border-box;min-width:0}
+[data-po06="bar"] button{flex:0 0 auto;white-space:nowrap}
+/* ② 窄屏收成图标按钮：标题与摘要一起收起（渐进隐藏，弹层里档位/权限/模型一应俱全） */
+@media (max-width:560px){[data-po06="options-label"],[data-po06="options-summary"]{display:none}}
+@media (max-width:560px){[data-po06="options-btn"]{padding:0 8px;gap:4px}}
+/* ③ 触控目标：控件栏按钮窄屏抬高（34px → 40px，后一条覆盖前一条，与 fork 同序） */
+@media (max-width:560px){[data-po06="bar"] button{min-height:34px;padding-left:10px;padding-right:10px}}
+/* ④ 窄屏下控件栏自身纵向堆叠、留出间距 */
+@media (max-width:560px){[data-po06="bar-row-1"]{row-gap:6px;max-width:100%}}
+/* ⑤ 真机量得控件栏按钮仅 34px 高（低于 40px 常用下限），窄屏抬到 40px */
+@media (max-width:560px){[data-po06="bar"] button{min-height:40px;padding-left:12px;padding-right:12px}}
+/* ⑥ 弹出层避开系统栏：全面屏手势条 / 刘海会盖住贴边浮层 */
+@supports (padding:max(0px)){[data-po06="options-pop"],[data-po06="help-pop"]{padding-bottom:max(10px,env(safe-area-inset-bottom));padding-left:max(12px,env(safe-area-inset-left));padding-right:max(12px,env(safe-area-inset-right))}}
+/* 全面屏安全区：★ 显式 border-box，否则内联 calc(100vw - Npx) 再加 padding 会溢出 */
+@supports (padding:max(0px)){[data-po06="intercept"]{box-sizing:border-box;padding-left:env(safe-area-inset-left);padding-right:env(safe-area-inset-right);padding-bottom:env(safe-area-inset-bottom)}}
+/* 拖动面板时禁止页面滚动/缩放干扰（仅拖拽头） */
+[data-po06="intercept-head"]{touch-action:none}
+
+/* ── 内联样式等价覆盖（fork 在 S.* 里改的**活值**；inline 需要 !important）─────────
+ * 依据：Object.assign(S, {...})（上游 client.js:758-931）二次覆盖了 optBtn / bar，
+ * 所以 fork 对这两个键的改动其实是死代码 ⇒ 这里**不复现**；而 optBtnText /
+ * optSummary / optPop / barRow 未被二次覆盖 ⇒ 必须复现，否则行为会退回上游。
+ *   optBtnText  : +whiteSpace:'nowrap'
+ *   optSummary  : +overflow:'hidden' +textOverflow:'ellipsis' +minWidth:0 +flex:'0 1 auto'
+ *   optPop      : +boxSizing:'border-box'  width 320px → min(340px, calc(100vw - 24px))
+ *   barRow      : +minWidth:0 +maxWidth:'100%'
+ * ───────────────────────────────────────────────────────────────────────── */
+[data-po06="options-pop"]{box-sizing:border-box !important;width:min(340px,calc(100vw - 24px)) !important;max-height:min(64vh,480px) !important}
+[data-po06="options-summary"]{overflow:hidden !important;text-overflow:ellipsis !important;min-width:0 !important;flex:0 1 auto !important}
+[data-po06="options-label"]{white-space:nowrap !important}
+[data-po06="bar-row-1"]{min-width:0 !important;max-width:100% !important}
+@media (max-width:560px){[data-po06="options-btn"] > span:nth-of-type(1){white-space:nowrap}}
