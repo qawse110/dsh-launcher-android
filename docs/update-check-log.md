@@ -1041,3 +1041,56 @@ node tools/verify-plugin-npm-source.mjs → 见第四节（联网，不进 CI）
 - **升级后「重启生效」的机制只做了静态核对**：设备 `.dsh/profiles/web/node_modules` 里 7 条插件都是指向 `files/plugins/<dir>` 的符号链接（如 `@liustack/modsearch -> ../../../../../plugins/modsearch`），profile 的 `package.json` 写成 `link:/data/user/0/com.dsh.nextapp1/files/plugins/<dir>` ⇒ 插件物理目录被替换后符号链接仍指向新内容，**不需要改 link 目标**；但 dsh 进程已 require 过的模块不会热替换，所以「重新装配 / 重启」仍然必要（脚本最后那行提示是对的）。未在运行中的 dsh 里验证「重启后确实加载了新版代码」。
 - **registry 可达性依赖当前网络**：实测 `registry.npmmirror.com` 可达、`registry.npmjs.org` 直连不可达（脚本按 npmmirror → npmjs 顺序兜底）。若两者都不可达，`--check` 会把每条标成 `status="error"` 并写进状态文件，UI 显示「查版失败」，不会伪装成「已是最新」。
 - 取回与比对用的 tarball、解包树、脚手架都只放在**未跟踪**的 `tmp/`（`tmp/doc17/`、`tmp/b209*`、`tmp/up12*`、`tmp/liverepro/` 等），插件目录内无临时产物，`find` 扫 `*.tgz` / `*.orig` / `*.bak` / `*.rej` 均为 0。
+**十二、WebView 保存文件弹窗（下载/导出管线）**
+
+**问题**：WebView 没有任何下载通道 —— 既没有 `DownloadListener`，也没有 JS 桥。于是页面里「导出」按钮点了完全没反应：jet hub 的账号备份（`lib/client/jet-hub.js:10112-10122` 里 `new Blob(...)` → `URL.createObjectURL` → 造 `<a download>` → `anchor.click()`）在桌面浏览器能直接下载，在 App 里静默失败。同类写法还有 dsh-wish-specializer、dsh-web-mobile、billion-context 的多处导出，所以修的是**通用链路**，不是只修 jet hub。
+
+**为什么不能只挂 `DownloadListener`**：`blob:` URL 在原生侧只是一串不可读的地址（`shouldInterceptRequest` 通常也看不到它），宿主拿不到内容。内容只有页面读得到 ⇒ 必须由页面侧把字节读出来，原生侧只负责「接收 + 落盘」。`DownloadListener` 保留，只做兜底。
+
+**实现（三件套，均为本次新增）**
+
+1. `app/src/main/assets/webview-download.js`（183 行，`version: 2`，注入到页面）
+   - 钩 `URL.createObjectURL` 记住最近 16 个 blob（`MAX_TRACKED_BLOBS`）；文档级 `click` 捕获监听往上找 `<a download>`，命中缓存就拿到 `Blob` 本体。
+   - 没命中缓存时交回默认动作（原生 `DownloadListener` → `pull()` → 页面 `fetch(href)` 兜底）。
+   - 读 `blob.arrayBuffer()` → base64，**96 KB/块**（`CHUNK_BYTES = 96 * 1024`）逐块过桥。
+   - **顺序是「先申请、后拦截」**：`beginTransfer` 拿到 token 才 `preventDefault()`；宿主拒收（来源不可信/体积超限）时 token 为空，直接 `return`，把点击交回原生与页面自己的降级路径。此前写成「先拦再取」，宿主一拒收就变成点了没反应 —— 正是用户抱怨的那个症状。
+   - 幂等：`window.__dshDownloadInstalled` 已存在时返回 `"already-installed"`（`onPageFinished` 每次导航都会注入）。
+2. `app/src/main/java/com/dsh/nextapp1/core/WebDownloadBridge.kt`（308 行，`@JavascriptInterface`）
+   - 桥名 `DshDownload`（`JS_NAME`），方法 `begin/chunk/abort`。base64 解码后**顺序写入** `cacheDir/webview-downloads/<token>.part`，`end` 时校验声明长度与实际字节（不符按失败处理）。
+   - `MAX_BYTES = 64 MB`；`STALE_MS = 24h` 顺手清垃圾；`sanitizeFileName` 把页面给的文件名当不可信输入（去分隔符/控制字符、限 120 字符、保扩展名），`resolveMime` 在页面没给 MIME 时按扩展名反推。
+   - `isAllowedOrigin` 按 URL **显式判 origin**：`blob:`/`data:`/`file://` 放行（只能由同源 JS 派生），`http` 必须 host 严格等于 `127.0.0.1`/`localhost`/`::1`/`[::1]`。不用 `startsWith("http://localhost")` —— 那会放过 `localhost.evil.com`。
+3. `app/src/main/java/com/dsh/nextapp1/ui/WebViewActivity.kt`（1046 行）
+   - 能力收敛进**单工厂** `createWebView()`（:721）：settings + `addJavascriptInterface` + `setDownloadListener`。主 WebView（:89）与 `onCreateWindow` 造出的子页（:583）都走它 —— 此前两处各抄一份 settings，「主页面能导出、window.open 出来的页不能」这类半残会一直复发。
+   - 保存走 **SAF**：`Intent(ACTION_CREATE_DOCUMENT) + CATEGORY_OPENABLE + type + EXTRA_TITLE`（`REQ_SAVE_DOCUMENT = 0x0D1E`，:889）。`saveQueue` 保证**一次只弹一个**系统面板（连点导出不会堆出一叠同名对话框）；取消/成功都回队列继续下一个。
+   - 落盘：`contentResolver.openOutputStream(uri, "wt")` + `copyTo` 在后台线程，回 UI 线程报「已保存：<名>」/「保存失败：<原因>」/「已取消保存」。`startActivityForResult` 抛异常（无文件选择器）时 fallback 到 `getExternalFilesDir(DIRECTORY_DOWNLOADS)`（:969）。
+   - 远端直链仍交系统下载器（`downloadWithSystem` :842，`CookieManager.getCookie` 带会话、`setDestinationInExternalFilesDir(DIRECTORY_DOWNLOADS)`、通知栏可见）。
+   - `onDestroy`（:277-285）清掉未完成的临时文件与队列，不留 `cacheDir` 垃圾。
+
+**安全：nonce，而不是 origin 白名单**
+
+`addJavascriptInterface` 的接口对**所有 frame** 可见，而 `pageUrl()` 只返回顶层 URL —— 跨源 iframe 完全可以自己调 `DshDownload.begin(...)`，顶层 origin 白名单挡不住这种情况（它看起来就是「dsh 页面里发生的事」）。所以真正的凭证是 `nonce`：
+
+- 每建一个 WebView 生成一枚（`WebDownloadBridge.newId()`），存在 `pageNonces`（`WeakHashMap<WebView, String>`）；
+- 注入时**先**写 `window.__dshDownloadNonce = "<nonce>"`，**再**写脚本（:765）—— 脚本只在安装那一刻读取它；
+- `begin` 校验 nonce，不符只写 `AppLog.e(TAG, "拒绝导出：页面凭证不符")` 并返回空串，**刻意不弹 toast**：不给探测者可见反馈；
+- iframe 读不到父页的 `window` 变量，因此调不动这条写盘通道。
+
+**门禁（本轮实跑，均 exit 0）**
+
+```
+cd tmp/wvchk && kotlinc -classpath …/android-34/android.jar -nowarn -d out.jar src/*.kt
+  → EXIT=0（真 kotlinc 2.0.21：WebViewActivity + WebDownloadBridge 整文件编译，Ui/AppCompat/material 用自写桩）
+node tmp/dlprobe/probe.mjs
+  → ALL PASS（15 用例）
+```
+
+探针覆盖：幂等注入（第二次只返回 `already-installed`、监听器仍 1 个）、往返 0/1/2/3/96000/196608/200007 字节（逐字节相同、每块 ≤ 98304、`finish` 的 total 等于实际字节）、非导出锚点不拦、begin 被拒时 `prevented=false`、nonce 不符/缺失被拒、第 2 块被拒 → `abort=1` 且不 `finish`、`pull` 命中 blob 缓存 / 走 `fetch` 兜底 / HTTP 404 报 `error:HTTP 404`。
+
+**边界（未验证，不遮掩）**
+
+- **未跑 `gradle :app:assembleDebug`、未跑 `:app:testDebugUnitTest`**（本机无 gradle、无 appcompat/material/robolectric 缓存，无法触发 CI）；**未在真机装新 APK 点一次真实导出**。替代验证是真 kotlinc 整文件编译 + 页面脚本的 node 探针，两者都不等于端到端。
+- **桥是单槽位**：同一页面并发两次导出，后一次 `begin` 会静默关闭前一次的临时文件（跨 WebView 不冲突，每 WebView 一个实例）。实际 UI 上连点会被 SAF 队列串行化，但两条导出**同时**跑到 `begin` 属于未定义的先后。
+- **远端 http(s) 直链不进 SAF**：走系统下载器直接落 app 外部目录，只有页面触发（blob / 同源）才弹保存面板。若要求「所有下载都由用户选择位置」，需要另做。
+- 64 MB 上限是硬编码；超过时 toast「文件过大（…），上限 64.0 MB」，不弹保存面板。
+- 页面若在点击前自行 `revokeObjectURL`，缓存里只有失效 URL，会退化成 `fetch` 失败 → toast「导出失败：…」，不会静默。
+- 注入依赖 `evaluateJavascript`（API 19+，minSdk 24 满足）；页面若预先占了 `window.__dshDownload` / `window.__dshDownloadNonce` 这两个名字，功能会被覆盖（当前 dsh 页面无此占用）。

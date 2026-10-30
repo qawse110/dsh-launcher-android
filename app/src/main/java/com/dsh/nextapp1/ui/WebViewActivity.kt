@@ -1,10 +1,14 @@
 package com.dsh.nextapp1.ui
 
 import android.annotation.SuppressLint
+import android.app.DownloadManager
+import android.content.Intent
 import android.content.res.ColorStateList
 import android.graphics.Bitmap
 import android.graphics.Typeface
+import android.net.Uri
 import android.os.Bundle
+import android.os.Environment
 import android.os.Message
 import android.view.Gravity
 import android.view.View
@@ -20,7 +24,9 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
+import android.widget.Toast
 import java.io.File
+import java.net.URLDecoder
 import androidx.appcompat.app.AppCompatActivity
 import com.google.android.material.color.DynamicColors
 import com.dsh.nextapp1.core.*
@@ -80,8 +86,7 @@ class WebViewActivity : AppCompatActivity() {
         Ui.applyDynamicColors(this)
         pendingPrompt = intent?.data?.getQueryParameter("prompt")
 
-        webView = WebView(this)
-        webView.setBackgroundColor(Ui.BG)
+        webView = createWebView()
 
         val root = FrameLayout(this).apply {
             setBackgroundColor(Ui.BG)
@@ -152,14 +157,6 @@ class WebViewActivity : AppCompatActivity() {
 
         setContentView(root)
 
-        webView.settings.apply {
-            javaScriptEnabled = true
-            domStorageEnabled = true
-            allowFileAccess = true
-            mediaPlaybackRequiresUserGesture = false
-            cacheMode = WebSettings.LOAD_DEFAULT
-        }
-
         webView.webViewClient = object : WebViewClient() {
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                 errorView.visibility = View.GONE
@@ -172,6 +169,7 @@ class WebViewActivity : AppCompatActivity() {
                 maybeInjectPrompt()
                 injectComposerLayoutFix()
                 injectBackNavigation()
+                injectDownloadHelper(view)
             }
 
             override fun onReceivedError(
@@ -276,6 +274,14 @@ class WebViewActivity : AppCompatActivity() {
      * 注意：只 destroy 不摘父容器、或只摘父容器不 destroy，都回收不掉渲染进程。
      */
     override fun onDestroy() {
+        // 导出临时文件属于本次会话：销毁时清掉，别留在 cacheDir 里占空间。
+        runCatching {
+            saveDialogPending?.file?.delete()
+            saveDialogPending = null
+            saveQueue.forEach { it.file.delete() }
+            saveQueue.clear()
+            saveDialogActive = false
+        }
         // 先收子 WebView：多窗口的 agent 页也是活的渲染进程，不收就会漏。
         popups.toList().forEach { runCatching { destroyPopup(it) } }
         popups.clear()
@@ -574,18 +580,18 @@ class WebViewActivity : AppCompatActivity() {
             }
         }
 
-        val child = WebView(this)
-        child.setBackgroundColor(Ui.BG)
+        val child = createWebView()
         child.settings.apply {
-            javaScriptEnabled = true
-            domStorageEnabled = true
-            allowFileAccess = true
-            mediaPlaybackRequiresUserGesture = false
-            cacheMode = WebSettings.LOAD_DEFAULT
             javaScriptCanOpenWindowsAutomatically = true
             setSupportMultipleWindows(true)
         }
-        child.webViewClient = object : WebViewClient() {}
+        // 子页与主页面**能力等价**：导出/保存同样要能用，否则「插件设置页能导出、
+        // agent 页不能」这类半残会一直复发。
+        child.webViewClient = object : WebViewClient() {
+            override fun onPageFinished(view: WebView?, url: String?) {
+                injectDownloadHelper(view)
+            }
+        }
         child.webChromeClient = object : WebChromeClient() {
             override fun onCreateWindow(
                 view: WebView?,
@@ -683,6 +689,310 @@ class WebViewActivity : AppCompatActivity() {
         age in 0..maxAgeMs
     }.getOrDefault(false)
 
+    // ── 下载 / 导出 ────────────────────────────────────────────────────────
+    //
+    // 页面侧（dsh 本体与各插件）导出文件统一是 new Blob(...) + a[download].click()。
+    // WebView 对这类下载**什么都不做也不报错** —— 用户点了「导出备份」像没点一样。
+    // 这里补齐整条链路：页面侧取内容（assets/webview-download.js）→ JS 桥分块 →
+    // 临时文件 → SAF 保存弹窗 → 落到用户选的位置。
+
+    /** 一次等待用户选保存位置的导出。 */
+    private data class PendingSave(val file: File, val name: String, val mime: String)
+
+    /**
+     * 待保存队列。一次只弹一个系统保存面板：连点导出时若并发弹窗，用户会面对
+     * 好几个同名对话框，且后一个会覆盖前一个的状态。
+     */
+    private val saveQueue = mutableListOf<PendingSave>()
+
+    /** 每个 WebView 的导出凭证（跟随页面注入，随 WebView 回收）。 */
+    private val pageNonces = java.util.WeakHashMap<WebView, String>()
+    private var saveDialogPending: PendingSave? = null
+    private var saveDialogActive = false
+
+    /**
+     * 新建一个能力等价的 WebView：主界面、onCreateWindow 造出的子页、插件弹窗全走这里。
+     *
+     * 为什么必须收敛成工厂：此前主页面与子页各复制一份 settings，能力只加在一处，
+     * 结果就是「主页面能做的事、window.open 出来的页做不到」这类半残。凡是
+     * window.open 造出来的页，都必须和主页面同一套能力。
+     */
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun createWebView(): WebView {
+        val wv = WebView(this)
+        wv.setBackgroundColor(Ui.BG)
+        wv.settings.apply {
+            javaScriptEnabled = true
+            domStorageEnabled = true
+            allowFileAccess = true
+            mediaPlaybackRequiresUserGesture = false
+            cacheMode = WebSettings.LOAD_DEFAULT
+        }
+        // 页面 → 宿主：Blob 导出/下载的唯一落盘入口（鉴权、分块拼装都在这个类里）。
+        // nonce 每个 WebView 一份：JS 接口对所有 frame 可见，跨源 iframe 读不到父页变量，
+        // 因此没有 nonce 就调不动这条写盘通道。
+        val nonce = WebDownloadBridge.newId()
+        pageNonces[wv] = nonce
+        wv.addJavascriptInterface(
+            WebDownloadBridge(
+                context = this,
+                pageUrl = { wv.url },
+                pageNonce = nonce,
+                onReady = { file, name, mime -> enqueueSave(file, name, mime) },
+                onError = { reason ->
+                    AppLog.e(TAG, "导出失败: " + reason)
+                    runOnUiThread {
+                        if (!isFinishing && !isDestroyed) toast("导出失败：" + reason)
+                    }
+                },
+            ),
+            WebDownloadBridge.JS_NAME,
+        )
+        // 兜底通道：页面侧钩子没接住时（未注入成功、iframe 内点击、普通直链），
+        // WebView 仍会把下载请求抛到这里。
+        wv.setDownloadListener { url, userAgent, disposition, mimetype, _ ->
+            onDownloadStart(wv, url, userAgent, disposition, mimetype)
+        }
+        return wv
+    }
+
+    /** 注入页面侧导出助手（脚本自带幂等守卫，重复注入是空操作）。 */
+    private fun injectDownloadHelper(view: WebView?) {
+        val target = view ?: webView
+        val script = downloadHelperScript() ?: return
+        val nonce = pageNonces[target] ?: ""
+        // 凭证必须在脚本之前写入：脚本只在安装那一刻读取它。
+        val payload = "window.__dshDownloadNonce=" + org.json.JSONObject.quote(nonce) + ";" + script
+        runCatching { target.evaluateJavascript(payload, null) }
+            .onFailure { AppLog.e(TAG, "注入导出助手失败: " + it.message) }
+    }
+
+    private fun downloadHelperScript(): String? {
+        downloadScriptCache?.let { return it }
+        val script = runCatching {
+            assets.open(ASSET_DOWNLOAD_JS).bufferedReader().use { it.readText() }
+        }.getOrElse {
+            AppLog.e(TAG, "读取 " + ASSET_DOWNLOAD_JS + " 失败: " + it.message)
+            null
+        }
+        if (script != null) downloadScriptCache = script
+        return script
+    }
+
+    /**
+     * 原生下载兜底。
+     *
+     * 关键判断：blob: / data: 的内容只有页面读得到，原生只拿到一串不可读的 URL，
+     * 所以这类请求必须回头让页面侧读出来（pull）。同源 http(s) 同理走页面取回，
+     * 这样能带上会话 cookie，也不会在系统下载器里留一条 127.0.0.1 的怪记录。
+     * 只有真正的远端直链才交给系统下载器。
+     */
+    private fun onDownloadStart(
+        view: WebView,
+        url: String?,
+        userAgent: String?,
+        contentDisposition: String?,
+        mimeType: String?,
+    ) {
+        val target = url ?: return
+        val name = WebDownloadBridge.sanitizeFileName(
+            fileNameFromDisposition(contentDisposition),
+            mimeType,
+        )
+        AppLog.i(
+            TAG,
+            "下载请求 scheme=" + target.substringBefore(':') + " name=" + name + " mime=" + mimeType,
+        )
+        val localSource = target.startsWith("http://127.0.0.1") ||
+            target.startsWith("http://localhost") ||
+            target.startsWith("file://")
+        if (target.startsWith("blob:") || target.startsWith("data:") || localSource) {
+            injectDownloadHelper(view)
+            val js = "window.__dshDownload && window.__dshDownload.pull(" +
+                org.json.JSONObject.quote(target) + "," +
+                org.json.JSONObject.quote(name) + "," +
+                org.json.JSONObject.quote(mimeType ?: "") + ")"
+            view.evaluateJavascript(js, null)
+            return
+        }
+        downloadWithSystem(target, userAgent, mimeType, name)
+    }
+
+    /** 从 Content-Disposition 取文件名（含 RFC 5987 的 filename*=UTF-8''... 形式）。 */
+    private fun fileNameFromDisposition(disposition: String?): String? {
+        val d = disposition ?: return null
+        val lowered = d.lowercase()
+        val starIdx = lowered.indexOf("filename*=")
+        if (starIdx >= 0) {
+            var v = d.substring(starIdx + 10).trim().substringBefore(';').trim()
+            val sep = v.indexOf("''")
+            if (sep >= 0) v = v.substring(sep + 2)
+            return runCatching { URLDecoder.decode(v, "UTF-8") }.getOrNull()
+        }
+        val idx = lowered.indexOf("filename=")
+        if (idx < 0) return null
+        var v = d.substring(idx + 9).trim().substringBefore(';').trim()
+        if (v.length >= 2 && v.first() == '"' && v.last() == '"') {
+            v = v.substring(1, v.length - 1)
+        }
+        return v.ifBlank { null }
+    }
+
+    /** 远端直链交给系统下载器：它有进度通知，也不占用本进程内存。 */
+    private fun downloadWithSystem(
+        url: String,
+        userAgent: String?,
+        mimeType: String?,
+        name: String,
+    ) {
+        val manager = getSystemService(DOWNLOAD_SERVICE) as? DownloadManager
+        if (manager == null) {
+            toast("系统下载器不可用")
+            return
+        }
+        val request = DownloadManager.Request(Uri.parse(url)).apply {
+            if (!mimeType.isNullOrBlank()) setMimeType(mimeType)
+            if (!userAgent.isNullOrBlank()) addRequestHeader("User-Agent", userAgent)
+            val cookie = runCatching { CookieManager.getInstance().getCookie(url) }.getOrNull()
+            if (!cookie.isNullOrBlank()) addRequestHeader("Cookie", cookie)
+            setTitle(name)
+            setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+            // 放应用私有外部目录：无需存储权限，也不会在 Android 11+ 撞分区存储限制。
+            setDestinationInExternalFilesDir(
+                this@WebViewActivity,
+                Environment.DIRECTORY_DOWNLOADS,
+                name,
+            )
+        }
+        runCatching { manager.enqueue(request) }
+            .onSuccess { toast("已开始下载：" + name) }
+            .onFailure {
+                AppLog.e(TAG, "系统下载失败: " + it.message)
+                toast("下载失败：" + (it.message ?: "未知错误"))
+            }
+    }
+
+    // ── 保存弹窗（SAF）────────────────────────────────────────────────────
+
+    /** 桥线程入口：先排队，再回到主线程弹系统保存面板。 */
+    private fun enqueueSave(file: File, name: String, mime: String) {
+        runOnUiThread {
+            if (isFinishing || isDestroyed) {
+                file.delete()
+                return@runOnUiThread
+            }
+            saveQueue.add(PendingSave(file, name, mime))
+            pumpSaveQueue()
+        }
+    }
+
+    private fun pumpSaveQueue() {
+        if (saveDialogActive) return
+        val next = saveQueue.removeFirstOrNull() ?: return
+        if (!next.file.isFile || next.file.length() <= 0L) {
+            AppLog.e(TAG, "临时文件缺失或为空，跳过保存: " + next.name)
+            next.file.delete()
+            pumpSaveQueue()
+            return
+        }
+        saveDialogActive = true
+        saveDialogPending = next
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = next.mime.ifBlank { "application/octet-stream" }
+            putExtra(Intent.EXTRA_TITLE, next.name)
+        }
+        val launched = runCatching { startActivityForResult(intent, REQ_SAVE_DOCUMENT) }.isSuccess
+        if (!launched) {
+            // 设备上没有文件选择器（精简 ROM）：退到应用私有下载目录，并明确告知路径，
+            // 而不是让导出静默失败。
+            AppLog.e(TAG, "SAF 不可用，回退到应用私有目录")
+            saveDialogActive = false
+            saveDialogPending = null
+            fallbackSave(next)
+            pumpSaveQueue()
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode == REQ_SAVE_DOCUMENT) {
+            val save = saveDialogPending
+            saveDialogPending = null
+            saveDialogActive = false
+            if (save == null) {
+                pumpSaveQueue()
+                return
+            }
+            val uri = if (resultCode == RESULT_OK) data?.data else null
+            if (uri == null) {
+                AppLog.i(TAG, "用户取消保存 name=" + save.name)
+                toast("已取消保存")
+                save.file.delete()
+                pumpSaveQueue()
+                return
+            }
+            copyToDestination(save, uri)
+            return
+        }
+        super.onActivityResult(requestCode, resultCode, data)
+    }
+
+    /** 把临时文件复制到用户选的 Uri（后台线程，避免大文件卡住界面）。 */
+    private fun copyToDestination(save: PendingSave, uri: Uri) {
+        Thread {
+            var error: String? = null
+            try {
+                val out = contentResolver.openOutputStream(uri, "wt")
+                    ?: throw IllegalStateException("目标不可写")
+                out.use { sink ->
+                    save.file.inputStream().use { input -> input.copyTo(sink) }
+                }
+            } catch (t: Throwable) {
+                error = t.message ?: t.javaClass.simpleName
+            }
+            val failed = error
+            runOnUiThread {
+                if (failed == null) {
+                    AppLog.i(TAG, "已保存 name=" + save.name + " uri=" + uri)
+                    toast("已保存：" + save.name)
+                } else {
+                    AppLog.e(TAG, "保存失败 name=" + save.name + " err=" + failed)
+                    toast("保存失败：" + failed)
+                }
+                save.file.delete()
+                pumpSaveQueue()
+            }
+        }.start()
+    }
+
+    /** 无 SAF 时的兜底落盘（应用私有外部目录，不需要任何权限）。 */
+    private fun fallbackSave(save: PendingSave) {
+        Thread {
+            val dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: filesDir
+            runCatching { if (!dir.isDirectory) dir.mkdirs() }
+            val target = File(dir, save.name)
+            val ok = runCatching {
+                save.file.inputStream().use { input ->
+                    target.outputStream().use { out -> input.copyTo(out) }
+                }
+            }.isSuccess
+            runOnUiThread {
+                if (!ok) {
+                    AppLog.e(TAG, "兜底保存失败 name=" + save.name)
+                    toast("保存失败：" + save.name)
+                } else {
+                    AppLog.i(TAG, "兜底保存到 " + target.absolutePath)
+                    toast("已保存到 " + target.absolutePath)
+                }
+                save.file.delete()
+            }
+        }.start()
+    }
+
+    private fun toast(text: String) {
+        runCatching { Toast.makeText(this, text, Toast.LENGTH_LONG).show() }
+    }
+
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
     /**
@@ -718,6 +1028,16 @@ class WebViewActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "WebViewActivity"
+
+        /** 页面侧导出助手（assets 内，随 APK 发布；见该文件的头注释）。 */
+        private const val ASSET_DOWNLOAD_JS = "webview-download.js"
+
+        /** SAF 保存请求码。 */
+        private const val REQ_SAVE_DOCUMENT = 0x0D1E
+
+        /** 注入脚本只读一次：每次页面完成都从 assets 解压读文本没必要。 */
+        @Volatile
+        private var downloadScriptCache: String? = null
 
         /** 子 WebView 存活上限（回收兜底；正常远不会触顶）。 */
         private const val MAX_POPUPS = 4
