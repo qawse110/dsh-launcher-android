@@ -14,7 +14,7 @@
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="license MIT"></a>
 </p>
 
-> **仓库**：`github.com/Fisfzy/dsh-ego-browser`｜当前版本 **v0.9.4**｜版本历史见 [CHANGELOG.md](CHANGELOG.md)｜详情页：[dshfind](https://dshfind.com/zh/plugins/Fisfzy/ego-browser)
+> **仓库**：`github.com/Fisfzy/dsh-ego-browser`｜当前版本 **v0.9.6**｜版本历史见 [CHANGELOG.md](CHANGELOG.md)｜详情页：[dshfind](https://dshfind.com/zh/plugins/Fisfzy/ego-browser)
 
 ### 版本兼容矩阵
 
@@ -25,7 +25,7 @@
 | **dsh-TUI**（可选） | — | 提供 `tuiSettingsSections` / `tuiStatus` / `tuiToast` / `tuiPanels` 的版本 | 按服务能力启用设置页、底栏状态、通知、纯文字侧栏面板；缺席时静默跳过，无额外 I/O |
 | **Node.js** | `22` | — | harness 环境自带 |
 
-**DSH 全版本适配说明**：v0.9.4 已在 DSH `0.1.2-rc.1` 至 `0.1.7`（含 0.2.0-rc.x / 0.2.1-rc.2 桌面端的 0.1.7 settings 路径 + 原生右侧边栏）上验证；核心 API（`defineTool`、`ctx.tools.register`、`ctx.subprocess.spawn`、`ctx.webServer.register`、`ctx.inject`、`ModuleLoader` CJS factory、`cordis.patch.yml`）在 v0.1.0-rc.7 → v0.2.1 无破坏性变更。0.1.2-alpha.x 系列按声明可装但未实测。
+**DSH 全版本适配说明**：v0.9.6 已在 DSH `0.1.2-rc.1` 至 `0.1.7`（含 0.2.0-rc.x / 0.2.1-rc.2 桌面端的 0.1.7 settings 路径 + 原生右侧边栏）上验证；核心 API（`defineTool`、`ctx.tools.register`、`ctx.subprocess.spawn`、`ctx.webServer.register`、`ctx.inject`、`ModuleLoader` CJS factory、`cordis.patch.yml`）在 v0.1.0-rc.7 → v0.2.1 无破坏性变更。0.1.2-alpha.x 系列按声明可装但未实测。
 
 **dsh-better-sidebar 适配说明**：ego-browser 通过 `ctx.betterSidebar` 服务（try-catch 防御性获取）注册侧边栏 Tab 并监听外部链接。关键 API 引入版本：
 
@@ -52,7 +52,7 @@ cookie 值不出现在任何日志与输出中；导入是单次快照。配合�
 
 **常驻执行器（v0.8.8，可选，默认关闭）**：设置页「常驻执行进程」开启后，`ego_*` 调用复用同一个 `ego-browser --serve` 进程——首次调用支付启动开销，之后每次 **~1–2 ms**（一次性 spawn 基准 ~340 ms）。浏览器被空闲回收或崩溃后，下一次调用自动回退到一次性 spawn 并重新拉起浏览器（带启动重试），随后恢复常驻；**已经写出的请求不会重试**，避免重复点击/填表。空闲停止时间可配（默认 30 分钟）。
 
-把 [CitroLabs/ego-lite](https://github.com/CitroLabs/ego-lite)（给 AI Agent 用的 Chromium）接入 DeepSeek Harness：以 **34 个结构化 `ego_*` 工具**驱动浏览器，并配一套**实时观察前端口**——agent 后台操作网页时，你能像看直播一样看到它正在浏览的每个页面，还能直接操作它。
+把 [CitroLabs/ego-lite](https://github.com/CitroLabs/ego-lite)（给 AI Agent 用的 Chromium）接入 DeepSeek Harness：以 **35 个结构化 `ego_*` 工具**驱动浏览器，并配一套**实时观察前端口**——agent 后台操作网页时，你能像看直播一样看到它正在浏览的每个页面，还能直接操作它。
 
 **一点私藏的独特之处（self-observation）**：agent 用的就是这一个 Chromium——连它操作 **DSH 自身**（管理会话、任务看板、调设置）时，观察窗也实时显示、你能随时接手。不只是"看得见 agent 在网页上干活"，连 agent 操作 DSH 界面本身都是全程可见、可掌控的。
 
@@ -64,7 +64,7 @@ cookie 值不出现在任何日志与输出中；导入是单次快照。配合�
 
 ```sh
 # 安装（任选一种；桌面端也可以走 插件 → 添加插件）
-dsh plugin --profile desktop add dsh-ego-browser@0.9.4
+dsh plugin --profile desktop add dsh-ego-browser@0.9.6
 ```
 
 1. 在 DSH 会话里说一句让 agent 用浏览器的话，例如：
@@ -82,7 +82,7 @@ dsh plugin --profile desktop add dsh-ego-browser@0.9.4
 
 | 能力 | ego-browser（本仓库） | 同类插件（Da1dr1em/dsh-ego-browser） |
 |---|---|---|
-| 结构化工具数 | **34 个**，职责单一、可确定性调用 | **3 个**（`run`/`help`/`status`） |
+| 结构化工具数 | **35 个**，职责单一、可确定性调用 | **3 个**（`run`/`help`/`status`） |
 | 实时观察窗（CDP JPEG / FFmpeg H.264 双后端 + 标签条 + 历史抽屉） | ✅ 有 | ❌ 无 |
 | 监控窗鼠标**直接操作**真实浏览器（点击/拖拽/滚动回传 CDP） | ✅ 有 | ❌ 无 |
 | worker 单实例守卫 + 崩溃/重复自愈 | ✅ 有 | ❌ 无 |
@@ -94,7 +94,7 @@ dsh plugin --profile desktop add dsh-ego-browser@0.9.4
 - **看得到**：别家是"跑完告诉你结果"的黑盒；我们实时推流，你**看着 agent 操作**，卡在验证码/走岔立刻发现。
 - **控得住**：别家只读；我们监控窗**直接驱动**同一个 agent 浏览器，需要时你亲手接管（缩放/拖拽/点击），不必打断 agent 重来。
 
-> 以上对比基于公开可见的可核实事实：本仓库代码（`bin/ego-cast-worker.mjs` 实时推流 + CDP 输入回传、`lib/index.js` 34 个注册工具、`src/cast-server.ts`（构建进 `lib/index.js`）host 桥接）与同类插件的源码/README。此文档不含对任何他人的贬低——我们只陈述自己多实现并验证了哪些能力。
+> 以上对比基于公开可见的可核实事实：本仓库代码（`bin/ego-cast-worker.mjs` 实时推流 + CDP 输入回传、`lib/index.js` 35 个注册工具、`src/cast-server.ts`（构建进 `lib/index.js`）host 桥接）与同类插件的源码/README。此文档不含对任何他人的贬低——我们只陈述自己多实现并验证了哪些能力。
 
 **相对 [ego-lite](https://github.com/CitroLabs/ego-lite) 本体，我们多做了这些（都可对照本仓库代码核实）：**
 
@@ -129,6 +129,8 @@ dsh plugin --profile desktop add dsh-ego-browser@0.9.4
 
 ## ✨ 近期亮点
 
+- **v0.9.6**：**`ego_wait_for_response` 回放已完成的响应**（`includeBuffered` 默认 true，load 后再等文档响应不再空等超时；缓存命中会解释并建议 cache-busting）；**会话级 task space**（`sessionScopedSpaces` 默认开，每个 DSH session 独立 context/window/tab/cursor，不再互相抢标签；可关闭保持旧行为）；**截图/下载卡片**（`ego_screenshot`/`ego_download` 在 Web GUI 显示可点击卡片，`deliver:false` 可关）；新增 **`ego_wait_for_human`**（CAPTCHA/登录/2FA 阻塞等待，超时返回提示而非报错）；合并 PR #84/#85/#86。
+- **v0.9.5**：**侧栏滚轮/触控板滚动恢复**（#81：wheel 改绑常驻 stage）；**双缓冲细节硬化**（#82：冷 seed、失败帧不换层、切目标 generation guard）；**合并 PR #83**（社区 @mecamangeg）——多标签跨调用固定 agent 当前 tab（per-space cursor + `@@EGO_TARGET@@`）、`ego_script`/`ego_cli` 支持 `tab`、`viewportWidth/Height/deviceScaleFactor` 覆盖、`ego_select` 按 value → label → index 回退，新增 25 个测试。
 - **v0.9.4**：**Chrome 风格面板**（`#f1f3f4` 工具区、Chrome 式标签、蓝色主按钮、移除登录提示条）；**一键复用 Chrome 登录态**——标题栏「连接 Chrome 登录态」配对一次后，之后点「复用 Chrome 登录态」即可由扩展后台自动导出当前网站 cookie（无需每次开 Chrome UI/点 Export）；**`ego_tabs`**（list / switch / open / close）；**#69 双安全路径**：安全复制（源 profile 永不打开/写入）+ Chrome 扩展桥接（Windows/macOS/Linux 的 Chrome/Edge/Brave 均可），已用真实 Bilibili 21 条 cookie 验证。
 - **v0.9.3**：**侧栏画面不再黑闪**（#81/#82，双缓冲：新帧解码完成才交换，旧帧始终保留）+ **Retina 不再发虚**（采集宽度跟随面板、`ResizeObserver` 防抖重启 watch）；**TUI 侧栏改为纯文字**（不再请求/渲染截图，标签元数据与 `disableFrameRelay` 解耦，选中按 `targetId` 防错位）；**移除悬浮球回退**（官方侧边栏优先，仅保留可选 `dsh-better-sidebar`）；**统一 Agent 浏览器图标**（浏览器窗口 + 光标，侧栏与面板头部一致）；**常驻执行器诊断**（`/api/ego/executor`、面板状态、连续 3 次失败自动停用、`ego_status.resident`）；**登录导入安全范围扩至 Windows + Chrome/Edge ≥127**（#69 fail-closed）；另有 #78 Termux 文档、#79 headless UA 版本探测、#80 `ego_script` page 门面文档、macOS 27 / Chrome 156 复测记录。
 - **v0.9.2**：**macOS 开箱可用**（#65/#68，社区 PR [#72](https://github.com/Fisfzy/dsh-ego-browser/pull/72) 由 @syjnzh918 提供并移植到当前主线）——自动探测 `/Applications` 与 `~/Applications` 下 Chrome / Chromium / Edge / Brave 的 `.app` 内二进制，并像 Windows 一样注入 `EGO_LINUX_CHROME`；headed 路径不再要求 Xvfb（macOS GUI 是 Aqua/Quartz、永不导出 `$DISPLAY`，`isHeadlessDetected` 继续排除 darwin 以保留 #16 的真实窗口能力）。社区真机复测（0.9.2）：**macOS 27.0.1 arm64 + Chrome 156.0.8078.47**（此前另有一次 macOS arm64 + Chrome 154 验证），`chromePath` 留空、无 `--headless`，冷启动 → navigate → 截图 → `ego_doctor` 全通。
@@ -163,7 +165,7 @@ dsh plugin --profile desktop add dsh-ego-browser@0.9.4
 **方式 B：命令行（npm，推荐）**：
 
 ```sh
-dsh plugin --profile <profile> add dsh-ego-browser@0.9.4
+dsh plugin --profile <profile> add dsh-ego-browser@0.9.6
 dsh plugin --profile <profile> list                 # 应看到 dsh-ego-browser
 # 升级
 dsh plugin --profile <profile> add dsh-ego-browser@latest
@@ -173,7 +175,7 @@ dsh plugin --profile <profile> add dsh-ego-browser@latest
 
 ```sh
 dsh plugin --profile <profile> add https://github.com/Fisfzy/dsh-ego-browser.git
-dsh plugin --profile <profile> add ./dsh-ego-browser-0.9.4.tgz
+dsh plugin --profile <profile> add ./dsh-ego-browser-0.9.6.tgz
 ```
 
 > **从旧版本升级（DSH Desktop 2.0.5+）**：本插件包名是 **`dsh-ego-browser`**（非 `@dsh-external/ego-browser`）。DSH Desktop 2.0.5 起增加了「profile 依赖名 == 包实际 name」的一致性校验，若 profile 仍用旧名 `@dsh-external/ego-browser` 引用，启动会挂进恢复模式（`profile package identity is invalid for @dsh-external/ego-browser`）。升级到 2.0.5 后请把 profile 的 `package.json` 依赖键 **和** `dsh.profile.bundles` 条目**两处**都改为 `dsh-ego-browser`：
@@ -190,7 +192,7 @@ dsh plugin --profile <profile> add ./dsh-ego-browser-0.9.4.tgz
 
 观察窗设置中可选 `captureBackend=auto|cdp|ffmpeg`（默认 `auto`，当前解析为 CDP）、画质档位、CDP FPS/JPEG 质量/最大宽度，以及 FFmpeg FPS/最大宽度/码率/编码器/自定义路径。插件先检测自定义路径、系统 PATH 和托管缓存；检测到兼容 FFmpeg 前，设置页禁止选择 FFmpeg，并提供固定版本的一键下载。GitHub 下载可用 `githubMirror` 替换 `https://github.com`，例如 `https://gh-proxy.com/github.com`。FFmpeg 码率范围为 500-20000 kbps，低/平衡/高档默认 2000/4000/8000 kbps。
 
-其他开关：`isolateSpaces`（任务空间沙盒隔离，默认关）、`idleTimeoutMin`（空闲 N 分钟后自动回收后台浏览器，默认 0=关）、`disableFrameRelay`（**禁用画面回传**，默认关）。
+其他开关：`isolateSpaces`（任务空间沙盒隔离，默认关）、`sessionScopedSpaces`（**每个 DSH 会话一个独立任务空间**，默认开——会话/子代理互不抢标签；关闭后所有会话共用一个空间）、`idleTimeoutMin`（空闲 N 分钟后自动回收后台浏览器，默认 0=关）、`disableFrameRelay`（**禁用画面回传**，默认关）。
 
 **禁用画面回传（`disableFrameRelay`）**：开启后插件不再回传任何画面——不启动 ego-cast worker（因此不会做 CDP/WGC 屏幕采集、不会 ffmpeg 拉流与 fMP4 封装），`/api/ego/stream`、`/api/ego/video` 及 worker 相关路由改为返回 `{"ok":false,"reason":"frame relay disabled"}`，观察窗不再建立任何拉流连接并显示禁用态提示。`ego_*` 工具本身完全不受影响（浏览器照常开，快照/点击/输入/截图照常工作）。开关是配置项，保存后立即生效：正在跑的 worker 会被停掉，重新开启后自动恢复。
 
@@ -202,7 +204,7 @@ dsh plugin --profile <profile> add ./dsh-ego-browser-0.9.4.tgz
 
 ```sh
 pkg install chromium            # Termux x11 仓库；约 159 MB deb / 644 MB 安装后
-dsh plugin --profile <profile> add dsh-ego-browser@0.9.4
+dsh plugin --profile <profile> add dsh-ego-browser@0.9.6
 ```
 
 - `chromium-browser` 已在 `COMMON_CHROME_BINS` 中，`ego_doctor` 会自动探测 `/data/data/com.termux/files/usr/bin/chromium-browser`，**无需**设置 `chromePath`
@@ -256,7 +258,7 @@ Metadata polling runs about every two seconds only while the panel is visible; t
 
 When the existing metadata response includes `capture`, the panel displays its backend, state and optional code in one line. This uses the same metadata refresh and starts no additional request or live stream; disabled relay or a stopped browser clears the row.
 
-## 工具清单（34 个，前缀 `ego_`，完整索引见 `ego_help`）
+## 工具清单（35 个，前缀 `ego_`，完整索引见 `ego_help`）
 
 | 类别 | 工具 |
 |---|---|
@@ -267,12 +269,12 @@ When the existing metadata response includes `capture`, the panel displays its b
 | 交互 | `ego_click` `ego_fill` `ego_hover` `ego_drag` `ego_select` `ego_check` `ego_key` `ego_scroll` |
 | 执行/调试 | `ego_js`（页面求值） `ego_cdp`（原始 CDP） `ego_cli`（任意 heredoc） `ego_script`（多步脚本） |
 | 输出 | `ego_screenshot` `ego_download` `ego_upload` |
-| 会话/安全 | `ego_auth_flush`（登录落盘） `ego_login_import`（登录态导入：`source=extension` 扩展桥接，或 `chrome/edge/brave` 安全复制） `ego_captcha` `ego_dialog` |
+| 会话/安全 | `ego_auth_flush`（登录落盘） `ego_login_import`（登录态导入：`source=extension` 扩展桥接，或 `chrome/edge/brave` 安全复制） `ego_captcha` `ego_dialog` `ego_wait_for_human`（CAPTCHA/登录/2FA 阻塞等待） |
 | 元工具 | `ego_help` `ego_doctor` `ego_http` |
 
-> `ego_tabs` 为 0.9.4（master）新增，0.9.4 起为 34 个工具。
+> `ego_tabs` 为 0.9.4 新增，`ego_wait_for_human` 为 0.9.6 新增；当前共 35 个工具。
 
-> 导航/等待语义（v0.8.7）：`ego_wait_for_url` 先比对当前 URL 再等未来导航，结果带 `matchedCurrent`；`ego_wait_for_response` 超时返回结构化 `reached:false`，不再抛错；两个等待都只观察**本次调用期间**的事件——触发动作与等待要放在同一个 `ego_script` 里。`ego_script`/`ego_cli` 的脚本需以 `console.log('@@DSH_RESULT@@' + JSON.stringify({...}))` 结尾（忘记哨兵时会兜底解析最后一行 JSON，并标记 `fallback: true`）。
+> 导航/等待语义（v0.9.7）：`ego_wait_for_url` 先比对当前 URL 再等未来导航，结果带 `matchedCurrent`；`ego_wait_for_response` 超时返回结构化 `reached:false`，不再抛错，并**默认回放当前文档已完成的请求**（`includeBuffered`，可传 `false` 回到严格只等未来事件）——所以 `page.goto()` 之后再去等那一次文档响应也能命中；跨 `ego_*` 调用仍然只能等到未来响应，触发动作与等待要放在同一个 `ego_script` 里。缓存命中的请求不产生网络事件，超时错误会点名具体 URL 并建议加 cache-busting 查询。`ego_script`/`ego_cli` 的脚本需以 `console.log('@@DSH_RESULT@@' + JSON.stringify({...}))` 结尾（忘记哨兵时会兜底解析最后一行 JSON，并标记 `fallback: true`）。
 
 > **`ego_script` 的 `page` 不是 Playwright API**（#80）：可用方法为 `goto reload info url title locator getByRole getByText getByLabel getByPlaceholder getByAltText getByTitle getByTestId waitForTimeout waitForLoadState waitForSelector waitForFunction waitForURL waitForRequest waitForResponse waitForEvent evaluate screenshot snapshot snapshotRaw elementCenter drainEvents screencast keyboard mouse`；**没有** `fill / click / type / press`——交互请用 `ego_fill` / `ego_click`，或 `page.locator(...)` 配合 `ego_*`。`page.goto()` 返回的也不是 Playwright Response，需要状态码请用 `ego_wait_for_response` 或 `page.info()`。
 

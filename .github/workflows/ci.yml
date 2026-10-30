@@ -43,6 +43,13 @@ jobs:
         # 等长替换不改长度/权限位、幂等不二次嵌套。CI 无真机 PREFIX，故用 fixture。
         run: node tools/verify-prefix-patch.test.mjs
 
+      - name: 插件在线升级工具自测
+        # 锁住 plugin-upgrade.mjs 的两处易碎语义：①compareVersions 的方向与
+        # 预发布比较（降级与否的判据全靠它）②extractTarball 的路径穿越/非普通
+        # 文件拒绝（tarball 来自公网 registry，必须假定其恶意）。纯离线自测，
+        # 不需要 registry 网络。
+        run: node tools/plugin-upgrade.test.mjs
+
       - name: Assemble debug（编译门禁）
         run: chmod +x gradlew && ./gradlew :app:assembleDebug --no-daemon
 

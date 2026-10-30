@@ -345,9 +345,18 @@ class PluginManagerActivity : AppCompatActivity() {
             }
 
             val installedDsh = readInstalledDshVersion()
+            // 在线升级状态（files/plugin-upgrade.json）与各插件的备份清单同样是文件 IO，
+            // 一并放后台读；主线程只做视图构建（本页此前就是被主线程 IO 拖到 ANR 的）。
+            val upgrade = PluginUpgrade.readState(this)
+            val npmDirs = (manifest.builtin + manifest.optional)
+                .filter { it.npm.isNotBlank() }
+                .map { it.dir }
+            val backups = npmDirs
+                .associateWith { dir -> PluginUpgrade.listBackups(this, dir) }
+                .filterValues { it.isNotEmpty() }
             runOnUiThread {
                 if (isFinishing || isDestroyed || gen != listGeneration) return@runOnUiThread
-                renderList(manifest, bundled, optionals, extras, issues, installedDsh)
+                renderList(manifest, bundled, optionals, extras, issues, installedDsh, upgrade, backups)
             }
         }
     }
@@ -359,7 +368,9 @@ class PluginManagerActivity : AppCompatActivity() {
         optionals: List<Triple<PluginEntry, BundledHealth, String>>,
         extras: List<PluginInfo>,
         issues: List<Pair<String, String>>,
-        installedDsh: String?
+        installedDsh: String?,
+        upgrade: PluginUpgrade.State,
+        backups: Map<String, List<PluginUpgrade.Backup>>,
     ) {
         listBox.removeAllViews()
         listBox.addView(buildOverviewCard(bundled.size, optionals.size, extras.size, issues, manifest.targetDsh, installedDsh))
@@ -402,6 +413,14 @@ class PluginManagerActivity : AppCompatActivity() {
                     status = "已装配 · 已禁用"
                     actions.add("启用" to { setBundled(e, true, "启用 ${e.dir}") })
                 }
+                // ★ 副本**比源新**：几乎总是用户自己在这个插件上做过「在线升级」。
+                //   不是故障，绝不给「修复」（那等于点一下就把升级打回出厂版）；
+                //   只在有备份时给「回滚」，让退出升级的路径留在明面上。
+                h.aheadOfSource -> {
+                    status = "已在线升级 · 高于内置源"
+                    val bk = backups[e.dir].orEmpty()
+                    if (bk.isNotEmpty()) actions.add("回滚" to { showRollbackDialog(e, bk) })
+                }
                 else -> {
                     status = "已装配"
                     actions.add("禁用" to { setBundled(e, false, "禁用 ${e.dir}") })
@@ -433,6 +452,11 @@ class PluginManagerActivity : AppCompatActivity() {
                         status = "副本已就绪 · 待装配"
                         actions.add("装配" to { wireBundled(e) })
                     }
+                    h.aheadOfSource -> {
+                        status = "已在线升级 · 高于源"
+                        val bk = backups[e.dir].orEmpty()
+                        if (bk.isNotEmpty()) actions.add("回滚" to { showRollbackDialog(e, bk) })
+                    }
                     h.staleVsSource -> {
                         status = "已装配 · 副本落后于源"
                         if (h.srcOk) actions.add("修复" to { repairSingle(e) })
@@ -445,6 +469,12 @@ class PluginManagerActivity : AppCompatActivity() {
                 listBox.addView(makeCard(e.title.ifBlank { e.dir }, e.desc, ver, status, actions))
             }
         }
+
+        // ── 插件在线升级（npm 渠道）：只列清单里声明了 npm 的条目 ──
+        // 与下方「在线扩展」是两条独立通道：在线扩展指 profile 里登记但不在清单里的
+        // 第三方 bundle（走 git 源更新），这里指随 APK 内置、但同时发在 npm registry
+        // 上的插件（走 tarball 在线升级）。混在一起会让「从哪升级」变得不可解释。
+        buildUpgradeSection(manifest, upgrade, backups)?.let { listBox.addView(it) }
 
         listBox.addView(sectionHeader("在线扩展", "${extras.size} 个"))
         for (info in extras) {
@@ -459,6 +489,190 @@ class PluginManagerActivity : AppCompatActivity() {
             listBox.addView(makeCard(info.name, info.desc, info.version, "已装配", acts))
         }
         listBox.addView(buildInstallCard())
+    }
+
+    /**
+     * 插件在线升级分区（npm 渠道）。
+     *
+     * 设计要点：
+     *   · 清单里没有一条声明 npm → 整个分区不出现（不摆一个永远空着的入口）；
+     *   · 状态只来自 files/plugin-upgrade.json，**没查过就显示「未检查」**，
+     *     绝不把「没有记录」渲染成「已是最新」（这正是同类功能最常见的骗人处）；
+     *   · 升级/回滚全部交给 install/plugin-upgrade.mjs，Kotlin 侧不碰网络与 tar。
+     *
+     * @return 分区视图；无可升级渠道时返回 null。
+     */
+    private fun buildUpgradeSection(
+        manifest: PluginManifest,
+        upgrade: PluginUpgrade.State,
+        backups: Map<String, List<PluginUpgrade.Backup>>,
+    ): View? {
+        val entries = (manifest.builtin + manifest.optional).filter { it.npm.isNotBlank() }
+        if (entries.isEmpty()) return null
+
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val outdated = entries.count { upgrade.itemOf(it.dir)?.hasUpdate == true }
+        val trimmedCount = entries.count { it.npmTrimmed }
+        box.addView(sectionHeader("插件在线升级", "${entries.size} 个 npm 渠道"))
+        box.addView(buildUpgradeSummaryCard(entries.size, outdated, trimmedCount, upgrade))
+
+        for (e in entries) {
+            val item = upgrade.itemOf(e.dir)
+            val localVer = readVersion(e.dir)
+            val up = upgrade.upgradedTo(e.dir, localVer)
+            // checked 只保留「真的查过上游」的条目：没查过绝不能渲染成「已是最新」
+            val checked = item?.takeIf { it.checked }
+            val status: String
+            val verText: String
+            if (up != null) {
+                // 刚升级完但还没重新装配/重启：dsh 正在跑的仍是旧代码，必须显式提示
+                status = "已升级 · 待重启"
+                verText = "${up.from} → ${up.to}"
+            } else if (checked == null) {
+                status = "未检查"
+                verText = localVer
+            } else if (checked.hasUpdate) {
+                status = "可升级"
+                verText = "${checked.local.ifBlank { localVer }} → ${checked.latest}"
+            } else if (checked.status == PluginUpgrade.STATUS_ERROR) {
+                status = "查版失败"
+                verText = localVer
+            } else if (checked.status == PluginUpgrade.STATUS_AHEAD) {
+                status = "领先上游"
+                verText = "${checked.local} > ${checked.latest}"
+            } else {
+                status = "已是最新"
+                verText = checked.local.ifBlank { localVer }
+            }
+            val err = item?.error
+            val desc = buildString {
+                append(e.desc)
+                // 裁剪版必须逐条标注：用户看到「升级会把 8 个文件变成 209 个文件」时
+                // 需要知道这是设计如此，而不是升级把插件搞坏了。
+                if (e.npmTrimmed) {
+                    append("\n裁剪版：本仓副本只保留运行时必需文件，升级会用上游完整包覆盖")
+                    append("（功能不变，体积会变大）")
+                }
+                if (err != null) append("\n查询失败：$err")
+            }
+            val acts = mutableListOf<Pair<String, () -> Unit>>()
+            if (checked != null && checked.hasUpdate) {
+                acts.add("升级到 ${checked.latest}" to { confirmUpgrade(e) })
+            } else {
+                acts.add("在线升级" to { confirmUpgrade(e) })
+            }
+            val bk = backups[e.dir].orEmpty()
+            if (bk.isNotEmpty()) {
+                acts.add("回滚" to { showRollbackDialog(e, bk) })
+            }
+            box.addView(makeCard(e.title.ifBlank { e.dir }, desc, verText, status, acts))
+        }
+        return box
+    }
+
+    /**
+     * 在线升级分区的头部小结：可升级数量 + 上次检查时间 + 「检查更新」入口。
+     *
+     * [trimmedCount] 是清单里标了 npmTrimmed 的条目数。这些插件的本仓副本是上游包的
+     * 裁剪版（只删了 sourcemap / .d.ts / 文档 / 非本宿主适配层），升级会用上游完整包
+     * 覆盖 —— 功能不变，但体积会明显变大。必须在点升级之前就把这件事说清楚。
+     */
+    private fun buildUpgradeSummaryCard(total: Int, outdated: Int, trimmedCount: Int, upgrade: PluginUpgrade.State): View {
+        val card = Ui.card(this, radiusDp = 14, background = Ui.SURFACE_CONTAINER_LOW, elevationDp = 0f)
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val head = TextView(this).apply {
+            text = when {
+                !upgrade.exists -> "尚未检查上游版本（共 $total 个 npm 渠道）"
+                outdated > 0 -> "↑ $outdated 个插件有新版本"
+                upgrade.summary.error > 0 -> "检查完成，但 ${upgrade.summary.error} 个查询失败"
+                else -> "✓ 全部已是最新（$total 个 npm 渠道）"
+            }
+            setTextColor(if (outdated > 0) Ui.WARNING else Ui.TEXT_SECONDARY)
+            textSize = 13f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+        }
+        col.addView(head)
+        val sub = TextView(this).apply {
+            text = buildString {
+                if (upgrade.checkedAt.isNotBlank()) append("上次检查：${formatCheckedAt(upgrade.checkedAt)}")
+                else append("上次检查：从未")
+                if (PluginUpgrade.isStale(upgrade)) append("（已过期）")
+                if (trimmedCount > 0) {
+                    append("\n其中 $trimmedCount 个是裁剪版（本仓只保留了运行时必需文件）：升级会用上游完整包覆盖，")
+                    append("功能不变但体积会变大（补回 sourcemap / .d.ts / 文档等），属预期。")
+                }
+                append("\n在线升级只替换 files/plugins 里的插件副本，完成后需重新装配或重启 dsh 才生效。")
+            }
+            setTextColor(Ui.TEXT_MUTED)
+            textSize = 11f
+            setLineSpacing(dp(2).toFloat(), 1f)
+            setPadding(0, dp(6), 0, dp(8))
+        }
+        col.addView(sub)
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        row.addView(Ui.button(this, "检查更新", { runUpgradeCheck(force = false) }, filled = true, compact = true).apply {
+            layoutParams = LinearLayout.LayoutParams(0, dp(40), 1f).apply { rightMargin = dp(6) }
+        })
+        row.addView(Ui.button(this, "强制重查", { runUpgradeCheck(force = true) }, filled = false, compact = true).apply {
+            layoutParams = LinearLayout.LayoutParams(0, dp(40), 1f).apply { rightMargin = dp(6) }
+        })
+        col.addView(row)
+        card.addView(col)
+        return card
+    }
+
+    /** ISO 时间串 → "MM-dd HH:mm"；解析失败原样返回（宁可难看也不吞掉信息）。 */
+    private fun formatCheckedAt(iso: String): String = try {
+        val t = java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", java.util.Locale.US)
+            .apply { timeZone = java.util.TimeZone.getTimeZone("UTC") }
+        val d = t.parse(iso.take(19))
+        if (d == null) iso else java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.US).format(d)
+    } catch (t: Throwable) {
+        iso
+    }
+
+    /**
+     * 升级确认：明确告知「会替换副本 + 会先备份 + 需重新装配才能生效」。
+     *
+     * 裁剪版（清单 npmTrimmed）额外说明「升级只做加法、体积会变大」——否则用户看到
+     * 插件目录从几个文件涨到上百个文件，会以为升级把插件搞坏了。
+     */
+    private fun confirmUpgrade(e: PluginEntry) {
+        if (!guardBusy()) return
+        val trimmedNote = if (e.npmTrimmed) {
+            "\n· 本仓副本是上游包的裁剪版（只保留运行时必需文件）：升级会用上游完整包覆盖，" +
+                "只会补回 sourcemap / .d.ts / 文档等被裁掉的文件，功能不变但体积会变大"
+        } else {
+            ""
+        }
+        AlertDialog.Builder(this)
+            .setTitle("在线升级 ${e.title.ifBlank { e.dir }}")
+            .setMessage(
+                "将从 npm registry 下载 ${e.npm} 的最新版本，替换 files/plugins/${e.dir} 下的插件副本。\n\n" +
+                    "· 替换前会自动备份到 files/.plugin-backup/${e.dir}/（可回滚）\n" +
+                    "· 若上游不是更新版本则原样保留（不降级）" +
+                    trimmedNote + "\n" +
+                    "· 完成后需「重新装配」或重启 dsh 才会生效\n\n继续？"
+            )
+            .setPositiveButton("升级") { _, _ -> runUpgrade(e) }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /** 回滚确认：列出备份版本，默认选最新的那个（脚本侧也是这个顺序）。 */
+    private fun showRollbackDialog(e: PluginEntry, backups: List<PluginUpgrade.Backup>) {
+        if (!guardBusy()) return
+        val labels = backups.map { b ->
+            "${b.version}（${java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.US).format(java.util.Date(b.mtime))}）"
+        }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("回滚 ${e.title.ifBlank { e.dir }}")
+            .setItems(labels) { _, which ->
+                val b = backups.getOrNull(which) ?: return@setItems
+                runRollback(e, b.version)
+            }
+            .setNegativeButton("取消", null)
+            .show()
     }
 
     /** 健康检测期间的概览占位。 */
@@ -794,6 +1008,15 @@ class PluginManagerActivity : AppCompatActivity() {
         val srcOk: Boolean,
         /** 装配副本落后于内置源（装了新 APK 但副本未刷新）。 */
         val staleVsSource: Boolean = false,
+        /**
+         * 装配副本**比源新**（通常来自「在线升级」）。
+         *
+         * 与 [staleVsSource] 互斥：两者都由内容指纹/版本比较得出，但语义相反 ——
+         * 一个该修（源更新），一个**不该修**（按源覆盖等于把在线升级静默回滚）。
+         * 旧逻辑把后者也判成 staleVsSource，于是界面上明晃晃一个「修复」按钮，
+         * 点下去就把用户刚升级的版本打回出厂版。
+         */
+        val aheadOfSource: Boolean = false,
         /** 对钉死版 dsh 的兼容性判定；无数据（未审计过）时为 null。 */
         val compat: CompatInfo? = null,
         /**
@@ -820,6 +1043,7 @@ class PluginManagerActivity : AppCompatActivity() {
             isWired(e),
             srcOk,
             staleVsSource = isStaleVsSource(e, dir),
+            aheadOfSource = isAheadOfSource(e, dir),
             compat = compatStatus[e.dir],
             bundled = isBundled(e),
         )
@@ -835,13 +1059,30 @@ class PluginManagerActivity : AppCompatActivity() {
      * 这里用与资产同步同一套内容指纹直接比对，暴露「源已更新、副本未刷新」。
      *
      * 源不存在（清单条目对应的源目录缺失）时返回 false，不做无根据的告警。
+     *
+     * ⚠️ 本地版本**高于**源时不算「落后」（那是「在线升级」的结果，见 [isAheadOfSource]）：
+     * 内容指纹必然不同，但该修的是源、不是副本 —— 判成落后会把在线升级成果说成故障。
      */
     private fun isStaleVsSource(e: PluginEntry, dir: File): Boolean {
         if (!File(dir, "package.json").isFile) return false
         val src = File(e.sourceDir, e.dir)
         if (!File(src, "package.json").isFile) return false
+        if (AssetSync.isNewerThanSource(dir, src)) return false
         return runCatching { !AssetSync.dirContentEquals(src, dir) }.getOrDefault(false)
     }
+
+    /**
+     * 装配副本是否**比源新** —— 通常意味着用户在这个插件上做过「在线升级」。
+     *
+     * 为什么要单列：在线升级只替换 `files/plugins/<dir>`，不动 `files/extra-plugins/<dir>`，
+     * 因此内容指纹与源必然不同。旧逻辑把这判成「副本落后于内置源」并给出「修复」按钮，
+     * 而修复=按出厂源整目录覆盖 ⇒ 用户点一下就把刚升级的版本静默回滚了。
+     * 这里必须把方向说对：文案改成「已在线升级 · 高于内置源」，且**不给修复按钮**。
+     *
+     * 只在两侧版本都可解析时才有结论（否则返回 false，交给内容指纹判「落后」）。
+     */
+    private fun isAheadOfSource(e: PluginEntry, dir: File): Boolean =
+        AssetSync.isNewerThanSource(dir, File(e.sourceDir, e.dir))
 
     /**
      * 目录健康：package.json 存在、可解析、name 非空，**且入口文件真实存在**。
@@ -901,11 +1142,30 @@ class PluginManagerActivity : AppCompatActivity() {
     private fun bundledSourceAvailable(e: PluginEntry): Boolean =
         File(File(e.sourceDir, e.dir), "package.json").isFile
 
-    /** 从内置源恢复单个插件目录：按清单取源目录整目录直拷（旧 tgz 通道已下线）。 */
-    private fun repairFromSource(e: PluginEntry): Boolean {
+    /**
+     * 从源目录恢复单个插件目录：按清单取源目录整目录直拷（旧 tgz 通道已下线）。
+     *
+     * **不降级守卫**：`files/plugins/<dir>` 可能已被「在线升级」换成比内置源更新的版本，
+     * 此时按源覆盖等于把用户的在线升级**静默回滚**（备份还在，但界面上的按钮写着「修复」，
+     * 行为无法解释）。判据与 [AssetSync.refreshBundledPluginCopies] 的守卫、
+     * `install/plugins.mjs` 的 syncExtraPlugin 完全同源：版本不可解析 → fail-open 照常恢复；
+     * 只有「本地明确更新」才拒绝。
+     *
+     * @param allowDowngrade 为 true 时跳过守卫强制回到出厂源。「一键重置」用它 ——
+     *   重置的语义本来就是回到出厂版；升级前的副本仍留在 `files/.plugin-backup/<dir>`，
+     *   需要时可在「插件在线升级」分区用「回滚」取回。
+     * @return 恢复后副本健康则 true；源缺失 / 被守卫拒绝 / 复制失败则 false。
+     */
+    private fun repairFromSource(e: PluginEntry, allowDowngrade: Boolean = false): Boolean {
         val src = File(e.sourceDir, e.dir)
         if (!File(src, "package.json").isFile) return false
         val dst = File(pluginsDir(), e.dir)
+        if (!allowDowngrade && AssetSync.isNewerThanSource(dst, src)) {
+            val dstVer = AssetSync.pkgVersionOf(dst)
+            appendLog("   ⚠ ${e.dir} 本地 $dstVer 高于内置源版本（已在线升级），拒绝按源覆盖")
+            appendLog("     如需退回出厂版：用「插件在线升级」分区的「回滚」，或「一键重置」")
+            return false
+        }
         dst.deleteRecursively()
         return runCatching {
             src.copyRecursively(dst, overwrite = true)
@@ -924,6 +1184,21 @@ class PluginManagerActivity : AppCompatActivity() {
         val desc: String,
         /** 该条目对应的源目录：builtin → files/extra-plugins，optional → files/optional-plugins。 */
         val sourceDir: File,
+        /**
+         * 清单声明的 npm 包名（在线升级渠道）。空 = 无 online 升级来源。
+         *
+         * 与 [name] 可以不同：历史上改过包名（如 modsearch 的内部 name 是
+         * @liustack/modsearch），registry 上真实存在的那个才是升级来源。
+         * 空字符串必须保留「没有渠道」这个语义，不能回退成 [name] ——
+         * `@dsh-external/<pkg>` 与只发 GitHub Release 的插件填了也查不到，只会变噪音。
+         */
+        val npm: String = "",
+        /**
+         * 清单标了 npmTrimmed：本仓副本是上游包的裁剪版（只删了 sourcemap / .d.ts /
+         * 文档 / 非本宿主适配层），升级会用上游完整包覆盖 —— 只做加法，功能不变但
+         * 体积会变大。UI 必须在点「升级」之前把这件事讲清，否则用户会以为出了 bug。
+         */
+        val npmTrimmed: Boolean = false,
     )
 
     /**
@@ -1005,6 +1280,8 @@ class PluginManagerActivity : AppCompatActivity() {
                     title = o.optString("title").trim().ifEmpty { dir },
                     desc = o.optString("desc").trim(),
                     sourceDir = sourceDir,
+                    npm = o.optString("npm").trim(),
+                    npmTrimmed = o.optBoolean("npmTrimmed", false),
                 )
             )
         }
@@ -1277,6 +1554,12 @@ class PluginManagerActivity : AppCompatActivity() {
         // 用户主动禁用是**正常状态**（不是错误），用中性灰而非红色。
         status.contains("已禁用") -> Ui.TEXT_MUTED
         status.contains("落后") -> Ui.WARNING
+        // 在线升级的三态：有新版本必须醒目（WARNING），「已升级 · 待重启」也不能绿
+        // （绿色等于告诉用户"这就生效了"，而实际上 dsh 跑的还是旧代码）。
+        status.contains("可升级") -> Ui.WARNING
+        status.contains("待重启") -> Ui.WARNING
+        status.contains("查版失败") -> Ui.DANGER
+        status.contains("已是最新") || status.contains("领先上游") -> Ui.TEXT_MUTED
         status.contains("已装配") || status.contains("已安装") || status.contains("已连接") -> Ui.SUCCESS
         status.contains("待") || status.contains("需") -> Ui.WARNING
         else -> Ui.TEXT_MUTED
@@ -1546,7 +1829,15 @@ class PluginManagerActivity : AppCompatActivity() {
                             val repairable = h.srcOk && (isBuiltin || h.dirExists)
                             if ((!h.dirExists || !h.healthy) && repairable) {
                                 appendLog(">> 恢复 ${e.dir} …")
-                                appendLog(if (repairFromSource(e)) "   ✓ ${e.dir} 已从源目录恢复" else "   ✗ ${e.dir} 恢复失败")
+                                // allowDowngrade = true：重置的语义就是「回到出厂版」，
+                                // 与「修复」按钮不同。这个分支只会命中「缺失 / 损坏」的副本
+                                // （健康的在线升级副本不进这里），而损坏副本本来就跑不起来；
+                                // 升级前的副本仍在 files/.plugin-backup/<dir>，可随时回滚取回。
+                                val restored = repairFromSource(e, allowDowngrade = true)
+                                appendLog(if (restored) "   ✓ ${e.dir} 已从源目录恢复" else "   ✗ ${e.dir} 恢复失败")
+                                if (restored && h.aheadOfSource) {
+                                    appendLog("   ⚠ ${e.dir} 此前已在线升级到更高版本，本次已恢复为出厂版；如需新版请用「插件在线升级」分区的升级 / 回滚")
+                                }
                             } else if (h.dirExists && !h.healthy) {
                                 appendLog("   ⚠ ${e.dir} 损坏且无源可恢复，跳过")
                             }
@@ -1840,6 +2131,136 @@ class PluginManagerActivity : AppCompatActivity() {
 
     private fun uninstall(name: String) {
         runDshPlugin(listOf("remove", name), "卸载 $name")
+    }
+
+    // ── 操作：插件在线升级（npm）──────────────────────────
+
+    /**
+     * 检查 plugin-upgrade.mjs 是否可运行：确保 node 与脚本都在位。
+     * 返回 null 表示不可运行（原因已写日志），否则返回 (node, script)。
+     */
+    private fun upgradeTooling(): Pair<File, File>? {
+        ensureHarnessTools()
+        val node = File(File(nodeDir, "bin"), "node")
+        if (!node.isFile) {
+            appendLog("✗ 在线升级不可用：内置 node 缺失（$node）")
+            toast("内置 node 缺失，无法在线升级")
+            return null
+        }
+        val script = PluginUpgrade.ensureScript(this)
+        if (script == null) {
+            appendLog("✗ 在线升级不可用：${PluginUpgrade.SCRIPT_REL} 缺失（assets 与 files 均取不到）")
+            toast("升级脚本缺失，请重新安装 APK 或点「重新装配」")
+            return null
+        }
+        return node to script
+    }
+
+    /** 在线升级脚本的进程环境：与 rewireCore 完全同源（只需 DSH_PREFIX，其余由 env.mjs 派生）。 */
+    private fun upgradeEnv(): MutableMap<String, String> = baseEnv().apply {
+        put("DSH_PREFIX", dshPrefix().absolutePath)
+        put("DSH_PROFILE", "web")
+        put("DSH_PLUGINS_DIR", pluginsDir().absolutePath)
+        put("DSH_APK_VER", AssetSync.apkVersion(this@PluginManagerActivity).toString())
+    }
+
+    /**
+     * 跑 plugin-upgrade.mjs 的一个子命令。
+     *
+     * @param args 子命令与参数，如 ["--check"]、["--apply", dir]、["--rollback", dir, "--version", v]
+     * @return 脚本退出码；-1 表示环境不满足（未执行）。
+     */
+    private fun runUpgradeScript(args: List<String>, label: String): Int {
+        val (node, script) = upgradeTooling() ?: return -1
+        // 路径与参数都不做 shell 转义：node/script 是 files 下的绝对路径，dir 来自清单
+        // （check-plugin-manifest.mjs 会拦下异常 dir），version 来自备份目录名。
+        // 若将来要把用户输入接进来，这里必须换成逐参数转义，不能直接拼。
+        val cmd = "${node.absolutePath} ${script.absolutePath} " + args.joinToString(" ") { "$it" }
+        return runProcess(cmd, upgradeEnv(), label)
+    }
+
+    /** 检查更新（后台，busy 锁）。[force] 为真时忽略 6 小时缓存直接打网络。 */
+    private fun runUpgradeCheck(force: Boolean) {
+        if (!guardBusy()) return
+        setBusy(true)
+        appendLog(">> 检查插件在线升级${if (force) "（强制重查）" else ""}…")
+        Thread {
+            try {
+                val args = mutableListOf("--check")
+                if (force) args.add("--force")
+                val code = runUpgradeScript(args, "检查插件更新")
+                // 退出码 0 才算查完；1 时脚本已经把失败原因写给每条 item，界面照常回读
+                appendLog(if (code == 0) "   ✓ 检查完成（见上方逐条结果）" else "   ✗ 检查未完成（exit=$code）")
+            } catch (t: Throwable) {
+                appendLog("检查插件更新异常: ${t.message}")
+            } finally {
+                refreshListSafe()
+                setBusy(false)
+            }
+        }.start()
+    }
+
+    /**
+     * 在线升级单个插件。
+     *
+     * 升级成功后不停在日志里：弹窗告诉用户「已替换副本，但 dsh 还在跑旧代码」，
+     * 并直接给「立即重启」——这是本功能最容易让人误判「没生效」的地方。
+     */
+    private fun runUpgrade(e: PluginEntry) {
+        if (!guardBusy()) return
+        setBusy(true)
+        appendLog(">> 在线升级 ${e.dir}（npm: ${e.npm}）…")
+        Thread {
+            var code = -1
+            try {
+                code = runUpgradeScript(listOf("--apply", e.dir), "在线升级 ${e.dir}")
+            } catch (t: Throwable) {
+                appendLog("在线升级异常: ${t.message}")
+            } finally {
+                refreshListSafe()
+                setBusy(false)
+            }
+            runOnUiThread { if (code == 0) showUpgradedDialog(e) }
+        }.start()
+    }
+
+    /** 回滚到指定备份版本。 */
+    private fun runRollback(e: PluginEntry, version: String) {
+        if (!guardBusy()) return
+        setBusy(true)
+        appendLog(">> 回滚 ${e.dir} → $version …")
+        Thread {
+            var code = -1
+            try {
+                code = runUpgradeScript(listOf("--rollback", e.dir, "--version", version), "回滚 ${e.dir}")
+            } catch (t: Throwable) {
+                appendLog("回滚异常: ${t.message}")
+            } finally {
+                refreshListSafe()
+                setBusy(false)
+            }
+            if (code == 0) {
+                runOnUiThread {
+                    toast("${e.dir} 已回滚到 $version，需重新装配后生效")
+                }
+            }
+        }.start()
+    }
+
+    /** 升级成功后的收尾提示：告知「需重新装配/重启」，并把两个动作直接送达。 */
+    private fun showUpgradedDialog(e: PluginEntry) {
+        if (isFinishing || isDestroyed) return
+        val cur = readVersion(e.dir)
+        AlertDialog.Builder(this)
+            .setTitle("升级完成")
+            .setMessage(
+                "${e.title.ifBlank { e.dir }} 的插件副本已替换（当前版本 $cur）。\n\n" +
+                    "dsh 正在运行的仍是升级前的代码，需要重新装配或重启才会生效。"
+            )
+            .setPositiveButton("立即重启") { _, _ -> restartFlow() }
+            .setNeutralButton("稍后", null)
+            .setNegativeButton("重新装配") { _, _ -> rewireBuiltins() }
+            .show()
     }
 
     /** 确保内置 Termux 与 Harness 工具就绪，失败仅记录不中断插件操作。 */

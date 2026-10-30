@@ -19,3 +19,6 @@ __pycache__/
 # Local artifacts
 dist/*.zip
 tools/.webkeys.txt
+# 本地脚手架/比对现场（tarball、解包树、kotlinc 编译检查等），不随仓库分发
+tmp/
+

@@ -1,0 +1,56 @@
+## [K5] package.json name / patch insert name / client.js 自注册 id
+### K5: Loader row specifier vs client.js self-registered id
+--- row id=modsearch
+    package.json name      : @liustack/modsearch
+    cordis.patch.yml insert name: @liustack/modsearch
+    client.js self-register id  : @liustack/modsearch
+    all three equal             : true
+    package exports["./client"] : "./dsh/client.js"
+    dsh.client.platform         : web
+--- row id=ego-browser
+    package.json name      : dsh-ego-browser
+    cordis.patch.yml insert name: dsh-ego-browser
+    client.js self-register id  : dsh-ego-browser
+    all three equal             : true
+    package exports["./client"] : "./lib/client.js"
+    dsh.client.platform         : web
+
+## [K5] client.js 实际 require() 说明符 vs 真实 seed 表（原文）
+function rM(){return{react:Ef,"react/jsx-runtime":If,"react-dom":Rf,"react-dom/client":Df,"@deepseek-ai/cordis":sf,"@deepseek-ai/dsh-client-store":lh,"@deepseek-ai/dsh-client-ui-slots":hh,"@deepseek-ai/dsh-client-ui-primitives":sE,"@deepseek-ai/dsh-client-ui-dockkit":XS}}
+--- @liustack/modsearch
+  require() specs     : @deepseek-ai/dsh-client-ui-primitives, react
+  dsh.client.inject   : []
+  dsh.client.external : null
+--- dsh-ego-browser
+  require() specs     : @deepseek-ai/dsh-client-store, react
+  dsh.client.inject   : ["@deepseek-ai/dsh-client-locale","@deepseek-ai/dsh-client-ui-settings-plugins"]
+  dsh.client.external : null
+
+## [K5] orderByModuleGraph 排图（dsh 自带函数）+ 逐说明符解析（原文）
+commander -> /data/user/0/com.dsh.nextapp1/files/dsh-prefix/node_modules/.pnpm/commander@15.0.0/node_modules/commander/index.js
+undici -> /data/user/0/com.dsh.nextapp1/files/dsh-prefix/node_modules/.pnpm/undici@8.11.2/node_modules/undici/index.js
+modsearch apply= function name= modsearch
+ego apply= function name= ego-browser inject= ["tools","subprocess"]
+ORDER OK (7 rows):
+  @liustack/modsearch
+  dsh-ego-browser
+@liustack/modsearch                all specifiers resolvable
+dsh-ego-browser                    all specifiers resolvable
+dsh-net-proxy                      all specifiers resolvable
+dsh-provider-headers               all specifiers resolvable
+@dsh-external/dsh-vision           all specifiers resolvable
+dsh-web-mobile                     all specifiers resolvable
+dsh-prompt-optimizer-mobile        all specifiers resolvable
+
+## [K6] 自带运行时从最终装配位置实跑（原文摘录）
+### modsearch CLI --version  (cwd=files, path=plugins/modsearch/dist/main.js)
+5.10.6
+### modsearch doctor
+  status:  OK
+  resolved: firecrawl
+  - firecrawl        READY    keyless: works with no key and no signup (Firecrawl grants 1,000 free credits/month, metered per IP per day). Set a free key for your own quota.
+  resolved: firecrawl
+  - firecrawl        READY    keyless fetch (default): public pages are read by a cloud browser, no key or signup needed. Opt out with: modsearch config set firecrawl.keylessFetch false
+### modsearch search --query 'node.js release' --max-results 1  (real network)
+### ego-browser runtime --status
+  "running": false

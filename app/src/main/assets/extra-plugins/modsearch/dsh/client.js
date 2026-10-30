@@ -27,12 +27,13 @@ window.__ModuleLoader__.load({
       'exa',
       'firecrawl',
       'keenable',
+      'youcom',
       'grok-cli',
       'local',
     ];
 
     // Engines that search with no key and no signup.
-    var KEYLESS_ENGINES = ['firecrawl', 'keenable'];
+    var KEYLESS_ENGINES = ['firecrawl', 'keenable', 'youcom'];
 
     // The chain is a row of search engines, so the page fetcher is not in it.
     // `local` reads a URL it is handed and searches for nothing, and a tickbox
@@ -72,6 +73,8 @@ window.__ModuleLoader__.load({
         discard: 'Discard',
         cliNote: 'This engine runs a local command-line tool: no key, no endpoint.',
         localNote: 'The built-in fetcher reads pages directly: no key, no endpoint.',
+        youcomNote:
+          "Runs on You.com's keyless free tier (100 searches a day per IP): no key, no endpoint.",
         envNote:
           'This key comes from an environment variable, which overrides the config file. Clear the variable to let a saved key take effect.',
         autoTitle: 'Automatic engine chain',
@@ -112,6 +115,7 @@ window.__ModuleLoader__.load({
         discard: '放弃修改',
         cliNote: '该引擎走本机命令行工具，无需密钥和接口地址。',
         localNote: '内置抓取器直连读取网页，无需密钥和接口地址。',
+        youcomNote: '走 You.com 免注册免费额度（每个 IP 每天 100 次），无需密钥和接口地址。',
         envNote: '该密钥来自环境变量，环境变量优先于配置文件。清掉变量后保存的密钥才会生效。',
         autoTitle: '自动引擎链',
         autoHint: '勾选后可参与故障转移。这里只列出本机已就绪的引擎。',
@@ -792,12 +796,20 @@ window.__ModuleLoader__.load({
                 ? hint(t.pickToConfigure, 'unpinned')
                 : canKey
                   ? secretField(t.apiKey, 'apiKey', current.hasKey ? t.stored : t.unset)
-                  : hint(draft.engine === 'local' ? t.localNote : t.cliNote, 'keyless'),
+                  : hint(
+                      draft.engine === 'local'
+                        ? t.localNote
+                        : draft.engine === 'youcom'
+                          ? t.youcomNote
+                          : t.cliNote,
+                      'keyless',
+                    ),
               canKey ? hint(t.apiKeyHint, 'api-key-rotation') : null,
               // The keyless engines ask for no signup at all. Silence here
               // reads as a key being required, which is the one thing these
               // engines do not need.
-              KEYLESS_ENGINES.indexOf(draft.engine) >= 0 && !current.hasKey
+              // A keyless engine with no key field (youcom) has its own note above.
+              canKey && KEYLESS_ENGINES.indexOf(draft.engine) >= 0 && !current.hasKey
                 ? hint(t.keylessTier, 'keyless-tier')
                 : null,
               canKey ? textField(t.baseUrl, 'baseURL', t.endpointFallback) : null,

@@ -2931,7 +2931,7 @@ function initCastServer(ctx, cfg, bridge, ffmpegManager, openAgentWindow = async
 */
 const EGO_HELP_INDEX = {
 	overview: "ego-browser 结构化浏览器工具。导航/交互/观察/表单/网络/等待/键鼠皆有专项工具，另提供 ego_help(本索引)、ego_doctor(体检)、ego_cli/ego_script(自由脚本逃生舱)。分类见: tools / navigate / observe / input / keyboard-mouse / form / wait / network / login / script / doctor。用 `topic` 查询，或直接给工具名。",
-	tools: "工具清单: ego_status, ego_space_open, ego_space_close, ego_snapshot, ego_navigate, ego_tabs, ego_click(+double), ego_fill, ego_js, ego_cdp, ego_screenshot(+selector), ego_page_info, ego_wait, ego_wait_for_selector, ego_wait_for_url, ego_wait_for_response, ego_key(+text/type), ego_hover, ego_read_element, ego_select, ego_drag, ego_scroll, ego_upload, ego_check, ego_dialog, ego_download, ego_http, ego_captcha, ego_auth_flush, ego_login_import, ego_help, ego_doctor, ego_cli, ego_script。",
+	tools: "工具清单: ego_status, ego_space_open, ego_space_close, ego_snapshot, ego_navigate, ego_tabs, ego_click(+double), ego_fill, ego_js, ego_cdp, ego_screenshot(+selector), ego_page_info, ego_wait, ego_wait_for_selector, ego_wait_for_url, ego_wait_for_response, ego_wait_for_human, ego_key(+text/type), ego_hover, ego_read_element, ego_select, ego_drag, ego_scroll, ego_upload, ego_check, ego_dialog, ego_download, ego_http, ego_captcha, ego_auth_flush, ego_login_import, ego_help, ego_doctor, ego_cli, ego_script。",
 	navigate: "ego_navigate: 打开URL或切tab(同任务复用当前tab)。ego_wait_for_url: 等跳转(登录/分页)。ego_tabs: 列出/切换/新建/关闭标签页(list/switch/open/close)。",
 	tabs: "ego_tabs: 标签页管理。action=list 列出所有标签(targetId/title/url/active); switch 用 targetId 切换; open 用 url 新建标签(默认 about:blank); close 用 targetId 关闭。targetId 来自 list/open/ego_space_open/ego_navigate 的返回。",
 	observe: "ego_snapshot: 整页语义树(带[ref]/loc供点击); ego_page_info: url/标题/视口/滚动/对话框/人机验证; ego_read_element: 读单元素文本/HTML/值/属性/可见性/计数; ego_screenshot(+selector): 整页或元素截图。",
@@ -2941,7 +2941,7 @@ const EGO_HELP_INDEX = {
 	wait: "ego_wait(固定毫秒); ego_wait_for_selector(等元素出现/消失); ego_wait_for_url(等跳转); ego_wait_for_response(等网络响应并可读body)。",
 	network: "ego_http: 发HTTP请求(默认浏览器上下文 fetch.browser, mode=server走Node fetch.server); ego_wait_for_response: 等并读接口响应。",
 	download: "ego_download: 等下载事件并落到指定路径(triggerSelector/triggerScript + 可选 savePath)。",
-	captcha: "ego_captcha: 检测页面人机验证(CAPTCHA)并返回{detected,kind}; 检测到请让用户去 ego 浏览器完成; ego_page_info 也附带 humanCheck。",
+	captcha: "ego_captcha: 检测页面人机验证(CAPTCHA)并返回{detected,kind}; 检测到请让用户去 ego 浏览器完成; ego_page_info 也附带 humanCheck。ego_wait_for_human: 先告诉用户要做什么，然后阻塞轮询直到验证码消失/登录完成(可选 selector 作为“登录成功”信号)，超时返回 resolved:false 而不是报错；不要走审批（never 策略会自动拒绝）。",
 	login: "ego_auth_flush: 把登录cookie落盘到ego profile; 观察窗登录引导条+『已登录,保存』按钮触发同一动作。ego_login_import: 按域名导入系统浏览器登录cookie——现代 Chrome/Edge 用 source=extension：先在 Agent 浏览器面板点「连接 Chrome 登录态」，按 6 位配对码在扩展里配对一次，之后面板按钮/该工具即可自动导入（扩展后台轮询，30 秒内）；旧版或已关闭浏览器用 source=chrome|edge|brave 安全复制（Chrome/Edge 127+ 的 ABE 会读到 0 并明确报错，源 profile 不会被打开/写入）。先 dryRun 看可导入项；ego 浏览器须已在运行。",
 	script: "ego_cli / ego_script: 原样运行任意 ego-browser nodejs heredoc脚本(page/browser/taskSpaces/site/fetch/cdp预载)。ego_script额外返回 duration/timedOut。注意 page 是本 runtime 的页面门面、不是 Playwright API：可用 goto/reload/info/url/title/locator/getByRole/getByText/getByLabel/getByPlaceholder/getByAltText/getByTitle/getByTestId/waitForTimeout/waitForLoadState/waitForSelector/waitForFunction/waitForURL/waitForRequest/waitForResponse/waitForEvent/evaluate/screenshot/snapshot/snapshotRaw/elementCenter/drainEvents/screencast/keyboard/mouse；没有 fill/click/type/press——交互用 ego_fill/ego_click 或 page.locator(...)。page.goto() 不返回 Playwright Response，取状态码用 ego_wait_for_response 或 page.info()。",
 	doctor: "ego_doctor: 体检环境(浏览器候选、vendored runtime、状态目录、CDP端口、任务空间)。"
@@ -3017,6 +3017,7 @@ const encoder = z.union([
 const prefs = {
 	tuiAutoOpenPanel: z.boolean().description("Open the TUI Agent Browser panel on the first ego_* call. Default off; activity still appears in the badge and status."),
 	isolateSpaces: z.boolean().description("Space isolation: false = persistent profile (keep logins across restarts); true = isolated sandbox."),
+	sessionScopedSpaces: z.boolean().description("Give each DSH session its own task space (dsh-agent-<session>) so concurrent sessions and subagents do not share tabs or steal each other's active tab. Off = one shared space."),
 	idleTimeoutMin: z.number().min(0).max(1440).step(1).description("Auto-stop the backing browser after N minutes without an ego_* call (0 = off). Relaunches on demand at the next call."),
 	disableFrameRelay: z.boolean().description("Disable the live frame relay (watch panel): no ego-cast worker, no screencast capture and no /api/ego stream routes. ego_* tools keep working."),
 	residentExecutor: z.boolean().description("Reuse one resident `ego-browser --serve` process across ego_* calls: the first call pays startup, later calls skip it (~16ms). Off = spawn per call. A dead resident falls back to a fresh spawn automatically."),
@@ -3035,7 +3036,10 @@ const prefs = {
 	ffmpegPath: z.string().description("Custom FFmpeg path. Empty = detect PATH or managed install."),
 	githubMirror: z.string().description("HTTPS base replacing https://github.com for managed downloads."),
 	egoCliArgs: z.string().description("Extra args appended to `ego-browser nodejs` argv. Takes effect on the next ego_* call."),
-	chromeArgs: z.string().description("Extra args appended to the Chrome launch argv. Takes effect on the next browser cold start (the browser is a singleton).")
+	chromeArgs: z.string().description("Extra args appended to the Chrome launch argv. Takes effect on the next browser cold start (the browser is a singleton)."),
+	viewportWidth: z.number().min(0).max(3840).step(10).description("Fixed CSS viewport width for agent pages, e.g. 1440. 0 = use the browser window size."),
+	viewportHeight: z.number().min(0).max(2160).step(10).description("Fixed CSS viewport height for agent pages, e.g. 900. 0 = use the browser window size."),
+	deviceScaleFactor: z.number().min(0).max(4).step(.25).description("Device pixel ratio for the fixed viewport. 0 = the browser default.")
 };
 const volatilePrefs = Object.fromEntries(Object.entries(prefs).map(([key, field]) => [key, field.volatile()]));
 const Config$1 = z.object({
@@ -3239,7 +3243,11 @@ function resolveConfig(config = {}) {
 		githubMirror: typeof config.githubMirror === "string" ? config.githubMirror : "",
 		egoCliArgs: typeof config.egoCliArgs === "string" ? config.egoCliArgs : "",
 		chromeArgs: typeof config.chromeArgs === "string" ? config.chromeArgs : "",
+		viewportWidth: finiteIn(config.viewportWidth, 0, 3840) ? config.viewportWidth : 0,
+		viewportHeight: finiteIn(config.viewportHeight, 0, 2160) ? config.viewportHeight : 0,
+		deviceScaleFactor: finiteIn(config.deviceScaleFactor, 0, 4) ? config.deviceScaleFactor : 0,
 		isolateSpaces: typeof config.isolateSpaces === "boolean" ? config.isolateSpaces : config.isolateSpaces === "true" || config.isolateSpaces === "1" || config.isolateSpaces === 1,
+		sessionScopedSpaces: typeof config.sessionScopedSpaces === "boolean" ? config.sessionScopedSpaces : !(config.sessionScopedSpaces === "false" || config.sessionScopedSpaces === "0" || config.sessionScopedSpaces === 0),
 		idleTimeoutMin: finiteIn(config.idleTimeoutMin, 0, 1440) ? config.idleTimeoutMin : 0,
 		disableFrameRelay: typeof config.disableFrameRelay === "boolean" ? config.disableFrameRelay : config.disableFrameRelay === "true" || config.disableFrameRelay === "1" || config.disableFrameRelay === 1,
 		residentExecutor: typeof config.residentExecutor === "boolean" ? config.residentExecutor : config.residentExecutor === "true" || config.residentExecutor === "1" || config.residentExecutor === 1,
@@ -4555,6 +4563,20 @@ const TOOL_TIMEOUT_MS = 12e4;
 function humanCheckScript(space) {
 	return `${useSpace(space)}${ensureRealTab()}let __hc = null\ntry { __hc = await page.evaluate(${j(HUMAN_CHECK_PROBE)}) } catch { __hc = null }\nconsole.log('${SENTINEL}' + JSON.stringify({ ok: true, humanCheck: __hc }))\n`;
 }
+/**
+* Script that blocks until the human clears a challenge.
+*
+* Polls the page (rather than sleeping once) so it returns as soon as the user
+* solves the CAPTCHA or completes the login. When `selector` is given, that
+* element must also exist — the usual "logged in now" signal. Returns a
+* structured payload, never an error: `resolved:false` is the honest answer
+* when the deadline passes.
+*/
+function waitForHumanScript(space, opts) {
+	const selector = opts.selector ?? "";
+	const selectorCheck = selector === "" ? "  const __selOk = true\n" : `  let __selOk = false\n  try { __selOk = (await page.count(${j(selector)})) > 0 } catch { __selOk = false }\n`;
+	return `${useSpace(space)}${ensureRealTab()}const __wb = Date.now()\nlet __saw = false, __resolved = false, __polls = 0, __last = null\nfor (;;) {\n  let __hc = null\n  try { __hc = await page.evaluate(${j(HUMAN_CHECK_PROBE)}) } catch { __hc = null }\n  if (__hc && __hc.detected) __saw = true\n  __last = __hc\n` + selectorCheck + `  if (!(__hc && __hc.detected) && __selOk) { __resolved = true; break }\n  if (Date.now() - __wb >= ${opts.timeoutMs}) break\n  __polls++\n  await page.waitForTimeout(${opts.pollMs})\n}\nconsole.log('${SENTINEL}' + JSON.stringify({ ok: true, needed: __saw, resolved: __resolved, waitedMs: Date.now() - __wb, polls: __polls, detected: !!(__last && __last.detected), kind: (__last && __last.kind) || null, url: await page.url().catch(() => null) }))\n`;
+}
 function createActiveSpaceTracker(defaultSpace = DEFAULT_SPACE) {
 	let activeSpace = defaultSpace;
 	let activeName = typeof defaultSpace === "string" ? defaultSpace : null;
@@ -4582,11 +4604,67 @@ function createActiveSpaceTracker(defaultSpace = DEFAULT_SPACE) {
 	};
 }
 /**
+* The session whose tool call is currently being prepared. Set for the whole
+* `execute` of a tool (buildScript runs synchronously inside it), so the space
+* tracker can answer "what is THIS session's default space?" without threading
+* a parameter through 30 buildScript closures.
+*/
+let pendingSessionId;
+/** The session id a tool call belongs to (undefined for host-initiated runs). */
+function currentSessionId() {
+	return pendingSessionId;
+}
+/**
+* Per-session default space name.
+*
+* Two DSH sessions (or two subagents) that both omit `space` used to share one
+* task space — and therefore one tab set and one cursor — so they stole each
+* other's pages. With session-scoped spaces each session gets its own space
+* (`dsh-agent-<sid8>`), hence its own browser context and window.
+*/
+function spaceNameForSession(sessionId, baseDefault, scoped) {
+	if (!scoped || sessionId === void 0 || sessionId === "") return baseDefault;
+	const short = String(sessionId).replace(/^session-/, "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 8);
+	if (short === "") return baseDefault;
+	return `${String(baseDefault)}-${short}`;
+}
+/**
+* Cursor key for the tab tracker. The session is part of the key so two
+* sessions sharing one space (session scoping off) still keep their own tab.
+*/
+function scopedTargetKey(sessionId, space) {
+	return `${sessionId ?? ""}\u0000${String(space)}`;
+}
+/**
+* A space tracker per DSH session, lazily created.
+*
+* `isScoped` is a live getter: the setting can be flipped without rebuilding
+* the tracker map, and existing sessions keep the space they already selected.
+*/
+function createSessionScopedSpaceTracker(baseDefault = DEFAULT_SPACE, isScoped = () => true) {
+	const bySession = /* @__PURE__ */ new Map();
+	const trackerFor = (sessionId) => {
+		const key = sessionId ?? "";
+		let tracker = bySession.get(key);
+		if (tracker === void 0) {
+			tracker = createActiveSpaceTracker(spaceNameForSession(sessionId, baseDefault, isScoped()));
+			bySession.set(key, tracker);
+		}
+		return tracker;
+	};
+	return {
+		forSession: trackerFor,
+		current: () => trackerFor(pendingSessionId).current(),
+		opened: (args, result) => trackerFor(pendingSessionId).opened(args, result),
+		selected: (space) => trackerFor(pendingSessionId).selected(space),
+		closed: (space, done) => trackerFor(pendingSessionId).closed(space, done),
+		resetToName: () => trackerFor(pendingSessionId).resetToName()
+	};
+}
+/**
 * The ego-lite host is a single persistent browser shared by every tool call;
 * concurrent tool executions would race on the same task space / tabs. All
-* ego_* executions are therefore serialized through one in-process lock. This
-* guards against concurrent tool calls within this plugin instance; separate
-* harness sessions sharing the same browser remain unsupported (host-level).
+* ego_* executions are therefore serialized through one in-process lock.
 */
 let egoLockChain = Promise.resolve();
 function withEgoLock(fn) {
@@ -5120,14 +5198,146 @@ async function runEgoScript(subprocess, script, exec, cfg, graceOverrideMs) {
 /** JS snippet that pins an action tool to one task space. */
 const useSpace = (name) => `const task = await taskSpaces.useOrCreate(${j(name)})\n`;
 /**
+* Optional `tab` parameter shared by every tool that can be pinned to one tab.
+* Declared at module scope so both registration functions can reuse it.
+*/
+const tabParam = {
+	type: "string",
+	description: "Optional tab targetId (from ego_tabs list). Omit to use the tab Chrome reports as active, falling back to the first real page."
+};
+/**
+* Side-channel line the prelude prints with the target it actually chose.
+* The host records it per space so the NEXT call — a brand-new process — can
+* re-pin the same tab. Chrome's own `active` flag is not enough: it resets to
+* the first tab when the previous CDP client disconnects, so a new process
+* cannot tell which tab the last call used.
+*/
+const TARGET_MARKER = "@@EGO_TARGET@@";
+function createTargetTracker() {
+	const bySpace = /* @__PURE__ */ new Map();
+	return {
+		get: (space) => bySpace.get(space),
+		set: (space, targetId) => {
+			if (space !== "" && targetId !== "") bySpace.set(space, targetId);
+		}
+	};
+}
+/**
+* The pin the tool wrapper feeds to `ensureRealTab()` for the current
+* buildScript call. Module-level because buildScript signatures are
+* (args) => string and every page tool calls the same shared helper.
+*/
+let pendingTargetPin;
+/** Viewport applied by `ensureRealTab()` for the current buildScript call. */
+let pendingViewport;
+/** Record the target a finished call actually used. */
+function recordPinnedTarget(tracker, space, stdout) {
+	const at = stdout.lastIndexOf(TARGET_MARKER);
+	if (at === -1) return;
+	const id = stdout.slice(at + 14).split(/\s/)[0];
+	if (id !== void 0 && id !== "") tracker.set(space, id);
+}
+/** Drop the pin side-channel from stdout returned to the model. */
+function stripTargetMarkers(text) {
+	if (!text.includes(TARGET_MARKER)) return text;
+	return text.split("\n").filter((line) => !line.includes(TARGET_MARKER)).join("\n");
+}
+/**
+* Record produced files as session deliverables.
+*
+* This emits the same `deliverables/presented` event the `present` tool emits,
+* so a screenshot or a downloaded file shows up as a card the user can open in
+* the Sidebar instead of a bare `/tmp/...` path they must copy from the chat.
+*
+* Entirely best-effort: a host without the projection service, a tool call
+* with no initiating agent, or a session that rejects the append must never
+* turn a successful screenshot into a failed tool call.
+*
+* @returns true when the event was appended.
+*/
+function deliverToSession(ctx, exec, files) {
+	if (files.length === 0) return false;
+	const session = (exec?.agent)?.session;
+	if (session === void 0 || typeof session.append !== "function") return false;
+	try {
+		const turn = (ctx.get?.("sessionProjections"))?.stateOf?.(session, "turnBoundary")?.lastTurn;
+		if (typeof turn !== "number") return false;
+		session.append("deliverables/presented", {
+			turn,
+			callId: exec?.callId,
+			files
+		});
+		return true;
+	} catch {
+		return false;
+	}
+}
+/**
 * JS snippet that makes the harness act on a real page tab.
 *
-* The Linux host (PR #234 ego-linux) does not reliably persist "current tab"
-* across CLI invocations: a fresh process sometimes resolves page actions
-* against a blank/stale tab. Selecting the first non-blank tab in the space
-* before acting makes cross-process tool calls deterministic.
+* The Linux host does not persist "current tab" across CLI invocations: every
+* ego_* call is a fresh process, and Chrome reports the first tab as active
+* again once the previous CDP client goes away. Selecting a tab before acting
+* is therefore mandatory for deterministic cross-process behaviour.
+*
+* Selection order (first match wins):
+*  1. an explicit `tab` targetId supplied by the caller,
+*  2. this space's cursor — the tab the previous call used (self-healing: a
+*     closed tab no longer matches, so selection falls through),
+*  3. the tab Chrome reports as active (correct within one process, and for
+*     a human who just clicked a tab),
+*  4. the first non-blank page (last-resort fallback).
+*
+* Before 0.9.5 there were no steps 1–2 and step 3 did not exist: the prelude
+* always jumped to the FIRST real tab, silently retargeting every call
+* whenever more than one tab was open.
+*
+* The viewport override is emitted AFTER the switch on purpose: `cdp()` needs
+* an attached session, and before the first tab exists (a cold browser) there
+* is nothing to attach to — running it first failed every tool with
+* "no active tab to attach session".
 */
-const ensureRealTab = () => "const __tabs = await browser.listTabs()\nconst __real = __tabs.find(t => !t.url.startsWith('about:') && !t.url.startsWith('chrome://')) ?? __tabs[0]\nif (__real) await browser.switchTab(__real.targetId)\n";
+const ensureRealTab = (preferred, viewport) => {
+	const pin = (preferred !== void 0 && preferred !== "" ? preferred : void 0) ?? pendingTargetPin;
+	const spec = viewport ?? pendingViewport;
+	return `const __tabs = await browser.listTabs()\nconst __want = ${pin !== void 0 ? j(pin) : "null"}\nconst __active = __want ? __tabs.find(t => t.targetId === __want) : __tabs.find(t => t.active === true)\nconst __real = __active ?? __tabs.find(t => !t.url.startsWith('about:') && !t.url.startsWith('chrome://')) ?? __tabs[0]\nif (__real) await browser.switchTab(__real.targetId)\nif (__real) console.log('${TARGET_MARKER}' + __real.targetId)\n` + (spec ? `if (__real) {\n${viewportPrelude(spec)}}\n` : "");
+};
+/**
+* JS snippet that pins the page viewport with CDP emulation.
+*
+* A one-shot `ego-browser nodejs` process dies with the call, and a
+* session-scoped `Emulation.setDeviceMetricsOverride` dies with it — the next
+* call starts from the raw window size again. Emitting the override at the
+* head of every script keeps a configured viewport stable across calls, and
+* also fixes hosts whose display scaling shrinks the CSS viewport into a
+* site's mobile breakpoint.
+*/
+const viewportPrelude = (cfg) => {
+	const width = Math.round(cfg.viewportWidth ?? 0);
+	const height = Math.round(cfg.viewportHeight ?? 0);
+	if (!(width > 0) || !(height > 0)) return "";
+	return `await cdp('Emulation.setDeviceMetricsOverride', { width: ${width}, height: ${height}, deviceScaleFactor: ${cfg.deviceScaleFactor !== void 0 && cfg.deviceScaleFactor > 0 ? cfg.deviceScaleFactor : 1}, mobile: false })\n`;
+};
+/**
+* Prelude for the raw heredoc tools (ego_cli / ego_script).
+*
+* These tools do NOT go through buildScript, so before this helper they ran
+* with no tab selection at all and a fresh process could attach to a stale
+* target. The prelude restores the same guarantees the structured tools get,
+* but is wrapped in try/catch: a diagnostic script that never touches `page`
+* must keep working even when no browser is up.
+*/
+const rawScriptPrelude = (cfg, tab) => `try {\n${ensureRealTab(tab, cfg)}} catch {}\n`;
+/**
+* selectOption with value → label → index fallback.
+*
+* `selectOption` matches option VALUES; a caller passing the visible label
+* ("Two" for `<option value="2">Two</option>`) used to fail with
+* `could not find option "Two"` even though the tool documented label support.
+* Try the value first (cheap, the common case), then the label, then — for a
+* numeric argument — the index.
+*/
+const selectOptionScript = (selector, value) => `const __sel = ${j(selector)}\nconst __v = ${j(value ?? "")}\nconst __pick = async (v) => {\n  try { return await page.locator(__sel).selectOption(v) } catch (__e) {\n    if (typeof v === 'string') { try { return await page.locator(__sel).selectOption({ label: v }) } catch {} }\n    if (typeof v === 'number') { try { return await page.locator(__sel).selectOption({ index: v }) } catch {} }\n    throw __e\n  }\n}\nconst __list = Array.isArray(__v) ? __v : [__v]\nlet __picked = []\ntry { __picked = await page.locator(__sel).selectOption(__v) } catch { __picked = [] }\nif (!Array.isArray(__picked) || __picked.length === 0) {\n  for (const __one of __list) { const __r = await __pick(__one); __picked = Array.isArray(__r) ? __r : [__r] }\n}\nconsole.log('${SENTINEL}' + JSON.stringify({ ok: true, select: __sel, values: __picked }))\n`;
 function renderText(_args, value) {
 	const v = value;
 	if (v !== null && typeof v === "object" && v.ok === true && typeof v.text === "string") return [{
@@ -5170,11 +5380,30 @@ function defineEgoTool(ctx, cfg, opts) {
 		},
 		timeoutMs: TOOL_TIMEOUT_MS,
 		execute: async (args, exec) => withEgoLock(() => observeEgoTool(cfg, opts.name, args, async () => {
-			markEgoToolCall(callingSessionId(exec));
-			const result = await runWithStaleSpaceRetry(ctx, cfg, exec, () => opts.buildScript(args));
-			if (!result.ok) throw new Error(result.error);
-			if (typeof opts.afterExecute === "function") opts.afterExecute(args, result.value);
-			return result.value;
+			const sessionId = callingSessionId(exec);
+			pendingSessionId = sessionId;
+			try {
+				markEgoToolCall(sessionId);
+				const spaceKey = scopedTargetKey(sessionId, str(args.space, cfg.defaultSpace));
+				const buildScript = () => {
+					pendingTargetPin = cfg.targetTracker.get(spaceKey);
+					pendingViewport = cfg;
+					try {
+						return opts.buildScript(args);
+					} finally {
+						pendingTargetPin = void 0;
+						pendingViewport = void 0;
+					}
+				};
+				const result = await runWithStaleSpaceRetry(ctx, cfg, exec, buildScript);
+				if (!result.ok) throw new Error(result.error);
+				recordPinnedTarget(cfg.targetTracker, spaceKey, result.stdout);
+				if (typeof opts.afterExecute === "function") opts.afterExecute(args, result.value);
+				if (typeof opts.deliverFiles === "function") deliverToSession(ctx, exec, opts.deliverFiles(args, result.value));
+				return result.value;
+			} finally {
+				pendingSessionId = void 0;
+			}
 		})),
 		presentCall: (args) => ({
 			card: "generic",
@@ -5225,11 +5454,12 @@ function apply(ctx, config = {}) {
 		configuredPath: initialFfmpegConfig.ffmpegPath,
 		requestedEncoder: initialFfmpegConfig.ffmpegEncoder
 	}).catch(() => {});
-	const spaceTracker = createActiveSpaceTracker(config.defaultSpace ?? DEFAULT_SPACE);
+	const spaceTracker = createSessionScopedSpaceTracker(config.defaultSpace ?? DEFAULT_SPACE, () => resolveConfig(bridge.source()).sessionScopedSpaces);
 	const cfg = {
 		egoBin: typeof config.egoBin === "string" && config.egoBin !== "" ? config.egoBin : DEFAULT_EGO_BIN,
 		configuredDefaultSpace: config.defaultSpace ?? DEFAULT_SPACE,
 		spaceTracker,
+		targetTracker: createTargetTracker(),
 		get defaultSpace() {
 			return this.spaceTracker.current();
 		},
@@ -5280,8 +5510,20 @@ function apply(ctx, config = {}) {
 		get chromeArgs() {
 			return resolveConfig(bridge.source()).chromeArgs;
 		},
+		get viewportWidth() {
+			return resolveConfig(bridge.source()).viewportWidth;
+		},
+		get viewportHeight() {
+			return resolveConfig(bridge.source()).viewportHeight;
+		},
+		get deviceScaleFactor() {
+			return resolveConfig(bridge.source()).deviceScaleFactor;
+		},
 		get isolateSpaces() {
 			return resolveConfig(bridge.source()).isolateSpaces;
+		},
+		get sessionScopedSpaces() {
+			return resolveConfig(bridge.source()).sessionScopedSpaces;
 		},
 		get idleTimeoutMin() {
 			return resolveConfig(bridge.source()).idleTimeoutMin;
@@ -5752,7 +5994,7 @@ function registerActionTools(ctx, cfg, reg) {
 	});
 	const spaceParam = {
 		type: "string",
-		description: "Task-space name or numeric id; defaults to the most recently opened or explicitly selected space."
+		description: "Task-space name or numeric id. Omit to use this session’s own space (dsh-agent-<session>) when session-scoped spaces are on (default), otherwise the most recently opened or explicitly selected space."
 	};
 	reg(t({
 		name: "ego_space_open",
@@ -5819,12 +6061,13 @@ function registerActionTools(ctx, cfg, reg) {
 				type: "number",
 				description: "Load wait timeout in ms (default 20000)."
 			},
+			tab: tabParam,
 			space: spaceParam
 		},
 		buildScript: (args) => {
 			const u = str(args.url, "");
 			if (u === "") return `console.log('${SENTINEL}' + JSON.stringify({ ok: false, reused: false, page: null, reason: 'ego_navigate: url is required' }))\n`;
-			return `${useSpace(str(args.space, cfg.defaultSpace))}${ensureRealTab()}const __existing = __tabs.find(t => t.url.split('#')[0] === ${j(u.split("#")[0])})\nconst tab = __existing ? await browser.switchTab(__existing.targetId) : await page.goto(${j(u)}, { wait: ${bool(args.wait, true)}, timeout: ${num(args.timeout, 2e4)} })\nconst pginfo = await page.info()\nconsole.log('${SENTINEL}' + JSON.stringify({ ok: true, reused: !!__existing, page: pginfo }))\n`;
+			return `${useSpace(str(args.space, cfg.defaultSpace))}${ensureRealTab(str(args.tab, ""))}const __existing = __tabs.find(t => t.url.split('#')[0] === ${j(u.split("#")[0])})\nconst tab = __existing ? await browser.switchTab(__existing.targetId) : await page.goto(${j(u)}, { wait: ${bool(args.wait, true)}, timeout: ${num(args.timeout, 2e4)} })\nconst pginfo = await page.info()\nconsole.log('${SENTINEL}' + JSON.stringify({ ok: true, reused: !!__existing, page: pginfo }))\n`;
 		}
 	}));
 	reg(t({
@@ -5932,6 +6175,10 @@ function registerActionTools(ctx, cfg, reg) {
 				type: "string",
 				description: "Optional absolute output path for the PNG."
 			},
+			deliver: {
+				type: "boolean",
+				description: "Surface the PNG as a deliverable card in the conversation (default true). Set false to keep it a bare path."
+			},
 			space: spaceParam
 		},
 		buildScript: (args) => {
@@ -5939,6 +6186,15 @@ function registerActionTools(ctx, cfg, reg) {
 			const pth = str(args.path, "");
 			const shot = sel !== "" ? `await page.locator(${j(sel)}).screenshot(${pth ? `{ path: ${j(pth)} }` : ""})` : `await page.screenshot(${pth ? `{ path: ${j(pth)} }` : ""})`;
 			return `${useSpace(str(args.space, cfg.defaultSpace))}${ensureRealTab()}const path = ${shot}\nconsole.log('${SENTINEL}' + JSON.stringify({ ok: true, path }))\n`;
+		},
+		deliverFiles: (args, value) => {
+			const file = value?.path;
+			if (args.deliver === false || typeof file !== "string" || file === "") return [];
+			const selector = str(args.selector, "");
+			return [{
+				path: file,
+				description: selector === "" ? "Screenshot" : `Screenshot of ${selector}`
+			}];
 		}
 	}));
 	reg(t({
@@ -5982,6 +6238,11 @@ function registerActionTools(ctx, cfg, reg) {
 			}
 			if (action !== "list") return `${space}console.log('${SENTINEL}' + JSON.stringify({ ok: false, error: ${j(`unknown action: ${action}`)} }))\n`;
 			return `${space}${done("")}`;
+		},
+		afterExecute: (args, value) => {
+			const v = value;
+			const target = str(v?.switched, "") || str(v?.created, "");
+			if (target !== "") cfg.targetTracker.set(scopedTargetKey(currentSessionId(), str(args.space, cfg.defaultSpace)), target);
 		}
 	}));
 	reg(t({
@@ -6042,7 +6303,7 @@ function registerActionTools(ctx, cfg, reg) {
 	}));
 	reg(t({
 		name: "ego_wait_for_response",
-		description: "Wait for a network response matching a URL/glob/regex and return it. Optionally return the body (text or JSON) — ideal for scraping API responses or confirming a submission. It only observes responses that arrive DURING this call: trigger the request and wait in the same ego_script. On timeout the result carries the current URL and a hint instead of throwing.",
+		description: "Wait for a network response matching a URL/glob/regex and return it. Optionally return the body (text or JSON) — ideal for scraping API responses or confirming a submission. By default it also matches responses that already finished during the CURRENT document load (includeBuffered), because \"wait for the response of the page I just opened\" is the common case; set includeBuffered=false for strict future-only semantics. Across separate ego_* calls only future responses can be seen — trigger the request and the wait in the same ego_script. On timeout the result carries the current URL and a hint instead of throwing.",
 		parameters: {
 			url: {
 				type: "string",
@@ -6057,13 +6318,17 @@ function registerActionTools(ctx, cfg, reg) {
 				type: "string",
 				description: "Return the response body: 'none' (default) | 'text' | 'json'."
 			},
+			includeBuffered: {
+				type: "boolean",
+				description: "Also match responses that already completed during the current document load (default true). Set false to wait only for future responses."
+			},
 			space: spaceParam
 		},
 		buildScript: (args) => {
 			const u = str(args.url, "").trim();
 			const mode = str(args.body, "none");
 			const wantBody = mode === "text" || mode === "json";
-			return `${useSpace(str(args.space, cfg.defaultSpace))}${ensureRealTab()}let __res = null, __err = null\ntry { __res = await page.waitForResponse(${j(u)}, { timeout: ${num(args.timeout, 1e4)} }) } catch (e) { __err = String(e && e.message || e) }\nif (!__res) {\n  const __u = await page.url().catch(() => null)\n  console.log('${SENTINEL}' + JSON.stringify({ ok: false, reached: false, url: __u, error: __err, hint: 'no matching response arrived during this call. Issue the request and the wait in the same ego_script; the url pattern is a full URL or glob/regex, not a bare substring.' }))\n} else {\n${wantBody ? `  const __body = ${mode === "json" ? "await __res.json().catch(()=>null)" : "await __res.text().catch(()=>null)"}\n` : ""}  console.log('${SENTINEL}' + JSON.stringify({ ok: true, reached: true, url: __res.url(), status: __res.status()${wantBody ? ", body: __body" : ""} }))\n}\n`;
+			return `${useSpace(str(args.space, cfg.defaultSpace))}${ensureRealTab()}let __res = null, __err = null\ntry { __res = await page.waitForResponse(${j(u)}, { timeout: ${num(args.timeout, 1e4)}, includeBuffered: ${bool(args.includeBuffered, true)} }) } catch (e) { __err = String(e && e.message || e) }\nif (!__res) {\n  const __u = await page.url().catch(() => null)\n  console.log('${SENTINEL}' + JSON.stringify({ ok: false, reached: false, url: __u, error: __err, hint: 'no matching response arrived during this call. Include the wait in the same ego_script as the request; a cached response produces no network event (add a cache-busting query); the url pattern is a full URL or glob/regex, not a bare substring.' }))\n} else {\n${wantBody ? `  const __body = ${mode === "json" ? "await __res.json().catch(()=>null)" : "await __res.text().catch(()=>null)"}\n` : ""}  console.log('${SENTINEL}' + JSON.stringify({ ok: true, reached: true, url: __res.url(), status: __res.status()${wantBody ? ", body: __body" : ""} }))\n}\n`;
 		}
 	}));
 	reg(t({
@@ -6177,7 +6442,7 @@ function registerActionTools(ctx, cfg, reg) {
 			},
 			space: spaceParam
 		},
-		buildScript: (args) => `${useSpace(str(args.space, cfg.defaultSpace))}${ensureRealTab()}await page.locator(${j(str(args.selector, ""))}).selectOption(${j(args.value ?? "")})\nconsole.log('${SENTINEL}' + JSON.stringify({ ok: true, select: ${j(str(args.selector, ""))} }))\n`
+		buildScript: (args) => `${useSpace(str(args.space, cfg.defaultSpace))}${ensureRealTab()}` + selectOptionScript(str(args.selector, ""), args.value ?? "")
 	}));
 	reg(t({
 		name: "ego_drag",
@@ -6270,6 +6535,10 @@ function registerActionTools(ctx, cfg, reg) {
 				type: "number",
 				description: "How long to wait for the download in ms (default 30000)."
 			},
+			deliver: {
+				type: "boolean",
+				description: "Surface the downloaded file as a deliverable card in the conversation (default true). Set false to keep it a bare path."
+			},
 			space: spaceParam
 		},
 		buildScript: (args) => {
@@ -6280,6 +6549,16 @@ function registerActionTools(ctx, cfg, reg) {
 			const trigger = sel !== "" ? `await page.locator(${j(sel)}).click()\n` : script !== "" ? `await page.evaluate(() => { ${script} })\n` : "/* no trigger given — the download may be started by an earlier navigation */\n";
 			const save = savePath !== "" ? `const __final = await __dl.saveAs(${j(savePath)}).catch(()=>null)\n` : `const __final = await __dl.path().catch(()=>null)\n`;
 			return `${useSpace(str(args.space, cfg.defaultSpace))}${ensureRealTab()}const __dlPromise = page.waitForEvent('download', { timeout: ${timeout} })\n` + trigger + "const __dl = await __dlPromise\nconst __name = typeof __dl.suggestedFilename === 'function' ? __dl.suggestedFilename() : null\nconst __url = typeof __dl.url === 'function' ? __dl.url() : null\n" + save + `console.log('${SENTINEL}' + JSON.stringify({ ok: true, path: __final, suggestedFilename: __name, url: __url }))\n`;
+		},
+		deliverFiles: (args, value) => {
+			const v = value;
+			const file = v?.path;
+			if (args.deliver === false || typeof file !== "string" || file === "") return [];
+			const name = typeof v?.suggestedFilename === "string" ? v.suggestedFilename : "";
+			return [{
+				path: file,
+				description: name === "" ? "Download" : `Download: ${name}`
+			}];
 		}
 	}));
 	reg(t({
@@ -6370,11 +6649,14 @@ function registerActionTools(ctx, cfg, reg) {
 		return defineTool({
 			name: "ego_cli",
 			description: "Escape hatch: run an arbitrary `ego-browser nodejs` heredoc script verbatim (facades page/browser/taskSpaces/site/fetch and the raw cdp() are preloaded). Use when the structured ego_* tools do not cover the task. Returns raw stdout plus the parsed console.log payload when present.",
-			parameters: { script: {
-				type: "string",
-				required: true,
-				description: "Full JS script body for the heredoc; ego-browser helpers are preloaded. End with console.log('@@DSH_RESULT@@' + JSON.stringify({...})) — the literal @@DSH_RESULT@@ sentinel is required. (A trailing plain JSON line is accepted as a fallback, with result.fallback=true.)"
-			} },
+			parameters: {
+				script: {
+					type: "string",
+					required: true,
+					description: "Full JS script body for the heredoc; ego-browser helpers are preloaded. End with console.log('@@DSH_RESULT@@' + JSON.stringify({...})) — the literal @@DSH_RESULT@@ sentinel is required. (A trailing plain JSON line is accepted as a fallback, with result.fallback=true.)"
+				},
+				tab: tabParam
+			},
 			output: {
 				schema: {
 					type: "object",
@@ -6396,16 +6678,24 @@ function registerActionTools(ctx, cfg, reg) {
 			},
 			timeoutMs: TOOL_TIMEOUT_MS,
 			execute: async (args, exec) => {
-				markEgoToolCall(callingSessionId(exec));
-				const result = await runWithStaleSpaceRetry(ctx, cfg, exec, () => str(args.script, ""));
-				if (!result.ok) throw new Error(result.error);
-				const parsed = parseSentinel(result.stdout);
-				return {
-					ok: true,
-					stdout: result.stdout,
-					stderr: result.stderr,
-					result: parsed ?? result.value ?? null
-				};
+				const sessionId = callingSessionId(exec);
+				pendingSessionId = sessionId;
+				try {
+					markEgoToolCall(sessionId);
+					const result = await runWithStaleSpaceRetry(ctx, cfg, exec, () => rawScriptPrelude(cfg, str(args.tab, "")) + str(args.script, ""));
+					if (!result.ok) throw new Error(result.error);
+					recordPinnedTarget(cfg.targetTracker, scopedTargetKey(sessionId, cfg.defaultSpace), result.stdout);
+					const stdout = stripTargetMarkers(result.stdout);
+					const parsed = parseSentinel(stdout);
+					return {
+						ok: true,
+						stdout,
+						stderr: result.stderr,
+						result: parsed ?? result.value ?? null
+					};
+				} finally {
+					pendingSessionId = void 0;
+				}
 			},
 			presentCall: (args) => ({
 				card: "generic",
@@ -6463,6 +6753,111 @@ function registerHelpAndDoctor(ctx, cfg, reg) {
 		presentCall: (args) => ({
 			card: "generic",
 			title: toolCallTitle("ego_captcha", args),
+			kind: "other",
+			rawInput: null
+		})
+	}));
+	reg(defineTool({
+		name: "ego_wait_for_human",
+		description: "Hand the page to the human for a CAPTCHA / login / 2FA / confirmation, then wait until it is cleared. Say what you need in the conversation FIRST (\"solve the challenge in the agent browser window, I will wait\"), then call this. It polls the page until the challenge disappears — and, when `selector` is given, until that selector exists — returning { needed, resolved, waitedMs }. A timeout is not an error: resolved=false means \"still not done\", so report back and call again. This is a deliberate blocking wait; do not route it through approval flows, which auto-reject under policy \"never\".",
+		parameters: {
+			reason: {
+				type: "string",
+				description: "Why the wait is needed: captcha | login | 2fa | confirm (free text is fine)."
+			},
+			timeoutSec: {
+				type: "number",
+				description: "How long to wait in seconds (default 60, clamped to 5–110)."
+			},
+			pollMs: {
+				type: "number",
+				description: "Polling interval in ms (default 1500, clamped to 250–10000)."
+			},
+			selector: {
+				type: "string",
+				description: "Optional selector that must also exist before returning (e.g. a post-login element). Omitting it waits only for the challenge to clear."
+			},
+			space: {
+				type: "string",
+				description: "Task-space name or numeric id; defaults to this session’s space."
+			}
+		},
+		output: {
+			schema: {
+				type: "object",
+				additionalProperties: true,
+				properties: {
+					ok: {
+						type: "boolean",
+						required: true
+					},
+					needed: {
+						type: "boolean",
+						required: true
+					},
+					resolved: {
+						type: "boolean",
+						required: true
+					},
+					waitedMs: {
+						type: "number",
+						required: true
+					}
+				}
+			},
+			render: renderText
+		},
+		timeoutMs: TOOL_TIMEOUT_MS,
+		execute: async (args, exec) => withEgoLock(() => observeEgoTool(cfg, "ego_wait_for_human", args, async () => {
+			{
+				markEgoToolCall(callingSessionId(exec));
+				const timeoutMs = Math.min(11e4, Math.max(5e3, num(args.timeoutSec, 60) * 1e3));
+				const pollMs = Math.min(1e4, Math.max(250, num(args.pollMs, 1500)));
+				const selector = str(args.selector, "");
+				const spaceKey = String(str(args.space, cfg.defaultSpace));
+				const build = () => {
+					pendingTargetPin = cfg.targetTracker.get(spaceKey);
+					pendingViewport = cfg;
+					try {
+						return waitForHumanScript(str(args.space, cfg.defaultSpace), {
+							timeoutMs,
+							pollMs,
+							selector
+						});
+					} finally {
+						pendingTargetPin = void 0;
+						pendingViewport = void 0;
+					}
+				};
+				const result = await runWithStaleSpaceRetry(ctx, cfg, exec, build);
+				if (!result.ok) return {
+					ok: false,
+					needed: true,
+					resolved: false,
+					waitedMs: 0,
+					reason: str(args.reason, "confirm"),
+					error: result.error
+				};
+				recordPinnedTarget(cfg.targetTracker, spaceKey, result.stdout);
+				const p = parseSentinel(result.stdout) || {};
+				const resolved = !!p.resolved;
+				return {
+					ok: true,
+					needed: !!p.needed,
+					resolved,
+					waitedMs: typeof p.waitedMs === "number" ? p.waitedMs : 0,
+					polls: typeof p.polls === "number" ? p.polls : 0,
+					detected: !!p.detected,
+					kind: p.kind ?? null,
+					url: p.url ?? null,
+					reason: str(args.reason, "confirm"),
+					...resolved ? {} : { hint: "still waiting after the timeout. Make sure the user knows which window to use (the agent browser window / watch panel), say what to click, then call ego_wait_for_human again." }
+				};
+			}
+		})),
+		presentCall: (args) => ({
+			card: "generic",
+			title: toolCallTitle("ego_wait_for_human", args),
 			kind: "other",
 			rawInput: null
 		})
@@ -6607,7 +7002,8 @@ function registerHelpAndDoctor(ctx, cfg, reg) {
 				timeoutMs: {
 					type: "integer",
 					description: "Per-run timeout in ms (default plugin grace)."
-				}
+				},
+				tab: tabParam
 			},
 			output: {
 				schema: {
@@ -6633,28 +7029,36 @@ function registerHelpAndDoctor(ctx, cfg, reg) {
 			},
 			timeoutMs: TOOL_TIMEOUT_MS,
 			execute: async (args, exec) => {
-				markEgoToolCall(callingSessionId(exec));
-				const timeoutMs = typeof args.timeoutMs === "number" && Number.isFinite(args.timeoutMs) && args.timeoutMs > 0 ? args.timeoutMs : void 0;
-				const start = Date.now();
-				const result = await runWithStaleSpaceRetry(ctx, cfg, exec, () => str(args.script, ""), timeoutMs);
-				const durationMs = Date.now() - start;
-				if (!result.ok) return {
-					ok: false,
-					stdout: result.stdout,
-					stderr: result.stderr,
-					durationMs,
-					timedOut: false,
-					error: result.error
-				};
-				const parsed = parseSentinel(result.stdout);
-				return {
-					ok: true,
-					stdout: result.stdout,
-					stderr: result.stderr,
-					result: parsed ?? result.value ?? null,
-					durationMs,
-					timedOut: false
-				};
+				const sessionId = callingSessionId(exec);
+				pendingSessionId = sessionId;
+				try {
+					markEgoToolCall(sessionId);
+					const timeoutMs = typeof args.timeoutMs === "number" && Number.isFinite(args.timeoutMs) && args.timeoutMs > 0 ? args.timeoutMs : void 0;
+					const start = Date.now();
+					const result = await runWithStaleSpaceRetry(ctx, cfg, exec, () => rawScriptPrelude(cfg, str(args.tab, "")) + str(args.script, ""), timeoutMs);
+					const durationMs = Date.now() - start;
+					if (!result.ok) return {
+						ok: false,
+						stdout: stripTargetMarkers(result.stdout),
+						stderr: result.stderr,
+						durationMs,
+						timedOut: false,
+						error: result.error
+					};
+					recordPinnedTarget(cfg.targetTracker, scopedTargetKey(sessionId, cfg.defaultSpace), result.stdout);
+					const stdout = stripTargetMarkers(result.stdout);
+					const parsed = parseSentinel(stdout);
+					return {
+						ok: true,
+						stdout,
+						stderr: result.stderr,
+						result: parsed ?? result.value ?? null,
+						durationMs,
+						timedOut: false
+					};
+				} finally {
+					pendingSessionId = void 0;
+				}
 			},
 			presentCall: (args) => ({
 				card: "generic",
@@ -6666,4 +7070,4 @@ function registerHelpAndDoctor(ctx, cfg, reg) {
 	})());
 }
 //#endregion
-export { Config, apply, createActiveSpaceTracker, detectChromeMajorVersion, ensureResidentTransport, findChromeBinary, inject, isColdStartError, loginImportForced, loginImportPolicy, name, parseSentinelOrLastJson, resetResidentTransportForTests, residentDiagnostics, resolveEgoEnv, runWithStaleSpaceRetry, shouldReapBrowser, superviseResidentFailure };
+export { Config, apply, createActiveSpaceTracker, createSessionScopedSpaceTracker, createTargetTracker, currentSessionId, deliverToSession, detectChromeMajorVersion, ensureRealTab, ensureResidentTransport, findChromeBinary, inject, isColdStartError, loginImportForced, loginImportPolicy, name, parseSentinelOrLastJson, rawScriptPrelude, recordPinnedTarget, resetResidentTransportForTests, residentDiagnostics, resolveEgoEnv, runWithStaleSpaceRetry, scopedTargetKey, selectOptionScript, shouldReapBrowser, spaceNameForSession, stripTargetMarkers, superviseResidentFailure, tabParam, viewportPrelude, waitForHumanScript };

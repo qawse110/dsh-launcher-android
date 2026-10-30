@@ -250,13 +250,14 @@ function registerXSearchTool(ctx) {
  * status code, undigested body) and excludes reading focus by design, while
  * this is an LLM-processed read with a summary, extracted content, links,
  * an uncertainty list, and operational warnings. The CLI blocks private-network
- * targets by default, and this tool exposes no override for that.
+ * targets by default, and this tool exposes no override for that. dsh also
+ * exposes its own raw web_fetch by default, so the description names the split.
  */
 function registerReadPageTool(ctx) {
   ctx.tools.register({
     name: 'read_page',
     description:
-      'Read one web page through the modsearch bridge. Use when a message references a specific http(s) URL whose content matters: docs, an article, a changelog, a thread. Returns structured evidence with a summary, the extracted content, outgoing links, uncertainty, and operational warnings such as cloud fetching. Pass "query" to focus the reading on one question. Page reading needs no engine setup. Run `npx @liustack/modsearch doctor` to inspect the resolved route.',
+      'Read one web page through the modsearch bridge and return digested evidence: a summary, the extracted content, outgoing links, uncertainty, and operational warnings such as cloud fetching. Use it over web_fetch when you want the page digested or focused on one question (pass "query"), or when the page is rendered by JavaScript and a plain fetch returns an empty shell. Use web_fetch, where available, when you need the raw page text or the HTTP status code. Private-network URLs are blocked. Page reading needs no engine setup. Run `npx @liustack/modsearch doctor` to inspect the resolved route.',
     parameters: {
       type: 'object',
       properties: {
@@ -460,6 +461,7 @@ const CARD_ENGINES = [
   'exa',
   'firecrawl',
   'keenable',
+  'youcom',
   'grok-cli',
   'local',
 ];

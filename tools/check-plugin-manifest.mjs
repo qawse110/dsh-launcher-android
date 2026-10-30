@@ -16,7 +16,17 @@
  *   2. 条目的 name 与 package.json 的 name 一致；
  *   3. 条目的 id 与 cordis.patch.yml 里 insert 行的 id 一致；
  *   4. extra-plugins/ 下没有「未登记」的多余目录（防止加了插件忘登记）；
- *   5. 同一 dir/name/id 不重复。
+ *   5. 同一 dir/name/id 不重复；
+ *   6. 可选字段 npm（插件「在线升级」的渠道声明）格式合法且不重复。
+ *      这一项**不联网**，只校验形状：写错一个字符（scope 少了 @、大小写、
+ *      空格）不会让构建失败，只会让插件管理页的「在线升级」永久 404 —— 属于
+ *      静默失效，所以必须在离线门禁里拦。是否真的存在于 registry 只能靠联网，
+ *      不在 CI 里做（见 docs/update-check-log.md 的在线升级一节）。
+ *   7. 可选字段 npmTrimmed 只能在 npm 存在时出现，且必须是 true/false。
+ *      它标记「本仓副本是上游包的裁剪版」：在线升级会用上游完整包覆盖，只做加法
+ *      （补回 sourcemap / .d.ts / 文档 / 非本宿主适配层），体积变大但功能不变。
+ *      究竟是不是裁剪版只能联网比对，这里只管形状（见
+ *      tools/verify-plugin-npm-source.mjs 的「裁剪版」判定）。
  *
  * 用法：node tools/check-plugin-manifest.mjs
  * 退出码：0 = 通过，1 = 有不一致（打印全部问题）。
@@ -53,7 +63,16 @@ function patchIds(file) {
   return ids;
 }
 
-const seenDir = new Map(), seenName = new Map(), seenId = new Map();
+/**
+ * npm 包名形状（在线升级渠道声明用）。
+ *
+ * 故意与 npm 的 validate-npm-package-name 保持同等宽度的保守子集：
+ * 允许 scope、小写字母数字、- . _ ~，不允许大写、空格、前导点、超长（214 上限这里不查）。
+ * 真实的 registry 存在性不在这里判断。
+ */
+const NPM_NAME_RE = /^(?:@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/;
+
+const seenDir = new Map(), seenName = new Map(), seenId = new Map(), seenNpm = new Map();
 for (const section of ['builtin', 'optional']) {
   const rows = manifest[section];
   if (!Array.isArray(rows)) { fail(`清单缺少 ${section} 数组`); continue; }
@@ -102,10 +121,36 @@ for (const section of ['builtin', 'optional']) {
       const ids = patchIds(patch);
       if (!ids.includes(row.id)) fail(`${where}: id 不一致 —— 清单=${row.id}, ${patch.split('/').pop()}=[${ids.join(', ')}]`);
     }
+    // 6. npm 渠道声明（可选字段）：形状合法 + 不重复
+    //    「在线升级」只认这个字段（Kotlin 与 plugin-upgrade.mjs 两侧都按它筛条目），
+    //    写错就等于该插件永久没有升级入口，且不会有任何报错。所以在这里拦形状。
+    let npmName = null;
+    if (row.npm !== undefined) {
+      if (typeof row.npm !== 'string' || !row.npm.trim()) {
+        fail(`${where}: npm 字段必须是非空字符串（不用的条目请完全省略该字段）`);
+      } else {
+        npmName = row.npm.trim();
+        if (npmName !== row.npm) fail(`${where}: npm 字段不能带首尾空格（${JSON.stringify(row.npm)}）`);
+        if (!NPM_NAME_RE.test(npmName)) fail(`${where}: npm 字段不是合法的 npm 包名（${JSON.stringify(npmName)}）`);
+      }
+    }
+    // 7. npmTrimmed 只能伴随 npm 出现，且必须是布尔值
+    if (row.npmTrimmed !== undefined) {
+      if (row.npm === undefined) {
+        fail(`${where}: npmTrimmed 只能与 npm 一起出现（该条没有 npm 渠道，裁剪标记无意义）`);
+      } else if (typeof row.npmTrimmed !== 'boolean') {
+        fail(`${where}: npmTrimmed 必须是 true/false（当前 ${JSON.stringify(row.npmTrimmed)}）`);
+      }
+    }
     // 5. 唯一性
     for (const [map, key, label] of [[seenDir, row.dir, 'dir'], [seenName, row.name, 'name'], [seenId, row.id, 'id']]) {
       if (map.has(key)) fail(`${where}: ${label} 重复（已出现在 ${map.get(key)}）`);
       else map.set(key, where);
+    }
+    // npm 渠道同样必须唯一：两条清单指向同一个包，在线升级会互相覆盖对方的副本
+    if (npmName) {
+      if (seenNpm.has(npmName)) fail(`${where}: npm 渠道重复（${npmName} 已出现在 ${seenNpm.get(npmName)}）`);
+      else seenNpm.set(npmName, where);
     }
   }
   // 4. 反向检查：资产目录里没有未登记的插件

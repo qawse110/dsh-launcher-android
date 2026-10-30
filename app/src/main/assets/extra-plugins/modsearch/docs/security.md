@@ -33,6 +33,11 @@ English | [简体中文](security.zh-CN.md)
   rest: the protection is file permissions plus the output boundaries above.
   Environment variables (`TAVILY_API_KEY`, `EXA_API_KEY`, `FIRECRAWL_API_KEY`,
   `KEENABLE_API_KEY`) work as an alternative to the file and are never written to disk.
+  You.com search has no key at all, so nothing of yours is stored for it.
+
+## Outbound hosts for the HTTP engines
+
+The HTTP search engines call only their own official hosts, unless a `baseURL` override says otherwise: `api.tavily.com`, `api.exa.ai`, `api.firecrawl.dev`, `api.keenable.ai`, and `api.you.com`. The You.com engine sends your search query to `api.you.com` with no key and no account. It has no `baseURL` setting.
 
 ## SSRF guards on the local fetcher
 

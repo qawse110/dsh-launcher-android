@@ -35,13 +35,14 @@ var ORIGIN_PATH = "/bili/origin";
 var POLL_INTERVAL_MS = 3e3;
 var POLL_MAX_ATTEMPTS = 10;
 var SLOW_POLL_INTERVAL_MS = 1e4;
-var PAGE_IDS = ["overview", "sessions", "config", "logs", "updates"];
+var PAGE_IDS = ["overview", "sessions", "config", "logs", "updates", "blog"];
 var PAGE_KEYS = {
   overview: "tab_overview",
   sessions: "tab_sessions",
   config: "tab_config",
   logs: "tab_logs",
-  updates: "tab_updates"
+  updates: "tab_updates",
+  blog: "tab_blog"
 };
 var REMOTE_RELAY_SNIPPET = '"security": { "adminRelay": true }';
 var EMBED_HEIGHT = "min(640px, 78vh)";
@@ -60,6 +61,7 @@ var ACTION_BTN_STYLE = {
 var CTX_STATUS_PATH = "/__bili/plugin/status?conversationId=dsh&fallback=latest";
 var ctxStatusPathFor = (hostSessionId) => hostSessionId === void 0 ? CTX_STATUS_PATH : `/__bili/plugin/status?conversationId=${encodeURIComponent(hostSessionId)}&fallback=latest`;
 var CTX_POLL_MS = 1e4;
+var UPSTREAM_POLL_MS = 1e4;
 function parseCtxStatus(raw) {
   const o = raw !== null && typeof raw === "object" ? raw : null;
   if (o === null || typeof o.ok !== "boolean") return void 0;
@@ -72,7 +74,7 @@ function parseCtxStatus(raw) {
     viaFallback: o.viaFallback === true
   };
 }
-function renderRemoteBlock(t, origin) {
+function renderRemoteBlock(t, origin, errorReadout) {
   const cfgUrl = `${origin}/__bili/#/config`;
   return (0, import_react.createElement)(
     "div",
@@ -97,7 +99,8 @@ function renderRemoteBlock(t, origin) {
       "button",
       { type: "button", title: cfgUrl, onClick: () => openExternal(cfgUrl), style: ACTION_BTN_STYLE },
       t("remote_open_config")
-    )
+    ),
+    errorReadout ?? null
   );
 }
 function openWebButton(origin, t, style) {
@@ -110,6 +113,93 @@ function openWebButton(origin, t, style) {
       style: { ...ACTION_BTN_STYLE, ...style }
     },
     t("open")
+  );
+}
+function describeProbeError(err, url) {
+  let msg;
+  const o = err !== null && typeof err === "object" ? err : void 0;
+  if (o !== void 0 && typeof o.message === "string" && o.message.length > 0) {
+    msg = o.message;
+  } else if (typeof err === "string" && err.length > 0) {
+    msg = err;
+  } else {
+    try {
+      msg = String(err);
+    } catch {
+      msg = "unknown error";
+    }
+  }
+  return `${msg} (${url})`;
+}
+function copyText(text) {
+  const g = globalThis;
+  const legacy = () => {
+    const doc = g.document;
+    if (!doc || typeof doc.createElement !== "function" || !doc.body || typeof doc.body.appendChild !== "function") return false;
+    const ta = doc.createElement("textarea");
+    ta.value = text;
+    ta.style = { position: "fixed", opacity: 0 };
+    doc.body.appendChild(ta);
+    try {
+      ta.select?.();
+    } catch {
+    }
+    const ok = doc.execCommand?.("copy") ?? false;
+    try {
+      doc.body.removeChild?.(ta);
+    } catch {
+    }
+    return ok;
+  };
+  const clip = g.navigator?.clipboard;
+  if (clip !== void 0 && typeof clip.writeText === "function") {
+    return clip.writeText(text).then(
+      () => true,
+      () => legacy()
+    );
+  }
+  return Promise.resolve(legacy());
+}
+function renderProbeError(t, error, copied, onCopy) {
+  return (0, import_react.createElement)(
+    "div",
+    { style: { display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-start" } },
+    (0, import_react.createElement)("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("probe_error")),
+    (0, import_react.createElement)(
+      "code",
+      {
+        style: {
+          display: "block",
+          padding: "6px 10px",
+          borderRadius: 8,
+          border: "1px solid rgba(127,127,127,0.4)",
+          background: "rgba(127,127,127,0.08)",
+          fontSize: 13,
+          lineHeight: 1.6,
+          whiteSpace: "pre-wrap",
+          wordBreak: "break-all"
+        }
+      },
+      error
+    ),
+    (0, import_react.createElement)(
+      "button",
+      {
+        type: "button",
+        title: error,
+        onClick: onCopy,
+        style: { ...ACTION_BTN_STYLE, fontSize: 13, lineHeight: "20px", padding: "4px 14px" }
+      },
+      copied ? t("copied") : t("copy")
+    )
+  );
+}
+function hintColumn(hint, box) {
+  return box === null ? hint : (0, import_react.createElement)(
+    "div",
+    { style: { display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-start" } },
+    hint,
+    box
   );
 }
 var EMBED_PROBE_PATH = "/__bili/?embed=1";
@@ -140,7 +230,8 @@ function probeEmbedRoute(origin, onVerdict) {
     } catch {
     }
     onVerdict({ origin, verdict });
-  }).catch(() => {
+  }).catch((err) => {
+    onVerdict({ origin, verdict: void 0, error: describeProbeError(err, `${origin}${EMBED_PROBE_PATH}`) });
   }).finally(() => {
     embedProbesInFlight.delete(origin);
   });
@@ -205,10 +296,18 @@ var zh = {
   "tab_config": "\u914D\u7F6E",
   "tab_logs": "\u65E5\u5FD7",
   "tab_updates": "\u7248\u672C",
+  "tab_blog": "\u535A\u5BA2",
   "tab_ctx": "\u4E0A\u4E0B\u6587",
   "ctx_waiting": "\u7B49\u5F85\u9996\u4E2A\u6A21\u578B\u8BF7\u6C42\u2026",
   "ctx_nodata": "\u6682\u65E0\u4E0A\u4E0B\u6587\u6570\u636E\u2014\u2014\u5B8C\u6210\u4E00\u6B21\u6A21\u578B\u8BF7\u6C42\u540E\u81EA\u52A8\u5237\u65B0\u3002",
-  "ctx_refresh": "\u5237\u65B0"
+  "ctx_refresh": "\u5237\u65B0",
+  "upstreams_label": "bili \u4E0A\u6E38\u72B6\u6001",
+  "upstreams_down_one": "1 \u4E2A\u4E0A\u6E38\u4E0D\u53EF\u7528",
+  "upstreams_down_many": "{n} \u4E2A\u4E0A\u6E38\u4E0D\u53EF\u7528",
+  "upstream_retry_hint": "\u7EA6 {s}s \u540E\u91CD\u8BD5",
+  "probe_error": "\u8FDE\u63A5 bili \u4EE3\u7406\u5931\u8D25\u2014\u2014\u6700\u8FD1\u4E00\u6B21\u63A2\u6D4B\u62A5\u51FA\u7684\u9519\u8BEF\uFF08\u53EF\u590D\u5236\uFF0C\u4FBF\u4E8E\u53CD\u9988\uFF09\uFF1A",
+  "copy": "\u590D\u5236",
+  "copied": "\u5DF2\u590D\u5236"
 };
 var en = {
   "nav": "bili",
@@ -225,10 +324,18 @@ var en = {
   "tab_config": "Config",
   "tab_logs": "Logs",
   "tab_updates": "Versions",
+  "tab_blog": "Blog",
   "tab_ctx": "Context",
   "ctx_waiting": "Waiting for the first model request\u2026",
   "ctx_nodata": "No context data yet \u2014 refreshes automatically after the first model request.",
-  "ctx_refresh": "Refresh"
+  "ctx_refresh": "Refresh",
+  "upstreams_label": "bili upstream status",
+  "upstreams_down_one": "1 upstream unavailable",
+  "upstreams_down_many": "{n} upstreams unavailable",
+  "upstream_retry_hint": "~{s}s until retry",
+  "probe_error": "Failed to reach the bili proxy \u2014 last probe error (copyable for reporting):",
+  "copy": "Copy",
+  "copied": "Copied"
 };
 function readOrigin() {
   const g = globalThis;
@@ -274,6 +381,25 @@ function remoteMismatch(origin) {
   const g = globalThis;
   const pageHost = typeof g.location?.hostname === "string" ? g.location.hostname : "";
   return pageHost.length > 0 && !isLoopbackHost(pageHost);
+}
+function parseUpstreamHealth(raw) {
+  if (typeof raw !== "object" || raw === null) return [];
+  const list = raw.upstreams;
+  if (!Array.isArray(list)) return [];
+  const rows = [];
+  for (const item of list) {
+    if (typeof item !== "object" || item === null) continue;
+    const o = item;
+    const host = typeof o.host === "string" && o.host.length > 0 ? o.host : void 0;
+    if (host === void 0) continue;
+    const kind = typeof o.kind === "string" && o.kind.length > 0 ? o.kind : "unknown";
+    const code = typeof o.code === "string" && o.code.length > 0 ? o.code : void 0;
+    const count = typeof o.count === "number" && Number.isFinite(o.count) ? Math.max(0, Math.round(o.count)) : 0;
+    const circuit = typeof o.circuit === "object" && o.circuit !== null ? o.circuit : void 0;
+    const probe = circuit !== void 0 && circuit.state === "open" && typeof circuit.nextProbeInMs === "number" && Number.isFinite(circuit.nextProbeInMs) ? Math.max(0, circuit.nextProbeInMs) : void 0;
+    rows.push({ host, kind, code, count, ...probe !== void 0 ? { nextProbeInMs: probe } : {} });
+  }
+  return rows;
 }
 var winningProbeForm;
 function probeForms() {
@@ -352,6 +478,8 @@ function apply(ctx) {
     const [sessionId, setSessionId] = (0, import_react.useState)(null);
     const [status, setStatus] = (0, import_react.useState)(void 0);
     const [fetchFailed, setFetchFailed] = (0, import_react.useState)(false);
+    const [statusError, setStatusError] = (0, import_react.useState)(void 0);
+    const [copied, setCopied] = (0, import_react.useState)(false);
     const [reloadTick, setReloadTick] = (0, import_react.useState)(0);
     (0, import_react.useEffect)(() => probeOrigin((o) => {
       setOrigin(o);
@@ -364,16 +492,21 @@ function apply(ctx) {
       if (origin === void 0) return;
       let cancelled = false;
       const load = () => {
-        void fetch(`${origin}${statusPath}`).then((res) => res.json()).then((raw) => {
+        void fetch(`${origin}${statusPath}`).then((res) => {
+          if (res.ok !== true) throw new Error(`HTTP ${typeof res.status === "number" ? res.status : "?"}`);
+          return res.json();
+        }).then((raw) => {
           if (cancelled) return;
           const parsed = parseCtxStatus(raw);
           setStatus(parsed);
           setFetchFailed(parsed === void 0);
+          setStatusError(void 0);
           setSessionId(parsed !== void 0 && parsed.sessionId !== null ? parsed.sessionId : null);
-        }).catch(() => {
+        }).catch((err) => {
           if (!cancelled) {
             setStatus(void 0);
             setFetchFailed(true);
+            setStatusError(describeProbeError(err, `${origin}${statusPath}`));
           }
         });
       };
@@ -385,18 +518,28 @@ function apply(ctx) {
       };
     }, [origin, reloadTick, statusPath]);
     const liveEmbed = embed !== void 0 && embed.origin === origin ? embed.verdict : void 0;
+    const liveEmbedError = embed !== void 0 && embed.origin === origin ? embed.error : void 0;
     const remoteBlocked = remoteMismatch(origin) && liveEmbed === void 0;
     const lang = t("nav") === zhDict.nav ? "zh" : "en";
     const sessionOurs = hostSessionId === void 0 || status === void 0 || status.viaFallback !== true || status.conversationId === hostSessionId;
+    const framed = origin !== void 0 && liveEmbed === "ok" && sessionId !== null && sessionOurs;
     const hintP = (key) => (0, import_react.createElement)("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t(key));
+    const startCopy = (target) => {
+      void copyText(target).then((ok) => {
+        if (!ok) return;
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2e3);
+      });
+    };
+    const errorBox = (error) => error === void 0 ? null : renderProbeError(t, error, copied, () => startCopy(error));
     let middle;
     if (origin === void 0) {
       middle = hintP("degraded");
     } else if (remoteBlocked) {
-      middle = renderRemoteBlock(t, origin);
+      middle = renderRemoteBlock(t, origin, errorBox(liveEmbedError));
     } else if (liveEmbed === "stale") {
       middle = hintP("stale");
-    } else if (liveEmbed === "ok" && sessionId !== null && sessionOurs) {
+    } else if (framed) {
       middle = (0, import_react.createElement)(
         "iframe",
         {
@@ -404,10 +547,11 @@ function apply(ctx) {
           title: t("title"),
           style: {
             display: "block",
+            flex: 1,
             width: "100%",
-            height: EMBED_HEIGHT,
-            border: "1px solid rgba(127,127,127,0.4)",
-            borderRadius: 8,
+            height: "100%",
+            minHeight: 0,
+            border: "none",
             background: "transparent"
           }
         }
@@ -415,20 +559,19 @@ function apply(ctx) {
     } else if (status?.ok === true && status.phase === "pre-first-request") {
       middle = hintP("ctx_waiting");
     } else if (status === void 0) {
-      middle = hintP(fetchFailed ? "degraded" : "connecting");
+      middle = hintColumn(hintP(fetchFailed ? "degraded" : "connecting"), errorBox(fetchFailed ? statusError : void 0));
     } else if (!status.ok) {
       middle = hintP("ctx_nodata");
     } else {
-      middle = hintP(liveEmbed === "ok" ? "ctx_nodata" : "connecting");
+      middle = hintColumn(hintP(liveEmbed === "ok" ? "ctx_nodata" : "connecting"), errorBox(liveEmbedError));
     }
     return (0, import_react.createElement)(
       "div",
-      { style: { display: "flex", flexDirection: "column", gap: 12, padding: "20px 8px" } },
-      middle,
-      (0, import_react.createElement)(
+      { style: { display: "flex", flexDirection: "column", height: "100%", minWidth: 0, minHeight: 0 } },
+      origin !== void 0 ? (0, import_react.createElement)(
         "div",
-        { style: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" } },
-        origin !== void 0 ? (0, import_react.createElement)(
+        { style: { display: "flex", alignItems: "center", gap: 8, flexShrink: 0, padding: "8px 12px" } },
+        (0, import_react.createElement)(
           "button",
           {
             type: "button",
@@ -436,8 +579,13 @@ function apply(ctx) {
             style: { cursor: "pointer", borderRadius: 8, border: "1px solid rgba(127,127,127,0.4)", background: "transparent", color: "inherit", fontFamily: "inherit", fontSize: 13, lineHeight: "20px", padding: "4px 14px" }
           },
           t("ctx_refresh")
-        ) : null,
+        ),
         openWebButton(origin, t, { fontSize: "13", lineHeight: "20px", padding: "4px 14px" })
+      ) : null,
+      (0, import_react.createElement)(
+        "div",
+        { style: framed ? { display: "flex", flex: 1, minHeight: 0 } : { flex: 1, minHeight: 0, padding: 16 } },
+        middle
       )
     );
   };
@@ -450,6 +598,7 @@ function apply(ctx) {
       const v = o !== void 0 ? embedVerdicts.get(o) : void 0;
       return o !== void 0 && v !== void 0 ? { origin: o, verdict: v } : void 0;
     });
+    const [copied, setCopied] = (0, import_react.useState)(false);
     (0, import_react.useEffect)(
       () => probeOrigin(
         (o) => {
@@ -465,13 +614,22 @@ function apply(ctx) {
       if (origin !== void 0) probeEmbedRoute(origin, setEmbed);
     }, [origin]);
     const liveEmbed = embed !== void 0 && embed.origin === origin ? embed.verdict : void 0;
+    const liveEmbedError = embed !== void 0 && embed.origin === origin ? embed.error : void 0;
     const remoteBlocked = remoteMismatch(origin) && liveEmbed === void 0;
     const lang = t("nav") === zhDict.nav ? "zh" : "en";
+    const startCopy = (target) => {
+      void copyText(target).then((ok) => {
+        if (!ok) return;
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2e3);
+      });
+    };
+    const errorBox = (error) => error === void 0 ? null : renderProbeError(t, error, copied, () => startCopy(error));
     let middle;
     if (origin === void 0) {
       middle = (0, import_react.createElement)("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("degraded"));
     } else if (remoteBlocked && origin !== void 0) {
-      middle = renderRemoteBlock(t, origin);
+      middle = renderRemoteBlock(t, origin, errorBox(liveEmbedError));
     } else if (liveEmbed === "stale") {
       middle = (0, import_react.createElement)("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("stale"));
     } else if (liveEmbed === "ok") {
@@ -523,7 +681,10 @@ function apply(ctx) {
         })
       );
     } else {
-      middle = (0, import_react.createElement)("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("connecting"));
+      middle = hintColumn(
+        (0, import_react.createElement)("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("connecting")),
+        errorBox(liveEmbedError)
+      );
     }
     return (0, import_react.createElement)(
       "div",
@@ -541,6 +702,41 @@ function apply(ctx) {
       )
     );
   };
+  const upstreamBanner = () => () => {
+    const [origin, setOrigin] = (0, import_react.useState)(readOrigin());
+    const [rows, setRows] = (0, import_react.useState)([]);
+    (0, import_react.useEffect)(() => probeOrigin((o) => setOrigin(o)), []);
+    (0, import_react.useEffect)(() => {
+      if (origin === void 0) return;
+      let cancelled = false;
+      const load = () => {
+        void fetch(`${origin}/__bili/upstreams`).then((res) => res.json()).then((raw) => {
+          if (!cancelled) setRows(parseUpstreamHealth(raw));
+        }).catch(() => {
+          if (!cancelled) setRows([]);
+        });
+      };
+      load();
+      const timer = setInterval(load, UPSTREAM_POLL_MS);
+      return () => {
+        cancelled = true;
+        clearInterval(timer);
+      };
+    }, [origin]);
+    if (rows.length === 0) return null;
+    const header = rows.length === 1 ? t("upstreams_down_one") : t("upstreams_down_many").replace("{n}", String(rows.length));
+    return (0, import_react.createElement)(
+      "div",
+      { role: "status", style: { display: "flex", flexDirection: "column", gap: 4, maxWidth: 520, padding: "8px 12px", borderRadius: 8, border: "1px solid rgba(217,63,11,0.5)", background: "rgba(217,63,11,0.1)" } },
+      (0, import_react.createElement)("div", { style: { fontSize: 13, fontWeight: 600 } }, header),
+      ...rows.map((r) => {
+        const code = r.code !== void 0 ? ` ${r.code}` : "";
+        const s = r.nextProbeInMs !== void 0 ? Math.max(1, Math.ceil(r.nextProbeInMs / 1e3)) : void 0;
+        const eta = s !== void 0 ? ` \xB7 ${t("upstream_retry_hint").replace("{s}", String(s))}` : "";
+        return (0, import_react.createElement)("div", { key: r.host, style: { fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12, lineHeight: 1.5 } }, `${r.host} \xB7 ${r.kind}${code} \xD7${r.count}${eta}`);
+      })
+    );
+  };
   ctx.slots.inject(
     "settings.section",
     () => ctx.slots.register({ name: "settings.section", id: "bili", order: 100, label: () => t("nav"), locale: NS }, panel(true))
@@ -556,6 +752,10 @@ function apply(ctx) {
       () => ctx.slots.register({ name: "conversation.view", id: "bili-context", order: 30, label: () => ctxGate.label ?? t("tab_ctx"), locale: NS }, contextPanel())
     );
   }
+  ctx.slots.inject(
+    "shell.overlay",
+    () => ctx.slots.register({ name: "shell.overlay", id: "bili-upstreams", order: 100, label: () => t("upstreams_label"), locale: NS }, upstreamBanner())
+  );
 }
 
 return module.exports;

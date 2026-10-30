@@ -1,0 +1,23 @@
+# 从 ci-job-114416237110.log 用 grep 直接抽取的原始行（未经改写），文件 sha256 与偏移见下
+# source_sha256=bd966c4310ba908ffa1035a06f677e1ec7e7aec14a73f1714c189a2b2ffba842
+# source_bytes=199721
+# extractor: sed -E "s/\x1b\[[0-9;]*m//g" | grep -a -E "TESTCLASS|TESTTOTAL|Task :app:testDebugUnitTest|BUILD SUCCESSFUL"
+
+BUILD SUCCESSFUL in 50s
+> Task :app:compileDebugUnitTestKotlin
+> Task :app:testDebugUnitTest
+BUILD SUCCESSFUL in 36s
+  echo "TESTCLASS $name tests=$t failures=$fa errors=$er"
+echo "TESTTOTAL tests=$total failures+errors=$failed"
+TESTCLASS com.dsh.nextapp1.core.BackupManagerTest tests=8 failures=0 errors=0
+TESTCLASS com.dsh.nextapp1.core.DshUpdaterTest tests=30 failures=0 errors=0
+TESTCLASS com.dsh.nextapp1.core.FileLogTest tests=4 failures=0 errors=0
+TESTCLASS com.dsh.nextapp1.core.MarkerStoreTest tests=13 failures=0 errors=0
+TESTCLASS com.dsh.nextapp1.core.NodeRuntimeTest tests=11 failures=0 errors=0
+TESTCLASS com.dsh.nextapp1.core.PrefixPatcherTest tests=8 failures=0 errors=0
+TESTCLASS com.dsh.nextapp1.core.TermuxEnvTest tests=3 failures=0 errors=0
+TESTCLASS com.dsh.nextapp1.core.WebAuthTest tests=6 failures=0 errors=0
+TESTCLASS com.dsh.nextapp1.tts.SentenceSplitterTest tests=16 failures=0 errors=0
+TESTCLASS com.dsh.nextapp1.ui.UiFlowRowLayoutTest tests=7 failures=0 errors=0
+TESTCLASS com.dsh.nextapp1.ui.UiFlowRowTest tests=5 failures=0 errors=0
+TESTTOTAL tests=111 failures+errors=0

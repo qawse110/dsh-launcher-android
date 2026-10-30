@@ -8,7 +8,7 @@
 
 <p align="center">🥇 <b>全网最强的 DeepSeek Harness (dsh) 免费联网搜索插件</b> 🥇</p>
 
-<p align="center">引擎：<b>Firecrawl</b>（免注册，默认）· <b>Keenable</b>（免注册）· <b>Antigravity CLI</b> · <b>Tavily</b> · <b>Exa</b> · <b>Grok（X）</b> · <b>local</b>，自动故障转移</p>
+<p align="center">引擎：<b>Firecrawl</b>（免注册，默认）· <b>Keenable</b>（免注册）· <b>You.com</b>（免注册）· <b>Antigravity CLI</b> · <b>Tavily</b> · <b>Exa</b> · <b>Grok（X）</b> · <b>local</b>，自动故障转移</p>
 
 <p align="center">
   <a href="./README.md">English</a> ·
@@ -36,7 +36,7 @@ DeepSeek 和 GLM 等模型没有联网能力或联网能力羸弱。ModSearch �
 
 ## 特性
 
-- **🥇 全网最强的 DeepSeek Harness (dsh) 免费联网搜索插件：** 一条命令即刻安装 `npx -y @deepseek-ai/dsh plugin --profile web add @liustack/modsearch@5.10.10`。桌面版「添加插件」里填 `@liustack/modsearch`，不要填 GitHub 地址。细节见[接入指南](docs/harness-setup.zh-CN.md#deepseek-harness-dsh)。
+- **🥇 全网最强的 DeepSeek Harness (dsh) 免费联网搜索插件：** 一条命令即刻安装 `npx -y @deepseek-ai/dsh plugin --profile web add @liustack/modsearch@5.10.11`。桌面版「添加插件」里填 `@liustack/modsearch`，不要填 GitHub 地址。细节见[接入指南](docs/harness-setup.zh-CN.md#deepseek-harness-dsh)。
 - **开箱免费，免注册。** 搜索和单页抓取默认跑在 Firecrawl 免注册通道上：[每月 1,000 免费 credits](https://www.firecrawl.dev/blog/firecrawl-keyless-launch)，没有账号、没有 API key、没有绑卡。后备通道也全部免费：Antigravity CLI 只需浏览器登录，Tavily、Exa 和免费的 Firecrawl key 各带独立的月度额度，均不要求绑卡。
 - **自动故障转移。** 一个通道失败或额度耗尽时自动切换下一个。
 - **单引擎多密钥轮换。** Tavily、Exa、Firecrawl、Keenable 都可配置逗号分隔的多个密钥。鉴权、限流或配额失败时先轮换到下一个密钥，再按引擎链故障转移。
@@ -65,12 +65,13 @@ DeepSeek 和 GLM 等模型没有联网能力或联网能力羸弱。ModSearch �
 
 ## 支持的引擎
 
-Firecrawl 和 Keenable 零配置直接可用，其余引擎各一条命令。key 存在 `~/.modsearch/config.json`（0600 权限，展示时打码）：
+Firecrawl、Keenable 和 You.com 零配置直接可用，其余引擎各一条命令。key 存在 `~/.modsearch/config.json`（0600 权限，展示时打码）：
 
 | 引擎 | 能做什么 | 免费额度 | 怎么开 |
 | :-- | :-- | :-- | :-- |
 | Firecrawl（默认） | 网页搜索 + 单页抓取 | 免注册每月 1,000 免费 credits。注册免费 key 再得独享的每月 1,000 | 无需任何操作，装完即用 |
 | Keenable | 网页搜索 | 免注册每小时 1,000 次（按 IP 计，同一 IP 上所有人共用）。注册免费 key 得独享的每月 100,000 次 | 无需任何操作，装完即用 |
+| You.com | 网页搜索 | 免注册每天 100 次（按 IP 计，同一 IP 上所有人共用） | 无需任何操作，装完即用 |
 | Antigravity CLI | 网页搜索 + 单页抓取 | 免费，浏览器登录 | 安装 `agy` 并登录 |
 | Tavily | 网页搜索 | 每月 1,000 credits，不绑卡 | `modsearch config set tavily.apiKey <key>` |
 | Exa | 网页搜索 | 每月 $10 循环额度（约 1,400 次），不绑卡 | `modsearch config set exa.apiKey <key>` |
@@ -155,7 +156,7 @@ Clash、Clash Verge Rev、mihomo、Surge 的代理 fake-ip 模式开箱即用：
 
 ## 免责声明
 
-ModSearch 以 MIT 许可发布，使用不受限制。作者不对任何用途（含商业使用）提供保证与背书。上游引擎（Antigravity CLI、Tavily、Exa、Firecrawl、Keenable、Grok Build）各有自己的条款与额度，遵守这些约束由使用者负责。
+ModSearch 以 MIT 许可发布，使用不受限制。作者不对任何用途（含商业使用）提供保证与背书。上游引擎（Antigravity CLI、Tavily、Exa、Firecrawl、Keenable、You.com、Grok Build）各有自己的条款与额度，遵守这些约束由使用者负责。
 
 ## License
 

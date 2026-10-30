@@ -1,0 +1,120 @@
+## [K3] 恢复到插入前状态后重跑的完整一轮 --plugins-only（原文行）
+
+2026-10-11T12:20:15.521Z [install] === official dsh install start ===
+2026-10-11T12:20:15.530Z [install] HOME=/data/user/0/com.dsh.nextapp1/files DSH_PREFIX=/data/user/0/com.dsh.nextapp1/files/dsh-prefix PROFILE=web
+2026-10-11T12:20:15.536Z [install] pnpm wrapper up-to-date: /data/user/0/com.dsh.nextapp1/files/.tools/bin/pnpm
+2026-10-11T12:20:15.537Z [install] @vscode/ripgrep not installed, skip ripgrep fallback
+2026-10-11T12:20:15.557Z [install] plugin dsh-web-mobile already wired, skip add
+2026-10-11T12:20:15.621Z [install] plugin dsh-prompt-optimizer-mobile already wired, skip add
+2026-10-11T12:20:15.689Z [install] plugin dsh-codearts-auth already wired, skip add
+2026-10-11T12:20:15.693Z [install] plugin dsh-status-bridge already wired, skip add
+2026-10-11T12:20:15.697Z [install] plugin dsh-android-links already wired, skip add
+2026-10-11T12:20:15.707Z [install] plugin dsh-net-proxy already wired, skip add
+2026-10-11T12:20:15.712Z [install] plugin dsh-provider-headers already wired, skip add
+2026-10-11T12:20:15.724Z [install] plugin dsh-vision already wired, skip add
+2026-10-11T12:20:15.756Z [install] extra plugin modsearch synced: absent -> 5.10.6 (apk 300)
+2026-10-11T12:20:15.757Z [install] dsh plugin add modsearch
+2026-10-11T12:20:15.760Z [install] $ /data/user/0/com.dsh.nextapp1/files/node/bin/node /data/user/0/com.dsh.nextapp1/files/dsh-prefix/node_modules/@deepseek-ai/dsh/lib/bin.js plugin --profile web add /data/user/0/com.dsh.nextapp1/files/plugins/modsearch (timeout=300s)
+✓ Lockfile passes supply-chain policies (verified 7m ago)
+Progress: resolved 1, reused 0, downloaded 0, added 0
+[WARN] Issues with peer dependencies found. Run "pnpm peers check" to list them.
+dependencies:
++ @liustack/modsearch link:/data/user/0/com.dsh.nextapp1/files/plugins/modsearch
+Already up to date
+Progress: resolved 26, reused 0, downloaded 0, added 0
+Progress: resolved 26, reused 0, downloaded 0, added 0, done
+Done in 4.6s using pnpm v11.7.0
+2026-10-11T12:20:22.154Z [install] exit=0 (/data/user/0/com.dsh.nextapp1/files/node/bin/node, 6.4s)
+2026-10-11T12:20:22.195Z [install] extra plugin dsh-ego-browser synced: absent -> 0.8.6 (apk 300)
+2026-10-11T12:20:22.196Z [install] dsh plugin add dsh-ego-browser
+2026-10-11T12:20:22.197Z [install] $ /data/user/0/com.dsh.nextapp1/files/node/bin/node /data/user/0/com.dsh.nextapp1/files/dsh-prefix/node_modules/@deepseek-ai/dsh/lib/bin.js plugin --profile web add /data/user/0/com.dsh.nextapp1/files/plugins/dsh-ego-browser (timeout=300s)
+✓ Lockfile passes supply-chain policies (verified 5s ago)
+Progress: resolved 1, reused 0, downloaded 0, added 0
+[WARN] Issues with peer dependencies found. Run "pnpm peers check" to list them.
+dependencies:
++ dsh-ego-browser link:/data/user/0/com.dsh.nextapp1/files/plugins/dsh-ego-browser
+Already up to date
+Progress: resolved 26, reused 0, downloaded 0, added 0, done
+Done in 3s using pnpm v11.7.0
+2026-10-11T12:20:26.674Z [install] exit=0 (/data/user/0/com.dsh.nextapp1/files/node/bin/node, 4.5s)
+2026-10-11T12:20:26.674Z [install] builtin plugins assembled: 10 ok, 0 failed / 10 total
+2026-10-11T12:20:26.684Z [install] builtin patch entries cleaned (profile patch dedupe)
+2026-10-11T12:20:26.801Z [install] compat audit: 10 compatible, 0 incompatible / 10 total (dsh 0.2.0-rc.2)
+2026-10-11T12:20:27.381Z [install] pnpm store bridge: 521 unique packages, 234 transitive bridged
+2026-10-11T12:20:27.382Z [install] plugin dep bridge: 164 kept, 71 linked, 4 stale removed, 0 warn -> /data/user/0/com.dsh.nextapp1/files/plugins/node_modules
+2026-10-11T12:20:27.620Z [install] profile dep bridge: 0 linked, 522 already present, 0 warn -> /data/user/0/com.dsh.nextapp1/files/.dsh/profiles/web/node_modules
+2026-10-11T12:20:27.621Z [install] === official dsh install done ===
+
+## [K3] 该轮 WARN|skip|fail 行（原文）
+2026-10-11T12:20:15.537Z [install] @vscode/ripgrep not installed, skip ripgrep fallback
+2026-10-11T12:20:15.557Z [install] plugin dsh-web-mobile already wired, skip add
+2026-10-11T12:20:15.621Z [install] plugin dsh-prompt-optimizer-mobile already wired, skip add
+2026-10-11T12:20:15.689Z [install] plugin dsh-codearts-auth already wired, skip add
+2026-10-11T12:20:15.693Z [install] plugin dsh-status-bridge already wired, skip add
+2026-10-11T12:20:15.697Z [install] plugin dsh-android-links already wired, skip add
+2026-10-11T12:20:15.707Z [install] plugin dsh-net-proxy already wired, skip add
+2026-10-11T12:20:15.712Z [install] plugin dsh-provider-headers already wired, skip add
+2026-10-11T12:20:15.724Z [install] plugin dsh-vision already wired, skip add
+[WARN] Issues with peer dependencies found. Run "pnpm peers check" to list them.
+[WARN] Issues with peer dependencies found. Run "pnpm peers check" to list them.
+2026-10-11T12:20:26.674Z [install] builtin plugins assembled: 10 ok, 0 failed / 10 total
+2026-10-11T12:20:27.382Z [install] plugin dep bridge: 164 kept, 71 linked, 4 stale removed, 0 warn -> /data/user/0/com.dsh.nextapp1/files/plugins/node_modules
+2026-10-11T12:20:27.620Z [install] profile dep bridge: 0 linked, 522 already present, 0 warn -> /data/user/0/com.dsh.nextapp1/files/.dsh/profiles/web/node_modules
+
+## [K3 补] `pnpm peers check` 全文（证明该 peer WARN 与两插件无关）
+$ cd files/.dsh/profiles/web && pnpm peers check   →  exit=1（预先存在的状况）
+Issues with peer dependencies found
+✕ missing peer @deepseek-ai/cordis
+  Wanted:
+    ^4.0.2:
+      dsh-context@0.62.2
+    ^4.0.4:
+      dsh-mnemon@0.5.23
+    ^4.0.1:
+      dsh-mnemon-provider-byterover@0.5.5
+      dsh-mnemon-provider-hindsight@0.5.5
+      dsh-mnemon-provider-holographic@0.5.6
+      dsh-mnemon-provider-honcho@0.5.5
+      dsh-mnemon-provider-mem0@0.5.5
+      dsh-mnemon-provider-mnemon-native@0.5.8
+      dsh-mnemon-provider-openviking@0.5.7
+      dsh-mnemon-provider-retaindb@0.5.5
+      dsh-mnemon-provider-supermemory@0.5.5
+      dsh-mnemon-source-documents@0.5.9
+      dsh-mnemon-source-memory-spaces@0.5.15
+      dsh-mnemon-source-runtime@0.5.12
+      dsh-mnemon-strategy-auto-capture@0.5.5
+      dsh-mnemon-strategy-default-three-tier@0.5.7
+      dsh-mnemon-strategy-general@0.5.1
+      dsh-mnemon-strategy-light-context@0.5.5
+      dsh-mnemon-strategy-scoped@0.5.5
+✕ missing peer @deepseek-ai/dsh-session
+  Wanted:
+    >=0.1.5-rc.1:
+      dsh-context@0.62.2
+✕ missing peer @deepseek-ai/dsh-settings
+  Wanted:
+    >=0.1.5-rc.1:
+      dsh-context@0.62.2
+✕ missing peer @deepseek-ai/dsh-client-ui-primitives
+  Wanted:
+    "^0.1.7-rc.2 || ^0.2.0-rc.1":
+      dsh-mnemon@0.5.23
+      dsh-mnemon-source-memory-spaces@0.5.15
+✕ missing peer @deepseek-ai/dsh-typert-protocol
+  Wanted:
+    "^0.1.7-rc.2 || ^0.2.0-rc.1":
+      dsh-mnemon@0.5.23
+✕ missing peer react
+  Wanted:
+    ^18.2.0:
+      dsh-mnemon@0.5.23
+    ">= 0.14.0":
+      markdown-to-jsx@7.7.0
+✕ missing peer react-dom
+  Wanted:
+    ^18.2.0:
+      dsh-mnemon@0.5.23
+
+$ grep -niE 'modsearch|ego-browser' <peers check 输出>
+(neither plugin appears anywhere)

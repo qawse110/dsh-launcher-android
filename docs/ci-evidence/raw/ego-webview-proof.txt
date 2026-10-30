@@ -1,0 +1,14 @@
+运行日期：2026-10-11（本轮）
+命令：NODE=<node> HOME_DIR=<files> node ego-webview-proof.mjs
+
+=== 输出 ===
+mock WebView  : abstract socket @proof_webview_devtools
+relay         : RELAY_READY port=42055 socket=proof_webview_devtools
+--- ego output ---
+RESULT_OK {"page":{"url":"https://example.com/","title":"Example Domain","w":1280,"h":720,"wx":0,"wy":0,"dpr":1,"sx":0,"sy":0},"snapshotChars":0}
+--- methods the mock received ---
+Browser.getVersion, Target.getTargets, Target.getTargets, Target.attachToTarget, Runtime.evaluate/SESS_1, Target.getTargets, Target.getTargets, Target.getTargets, Target.activateTarget, Target.getTargets, Target.attachToTarget, Page.enable/SESS_2, Target.getTargets, Target.activateTarget, Target.getTargets, Target.getTargets, Target.getTargets, Target.activateTarget, Target.getTargets, Target.attachToTarget, Page.enable/SESS_3, Runtime.evaluate/SESS_3, Target.attachToTarget, Runtime.evaluate/SESS_2, DOMSnapshot.captureSnapshot/SESS_4
+--- checks ---
+targets       : GUI_TARGET, AGENT_TARGET
+GUI url intact: true
+PROOF_PASS: ego 经中继新建页并取回页面信息

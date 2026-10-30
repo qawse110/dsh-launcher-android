@@ -1,0 +1,20 @@
+### dsh --profile web --dump-config   (exit=0)
+### stdout: 50624 chars / 1407 lines
+### stderr: 0 chars / 0 lines (0 = no warnings)
+
+### the two new rows, verbatim with their section markers:
+-----
+- id: modsearch
+  name: '@liustack/modsearch'
+=> disabled present? false
+-----
+- id: ego-browser
+  name: dsh-ego-browser
+
+=> disabled present? false
+
+### Negative control (same dump): how many rows DO carry disabled:
+    39 of 199 rows carry disabled:  (so absence on ours is meaningful)
+
+### stderr content:
+""

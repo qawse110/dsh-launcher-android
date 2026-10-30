@@ -8,7 +8,7 @@
 
 <p align="center">🥇 <b>The strongest free web search plugin for DeepSeek Harness (dsh)</b> 🥇</p>
 
-<p align="center">Engines: <b>Firecrawl</b> (keyless, default) · <b>Keenable</b> (keyless) · <b>Antigravity CLI</b> · <b>Tavily</b> · <b>Exa</b> · <b>Grok (X)</b> · <b>local</b>, with automatic failover</p>
+<p align="center">Engines: <b>Firecrawl</b> (keyless, default) · <b>Keenable</b> (keyless) · <b>You.com</b> (keyless) · <b>Antigravity CLI</b> · <b>Tavily</b> · <b>Exa</b> · <b>Grok (X)</b> · <b>local</b>, with automatic failover</p>
 
 <p align="center">
   <a href="./README.zh-CN.md">简体中文</a> ·
@@ -36,7 +36,7 @@ Hit a problem? [Open an issue](https://github.com/liustack/modsearch/issues/new/
 
 ## Features
 
-- **🥇 The strongest free web search plugin for DeepSeek Harness (dsh):** one command installs it, `npx -y @deepseek-ai/dsh plugin --profile web add @liustack/modsearch@5.10.10`. In the desktop app's Add plugin dialog, enter `@liustack/modsearch`, not the GitHub URL. Details in [harness setup](docs/harness-setup.md#deepseek-harness-dsh).
+- **🥇 The strongest free web search plugin for DeepSeek Harness (dsh):** one command installs it, `npx -y @deepseek-ai/dsh plugin --profile web add @liustack/modsearch@5.10.11`. In the desktop app's Add plugin dialog, enter `@liustack/modsearch`, not the GitHub URL. Details in [harness setup](docs/harness-setup.md#deepseek-harness-dsh).
 - **Free out of the box, no signup.** Search and page fetch run on Firecrawl Keyless by default: [1,000 free credits/month](https://www.firecrawl.dev/blog/firecrawl-keyless-launch), no account, no API key, no card. Every fallback channel is free too: Antigravity CLI needs only a browser sign-in, and Tavily, Exa, and a free Firecrawl key each add their own monthly quota with no card required.
 - **Automatic failover.** When a channel fails or exhausts its quota, the next one takes over.
 - **Per-engine key rotation.** Give Tavily, Exa, Firecrawl, or Keenable multiple comma-separated keys. Authentication, rate-limit, and quota failures rotate to the next key before the engine chain falls back.
@@ -65,12 +65,13 @@ Ask which Node.js line is still in maintenance. `read_page` reads the release pa
 
 ## Supported engines
 
-Firecrawl and Keenable work with zero setup. Every other engine is one command away. Keys live in `~/.modsearch/config.json` (0600, masked when shown):
+Firecrawl, Keenable, and You.com work with zero setup. Every other engine is one command away. Keys live in `~/.modsearch/config.json` (0600, masked when shown):
 
 | Engine | Does | Free tier | Turn it on |
 | :-- | :-- | :-- | :-- |
 | Firecrawl (default) | web search + page fetch | keyless: 1,000 free credits/month, no signup. A free key adds your own 1,000/month | nothing, it works as installed |
 | Keenable | web search | keyless: 1,000 requests/hour per IP (shared by everyone on that IP), no signup. A free key gives 100,000 requests/month of your own | nothing, it works as installed |
+| You.com | web search | keyless: 100 searches/day per IP (shared by everyone on that IP), no signup | nothing, it works as installed |
 | Antigravity CLI | web search + page fetch | free, browser sign-in | install `agy` and sign in |
 | Tavily | web search | 1,000 credits/month, no card | `modsearch config set tavily.apiKey <key>` |
 | Exa | web search | $10/month recurring credit (~1,400 searches), no card | `modsearch config set exa.apiKey <key>` |
@@ -155,7 +156,7 @@ Follow the WeChat official account **liustack** (Chinese-language): AI tools, pr
 
 ## Disclaimer
 
-ModSearch is MIT-licensed, so use is not restricted. The author gives no warranty and no endorsement for any particular use, commercial or otherwise. The upstream engines it drives (Antigravity CLI, Tavily, Exa, Firecrawl, Keenable, Grok Build) each carry their own terms and quotas, and complying with them is the user's responsibility.
+ModSearch is MIT-licensed, so use is not restricted. The author gives no warranty and no endorsement for any particular use, commercial or otherwise. The upstream engines it drives (Antigravity CLI, Tavily, Exa, Firecrawl, Keenable, You.com, Grok Build) each carry their own terms and quotas, and complying with them is the user's responsibility.
 
 ## License
 

@@ -1,0 +1,52 @@
+运行时间：2026-10-12T15:19Z 起（真机 RMX3888 / Android 16）
+对象：用户已安装的新 APK（base.apk mtime 2026-10-12 23:17:10，88000145 bytes）
+
+## 1. 新包确实生效（先取证再论结论）
+- assets/webview-cdp-relay.mjs 在 APK 内与仓库版本 **byte-identical**（27664 bytes）
+- files/webview-cdp-relay.mjs 已同步（23:17:17），与仓库一致
+- classes7.dex 含 **MAX_POPUPS**（该常量只在我最新的两次提交里出现）
+  ⇒ 本次遮挡修复确实进了已安装的包
+- 中继由启动脚本自动拉起：files/logs/webview-relay.log = RELAY_READY port=41999
+
+## 2. 目标（用户界面不被遮挡）—— 已达成
+真 ego 运行时经生产中继（41999）驱动真 WebView：
+  baseline: pages=1  gui=http://127.0.0.1:3080/
+  ego 建页并 goto 后：
+    每个 target 最终 visible=true；GUI 的 url 从未改变
+  **GUI 中间态: 无（全程未变）**
+  **GUI visible 采样值: true（184 个样本）**      ← 上一轮的遮挡症状未再出现
+  第二轮（本地内容服务器，排除网络变量）：
+  **GUI visible: true（42 个样本）**，GUI url 全程未变
+
+## 3. 前提（被 GUI 覆盖的底层 WebView 仍可驱动）—— 正面证据已拿到
+本地内容服务器 http://127.0.0.1:42991/ 返回带标记 AGENT_PROBE_OK_7f3a 的页面：
+  ego → RESULT {"url":"http://127.0.0.1:42991/","title":"Probe Page",
+                "rawChars":42,"rawHasMark":true,
+                "ev":{"u":"http://127.0.0.1:42991/","t":"Probe Page","hasMark":true}}
+  即：压在 GUI 之下的 agent 页 **能加载、能执行 JS、能取回真实内容**。
+  ⇒ 上一轮 review 标为 unverified 的前提，现已正面验证（不再是推断）。
+
+## 4. 仍未解决：关页不可靠（诚实标注）
+- 经中继发 Target.closeTarget，40s 后页面仍在（3 个 page 变成 3 个）。
+- 逐步诊断发现中继的 internalCall("Target.getTargets") 在真 WebView 上**超时**
+  （同一时刻 HTTP /json/list 正常返回 3 条），即中继的**内部会话**与真 WebView
+  之间有问题，而不是关页指令本身。
+- 已修一处真 bug：fire() 辅助函数只收 (method, params)，把 sessionId 悄悄丢了，
+  导致 Page.close 落到浏览器级。修后经中继仍关不掉（上面那条才是主因）。
+- 缓解：Kotlin 侧 MAX_POPUPS=4 硬上限（超出销毁最旧），且残留页现在**压在 GUI 之下**，
+  用户看不到；代价是暂占内存。
+- 对照：HTTP /json/list 显示 3 个 page，而 ego 的 browser.listTabs() 只看到 1 个
+  ⇒ 两者口径不同，残留页可能是 devtools 服务的陈旧登记。
+
+## 结论
+- 用户报告的「GUI 不可见」**已修复并经真机验证**：两处独立采样共 184 + 42 = 226 次，
+  每次 GUI 均 visible=true 且 url 未变（另有一处为最终状态快照，未计入采样数）。
+- 「底层页仍可驱动」前提**已正面验证**。
+- 「关页」仍不可靠，属**未闭环**项；不遮挡用户，但有内存代价，已加 4 个上限兜底。
+
+## 5. 验收口径的诚实边界
+- visible 来自 devtools 元数据（/json/list 的 description 字段），不是人眼画面。
+  screencap 在无 root 下失败，故「用户实际看到哪一层」由 visible 字段 + 代码合成顺序
+  （addView(it, 0) 使其位于索引 0）共同支持，未由截图独立证实。
+- 关页根因（中继内部会话 Target.getTargets 超时 / 与 /json/list 口径 3 vs 1）
+  仍是**推断**，措辞已保留余地，未当作定论。

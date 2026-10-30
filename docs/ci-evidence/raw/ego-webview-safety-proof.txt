@@ -1,0 +1,36 @@
+运行日期：2026-10-11（本轮）
+目的：回应审查意见 ——「只看前后 url/title 无法区分『从未导航』与『先导航走再 restore 回来』」。
+
+================================================================
+实验 2（决定性）：统计上游收到的**全部** CDP 方法
+（上一版只统计 Runtime.evaluate，审查指出那只排除「经 window.open 的导航」，
+  排除不了 restoreUserPage 走的 Page.navigate —— 本版已补上对全部方法的计数。）
+命令：NODE=<node> HOME_DIR=<files> node disc-structural.mjs
+----------------------------------------------------------------
+ego: refusal
+upstream methods (all)         : Browser.getVersion, Target.getTargets, Target.getTargets
+upstream Page.navigate count   : 0
+upstream Runtime.evaluate count : 0
+of which window.open           : 0
+targets                        : GUI_TARGET
+GUI url                        : http://127.0.0.1:3080/
+STRUCTURAL_PASS: 拒绝分支既没发 window.open 也没发 Page.navigate —— 用户页既不会被 window.open 导航，也不存在事后 restore 的导航
+----------------------------------------------------------------
+结论：拒绝分支下上游**只**收到 Browser.getVersion 与 Target.getTargets ——
+      既没有 window.open（Runtime.evaluate 计数 0），也没有 Page.navigate（计数 0）。
+      因此用户页既不会被 window.open 导航走，也不存在「事后 restore」的导航，
+      不存在任何中间态。这不是「导航后又还原」，而是**根本没有导航动作**。
+      与源码一致：openTarget 在 opener===null 时直接 throw，位于
+      Runtime.evaluate(window.open) 之前；pickOpener 在「无 agent 页且未开多窗口」
+      时返回 null，绝不退回 pages[0]。
+      ⚠ 本实验用的是**仿造 WebView**（复刻真 WebView 的 ws url 形态/deflate/唯一 session），
+        真中继 + 真 ego 运行时。它证明的是**中继的拒绝语义**，不是真 WebView 的行为；
+        真 WebView 上的同一拒绝已另在真机验证（见下）。
+
+================================================================
+交叉印证（真机、真 WebView）：时间采样每 ~80ms 读一次 target 列表
+命令：NODE=<node> HOME_DIR=<files> node disc-sampling.mjs
+----------------------------------------------------------------
+(见 ego-webview-safety-proof 早前输出：samples 10-15, anomalous states: NONE)
+----------------------------------------------------------------
+（采样法有理论盲区且样本少，仅作交叉印证；决定性证据是上面的全方法计数。）

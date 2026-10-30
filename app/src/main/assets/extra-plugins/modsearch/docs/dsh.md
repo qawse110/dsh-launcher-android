@@ -36,7 +36,7 @@ The dump should contain both `searchProvider: modsearch` and a plugin row named 
 Install into the profile you actually start. `web` is the normal browser UI profile:
 
 ```sh
-npx -y @deepseek-ai/dsh plugin --profile web add @liustack/modsearch@5.10.10
+npx -y @deepseek-ai/dsh plugin --profile web add @liustack/modsearch@5.10.11
 ```
 
 Restart dsh after installation, then confirm the resolved package:
@@ -62,7 +62,7 @@ The plugin then exposes:
 | :-- | :-- | :-- |
 | Web search | Built-in `web_search` | Runs the ModSearch web engine chain and keeps native citation cards. |
 | X search | Added `x_search` tool | Uses Grok Build when available. A web substitute is labeled degraded. |
-| Focused page read | Added `read_page` tool | Reads one URL, optionally focused by a question. Private-network targets stay blocked. |
+| Focused page read | Added `read_page` tool | Reads one URL, optionally focused by a question. Private-network targets stay blocked. dsh's own `web_fetch` stays on for raw page text and status codes. |
 
 ## Configure search engines
 
@@ -71,7 +71,7 @@ The dsh plugin does not keep a second engine config. It inherits the same enviro
 Start with the offline health check:
 
 ```sh
-npx -y @liustack/modsearch@5.10.10 doctor
+npx -y @liustack/modsearch@5.10.11 doctor
 ```
 
 Common settings:
@@ -86,7 +86,7 @@ modsearch config set firecrawl.keylessFetch false
 modsearch config set cooldown off
 ```
 
-No setting is required to start: search and page fetch run on Firecrawl's keyless free quota (1,000 free credits/month, no signup), and search falls back to Keenable's keyless pool (1,000 requests/hour per IP, no signup). Keyless public-page fetch is on by default. It sends the requested URL to Firecrawl's cloud crawler, and the result warning names that route. `firecrawl.keylessFetch false` keeps automatic fetch local-only. Private and reserved targets are never sent to Firecrawl and fall through to the local fetcher.
+No setting is required to start: search and page fetch run on Firecrawl's keyless free quota (1,000 free credits/month, no signup), and search falls back to Keenable's keyless pool (1,000 requests/hour per IP, no signup), then to You.com's keyless search (100 searches/day per IP, no signup). Keyless public-page fetch is on by default. It sends the requested URL to Firecrawl's cloud crawler, and the result warning names that route. `firecrawl.keylessFetch false` keeps automatic fetch local-only. Private and reserved targets are never sent to Firecrawl and fall through to the local fetcher.
 
 See the [full engine configuration reference](../skills/modsearch/references/configure.md) and [security model](security.md).
 
@@ -96,8 +96,8 @@ The dsh web UI has no terminal, so the plugin brings its own settings card. On d
 
 The card holds three things:
 
-- The preferred engine: automatic, or one of `antigravity-cli`, `tavily`, `exa`, `firecrawl`, `keenable`, `grok-cli`. The `firecrawl` and `keenable` options are labelled as the keyless free tier. `local` fetches single pages and searches nothing, so it is not offered, unless the config file already names it as `engine`, in which case it stays listed rather than let the card disagree with the file.
-- The selected engine's own settings: API key and base URL for the HTTP engines (`tavily`, `exa`, `firecrawl`, `keenable`), and the model for `antigravity-cli`. Engines that sign in through their own command-line tool, and the built-in fetcher, show a line saying they need neither. Selecting `firecrawl` or `keenable` with no key stored adds a line saying it runs on the keyless free tier by default.
+- The preferred engine: automatic, or one of `antigravity-cli`, `tavily`, `exa`, `firecrawl`, `keenable`, `youcom`, `grok-cli`. The `firecrawl`, `keenable`, and `youcom` options are labelled as the keyless free tier. `local` fetches single pages and searches nothing, so it is not offered, unless the config file already names it as `engine`, in which case it stays listed rather than let the card disagree with the file.
+- The selected engine's own settings: API key and base URL for the HTTP engines (`tavily`, `exa`, `firecrawl`, `keenable`), and the model for `antigravity-cli`. Engines that sign in through their own command-line tool, and the built-in fetcher, show a line saying they need neither. Selecting `firecrawl` or `keenable` with no key stored adds a line saying it runs on the keyless free tier by default. Selecting `youcom` shows a note instead of a key field, since it is keyless only.
 - The automatic engine chain: one checkbox per search engine `modsearch doctor` found ready on this machine. Checked means automatic routing may use it. Engines this machine cannot run are left out, since they are not a decision to make, and so is `local`, which fetches pages rather than searching. `grok-cli` carries an "X search only" note, since it serves the social role alone. When doctor's answer never arrives, every search engine is listed with a line saying the status is unknown. A successful save re-reads doctor, so an engine the save just made ready gets its checkbox straight away.
 
 Every engine is checked by default. Unchecking one writes only `enabled: false`. Checking it again deletes that override instead of storing a redundant `true`. Unchecking the current preference returns the preference to automatic. The card only edits engines it lists: the `enabled` of an engine with no checkbox (one this machine cannot run, and `local`) is copied through untouched, and `modsearch config set <engine>.enabled` is the only way to change it. When no engine is ready here, the row of checkboxes is replaced by a line reading "No engine is ready on this machine yet."
@@ -177,7 +177,7 @@ The first call should use dsh's native `web_search` card. The other two should a
 Refresh the recorded request with the exact current version:
 
 ```sh
-npx -y @deepseek-ai/dsh plugin --profile <name> add @liustack/modsearch@5.10.10
+npx -y @deepseek-ai/dsh plugin --profile <name> add @liustack/modsearch@5.10.11
 ```
 
 Remove it with:

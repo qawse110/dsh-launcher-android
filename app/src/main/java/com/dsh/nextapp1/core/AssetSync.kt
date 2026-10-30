@@ -5,6 +5,7 @@ import android.os.Build
 import java.io.File
 import java.io.InputStream
 import org.apache.commons.compress.archivers.zip.ZipFile
+import org.json.JSONObject
 import com.dsh.nextapp1.core.*
 import com.dsh.nextapp1.overlay.*
 import com.dsh.nextapp1.service.*
@@ -160,6 +161,20 @@ object AssetSync {
             try {
                 // 内容一致则跳过，避免每次启动无谓重写大量文件
                 if (dstHasPkg && fingerprintOf(dst) == fingerprintOf(src)) continue
+                // 不降级守卫：plugins/<dir> 可能已被「在线升级」换成比 assets 更新的上游版本，
+                // 此时用出厂源整个覆盖等于把用户的在线升级静默回滚（且备份仍在，行为极难解释）。
+                // 语义与 install/plugins.mjs 的 syncExtraPlugin 严格对齐：
+                //   · 任一侧版本号取不到（缺 version / 自由文本）→ fail-open，照旧覆盖
+                //     （既有 MarkerStoreTest 的夹具 package.json 只有 name 无 version，依赖这条）
+                //   · 本地 > 源 → 跳过刷新，且**不写任何 marker**（假账会让下一次启动起静默）
+                if (dstHasPkg && isNewerThanSource(dst, src)) {
+                    AppLog.i(
+                        "AssetSync",
+                        "refresh plugin copy ${src.name} skip downgrade: " +
+                            "keep ${pkgVersionOf(dst)} (> asset ${pkgVersionOf(src)})"
+                    )
+                    continue
+                }
                 dst.deleteRecursively()
                 dst.parentFile?.mkdirs()
                 src.copyRecursively(dst, overwrite = true)
@@ -170,6 +185,73 @@ object AssetSync {
         }
         return n
     }
+
+    /**
+     * 读某个插件目录 package.json 里的 version。缺失 / 解析失败 / version 非字符串 → null。
+     *
+     * 供「不降级守卫」做版本取证，因此刻意比 PluginManagerActivity.readVersion 宽松：
+     * 那里对界面显示返回 "?"，这里对 null 有语义（null = 无法比较 = fail-open）。
+     * 装配侧的「修复/恢复」也用同一判据（见 repairFromSource），保证两处语义同源。
+     */
+    fun pkgVersionOf(dir: File): String? = try {
+        val text = File(dir, "package.json").readText()
+        val v = JSONObject(text).opt("version")
+        if (v is String && v.isNotBlank()) v.trim() else null
+    } catch (t: Throwable) {
+        null
+    }
+
+    /**
+     * 复刻 install/plugins.mjs 的 compareVersion（数点分段逐段数值比较）。
+     *
+     * 为什么不用 DshUpdater.compareVersions：那个函数永不返回 null，
+     * 而这里必须区分「0 = 同版本」与「null = 无法比较」，否则缺 version 的插件会被误判成
+     * 「同版本」而走另一条分支。同时它与 JS 侧同源，避免两端判据漂移。
+     *
+     * public 是因为装配侧的 repairFromSource 也要用同一套判据（在线升级过的新版本
+     * 不得被「修复」按钮按出厂源覆盖），两处必须逐字同源。
+     *
+     * @return a 更新 → 1；a 更旧 → -1；同核心版本 → 0；任一侧取不到数字段 → null。
+     */
+    fun compareVersionNums(a: String?, b: String?): Int? {
+        val x = parseVersionNums(a) ?: return null
+        val y = parseVersionNums(b) ?: return null
+        val n = maxOf(x.size, y.size)
+        for (i in 0 until n) {
+            val p = if (i < x.size) x[i] else 0
+            val q = if (i < y.size) y[i] else 0
+            if (p != q) return if (p > q) 1 else -1
+        }
+        return 0
+    }
+
+    /**
+     * 本地副本是否**比源目录更新**（两侧都有 package.json、版本都可解析且 local > source）。
+     *
+     * 这是「在线升级」与「按源修复」之间的分界线，装配侧有三处都要用它：
+     *   · [refreshBundledPluginCopies] 的不降级守卫；
+     *   · PluginManagerActivity.isAheadOfSource（界面要显示「已在线升级」而不是「落后」）；
+     *   · PluginManagerActivity.repairFromSource（「修复」按钮不得按出厂源覆盖升级结果）。
+     * 抽在这里是为了让三处逐字同源 —— 判据一旦分叉，界面说「已是最新」而修复又降级，
+     * 就是最难排查的那类问题。
+     *
+     * 语义与 install/plugins.mjs 的 syncExtraPlugin 一致：任一侧版本不可解析 → false。
+     */
+    fun isNewerThanSource(localDir: File, sourceDir: File): Boolean {
+        if (!File(localDir, "package.json").isFile) return false
+        if (!File(sourceDir, "package.json").isFile) return false
+        val order = compareVersionNums(pkgVersionOf(localDir), pkgVersionOf(sourceDir))
+        return order != null && order > 0
+    }
+
+    /** 取「首个数字点分段」，与 plugins.mjs 的 parseVersionNum 同正则同语义。 */
+    private fun parseVersionNums(v: String?): List<Int>? {
+        if (v.isNullOrBlank()) return null
+        val m = VERSION_NUM_RE.find(v) ?: return null
+        return m.groupValues[1].split('.').map { it.toIntOrNull() ?: 0 }
+    }
+
+    private val VERSION_NUM_RE = Regex("(\\d+(?:\\.\\d+)*)")
 
     /**
      * 公开的单文件指纹（长度 + 头 64KB CRC32），供「脚本内容变了就该重跑」类判据使用

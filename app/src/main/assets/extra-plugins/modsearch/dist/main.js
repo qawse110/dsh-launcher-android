@@ -123,8 +123,8 @@ function commandOnPath(bin, env = process.env, platform = process.platform) {
   }
   return false;
 }
-const DEFAULT_MODEL = "gemini-3.6-flash-low";
-const DEFAULT_MAX_RESULTS$2 = 8;
+const DEFAULT_MODEL = "gemini-3.8-flash-low";
+const DEFAULT_MAX_RESULTS$3 = 8;
 function buildAntigravityInvocation(options) {
   let prompt;
   let schemaJson;
@@ -144,7 +144,7 @@ function buildAntigravityInvocation(options) {
     }
     prompt = buildSearchPrompt({
       query: options.query,
-      maxResults: options.maxResults ?? DEFAULT_MAX_RESULTS$2,
+      maxResults: options.maxResults ?? DEFAULT_MAX_RESULTS$3,
       extraPrompt: options.extraPrompt
     });
     schemaJson = searchResultSchemaJson();
@@ -407,7 +407,7 @@ async function executeExaSearch(options) {
       title: r.title ?? "",
       url: r.url ?? "",
       snippet: r.highlights?.[0] ?? "",
-      source: r.url ? safeHostname$3(r.url) : void 0
+      source: r.url ? safeHostname$4(r.url) : void 0
     };
     if (r.publishedDate) {
       item.published_at = r.publishedDate;
@@ -434,7 +434,7 @@ async function executeExaSearch(options) {
     }
   };
 }
-function safeHostname$3(url) {
+function safeHostname$4(url) {
   try {
     return new URL(url).hostname;
   } catch {
@@ -811,7 +811,7 @@ async function firecrawlSearch(options) {
     title: r.title ?? "",
     url: r.url ?? "",
     snippet: r.description ?? "",
-    source: r.url ? safeHostname$2(r.url) : void 0
+    source: r.url ? safeHostname$3(r.url) : void 0
   }));
   const summary = items.length > 0 ? `Firecrawl returned ${items.length} ranked result(s) for "${options.query}". Read items for the sources.` : "";
   return {
@@ -962,7 +962,7 @@ function normalizeLinks(raw) {
   }
   return out;
 }
-function safeHostname$2(url) {
+function safeHostname$3(url) {
   try {
     return new URL(url).hostname;
   } catch {
@@ -1797,8 +1797,8 @@ const httpFetchProvider = {
   isAvailable: () => true,
   execute: executeHttpFetch
 };
-const DEFAULT_MAX_RESULTS$1 = 10;
-const MAX_RESULTS_CEILING = 50;
+const DEFAULT_MAX_RESULTS$2 = 10;
+const MAX_RESULTS_CEILING$1 = 50;
 const KEENABLE_DEFAULT_BASE = "https://api.keenable.ai";
 const APP_TITLE = "modsearch";
 async function executeKeenableSearch(options) {
@@ -1811,7 +1811,7 @@ async function executeKeenableSearch(options) {
   const apiKeys = splitApiKeys(options.settings.apiKey);
   const apiKey = apiKeys[0] ?? null;
   const apiKeySecrets = [.../* @__PURE__ */ new Set([...apiKeys, ...options.apiKeySecrets ?? []])];
-  const maxResults = Math.min(options.maxResults ?? DEFAULT_MAX_RESULTS$1, MAX_RESULTS_CEILING);
+  const maxResults = Math.min(options.maxResults ?? DEFAULT_MAX_RESULTS$2, MAX_RESULTS_CEILING$1);
   const startedAt = Date.now();
   const headers = { "content-type": "application/json" };
   if (apiKey) {
@@ -1865,7 +1865,7 @@ async function executeKeenableSearch(options) {
       url: r.url ?? "",
       // The snippet is the page excerpt; the description is often empty.
       snippet: r.snippet || r.description || "",
-      source: r.url ? safeHostname$1(r.url) : void 0
+      source: r.url ? safeHostname$2(r.url) : void 0
     };
     if (r.published_at) {
       item.published_at = r.published_at;
@@ -1889,7 +1889,7 @@ async function executeKeenableSearch(options) {
     }
   };
 }
-function safeHostname$1(url) {
+function safeHostname$2(url) {
   try {
     return new URL(url).hostname;
   } catch {
@@ -1905,7 +1905,7 @@ const keenableProvider = {
   isAvailable: () => true,
   execute: executeKeenableSearch
 };
-const DEFAULT_MAX_RESULTS = 8;
+const DEFAULT_MAX_RESULTS$1 = 8;
 const TAVILY_DEFAULT_BASE = "https://api.tavily.com";
 async function executeTavilySearch(options) {
   if (options.mode === "fetch") {
@@ -1922,7 +1922,7 @@ async function executeTavilySearch(options) {
       "The tavily provider needs an API key. Set TAVILY_API_KEY, or run: modsearch config set tavily.apiKey <key> (free tier: 1,000 credits/month at https://app.tavily.com)"
     );
   }
-  const maxResults = options.maxResults ?? DEFAULT_MAX_RESULTS;
+  const maxResults = options.maxResults ?? DEFAULT_MAX_RESULTS$1;
   const startedAt = Date.now();
   const { response, text } = await requestText(
     "tavily",
@@ -1965,7 +1965,7 @@ async function executeTavilySearch(options) {
     title: r.title ?? "",
     url: r.url ?? "",
     snippet: r.content ?? "",
-    source: r.url ? safeHostname(r.url) : void 0
+    source: r.url ? safeHostname$1(r.url) : void 0
   }));
   const result = {
     summary: data.answer ?? items.map((item) => item.snippet).filter(Boolean).join(" "),
@@ -1981,7 +1981,7 @@ async function executeTavilySearch(options) {
     }
   };
 }
-function safeHostname(url) {
+function safeHostname$1(url) {
   try {
     return new URL(url).hostname;
   } catch {
@@ -1996,6 +1996,86 @@ const tavilyProvider = {
   defaultModel: "tavily-basic",
   execute: executeTavilySearch
 };
+const DEFAULT_MAX_RESULTS = 10;
+const MAX_RESULTS_CEILING = 50;
+const YOUCOM_KEYLESS_ENDPOINT = "https://api.you.com/v1/agents/search";
+async function executeYoucomSearch(options) {
+  if (options.mode === "fetch") {
+    throw new Error("The youcom engine does not support page fetch (-u). It searches only.");
+  }
+  if (!options.query) {
+    throw new Error("Search mode requires a query.");
+  }
+  const maxResults = Math.min(options.maxResults ?? DEFAULT_MAX_RESULTS, MAX_RESULTS_CEILING);
+  const startedAt = Date.now();
+  const url = new URL(YOUCOM_KEYLESS_ENDPOINT);
+  url.searchParams.set("query", options.query);
+  url.searchParams.set("count", String(maxResults));
+  const { response, text } = await requestText(
+    "youcom",
+    url.toString(),
+    { method: "GET", headers: { accept: "application/json" } },
+    AbortSignal.timeout(options.timeoutMs),
+    options.timeoutMs,
+    []
+  );
+  if (!response.ok) {
+    const detail = text.trim();
+    if (response.status === 429) {
+      throw new Error(
+        "youcom's keyless allowance for this IP is used up for the day (100 searches). Search continues with the next engine."
+      );
+    }
+    throw new Error(
+      `youcom returned ${response.status} ${response.statusText}.${detail ? ` ${detail}` : ""}`
+    );
+  }
+  const data = JSON.parse(text);
+  const items = (data.results?.web ?? []).map((r) => {
+    const item = {
+      title: r.title ?? "",
+      url: r.url ?? "",
+      // The first snippet is the excerpt matched to the query; the
+      // description is the page's own blurb.
+      snippet: r.snippets?.[0] || r.description || "",
+      source: r.url ? safeHostname(r.url) : void 0
+    };
+    if (r.page_age) {
+      item.published_at = r.page_age;
+    }
+    return item;
+  });
+  const summary = items.length > 0 ? `You.com returned ${items.length} ranked result(s) for "${options.query}". Read items for the sources.` : "";
+  return {
+    result: {
+      summary,
+      items,
+      uncertainty: items.length === 0 ? ["No results found for this query."] : [],
+      warnings: [
+        "You.com returns ranked results without an LLM summary, so the summary is mechanical: read items directly for the evidence."
+      ]
+    },
+    meta: {
+      conversationId: null,
+      durationSeconds: (Date.now() - startedAt) / 1e3,
+      usage: { resultCount: items.length }
+    }
+  };
+}
+function safeHostname(url) {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return void 0;
+  }
+}
+const youcomProvider = {
+  name: "youcom",
+  roles: ["search"],
+  requirement: "nothing: search works keyless (100 searches/day per IP, no signup)",
+  isAvailable: () => true,
+  execute: executeYoucomSearch
+};
 const ENGINES = {
   "antigravity-cli": antigravityCliProvider,
   antigravity: antigravityCliProvider,
@@ -2004,6 +2084,7 @@ const ENGINES = {
   exa: exaProvider,
   firecrawl: firecrawlProvider,
   keenable: keenableProvider,
+  youcom: youcomProvider,
   "grok-cli": grokCliProvider,
   grok: grokCliProvider,
   // The built-in direct fetcher, canonically `local`. `http` and `direct` stay
@@ -2016,10 +2097,12 @@ const ROLE_PREFERENCE = {
   // Firecrawl leads: its keyless allowance works on a bare machine with no
   // signup, which is the product's zero-setup promise. Keenable is the second
   // keyless engine, so a bare machine still has a fallback when Firecrawl's
-  // daily allowance runs out. agy synthesizes and cites but its weekly quota
-  // is small, so it backs the keyless pair up rather than fronting the chain.
-  // Tavily and Exa are keyed backups.
-  search: ["firecrawl", "keenable", "antigravity-cli", "tavily", "exa"],
+  // daily allowance runs out. You.com is the third, smallest keyless pool
+  // (100 a day per IP), there for when both run dry on a busy IP. agy
+  // synthesizes and cites but its weekly quota is small, so it backs the
+  // keyless engines up rather than fronting the chain. Tavily and Exa are
+  // keyed backups.
+  search: ["firecrawl", "keenable", "youcom", "antigravity-cli", "tavily", "exa"],
   // Firecrawl runs a cloud browser for JS-heavy pages, keyless by default
   // (opt out with firecrawl.keylessFetch false). agy extracts to a focus. The
   // local needs no setup and returns the page as served, so it stays the
@@ -2785,6 +2868,14 @@ function diagnoseEngine(engine, config2, env, role) {
       ready: true,
       keySource,
       reason: keySource ? apiKeyPresentReason(count, keySource) : "keyless: works with no key and no signup (1,000 requests/hour, shared by everyone on this IP). Set a free key for 100,000 requests/month of your own."
+    };
+  }
+  if (engine.name === "youcom") {
+    return {
+      engine: engine.name,
+      enabled,
+      ready: true,
+      reason: "keyless: works with no key and no signup (100 searches/day, shared by everyone on this IP)."
     };
   }
   if (engine.name === "firecrawl") {
@@ -3700,13 +3791,13 @@ function writeFully(stream, text) {
 const program = new Command();
 program.name("modsearch").description(
   "Plug-in web search and page fetch for models without native web access: query or URL in, structured JSON evidence out"
-).version("5.10.10");
+).version("5.10.11");
 program.command("search", { isDefault: true }).description("Search the web or X, or fetch a page (default command)").option("-q, --query <text>", "Search query (or answer focus when combined with -u)").option("-u, --url <url>", "Fetch this web page instead of searching").option("-o, --output <path>", "Write result JSON to a file").option(
   "-s, --source <list>",
   "Where to search: web, x, or web,x (default: web, or x when the query is about X)"
 ).option(
   "-e, --engine <name>",
-  "Engine for this run, overriding config (antigravity-cli, tavily, exa, firecrawl, keenable, grok-cli, local)"
+  "Engine for this run, overriding config (antigravity-cli, tavily, exa, firecrawl, keenable, youcom, grok-cli, local)"
 ).option("-m, --model <name>", "Engine model, where the engine has one").option("--prompt <text>", "Extra constraints for this run").option("--max-results <n>", "Maximum number of search results", "8").option("--timeout <ms>", "Engine timeout in milliseconds", "180000").option(
   "--deadline <ms>",
   "Wall-clock budget for the whole run in milliseconds, across every engine tried (default: none)"
@@ -3796,7 +3887,7 @@ config.command("init").description(`Create a starter config at ${CONFIG_PATH}`).
       [
         `Created ${CONFIG_PATH}`,
         "Everything is optional. Things you can set:",
-        "  modsearch config set engine <antigravity-cli|tavily|exa|firecrawl|keenable>   which engine searches",
+        "  modsearch config set engine <antigravity-cli|tavily|exa|firecrawl|keenable|youcom>   which engine searches",
         "  modsearch config set <engine>.<apiKey|bin|model|baseURL|keylessFetch> <value>   engine settings",
         "  modsearch config set cooldown <on|off>   quota cooldown failover (default on)",
         "  modsearch config set allowPrivateNetwork <true|false>   reach reserved/private ranges (default false)",

@@ -1,0 +1,50 @@
+运行时间：2026-10-12 23:37–23:55（真机 RMX3888 / Android 16 / arm64-v8a）
+对象：用户新装的 APK（base.apk mtime 2026-10-12 23:37:31，88000145 bytes，app pid 18352）
+
+## ⚠️ 重要更正：本轮曾误判「关页不可靠」，那是我测试代码的错
+我先前用**手写 WebSocket 帧**做 CDP 客户端：设置了 MASK 位却**没有真正掩码** payload。
+RFC6455 要求客户端帧必须掩码，服务器据此**正确地**丢弃了这些帧 —— 于是所有
+closeTarget/Page.close 都"超时"，我据此写下"关页不可靠"。换成 Node 原生
+WebSocket（undici，掩码正确）后，同一路径**立即成功**。
+
+## 三项目标验收（全部 PASS，均用原生 WebSocket 或 ego 自身 API）
+
+### ① GUI 不被遮挡 —— PASS
+真 ego 经生产中继 41999 + 真 WebView 新建页：
+    GUI visible: true（47 个样本，每 80ms 一次）
+    GUI 中间态: 无（url 全程未变）
+  视图序（代码）：popupLayer(索引 0，最底) < progressBar < webView(GUI) < errorView。
+
+### ② 被 GUI 覆盖的底层 WebView 仍可被 CDP 驱动 —— PASS
+本地内容服务器 http://127.0.0.1:43111/ 返回标记 FINALPROBE_4d7：
+    CREATE {"url":"http://127.0.0.1:43111/","rawChars":25,"rawHasMark":true,
+            "ev":{"u":"http://127.0.0.1:43111/","t":"Final Probe","hasMark":true}}
+  判据用 snapshotRaw/evaluate（按约定不用 page.snapshot()，那是独立缺陷 2）。
+
+### ③ 关页真正回收 —— PASS
+    ego TABS  : [{"id":"C6A862E0A5","url":"http://127.0.0.1:43111/"}]
+    ego CLOSED: "C6A862E0A5057BA78B6C12F748BB4EF3"
+    popup created 10→11, destroyed 8→9   ← dsh.log 出现 destroyed，对应本次关闭
+    关闭后 pages=1（只剩 GUI）
+  即：宿主 WebChromeClient.onCloseWindow 被触发、子 WebView 被真正 destroy。
+
+## 本轮真正有效的代码修复（提交 fb3838d）
+closeTarget 的 fire() 辅助只声明 (method, params)，调用点却传 sessionId ⇒ 第三个参数
+被静默丢弃，Page.close/Runtime.evaluate 落到**浏览器级**。这是真 bug（无论我的客户端
+是否有掩码问题），已修。
+
+## 本轮新发现（代码级缺口，未在真机复现其后果）
+**中继没有监督者，一旦退出不会被重新拉起。**
+- DshFlow.startDshWeb 在 3080 已响应时提前 return（"dsh web 已在运行"），
+  整段 launcher 渲染/执行被跳过 ⇒ 由 launcher 负责启动的中继也不会被补起。
+- Supervisor.reviveWebIfDue 只探 WEB_PORT(3080)，**从不探 RELAY_PORT(41999)**
+  （grep：Supervisor.kt 出现 RELAY_PORT 0 次）。
+- 中继自身在 server error / EADDRINUSE 时 process.exit(1)（webview-cdp-relay.mjs:676），
+  即它会自行退出而无人重启 ⇒ ego 会静默失效。
+- 备注：我先前观察到的"中继消失"多为我的测试进程退出时被一并回收，故不声称
+  已在真机复现该缺口；仅作代码级风险记录。
+
+## 遗留（承接上一轮，未处理）
+- 缺陷 2：page.snapshot() 返回 0 字符（ego_snapshot 退化）；read 类工具走 snapshotRaw()
+  不受影响。仍未定位。
+- 我测试遗留的 agent 页：本轮已通过 closeTarget 关掉，最终 pages=1（只剩 GUI）。

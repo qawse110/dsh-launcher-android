@@ -1,0 +1,42 @@
+运行时间：2026-10-13 00:39–00:50（真机 RMX3888 / Android 16 / arm64-v8a）
+对象：用户第四次安装的 APK
+  base.apk mtime 2026-10-12T16:39:41Z, size 88000329
+  /data/app/~~q5-tbOLCTplV-kurn_5cvA==/com.dsh.nextapp1-02Uyr9MZJHzqYQSPaP8YcQ==/base.apk
+
+## 0. 先取证本次包含修复（从 APK zip 条目解压核对，不靠自述）
+- assets/webview-cdp-relay.mjs 与仓库版本 **byte-identical**
+- classes5.dex 含 **ensureRelayRunning**（cb0591a 引入，3200efc 复用）
+- classes7.dex 含 MAX_POPUPS / openPopupWebView / popup WebView created
+
+## 1. 【本轮关键新证据】中继自愈已在真机端到端跑通
+未做任何手工干预，启动后状态：
+  41999: UP  —  只有 1 个 relay 进程，pid=22329, **ppid=1**（已脱离，独立于 App 进程组）
+  dsh.log: 2026-10-13 00:40:37.276 [I] [DshWatchdog] >> 已补起 WebView CDP 中继（端口 41999）
+  flow.log: 00:40:34.824 OK 启动完成 (http://127.0.0.1:3080)
+⇒ 上一轮修的两条路径中，**DshWatchdog 这条在真机上被实际触发并成功拉起**。
+  （relay 日志同时出现一条 EADDRINUSE，是启动脚本与 watchdog 的竞态所致；
+   后到者退出、先到者存活，最终恰好一条在跑 —— 结果正确但边界略噪，
+   已记为可优化项而非缺陷。）
+
+## 2. 三项目标验收（全部 PASS，本轮第 4 次复现）
+CDP 客户端一律用 Node 原生 WebSocket（RFC6455 掩码正确）。
+
+① GUI 未被遮挡 —— PASS
+   GUI visible: true（50 个样本，每 80ms）; GUI 中间态: 无（url 全程未变）
+
+② 被 GUI 覆盖的底层 WebView 仍可被 CDP 驱动 —— PASS
+   CREATE {"url":"http://127.0.0.1:43331/","rawChars":22,"rawHasMark":true,
+           "ev":{"u":"http://127.0.0.1:43331/","t":"R4 Probe","hasMark":true}}
+
+③ 关页真正回收 —— PASS
+   closeTarget http://127.0.0.1:43331/ → {"id":2,"result":{}}
+   popup created 12→13, destroyed 10→11（dsh.log 出现 destroyed）
+   after-close pages=1（只剩 GUI）
+
+## 3. 仍未闭环（诚实边界）
+- GUI「可见」仍来自 devtools 元数据（screencap 无 root 失败），非人眼画面。
+  需要用户肉眼确认界面正常，这一条才算完全闭环。
+- 缺陷 2：page.snapshot() 返回 0 字符（ego_snapshot 退化）；read 类工具走
+  snapshotRaw() 不受影响。仍未定位。
+- ego API 无 closeTab；关页只能走 CDP Target.closeTarget 或插件侧工具。
+- relay 启动竞态（启动脚本 vs watchdog 双拉）会产生一条无害的 EADDRINUSE 日志。

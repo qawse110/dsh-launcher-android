@@ -23,7 +23,7 @@ Every engine for the web source failed.
   - firecrawl: ...
 ```
 
-Firecrawl 和 Keenable 都能走免注册端点搜索，所以裸安装也有可用引擎。现在看到这条信息，表示所有候选都在运行时失败。按尝试列表找真实原因，常见情况是网络不可用、超时、免注册每日额度耗尽、Keenable 免注册的每小时额度用完，或已配置引擎的账号额度用完。
+Firecrawl、Keenable 和 You.com 都能走免注册端点搜索，所以裸安装也有可用引擎。现在看到这条信息，表示所有候选都在运行时失败。按尝试列表找真实原因，常见情况是网络不可用、超时、免注册每日额度耗尽、Keenable 免注册的每小时额度用完、You.com 免注册的每日额度用完，或已配置引擎的账号额度用完。
 
 ```bash
 curl -fsSL https://antigravity.google/cli/install.sh | bash && agy   # 然后登录
@@ -45,7 +45,7 @@ Individual quota reached. Please upgrade your subscription ... Resets in 94h19m9
 agy 的免费额度是 Antigravity 桌面应用、CLI、SDK 共享的每周配额，并行子 agent 会加速消耗。三条出路：
 
 - 等报错里写的重置时间。
-- 加一个带 key 的搜索引擎（Tavily、Exa、Firecrawl 或 Keenable）。之后搜索自动落到它，你不用再做任何事。
+- 加一个带 key 的搜索引擎（Tavily、Exa、Firecrawl 或 Keenable）。You.com 没有 key 可加。之后搜索自动落到它，你不用再做任何事。
 - 冷却开着时（默认），agy 会被记为耗尽并挪到链末尾直到重置，后续运行先走别家。见下文「某个引擎总被跳过」。
 
 ## agy 在你所在地区不可用
@@ -99,6 +99,14 @@ keenable's keyless pool for this IP is used up for the hour (1,000 requests). Se
 modsearch config set keenable.apiKey <key>
 # 或环境变量：export KEENABLE_API_KEY=<key>
 ```
+
+## You.com 免注册额度今天用完
+
+```
+youcom's keyless allowance for this IP is used up for the day (100 searches). Search continues with the next engine.
+```
+
+You.com 免注册搜索每个 IP 每天给 100 次，同一 IP 上的所有人共用这份额度（办公室、VPN 出口、云主机都算）。链上的下一个搜索引擎会自动接手，这条错误不会让 You.com 进入冷却。它没有可以加的 key 来换更大的额度，所以等到第二天，或换其他引擎。其他失败的信息形如 `youcom returned <status> <statusText>. <body>`。
 
 ## Tavily 月度额度用完（432/433）
 

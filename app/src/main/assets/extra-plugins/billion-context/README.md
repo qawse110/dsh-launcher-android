@@ -238,7 +238,7 @@ Notes:
 - `kimi` reports runtime-info at bootstrap only (static headers can't carry per-request window/model values); subagent tool calls are routed by the proxy's outbound tool-use witness ring (#1685) — no model-visible conversation id.
 - `hermes`'s native plugin is Python: it points hermes' httpx stack at the proxy via env vars after a health check and stamps per-request headers through an `llm_request` middleware.
 - `codex` is the one client a plugin install cannot make self-sufficient: codex routes model traffic via env only (no config-file routing seam for the default ChatGPT-login provider — a managed `model_providers` block would force API-key auth and drop subscription login), and an MCP server cannot inject env into its parent. `bili plugin install codex` writes a single `[mcp_servers.bili]` block into `~/.codex/config.toml` (command = node, args = dist/mcp.js) exposing the four ACP tools; at session start the shell resolves a proxy — env `BILI_MCP_PROXY` > the live-instance record (any lane's proxy or a `bili start` daemon) > the 8787 user-zone default (#1660 removed the install-time origin bake, #403) — nothing reachable → `tools/list` fails with -32003. So: start bili first (`bili start` or any client's lane proxy), export HTTPS_PROXY yourself if you also want compression, or use `bili codex` for the zero-config full posture. Mechanics: [CLIENTS.md](CLIENTS.md#codex-openai-codex-cli).
-- `claude` has a native posture (#964): managed settings block + `SessionStart` hook + MCP shell; the hook rides the self-managed port zone (#1660) and re-pins the managed URL to the live origin each session, so port drift self-heals. Since #1821 the MCP shell also watches the proxy mid-session (30 s tick × 3 failures) and respawns a dead lane proxy itself, so model requests recover within ~90 s instead of a new session (same semantics as the zcode lane). Opt out with `BILI_NATIVE_CLAUDE=0` (passthrough). Mechanics: [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md). **Known limitation (#2290):** the Claude Desktop app's Code tab (`CLAUDE_CODE_ENTRYPOINT=claude-desktop`) sets its own `ANTHROPIC_BASE_URL` on its embedded Claude Code, overriding the managed one — desktop sessions bypass the proxy entirely while the managed block's `DISABLE_AUTO_COMPACT=1` still applies, so they get neither bili compression nor native auto-compaction. The hook warns loudly at session start (and records it for `bili doctor`, which also flags machines where Claude Desktop is installed alongside the native lane); terminal sessions are unaffected. **Field-tested 2026-10-06 (#2290):** putting `HTTPS_PROXY` in the settings `env` block produced zero CONNECT traffic to a live MITM-enabled proxy on Claude Desktop 2.19675.1 / embedded CC 2.1.288 (Windows 11) — the variable reaches no network stack there, consistent with the CLI finding that CC's undici ignores proxy env vars (why `bili claude` uses the `/bili/` base-URL rewrite instead). As of that version there is no usable routing seam on the desktop Code tab; the lane stays tracked in [#2290](https://github.com/ranxianglei/billion-context/issues/2290) in case upstream changes behavior. Desktop-only users can restore native auto-compact with `bili plugin remove claude`.
+- `claude` has a native posture (#964): managed settings block + `SessionStart` hook + MCP shell; the hook rides the self-managed port zone (#1660) and re-pins the managed URL to the live origin each session, so port drift self-heals. Since #1821 the MCP shell also watches the proxy mid-session (30 s tick × 3 failures) and respawns a dead lane proxy itself, so model requests recover within ~90 s instead of a new session (same semantics as the zcode lane). Opt out with `BILI_NATIVE_CLAUDE=0` (passthrough). Mechanics: [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md). **Known limitation (#2290):** the Claude Desktop app's Code tab (`CLAUDE_CODE_ENTRYPOINT=claude-desktop`) sets its own `ANTHROPIC_BASE_URL` on its embedded Claude Code, overriding the managed one — desktop sessions bypass the proxy entirely while the managed block's `DISABLE_AUTO_COMPACT=1` still applies, so they get neither bili compression nor native auto-compaction. The hook warns loudly at session start (and records it for `bili doctor`, which also flags machines where Claude Desktop is installed alongside the native lane); terminal sessions are unaffected. **Field-tested 2026-10-06 (#2290):** putting `HTTPS_PROXY` in the settings `env` block produced zero CONNECT traffic to a live MITM-enabled proxy on Claude Desktop 2.19675.1 / embedded CC 2.1.288 (Windows 11) — the variable reaches no network stack there, matching the CLI behavior of that era — note that newer builds (CC 2.1.301+) DO honour `HTTPS_PROXY` on the CLI, which is why `bili claude` routes via the `/bili/` base-URL rewrite — the launcher gives this lane no proxy and no CA at all, and a child that brings a proxy of its own gets the loopback hosts merged into `NO_PROXY`/`no_proxy` so that leg stays direct regardless of its proxy behavior (#3446). As of that version there is no usable routing seam on the desktop Code tab; the lane stays tracked in [#2290](https://github.com/ranxianglei/billion-context/issues/2290) in case upstream changes behavior. Desktop-only users can restore native auto-compact with `bili plugin remove claude`.
 - `zcode` has a native posture (#1145): managed `~/.zcode/cli/config.json` block + per-session provider `baseURL` rewrite. Full mechanics: [CLIENTS.md](CLIENTS.md).
 - `jcode` and `aider` have no native mode (no plugin/MCP/tool-injection seam: #962, #1048) — use `bili jcode` / `bili aider`.
 - `copilot`, `amp` and `goose` are launcher-only (#1049); goose cannot be cert-MITMed (rustls trusts no CA file) and rides plain-HTTP base-URL redirects instead.
@@ -378,8 +378,11 @@ report above.
 **Can I query sessions and config over the web?** Yes — open
 [http://localhost:8787](http://localhost:8787): an overview dashboard, session
 list with per-session detail, live logs, a config editor, and an upstream
-connectivity test. Everything is also plain JSON for scripting
-(`/__bili/stats`, `/__bili/sessions`, `/__bili/config`, …).
+connectivity test. A Blog view renders notes and long-form articles inside the
+panel itself — bundled with the install, refreshed from GitHub master on a
+~1-hour throttle while online (fail-soft to the bundled copy when offline);
+the full library also lives on GitHub Pages. Everything else is also plain JSON
+for scripting (`/__bili/stats`, `/__bili/sessions`, `/__bili/config`, …).
 
 **When does compression happen?** It is model-driven: the injected context
 tools are called by the model as context grows, gentle growth nudges
@@ -402,6 +405,29 @@ unchanged ([CLIENTS.md](CLIENTS.md)), and every mode reverses cleanly:
 `bili plugin remove <client>` for native installs, stop using the launcher
 command / env vars / `/bili/` prefix for the other two — traffic goes direct
 again immediately.
+
+**Can I combine bili with a model-routing gateway (e.g. [magpie](https://github.com/yetone/magpie))?**
+Yes — point the client at bili, and point bili at the gateway through the
+`/bili/` prefix, which embeds the gateway's absolute URL:
+`http://localhost:8787/bili/http://127.0.0.1:3425…`. Example: Claude Code →
+`ANTHROPIC_BASE_URL=http://localhost:8787/bili/http://127.0.0.1:3425` +
+`ANTHROPIC_API_KEY=magpie`; OpenAI-style clients →
+`OPENAI_BASE_URL=http://localhost:8787/bili/http://127.0.0.1:3425/v1` (+
+`OPENAI_API_KEY=magpie`). Compression happens *before* routing — every request
+that reaches any account in the gateway's routing groups is already compressed.
+Credentials stay in the gateway: the client's dummy key rides through
+untouched, and real keys never touch bili. Caveats: ① an account switch
+mid-conversation invalidates the provider's prefix cache — inherent to
+multi-account routing, not bili (watch it in the `KEY SWITCHES` section of
+`/acp-cache`); ② routed model names are opaque to bili's window lookup —
+declare their context windows under the providers key
+`http://127.0.0.1:3425` via `models.<name>.context`, or they run on the
+fallback window (route-miss warning, #2317); ③ if the relay rejects bili's
+Anthropic-lane `cache_control` stamps, set `compat.noCacheControl`; ④ loopback
+gateways work out of the box; a gateway on a private non-loopback address may
+additionally need `network.allowPrivateHttpProviders` (#2984). Verified
+end-to-end over all three wires (OpenAI Chat / Responses / Anthropic Messages,
+including cross-protocol conversion), #4433.
 
 **Where are logs and session data stored?** Log:
 `~/.local/state/billion-context/bili.log` (also mirrored to stderr); session

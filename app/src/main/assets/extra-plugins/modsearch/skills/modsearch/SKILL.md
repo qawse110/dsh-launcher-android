@@ -39,11 +39,11 @@ Nothing else needs setting up first: modsearch works with no config file. Web se
 
 ### If you cannot run the launcher script
 
-Some harnesses forbid running scripts. Reason through the same order by hand and run the first line that works (the pinned version is 5.10.10):
+Some harnesses forbid running scripts. Reason through the same order by hand and run the first line that works (the pinned version is 5.10.11):
 
-1. A `modsearch` on `PATH` whose major version is 5 and is at least 5.10.10: `modsearch <args>`.
-2. Otherwise, if `npx` exists: `npx --yes --package @liustack/modsearch@5.10.10 modsearch <args>`.
-3. Otherwise, if `bunx` exists: `bunx --bun @liustack/modsearch@5.10.10 <args>`.
+1. A `modsearch` on `PATH` whose major version is 5 and is at least 5.10.11: `modsearch <args>`.
+2. Otherwise, if `npx` exists: `npx --yes --package @liustack/modsearch@5.10.11 modsearch <args>`.
+3. Otherwise, if `bunx` exists: `bunx --bun @liustack/modsearch@5.10.11 <args>`.
 4. Otherwise none of these runtimes is here. Tell the user no JavaScript runtime was found and that installing Node 22.13+ (https://nodejs.org) or Bun (https://bun.sh) is the next step. Do not claim modsearch itself failed.
 
 `references/runtime.md` documents the version pin, the compatibility rule, and the diagnostic fields.
@@ -72,7 +72,7 @@ Three jobs, each with its own engines:
 
 | Role | Engines (best first) | Notes |
 | :-- | :-- | :-- |
-| search the web | `firecrawl`, `keenable`, `antigravity-cli`, `tavily`, `exa` | Firecrawl works keyless with no signup (1,000 free credits/month), and so does Keenable (1,000 requests/hour, shared per IP). agy is free with a browser sign-in. Tavily, Exa, and a free Firecrawl or Keenable key add personal quotas. |
+| search the web | `firecrawl`, `keenable`, `youcom`, `antigravity-cli`, `tavily`, `exa` | Firecrawl works keyless with no signup (1,000 free credits/month), and so do Keenable (1,000 requests/hour, shared per IP) and You.com (100 searches/day, shared per IP). agy is free with a browser sign-in. Tavily, Exa, and a free Firecrawl or Keenable key add personal quotas. |
 | fetch a page | `firecrawl`, `antigravity-cli`, `local` | Firecrawl runs a cloud browser, keyless by default (`firecrawl.keylessFetch false` opts out). `local` needs nothing and is the default floor. |
 | search X | `grok-cli` | Needs Grok Build with SuperGrok or X Premium. |
 
@@ -124,9 +124,9 @@ Fetch mode replaces `items` with `content` (the page as text or markdown) and `l
 
 Every error this CLI prints names its cause, and most already name the fix, so read the message first. When setup is the suspect, run `modsearch doctor` (spends no quota): it reports each engine's readiness per role and the config in effect, with a fix command for anything missing. `--json` gives a machine-readable report.
 
-- `Every engine for the web source failed`: read the attempt list. A bare install includes keyless Firecrawl and Keenable, so this means runtime failures such as no network, timeout, or exhausted limits rather than missing setup.
+- `Every engine for the web source failed`: read the attempt list. A bare install includes keyless Firecrawl, Keenable, and You.com, so this means runtime failures such as no network, timeout, or exhausted limits rather than missing setup.
 - `Every engine for the <source> source failed`: each engine's failure is listed, and `attempts` in a returned entry carries the same per-engine errors. Act on the first fixable one.
-- Quota exhausted (agy weekly quota, or `exa`/`firecrawl`/`keenable` out of credits, or Keenable's hourly keyless pool used up): not fatal when another search engine is set up, since search falls through on its own and cooldown moves the spent engine to the back. Otherwise relay the reset time from the message.
+- Quota exhausted (agy weekly quota, or `exa`/`firecrawl`/`keenable` out of credits, or Keenable's hourly or You.com's daily keyless allowance used up): not fatal when another search engine is set up, since search falls through on its own and cooldown moves the spent engine to the back. Otherwise relay the reset time from the message.
 - Timeouts: retry once with `--timeout 300000`. If it still fails, report the exact error instead of answering from stale memory.
 
 ## References (read on demand)

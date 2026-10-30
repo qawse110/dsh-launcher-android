@@ -1,0 +1,54 @@
+运行时间：2026-10-13 00:08–00:25（真机 RMX3888 / Android 16 / arm64-v8a）
+对象：用户第三次安装的 APK（base.apk mtime 2026-10-12T16:08:07Z，
+       /data/app/~~lHwk25KdkD-BP7HoEm8zWA==/com.dsh.nextapp1-gQrOHrMEvfZFiyxDg48c8Q==/base.apk）
+
+## 0. 先取证「本次包确实含修复」
+直接从 APK 的 zip 条目解压校验（不靠自述）：
+- assets/webview-cdp-relay.mjs 与仓库版本 **byte-identical**
+- classes5.dex 含 **ensureRelayRunning** ← 该符号只在 cb0591a 引入
+- classes7.dex 含 MAX_POPUPS / openPopupWebView / onCreateWindow
+
+## 1. 三项目标验收（全部 PASS）
+所有 CDP 客户端均用 **Node 原生 WebSocket**（RFC6455 掩码正确）。
+⚠ 上一轮曾因我手写帧「设了 MASK 位却没掩码」而误判「关页不可靠」，本轮已修正工具链。
+
+① GUI 未被遮挡 —— PASS
+   真 ego 经生产中继 41999 + 真 WebView 新建页：
+     GUI visible: true（41 个样本，每 80ms 一次）
+     GUI 中间态: 无（url 全程未变）
+   视图序（代码）：popupLayer(索引 0，最底) < progressBar < webView(GUI) < errorView
+
+② 被 GUI 覆盖的底层 WebView 仍可被 CDP 驱动 —— PASS
+   本地内容服务器 http://127.0.0.1:43221/ 返回标记 B3PROBE_7a1：
+     CREATE {"url":"http://127.0.0.1:43221/","rawChars":22,"rawHasMark":true,
+             "ev":{"u":"http://127.0.0.1:43221/","t":"B3 Probe","hasMark":true}}
+
+③ 关页真正回收 —— PASS
+     Target.getTargets 返回 2 targets（GUI + agent）
+     closeTarget http://127.0.0.1:43221/ → {"id":2,"result":{}}
+     popup created 12→12, destroyed 9→10   ← dsh.log 出现 destroyed（对应本次）
+     after pages=1（只剩 GUI）
+
+## 2. 本轮新发现并修复的第三个监督缺口（提交 3200efc）
+新包启动后实测仍是「3080 正常、41999 ECONNREFUSED」：
+   flow.log 有 DSH_RELAY_PID=19295（启动脚本确实起过中继），但随后 41999 无监听。
+根因（读代码）：DshWatchdog.maybeRevive 在 isUp()（3080 正常）时**直接 return**，
+压根不走 reviveWebIfDue；而 reviveWebIfDue 本身也只探 WEB_PORT。
+⇒ 「3080 好、41999 没了」这一最常见状态**没有任何代码补中继**。
+修法：web 健康分支里顺手调 ensureRelayRunning（幂等），nodeDir 走
+NodeRuntime.ensureExtracted（marker 命中即返回，代价可忽略），整体 runCatching。
+
+至此三条路径都覆盖：启动早退（cb0591a）、watchdog web 正常（3200efc）、
+启动脚本首次拉起。
+
+## 3. 尚未在真机验证（诚实边界）
+- 3200efc 的中继自愈**尚未装到设备**（用户装的是到 cb0591a 为止的包），
+  故「中继被杀后能被自动补起」这条只有代码级推理 + 拉起逻辑的等价实验
+  （独立端口 42555：拉起成功、二次调用幂等），**没有真机端到端证据**。
+- GUI「可见」仍来自 devtools 元数据（screencap 无 root 失败），非人眼画面。
+
+## 4. 遗留（承接前几轮，未处理）
+- 缺陷 2：page.snapshot() 返回 0 字符（ego_snapshot 退化）；read 类工具走
+  snapshotRaw() 不受影响。仍未定位。
+- ego 的 API 里**没有 closeTab**（本轮实测 ego.closeTab is not a function）；
+  关页只能走 CDP Target.closeTarget 或插件侧的对应工具。

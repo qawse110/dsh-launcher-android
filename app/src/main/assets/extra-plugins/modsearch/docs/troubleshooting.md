@@ -23,7 +23,7 @@ Every engine for the web source failed.
   - firecrawl: ...
 ```
 
-Firecrawl and Keenable both search through keyless endpoints, so a bare installation has an engine. This message now means every candidate failed at runtime. Read the attempt lines for the actual causes, commonly no network, a timeout, exhausted anonymous daily limits, Keenable's hourly keyless pool running out, or a configured engine's quota.
+Firecrawl, Keenable, and You.com all search through keyless endpoints, so a bare installation has an engine. This message now means every candidate failed at runtime. Read the attempt lines for the actual causes, commonly no network, a timeout, exhausted anonymous daily limits, Keenable's hourly keyless pool running out, You.com's daily keyless allowance running out, or a configured engine's quota.
 
 ```bash
 curl -fsSL https://antigravity.google/cli/install.sh | bash && agy   # then sign in
@@ -45,7 +45,7 @@ Individual quota reached. Please upgrade your subscription ... Resets in 94h19m9
 agy's free tier is one weekly grant shared by the Antigravity desktop app, the CLI, and the SDK, and parallel subagents drain it faster. Three ways out:
 
 - Wait for the reset named in the message.
-- Add a keyed search engine (Tavily, Exa, Firecrawl, or Keenable). Search then falls through to it automatically, with no further action from you.
+- Add a keyed search engine (Tavily, Exa, Firecrawl, or Keenable). You.com has no key to add. Search then falls through to it automatically, with no further action from you.
 - With cooldown on (the default), agy is remembered as spent and moved to the back of the chain until it resets, so later runs fail over first. See "An engine keeps getting skipped" below.
 
 ## agy not available in your location
@@ -99,6 +99,14 @@ With no key, Keenable allows 1,000 requests an hour per IP, and everyone on that
 modsearch config set keenable.apiKey <key>
 # or: export KEENABLE_API_KEY=<key>
 ```
+
+## You.com keyless allowance used up for the day
+
+```
+youcom's keyless allowance for this IP is used up for the day (100 searches). Search continues with the next engine.
+```
+
+You.com's keyless search allows 100 searches a day per IP, and everyone on that IP shares the allowance (an office, a VPN exit, a cloud host). The next search engine in the chain picks up the work on its own, and this error does not put You.com on cooldown. There is no key to add for a bigger allowance, so wait for the next day, or use another engine. Any other failure reads `youcom returned <status> <statusText>. <body>`.
 
 ## Tavily out of monthly quota (432/433)
 

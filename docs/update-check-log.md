@@ -798,3 +798,246 @@ dist/index.js (4.62MB，代理主程序)   dist/agent/dsh-native.js (2.22MB，�
 
 **六、顺带更正一条旧环境结论**
 - 旧记忆写「WebView CDP 无 `Target.createTarget`」，本轮实测**可以**（返回 targetId，attach 后 Page/Runtime/Network 域全部可用）。先前「不能」的结论应作废。
+
+### 十六、modsearch 5.10.11 与 dsh-ego-browser 0.9.6 升级（2026-10-28T13:53Z／北京 21:53）
+
+两个内置插件副本各追一个上游小版本。**只改文件，未 commit / 未 push**；未动 Kotlin、未动 `install/` 脚本、未动 `assets/dsh-pin.json`（仍为 `0.2.1-rc.2`）、未动其它插件目录。本机无 java/gradle/Android SDK，本轮**未编译**，也未重启 dsh 做运行时验证（见末节「边界」）。
+
+**一、上游身份与取回（可复算）**
+
+| 插件 | 旧 → 新 | dist-tags.latest | 发布时间（UTC） | tarball 字节数 | registry `fileCount` / `unpackedSize` |
+|---|---|---|---|---|---|
+| `@liustack/modsearch` | `5.10.10` → `5.10.11` | 5.10.11 | 2026-10-28T11:05:40.885Z | 170,839 | 36 / 518,726 |
+| `dsh-ego-browser` | `0.9.4` → `0.9.6` | 0.9.6 | 2026-10-28T11:41:08.717Z | 376,766 | 51 / 1,418,228 |
+
+- 源：`https://registry.npmmirror.com/@liustack/modsearch/-/modsearch-5.10.11.tgz`、`https://registry.npmmirror.com/dsh-ego-browser/-/dsh-ego-browser-0.9.6.tgz`（`curl -sSL`，302 跳 `cdn.npmmirror.com`；`registry.npmjs.org` 直连不可达）。
+- 完整性：两包本地 `sha1` 与 registry `shasum` **逐位相同**（`f5c3fb34…893de17` / `aba73191…cbdb1800`），本地算的 `sha512`-base64 与 registry `integrity` **逐位相同**；`sha256` 分别为 `f3aa3ceb92dbab01ee58069851b0cf07e7077a78d444eafee4439333218e6ce8`、`68c9f65e922ea7e51f413304c6c597e9125ce24740ff0fc2f0ac14fc08127f2f`。
+- 解包后文件数/字节数与 `fileCount`/`unpackedSize` 完全一致（36 / 518,726；51 / 1,418,228）。
+- **零改动口径可复算**：另取旧版 tarball（`modsearch-5.10.10.tgz` 167,573 B、`dsh-ego-browser-0.9.4.tgz` 367,307 B）与替换前的仓库副本逐文件 `sha256` 比对——modsearch 36/36 全同、ego 51/51 全同，差异 0 ⇒ 旧副本本来就是上游整包，本次继续保持「整包同源，无本地改动」。
+
+**二、收录口径（未裁剪任何文件）**
+
+- modsearch：新版整包 36 文件。其 `package.json` `files` 为 `["dist","docs","skills/modsearch/SKILL.md","skills/modsearch/scripts","skills/modsearch/references","CHANGELOG.md","SECURITY.md","dsh","cordis.patch.yml"]`；`files` 之外只剩 `package.json`、`README.md`、`README.zh-CN.md`、`LICENSE` 四个 npm 强制/惯例包含项 ⇒ 全树 36 文件与 `files` 口径一致，`.map` 源映射 0 个，与旧副本 36 文件同构。**删除项：无。**
+- dsh-ego-browser：新版整包 51 文件（根 6 / `bin/` 2 / `lib/` 2 / `runtime/` 37 / `extension/` 4），全部被 `files` 的 `["lib/","bin/","runtime/","extension/","cordis.patch.yml","dsh-plugin.json","THIRD_PARTY_NOTICES.md","!**/*.map"]` 覆盖，负向模式 `!**/*.map` 在树中命中 0 个。**`extension/`（MV3，桌面扩展专用，Android 不适用）按惯例随包保留**，与只读目录清单一致。**删除项：无。**
+
+**三、文件增删改清单（`sha256` 比对，不是只看大小）**
+
+替换方式为「删空旧目录 + 全量拷入新版」（`find <dir> -mindepth 1 -delete` 后 `cp -a`），避免残留已删文件；替换后逐文件 `sha256` 与 tarball 解包树比对，差异 0。两包**均无新增、无删除**，只有内容变化。
+
+- `@liustack/modsearch@5.10.11`：36 文件（旧 36），同 10 / 改 26 / 增 0 / 删 0；目录总字节 507,359 → 518,726。
+  - 改（26）：`CHANGELOG.md`、`README.md`、`README.zh-CN.md`、`dist/main.js`、`docs/dsh.md`、`docs/dsh.zh-CN.md`、`docs/harness-setup.md`、`docs/harness-setup.zh-CN.md`、`docs/security.md`、`docs/security.zh-CN.md`、`docs/testing.md`、`docs/troubleshooting.md`、`docs/troubleshooting.zh-CN.md`、`dsh/client.js`、`dsh/index.js`、`package.json`、`skills/modsearch/SKILL.md`、`skills/modsearch/references/cli.md`、`skills/modsearch/references/cli.zh-CN.md`、`skills/modsearch/references/configure.md`、`skills/modsearch/references/configure.zh-CN.md`、`skills/modsearch/references/output-schema.md`、`skills/modsearch/references/output-schema.zh-CN.md`、`skills/modsearch/references/runtime.md`、`skills/modsearch/scripts/run.ps1`、`skills/modsearch/scripts/run.sh`。
+  - 未变（10）：`LICENSE`、`SECURITY.md`、`cordis.patch.yml`、`docs/commit.md`、`docs/research-gemini-claude-skills.md`、`dsh/fetch-schema.json`、`dsh/search-schema.json`、`dsh/spawnHidden.d.ts`、`dsh/spawnHidden.js`、`skills/modsearch/references/runtime.zh-CN.md`。
+- `dsh-ego-browser@0.9.6`：51 文件（旧 51），同 43 / 改 8 / 增 0 / 删 0；目录总字节 1,389,213 → 1,418,228。
+  - 改（8）：`README.md`(+16/−14)、`dsh-plugin.json`(+1/−1，仅 `version`)、`extension/manifest.json`(+1/−1，仅 `version`)、`lib/client.js`(+47/−21)、`lib/index.js`(+465/−61)、`package.json`(+1/−1，仅 `version`)、`runtime/PATCHES.md`(+8/−0)、`runtime/ego-browser/dist/out/index.js`(+136/−7)。
+  - 未变（43）：`LICENSE`、`THIRD_PARTY_NOTICES.md`、`bin/ego-cast-worker.mjs`、`bin/ego-chrome-wrapper.sh`、`cordis.patch.yml`、`extension/{background.js,popup.html,popup.js}`、`runtime/ego-browser/{screenshot-clip.mjs,screenshot-clip.d.mts}`、`runtime/ego-linux/bin/ego-browser.mjs` 与 `runtime/ego-linux/src/*.mjs`（14 个）、`runtime/skills/ego-browser/` 全部（SKILL.md、agents/openai.yaml、assets/ 2、learnings/ 10、references/ 3、scripts/install.sh）。
+- 替换后目录内 `package.json` 的 `version` 实测：modsearch `5.10.11`（`name "@liustack/modsearch"`）、ego `0.9.6`（`name "dsh-ego-browser"`）；两个目录内无 `*.tgz` / `*.orig` / `*.bak` / `*.rej` 残留。
+
+**四、上游改了什么（便于日后回溯）**
+
+- modsearch 5.10.11（`CHANGELOG.md` 原文三条）：① Antigravity CLI 未配置模型时恢复可用（`agy` 不再提供 `gemini-3.6-flash-low`，默认改 `gemini-3.8-flash-low`，#46）；② dsh 里 `read_page` 与 `web_fetch` 拉开语义（dsh 现在默认开自己的 `web_fetch`；`read_page` 描述改为「要摘要 / 聚焦一问 / JS 渲染页用我，要原始文本或 HTTP 状态码用 `web_fetch`」，#47）；③ 新增 You.com 免密钥引擎（100 次/天、同 IP 共享、链上第三，在 Firecrawl 与 Keenable 之后，#44）。代码可见证据：`dsh/index.js` 的 `ENGINE` 列表在 `'keenable'` 与 `'grok-cli'` 之间新增 `'youcom'`；`registerReadPageTool` 的 `description` 整句重写。
+- ego-browser 0.9.6：工具数 **34 → 35**，新增 `ego_wait_for_human`（CAPTCHA/登录/2FA 阻塞等待，超时返回提示而非报错）；`ego_wait_for_response` 新增 `includeBuffered`（默认 true，回放当前文档已完成的响应；缓存命中会解释并建议 cache-busting）；`sessionScopedSpaces` 默认开（每个 DSH 会话独立 context/window/tab/cursor）；`ego_screenshot` / `ego_download` 在 Web GUI 显示可点击卡片（`deliver:false` 可关）；合并 PR #84/#85/#86。0.9.5 带来的 `runtime/PATCHES.md` 记录亦随包：`waitForResponse: honour glob string matchers`（`networkMatches` 原用 `===` 比字符串，`**/api/stories` 之类 glob 永不匹配，现走 `globToRegExp`）；对应实现在 `runtime/ego-browser/dist/out/index.js` 的 `enablePageEvents` / `waitForNetworkMatch` / `acquireNetworkEvents`。
+- 依赖面未变：modsearch `dependencies` 仍为 `commander ^13.1.0` + `undici ^7.29.0`；ego `dependencies` 仍为 `@deepseek-ai/schemastery ^3.18.3` + `schemastery ^3.18.0`；ego 新版 `lib/index.js` 的 import 仍只有 `node:*` / `@deepseek-ai/dsh-tools` / `@deepseek-ai/schemastery`，`lib/client.js` 仍只 require `@deepseek-ai/dsh-client-store` 与 `react` ⇒ **依赖桥接无需变动**。
+
+**五、兼容性核对（用宿主真实判定函数，不靠读文档）**
+
+- `@liustack/modsearch@5.10.11` `package.json` 原文：`engines = {"node":">=22.13"}`（**无 `engines.dsh`**）、`peerDependencies` = **未声明**（`undefined`）、`dependencies = {"commander":"^13.1.0","undici":"^7.29.0"}`、`dsh = {"bundle":{"patch":"./cordis.patch.yml"},"client":{"inject":[],"platform":"web","immediately":true}}`。没有任何 `@deepseek-ai/dsh*` 版本范围 ⇒ 兼容性前置校验无输入，不存在不覆盖的硬故障。
+- `dsh-ego-browser@0.9.6` `package.json` 原文：`engines = {"node":">=22"}`（**顶层无 `dsh`**）、`dsh.engines.dsh = ">=0.1.2-rc.1"`、`peerDependencies = {"@deepseek-ai/dsh-client-locale":">=0.1.2-rc.1","@deepseek-ai/dsh-client-store":">=0.1.2-rc.1","@deepseek-ai/dsh-client-ui-settings-plugins":">=0.1.2-rc.1","@deepseek-ai/dsh-client-ui-slots":">=0.1.2-rc.1","@deepseek-ai/dsh-settings":">=0.1.2-rc.1","@deepseek-ai/dsh-tools":">=0.1.2-rc.1","react":"^18.2.0","schemastery":"^3.18.0"}`（`peerDependenciesMeta` 全部 `optional:true`）、`dependencies = {"@deepseek-ai/schemastery":"^3.18.3","schemastery":"^3.18.0"}`。6 条 `@deepseek-ai/dsh-*` peer 全为**无上界**的 `>=0.1.2-rc.1`，覆盖 `0.2.1-rc.2`。
+- 判定语义提醒（与清单 `$compatContract` 一致，源码 `@deepseek-ai/dsh-app-boot/lib/index.js`）：`unmetRequirements()` 只认**顶层** `engines.dsh`；ego 的 `dsh.engines.dsh` 是嵌套字段，**不参与**独占判定，实际判定走 6 条 peer（`satisfies` 带 `includePrerelease`）。
+- 直接 import 宿主同一个 `evaluatePluginCompatibility`（`/data/user/0/com.dsh.nextapp1/files/dsh-prefix/node_modules/@deepseek-ai/dsh-app-boot/lib/index.js`）对**替换后仓库内副本**实测：
+
+```
+modsearch 5.10.11 vs dsh 0.2.1-rc.2 => undefined (compatible)
+modsearch 5.10.11 vs dsh 0.2.1-rc.4 => undefined (compatible)
+modsearch 5.10.11 vs dsh 0.2.0-rc.2 => undefined (compatible)
+modsearch 5.10.11 vs dsh 0.3.0     => undefined (compatible)
+modsearch 5.10.11 vs dsh 0.1.9-rc.1 => undefined (compatible)
+ego 0.9.6 vs dsh 0.2.1-rc.2 => undefined (compatible)
+ego 0.9.6 vs dsh 0.2.1-rc.4 => undefined (compatible)
+ego 0.9.6 vs dsh 0.2.0-rc.2 => undefined (compatible)
+ego 0.9.6 vs dsh 0.3.0     => undefined (compatible)
+ego 0.9.6 vs dsh 0.1.9-rc.1 => undefined (compatible)
+```
+
+- **结论：两个新版本都覆盖 targetDsh `0.2.1-rc.2`，不会触发「装配成功但运行时被静默禁用」的硬故障，升级放行。** ego 上游 README 的兼容矩阵也自称「v0.9.6 已在 DSH `0.1.2-rc.1` 至 `0.1.7`（含 0.2.0-rc.x / 0.2.1-rc.2）验证」；上面是用宿主函数复核，不采信自述。
+
+**六、清单与文档**
+
+- `app/src/main/assets/plugin-manifest.json`：本次升级只动两个条目——`version` 改为 `5.10.11` / `0.9.6`；`desc` 里写死的「v5.10.10」「v0.9.4」同步改为「v5.10.11」「v0.9.6」；两条各在 `upstream` **之后**新增机器可读渠道声明 `"npm": "@liustack/modsearch"` / `"npm": "dsh-ego-browser"`（值与各自 `package.json` 的 `name` 完全一致）。其余 14 个条目的 title/desc/version/upstream 一字未动。
+- 关于 `npm` 字段：本期并行有另一路工作在推进「在线升级」功能（未跟踪的 `app/src/main/assets/install/plugin-upgrade.mjs`），它给清单顶层加了 `$npmComment`、并给 `dsh-web-mobile` / `dsh-providers-hub` / `dsh-net-proxy` / `dsh-skills-manager` / `billion-context` 五个条目补了同样的 `npm` 字段（现共 16 条目 / 7 条带 `npm`）。那些改动**不属于本次升级**，本文档不据为己有；本次只按同一契约给 modsearch 与 dsh-ego-browser 补字段，两条的值都与各自 `package.json` 的 `name` 逐字符相等。
+- 门禁原文（`node tools/check-plugin-manifest.mjs`，exit 0）：
+
+```
+✓ 插件清单一致性校验通过：builtin=13，optional=3
+```
+
+**七、边界（未验证）**
+
+- 本轮**未编译**（本机无 java/gradle/Android SDK）、**未重启 dsh**、**未在真机重新装配**：以上证明的是「文件与上游逐字节一致 + 清单结构与命名契约成立 + 宿主兼容性判定放行」，不含「插件在运行中的进程里真的加载并工作」。
+- ego-browser 的运行期前提未变：设备上仍需一个可达 Chrome/Chromium 二进制（本机当前未装），否则工具可加载但会如实回报「未找到浏览器二进制」。
+- modsearch 5.10.11 新增的 You.com 引擎与 `read_page` 新描述只在代码层核对，未真机发起检索。
+- 取回与比对用的 tarball、解包树、比对脚本只放在**未跟踪**的 `tmp/dl/`，核对完毕后已全部删除（不留 tarball）；插件目录内无任何临时产物，`find` 扫 `*.tgz` / `*.orig` / `*.bak` / `*.rej` 均为 0。
+
+### 十七、插件在线升级（npm 渠道）落地（2026-10-28T16:50Z／北京 00:50）
+
+**本节解决的问题**：内置/可选插件的源码是随 APK 打进 `assets/extra-plugins` 与 `assets/optional-plugins` 的，装配链（`install/plugins.mjs` 的 `syncExtraPlugin`）只会把 APK 里的副本同步进 `files/plugins`。因此在本部署里，「上游发了新版本」这件事**原本没有任何入口** —— 用户只能等下一个 APK。本节把这条通道补上：按清单里的 `npm` 字段直连 registry 取版、下 tarball、整目录替换 `files/plugins/<dir>`，并把结果写进 `files/plugin-upgrade.json` 供插件管理页读取。
+
+> 与第十六节的关系：第十六节末尾那句「本期并行有另一路工作在推进『在线升级』功能……那些改动**不属于本次升级**，本文档不据为己有」——**那句边界到此收口**。第十六节只给 modsearch / dsh-ego-browser 补了两个 `npm` 字段；本节统一交代全部 7 条 `npm` 渠道（含第十六节未认领的那 5 条）、`npmTrimmed` 标记的由来，以及它们各自与上游的同源核对结论。
+
+**一、三条设计约束（都不是可选项，写进 `plugin-upgrade.mjs` 文件头）**
+
+1. **只动 `files/plugins/<dir>`，绝不动 `files/extra-plugins/<dir>`。** 后者是「内置源」＝APK 资产的设备侧镜像，语义是出厂版本；「一键重置」必须还能回到出厂版本，所以在线升级不能污染它。
+2. **升级前必须备份。** 备份到 `files/.plugin-backup/<dir>/<version>/`，每个插件最多留 3 份（按写入时间淘汰）。上游发版可能引入不兼容（本仓历史上踩过 dsh peer 判定、client bundle 缺失两类），出问题时用户要能一键退回。
+3. **降级守卫与安装链同源。** `install/plugins.mjs` 的 `syncExtraPlugin()` 已经会拒绝「APK 源比副本旧」的回灌；本脚本反向也要成立：在线升级过的副本，不能因为 APK 升级而被旧内置源盖掉。Kotlin 侧 `AssetSync.refreshBundledPluginCopies` 已补配套守卫（见第七节）。
+
+**二、交付物清单（新增文件均未跟踪，需随本次一并联入）**
+
+| 文件 | 行数 | 作用 |
+|---|---|---|
+| `app/src/main/assets/install/plugin-upgrade.mjs` | 818 | 唯一实现：查版 / 升级 / 回滚 / 列状态。子命令 `--check [--force] [--only <dir>]`（默认）、`--apply <dir> [--version <v>] [--force]`、`--rollback <dir> [--version <v>]`、`--list`；退出码 0=成功（含「已是最新」），1=失败 |
+| `app/src/main/java/com/dsh/nextapp1/core/PluginUpgrade.kt` | 242 | Kotlin 只做「保证脚本在位 / 读状态 / 列备份」，**不碰网络与 tar**。状态文件缺失是正常态 → `State(exists=false)`，界面显示「未检查」而不是「已是最新」 |
+| `app/src/main/java/com/dsh/nextapp1/ui/PluginManagerActivity.kt` | +426/−5 | 新增「插件在线升级」分区、汇总卡、升级/回滚确认弹窗、升级后「立即重启」弹窗；`PluginEntry` 加 `npm` / `npmTrimmed`；内置/可选卡片新增「副本领先内置源」状态 |
+| `app/src/main/java/com/dsh/nextapp1/core/AssetSync.kt` | +82 | 不降级守卫 + 三个共享判据 `pkgVersionOf` / `compareVersionNums` / `isNewerThanSource` |
+| `app/src/test/java/com/dsh/nextapp1/core/PluginUpgradeGuardTest.kt` | 283 / 14 个 `@Test` | 守卫语义 + 状态读取 + 备份枚举 |
+| `tools/plugin-upgrade.test.mjs` | 205 / 41 项断言 | `compareVersions` 方向与预发布比较 + `extractTarball` 的路径穿越/非普通文件拒绝 |
+| `tools/verify-plugin-npm-source.mjs` | 342 | 联网的同源核对工具（**刻意不进 CI**，因为要打 registry） |
+| `tools/check-plugin-manifest.mjs` | +47/−2 | CI 离线门禁新增第 6 项：`npm` 字段格式合法且不重复（不联网） |
+| `.github/workflows/ci.yml` | +7 | 新步骤「插件在线升级工具自测」插在「前缀适配工具自测」与「Assemble debug」之间 |
+
+**三、npm 渠道盘点：16 条目里 7 条可在线升级**
+
+| 插件（清单 dir） | version | npm | npmTrimmed |
+|---|---|---|---|
+| `dsh-web-mobile` | 3.2.1 | `dsh-web-mobile` | true |
+| `dsh-providers-hub` | 2.8.261028 | `dsh-providers-hub` | true |
+| `dsh-net-proxy` | 0.8.0 | `dsh-net-proxy` | true |
+| `modsearch` | 5.10.11 | `@liustack/modsearch` | false |
+| `dsh-ego-browser` | 0.9.6 | `dsh-ego-browser` | false |
+| `dsh-skills-manager` | 1.2.21 | `@michengai/dsh-skills-manager` | false |
+| `billion-context` | 0.1.209 | `billion-context` | true |
+
+另 9 条**没有** `npm`，逐条原因（都实测查过 registry，不是猜的）：
+
+- `dsh-wish-specializer` 0.9.0-stable：只发 GitHub Release tgz，registry 无包。
+- `dsh-mobile-replay` 0.1.0 / `dsh-status-bridge` 0.1.3 / `dsh-android-links` 0.1.1 / `dsh-vision` 0.2.0 / `dsh-oh-we-need` 0.2.0 / `billion-context-dsh` 0.2.27：`@dsh-external/*` 是本仓私有 scope，未发布到公共 registry。
+- `dsh-provider-headers` 0.1.0：registry 上确有同名包（latest 0.1.2），但目录结构完全不同（上游平铺 `index.js` + `client.js`，本仓是 `lib/index.js` + `lib/client.js`）⇒ 异源，不能声明 npm 渠道。
+- `dsh-llm-codebuddy` 1.6.0：registry latest 只有 1.3.10，本仓副本更新（属 ahead），声明了也只会永远显示「领先上游」，无升级意义。
+
+**四、同源核对（本节最重要的一条安全结论）**
+
+`npm` 字段写错有两种静默后果：① 拼错 → 永久查版失败，但构建与装配全正常，没人会发现；② **写成真实存在但与本仓副本不同源的包 → 用户点一下「升级」，本仓对插件的本地改动被上游整包无声覆盖**。为此新增 `tools/verify-plugin-npm-source.mjs`，判据对应清单 `$npmComment` 三条：包真实存在（能取到清单所声明版本的 tarball）、包内 `package.json` 的 `name` 与清单 `name` 逐字符相等、仓库副本与该版本 tarball **逐文件 sha256 比对 + CRLF 归一**。
+
+`node tools/verify-plugin-npm-source.mjs --quiet` 实测输出：
+
+```
+✓ dsh-web-mobile (dsh-web-mobile@3.2.1) 裁剪版，可在线升级
+✓ dsh-providers-hub (dsh-providers-hub@2.8.261028) 裁剪版，可在线升级
+✓ dsh-net-proxy (dsh-net-proxy@0.8.0) 裁剪版，可在线升级
+    本仓 23 / 上游 23 文件；升级会补全 0 个文件（+0 B，无）；本仓 22 个文件仅 CRLF 行尾差异，语义等同
+✓ modsearch (@liustack/modsearch@5.10.11) 与上游逐文件同源（36 文件）
+✓ dsh-ego-browser (dsh-ego-browser@0.9.6) 与上游逐文件同源（51 文件）
+✓ dsh-skills-manager (@michengai/dsh-skills-manager@1.2.21) 与上游逐文件同源（50 文件）
+✓ billion-context (billion-context@0.1.209) 裁剪版，可在线升级
+    本仓 11 / 上游 39 文件；升级会补全 28 个文件（+31.30 MB，非 dsh 适配层 15、文档/论文/站点 11、文档 2）
+
+汇总：同源 3 / 裁剪版 4 / 裁剪但需确认 0 / 本地改动 0
+✓ 没有发现「本地改动」条目，7 条 npm 渠道均可在线升级
+```
+
+**结论：7 条里没有一条是「本地改动版」。** 4 条是纯裁剪（只删 sourcemap / `.d.ts` / TS 源码 / 文档 / 论文配图 / 非 dsh 宿主的适配层，本地留下的文件与上游逐字节相同或仅 CRLF 差异）。因此**裁剪版在线升级 = 用上游完整包覆盖，只会「补全」被裁掉的文件，不会丢失本仓任何代码改动**，功能上安全（代价是体积变大）——这也是清单 `npmTrimmed` 标记存在的意义：UI 必须在用户点升级之前就把「文件数会从 8 变成 209」讲清楚。
+
+逐条差异明细（供复核）：
+
+- `dsh-web-mobile@3.2.1`：本仓 8 文件 / 上游 209 文件，8 个本地文件与上游逐字节相同，多 0、改 0 ⇒ 纯裁剪。缺的 201 个 = `lib/types` 128（`.d.ts` + `.d.ts.map`）+ `src/client` 63（TS 源码）+ `lib/*.js.map` 3 + `assets/*.png` 4（README 配图，`grep` `lib/*.js` 命中 0 次）+ 顶层 `src/*.ts`。
+- `dsh-providers-hub@2.8.261028`：本仓 251 / 上游 980，缺的 729 个**全部**是 `*.js.map` 与 `*.d.ts`（含 `lib/openai-gateway` 45 个 sourcemap），其它缺失 0；本地文件与上游逐字节相同 ⇒ 只删 sourcemap。本仓 8.52 MB vs 上游 14.88 MB。
+- `dsh-net-proxy@0.8.0`：本仓 23 / 上游 23 文件，22 个「不同」全部是 CRLF 行尾差异，归一律后实质不同 **0** 个 ⇒ 语义完全等同上游。
+- `billion-context@0.1.209`：本仓 11 / 上游 39，11 个文件与上游逐字节相同（same=11 diff=0），缺 24 个全是非运行时文件（`dist/kimi/*`、`dist/zcode/*`、`dist/claude-*`、`dist/mcp.js`、`dist/agent/{dsh-acp,omp,omp-native,opencode,pi,pi-native}.js`、中英文 README/CONFIGURATION、`paper/*`、`hermes-plugin/*`）⇒ 正是清单 desc 明写的「已按上游 files 字段裁剪」。本仓 10.18 MB vs 上游 37.95 MB。
+
+⚠ 一条方法论教训：先前一轮我用「工作区 vs 上游 tarball」直接比对，把 `dsh-skills-manager` 的 9 个改动文件误判为「本地补丁」，实际是**升级本身**造成的。判断「本地改动」必须拿 `git archive HEAD` 做三方对照（HEAD 树 vs 旧版上游、工作区 vs 新版上游），不能只看工作区与上游的差异。
+
+**五、真机等价实测（用真机上的旧副本当升级对象）**
+
+脚手架 `tmp/doc17/`，`HOME` / `DSH_PREFIX` / `DSH_EXTRA_PLUGINS_SRC` / `DSH_PLUGINS_DIR` / `TMPDIR` 全指到该目录，`plugins/` 里放的是从 `/data/user/0/com.dsh.nextapp1/files/plugins/` 复制来的**设备真实旧副本**（modsearch 5.10.10 / ego 0.9.4 / skills-manager 1.2.20 / billion-context 0.1.208 / web-mobile 3.2.1 / providers-hub 2.8.261028 / net-proxy 0.8.0）。
+
+`--check --force` 实测：
+
+```
+>> 检查上游版本（7 个 npm 渠道插件，清单 plugin-manifest.json）
+   ✓ dsh-web-mobile  3.2.1 已是最新
+   ✓ dsh-providers-hub  2.8.261028 已是最新
+   ✓ dsh-net-proxy  0.8.0 已是最新
+   ↑ modsearch  5.10.10 → 5.10.11
+   ↑ dsh-ego-browser  0.9.4 → 0.9.6
+   ↑ dsh-skills-manager  1.2.20 → 1.2.21
+   ↑ billion-context  0.1.208 → 0.1.209
+   状态已写入 …/plugin-upgrade.json（可升级 4 个）
+```
+
+`--apply` 四条全部 `exit=0`，每条都打印「已下载 N 字节 → 解出 M 个文件 → 已备份 → 已替换」：
+
+| 插件 | tarball 字节 | 解出文件 | 升级后版本 | 升级后目录实测 | 备份版本 |
+|---|---|---|---|---|---|
+| `modsearch` | 170,839 | 36 | 5.10.11 | 36 文件 / 518,726 B | 5.10.10 |
+| `dsh-ego-browser` | 376,766 | 51 | 0.9.6 | 51 文件 / 1,418,228 B | 0.9.4 |
+| `dsh-skills-manager` | 1,045,869 | 50 | 1.2.21 | 50 文件 / 1,545,336 B | 1.2.20 |
+| `billion-context` | 10,683,331 | 39 | 0.1.209 | 39 文件 / 46,699,842 B | 0.1.208 |
+
+四条升级后目录的**文件数与字节数都与 registry 的 `fileCount` / `unpackedSize` 逐字相等**（含 billion-context 的 46,699,842 B）。billion-context 因为标了 `npmTrimmed`，升级前额外打印两行裁剪版提示（「只会补回被裁掉的 sourcemap/.d.ts/文档/非本宿主适配层等文件，功能不变但体积会变大」）。每条最后都打印 `⚠ 副本已替换，需重新装配后 dsh 才会使用新代码（插件管理页「重新装配」）`。脚手架里没有 `dsh-prefix`，所以每条都有一行 `WARN dsh-prefix node_modules missing, skip plugin dep bridge` —— 预期行为（真机上有 `dsh-prefix`，依赖桥接会真的跑）。
+
+`--rollback billion-context` → `✓ 已回滚到 0.1.208（11 个文件），需重新装配`，回滚后实测 11 文件 / 10,673,909 B，正是裁剪版体积。
+
+幂等 / 错误路径 / 守卫（全部实测）：
+
+- `--apply modsearch`（已最新）→ `✓ 已是最新（本地 5.10.11，上游 5.10.11），无需升级`，`exit=0`（**不是失败**）。
+- `--apply dsh-vision`（无 npm）→ `plugin-upgrade: dsh-vision 未声明 npm 渠道（无 online 升级来源）`，`exit=1`。
+- `--rollback dsh-web-mobile`（无备份）→ `没有可用备份（…/.plugin-backup/dsh-web-mobile）`，`exit=1`。
+- **ahead 守卫**：把 `dsh-net-proxy` 本地版本改成 9.9.9 后 `--check --force` → `• dsh-net-proxy  9.9.9 领先上游 0.8.0（不降级）`，状态文件里 `status="ahead"`、`updateAvailable=false`；再 `--apply dsh-net-proxy` → `✓ 已是最新（本地 9.9.9，上游 0.8.0），无需升级`，版本仍是 9.9.9，**没有被降级**。
+- **备份轮转**（`MAX_BACKUPS=3`）：为 modsearch 造 5.10.7 / 5.10.8 / 5.10.9 三份备份后再升级，最终剩 5.10.6 / 5.10.8 / 5.10.9 —— 最旧的 5.10.7 被删。注意**按 mtime 排序淘汰，不按版本号**。
+
+**六、Kotlin 侧接入（不碰网络，只调脚本 + 读状态 + 给按钮）**
+
+- 调用形态与既有 `rewireCore` 同源：`node <files>/install/plugin-upgrade.mjs <子命令>`，env 只需 `DSH_PREFIX`（其余路径由 `install/env.mjs` 自动派生），另加 `DSH_PROFILE=web` / `DSH_PLUGINS_DIR` / `DSH_APK_VER`。脚本每次调用前用 `AssetSync.copyAsset` 从 assets 覆盖一份到 `files/install/`，失败则沿用本地旧副本（`PluginUpgrade.ensureScript`）——因为快速启动路径不一定会走 `syncCompatScripts`。
+- **UI 三态不许骗人**：状态只来自 `files/plugin-upgrade.json`；**没查过就显示「未检查」，绝不把「没有记录」渲染成「已是最新」**。`PluginUpgrade.isStale` 在 `checkedAtMs<=0`（回滚后脚本会强制写 0 以逼下次走网络）或超过 6 小时缓存时判过期。
+- 「已升级 · 待重启」是独立状态：只有 `upgraded[dir].to == 当前读出的版本` 时才显示，且**必须染 WARNING 而不是绿色**（绿色等于告诉用户「这就生效了」，而实际上 dsh 跑的还是旧代码）。升级成功后弹窗给「立即重启 / 稍后 / 重新装配」三个出口（「立即重启」直接调既有 `restartFlow()`）。
+- 清单 `PluginEntry` 新增 `npm` 与 `npmTrimmed`（都有默认值，`parseManifestList` 是唯一构造点）。`statusColor` 新增四条分支且**必须排在「已装配」之前**（「可升级」「待重启」→ WARNING，「查版失败」→ DANGER，「已是最新」「领先上游」→ TEXT_MUTED），否则会被「已装配」分支染成绿色的「一切正常」。
+- 内置/可选卡片新增「已装配 · 副本领先内置源」：`AssetSync.isNewerThanSource` 为真时不再显示「副本落后于源」，也不提供「修复」（否则「修复」会把在线升级偷偷回滚）。
+
+**七、AssetSync 不降级守卫（回灌风险）**
+
+`refreshBundledPluginCopies` 原本会把 `files/plugins` 用 `extra-plugins` 整个覆盖 —— APK 一升级，用户在线升级过的副本就被出厂版本盖回去（备份还在，但行为极难解释）。守卫插在「内容一致则跳过」之后、`deleteRecursively` 之前：
+
+- 语义与 `install/plugins.mjs` 的 `compareVersion` **严格对齐**：任一侧版本号取不到（缺 `version` / 自由文本）→ **fail-open，照旧覆盖**；本地 > 源 → 跳过，且**不写任何 marker**（假账会让下一次启动起就静默）。
+- fail-open 是必须的：既有 `MarkerStoreTest` 的夹具 `package.json` 只有 `{"name":"plugA"}` 没有 `version`，若在这里 fail-closed 会直接把既有测试打红。
+- 判据抽成 `AssetSync.isNewerThanSource(localDir, sourceDir)` 供三处消费：`refreshBundledPluginCopies` 守卫、`PluginManagerActivity.isAheadOfSource`、`repairFromSource` —— 保证「判据逐字同源」，不会三处各写一套。
+- `repairFromSource(e, allowDowngrade = …)` 默认 `false`：修复/恢复**拒绝**用旧源覆盖更新的本地副本，并提示「如需退回出厂版：用『插件在线升级』分区的『回滚』，或『一键重置』」。只有 `resetBuiltins()`（语义就是回出厂版）显式传 `true`。
+
+**八、用真 kotlinc 编译校验发现的两个真 bug（都会让 CI 挂）**
+
+本机没有 gradle，但「没有 gradle」不等于「没法验」：设备上装了 JDK 17 与 kotlinc 2.0.21（`/data/user/0/com.dsh.nextapp1/files/tools/jdk17`、`tools/bin/kotlinc`），用 `android.jar`（api 34）+ commons-compress + 自写桩对**整文件**做了真编译，`exit=0`、error 归零。过程中揪出两个真 bug：
+
+1. **KDoc 里的 `@dsh-external/*` 触发了 Kotlin 嵌套块注释。** 原写 `* @dsh-external/* 与只发 GitHub Release 的插件…`。Kotlin **支持嵌套 `/* */`**，那个 `/*` 打开了内层注释，把 `data class PluginEntry` 之后的**整个类体吞进了注释**。kotlinc 报的却是 `PluginManagerActivity.kt:1187:9: error: syntax error: Parameter name expected.` + 「Parameters must have type annotation」+ 约 150 条 `unresolved reference` 与 `overload resolution ambiguity` —— **报错方向完全是错的**。改成 `` `@dsh-external/<pkg>` `` 后 error 从 159 条降到 0。
+   ⇒ **本仓 Kotlin 注释里写 npm scope 时绝不能出现裸 `/*`。**
+2. **反引号测试名里不能含 `.` 和 `/`。** `PluginUpgradeGuardTest.kt` 原有 4 个测试名带 `.` 或 `/`（`rc.10`、`package.json`、`副本损坏/被改`），kotlinc 报 `error: name contains illegal characters: .`。这条如果没发现，CI 的 `:app:testDebugUnitTest` 会在**编译阶段**直接失败。已改名为 `rc10` / `package json` / `副本损坏或被改`。仓库里既有的 122 个反引号测试名一律不含 `.` 或 `/`，本仓既有约定如此。
+
+**九、门禁（全部 exit 0）**
+
+```
+node tools/plugin-upgrade.test.mjs      → ✓ plugin-upgrade 单测通过：41 项断言（compareVersions + extractTarball）
+node tools/check-plugin-manifest.mjs    → ✓ 插件清单一致性校验通过：builtin=13，optional=3
+node tools/verify-prefix-patch.test.mjs → 15 项通过
+node tools/verify-plugin-npm-source.mjs → 见第四节（联网，不进 CI）
+```
+
+`check-plugin-manifest.mjs` 的 npm 校验做过负向测试：临时把 6 条 `npm` 改成大写 / 带空格 scope / 首尾空格 / 空串 / 两条重复，门禁如实报 `✗ 插件清单一致性校验失败（5 项）` 并逐条命中；恢复后重新 `✓`。
+
+**十、随本次一并升版的两个插件副本（`assets/extra-plugins/`）**
+
+- `dsh-skills-manager` 1.2.20 → **1.2.21**：tarball 1,045,869 B，本地 `sha1` / `sha512` 与 registry `dist.shasum` / `dist.integrity` 逐位相同；解包 50 文件 / 1,545,336 B 与 `fileCount` / `unpackedSize` 一致；逐文件 相同 40 / 改 9 / 新增 1（`assets/icon.svg`）/ 删除 0；替换后 50/50 sha256 全同。语义变化：**全部 API 路由前缀加上 `/michengai`**（服务端 53 处 + 前端 2 处，注册点 `lib/index.js:364`）、`fs.rename` 改 `renameWithRetry`（`lib/core.js:1284` 定义、`:3633` 导出）、`package.json` 新增 `icon` 字段。`engines.dsh = ">=0.2.0-rc.1 <0.3.0-0"`，用宿主同一份 `evaluatePluginCompatibility` 实测 0.2.1-rc.2 / 0.2.1-rc.4 / 0.2.0-rc.2 → 放行，0.3.0 / 0.1.9-rc.1 → 被拒，**与 1.2.20 判定完全相同**。前缀改动对本仓影响：`app/src/main` 与 `install/` 对 `/api/michengai/…` 引用为 0，**无需同步改代码**；`docs/update-check-log.md:732/775/776/781` 与 `docs/runtime-evidence/EVIDENCE-runtime.md:8-9` 里的旧前缀属历史证据，append-only 不改。
+- `billion-context` 0.1.208 → **0.1.209** 并按新版 `files` 字段重新裁剪：tarball 10,683,331 B，`sha1` / `sha512` 与 registry 逐位相同；全包 39 文件，**保留 11 个**（与 0.1.208 的保留集完全同形：`LICENSE` / `README.md` / `CONFIGURATION.md` / `dist/index.js` / `dist/build-info.json` / `dist/agent/{dsh-native,dsh-native-client,dsh-compaction-gate,opencode-native}.js` / `dsh.bundle.patch.yml` / `package.json`），裁掉 28 个 / 32,824,615 B（非 dsh 宿主适配层 15、文档/论文/站点 11、其余 2）。与 0.1.208 相比 `package.json` **只有 `version` 与 `files` 两个字段变化**（exports / main / bin / `dsh.bundle` / engines / dependencies / optionalDependencies / peerDependencies 全部逐字相同，`dsh.bundle.patch.yml` 逐字节相同 ⇒ 装配补丁面零变化）。裁掉的文件确实不被 dsh 车道引用：对 5 个保留的 js 抓相对导入，命中的路径在上游包里本就 absent（0.1.208 也 absent，是 bundler 留下的条件分支字符串）；「存在于包内但不在保留集里」的相对导入 = 0 条。新文件冒烟：`node --check` 5 个 js 全 ok，`import(./dist/agent/dsh-compaction-gate.js)` → `name=bili-compaction-gate`、`import(./dist/agent/dsh-native.js)` → `name=bili-native, inject=["tools","commands","agents"]`。
+
+**十一、边界（未验证，不遮掩）**
+
+- **未跑 `gradle :app:assembleDebug`、未跑 `:app:testDebugUnitTest`**：本机无 gradle、无 `appcompat` / `material` / `junit` / `robolectric` 依赖缓存，且 `git push` 无任何凭据（`git push --dry-run` → `fatal: could not read Username for https://github.com`），**无法触发 CI**。已做到的替代验证：用真 kotlinc 2.0.21 对 `PluginManagerActivity.kt` + core 四文件做整文件编译（`exit=0`，Ui / material / appcompat 用自写桩）、对 `PluginUpgradeGuardTest.kt` 做类型检查（`exit=0`）。**`Ui.kt` 自身的实现未参与编译**（真实 `Ui.kt` 依赖 material 库），只逐一对齐了调用签名。⇒ 交付后仍须在 CI 上过一次真编译。
+- **未在真机装上带本功能的新 APK 做端到端回归**。设备现状（`/data/user/0/com.dsh.nextapp1/files`）：`files/install/` 里**没有** `plugin-upgrade.mjs`（装的是旧 APK）、`files/plugin-manifest.json` 的 `npm` 字段 **0 条**（旧清单）、`files/plugin-upgrade.json` **不存在**。所以本节的真机证据是「用设备真实旧副本 + 仓库新脚本/新清单在脚手架里跑通」，**不是**「在 App 界面里点出来的」。装上后进插件管理页应能看到 7 条 npm 渠道、检查更新报 4 条可升级，并可直接把设备上的 modsearch 5.10.10 / ego 0.9.4 / skills-manager 1.2.20 / billion-context 0.1.208 升到新版。
+- **升级后「重启生效」的机制只做了静态核对**：设备 `.dsh/profiles/web/node_modules` 里 7 条插件都是指向 `files/plugins/<dir>` 的符号链接（如 `@liustack/modsearch -> ../../../../../plugins/modsearch`），profile 的 `package.json` 写成 `link:/data/user/0/com.dsh.nextapp1/files/plugins/<dir>` ⇒ 插件物理目录被替换后符号链接仍指向新内容，**不需要改 link 目标**；但 dsh 进程已 require 过的模块不会热替换，所以「重新装配 / 重启」仍然必要（脚本最后那行提示是对的）。未在运行中的 dsh 里验证「重启后确实加载了新版代码」。
+- **registry 可达性依赖当前网络**：实测 `registry.npmmirror.com` 可达、`registry.npmjs.org` 直连不可达（脚本按 npmmirror → npmjs 顺序兜底）。若两者都不可达，`--check` 会把每条标成 `status="error"` 并写进状态文件，UI 显示「查版失败」，不会伪装成「已是最新」。
+- 取回与比对用的 tarball、解包树、脚手架都只放在**未跟踪**的 `tmp/`（`tmp/doc17/`、`tmp/b209*`、`tmp/up12*`、`tmp/liverepro/` 等），插件目录内无临时产物，`find` 扫 `*.tgz` / `*.orig` / `*.bak` / `*.rej` 均为 0。

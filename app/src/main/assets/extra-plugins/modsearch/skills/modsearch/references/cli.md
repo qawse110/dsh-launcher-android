@@ -42,7 +42,7 @@ Output is always a `results` array, one entry per corpus:
 | `-s, --source <list>` | Corpora: `web`, `x`, or `web,x` | from the query, else `web` |
 | `-e, --engine <name>` | Use only this engine for this run. On failure the run errors instead of switching engines | automatic |
 | `-o, --output <path>` | Also write JSON to a file | |
-| `-m, --model <name>` | Engine model | `gemini-3.6-flash-low` |
+| `-m, --model <name>` | Engine model | `gemini-3.8-flash-low` |
 | `--prompt <text>` | Extra constraints for this run, passed to the engine | |
 | `--max-results <n>` | Maximum search results | `8` |
 | `--timeout <ms>` | Time one engine may take. A failed engine hands over to the next with a fresh budget | `180000` |
@@ -60,6 +60,6 @@ macOS and Linux are fully supported and run the whole test suite in CI on Node 2
 
 The CI matrix also includes `windows-latest` on Node 22 and 24, running the same typecheck, test, and build gate. What works on Windows follows from what each part depends on:
 
-- **The CLI, its routing and config logic, and the HTTP engines** (`local` fetch, Tavily, Exa, Firecrawl, Keenable) are pure Node: they use `fetch` and the filesystem alone, so they are cross-platform.
+- **The CLI, its routing and config logic, and the HTTP engines** (`local` fetch, Tavily, Exa, Firecrawl, Keenable, You.com) are pure Node: they use `fetch` and the filesystem alone, so they are cross-platform.
 - **agy and grok are external CLIs.** modsearch runs them by name with no shell, so a native Windows executable on PATH works, while an npm-style `.cmd` shim does not. Whether a Windows build exists is each tool's own decision, not modsearch's. Every direct child is started with `windowsHide: true`, so a GUI host with no console does not flash a new black window per call.
 - **The cooldown state file** is written through a temp file and an atomic rename. On Windows that rename replaces the target, but the OS cannot replace a file another process holds open, so a rare simultaneous-writer race can drop one write. The store is a best-effort cache that merges on read, so a later run rediscovers anything lost.

@@ -1,5 +1,11 @@
 # Changelog
 
+## 5.10.11 - 2026-10-28
+
+- Antigravity CLI searches work again with no model configured (#46). agy no longer offers `gemini-3.6-flash-low`, the default modsearch passed, so every call failed with `invalid model selection`. The default is now `gemini-3.8-flash-low`. If you set `antigravity-cli.model` yourself as a workaround, it keeps working. `agy models` lists the ids your agy accepts.
+- In DeepSeek Harness, the model can now tell `read_page` and `web_fetch` apart (#47). dsh turns its own `web_fetch` on by default these days, so the model saw two tools that both take a URL and had to guess. The `read_page` description now says when to use it: for a digest, a read focused on one question, or a page that only renders with JavaScript. It also says to use `web_fetch` for the raw page text or the HTTP status code. The docs no longer claim dsh ships `web_fetch` switched off.
+- New search engine: You.com (#44). It searches with no key and no signup, on 100 searches a day shared by everyone on the same IP. It sits third in the search chain, after Firecrawl and Keenable, so a busy IP that uses up both still has a free fallback. It searches only, and its summary is mechanical like Keenable's. The dsh settings card lists it as a keyless engine. `modsearch config set youcom.enabled false` leaves it out of the chain.
+
 ## 5.10.10 - 2026-10-19
 
 - `web_fetch` in DeepSeek Harness no longer fails with `multiple usable web providers are registered (deepseek-fetch-api, http); configure one explicitly` (#43). To send `web_search` to modsearch, the plugin rewrites dsh's web settings, and that rewrite replaces the whole block, so it also dropped dsh's own `fetchProvider: http`. That was harmless while `http` was the only page fetcher. Newer dsh builds, the desktop app 44.7.0 among them, add a second one, `deepseek-fetch-api`, so dsh could no longer choose. The plugin now keeps `fetchProvider: http`. If you added a `- id: web` override to your profile patch as a workaround, you can delete it now, or leave it in place. Either way works. The dsh guide's example for switching search back now keeps that line too.

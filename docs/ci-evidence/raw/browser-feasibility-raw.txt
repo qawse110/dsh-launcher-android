@@ -1,0 +1,31 @@
+### 1) 设备上没有任何 Chrome/Chromium 二进制
+  chrome                (not on PATH)
+  chromium              (not on PATH)
+  chromium-browser      (not on PATH)
+  brave                 (not on PATH)
+  msedge                (not on PATH)
+  headless_shell        (not on PATH)
+  chrome-headless-shell (not on PATH)
+  find / (maxdepth 6) 命中: 0
+
+### 2) 已安装包（无浏览器；有 System WebView）
+  package:com.google.android.gsf
+  package:com.android.providers.media
+  package:com.google.android.permissioncontroller.overlay.oplus
+  package:com.dsh.nextapp1
+  package:android
+  package:com.google.android.webview
+  package:com.tencent.mm
+  package:com.android.healthconnect.controller
+  package:android.ext.services
+  package:com.google.android.gms
+  package:com.android.permissioncontroller
+  package:com.oplus.securitypermission
+
+### 3) 应用自身 WebView 的 CDP 端点存活（抽象 unix socket）
+  app pid = 16427
+  socket @webview_devtools_remote_16427 => REACHABLE
+
+### 4) WebView 版本
+bash: -c: line 34: syntax error near unexpected token `)'
+bash: -c: line 34: `c.on('close',()=>{const m=/Browser\\":\\s*\\"([^\\"]+)/.exec(b);console.log('  ',m?m[1]:b.slice(0,120));});'

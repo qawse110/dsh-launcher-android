@@ -1,0 +1,30 @@
+运行时间：2026-10-11T23:45Z（真机 RMX3888 / Android 16 / arm64-v8a）
+对象：用户已安装的**新 APK**（base.apk mtime 2026-10-12 07:26）
+路径：生产端口 41999 上由启动脚本拉起的中继（非我另起） + 真 WebView + 真 ego 运行时
+
+判读要点：
+- 生产环境（启动脚本自动）：
+    files/webview-cdp-relay.mjs 存在，且与仓库 assets 版本 **byte-identical**（26760 bytes）
+    files/logs/webview-relay.log 首行 = RELAY_READY port=41999 socket=webview_devtools_remote_11275
+- 已安装 APK 的 assets/webview-cdp-relay.mjs 与仓库版本 **byte-identical**
+- 已安装 APK 的 classes7.dex 含 onCreateWindow / SupportMultipleWindows /
+  openPopupWebView / destroyPopup ⇒ 我加的 Kotlin 代码确实进了包
+- 真机 dsh web 在跑（3080 → HTTP 401，预期 trust fence），GUI page visible=true
+
+原始输出：
+== 检查开始 2026-10-11T23:45:39.625Z ==
+生产中继 pages=1  gui=http://127.0.0.1:3080/
+gui title=将liustack/modsearch和dsh-ego-browser — DeepSeek Harness
+gui desc ={"attached":true,"empty":false,"height":2640,"never_attached":false,"screenX":0,"screenY":140,"visible":true,"
+ego → PROOF {"info":{"url":"https://example.com/","title":"Example Domain","w":361,"h":754,"sx":0,"sy":0,"pw":361,"ph":917},"snapshotChars":0,"rawChars":1065,"rawHead":"text: 该域名仅用于文档示例，无需获得许可。这并非一项服务，请勿将其用于测试和监控目的。\ntext: This domain is for use in documentation examples without ","evaluate":{"u":"https://example.com/","t":"Example Domain","body":"该域名仅用于文档示例，无需获得许可。这并非一项服务，请勿将其用于测试和监控目的。\n\nThis domain is for use in documentation examples without needing permission. This is not a service; avoid re"}}
+after pages=2  https://example.com/ | http://127.0.0.1:3080/
+GUI 中间态: 无（全程未变）
+samples=58 (每 ~60ms)
+
+结论（一档）：
+  ego 在新 APK 上真的新建了一个独立 page，并取回 example.com 的**真实网页内容**
+  （snapshotRaw 1065 字符 + evaluate 拿到真实 title/body），
+  用户 GUI（http://127.0.0.1:3080/）在 58 次每 ~60ms 的采样里 url 全程未变。
+
+  ⚠ 已知偏差：page.snapshot()（a11y 树）返回 0 字符，而 snapshotRaw() 正常（1065 字符）。
+    即「结构化快照」这一条路在新 WebView 上还没通，取内容要走 snapshotRaw / evaluate。
