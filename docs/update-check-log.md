@@ -1094,3 +1094,14 @@ node tmp/dlprobe/probe.mjs
 - 64 MB 上限是硬编码；超过时 toast「文件过大（…），上限 64.0 MB」，不弹保存面板。
 - 页面若在点击前自行 `revokeObjectURL`，缓存里只有失效 URL，会退化成 `fetch` 失败 → toast「导出失败：…」，不会静默。
 - 注入依赖 `evaluateJavascript`（API 19+，minSdk 24 满足）；页面若预先占了 `window.__dshDownload` / `window.__dshDownloadNonce` 这两个名字，功能会被覆盖（当前 dsh 页面无此占用）。
+**十三、CI 复核（推送后自动触发，2026-10-30）**
+
+把 `next` 推到 `39dd8aa` 后，两个工作流自动跑完，都是 success。此前第九 / 十一 / 十二节里「本机无 gradle、无法触发 CI」「未跑 `assembleDebug` / `testDebugUnitTest`」的边界，**对编译与单测已解除**；真机端到端仍未被覆盖（见末行）。
+
+- **`CI`**（run `41012953148`，head `39dd8aa`，2026-10-30T06:14:50Z → 06:16:47Z，job `assemble-debug` = success）：12 步全绿 —— 插件清单一致性门禁、前缀适配工具自测、插件在线升级工具自测、**Assemble debug（编译门禁）**、**Unit tests（P2-2 单测门禁）**、单测结果摘要、Upload test reports 均 success；日志里 `BUILD SUCCESSFUL in 56s` 与 `BUILD SUCCESSFUL in 34s`。
+- **单测汇总**：`TESTTOTAL tests=134 failures+errors=0`。分项：`DshUpdaterTest 34`、`SentenceSplitterTest 16`、**`PluginUpgradeGuardTest 14`**（本次新增）、`MarkerStoreTest 13`、`NodeRuntimeTest 11`、`PrefixPatcherTest 8`、`UiFlowRowLayoutTest 7`、`WebAuthTest 6`、`UiFlowRowTest 5`、`FileLogTest 4`、`TermuxEnvTest 3`，全部 `failures=0 errors=0`。
+- **`Build APK`**（run `41012953042`，job `build` = success）：产物 `app-debug-apk`，93,459,875 B。
+
+⇒ 本地「真 kotlinc 整文件编译 + 页面脚本 node 探针」是替代证据，CI 才是真编译/真单测门禁；两条线结论一致（本仓 Kotlin 侧零编译错误、既有单测无一被本轮的 `AssetSync` / `PluginUpgrade` 改动打红）。
+
+**仍未验证**：装上该 APK 后，在真机点一次 jet hub「导出」，确认弹系统保存面板并落盘（十二节边界第一条）；本机无设备安装通路，这条只能人工点。
